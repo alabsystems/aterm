@@ -49,6 +49,7 @@ impl FakeRepo {
         me.script("tools/license_check.sh", "echo 'LICENSE: PASS'; exit 0");
         me.script("tools/test-install-channel.sh", "exit 0");
         me.script("tools/test-trust-gate-verdict.sh", "exit 0");
+        me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
         // The redraw harness the gate builds and then DRIVES. Present and passing
         // by default so an unrelated test never reads a missing binary as a
@@ -201,8 +202,8 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
     assert_eq!(
         expected.len(),
-        18,
-        "16 gate stages plus the two --full tiers"
+        19,
+        "17 gate stages plus the two --full tiers"
     );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
@@ -598,6 +599,10 @@ fn selftest_matches_the_scripts_selftest_ladder_exactly() {
             (
                 "skip",
                 "test-trust-gate-verdict.sh (selftest: not executed)"
+            ),
+            (
+                "skip",
+                "test-trust-contract-probe.sh (selftest: not executed)"
             ),
             ("skip", "test-start-compare.sh (selftest: not executed)"),
             ("skip", "license_check.sh (selftest)"),

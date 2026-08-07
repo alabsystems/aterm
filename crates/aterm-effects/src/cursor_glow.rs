@@ -374,8 +374,8 @@ const RAINBOW_TRANSIENT_COV_CAP: f32 = 118.0;
 /// only place it exists.
 const RAINBOW_BAND_COV_CAPS: [f32; 33] = [
     90.0, 82.0, 76.0, 69.0, 64.0, 59.0, 58.0, 58.0, 58.0, 58.0, 59.0, 59.0, 57.0, 57.0, 57.0, 59.0,
-    60.0, 62.0, 63.0, 62.0, 62.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 66.0, 73.0, 80.0, 91.0, 103.0,
-    120.0,
+    60.0, 62.0, 63.0, 62.0, 62.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 66.0, 73.0, 80.0, 91.0,
+    103.0, 120.0,
 ];
 
 /// The largest value any entry of [`RAINBOW_BAND_COV_CAPS`] can take — the bound
@@ -441,12 +441,23 @@ fn rainbow_over_ink_coverage(requested: f32) -> f32 {
 /// fresh cell drops under the emit floor (a cold head spark is
 /// `~96 born_cov × 0.7 intensity`; 0.22 keeps it a visible,
 /// clearly-saturated wisp).
-const RAINBOW_HEAD_FLOOR: f32 = 0.22;
-/// The onset spans half the spark's life: brightness climbs smoothly for the
-/// whole near-cursor stretch instead of snapping to full body two cells
-/// behind the head — "more bright further away", not "bright almost
-/// immediately".
-const RAINBOW_HEAD_RAMP: f32 = 0.52;
+/// RAISED 0.22 → 0.55 (owner, 2026-08-06: "the underline cursor trail … feels
+/// a bit lagged? it needs to be more responsive and not feel like it's
+/// delayed"). At 0.22 the freshest cell showed 22 % of the body and the
+/// clearance below took another cut out of it, so the light under the hand was
+/// ~8 % of the ribbon's own brightness: the visible trail BEGAN several letters
+/// back and several hundred milliseconds late, which is exactly what reads as
+/// lag. The head is now clearly lit the instant a cell is laid, and the crest
+/// still sits behind it, so the "brighter further back" shape survives — it is
+/// a gradient now rather than an onset from near-nothing.
+const RAINBOW_HEAD_FLOOR: f32 = 0.55;
+/// The onset span, as a fraction of the spark's life. PULLED IN 0.52 → 0.26
+/// with the raised floor: the climb to full body now completes in the first
+/// quarter of a life instead of the first half, so the ribbon reaches its body
+/// within the couple of letters the eye is actually on. Kept well under
+/// [`RAINBOW_CREST_POS`] so the crest is still a crest and not the top of the
+/// onset.
+const RAINBOW_HEAD_RAMP: f32 = 0.26;
 /// Where the crest lands on the `u` axis: past the onset, before the tail
 /// dissolve — the MID-TO-FAR tail. (At the default cadence that is roughly
 /// 4-7 cells behind the head, the band the owner pointed at.)
@@ -481,7 +492,13 @@ const RAINBOW_CREST_WIDTH: f32 = 0.30;
 /// %-of-life ease there would hide freshly typed light for over a SECOND —
 /// the opposite of a responsive head. The tail ease below IS %-of-life on
 /// purpose: the dissolve should scale with how long the ribbon lingers.
-const RAINBOW_EDGE_IN_S: f32 = 0.05;
+/// CUT 0.05 → 0.018 with the head-floor raise: 50 ms is three frames at 60 Hz,
+/// and at a 90 ms typing cadence that is more than half the gap between two
+/// letters spent fading a cell UP from nothing — the temporal half of the same
+/// "delayed" read. 18 ms is about one frame: the head still condenses out of
+/// the background rather than popping, but it is lit on the frame after the
+/// keystroke instead of three frames later.
+const RAINBOW_EDGE_IN_S: f32 = 0.018;
 /// Ceiling on the birth ease as a fraction of life (the "first few percent"),
 /// so a very short-lived spark still spends the overwhelming share of its
 /// life visible instead of losing a big slice to the ease-in.
@@ -574,20 +591,206 @@ fn rainbow_ribbon_profile(u: f32, life: f32) -> f32 {
 // hidden cursor — no known head — dims nothing at all). The emitter scales the
 // whole clearance by the momentum spine and never lets it cull a cell — see
 // the application site in `emit_rainbow` for both bounds.
+// ---- THE LIGHT-THEME INK RECIPE ---------------------------------------------
+//
+// One pair of numbers behind every source-over mark the rainbow kitty draws on
+// a white ground — the rails, the light twinkle, the meteor streak, the landing
+// stars, the delete sparkles. They were spelled inline at each site as a bare
+// `0.28` and a bare `150`, and a white-ground capture showed the result: every
+// transient read as PALE PASTEL CONFETTI, because a saturated hue only 28 % of
+// the way to black, composited at ~40 % centre alpha and then run through
+// `push_halo_over`'s radial falloff, lands a handful of counts off white
+// everywhere but the exact centre pixel.
+//
+// Naming them makes the light arms one system and lets the whole family gain
+// contrast in one place.
+/// Ceiling on the LUMA (0..255, Rec. 709) of any hue composited source-over on
+/// a white ground.
+///
+/// A flat "mix `x` toward black" — which is what every light arm used to spell
+/// inline — is the wrong operator here, because the six bands do not start
+/// anywhere near the same brightness: pure yellow's luma is 226 and pure blue's
+/// is 32, so ONE mix ratio leaves yellow and green tinting the paper while red
+/// and violet stain it. Normalizing to a luma target instead darkens each band
+/// by whatever IT needs, so a rainbow of light-theme marks reads as one
+/// material. 92/255 keeps every band a clear contrast INCREASE against white
+/// while leaving enough headroom that the hue is still obviously the hue.
+/// LOWERED 92 -> 68 after a white-ground review: at 92 the warm middle of the
+/// spectrum (yellow, tan, yellow-green) still composited to within a few counts
+/// of the paper, so a rainbow drawn on white visibly THINNED OUT in its middle
+/// while its violet/blue end stayed strong — "the ribbon looks like it has a
+/// hole in it". The bar has to be set by the WORST band, not an average one.
+const LIGHT_INK_MAX_LUMA: f32 = 68.0;
+/// Companion ceiling on any SINGLE channel. Luma alone is not enough: pure red
+/// has a luma of only 54, so a luma bar leaves it at a full-blast `FF` in the
+/// red channel — and the fresh-ink veil, which composites OVER the glyph, would
+/// then tint near-black ink to a dark red instead of merely greying its
+/// surround. Bounding the channel too keeps every band's darken honest against
+/// the INK as well as against the ground.
+const LIGHT_INK_MAX_CHANNEL: f32 = 150.0;
+/// LEGIBILITY CEILING on any light-theme mark's per-pixel CENTRE over-alpha
+/// (`aterm_render::halo_over_cap`). Raised 150 → 190: at 150 the transients
+/// were bounded well under what legibility actually requires, and the bound
+/// that matters is the one this constant now states — `over_rgb(glyph, ink,
+/// cap)` keeps `(255−cap)/255` of the glyph, so near-black ink stays near-black
+/// and a white counter stays a light grey. Pinned by
+/// `light_ink_cap_keeps_glyphs_legible`.
+const LIGHT_INK_ALPHA_CAP: f32 = 190.0;
+
+/// SOURCE-OVER GAIN. Every light arm derives its opacity from a number that was
+/// tuned as ADDITIVE COVERAGE on black — `RAINBOW_TRANSIENT_COV_CAP`, the
+/// particle base, and so on — and then clamps it. Those two quantities are not
+/// the same currency: additive coverage of 80 on black is a bright mark, while
+/// a source-over alpha of 80/255 on white is a 31 % wash that the radial
+/// falloff then thins further from the centre outward. The result, in a
+/// white-ground capture, was that every transient's alpha ceiling
+/// ([`LIGHT_INK_ALPHA_CAP`]) never once bound — the marks were pale not because
+/// they were bounded but because nothing ever asked for the bound.
+///
+/// One gain, applied where a light arm converts a coverage into an over-alpha,
+/// so the ceiling is what actually limits them.
+const LIGHT_INK_GAIN: f32 = 2.1;
+
+/// Rec. 709 luma of a `0x00RRGGBB` colour, 0..255. The one luminance the light
+/// arms measure with.
+#[inline]
+fn luma709(rgb: u32) -> f32 {
+    0.2126 * ((rgb >> 16) & 0xff) as f32
+        + 0.7152 * ((rgb >> 8) & 0xff) as f32
+        + 0.0722 * (rgb & 0xff) as f32
+}
+
+/// THE LEADING-ONLY INK — vivid, for marks that provably never touch a glyph.
+///
+/// [`light_ink`] is deliberately conservative because its marks CAN land on
+/// text: it bounds the channel hard, which on white leaves the low channels
+/// showing enough paper through to read as grey. Three white-ground reviews
+/// converged on the same sentence — "the palette collapses on white",
+/// "desaturated olive/gray smear" — and this is the arithmetic behind it.
+///
+/// The marks that live wholly in the inter-line leading (the rail, the pop's
+/// bar, the streak that rides the rail line, the landing bloom) are under no
+/// such constraint, and they are the ones that carry the rainbow. They get:
+///
+///   * FULL SATURATION — the hue's own channel ratios pushed to S = 1, so the
+///     low channels go to zero instead of letting white through them. This is
+///     what separates "green" from "grey-green" once composited.
+///   * A HIGHER luma allowance, because contrast on white is bought by ALPHA
+///     (these marks composite near-opaque) rather than by crushing the hue.
+///     A dark-yellow is olive no matter what alpha it is drawn at; the fix for
+///     the warm middle of the spectrum is to stop crushing it.
+const LIGHT_INK_BOLD_MAX_LUMA: f32 = 120.0;
+const LIGHT_INK_BOLD_MAX_CHANNEL: f32 = 215.0;
+
+/// [`light_ink`]'s vivid twin — see the constants above. Saturates first (the
+/// dominant channel to its ceiling, the others scaled by the SAME factor about
+/// zero so the hue is preserved), then applies the luma bar.
+#[inline]
+fn light_ink_bold(rgb: u32) -> u32 {
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as f32,
+        ((rgb >> 8) & 0xff) as f32,
+        (rgb & 0xff) as f32,
+    );
+    let hi = r.max(g).max(b);
+    let lo = r.min(g).min(b);
+    if hi <= 0.5 {
+        return 0;
+    }
+    // SATURATE: subtract the achromatic floor, then renormalize. `lo` is the
+    // white the hue was carrying; removing it is exactly what stops the paper
+    // showing through the low channels after compositing.
+    let span = (hi - lo).max(1e-3);
+    let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
+    let (r, g, b) = (sat(r), sat(g), sat(b));
+    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    let hi = r.max(g).max(b);
+    let k = (LIGHT_INK_BOLD_MAX_LUMA / y.max(1.0))
+        .min(LIGHT_INK_BOLD_MAX_CHANNEL / hi.max(1.0))
+        .min(1.0);
+    let ch = |c: f32| ((c * k) + 0.5) as u32;
+    (ch(r) << 16) | (ch(g) << 8) | ch(b)
+}
+
+/// THE LIGHT-THEME INK: `rgb` scaled down (hue and saturation intact — every
+/// channel by the SAME factor) until it satisfies BOTH bars —
+/// [`LIGHT_INK_MAX_LUMA`] and [`LIGHT_INK_MAX_CHANNEL`]. A colour already under
+/// both is returned UNCHANGED, so the dark bands are not needlessly crushed.
+/// Scaling uniformly (rather than mixing toward black per-channel) is what
+/// preserves the hue: the band is still recognisably its own colour, just at
+/// ink weight. Pinned by `light_ink_darkens_every_band_to_one_bar`.
+#[inline]
+fn light_ink(rgb: u32) -> u32 {
+    let rgb = rgb & 0x00FF_FFFF;
+    let y = luma709(rgb);
+    let hi = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff) as f32;
+    let k = (LIGHT_INK_MAX_LUMA / y.max(1.0))
+        .min(LIGHT_INK_MAX_CHANNEL / hi.max(1.0))
+        .min(1.0);
+    if k >= 1.0 {
+        return rgb;
+    }
+    let ch = |sh: u32| ((((rgb >> sh) & 0xff) as f32 * k) + 0.5) as u32;
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
 // ---- rainbow kitty LIGHT-THEME RAILS ------------------------------------------------
-/// The light ribbon's two rails: how far from the glyph centre they sit, how
-/// THIN they are, and how far they reach sideways. `DY ± RY` (0.55 ± 0.11) keeps
-/// them wholly in the inter-line leading — clear of cap heights and descenders —
-/// while `RX` well over half a cell makes neighbouring cells' rails merge into
-/// one continuous band. Rails thick enough to span a whole cell of blur read
+/// The light ribbon's ONE rail: how far BELOW the glyph centre it sits, how
+/// THIN it is, and how far it reaches sideways. `DY − RY` (0.62 − 0.13 = 0.49)
+/// keeps it wholly in the inter-line leading — clear of every descender —
+/// while `RX` well over a cell makes neighbouring cells' rails merge into
+/// one continuous band. A rail thick enough to span a whole cell of blur reads
 /// as a smudged highlighter stroke, not a ribbon.
-const RAINBOW_LIGHT_RAIL_DY: f32 = 0.55;
-const RAINBOW_LIGHT_RAIL_RY: f32 = 0.11;
-const RAINBOW_LIGHT_RAIL_RX: f32 = 1.45;
+const RAINBOW_LIGHT_RAIL_DY: f32 = 0.62;
+const RAINBOW_LIGHT_RAIL_RY: f32 = 0.13;
+/// WIDENED 1.45 -> 2.15. `push_halo_over` is a RADIAL falloff, so how far a
+/// rail reaches before it drops under the visible threshold shrinks with its
+/// own alpha — at 1.45 cells a FRESH rail merged with its neighbours into one
+/// band but a FADING one broke into a row of evenly spaced beads, one per cell.
+/// A white-ground capture of a ribbon a second old showed exactly that: a
+/// dotted rule where the continuous band is supposed to be. Overlapping ~2x a
+/// cell keeps the merge alive all the way down the fade.
+const RAINBOW_LIGHT_RAIL_RX: f32 = 2.15;
 /// LEGIBILITY CEILING on a rail's per-pixel centre over-alpha. The rails live
 /// outside the glyph band, so this bounds how dark the LEADING can get (and how
 /// much two overlapping rails can compound), not the ink.
-const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 150.0;
+/// RAISED 150 -> 200 across two white-ground reviews. The rail is the ONE
+/// continuous mark of this family on white — the "underline cursor trail" — and
+/// at the old ceiling it read as a pastel wash rather than a rainbow. It may go
+/// higher than [`LIGHT_INK_ALPHA_CAP`] precisely because it is NOT a transient
+/// over text: it lives wholly in the leading below the row (`DY − RY` = 0.49,
+/// clear of any descender), so nothing it darkens is ever a glyph.
+const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 236.0;
+/// The light rail's OWN peak centre over-alpha, before the life envelope and
+/// the host's intensity. Above the ceiling on purpose, so an ordinary ribbon
+/// cell sits AT the ceiling and only a dimmed/low-intensity one falls below it
+/// — the band is meant to be ink, and the ceiling is meant to bind.
+const RAINBOW_LIGHT_RAIL_PEAK: f32 = 255.0;
+/// The light rail's own tail melt: how much of a life the dissolve occupies,
+/// and how sub-linear it is.
+///
+/// The shared [`RAINBOW_EDGE_OUT`] (0.30 at γ 0.6) is tuned for ADDITIVE light,
+/// where a long gentle fade reads as light going out. Source-over ink fades
+/// differently: as the alpha drops, a luma-68 hue over white loses SATURATION
+/// before it loses presence, so the same curve turns the older half of the band
+/// into grey — measured on a hot typing frame as a saturated (60,109,141) under
+/// the caret and a washed-out grey-green four cells back, which every
+/// white-ground review called a smudge. A shorter melt at a much flatter gamma
+/// holds the band at ink weight through its body and spends the fade in its
+/// last fifth, where there is no saturation left to lose.
+const RAINBOW_LIGHT_RAIL_MELT: f32 = 0.28;
+const RAINBOW_LIGHT_RAIL_MELT_GAMMA: f32 = 0.30;
+
+/// The light rail's own both-ends envelope: the SHARED birth ease (so the head
+/// is exactly as responsive as the dark ribbon's) with the flatter light melt
+/// above on the tail. Zero at both endpoints, so a rail can never terminate at
+/// visible alpha — the same contract [`rainbow_edge_envelope`] carries.
+#[inline]
+fn rainbow_light_rail_envelope(u: f32, life: f32) -> f32 {
+    let birth = (RAINBOW_EDGE_IN_S / life.max(1e-3)).min(RAINBOW_EDGE_IN);
+    smoothstep01(u / birth)
+        * smoothstep01((1.0 - u) / RAINBOW_LIGHT_RAIL_MELT).powf(RAINBOW_LIGHT_RAIL_MELT_GAMMA)
+}
 /// How fast the band ramp sweeps ALONG the rails: per column, and per unit of
 /// the ribbon's own shared phase clock. Slow — the spectrum should flow, not
 /// strobe — and phase-driven, so it freezes exactly when the ribbon does.
@@ -598,12 +801,20 @@ const RAINBOW_LIGHT_RAIL_FLOW: f32 = 0.35;
 /// ribbon must still visibly START at the cursor (a hard clear zone would read
 /// as the rainbow detaching from the cat), it must merely be quiet enough that
 /// the glyph is the crispest thing in the cell.
-const RAINBOW_CLEAR_FLOOR: f32 = 0.35;
-/// Distance in CELLS over which the body climbs from [`RAINBOW_CLEAR_FLOOR`] back
-/// to its full profile value. Three cells: the two or three letters the eye is
-/// actually reading while typing stay clean, and the ribbon is already at full
-/// strength within the four-letter span the chain guarantee lights.
-const RAINBOW_CLEAR_CELLS: f32 = 3.0;
+/// RAISED 0.35 → 0.74 with [`RAINBOW_HEAD_FLOOR`], and for the same reason:
+/// the SPATIAL half of the "lagged" read. The clearance and the age profile
+/// MULTIPLY, so at the old pair the cell under the caret carried
+/// 0.22 × 0.35 ≈ 0.08 of the body — a ribbon that visibly started a word
+/// behind the hand. Legibility is not spent here: every emitted sample still
+/// passes through [`rainbow_band_coverage`], the per-band contrast clamp that
+/// actually carries the bound, and on light themes the rails live wholly in the
+/// inter-line leading and never touch a glyph at all.
+const RAINBOW_CLEAR_FLOOR: f32 = 0.74;
+/// Distance in CELLS over which the body climbs from [`RAINBOW_CLEAR_FLOOR`]
+/// back to its full profile value. PULLED IN 3.0 → 1.6: the dip is now a
+/// half-word-wide softening under the hand rather than a three-letter hole the
+/// ribbon has to climb out of.
+const RAINBOW_CLEAR_CELLS: f32 = 1.6;
 /// How much of the ribbon's WIDTH survives at the cursor. The same clearance
 /// that quiets the body near the hand also narrows it, so the ribbon reads as a
 /// trail being FORMED — light thrown off the cursor and widening as it settles
@@ -747,13 +958,17 @@ const FRESH_INK_CAP: usize = 32;
 const FRESH_INK_LIFE_S: f32 = 0.70;
 /// The birth-flash window: the wide soft halo exists only this long (~120 ms),
 /// a small fixed fraction of the pop.
-const FRESH_INK_HALO_S: f32 = 0.12;
-/// Peak size boost of the pop's light envelope (1.0 → ~1.28 → 1.0) — a
-/// clearly-felt swell on the keystroke, not a subtle nudge.
-const FRESH_INK_SCALE_AMP: f32 = 0.28;
-/// Where (as a fraction of the pop life) the size boost peaks: ~155 ms — the
-/// swell lands on the keystroke, not halfway through the fade.
-const FRESH_INK_SCALE_PEAK: f32 = 0.18;
+const FRESH_INK_HALO_S: f32 = 0.16;
+/// Peak size boost of the pop's light envelope (1.0 → ~1.40 → 1.0) — a
+/// clearly-felt swell on the keystroke, not a subtle nudge. RAISED with
+/// [`FRESH_INK_EMPH_TAIL`]: the swell is the half of the pop that survives
+/// every legibility clamp untouched (a radius is not a coverage), so it is
+/// where "more emphasis on the newly typed character" is cheapest to buy.
+const FRESH_INK_SCALE_AMP: f32 = 0.40;
+/// Where (as a fraction of the pop life) the size boost peaks: ~91 ms — the
+/// swell lands ON the keystroke rather than a frame or two after it. Pulled in
+/// from 0.18 (155 ms) so the pop reads as struck, not as inflating.
+const FRESH_INK_SCALE_PEAK: f32 = 0.13;
 /// The pop's hue: WARM white (`0x00RRGGBB`) — reads as fresh ink catching the
 /// light, distinct from the ribbon's six saturated bands and from the pure
 /// white starfield.
@@ -807,26 +1022,42 @@ const FRESH_INK_HALO_COV: f32 = 34.0;
 /// comes back for the pops FURTHER BACK, which make the trail read as a glow.
 const FRESH_INK_FLASH_RX: f32 = 1.70;
 const FRESH_INK_FLASH_RY: f32 = 1.10;
-/// THE CARET POCKET. The pop's light ramps IN behind the hand: the letter just
-/// committed sits in a dim pocket and the glow reaches full body a few cells
-/// back, so the eye reads a trail FORMING BEHIND the cursor instead of a lamp on
-/// the fingertips. Deliberately the same shape the ribbon body already uses for
-/// the same problem ([`rainbow_head_clearance`]), so the two dim over one shared
-/// span. Measured in CELLS, so it is cadence-invariant. The floor is LOWER than
-/// the ribbon's because the pop is the layer that actually lands ON the glyph.
-const FRESH_INK_POCKET_FLOOR: f32 = 0.22;
-/// Distance in CELLS over which the pop climbs to full. Matched to
-/// [`RAINBOW_CLEAR_CELLS`] so pop and ribbon share one pocket.
-const FRESH_INK_POCKET_CELLS: f32 = 3.0;
+/// THE FRESH-INK EMPHASIS RAMP — the deliberate INVERSION of the old caret
+/// pocket (owner, 2026-08-06: "newly typed characters need more of an
+/// emphasis").
+///
+/// The pocket held the letter under the hand at [`FRESH_INK_POCKET_FLOOR`] =
+/// 0.22 and climbed to FULL three cells back, so the brightest ink in the run
+/// was always three letters behind the one being typed — and, because the pop
+/// lives [`FRESH_INK_LIFE_S`], a fast run painted a full-strength smear over
+/// the last half-word while the newest glyph sat in the dim spot. That reads as
+/// a trailing smudge, not as emphasis on what you just typed.
+///
+/// The ramp now runs the other way: FULL weight on the cell just committed,
+/// easing DOWN to [`FRESH_INK_EMPH_TAIL`] by [`FRESH_INK_EMPH_CELLS`] behind it.
+/// The trail still exists (the earlier "the glow is gone" complaint is not
+/// re-earned — 42 % is a clearly visible wake) but the NEWEST letter is now the
+/// brightest thing on the row, which is what "more emphasis" means. Measured in
+/// CELLS, so it is cadence-invariant exactly as the pocket was.
+///
+/// The ribbon body keeps its own [`rainbow_head_clearance`]: the ribbon is a
+/// continuous bed the eye reads THROUGH, the pop is a transient highlight ON
+/// one glyph. They no longer share a shape, and the doc that said they did is
+/// gone with the pocket.
+const FRESH_INK_EMPH_TAIL: f32 = 0.36;
+/// Distance in CELLS over which the pop eases from full down to
+/// [`FRESH_INK_EMPH_TAIL`] — about a short word, so a whole typed word carries
+/// a visible gradient rather than one flat block of light.
+const FRESH_INK_EMPH_CELLS: f32 = 4.0;
 
-/// The caret pocket's ramp at `cells` behind the live caret: exactly
-/// [`FRESH_INK_POCKET_FLOOR`] at the caret, smoothstepping to 1.0 at
-/// [`FRESH_INK_POCKET_CELLS`]. Monotone non-decreasing and continuous — the same
-/// contract as [`rainbow_head_clearance`].
+/// The emphasis ramp at `cells` behind the live caret: exactly 1.0 AT the
+/// caret, smoothstepping DOWN to [`FRESH_INK_EMPH_TAIL`] at
+/// [`FRESH_INK_EMPH_CELLS`] and staying there. Monotone NON-INCREASING and
+/// continuous (pinned by `fresh_ink_emphasis_peaks_at_the_caret`) — the mirror
+/// of [`rainbow_head_clearance`]'s contract.
 #[inline]
-fn fresh_ink_pocket(cells: f32) -> f32 {
-    FRESH_INK_POCKET_FLOOR
-        + (1.0 - FRESH_INK_POCKET_FLOOR) * smoothstep01(cells / FRESH_INK_POCKET_CELLS)
+fn fresh_ink_emphasis(cells: f32) -> f32 {
+    1.0 - (1.0 - FRESH_INK_EMPH_TAIL) * smoothstep01(cells / FRESH_INK_EMPH_CELLS)
 }
 /// COMPOSITE CENTRE CEILING: the tight CORE halo and the wide birth-FLASH halo
 /// share the glyph centre, and both peak there, so their additive light STACKS
@@ -854,7 +1085,14 @@ const FRESH_INK_MOM_FLOOR: f32 = 0.90;
 /// never detached. (At a 90 ms cadence the lag is `e^(-gap/τ)/(1−e^(-gap/τ))`
 /// ≈ 0.12 cells; at 150 ms it is 0.03.) The ease is a pure exponential on the injected clock, so it
 /// is frame-rate independent and deterministic.
-const RAINBOW_WAKE_HEAD_TAU: f32 = 0.042;
+/// CUT 0.042 → 0.026 in the same responsiveness pass as
+/// [`RAINBOW_HEAD_FLOOR`]: the nozzle is the one piece of the ribbon family
+/// that is ALLOWED to trail the caret, but at 42 ms it contributed a visible
+/// share of the "delayed" read on top of the profile's own onset. At 26 ms the
+/// steady-state lag at a 90 ms cadence falls from ~0.12 cells to ~0.05 — still
+/// a drag, no longer a delay. The ease is a pure exponential on the injected
+/// clock, so it stays frame-rate independent and deterministic.
+const RAINBOW_WAKE_HEAD_TAU: f32 = 0.026;
 /// Beyond this many cells of disagreement the head SNAPS instead of easing: a
 /// real cursor jump, a line wrap, or a fresh focus must not drag a nozzle across
 /// the screen. Sized just above one cell so ordinary typing (and a two-cell
@@ -1153,7 +1391,7 @@ fn rainbow_wake_pulse(d: f32, age: f32) -> f32 {
 /// smooth contrail. The reverse — sparse and strong — is what produces a line of
 /// discrete grey blobs, which is the light-theme spelling of exactly the
 /// quantised look this whole retune exists to kill.
-const RAINBOW_WAKE_LIGHT_GAIN: f32 = 0.34;
+const RAINBOW_WAKE_LIGHT_GAIN: f32 = 0.11;
 /// The light contrail's own straight RGB (source-over). Deliberately DISTINCT
 /// from the fresh-ink pop's `FRESH_INK_LIGHT_VEIL`, though both are cool-neutral
 /// near-blacks: they are two different marks that merely share a palette — the
@@ -1162,7 +1400,8 @@ const RAINBOW_WAKE_LIGHT_GAIN: f32 = 0.34;
 /// cannot tell them apart, and neither can a human reading a capture).
 const RAINBOW_WAKE_LIGHT_VEIL: u32 = 0x0022_2A33;
 
-/// [`fresh_ink_veil`] for the contrail: its straight colour stamped with the
+/// [`fresh_ink_veil_tinted`]'s untinted twin for the contrail: its straight
+/// colour stamped with the
 /// per-pixel centre over-alpha CEILING in the high byte.
 #[inline]
 fn rainbow_wake_veil(cap: u8) -> u32 {
@@ -1203,27 +1442,235 @@ fn rainbow_wake_veil(cap: u8) -> u32 {
 /// rides the high byte (`aterm_render::halo_over_cap`), so this stays the low 24
 /// bits.
 const FRESH_INK_LIGHT_VEIL: u32 = 0x0026_2E36;
-/// Peak CENTRE over-alpha (0..255) of the core darken veil at birth/full
+/// How far the light-theme veil is tinted toward the RIBBON'S OWN live band hue
+/// (0 = the neutral slate above, 1 = the darkened band itself). The pop reads on
+/// white by DARKENING, and a purely neutral darken is a grey smudge — which is
+/// exactly what a white-ground capture of the shipping build showed sitting over
+/// the last half-word. Tinting it re-colours the same bounded darken into
+/// SATURATED INK: the fresh letter looks freshly written rather than dirtied.
+///
+/// The hue is sampled from the SAME expression the rail under the glyph uses
+/// ([`RAINBOW_LIGHT_RAIL_SPREAD`] / [`RAINBOW_LIGHT_RAIL_FLOW`]), so the pop and
+/// the ribbon beneath it are never two different colours in one cell.
+/// How far the light-theme veil is tinted toward the ribbon's live band hue
+/// (0 = the neutral slate above, 1 = the darkened band itself).
+///
+/// RAISED 0.62 -> 0.90. A kill-switch experiment settled what a white-ground
+/// capture actually shows: with the light POP suppressed the band vanishes
+/// entirely, so this layer — not the rail, not the contrail — IS the underline
+/// the owner sees while typing. At 0.62 it carried 38 % of a cool-neutral
+/// near-black, which is precisely the "olive/steel-grey, not rainbow"
+/// desaturation three reviews reported.
+///
+/// Held BELOW 1 on purpose: at exactly 1 the pop's colour becomes bit-identical
+/// to the rail's, and [`is_fresh_ink_veil`] — the predicate that keeps a light
+/// pop independently assertable from every other veil in the frame — stops
+/// discriminating. A tenth of the slate is what carries that identity.
+const FRESH_INK_LIGHT_TINT: f32 = 0.90;
+/// The light pop's footprint (cell widths / heights) — a short, flat BAR, not a
+/// disc.
+///
+/// The dark arm can afford a round core centred on the glyph because additive
+/// light on black stops where the light stops. A source-over darken paints
+/// every pixel it covers, so the same radii that read as a bloom on black read
+/// as a grey lozenge sitting ON the letter — and a white-ground capture of six
+/// letters mid-run showed exactly that: a continuous smudge over the last
+/// half-word, with the letters underneath fighting to be read.
+///
+/// So on white the pop moves OFF the glyph entirely and becomes a SWELL OF THE
+/// RAIL: two short saturated bars on the ribbon's own rail lines
+/// (±[`RAINBOW_LIGHT_RAIL_DY`]), directly under and over the fresh letter.
+/// Nothing composites onto the letterform at all, and the mark lands on the
+/// one piece of this family the owner already likes — "the underline cursor
+/// trail is cute" — so a fresh character reads as the underline FLARING where
+/// you just typed.
+/// A FLARE, not a cloud. `push_halo_over` is a RADIAL falloff, so width buys
+/// softness as well as reach: at rail width (1.60) the pop stopped reading as a
+/// mark on the underline and started reading as a diffuse stain over the glyph
+/// band — "a ~37px-tall blur over the letters", in a white-ground review's
+/// words. Three quarters of a cell keeps it local to the letter it belongs to
+/// and still merges with its immediate neighbours into one flare.
+const FRESH_INK_LIGHT_CORE_RX: f32 = 0.75;
+const FRESH_INK_LIGHT_CORE_RY: f32 = 0.13;
+/// The light BIRTH-veil footprint — the same two rail lines, wider and dimmer:
+/// the peripheral "pop" edge, spread along the rail rather than out over the
+/// neighbouring letters.
+const FRESH_INK_LIGHT_FLASH_RX: f32 = 1.30;
+const FRESH_INK_LIGHT_FLASH_RY: f32 = 0.13;
+/// Half-height, in cell heights, of the band a GLYPH may occupy — cap height up
+/// through descender. The light pop's bars must clear it on both sides, which
+/// is what makes their legibility STRUCTURAL rather than budgeted (pinned by
+/// `fresh_ink_light_theme_pops_with_a_darken_veil`). `RAINBOW_LIGHT_RAIL_DY −
+/// RAINBOW_LIGHT_RAIL_RY` is the tightest a rail ever comes; this stays under
+/// it, and the ribbon's own rails have honoured the same clearance since they
+/// shipped.
+const FRESH_INK_LIGHT_GLYPH_HALF: f32 = 0.34;
+// ---- THE FRESH-INK GLYPH TINT ----------------------------------------------
+//
+// Owner-approved 2026-08-07, and it reverses the standing no-recolor law for
+// exactly one case. That law was written for the FIRE style, where the ask was
+// to char burning text and the answer was twice "no" — the halo lives AROUND
+// the strokes, never in them. This is not that: it is a ~200 ms tint on the one
+// character you just typed, and it exists because every white-ground review of
+// this family scored new-text emphasis 2-3 with the same reason — "the
+// last-typed word is the same flat black as text 900 px away". Light and
+// shadow in the leading cannot answer that; only the letterform can.
+//
+// LEGIBILITY IS STRUCTURAL, not budgeted. The tint interpolates between two
+// inks that are BOTH high-contrast against the theme's own ground and BOTH on
+// the same side of it — dark inks on a light ground, light inks on a dark one.
+// A lerp between two colours on the same side of the ground can never cross it,
+// so every frame of the fade clears the bar by construction; there is no
+// mid-path dip to tune around. Pinned across all six bands and the whole weight
+// range by `fresh_ink_glyph_tint_is_always_legible`.
+/// How long the tint lasts, as a fraction of [`FRESH_INK_LIFE_S`]. Short on
+/// purpose: this substitutes the cell's resolved foreground, so the shorter it
+/// is on screen the less the hand-back at the end can matter (see
+/// [`FRESH_INK_GLYPH_ANCHOR_LIGHT`]).
+const FRESH_INK_GLYPH_SPAN: f32 = 0.32;
+/// Ceiling on the tint ink's WCAG RELATIVE LUMINANCE.
+///
+/// Not a luma bar — luma is the wrong measure here and using one is what the
+/// first cut of this got wrong. Pure red's luma is only 54, so a luma bar never
+/// bound it, yet red on white is 4.0:1: below the AA bar for small text. The
+/// bound that matters is the one the contrast ratio is computed from.
+///
+/// 0.15 is the largest value that still clears the AA bar for small text on
+/// the light grounds that actually exist — 5.3:1 on pure white, 4.9:1 on
+/// Solarized Light's `#FDF6E3` — which is what lets this be a fixed constant
+/// instead of a per-theme calculation the engine has no input for. It is set at
+/// the edge rather than comfortably inside it because CHROMA is the whole point
+/// of the layer: at 0.09 the bands are legible but nearly monochrome once
+/// composited, and a tint you cannot see is a foreground substitution that buys
+/// nothing.
+const FRESH_INK_GLYPH_MAX_LUM: f32 = 0.15;
+/// The colour the tint fades back TO — a theme-appropriate neutral ink, not the
+/// cell's real foreground, which the engine cannot see (`GlowConfig` carries no
+/// theme fg). The hand-back at the end of the fade is therefore a small step
+/// from this anchor to whatever the theme actually uses; it is chosen to sit
+/// within a few counts of the common default (`#1F2328` on GitHub Light), so
+/// the step is imperceptible in the ordinary case and never a flash in any
+/// case — both are dark inks on a light ground.
+const FRESH_INK_GLYPH_ANCHOR_LIGHT: u32 = 0x001E_2228;
+/// Below this tint weight nothing is emitted: an entry at zero weight would be
+/// a foreground substitution that changes nothing but still costs the renderer a
+/// merge-walk entry, and it is the point at which the anchor hand-back happens.
+const FRESH_INK_GLYPH_MIN_W: f32 = 0.06;
+
+/// WCAG relative luminance of a `0x00RRGGBB` colour.
+#[inline]
+fn rel_luminance(c: u32) -> f32 {
+    let ch = |sh: u32| {
+        let v = ((c >> sh) & 0xff) as f32 / 255.0;
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
+}
+
+/// The band hue as GLYPH INK on a LIGHT theme: saturated about zero, then
+/// scaled down until its relative luminance clears
+/// [`FRESH_INK_GLYPH_MAX_LUM`].
+///
+/// LIGHT ONLY, deliberately. The tint exists to answer a defect measured on
+/// white, and on a dark ground the additive fresh-ink pop ALREADY brightens the
+/// letterform — that is emphasis expressed in the glyph without recolouring it,
+/// so the dark arm needs nothing here and keeps the no-recolor law intact. It
+/// also avoids the bound this side does not have: "bright enough for any dark
+/// theme" lands near white, which would wash the hue out to no purpose.
+///
+/// The scale is found by bisection on the exact luminance rather than by a
+/// closed form, because `rel_luminance` is a gamma curve — a linear guess
+/// undershoots on the saturated bands and overshoots on the dim ones.
+#[inline]
+fn fresh_ink_glyph_ink_light(band: u32) -> u32 {
+    let (r, g, b) = (
+        ((band >> 16) & 0xff) as f32,
+        ((band >> 8) & 0xff) as f32,
+        (band & 0xff) as f32,
+    );
+    let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+    if hi <= 0.5 {
+        return FRESH_INK_GLYPH_ANCHOR_LIGHT;
+    }
+    // Saturate about zero, exactly as `light_ink_bold` does — a hue carrying an
+    // achromatic floor reads as a tinted grey rather than as a colour.
+    let span = (hi - lo).max(1e-3);
+    let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
+    let (sr, sg, sb) = (sat(r), sat(g), sat(b));
+    let pack = |k: f32| -> u32 {
+        let ch = |c: f32| (((c * k) + 0.5) as u32).min(255);
+        (ch(sr) << 16) | (ch(sg) << 8) | ch(sb)
+    };
+    if rel_luminance(pack(1.0)) <= FRESH_INK_GLYPH_MAX_LUM {
+        return pack(1.0);
+    }
+    let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
+    for _ in 0..16 {
+        let mid = 0.5 * (lo_k + hi_k);
+        if rel_luminance(pack(mid)) > FRESH_INK_GLYPH_MAX_LUM {
+            hi_k = mid;
+        } else {
+            lo_k = mid;
+        }
+    }
+    pack(lo_k)
+}
+
+/// The emphasis floor a pop must clear to earn its own SPARKLE (see the emit
+/// site). Set high on purpose: [`fresh_ink_emphasis`] is 1.0 AT the caret and
+/// decays over [`FRESH_INK_EMPH_CELLS`], so at 0.82 only the newest cell or two
+/// spark. A star on every letter of a typed word is a starfield, not emphasis.
+/// How sharply the LIGHT bar's emphasis ramp is concentrated on the newest
+/// cells — see the emit site. Tried at 3.0 first and backed off: that
+/// concentrated the bar so hard that the older half of the run vanished and the
+/// trail got SHORTER rather than better-graded, which is the opposite of the
+/// point. 1.7 keeps a visible body behind the caret while leaving the newest
+/// cell unmistakably the strongest.
+const FRESH_INK_LIGHT_EMPH_GAMMA: f32 = 1.7;
+const FRESH_INK_SPARK_EMPH: f32 = 0.82;
+/// How far ABOVE the cell centre the fresh-ink sparkle sits, in cell heights —
+/// the same sky band the ribbon's own light twinkle uses, so the two never
+/// occupy different heights for the same cell.
+const FRESH_INK_SPARK_DY: f32 = 0.86;
+/// The sparkle's arm, in cell heights. A touch larger than the sky twinkle's
+/// (0.26): this one marks an event, not ambience.
+const FRESH_INK_SPARK_ARM: f32 = 0.32;
+/// Peak CENTRE over-alpha (0..255) of the core rail bar at birth/full
 /// momentum/full intensity, before the `env·momentum·intensity` scaling — the
 /// darken twin of the dark arm's `FRESH_INK_CORE_COV`. Deliberately ABOVE the
-/// legibility ceiling so a hot keystroke pushes the veil TO the ceiling (a real,
+/// legibility ceiling so a hot keystroke pushes the bar TO the ceiling (a real,
 /// bounded pop) then fades; a cold/low-intensity pop fades from below it.
-const FRESH_INK_LIGHT_VEIL_ALPHA: f32 = 210.0;
+/// RAISED 210 -> 430 alongside the ceiling (128 -> 190 -> the rail's 236). The
+/// request has to clear the ceiling AFTER the momentum floor (0.9) and the life
+/// envelope have taken their share, or the bound stops binding — a cap that
+/// never bites at the shipping intensity protects nothing. It rose again with
+/// [`FRESH_INK_LIGHT_EMPH_GAMMA`], which takes another bite out of the request
+/// one cell behind the caret. It is a REQUEST, not an emitted value; the clamp
+/// is what ships, and it now binds across the whole span the bar is meant to be
+/// solid over.
+const FRESH_INK_LIGHT_VEIL_ALPHA: f32 = 430.0;
 /// Peak over-alpha of the WIDER birth veil — the source-over twin of the dark
 /// arm's birth flash (the peripheral "pop" edge), dimmer than the core.
 const FRESH_INK_LIGHT_HALO_ALPHA: f32 = 105.0;
 /// LEGIBILITY CEILING on the veil's per-pixel CENTRE over-alpha (the value
 /// stamped into the colour's high byte via `aterm_render::halo_over_cap`). At
-/// this ceiling `over_rgb(glyph, veil, cap)` keeps at least `(255−cap)/255` of
-/// the glyph's own value — a WHITE counter stays a light grey, near-black ink
-/// stays near-black — so the veil only ever GREYS the surround and the glyph
-/// centre is never fully replaced (the docstring's "never approaching the
-/// near-black ink"). ~50%: half the darken headroom, bounding both veils.
-const FRESH_INK_LIGHT_ALPHA_CAP: f32 = 128.0;
+/// RAISED 128 -> [`LIGHT_INK_ALPHA_CAP`] with the move OFF the glyph. At 128 the
+/// bound was doing two jobs: keeping the mark from burying the letterform, and
+/// keeping it from shouting. The first job is gone — the light pop is now two
+/// bars on the RAIL LINES, wholly inside the inter-line leading, so nothing it
+/// draws composites onto a glyph at all — and at 128 a thin bar behind a radial
+/// falloff was simply too faint to read as a pop. The remaining bound is the
+/// shared light-theme ceiling every other transient obeys, which still keeps a
+/// rail from going fully opaque.
+const FRESH_INK_LIGHT_ALPHA_CAP: f32 = RAINBOW_LIGHT_RAIL_ALPHA_CAP;
 /// The `push_halo_over` PEAK the light veil passes: FULL, so the veil's RADIUS
 /// rides the size spring alone (no per-life radius-shrink) and clears the ≥96
 /// visibility gate for the whole life — the OPACITY fade is carried by the
-/// per-pixel alpha ceiling (`fresh_ink_veil`) instead, mirroring the dark arm.
+/// per-pixel alpha ceiling (`fresh_ink_veil_tinted`) instead, mirroring the dark arm.
 const FRESH_INK_LIGHT_VEIL_PEAK: u8 = 255;
 
 /// The pop's brightness envelope at normalized age `u` (0 birth → 1 settled):
@@ -1279,9 +1726,43 @@ fn fresh_ink_scale(u: f32) -> f32 {
 /// opacity, so the SAME value drives the life-fade AND the legibility bound.
 /// A non-zero `cap` is required (`0` decodes as UNCAPPED); the emit's `>= 1.0`
 /// gate guarantees it. Pinned by `fresh_ink_light_veil_centre_is_capped_for_legibility`.
+/// TINTED [`FRESH_INK_LIGHT_TINT`] of the way toward the DARKENED band hue
+/// `band` — the "saturated ink, not grey smudge" recipe. The high-byte
+/// alpha-ceiling contract is exactly the neutral form's, so the legibility bound
+/// is unchanged; only the straight RGB moves, and it moves toward a colour whose
+/// every channel is at most the slate's plus the band's darkened value — bounded
+/// by the same `over_rgb(glyph, veil, cap)` argument, and pinned across ALL SIX
+/// bands by `fresh_ink_light_veil_centre_is_capped_for_legibility`.
+///
+/// `band` is always one of the six [`RAINBOW_BANDS`] anchors, never a point on
+/// the continuous gradient — see [`is_fresh_ink_veil`] for why that matters.
 #[inline]
-fn fresh_ink_veil(cap: u8) -> u32 {
-    (FRESH_INK_LIGHT_VEIL & 0x00FF_FFFF) | ((cap as u32) << 24)
+fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
+    let ink = lerp_rgb(
+        FRESH_INK_LIGHT_VEIL,
+        light_ink_bold(band),
+        FRESH_INK_LIGHT_TINT,
+    );
+    (ink & 0x00FF_FFFF) | ((cap as u32) << 24)
+}
+
+/// Is `color` one of the SIX straight RGBs [`fresh_ink_veil_tinted`] can
+/// produce?
+///
+/// The neutral slate the light pop shipped as bought one thing the tint would
+/// otherwise cost: the veil was INDEPENDENTLY ASSERTABLE — a filter on the
+/// colour told a fresh-ink pop apart from the wake contrail beside it, for
+/// tests and for a human reading a capture alike. The pop therefore QUANTIZES
+/// its tint to the six [`RAINBOW_BANDS`] anchors rather than sampling the rail's
+/// continuous gradient, so this predicate is exact and the identity survives the
+/// colour. (Quantizing also reads better: six iconic stripes walking under a
+/// typed word is the rainbow, where a continuous blend across three letters is
+/// a smear.)
+#[inline]
+fn is_fresh_ink_veil(color: u32) -> bool {
+    RAINBOW_BANDS
+        .iter()
+        .any(|&b| fresh_ink_veil_tinted(0, b) & 0x00FF_FFFF == color & 0x00FF_FFFF)
 }
 
 /// One comet cell, fading from `born`.
@@ -1421,10 +1902,12 @@ struct Starburst {
     stars: u8,
     /// How many 4-point TWINKLE SPARKLES this burst scatters alongside its
     /// burst stars — the owner's "sparkles aligned with the stars that appear
-    /// when I'm typing in rainbow-kitty mode". ZERO for every discrete-JUMP landing (so
-    /// the shipped jump starburst stays byte-identical), non-zero only for a
-    /// FAST-GLIDE landing. Rendered through `push_twinkle_star` — literally the
-    /// typing starfield's own geometry.
+    /// when I'm typing in rainbow-kitty mode". Non-zero for BOTH landing
+    /// families now: the fast-GLIDE landing it shipped for, and — since
+    /// 2026-08-06 — the discrete JUMP landing too, graduated by distance
+    /// ([`CursorGlow::RAINBOW_BURST_SPARKLES`]). Rendered through
+    /// `push_twinkle_star` on dark and `push_twinkle_over` on light — literally
+    /// the typing starfield's own geometry on both grounds.
     sparkles: u8,
 }
 
@@ -1661,6 +2144,136 @@ impl RainbowState {
 /// starfield's twinkles without becoming a different object (the burst draws
 /// [`push_twinkle_star`], the one star shape).
 const RAINBOW_STAR_R_FRAC: f32 = 0.30;
+
+// ---- THE ERASE POOF's ENERGY -----------------------------------------------
+//
+// Owner, 2026-08-06: bring the delete poof back "with a similar momentum as
+// forward typing and also include some weight for the size of what is deleted".
+// Two independent terms, multiplied:
+//
+//   * MOMENTUM — how hard the delete RUN is going, read from
+//     [`CursorGlow::erase_mom`], the mirror of the canonical typing metric.
+//   * WEIGHT — how much VANISHED, in cells.
+//
+// The old poof had neither: a fixed 4..10 stars whose count crept up by one per
+// two erased columns and saturated at ten, so a lone Backspace and a killed
+// 80-column line threw indistinguishable puffs, and a held delete run looked
+// exactly like a single correction.
+/// Floor of the momentum term. Deliberately high: a delete you make ONCE, cold,
+/// must still be clearly acknowledged — the poof is feedback before it is
+/// choreography. Momentum then carries it the rest of the way.
+const ERASE_MOM_FLOOR: f32 = 0.55;
+/// Ceiling on the WEIGHT term. `sqrt(cells)` grows the burst with what vanished
+/// (1 cell → 1.0, a six-letter word → 2.4, a killed line → this cap) without
+/// letting a full-line kill scale linearly into a screen-filling cloud.
+const ERASE_WEIGHT_CAP: f32 = 3.4;
+/// Sparkles at drive 1.0. Sized so a COLD single-character Backspace (drive =
+/// [`ERASE_MOM_FLOOR`]) still throws the ~6 the shipping poof always did — the
+/// energy law must make deletes MORE expressive, never quietly thin out the
+/// most common one — while a hot word kill lands near 27 and a hot line kill
+/// hits [`ERASE_POOF_CAP`].
+const ERASE_POOF_STARS: f32 = 11.0;
+/// Hard ceiling on one poof's sparkle count, well under `MAX_PARTICLES` so a
+/// held Ctrl-U mash can never crowd out the rest of the family.
+const ERASE_POOF_CAP: usize = 26;
+/// How wide, in CELLS, one poof's debris may spread — regardless of how long
+/// the erased span was.
+///
+/// A killed 60-column line spread evenly over its own span is a DOTTED RULE
+/// across the window, which is what a white-ground capture showed: sixty pale
+/// specks in a neat row, reading as a horizontal line rather than as something
+/// vanishing. The span still sets the poof's ENERGY (via [`erase_weight`]); it
+/// no longer sets its geometry. Debris clusters at the collapse point — the
+/// span's start, where the caret ends up — and thins outward.
+const ERASE_POOF_SPREAD_CELLS: f32 = 9.0;
+/// How much headroom above the erased row the debris needs before it is allowed
+/// to rise. Inside this, the poof falls instead — see `spawn_erase_sparkles`.
+const ERASE_POOF_LIFT_CELLS: f32 = 1.2;
+/// The HERO grain's `cov_scale` band, reserved at the top of the GLITTER
+/// sentinel range (`< 0.9`): `MIN` at a single character, `MIN + SPAN` at a
+/// killed line. `emit_particles` decodes it back into a size multiplier, so the
+/// poof's central pop grows with the weight of what vanished while every other
+/// grain keeps the plain glitter size.
+const ERASE_HERO_SCALE_MIN: f32 = 0.80;
+const ERASE_HERO_SCALE_SPAN: f32 = 0.09;
+/// Size multiplier the hero grain is drawn at, from a single character to a
+/// killed line.
+const ERASE_HERO_ARM_MIN: f32 = 2.0;
+const ERASE_HERO_ARM_MAX: f32 = 3.2;
+
+/// Decode a particle's `cov_scale` into the hero size multiplier: `1.0` for an
+/// ordinary glitter grain, [`ERASE_HERO_ARM_MIN`]..=[`ERASE_HERO_ARM_MAX`] for
+/// the reserved hero band. One function so the encode site and `emit_particles`
+/// cannot drift.
+#[inline]
+fn erase_hero_arm(cov_scale: f32) -> f32 {
+    if cov_scale < ERASE_HERO_SCALE_MIN {
+        return 1.0;
+    }
+    let heft = ((cov_scale - ERASE_HERO_SCALE_MIN) / ERASE_HERO_SCALE_SPAN).clamp(0.0, 1.0);
+    ERASE_HERO_ARM_MIN + (ERASE_HERO_ARM_MAX - ERASE_HERO_ARM_MIN) * heft
+}
+
+/// The WEIGHT term: how big the vanished span reads, in
+/// `1.0..=`[`ERASE_WEIGHT_CAP`]. Monotone non-decreasing in `cells` (pinned by
+/// `erase_poof_drive_grows_with_momentum_and_weight`).
+#[inline]
+fn erase_weight(cells: u16) -> f32 {
+    f32::from(cells.max(1)).sqrt().min(ERASE_WEIGHT_CAP)
+}
+
+/// The poof's ENERGY: the momentum term (floored at [`ERASE_MOM_FLOOR`]) times
+/// the [`erase_weight`] of what vanished. Monotone non-decreasing in BOTH
+/// arguments, which is the whole contract — a faster run poofs harder, and a
+/// bigger erase poofs harder, independently.
+#[inline]
+fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
+    (ERASE_MOM_FLOOR + (1.0 - ERASE_MOM_FLOOR) * mom.clamp(0.0, 1.0)) * erase_weight(cells)
+}
+
+// ---- THE METEOR NUCLEUS ----------------------------------------------------
+//
+// The bright head the ZOOM streak never had. See the emit site in
+// `emit_rainbow_jumps` for why it is a halo rather than a quad.
+/// The nucleus hue: the same WHITE-HOT the shooting-star head and the twinkle
+/// kit use, so the meteor's core is the family's white and not a seventh
+/// colour. On light themes the emit inverts it to a saturated ink core instead.
+const RAINBOW_METEOR_CORE: u32 = 0x00FF_FFFF;
+/// Peak nucleus coverage before the fade / intensity scaling. Rides the same
+/// [`RAINBOW_TRANSIENT_COV_CAP`] band as the rest of the jump payload — a jump
+/// is a rare, sub-second, deliberate gesture, the class this budget is for.
+const RAINBOW_METEOR_NUCLEUS_COV: f32 = RAINBOW_TRANSIENT_COV_CAP;
+/// Nucleus radius as a multiple of the streak's total band thickness: a core
+/// clearly FATTER than the ribbon behind it, which is what makes it read as a
+/// head rather than as the tail's last segment.
+const RAINBOW_METEOR_NUCLEUS_R: f32 = 0.62;
+/// The COMA around the core — how much wider, and what share of the core's
+/// coverage. Wide and dim: the soft glow that separates a burning body from a
+/// bright dot.
+const RAINBOW_METEOR_COMA_R: f32 = 2.4;
+const RAINBOW_METEOR_COMA_GAIN: f32 = 0.34;
+
+// ---- THE LANDING FLASH -----------------------------------------------------
+/// Share of the starburst's life the impact bloom occupies. Well under 1 so the
+/// flash is provably OVER while the stars are still scattering — the landing
+/// must read as one event with a cause, not as two marks fading together.
+const RAINBOW_LAND_FLASH_SPAN: f32 = 0.42;
+/// The flash's share of [`RAINBOW_TRANSIENT_COV_CAP`] at touchdown. Kept
+/// meaningfully under 1: this is the ONE layer of the landing that covers the
+/// cell the cursor actually arrived on, so it is the one that has to stay off
+/// the glyph's back.
+const RAINBOW_LAND_FLASH_GAIN: f32 = 0.55;
+/// How many star-radii the bloom grows to over its span.
+const RAINBOW_LAND_FLASH_GROW: f32 = 3.6;
+/// How flat the LIGHT arm's impact bloom is. Source-over ink cannot afford a
+/// round disc on the landing cell — see the emit site — so on white the bloom
+/// is squashed into the leading and spreads sideways instead.
+const RAINBOW_LAND_FLASH_LIGHT_SQUASH: f32 = 0.30;
+/// How much larger a landing star is drawn on LIGHT than on dark. Additive
+/// light buys presence with per-pixel coverage; source-over ink has to buy it
+/// with AREA, so the same radius that reads as a star on black reads as a
+/// speck on white.
+const RAINBOW_LAND_STAR_LIGHT_SCALE: f32 = 1.55;
 
 /// One FIRE METEOR — the fire style's inter-line / long-jump streak: a
 /// straight pixel-space line of fire drawn ALONG the true jump vector, whose
@@ -2035,6 +2648,26 @@ pub struct CursorGlow {
     /// cursor cat, so the delete burst fires whether or not the cat is flying
     /// (the cat's tongue-out "oops" layers on top when it happens to be present).
     bs_poof_hint: Option<Instant>,
+    /// The cursor row's FILL as it stood when that Backspace key arrived —
+    /// `(row, fill)`, stamped by [`Self::note_backspace`] from whatever probe
+    /// the host had last handed over.
+    ///
+    /// WHY A STAMP AND NOT THE LIVE DIFF. `poof_scan`'s span branch proves an
+    /// erasure by diffing the PREVIOUS presented row against this frame's. That
+    /// works while frames are flowing, and only while frames are flowing: the
+    /// host probes the row as part of composing, so on a QUIET screen the first
+    /// probe a lone Backspace ever produces is already the POST-erase row, and
+    /// every diff from then on is post-vs-post — provably equal, forever. The
+    /// plain-Backspace fallback demanded that same proof, so a correction typed
+    /// after a pause could never poof, while a held delete run (whose own
+    /// particles keep the frame train alive, so a real baseline exists) always
+    /// did. That asymmetry is exactly the reported "the delete poof is gone for
+    /// characters".
+    ///
+    /// `None` means the host had nothing to give at the key — which is NOT
+    /// evidence that nothing was erased, and the fallback treats it that way
+    /// (see `poof_scan`).
+    bs_baseline: Option<(u16, u16)>,
     /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]): the host saw
     /// the attached app's DECTCEM-hide-inside-DEC-2026 repaint bracket (the
     /// terminal's `repaint_blink_epoch` advanced — Claude Code wraps EVERY
@@ -2053,6 +2686,22 @@ pub struct CursorGlow {
     /// When the last erase poof fired — the rate limiter ([`Self::POOF_MIN_GAP`])
     /// so a held kill-key repeat billows at a readable cadence, not per frame.
     last_poof: Option<Instant>,
+    /// ERASE MOMENTUM — the mirror of the canonical typing metric, for the
+    /// gesture going the other way (owner, 2026-08-06: bring the delete poof
+    /// back "with a similar momentum as forward typing").
+    ///
+    /// The SAME law, deliberately: a [`TypingMomentum`] instance, the same
+    /// rate-normalized accrual, the same 2 s decay. Only the gesture that feeds
+    /// it differs — every erase edge ([`Self::note_backspace`],
+    /// [`Self::note_kill`]) credits it, and nothing else can. So a held
+    /// backspace run builds exactly the way a typing run builds, one erase at a
+    /// time, and a single correction mid-sentence stays a single small puff.
+    ///
+    /// It does NOT touch [`RainbowState::momentum`]: forward momentum still
+    /// only builds from forward typing and still DRAINS on a delete (the
+    /// erase-never-builds law is untouched). This is a second, independent
+    /// metric that exists so the delete gesture has a speedometer of its own.
+    erase_mom: TypingMomentum,
     /// SOUND CUES recorded at the spawn/poof edges this frame — the aural
     /// twin of the visual spawns, drained by the host each tick
     /// ([`Self::drain_sound_cues`]) and fed to the trail synth
@@ -2378,6 +3027,12 @@ impl CursorGlow {
     const RAINBOW_TERMINUS_RIBBON_WINDOW: f32 = 2.5;
     /// Most simultaneous live jump streaks (oldest evicted first).
     const RAINBOW_JUMP_CAP: usize = 4;
+    /// Ceiling on the METEOR's shed sparks per fling (see `push_jump_streak`).
+    /// A screen-crossing Ctrl-A at 80 columns would otherwise strew 44 grains
+    /// in one frame and a mash would strew four times that; 14 is enough to
+    /// read as a burning trail and leaves the shared `MAX_PARTICLES` budget to
+    /// the landing burst that follows immediately behind it.
+    const METEOR_SPARK_CAP: usize = 14;
     // ---- FAST-GLIDE rainbow shooting star (velocity-triggered) --------------
     /// EMA attack coefficient for [`GlideState::vel`] on each observed move: a
     /// couple of consecutive fast frames ramp the spine toward the true speed.
@@ -2443,10 +3098,21 @@ impl CursorGlow {
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
     /// scanline rows × ≤2 spans, capped by [`Self::MAX_QUADS`]).
-    const RAINBOW_BURST_STARS: usize = 10;
+    /// RAISED 10 → 18 (owner: "an even bigger brighter landing").
+    const RAINBOW_BURST_STARS: usize = 18;
     /// Starburst life (seconds): a brisk celebratory bloom-and-fade, in the same
-    /// register as the ZOOM streak's `0.18..0.52` so the two read as one event.
-    const RAINBOW_BURST_LIFE: f32 = 0.55;
+    /// register as the ZOOM streak's `0.26..0.78` so the two read as one event.
+    /// Lengthened with the streak it lands from, and for the same reason — the
+    /// two must resolve together or the landing pops before the meteor arrives.
+    const RAINBOW_BURST_LIFE: f32 = 0.72;
+    /// The landing's own TWINKLE SPARKLES — [`Starburst::sparkles`] for a
+    /// discrete JUMP landing, graduated by distance exactly as the colour stars
+    /// are. Was hard-zero: only a fast-GLIDE landing sparkled, so a Ctrl-A/E
+    /// fling — the gesture most likely to be watched — landed with colour stars
+    /// and none of the white/gold twinkle the cursor trail scatters while you
+    /// type. Owner: the landing should include "same sparkles that appear in
+    /// the cursor trail".
+    const RAINBOW_BURST_SPARKLES: usize = 9;
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
@@ -3138,6 +3804,10 @@ impl CursorGlow {
         // ([`crate::typing_momentum`]). Stamped at the KEY, not the echo, so
         // an echo the shell swallows (start-of-line) still un-earns.
         self.rainbow.momentum.delete(now);
+        // …and the MIRROR metric builds, on the same law, from the same edge:
+        // one erase is one advance of [`Self::erase_mom`]. Momentum going
+        // forward and momentum going backward are now measured identically.
+        self.erase_mom.advance(now);
         self.quench_hint = Some(now);
         // EVERY Backspace licenses the erase POOF (cat-independent). A dedicated
         // hint — not `kill_hint` — so it never borrows the kill hint's
@@ -3146,6 +3816,13 @@ impl CursorGlow {
         // saturated sparkle on light). Rate-limited by `POOF_MIN_GAP`, so a
         // held-repeat Backspace puffs at a readable cadence, not per frame.
         self.bs_poof_hint = Some(now);
+        // Stamp the PRE-erase row fill while it is still the pre-erase row (see
+        // [`Self::bs_baseline`]). `row_cur_meta` is the probe from this frame if
+        // one has landed; otherwise `row_prev_meta` is the last presented truth.
+        self.bs_baseline = self
+            .row_cur_meta
+            .or(self.row_prev_meta)
+            .map(|m| (m.row, m.fill));
     }
 
     /// HOST KEY-HINT: a NAVIGATION keypress (Ctrl-A/Ctrl-E, Home/End, arrow
@@ -3281,9 +3958,23 @@ impl CursorGlow {
         // Canonical metric: a span erased un-earns like ~two deletes (the
         // same escalation the quench above documents) — and never builds.
         self.rainbow.momentum.kill(now);
+        // The MIRROR metric builds — and a span kill is a bigger gesture than a
+        // character, so it credits TWICE, exactly the escalation the forward
+        // metric spends on a kill. One `advance` per erase keeps the two laws
+        // symmetric; the second is the span's extra weight.
+        self.erase_mom.advance(now);
+        self.erase_mom.advance(now);
         if moves_cursor {
             self.nav_hint = Some(now);
         }
+    }
+
+    /// The ERASE-momentum mirror of [`Self::typing_momentum`] at `now` — how
+    /// hard a delete run is going, on the identical law. Drives the poof's
+    /// energy (see `erase_poof_drive`); exposed so hosts/tests can observe it.
+    #[must_use]
+    pub fn erase_momentum(&self, now: Instant) -> f32 {
+        self.erase_mom.value(now)
     }
 
     /// THE canonical typing-momentum metric at `now`
@@ -3429,13 +4120,15 @@ impl CursorGlow {
             }
             None => false,
         });
-        self.rainbow.ink_pops.retain_mut(|p| match p.row.checked_sub(rows) {
-            Some(r) => {
-                p.row = r;
-                true
-            }
-            None => false,
-        });
+        self.rainbow
+            .ink_pops
+            .retain_mut(|p| match p.row.checked_sub(rows) {
+                Some(r) => {
+                    p.row = r;
+                    true
+                }
+                None => false,
+            });
     }
 
     /// PER-FRAME ROW PROBE: hand the engine the cursor row's content as
@@ -3660,7 +4353,29 @@ impl CursorGlow {
     pub fn is_active(&self) -> bool {
         self.has_live_motion()
             || self.cursor_temp > Self::FORGE_MIN_TEMP
-            || self.kill_hint.is_some()
+            || self.poof_hint_pending().is_some()
+    }
+
+    /// THE PENDING POOF LICENCE — the earlier of the two hints that can still
+    /// fire an erase poof ([`Self::kill_hint`], [`Self::bs_poof_hint`]).
+    ///
+    /// WHY THIS EXISTS. `poof_scan` treats the two hints identically — it ORs
+    /// them into one `fresh_kill` gate — but the two SCHEDULING seams
+    /// ([`Self::is_active`] and [`Self::next_change_deadline`]) named
+    /// `kill_hint` alone. A kill chord therefore kept the engine awake long
+    /// enough for the row probe to witness the shrink, while a plain Backspace
+    /// did not: from a QUIET screen the host had no reason to tick, no probe
+    /// ever arrived, and the hint expired unconsumed. The poof was intact and
+    /// unreachable — which is why deleting single characters looked like it had
+    /// lost its sparkle while a held delete run (whose own particles keep the
+    /// frame train alive) still puffed.
+    ///
+    /// One accessor, so a third licence cannot repeat the omission.
+    fn poof_hint_pending(&self) -> Option<Instant> {
+        match (self.kill_hint, self.bs_poof_hint) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Whether any MOVING light is alive (everything is_active tracks EXCEPT
@@ -3721,11 +4436,14 @@ impl CursorGlow {
         // this engine decision identical to the host scheduler's phase-lock gate.
         if self.needs_frame_cadence() {
             Some(now + frame_interval)
-        } else if let Some(t) = self.kill_hint {
+        } else if let Some(t) = self.poof_hint_pending() {
             // The FIRST wake lands exactly as the fallback's grace opens (the
             // `>=` admits a tick at hint+grace), then the coarse poll takes
             // over — the poof fires at the caret's position AT grace-open,
             // narrowing the moved-caret race a flat 40 ms cadence would allow.
+            // EITHER licence paces this: a plain Backspace from a quiet screen
+            // needs the wake just as much as a kill chord does (see
+            // [`Self::poof_hint_pending`]).
             let grace_open = t + Duration::from_secs_f32(Self::POOF_FALLBACK_GRACE);
             Some(grace_open.max(now).min(now + Self::KILL_HINT_POLL_INTERVAL))
         } else if !self.vapor.is_empty() || self.cursor_temp > Self::FORGE_MIN_TEMP {
@@ -3777,6 +4495,7 @@ impl CursorGlow {
         self.reflow_hint = None;
         self.return_hint = None;
         self.bs_poof_hint = None;
+        self.bs_baseline = None;
         self.last_poof = None;
         self.row_cur.clear();
         self.row_prev.clear();
@@ -3802,6 +4521,11 @@ impl CursorGlow {
         self.cursor_temp = 0.0;
         self.flame_phase = 0.0;
         self.rainbow.clear_thermals();
+        // The ERASE metric is a thermal integrator like the rest: it belongs in
+        // the full-dark wipe and NOT in the zero-amplitude path, for exactly
+        // the reason the doc above gives — a focus blip must only cool it by
+        // the elapsed gap, which the lazy decay already does.
+        self.erase_mom.reset();
         self.last_type = None;
     }
 
@@ -4167,9 +4891,8 @@ impl CursorGlow {
         // Decay everything to EXACTLY empty. Each spark fades on its OWN lifetime
         // (short for typing, full for jumps), so a fast typing wake never lingers
         // as a smear behind the cursor.
-        self.sparks
-            .retain(|s| {
-                now.saturating_duration_since(s.born).as_secs_f32() < s.life
+        self.sparks.retain(|s| {
+            now.saturating_duration_since(s.born).as_secs_f32() < s.life
                     // …and a retracted cell is reaped only once its fade-out has
                     // actually finished, so the swoosh's drain never removes light
                     // that is still on screen.
@@ -4177,7 +4900,7 @@ impl CursorGlow {
                         now.saturating_duration_since(at).as_secs_f32()
                             >= Self::RAINBOW_RETRACT_FADE
                     })
-            });
+        });
         let spark_cap = if matches!(cfg.style, GlowStyle::RainbowKitty) {
             Self::RAINBOW_MAX_CELLS
         } else {
@@ -4431,6 +5154,10 @@ impl CursorGlow {
             // GlowQuad budget to consult (halo-only, bounded by the ring cap;
             // the shared MAX_HALOS truncation covers it).
             self.emit_fresh_ink(now, cfg, geom, &mut halos);
+            // …and the GLYPH TINT beside it: the same pops, expressed in the
+            // letterform itself rather than in light around it. Disjoint
+            // streams (`char_fg` vs `glow_halo`), so neither bounds the other.
+            self.emit_fresh_ink_glyphs(now, cfg, &mut charred);
             // …and the TYPING WAKE beside it: the continuous plume in the
             // LEADING under the typed row. The two are geometrically disjoint —
             // the pop above is the bounded highlight ON the letter, this is the
@@ -6114,32 +6841,29 @@ impl CursorGlow {
             // backspaces lay a train of poofs chasing the cursor leftward.
             // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-rainbow kitty styles
             // fall through to the comet path, so their deletion read is unchanged.
+            //
+            // ONE POOF, ONE LAW: this echo path used to hand-roll its own
+            // 6-10 omnidirectional cloud while the span detector
+            // ([`Self::spawn_poof`]) rolled a different 4-10 leftward one, so
+            // the same Backspace looked like two different gestures depending
+            // on which detector answered. Both now call
+            // [`Self::spawn_erase_sparkles`], which carries the momentum ×
+            // weight energy law. The echo knows exactly one vacated cell, so
+            // its span is that cell and its weight is 1 — the floor of the same
+            // law the line kill tops out on.
             let cell = geom.ch as f32;
+            let cwf = geom.cw as f32;
             let (ox, oy) = geom.cell_center(cr, cc);
-            let poofs = 6 + (self.frand() * 5.0) as usize; // 6-10
-            for _ in 0..poofs {
-                if self.particles.len() >= Self::MAX_PARTICLES {
-                    break;
-                }
-                let r0 = self.frand();
-                let r1 = self.frand();
-                let r2 = self.frand();
-                let r3 = self.frand();
-                let r4 = self.frand();
-                let ang = r0 * std::f32::consts::TAU;
-                let speed = (0.4 + r1 * 0.9) * cell; // gentle omnidirectional puff
-                self.particles.push(Particle {
-                    x0: ox + (r2 - 0.5) * geom.cw as f32 * 0.5,
-                    y0: oy + (r3 - 0.5) * cell * 0.4,
-                    vx: ang.cos() * speed,
-                    vy: ang.sin() * speed - 0.6 * cell, // slight UPWARD bias
-                    gy: 1.1 * cell,                     // gentle gravity settles the cloud
-                    life: 0.3 + r4 * 0.3,               // short-lived (0.3-0.6s)
-                    hue: r0,                            // sparkle tint + twinkle seed
-                    cov_scale: 0.7,                     // dimmer + GLITTER draw sentinel
-                    born: now,
-                });
-            }
+            self.spawn_erase_sparkles(
+                ox - cwf * 0.5,
+                cwf,
+                oy,
+                f32::from(geom.origin_y),
+                cell,
+                cwf,
+                1,
+                now,
+            );
         } else {
             // Comet path: swept cells from origin toward the destination.
             let cap = if matches!(cfg.style, GlowStyle::RainbowKitty) {
@@ -7745,6 +8469,7 @@ impl CursorGlow {
             .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > Self::KILL_HINT_FRESH)
         {
             self.bs_poof_hint = None;
+            self.bs_baseline = None;
         }
         // A poof is licensed by EITHER a kill chord (`kill_hint`) OR a plain
         // Backspace (`bs_poof_hint`): both mean "text is vanishing, puff the
@@ -7825,6 +8550,7 @@ impl CursorGlow {
                 self.last_poof = Some(now);
                 self.kill_hint = None;
                 self.bs_poof_hint = None;
+                self.bs_baseline = None;
                 poofed = true;
             }
         }
@@ -7852,19 +8578,35 @@ impl CursorGlow {
         // still reads as honest feedback" (the reflowing-TUI case the fallback
         // exists for). But an ordinary Backspace at column 0 / on an empty row
         // erases NO cell, so when the ONLY licensing hint is `bs_poof_hint`
-        // (kill hint absent) we demand the SAME real-shrink evidence the span
-        // branch above proves — `cur.fill < prev.fill` on the same row. A no-op
-        // Backspace (and its autorepeat at the left margin) thus stays silent
-        // instead of puffing over text it never touched.
+        // (kill hint absent) we demand real-shrink evidence.
+        //
+        // TWO WITNESSES, because one of them is blind exactly when it matters.
+        // `erasure_proven` is the live frame-to-frame diff; it only exists while
+        // frames are flowing, and a lone correction after a pause is by
+        // definition the case where they are not (see [`Self::bs_baseline`]).
+        // `bs_erased` asks the same question against the row stamped AT THE KEY,
+        // which is the only observation that predates the erase in that case.
         let bs_only = self.kill_hint.is_none();
         let erasure_proven = self
             .row_prev_meta
             .zip(self.row_cur_meta)
             .is_some_and(|(prev, cur)| prev.row == cur.row && cur.fill < prev.fill);
+        // …and the same question asked against the row as it stood AT THE KEY
+        // ([`Self::bs_baseline`]), which survives the frame gap the live diff
+        // cannot. With no baseline stamped the host simply was not composing,
+        // so "no shrink observed" proves nothing; fall back to the honest
+        // weaker witness — the caret is off column 0, so a Backspace here COULD
+        // have erased. A no-op Backspace at the left margin (and its autorepeat
+        // there) still stays silent, which is the case this gate exists for.
+        let bs_erased = match (self.bs_baseline, self.row_cur_meta) {
+            (Some((brow, bfill)), Some(cur)) => cur.row == brow && cur.fill < bfill,
+            (None, Some(cur)) => cur.caret > 0,
+            _ => false,
+        };
         if fresh_kill
             && gap_ok
             && !poofed
-            && (!bs_only || erasure_proven)
+            && (!bs_only || erasure_proven || bs_erased)
             && poof_hint_at.is_some_and(|t| {
                 now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
             })
@@ -7875,6 +8617,7 @@ impl CursorGlow {
             self.last_poof = Some(now);
             self.kill_hint = None;
             self.bs_poof_hint = None;
+            self.bs_baseline = None;
         }
         // Rotate unconditionally — but only when a FRESH probe arrived this
         // frame; an unprobed frame (scrolled back, split pane unwired) keeps
@@ -7947,61 +8690,16 @@ impl CursorGlow {
         }
         match cfg.style {
             GlowStyle::RainbowKitty | GlowStyle::Sparkle => {
-                // Star-power sparkles across the vanished span — the exact
-                // particle family the rainbow kitty momentum stars use (fly up and back,
-                // arc down under light gravity, twinkle on the hue seed);
-                // Sparkle's `_` colour arm renders the same burst white-cored
-                // rainbow. Count scales gently with the span, on a floor of 4 so
-                // a single-cell delete throws a real handful, not a pair.
-                let stars = (4 + (n as usize) / 2).min(10);
-                for k in 0..stars {
-                    if self.particles.len() >= Self::MAX_PARTICLES {
-                        break;
-                    }
-                    let r0 = self.frand();
-                    let r1 = self.frand();
-                    let r2 = self.frand();
-                    let r3 = self.frand();
-                    let r4 = self.frand();
-                    self.particles.push(Particle {
-                        x0: span_x0 + ((k as f32 + 0.5) / stars as f32) * span_w + (r0 - 0.5) * cwf,
-                        y0: oy + (r1 - 0.5) * cell * 0.6,
-                        vx: -(0.4 + r2 * 1.3) * cell,
-                        vy: -(0.3 + r3 * 1.1) * cell,
-                        gy: 0.9 * cell,
-                        life: 0.5 + r4 * 0.7,
-                        hue: r0, // twinkle seed
-                        // GLITTER sentinel (`cov_scale < 0.9`): the delete poof is
-                        // a DELETION gesture, not the momentum shower, so it keeps
-                        // FULL brightness regardless of typing momentum (the
-                        // `emit_particles` glitter arm pins `mom = 1.0`). Plain
-                        // twinkle stars would take `rainbow_star_momentum(rainbow.disp)`
-                        // instead and go barely-there on a cold delete.
-                        cov_scale: 0.7,
-                        born: now,
-                    });
-                }
-                // ONE bright white-cored central POP flash at the erased cell —
-                // an unmistakable spark at the exact vanished glyph so even a
-                // lone Backspace on dark reads immediately. Near-stationary
-                // (pops in place, tiny drift), short life, `hue < 0.4` so the
-                // glitter arm tints it pure white; momentum-independent like the
-                // sparkles above.
-                if self.particles.len() < Self::MAX_PARTICLES {
-                    let r0 = self.frand();
-                    let r1 = self.frand();
-                    self.particles.push(Particle {
-                        x0: span_x0 + span_w * 0.5,
-                        y0: oy - 0.1 * cell,
-                        vx: (r0 - 0.5) * 0.3 * cell,
-                        vy: -(0.2 + r1 * 0.3) * cell,
-                        gy: 0.6 * cell,
-                        life: 0.34,
-                        hue: 0.2, // < 0.4 → white glitter core
-                        cov_scale: 0.7,
-                        born: now,
-                    });
-                }
+                self.spawn_erase_sparkles(
+                    span_x0,
+                    span_w,
+                    oy,
+                    f32::from(geom.origin_y),
+                    cell,
+                    cwf,
+                    n,
+                    now,
+                );
             }
             GlowStyle::Water | GlowStyle::Comet => {
                 // WATER: droplets spray up out of the span and fall under real
@@ -8072,6 +8770,135 @@ impl CursorGlow {
         }
     }
 
+    /// THE ERASE SPARKLE POOF — ONE implementation, both entry points.
+    ///
+    /// The rainbow kitty / Sparkle language for "text went away": a scatter of
+    /// GLITTER twinkles off the vanished span plus one bright white-cored pop at
+    /// its centre. Called by the span detector ([`Self::spawn_poof`], which
+    /// knows the exact erased range) AND by the deletion ECHO in
+    /// [`Self::spawn`] (which sees one vacated cell as the caret steps left).
+    /// They used to be two hand-written particle loops that had drifted apart —
+    /// different counts, different ballistics, only one of them with a pop — so
+    /// a single Backspace looked like a different gesture depending on which
+    /// detector happened to answer first.
+    ///
+    /// ENERGY is [`erase_poof_drive`]: momentum × weight. It sets the star
+    /// COUNT, the launch SPEED, and the LIFE, so "deleting fast" and "deleting a
+    /// lot" both read immediately and independently.
+    ///
+    /// BALLISTICS mirror the typing wake. Erasing walks the caret LEFT, so the
+    /// debris streams RIGHT — behind the direction of travel, exactly as the
+    /// typing plume streams left behind a caret walking right. That is the
+    /// "similar momentum as forward typing" the owner asked for: the same
+    /// physical read, pointed the other way.
+    ///
+    /// Bounded by [`ERASE_POOF_CAP`] and the shared `MAX_PARTICLES` ceiling.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "span + geometry scalars + clock; the two internal call sites are the two erase detectors"
+    )]
+    fn spawn_erase_sparkles(
+        &mut self,
+        span_x0: f32,
+        span_w: f32,
+        oy: f32,
+        top: f32,
+        cell: f32,
+        cwf: f32,
+        n: u16,
+        now: Instant,
+    ) {
+        let mom = self.erase_mom.value(now);
+        let drive = erase_poof_drive(mom, n);
+        // UP, UNLESS THERE IS NO UP. The debris rises; on the FIRST grid row
+        // there is nowhere to rise to, so a third of every poof was thrown
+        // past the top of the viewport and clipped mid-sparkle — a half-effect
+        // for anyone deleting on line one, which is where a shell prompt lives.
+        // Flip the bias downward when the row cannot afford the lift.
+        let lift = if oy - top < cell * ERASE_POOF_LIFT_CELLS {
+            -1.0
+        } else {
+            1.0
+        };
+        let stars = ((ERASE_POOF_STARS * drive) as usize).clamp(4, ERASE_POOF_CAP);
+        // Speed rides the RUN, size rides the SPAN: a fast correction flicks,
+        // a killed line heaves.
+        let speed = 0.55 + 0.85 * mom.clamp(0.0, 1.0);
+        let heft = erase_weight(n) / ERASE_WEIGHT_CAP; // 0..1
+        // The debris CLUSTERS at the collapse point (see
+        // [`ERASE_POOF_SPREAD_CELLS`]): `f²` biases it toward the span's start
+        // and the width is capped, so a line kill is a burst where the line went
+        // rather than a dotted rule where the line was.
+        let spread_w = span_w.min(cwf * ERASE_POOF_SPREAD_CELLS);
+        for k in 0..stars {
+            if self.particles.len() >= Self::MAX_PARTICLES {
+                break;
+            }
+            let r0 = self.frand();
+            let r1 = self.frand();
+            let r2 = self.frand();
+            let r3 = self.frand();
+            let r4 = self.frand();
+            let f = (k as f32 + 0.5) / stars as f32;
+            self.particles.push(Particle {
+                x0: span_x0 + spread_w * f * f + (r0 - 0.5) * cwf,
+                // A heavier erase has more VOLUME, not just more grains.
+                y0: oy + (r1 - 0.5) * cell * (0.6 + 0.9 * heft),
+                // RIGHTWARD — trailing the leftward-walking caret (see the doc).
+                vx: (0.35 + r2 * 1.25) * cell * speed,
+                vy: -lift * (0.3 + r3 * 1.1) * cell * speed,
+                // Gravity is DOWN regardless of which way the debris was
+                // thrown: multiplying it by `lift` made a downward poof
+                // accelerate back UP and off the top of the viewport, which is
+                // the clipping a white-ground review kept seeing on row 0.
+                gy: 0.9 * cell,
+                life: (0.42 + r4 * 0.55) * (0.85 + 0.45 * heft),
+                hue: r0, // twinkle seed
+                // GLITTER sentinel (`cov_scale < 0.9`): the delete poof is
+                // a DELETION gesture, not the momentum shower, so it keeps
+                // FULL brightness regardless of TYPING momentum (the
+                // `emit_particles` glitter arm pins `mom = 1.0`). Plain
+                // twinkle stars would take `rainbow_star_momentum(rainbow.disp)`
+                // instead and go barely-there on a cold delete.
+                cov_scale: 0.7,
+                born: now,
+            });
+        }
+        // ONE bright white-cored central POP flash at the erased span — an
+        // unmistakable spark at the exact vanished glyphs so even a lone
+        // Backspace reads immediately. Near-stationary (pops in place, tiny
+        // drift), short life, `hue < 0.4` so the glitter arm tints it pure
+        // white; TYPING-momentum-independent like the sparkles above, but its
+        // life carries the span's heft so a line kill's pop lingers.
+        if self.particles.len() < Self::MAX_PARTICLES {
+            let r0 = self.frand();
+            let r1 = self.frand();
+            self.particles.push(Particle {
+                x0: span_x0 + span_w * 0.5,
+                y0: oy - 0.1 * cell,
+                vx: (r0 - 0.5) * 0.3 * cell,
+                vy: -lift * (0.2 + r1 * 0.3) * cell,
+                gy: 0.6 * cell,
+                life: 0.30 + 0.26 * heft,
+                // `< 0.4` still selects the WHITE core on dark; on light the
+                // same seed becomes `hsv2rgb(hue, 0.9, 1.0)`, and at 0.2 that is
+                // a yellow-green that `light_ink` turns into the "muddy olive
+                // smudge" a white-ground review put at the centre of the poof.
+                // Red reads as a spark on both grounds.
+                hue: 0.02,
+                // THE HERO. Still inside the GLITTER band (`< 0.9`), but in the
+                // reserved top of it: `emit_particles` reads 0.80..=0.89 as
+                // "draw this one BIG", scaled by the heft encoded in the
+                // fraction. A poof whose grains are all one size cannot say how
+                // much vanished — a white-ground review put it exactly that
+                // way, "a 1-char delete and a 5-char delete would look
+                // identical". This is the one grain that does.
+                cov_scale: ERASE_HERO_SCALE_MIN + ERASE_HERO_SCALE_SPAN * heft,
+                born: now,
+            });
+        }
+    }
+
     /// The neutral-grey SMOKE POOF puffs: the hot-cursor smoke's buoyant
     /// motion with a SHORT life — a puff, not a chimney. A one-char kill is a
     /// single wisp; a whole-line kill a real few-puff billow. The default
@@ -8092,7 +8919,11 @@ impl CursorGlow {
         n: u16,
         now: Instant,
     ) {
-        let puffs = ((1.0 + f32::from(n).sqrt()) as usize).clamp(1, 5);
+        // WEIGHT, on the same law the sparkles use: a killed line billows where
+        // a single character wisps. The old `clamp(1, 5)` saturated at nine
+        // erased columns, so on a white ground — where these grey puffs ARE the
+        // poof's body — a word kill and a line kill were the same puff.
+        let puffs = ((1.0 + f32::from(n).sqrt() * 1.4) as usize).clamp(1, 8);
         for k in 0..puffs {
             if self.vapor.len() >= Self::MAX_VAPOR {
                 break;
@@ -9692,11 +10523,81 @@ impl CursorGlow {
             // A longer swoosh for a longer jump — still brisk (visual review: a
             // lingering streak reads as a selection highlight, not speed), but long
             // enough that the ZOOM registers before it's gone.
-            life: (0.18 + 0.009 * dist).clamp(0.18, 0.52),
+            // LENGTHENED (owner: the streak "needs to look more like a rainbow
+            // meteor"): a meteor is READ, not glimpsed. At the old 0.18-0.52 s a
+            // screen-crossing fling was gone in about a quarter of a second,
+            // which is why it registered as a flicker rather than a body with a
+            // direction. Still capped under a second, so it can never be
+            // mistaken for a selection highlight.
+            life: (0.26 + 0.014 * dist).clamp(0.26, 0.78),
             // The fling's fatness rides the EASED momentum you HAD (a leap from a
             // hot run throws a fat rainbow), not the raw last keystroke.
             mom: self.rainbow.disp,
         });
+        // THE METEOR'S SHED SPARKS — "including [the] same sparkles that appear
+        // in the cursor trail". A meteor is a nucleus, a tail, AND the grains
+        // burning off it; the ZOOM had only the first two, which is most of why
+        // it read as a drawn rule. These are literally the trail's own glitter
+        // particles (the `cov_scale < 0.9` sentinel, drawn as the 4-point
+        // twinkle on dark and via `push_twinkle_over` on light), strewn along
+        // the flight path and drifting BACKWARD off it.
+        //
+        // Bounded four ways: a count that grows with distance but caps at
+        // [`Self::METEOR_SPARK_CAP`], the shared `MAX_PARTICLES` ceiling,
+        // the reduced-motion opt-out (these drift, tumble and pulse; that arm
+        // has no way to render them still — the same argument
+        // `scatter_rainbow_terminus` makes), and an ACTIVITY WITNESS.
+        //
+        // The witness is the same one the landing burst takes: a recent
+        // committed TYPED press. Without it, every arrow-key history recall and
+        // idle Ctrl-A/E at a cold prompt would strew glitter down a line the
+        // user has not touched — which is precisely the "spurious sparkle on a
+        // cold Ctrl-A" the terminus gate already exists to prevent
+        // (`cold_cursor_jump_scatters_no_terminus`). The BEAM still draws
+        // cold; only its debris is earned.
+        if self.reduced_motion
+            || self.typed_presses_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) == 0
+        {
+            return;
+        }
+        let (x0, y0) = (
+            oxf + (pc_c as f32 + 0.5) * cwf,
+            oyf + (pr_c as f32 + 0.5) * chf,
+        );
+        let (x1, y1) = (
+            oxf + (to.1 as f32 + 0.5) * cwf,
+            oyf + (to.0 as f32 + 0.5) * chf,
+        );
+        let sparks = ((dist * 0.55) as usize).clamp(3, Self::METEOR_SPARK_CAP);
+        for k in 0..sparks {
+            if self.particles.len() >= Self::MAX_PARTICLES {
+                break;
+            }
+            let r0 = self.frand();
+            let r1 = self.frand();
+            let r2 = self.frand();
+            let r3 = self.frand();
+            // Along the path, biased toward the HEAD (`f²`): a meteor sheds
+            // most where it burns hottest, and a uniform scatter reads as
+            // confetti dropped on a line.
+            let f = ((k as f32 + r0) / sparks as f32).clamp(0.0, 1.0);
+            let f = f * f;
+            let (px, py) = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
+            // Drift BACKWARD along the flight (the wake), with a little
+            // cross-track scatter and a light settle.
+            let back = -(0.35 + r1 * 0.9);
+            self.particles.push(Particle {
+                x0: px + (r2 - 0.5) * cwf * 0.6,
+                y0: py + (r3 - 0.5) * chf * 0.5,
+                vx: (x1 - x0).signum() * back * chf * 1.4,
+                vy: (r2 - 0.7) * 0.7 * chf,
+                gy: 0.8 * chf,
+                life: 0.26 + r3 * 0.34,
+                hue: r0,
+                cov_scale: 0.7, // GLITTER twinkle sentinel — the trail's own star
+                born: now,
+            });
+        }
     }
 
     fn emit_rainbow_jump_landing(
@@ -9727,10 +10628,24 @@ impl CursorGlow {
                 self.rainbow.bursts.remove(0);
             }
             let seed = self.frand();
-            let reach = (0.9 + 0.09 * dist).clamp(1.1, 2.6) * geom.ch as f32;
-            // Star count ramps 1 → RAINBOW_BURST_STARS across ~2..30 cells: the
-            // farther the leap, the more stars scatter off the landing.
-            let stars = (1 + (dist / 3.2) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
+            // REACH, star count and sparkle count all widened together
+            // ("an even bigger brighter landing"): the burst now spreads over
+            // roughly a cell and a half more, and saturates its star count in
+            // half the distance it used to.
+            let reach = (1.15 + 0.13 * dist).clamp(1.4, 3.4) * geom.ch as f32;
+            // Star count ramps 1 → RAINBOW_BURST_STARS across ~2..38 cells: the
+            // farther the leap, the more stars scatter off the landing. The
+            // FLOOR stays at one — a two-cell Option-B/F hop earns exactly one
+            // small star, deliberately, so ordinary word-motion editing is not
+            // a fireworks show; only the SLOPE steepened (dist/3.2 → dist/2.2),
+            // so a real fling saturates instead of trickling.
+            let stars = (1 + (dist / 2.2) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
+            // …and the SAME twinkle the cursor trail scatters while you type,
+            // interleaved with the colour stars (see `emit_rainbow_starburst`).
+            // Zero on a short hop for the same anti-noise reason the star floor
+            // exists: sparkles are the celebration, and a two-cell hop is not
+            // one.
+            let sparkles = ((dist / 5.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
             self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
@@ -9739,7 +10654,7 @@ impl CursorGlow {
                 reach,
                 seed,
                 stars,
-                sparkles: 0,
+                sparkles,
             });
             // SOUND: the starburst's aural twin, cued at the SAME edge under the
             // SAME gate, so the star scatter and the chime can never diverge —
@@ -9909,6 +10824,69 @@ impl CursorGlow {
             if cov < 1.0 {
                 continue;
             }
+            // THE LANDING FLASH — the IMPACT the burst never had. Stars alone
+            // say "something scattered here"; the moment of arrival needs a
+            // single expanding bloom underneath them or the landing reads as
+            // confetti with no event behind it (owner: "an even bigger brighter
+            // landing"). One halo: small and bright at touchdown, swelling to
+            // the burst's own reach and gone by
+            // [`RAINBOW_LAND_FLASH_SPAN`] of the life — always finished BEFORE
+            // the stars are, so it reads as the cause and not a competing mark.
+            //
+            // Suppressed under reduced motion: an expanding radius IS the
+            // effect, and there is no still frame of it that means anything.
+            if !self.reduced_motion && u < RAINBOW_LAND_FLASH_SPAN {
+                let fu = u / RAINBOW_LAND_FLASH_SPAN;
+                let fcov = (RAINBOW_TRANSIENT_COV_CAP
+                    * RAINBOW_LAND_FLASH_GAIN
+                    * (1.0 - fu).powf(1.6)
+                    * cfg.intensity)
+                    .clamp(0.0, 255.0);
+                if fcov >= 1.0 {
+                    let fr = base_r * (0.8 + RAINBOW_LAND_FLASH_GROW * (1.0 - (1.0 - fu).powi(2)));
+                    if cfg.dark_theme {
+                        push_halo(
+                            halos,
+                            geom,
+                            b.cx,
+                            b.cy,
+                            fr,
+                            fr,
+                            premul_rgb(RAINBOW_METEOR_CORE, fcov as u8),
+                        );
+                    } else {
+                        // On white the flash inverts with everything else: a
+                        // saturated ink bloom rolling the spectrum off the seed,
+                        // so the impact darkens instead of brightening.
+                        let hue = rainbow_gradient_of(
+                            &RAINBOW_BANDS,
+                            (b.seed + fu * 0.3).rem_euclid(1.0),
+                        );
+                        //
+                        // ON THE RAIL LINE, and FLAT. Centred on the landing
+                        // cell this is a soft disc over whatever glyph the
+                        // cursor arrived on — a white-ground review read it as
+                        // "a pale pink highlighter swipe over the letters",
+                        // which is the one thing this family must never be.
+                        // Dropped into the leading and squashed, it is the same
+                        // impact bloom spreading along the underline the meteor
+                        // arrived on.
+                        let ink = light_ink_bold(hue);
+                        let cap = ((fcov * LIGHT_INK_GAIN) as u32)
+                            .clamp(1, RAINBOW_LIGHT_RAIL_ALPHA_CAP as u32);
+                        push_halo_over(
+                            halos,
+                            geom,
+                            b.cx,
+                            b.cy + chf * RAINBOW_LIGHT_RAIL_DY,
+                            fr,
+                            (fr * RAINBOW_LAND_FLASH_LIGHT_SQUASH).max(1.0),
+                            (ink & 0x00FF_FFFF) | (cap << 24),
+                            255,
+                        );
+                    }
+                }
+            }
             for i in 0..n {
                 if out.len() >= Self::MAX_QUADS {
                     return;
@@ -9949,13 +10927,26 @@ impl CursorGlow {
                 }
                 if !cfg.dark_theme {
                     // LIGHT ARM: additive light does nothing on white, so each
-                    // star inverts to a DARKENED SATURATED source-over veil dot
-                    // (contrast increase — the ribbon-rail recipe), the centre
-                    // over-alpha capped for legibility so it never buries text.
-                    let veil = lerp_rgb(hue, 0x0000_0000, 0.28);
-                    let cap = (cov as u32).clamp(1, 150);
-                    let veil_capped = (veil & 0x00FF_FFFF) | (cap << 24);
-                    push_halo_over(halos, geom, cx_i, cy_i, r_i, r_i, veil_capped, 255);
+                    // star inverts to a DARKENED SATURATED source-over mark
+                    // (contrast increase — the shared light-ink recipe), the
+                    // centre over-alpha capped for legibility so it never
+                    // buries text. It draws the SAME 4-point plus the dark arm
+                    // does (`push_twinkle_over`): this used to be a round blob,
+                    // which is why a white-ground landing read as pastel
+                    // confetti while dark read as a starburst.
+                    // BIGGER on white. The additive star gets its presence
+                    // from full-coverage pixels; the ink star has to buy the
+                    // same presence with area, or a landing reads as "a handful
+                    // of tiny sparkles" with "almost no luminance".
+                    push_twinkle_over(
+                        halos,
+                        geom,
+                        cx_i,
+                        cy_i,
+                        r_i * RAINBOW_LAND_STAR_LIGHT_SCALE,
+                        hue,
+                        (cov * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
+                    );
                     continue;
                 }
                 // DARK ARM: THE SHARED TWINKLE, in this star's rainbow band hue.
@@ -9976,17 +10967,21 @@ impl CursorGlow {
                     return;
                 }
             }
-            // GLIDE LANDING SPARKLES (`sparkles > 0` — glide landings only;
-            // every discrete-JUMP burst carries 0). LITERALLY the typing
+            // LANDING SPARKLES (`sparkles > 0` — both landing families since
+            // 2026-08-06). LITERALLY the typing
             // starfield's 4-point twinkle plus (`push_twinkle_star`): same arms,
             // same white/gold palette, same diagonal glint, same pulse sine —
             // the WHITE/GOLD half of the one star kit whose colour half the
             // stars above draw through the same call.
             // Scattered on the burst's own even fan, offset HALF a step so they
             // interleave with the colour stars instead of hiding behind them.
-            // LIGHT theme: skipped — additive white is invisible on white, and
-            // the light-theme veil dots already mark the landing.
-            if b.sparkles > 0 && cfg.dark_theme {
+            // LIGHT theme: drawn through `push_twinkle_over` — the same plus, in
+            // ink rather than light. It used to be SKIPPED on the grounds that
+            // "the light-theme veil dots already mark the landing", which was
+            // only ever true of a landing that had veil dots to spare; a
+            // white-ground capture showed the landing reading as a few pale
+            // specks, so the sparkles now land on both grounds.
+            if b.sparkles > 0 {
                 let ns = b.sparkles as usize;
                 let arm = ((chf * 0.11) as i32).max(1);
                 let (cwi, chi) = (geom.cw as i32, geom.ch as i32);
@@ -10025,6 +11020,23 @@ impl CursorGlow {
                     // Every third sparkle is GOLD — the same accent ratio the
                     // starfield's gold gate produces at full spine.
                     let sgold = i % 3 == 0;
+                    if !cfg.dark_theme {
+                        // LIGHT: the same plus in ink. White/gold is invisible
+                        // on white, so the light sparkle takes the GOLD half of
+                        // the palette as its hue seed and lets the shared
+                        // darken carry it — a warm ink fleck, distinct from the
+                        // colour stars' band hues beside it.
+                        push_twinkle_over(
+                            halos,
+                            geom,
+                            sx as f32,
+                            sy as f32,
+                            arm as f32,
+                            twinkle_rgb(true),
+                            (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
+                        );
+                        continue;
+                    }
                     if !push_twinkle_star(
                         out,
                         geom,
@@ -10098,17 +11110,22 @@ impl CursorGlow {
             if !cfg.dark_theme {
                 // LIGHT ARM: additive light is invisible on white — invert to a
                 // darkened saturated rainbow source-over streak (ribbon-rail
-                // recipe), tail→head, brightening into the head.
+                // recipe), tail→head, brightening into the head, and dropped
+                // onto the RAIL LINE for the same reason the jump ZOOM is (see
+                // there): source-over ink through a glyph row reads as a
+                // strikethrough.
+                let dy = chf * RAINBOW_LIGHT_RAIL_DY;
                 push_rainbow_streak_over(
                     halos,
                     geom,
                     tx,
-                    ty,
+                    ty + dy,
                     hx,
-                    hy,
+                    hy + dy,
                     thick,
-                    head_cov as u8,
+                    (head_cov * LIGHT_INK_GAIN).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8,
                     g.seed,
+                    RAINBOW_LIGHT_RAIL_ALPHA_CAP,
                 );
                 continue;
             }
@@ -10238,6 +11255,65 @@ impl CursorGlow {
             if head_cov < 1.0 {
                 continue;
             }
+            // THE METEOR NUCLEUS (owner: the streak should "look more like a
+            // rainbow meteor"). A meteor is a BRIGHT HEAD dragging a tail; the
+            // ZOOM was a tail alone, and a banded ribbon with no nucleus reads
+            // as a drawn rule. One round core rides the leading tip on BOTH
+            // themes — white-hot additive light on dark, a saturated ink core on
+            // white — with a wider, dimmer coma around it.
+            //
+            // It is a HALO, not a quad: the nucleus must be round and soft at
+            // any jump angle, and the band beam below is the only other thing
+            // drawn here, so nothing else claims that centre.
+            let nuc = (RAINBOW_METEOR_NUCLEUS_COV * fade * cfg.intensity).clamp(0.0, 255.0);
+            if nuc >= 1.0 {
+                let rn = total * RAINBOW_METEOR_NUCLEUS_R * (0.75 + 0.25 * fade);
+                if cfg.dark_theme {
+                    push_halo(
+                        halos,
+                        geom,
+                        j.x1,
+                        j.y1,
+                        rn * RAINBOW_METEOR_COMA_R,
+                        rn * RAINBOW_METEOR_COMA_R,
+                        premul_rgb(RAINBOW_METEOR_CORE, (nuc * RAINBOW_METEOR_COMA_GAIN) as u8),
+                    );
+                    push_halo(
+                        halos,
+                        geom,
+                        j.x1,
+                        j.y1,
+                        rn,
+                        rn,
+                        premul_rgb(RAINBOW_METEOR_CORE, nuc as u8),
+                    );
+                } else {
+                    // On white the "white-hot" core inverts: the nucleus is the
+                    // DARKEST, most saturated point of the streak, so the head
+                    // still reads as where the energy is.
+                    let hue = rainbow_gradient_of(&RAINBOW_BANDS, (u * 0.5).rem_euclid(1.0));
+                    // ON THE RAIL LINE, like the streak it heads. Left centred
+                    // on the landing CELL it is a fat dark disc over whatever
+                    // glyph the cursor arrived on — a white-ground review read
+                    // the light landing as "a dark smudge over the prompt text".
+                    // The streak was already dropped into the leading for the
+                    // same reason; the nucleus has to follow it or the meteor
+                    // arrives somewhere its own body does not.
+                    let ink = light_ink_bold(hue);
+                    let cap = ((nuc * LIGHT_INK_GAIN) as u32)
+                        .clamp(1, RAINBOW_LIGHT_RAIL_ALPHA_CAP as u32);
+                    push_halo_over(
+                        halos,
+                        geom,
+                        j.x1,
+                        j.y1 + chf * RAINBOW_LIGHT_RAIL_DY,
+                        rn,
+                        (rn * RAINBOW_LAND_FLASH_LIGHT_SQUASH).max(1.0),
+                        (ink & 0x00FF_FFFF) | (cap << 24),
+                        255,
+                    );
+                }
+            }
             // LIGHT ARM: the additive banded beam does NOTHING on a white
             // ground, so the ZOOM inverts to a DARKENED SATURATED rainbow
             // source-over streak (the ribbon-rail recipe), retracting tail→head
@@ -10245,16 +11321,26 @@ impl CursorGlow {
             // on white. Dark falls through to the additive band beam below,
             // byte-identical.
             if !cfg.dark_theme {
+                // ON THE RAIL LINE, not through the letters. The dark arm's
+                // banded beam is ADDITIVE, so crossing a glyph row reads as
+                // light passing over text; the light arm's ink is source-over,
+                // and a saturated bar at the row's centre reads as a
+                // STRIKETHROUGH. Dropping it into the inter-line leading — the
+                // same line the ribbon's own rails occupy — keeps the meteor
+                // fully visible, puts it exactly where this style's continuous
+                // mark already lives, and costs the text nothing.
+                let dy = chf * RAINBOW_LIGHT_RAIL_DY;
                 push_rainbow_streak_over(
                     halos,
                     geom,
                     tx,
-                    ty,
+                    ty + dy,
                     j.x1,
-                    j.y1,
+                    j.y1 + dy,
                     total * 0.5,
-                    head_cov as u8,
+                    (head_cov * LIGHT_INK_GAIN).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8,
                     u * 0.5,
+                    RAINBOW_LIGHT_RAIL_ALPHA_CAP,
                 );
                 continue;
             }
@@ -10341,7 +11427,8 @@ impl CursorGlow {
         &self,
         s: &Spark,
         age: f32,
-        env: f32,
+        u: f32,
+        retract: f32,
         cov_f: f32,
         cfg: &GlowConfig,
         geom: Geom,
@@ -10356,29 +11443,63 @@ impl CursorGlow {
         const RAINBOW_LIGHT_RAIL_COV_CAP: f32 = 120.0;
         // Opacity in the high byte, peak always FULL: constant radii.
         let (scx, scy) = geom.cell_center(s.row, s.col);
-        let alpha =
-            (cov_f.min(RAINBOW_LIGHT_RAIL_COV_CAP) * 1.9).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8;
+        // ONE RAIL, UNDER THE LINE — an UNDERLINE, which is what the owner
+        // calls this ("the underline cursor trail is cute") and what a
+        // white-ground review kept asking for. The light ribbon used to be a
+        // BRACKET: a warm bar above the row and a cool bar below it. Two things
+        // were wrong with that. The upper bar renders ABOVE the text, which
+        // every review flagged as haze/dirt over the line and which no
+        // underline should ever do; and splitting the spectrum in half meant
+        // each bar only ever showed a THIRD of the rainbow, so the mark read as
+        // "a grey-green smear" with "no red/orange/yellow anywhere". A single
+        // bar rolling the WHOLE gradient along the line is both a truer
+        // underline and a truer rainbow.
+        //
+        // GAINED to the cap. The alpha is derived from the ribbon's own
+        // coverage, which is an ADDITIVE budget — see [`LIGHT_INK_GAIN`] — so
+        // without the conversion the ceiling below never bound and the band
+        // composited as a pastel wash rather than as ink.
+        // DRIVEN BY THE SPARK, NOT BY THE DARK BED'S PROFILE. `cov_f` carries
+        // `rainbow_ribbon_profile` and the head clearance — machinery that
+        // exists to keep additive light OFF the glyphs it composites over. The
+        // light rail composites over nothing: it lives in the leading below the
+        // row. Inheriting that profile made the band's brightness collapse
+        // exactly where the ribbon is freshest, which is why a white-ground
+        // review of a hot typing frame read the trail as "a grey-olive smudge"
+        // while the same build's meteor read as saturated ink.
+        //
+        // So the rail takes its own peak, shaped only by the edge envelope —
+        // the one part of the profile that is about the ribbon's ENDS rather
+        // than about glyph safety. `cov_f` stays as the visibility GATE (the
+        // caller already dropped sub-floor cells), so a spark the dark arm
+        // would not draw still draws nothing here.
+        // The dark bed's `env` is a SOLID-then-cosine tail whose fade opens at
+        // `u = 1 − (0.32 + 0.45·disp)` — as early as a quarter of the way
+        // through a life when the ribbon is hot, because a long soft dissolve
+        // is what an additive bed wants. Source-over ink does not: the same
+        // curve turned the underline into two saturated cells followed by six
+        // washed-out ones, measured at (60,109,141) under the caret and barely
+        // off-white four cells back. The rail takes the RETRACT fade (the exit
+        // swoosh, which is a real event) and the edge envelope (which melts the
+        // ribbon's ENDS to exactly zero) and nothing else, so the band holds its
+        // ink through its body and then melts.
+        let alpha = (RAINBOW_LIGHT_RAIL_PEAK
+            * retract
+            * rainbow_light_rail_envelope(u, s.life)
+            * cfg.intensity)
+            .min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8;
+        debug_assert!(cov_f >= 1.0, "the caller gates sub-floor cells out");
         if alpha >= 1 {
             // Where this cell sits on the band ramp: a slow travelling
-            // sweep (the ribbon's own phase + the column) so the rails
-            // read as a rainbow flowing past rather than two flat bars.
+            // sweep (the ribbon's own phase + the column) so the rail reads
+            // as a rainbow flowing past rather than one flat bar.
             let sweep = (s.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
                 + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
                 .rem_euclid(1.0);
-            // Warm half (red→yellow) up top, cool half (green→violet)
-            // below — darkened so the saturated hue survives source-over
-            // on white.
-            let warm = lerp_rgb(
-                rainbow_gradient_of(&RAINBOW_BANDS, sweep * 0.42),
-                0x0000_0000,
-                0.28,
-            );
-            let cool = lerp_rgb(
-                rainbow_gradient_of(&RAINBOW_BANDS, 0.58 + sweep * 0.42),
-                0x0000_0000,
-                0.28,
-            );
-            let stamp = |rgb: u32| (rgb & 0x00FF_FFFF) | ((alpha as u32) << 24);
+            // The FULL spectrum along the line, pulled to the shared
+            // [`LIGHT_INK_MAX_LUMA`] bar so every band survives source-over on
+            // white with comparable weight.
+            let hue = light_ink_bold(rainbow_gradient_of(&RAINBOW_BANDS, sweep));
             // rx spans well past the cell so neighbouring rails merge
             // into ONE continuous band with no ripple (the radii are
             // constant now, so the merge is actually smooth).
@@ -10386,28 +11507,19 @@ impl CursorGlow {
                 halos,
                 geom,
                 scx,
-                scy - chf * RAINBOW_LIGHT_RAIL_DY,
-                cwf * RAINBOW_LIGHT_RAIL_RX,
-                chf * RAINBOW_LIGHT_RAIL_RY,
-                stamp(warm),
-                255,
-            );
-            push_halo_over(
-                halos,
-                geom,
-                scx,
                 scy + chf * RAINBOW_LIGHT_RAIL_DY,
                 cwf * RAINBOW_LIGHT_RAIL_RX,
                 chf * RAINBOW_LIGHT_RAIL_RY,
-                stamp(cool),
+                (hue & 0x00FF_FFFF) | ((alpha as u32) << 24),
                 255,
             );
         }
         // LIGHT STARFIELD TWINKLE. The dark ribbon's sparse plus-stars are
         // ADDITIVE white — invisible on white — and sit PAST the light arm's
         // `continue`, so the light ribbon needs its own sparkle here:
-        // tiny DARKENED SATURATED source-over twinkle
-        // dots (the veil recipe) placed in the SKY band above the cell,
+        // tiny DARKENED SATURATED source-over twinkle STARS — the 4-point plus
+        // via [`push_twinkle_over`], the same shape the dark sky draws, not the
+        // round blob this used to push — placed in the SKY band above the cell,
         // clear of the glyph row. Same stable 1-in-6 per-cell hash gate as
         // the dark cold-star population, skipped only over a KNOWN-occupied
         // sky cell (unknown/clear twinkle, mirroring the dark contract);
@@ -10419,25 +11531,22 @@ impl CursorGlow {
         {
             let twinkle = 0.55 + 0.45 * (age * 9.0 + (sh >> 3) as f32).sin().abs();
             let mom = rainbow_star_momentum(self.rainbow.disp);
-            let scov =
-                (RAINBOW_LIGHT_RAIL_COV_CAP * env * twinkle * mom * cfg.intensity).min(150.0);
+            let scov = (RAINBOW_LIGHT_RAIL_COV_CAP * retract * twinkle * mom * cfg.intensity)
+                .min(LIGHT_INK_ALPHA_CAP);
             if scov >= 1.0 {
-                // A saturated darkened sparkle hue (rolls per cell so the
-                // sky isn't monochrome), capped for legibility.
+                // A saturated sparkle hue (rolls per cell so the sky isn't
+                // monochrome); `push_twinkle_over` applies the shared darken +
+                // legibility cap and draws it as the 4-point plus.
                 let hue = rainbow_gradient_of(&RAINBOW_BANDS, ((sh >> 5) & 0xff) as f32 / 255.0);
-                let dot = lerp_rgb(hue, 0x0000_0000, 0.28);
-                let cap = (scov as u32).clamp(1, 150);
-                let dot_capped = (dot & 0x00FF_FFFF) | (cap << 24);
                 let jx = ((sh >> 9) % (cwf.max(2.0) as u32)) as f32 - cwf * 0.5;
-                push_halo_over(
+                push_twinkle_over(
                     halos,
                     geom,
                     scx + jx,
                     scy - chf * 1.1,
-                    chf * 0.2,
-                    chf * 0.2,
-                    dot_capped,
-                    255,
+                    chf * 0.26,
+                    hue,
+                    scov as u8,
                 );
             }
         }
@@ -10894,7 +12003,8 @@ impl CursorGlow {
             // easing to zero. Starts at 1.0 at the stamp instant, so there is no
             // step where the drain picks a cell — which is the whole reason this
             // is a separate multiplier rather than a clamp on `life`.
-            let env = env * self.retract_fade_of(now, s);
+            let retract = self.retract_fade_of(now, s);
+            let env = env * retract;
             let head = rainbow_ribbon_profile(u, s.life);
             let raw_cov = (s.born_cov as f32) * env * head * cfg.intensity;
             // The age profile (temporal) × the cell-distance CLEARANCE (spatial).
@@ -10925,7 +12035,7 @@ impl CursorGlow {
                 continue;
             }
             if !cfg.dark_theme {
-                self.emit_rainbow_rails_light(s, age, env, cov_f, cfg, geom, halos);
+                self.emit_rainbow_rails_light(s, age, u, retract, cov_f, cfg, geom, halos);
                 continue;
             }
             if !self.emit_rainbow_body_dark(s, u, cov_f, clearance, geom, under) {
@@ -10935,6 +12045,80 @@ impl CursorGlow {
                 return;
             }
         }
+    }
+
+    /// THE FRESH-INK GLYPH TINT (see the constants block): for each pop still
+    /// inside its tint window, one [`CharFg`] substituting the cell's resolved
+    /// foreground with the band hue as INK, fading back to a theme-neutral
+    /// anchor.
+    ///
+    /// This is the only layer in the family that touches a letterform, and it
+    /// is the only one that can answer "which character did I just type?" —
+    /// light in the leading is read as decoration, not as an attribute of the
+    /// text. It is deliberately BRIEF ([`FRESH_INK_GLYPH_SPAN`] of a pop's
+    /// life) and deliberately CONCENTRATED (the emphasis ramp, so the run
+    /// behind the caret hands off to the rail rather than staying coloured).
+    ///
+    /// Rainbow-kitty only. Under REDUCED MOTION the fade is a hard two-step,
+    /// matching every other reduced arm in this file: an acknowledgment, not an
+    /// animation.
+    ///
+    /// The renderers merge-walk `char_fg` in lockstep with their column loops,
+    /// so the stream must be `(row, col)`-sorted with unique cells. Uniqueness
+    /// is structural — [`Self::born_ink_pop`] keeps at most one pop per cell —
+    /// and the sort is done here, exactly as the charred stream does it.
+    fn emit_fresh_ink_glyphs(&self, now: Instant, cfg: &GlowConfig, charred: &mut Vec<CharFg>) {
+        if !matches!(cfg.style, GlowStyle::RainbowKitty)
+            || cfg.dark_theme
+            || self.rainbow.ink_pops.is_empty()
+        {
+            return;
+        }
+        let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
+        let first = charred.len();
+        for p in &self.rainbow.ink_pops {
+            let u = now.saturating_duration_since(p.born).as_secs_f32() / FRESH_INK_LIFE_S;
+            if u >= FRESH_INK_GLYPH_SPAN {
+                continue;
+            }
+            // Linear to zero across the window, so the tint is gone well before
+            // the pop's own light is.
+            let fade = 1.0 - (u / FRESH_INK_GLYPH_SPAN).clamp(0.0, 1.0);
+            let fade = if self.reduced_motion {
+                if fade > 0.5 { 1.0 } else { 0.45 }
+            } else {
+                fade
+            };
+            let emphasis = match head_cell {
+                Some((hr, hc)) if hr == p.row && !self.reduced_motion => {
+                    fresh_ink_emphasis(hc.abs_diff(p.col) as f32)
+                }
+                _ => 1.0,
+            };
+            // The amplitude envelope gates the tint but does not scale it
+            // linearly: `intensity` is a MOTION amplitude, and a hue's presence
+            // is not linear in one the way emitted light is — at the shipping
+            // 0.7 a linear scale left the tint halfway to the anchor and
+            // therefore invisible. Zero still means exactly off.
+            let w = fade * emphasis * cfg.intensity.clamp(0.0, 1.0).sqrt();
+            if w < FRESH_INK_GLYPH_MIN_W {
+                continue;
+            }
+            // The SAME band the rail under this glyph is drawing, quantized to
+            // the six anchors — the letter and its underline are one mark.
+            let sweep = (p.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
+                + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
+                .rem_euclid(1.0);
+            let band = RAINBOW_BANDS
+                [((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)];
+            let ink = fresh_ink_glyph_ink_light(band);
+            charred.push(CharFg {
+                row: p.row,
+                col: p.col,
+                fg: lerp_rgb(FRESH_INK_GLYPH_ANCHOR_LIGHT, ink, w),
+            });
+        }
+        charred[first..].sort_unstable_by_key(|c| (c.row, c.col));
     }
 
     /// FRESH-INK POP emitter (see the FRESH-INK constants block): each live
@@ -10986,23 +12170,29 @@ impl CursorGlow {
             if u >= 1.0 {
                 continue;
             }
-            // The caret pocket. Off-row pops and an unknown head clear to 1.0.
-            // SCALED BY THE MOMENTUM SPINE, exactly as the ribbon scales its own
-            // head clearance: a COLD lone keystroke is byte-identical to the
-            // un-pocketed law, so the first casual character still pops bright
-            // and alone. The pocket opens as the run heats up — which is when
-            // the pop, ribbon, crown and starfield all stack on the same few
-            // cells, the only condition under which "too bright" was ever true.
+            // THE EMPHASIS RAMP (see [`fresh_ink_emphasis`]): full ON the cell
+            // just typed, easing down to the tail a short word behind. Off-row
+            // pops and an unknown head weigh 1.0.
+            //
+            // UNSCALED BY MOMENTUM, unlike the pocket it replaces. The pocket
+            // rode the spine because it was a legibility retreat that only
+            // needed to open when the layers stacked; emphasis on the newest
+            // letter is wanted from the FIRST keystroke, and a spine-scaled
+            // emphasis would be exactly absent on the cold lone character the
+            // owner is most likely to be looking at. The trail behind still
+            // reads (the tail is 42 %), and every layer here remains bounded by
+            // [`FRESH_INK_CENTRE_CAP`] / the light arm's alpha ceiling, so
+            // dropping the scale spends no legibility budget.
+            //
             // REDUCED MOTION opts out: that arm is a hard step-fade, and a
             // continuous ramp would turn each step back into a ramp.
-            let pocket = match head_cell {
+            let emphasis = match head_cell {
                 Some((hr, hc)) if hr == p.row && !self.reduced_motion => {
-                    let near = fresh_ink_pocket(hc.abs_diff(p.col) as f32);
-                    1.0 - (1.0 - near) * self.rainbow.disp.clamp(0.0, 1.0)
+                    fresh_ink_emphasis(hc.abs_diff(p.col) as f32)
                 }
                 _ => 1.0,
             };
-            let m = pocket
+            let m = emphasis
                 * (FRESH_INK_MOM_FLOOR + (1.0 - FRESH_INK_MOM_FLOOR) * p.mom.clamp(0.0, 1.0));
             let (env, scale, flash) = if self.reduced_motion {
                 // The reduced arm: stepped brightness, base footprint, no
@@ -11013,20 +12203,49 @@ impl CursorGlow {
             };
             let (cx, cy) = geom.cell_center(p.row, p.col);
             if !cfg.dark_theme {
-                // LIGHT ARM — SOURCE-OVER cool-neutral DARKEN veil (see the
-                // FRESH-INK POP light-theme block). Additive warm-white does
-                // nothing on white, so the pop inverts: a bounded darken veil
-                // hugging the glyph greys its surround for a beat, so the fresh
-                // letter reads as popping OUT of a faint vignette. The CENTRE
-                // over-alpha is the life-faded, momentum/intensity-scaled opacity
-                // (the darken twin of the dark core's `cov`) CLAMPED to the
-                // legibility ceiling and stamped into the veil colour's high byte
-                // (`fresh_ink_veil`): the renderer bounds the source-over falloff
-                // there, so the veil greys the surround without ever burying the
-                // glyph and fades smoothly over the WHOLE life. Radius rides the
-                // size spring alone (full `push_halo_over` peak — no per-life
-                // radius-shrink, no ≥96 hard cutoff). `>= 1.0` mirrors the dark
-                // core's skip (and keeps the high byte non-zero, i.e. capped).
+                // LIGHT ARM — a SWELL OF THE RAIL (see the FRESH-INK POP
+                // light-theme block). Additive warm-white does nothing on
+                // white, so the pop inverts to a source-over darken; but a
+                // darken CENTRED on the glyph paints the letterform, which on a
+                // white ground reads as a smudge over the last half-word rather
+                // than as a pop. So the light pop lands on the ribbon's own two
+                // RAIL LINES instead — short saturated bars directly under and
+                // over the fresh letter, in the same band hue the rail there is
+                // already drawing, and never a pixel on the glyph.
+                //
+                // The CENTRE over-alpha is the life-faded, momentum/intensity-
+                // scaled opacity (the darken twin of the dark core's `cov`)
+                // CLAMPED to the legibility ceiling and stamped into the colour's
+                // high byte (`fresh_ink_veil_tinted`): the renderer bounds the
+                // source-over falloff there, so a bar fades smoothly over the
+                // WHOLE life. Radius rides the size spring alone (full
+                // `push_halo_over` peak — no per-life radius-shrink, no ≥96 hard
+                // cutoff). `>= 1.0` mirrors the dark core's skip (and keeps the
+                // high byte non-zero, i.e. capped).
+                //
+                // The band is read from the light rail's own sweep expression so
+                // the pop and the rail it swells are never two colours, then
+                // QUANTIZED to the six anchors (see [`is_fresh_ink_veil`]).
+                let sweep = (p.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
+                    + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
+                    .rem_euclid(1.0);
+                let band = RAINBOW_BANDS
+                    [((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)];
+                let rail_dy = chf * RAINBOW_LIGHT_RAIL_DY;
+                // THE POP MARKS THE NEW CHARACTER; THE RAIL MARKS THE TRAIL.
+                //
+                // On light this bar is the strongest mark in the leading, and at
+                // the shared emphasis ramp it stayed strong for most of a pop's
+                // 0.7 s life — nine cells at a sprint. So the pop WAS the trail,
+                // and "the letter you just typed" looked exactly like "the letter
+                // you typed eight keystrokes ago": every white-ground review
+                // scored new-text emphasis 2-3 for precisely that reason.
+                //
+                // Gamma-ing the ramp concentrates the bar on the newest cell or
+                // two and hands the rest of the run to the rail, which is now
+                // saturated enough to carry it. Two marks, two jobs.
+                let light_emph = emphasis.powf(FRESH_INK_LIGHT_EMPH_GAMMA);
+                let m = m * light_emph / emphasis.max(1e-3);
                 let alpha = (FRESH_INK_LIGHT_VEIL_ALPHA * env * m * cfg.intensity)
                     .min(FRESH_INK_LIGHT_ALPHA_CAP);
                 if alpha >= 1.0 {
@@ -11034,15 +12253,70 @@ impl CursorGlow {
                         halos,
                         geom,
                         cx,
-                        cy,
-                        cwf * 0.95 * scale,
-                        chf * 0.72 * scale,
-                        fresh_ink_veil(alpha as u8),
+                        cy + rail_dy,
+                        cwf * FRESH_INK_LIGHT_CORE_RX * scale,
+                        // The size spring swells the bar ALONG the rail, never
+                        // ACROSS it: a thickening bar would grow toward the
+                        // glyph band and turn the structural clearance into a
+                        // tuned one.
+                        chf * FRESH_INK_LIGHT_CORE_RY,
+                        fresh_ink_veil_tinted(alpha as u8, band),
                         FRESH_INK_LIGHT_VEIL_PEAK,
                     );
                 }
-                // The BIRTH veil: the wider, dimmer source-over twin of the dark
-                // arm's birth flash — the peripheral pop edge.
+                // THE FRESH-INK SPARKLE — the light theme's actual answer to
+                // "newly typed characters need more of an emphasis".
+                //
+                // A swell of the rail says "the trail is brighter here", which a
+                // white-ground review read as a soft stain rather than as an
+                // event: the bar is a wide radial falloff, so it can be strong
+                // without ever being CRISP. A star can. One twinkle — the same
+                // 4-point plus the trail scatters, in the same band hue — sits
+                // in the sky above the fresh glyph, gated by the emphasis ramp
+                // so it belongs to the newest letters and fades out within a
+                // couple of cells rather than trailing a row of them.
+                //
+                // Clear of the glyph band by construction (the sky band the
+                // ribbon's own light twinkle already uses), and skipped over a
+                // PROVABLY occupied sky cell — the starfield's text-first rule.
+                //
+                // ABOVE, UNLESS THERE IS NO ABOVE. On the FIRST grid row the
+                // sky is outside the effects box, so a star placed there is
+                // clipped to nothing — and row 0 is where a shell prompt lives,
+                // i.e. the row this mark most needs to work on. Mirror it below
+                // the glyph there, which is symmetric leading and equally clear
+                // of the letterform.
+                let sky_up = f32::from(geom.origin_y) + chf * FRESH_INK_SPARK_DY <= cy;
+                let sky_row = if sky_up {
+                    i32::from(p.row) - 1
+                } else {
+                    i32::from(p.row) + 1
+                };
+                if emphasis >= FRESH_INK_SPARK_EMPH
+                    && self.probed_cell_glyph(sky_row, p.col, geom.rows) != Some(true)
+                {
+                    let earn = ((emphasis - FRESH_INK_SPARK_EMPH)
+                        / (1.0 - FRESH_INK_SPARK_EMPH).max(1e-3))
+                    .clamp(0.0, 1.0);
+                    let scov =
+                        (LIGHT_INK_ALPHA_CAP * env * earn * cfg.intensity).min(LIGHT_INK_ALPHA_CAP);
+                    if scov >= 1.0 {
+                        let dy = chf * FRESH_INK_SPARK_DY * if sky_up { -1.0 } else { 1.0 };
+                        push_twinkle_over(
+                            halos,
+                            geom,
+                            cx,
+                            cy + dy,
+                            chf * FRESH_INK_SPARK_ARM * scale,
+                            band,
+                            scov as u8,
+                        );
+                    }
+                }
+                // The BIRTH bar: the wider, dimmer twin of the dark arm's birth
+                // flash — spread ALONG the rail rather than out over the
+                // neighbouring letters, so the peripheral "pop" edge costs the
+                // text nothing.
                 if flash {
                     let fl = (1.0 - u / FRESH_INK_HALO_S).clamp(0.0, 1.0);
                     let halpha = (FRESH_INK_LIGHT_HALO_ALPHA * fl * m * cfg.intensity)
@@ -11052,10 +12326,10 @@ impl CursorGlow {
                             halos,
                             geom,
                             cx,
-                            cy,
-                            cwf * FRESH_INK_FLASH_RX * scale,
-                            chf * FRESH_INK_FLASH_RY * scale,
-                            fresh_ink_veil(halpha as u8),
+                            cy + rail_dy,
+                            cwf * FRESH_INK_LIGHT_FLASH_RX * scale,
+                            chf * FRESH_INK_LIGHT_FLASH_RY,
+                            fresh_ink_veil_tinted(halpha as u8, band),
                             FRESH_INK_LIGHT_VEIL_PEAK,
                         );
                     }
@@ -11502,6 +12776,19 @@ impl CursorGlow {
                     // EVERY segment — the old `RAINBOW_WAKE_LIGHT_STRIDE` knob was a
                     // constant 1, so the sparseness comes from the alpha below,
                     // not from skipping.
+                    //
+                    // DELIBERATELY FAINT, and deliberately still NEUTRAL. The
+                    // contrail and the rail occupy the same strip of leading, so
+                    // at its old weight this cool-neutral plume composited over
+                    // the rainbow rail and greyed it — three white-ground
+                    // reviews read the trail as "olive/steel-grey, not rainbow"
+                    // and as "two different systems" in one band, and this is
+                    // the grey one. Colouring it was tried and rejected: the
+                    // contrail must stay independently assertable from the pop
+                    // and the rail (see [`RAINBOW_WAKE_LIGHT_VEIL`]), and at
+                    // tint 1.0 all three become the same bytes. So it keeps its
+                    // own colour and gives up its weight instead — a faint aura
+                    // under the rail rather than a second band beside it.
                     let alpha = (FRESH_INK_LIGHT_VEIL_ALPHA * w * amp * RAINBOW_WAKE_LIGHT_GAIN)
                         .min(FRESH_INK_LIGHT_ALPHA_CAP);
                     if alpha >= 1.0 {
@@ -12187,6 +13474,7 @@ impl CursorGlow {
                                 thick,
                                 cov,
                                 p.hue,
+                                LIGHT_INK_ALPHA_CAP,
                             );
                             continue;
                         }
@@ -12282,14 +13570,22 @@ impl CursorGlow {
                     // gives on dark. Only the delete GLITTER family forks — the
                     // momentum shower (twinkle stars) stays dark-only by design.
                     if !cfg.dark_theme && glitter && scov > 0 {
+                        // The SAME 4-point plus the dark arm draws, in ink:
+                        // `push_twinkle_over` applies the shared darken and the
+                        // legibility ceiling. This used to be a round blob,
+                        // which is why a white-ground line kill read as a row of
+                        // pale dots where dark read as a shower of sparkles.
                         let sat = hsv2rgb(p.hue, 0.9, 1.0);
-                        let veil = lerp_rgb(sat, 0x0000_0000, 0.30);
-                        // Per-pixel centre over-alpha ceiling (`aterm_render::halo_over_cap`):
-                        // scov drives the fade, clamped to a legibility bound.
-                        let cap = scov.clamp(1, 150);
-                        let veil_capped = (veil & 0x00FF_FFFF) | ((cap as u32) << 24);
-                        let arm = (geom.ch as f32 * 0.13).max(1.5);
-                        push_halo_over(halos, geom, x, y, arm, arm, veil_capped, 255);
+                        let arm = (geom.ch as f32 * 0.17 * erase_hero_arm(p.cov_scale)).max(1.5);
+                        push_twinkle_over(
+                            halos,
+                            geom,
+                            x,
+                            y,
+                            arm,
+                            sat,
+                            (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
+                        );
                         continue;
                     }
                     if scov > 0 {
@@ -12311,7 +13607,10 @@ impl CursorGlow {
                         // Momentum breathes the star's SIZE too: ~72% of the
                         // shipped 0.16·ch arm at the spawn floor, the full arm at
                         // full spine (glitter keeps the shipped size).
-                        let arm = ((geom.ch as f32 * (0.11 + 0.05 * mom)) as i32).max(1);
+                        let arm =
+                            ((geom.ch as f32 * (0.11 + 0.05 * mom) * erase_hero_arm(p.cov_scale))
+                                as i32)
+                                .max(1);
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -12663,7 +13962,7 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
 /// streak from `(x0,y0)` (tail) to `(x1,y1)` (head) is laid as a short chain of
 /// DARKENED SATURATED source-over dots — the ribbon-rail recipe — each dot's
 /// [`RAINBOW_BANDS`] hue mixed ~28 % toward black, [`HaloMode::Over`], its high-byte
-/// centre over-alpha CAPPED (≤ 150) for legibility so it darkens the ground into
+/// centre over-alpha CAPPED at [`LIGHT_INK_ALPHA_CAP`] for legibility so it darkens the ground into
 /// a contrast INCREASE without ever burying ink. The hue rolls tail→head across
 /// the spectrum (offset by `hue_roll`) and the alpha brightens toward the head.
 /// `peak` is the head coverage byte; `thick` the dot radius (px). Bounded to
@@ -12679,23 +13978,97 @@ fn push_rainbow_streak_over(
     thick: f32,
     peak: u8,
     hue_roll: f32,
+    // The centre over-alpha CEILING this caller is entitled to. A streak that
+    // rides the RAIL LINE is leading-only and may go to the rail's ceiling; a
+    // streak trailing a FLYING particle can cross a glyph at any moment and
+    // takes the conservative shared one.
+    cap_max: f32,
 ) {
-    const STREAK_DOTS: usize = 6;
+    // CONTINUOUS, not six beads. Six fixed dots is a legible streak across two
+    // cells and a dotted line across a window: on a screen-crossing Ctrl-A the
+    // spacing was ~200 px between ~7 px dots, which is why a white-ground
+    // capture showed no streak at all where dark drew a full rainbow rule.
+    // Sample by LENGTH instead, one dot per `STREAK_STEP` of the dot's own
+    // diameter, so the chain always overlaps into one band.
+    const STREAK_STEP: f32 = 0.55;
+    const STREAK_DOTS_MIN: usize = 6;
+    const STREAK_DOTS_MAX: usize = 160;
+    /// The meteor TAPER: how much of the head's thickness the tail keeps. The
+    /// spacing below is computed from THIS, not from the head — a chain spaced
+    /// for the fat end prints the thin end as a dotted rule, which is what a
+    /// white-ground capture of a killed line showed running clear across the
+    /// window.
+    const STREAK_TAPER_MIN: f32 = 0.34;
     let r = thick.max(1.0);
-    for k in 0..STREAK_DOTS {
-        let f = k as f32 / (STREAK_DOTS as f32 - 1.0); // 0 tail .. 1 head
+    let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+    let step = (r * STREAK_TAPER_MIN * 2.0 * STREAK_STEP).max(1.0);
+    let dots = ((len / step).ceil() as usize).clamp(STREAK_DOTS_MIN, STREAK_DOTS_MAX);
+    for k in 0..dots {
+        let f = k as f32 / (dots as f32 - 1.0); // 0 tail .. 1 head
         let cx = x0 + (x1 - x0) * f;
         let cy = y0 + (y1 - y0) * f;
         // Rainbow rolls along the length; darken toward black so the saturated
         // hue survives source-over on white.
         let hue = rainbow_gradient_of(&RAINBOW_BANDS, (f + hue_roll).rem_euclid(1.0));
-        let veil = lerp_rgb(hue, 0x0000_0000, 0.28);
-        // Brighten into the head; cap the centre over-alpha for legibility.
-        let a = (peak as f32 * (0.4 + 0.6 * f)) as u32;
-        let cap = a.clamp(1, 150);
+        let veil = light_ink_bold(hue);
+        // Brighten into the head. The ramp is steep on purpose: a chain whose
+        // tail is 40 % of its head reads as a rule of even weight — "no
+        // directional shape: uniform dotted line, no head, no taper, no fade",
+        // in a white-ground review's words. From an eighth to full, a still
+        // frame shows which way the thing was going.
+        let a = (peak as f32 * (0.12 + 0.88 * f * f)) as u32;
+        let cap = a.clamp(1, cap_max as u32);
         let veil_capped = (veil & 0x00FF_FFFF) | (cap << 24);
-        push_halo_over(halos, geom, cx, cy, r, r, veil_capped, 255);
+        // METEOR TAPER: a thread at the tail swelling into the head, so the
+        // streak reads as a body with a direction rather than a rule of even
+        // thickness.
+        let rk = r * (STREAK_TAPER_MIN + (1.0 - STREAK_TAPER_MIN) * f);
+        push_halo_over(halos, geom, cx, cy, rk, rk, veil_capped, 255);
     }
+}
+
+/// THE LIGHT-THEME STAR — [`push_twinkle_star`]'s source-over twin.
+///
+/// Additive light is invisible on paper-white, so every light arm of the
+/// rainbow-kitty star kit used to fall back to a round `push_halo_over` blob:
+/// a white-ground capture of a line kill showed a row of pale pastel DOTS where
+/// dark showed sparkles. This draws the SAME 4-point plus — a horizontal and a
+/// vertical arm crossing at `(cx, cy)` — as two elongated capped source-over
+/// halos, so a sparkle is a sparkle on both grounds and only the compositing
+/// changes.
+///
+/// `rgb` is the star's straight hue; it is darkened by [`light_ink`]
+/// here (callers pass the same hue they would give the additive star) and its
+/// centre over-alpha is bounded by [`LIGHT_INK_ALPHA_CAP`], so a sparkle can
+/// grey the ground into a contrast INCREASE but never bury ink.
+fn push_twinkle_over(
+    halos: &mut Vec<RainHalo>,
+    geom: Geom,
+    cx: f32,
+    cy: f32,
+    arm: f32,
+    rgb: u32,
+    cov: u8,
+) {
+    if cov == 0 || arm < 0.75 {
+        return;
+    }
+    let ink = light_ink(rgb);
+    let cap = u32::from(cov).clamp(1, LIGHT_INK_ALPHA_CAP as u32);
+    let star = (ink & 0x00FF_FFFF) | (cap << 24);
+    // The arms carry MASS. A source-over hairline on white is dust: the dark
+    // arm's additive plus reads because every lit pixel is at full coverage,
+    // while a 1 px source-over arm behind a radial falloff is a few counts off
+    // the paper. Thicker arms plus a CORE — a small round nucleus at the
+    // crossing — give the mark the bright centre the additive star gets for
+    // free, so a sparkle reads as a sparkle rather than as a stray '+'.
+    const LIGHT_STAR_WAIST: f32 = 0.34;
+    const LIGHT_STAR_CORE: f32 = 0.40;
+    let waist = (arm * LIGHT_STAR_WAIST).max(1.0);
+    push_halo_over(halos, geom, cx, cy, arm, waist, star, 255);
+    push_halo_over(halos, geom, cx, cy, waist, arm, star, 255);
+    let core = (arm * LIGHT_STAR_CORE).max(1.0);
+    push_halo_over(halos, geom, cx, cy, core, core, star, 255);
 }
 
 #[allow(
@@ -14990,6 +16363,59 @@ mod tests {
         );
     }
 
+    /// A PLAIN BACKSPACE WAKES THE HOST TOO — the scheduling half of "bring
+    /// back the sparkle poof of deleting characters".
+    ///
+    /// `poof_scan` has always ORed the two poof licences into one gate, but the
+    /// two SCHEDULING seams named `kill_hint` alone. So from a QUIET screen a
+    /// lone Backspace armed a licence the host was never told to wake for: no
+    /// tick, no row probe, no shrink witnessed, hint expired — silence. A held
+    /// delete run still puffed (its own particles keep the frame train alive),
+    /// which is exactly the shape of the report: single characters lost their
+    /// poof while runs kept theirs.
+    ///
+    /// Both hints must arm both seams, at the same coarse poll.
+    #[test]
+    fn a_plain_backspace_arms_the_host_exactly_like_a_kill() {
+        let frame = Duration::from_millis(16);
+        let t0 = Instant::now();
+        let mut bs = CursorGlow::default();
+        assert!(!bs.is_active(), "idle: nothing armed");
+        bs.note_backspace(t0);
+        assert!(
+            bs.is_active(),
+            "a pending plain-Backspace poof licence keeps the host arming"
+        );
+        let d = bs
+            .next_change_deadline(t0, frame)
+            .expect("a plain Backspace arms a deadline");
+        assert_eq!(
+            d.saturating_duration_since(t0),
+            CursorGlow::KILL_HINT_POLL_INTERVAL,
+            "…at the same coarse poll a kill chord takes"
+        );
+        // PARITY, stated directly: the two licences schedule identically.
+        let mut kill = CursorGlow::default();
+        kill.note_kill(t0, false);
+        assert_eq!(
+            bs.next_change_deadline(t0, frame),
+            kill.next_change_deadline(t0, frame),
+            "the two poof licences pace the host identically"
+        );
+        assert_eq!(bs.is_active(), kill.is_active());
+        // And it self-disarms on the same freshness window.
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let mut out = Vec::new();
+        let t1 = t0 + Duration::from_millis(400);
+        bs.tick(Some((2, 2)), t1, &c, g, &mut out);
+        assert!(bs.bs_poof_hint.is_none(), "unconsumed licence self-expires");
+        assert!(
+            bs.next_change_deadline(t1, frame).is_none(),
+            "an expired licence disarms the timer"
+        );
+    }
+
     #[test]
     fn cadence_predicate_separates_brisk_rainbow_from_coarse_ember() {
         let frame = Duration::from_millis(16);
@@ -15217,7 +16643,7 @@ mod tests {
             "the light delete sheds a saturated source-over sparkle (contrast-increasing on white)"
         );
         // Legibility: every saturated sparkle veil carries a bounded per-pixel
-        // centre cap in its high byte (1..=150), so it greys the surround
+        // centre cap in its high byte (bounded by LIGHT_INK_ALPHA_CAP), so it greys the surround
         // without ever burying the ink (`aterm_render::halo_over_cap`).
         assert!(
             glow.halos()
@@ -15233,7 +16659,7 @@ mod tests {
                 })
                 .all(|h| {
                     let cap = (h.color >> 24) & 0xff;
-                    (1..=150).contains(&cap)
+                    (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&cap)
                 }),
             "the light delete sparkle is capped for legibility"
         );
@@ -18097,7 +19523,10 @@ mod tests {
         for i in 0..=256 {
             let t = i as f32 / 256.0;
             let cap = rainbow_band_cap_at(t);
-            assert!(cap <= RAINBOW_BAND_COV_CAP_MAX, "table entry past the max at {t}");
+            assert!(
+                cap <= RAINBOW_BAND_COV_CAP_MAX,
+                "table entry past the max at {t}"
+            );
             assert!(
                 rainbow_band_coverage(1_000.0, t) <= cap,
                 "an unbounded request clamps to this band's ceiling at {t}"
@@ -21038,6 +22467,267 @@ mod tests {
         assert_eq!(rainbow_terminus_feather(-1.0), 0.0);
     }
 
+    /// THE GLYPH TINT IS ALWAYS LEGIBLE — the structural claim the tint rests
+    /// on, checked rather than argued.
+    ///
+    /// The tint substitutes a cell's resolved foreground, so unlike every other
+    /// layer in this family it cannot be bounded by "it never touches a glyph".
+    /// Instead both ends of its fade are DARK inks bounded by
+    /// [`FRESH_INK_GLYPH_MAX_LUM`], and a lerp between two colours below a
+    /// luminance ceiling cannot rise above it. This walks the whole path —
+    /// every band, every weight — against two real light-theme grounds.
+    #[test]
+    fn fresh_ink_glyph_tint_is_always_legible() {
+        let ratio = |a: u32, b: u32| {
+            let (x, y) = (rel_luminance(a), rel_luminance(b));
+            let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+            (hi + 0.05) / (lo + 0.05)
+        };
+        // GitHub Light's pure white, and a dimmer light ground (Solarized
+        // Light's `#FDF6E3`) so the bound is not tuned to one theme.
+        for ground in [0x00FF_FFFF, 0x00FD_F6E3] {
+            assert!(
+                ratio(FRESH_INK_GLYPH_ANCHOR_LIGHT, ground) >= 7.0,
+                "the anchor is legible ink on {ground:06X} ({:.2}:1)",
+                ratio(FRESH_INK_GLYPH_ANCHOR_LIGHT, ground)
+            );
+            for &band in &RAINBOW_BANDS {
+                let ink = fresh_ink_glyph_ink_light(band);
+                assert!(
+                    rel_luminance(ink) <= FRESH_INK_GLYPH_MAX_LUM + 1e-4,
+                    "band {band:06X} -> {ink:06X} clears the luminance ceiling"
+                );
+                for step in 0..=20 {
+                    let w = step as f32 / 20.0;
+                    let fg = lerp_rgb(FRESH_INK_GLYPH_ANCHOR_LIGHT, ink, w);
+                    let r = ratio(fg, ground);
+                    assert!(
+                        r >= 4.5,
+                        "band {band:06X} at weight {w:.2} -> {fg:06X} is {r:.2}:1 on {ground:06X}"
+                    );
+                }
+                // The tint is a COLOUR, not a re-shade of the anchor: at full
+                // weight it must read as the band, or the layer buys nothing.
+                let chan = |c: u32, sh: u32| ((c >> sh) & 0xff) as i32;
+                let spread = |c: u32| {
+                    let (r, g, b) = (chan(c, 16), chan(c, 8), chan(c, 0));
+                    r.max(g).max(b) - r.min(g).min(b)
+                };
+                assert!(
+                    spread(ink) > spread(FRESH_INK_GLYPH_ANCHOR_LIGHT) + 24,
+                    "band {band:06X} reads as a hue, not as the anchor (spread {} vs {})",
+                    spread(ink),
+                    spread(FRESH_INK_GLYPH_ANCHOR_LIGHT)
+                );
+            }
+        }
+    }
+
+    /// DARK KEEPS THE NO-RECOLOR LAW. The tint is a light-theme answer to a
+    /// light-theme defect; on a dark ground the additive pop already brightens
+    /// the letterform, so no foreground is ever substituted there.
+    #[test]
+    fn fresh_ink_glyph_tint_never_recolours_on_dark() {
+        let g = geom();
+        let c = rainbow_pop_cfg(); // dark
+        assert!(c.dark_theme);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        let t1 = t0 + Duration::from_millis(16);
+        glow.note_typed(t1);
+        glow.tick(Some((3, 3)), t1, &c, g, &mut out);
+        assert!(!glow.rainbow.ink_pops.is_empty(), "the fixture did pop");
+        assert!(
+            glow.charred().is_empty(),
+            "no foreground substitution on a dark theme: {:?}",
+            glow.charred()
+        );
+    }
+
+    /// The LIGHT arm does tint, briefly, sorted, and one entry per cell.
+    #[test]
+    fn fresh_ink_glyph_tint_marks_the_newest_cells_then_hands_back() {
+        let g = geom();
+        let c = rainbow_pop_light_cfg();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((3, 2)), t, &c, g, &mut out);
+        for col in 3..9u16 {
+            t += Duration::from_millis(40);
+            glow.note_typed(t);
+            glow.tick(Some((3, col)), t, &c, g, &mut out);
+        }
+        let tinted = glow.charred().to_vec();
+        assert!(!tinted.is_empty(), "the light arm tints fresh glyphs");
+        // The renderers merge-walk this stream: sorted, unique cells.
+        let mut keys: Vec<(u16, u16)> = tinted.iter().map(|c| (c.row, c.col)).collect();
+        let sorted = keys.clone();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), tinted.len(), "one entry per cell");
+        assert_eq!(keys, sorted, "sorted by (row, col)");
+        // BRIEF: past the tint window every pop has handed its foreground back,
+        // even though the pops themselves are still alive and still glowing.
+        let late = t + Duration::from_secs_f32(FRESH_INK_LIFE_S * FRESH_INK_GLYPH_SPAN + 0.02);
+        glow.tick(Some((3, 8)), late, &c, g, &mut out);
+        assert!(
+            glow.charred().is_empty(),
+            "the tint hands the foreground back well before the pop expires"
+        );
+        assert!(
+            !glow.rainbow.ink_pops.is_empty(),
+            "…while the pop's own light is still live"
+        );
+    }
+
+    /// FRESH-INK EMPHASIS (owner, 2026-08-06: "newly typed characters need more
+    /// of an emphasis"). The ramp is the deliberate INVERSION of the old caret
+    /// pocket: EXACTLY full weight on the cell just typed, monotone
+    /// NON-INCREASING behind it, settling on [`FRESH_INK_EMPH_TAIL`] — and that
+    /// tail is a real, visible fraction, not a fade to nothing, so the trail
+    /// behind the hand survives.
+    #[test]
+    fn fresh_ink_emphasis_peaks_at_the_caret() {
+        assert!(
+            (fresh_ink_emphasis(0.0) - 1.0).abs() < 1e-6,
+            "the letter just typed carries FULL emphasis, got {}",
+            fresh_ink_emphasis(0.0)
+        );
+        let mut prev = f32::INFINITY;
+        for i in 0..=400 {
+            let cells = i as f32 * 0.05;
+            let v = fresh_ink_emphasis(cells);
+            assert!(v <= prev + 1e-6, "emphasis never rises behind the caret");
+            assert!(
+                v >= FRESH_INK_EMPH_TAIL - 1e-6,
+                "emphasis never falls below the tail"
+            );
+            prev = v;
+        }
+        assert!(
+            (fresh_ink_emphasis(FRESH_INK_EMPH_CELLS) - FRESH_INK_EMPH_TAIL).abs() < 1e-6,
+            "it reaches the tail exactly at FRESH_INK_EMPH_CELLS"
+        );
+        // The INVERSION is the point: the caret is now the brightest cell, not
+        // the dimmest. A pocket-shaped ramp would fail this.
+        assert!(
+            fresh_ink_emphasis(0.0) > fresh_ink_emphasis(FRESH_INK_EMPH_CELLS),
+            "the caret outshines the trail behind it"
+        );
+    }
+
+    /// THE LIGHT-THEME INK BAR: [`light_ink`] pulls EVERY rainbow band under
+    /// both [`LIGHT_INK_MAX_LUMA`] and [`LIGHT_INK_MAX_CHANNEL`] while keeping
+    /// it recognisably its own hue, so a white-ground capture reads as one
+    /// material rather than as yellow-tinted paper beside violet stains.
+    #[test]
+    fn light_ink_darkens_every_band_to_one_bar() {
+        for &band in &RAINBOW_BANDS {
+            let ink = light_ink(band);
+            assert!(
+                luma709(ink) <= LIGHT_INK_MAX_LUMA + 1.0,
+                "band {band:06X} -> {ink:06X} luma {} exceeds the bar",
+                luma709(ink)
+            );
+            let hi = ((ink >> 16) & 0xff).max((ink >> 8) & 0xff).max(ink & 0xff) as f32;
+            assert!(
+                hi <= LIGHT_INK_MAX_CHANNEL + 1.0,
+                "band {band:06X} -> {ink:06X} peaks at {hi}, over the channel bar"
+            );
+            // HUE PRESERVED: uniform scaling keeps the channel ORDER, so the
+            // band is still its own colour at ink weight.
+            let order = |c: u32| {
+                let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+                (r >= g, g >= b, r >= b)
+            };
+            assert_eq!(
+                order(band),
+                order(ink),
+                "band {band:06X} keeps its hue at ink weight ({ink:06X})"
+            );
+        }
+        // A colour already under both bars is returned untouched — the dark
+        // bands are not needlessly crushed.
+        assert_eq!(light_ink(0x0010_2030), 0x0010_2030);
+    }
+
+    /// THE LIGHT-THEME LEGIBILITY BOUND: at [`LIGHT_INK_ALPHA_CAP`] — the
+    /// ceiling every light-theme transient's centre over-alpha is clamped to —
+    /// near-black ink stays dark and a white counter survives, for every band.
+    /// This is the property the raised cap (150 -> 190) has to keep.
+    #[test]
+    fn light_ink_cap_keeps_glyphs_legible() {
+        let cap = LIGHT_INK_ALPHA_CAP as u8;
+        let max_c = |p: u32| ((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff);
+        let min_c = |p: u32| ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff);
+        for &band in &RAINBOW_BANDS {
+            let ink = light_ink(band) | (u32::from(cap) << 24);
+            let over_ink = aterm_render::over_rgb(0x000A_0A0A, ink, cap);
+            let over_white = aterm_render::over_rgb(0x00FF_FFFF, ink, cap);
+            assert!(
+                max_c(over_ink) <= 0x80,
+                "band {band:06X} over near-black ink stays dark ({over_ink:06X})"
+            );
+            assert!(
+                min_c(over_white) < 0xF0,
+                "band {band:06X} actually darkens a white ground ({over_white:06X})"
+            );
+        }
+    }
+
+    /// THE ERASE POOF's ENERGY LAW (owner: bring the delete poof back "with a
+    /// similar momentum as forward typing and also include some weight for the
+    /// size of what is deleted"). Both terms must bite, INDEPENDENTLY: a faster
+    /// run poofs harder at the same span, and a bigger span poofs harder at the
+    /// same speed — and a cold single character still clears the floor the
+    /// shipping poof always threw.
+    #[test]
+    fn erase_poof_drive_grows_with_momentum_and_weight() {
+        // MOMENTUM bites at a fixed span.
+        assert!(
+            erase_poof_drive(1.0, 1) > erase_poof_drive(0.0, 1),
+            "a hot delete run poofs harder than a cold one"
+        );
+        // WEIGHT bites at a fixed momentum, and keeps biting up the range.
+        assert!(
+            erase_poof_drive(0.5, 8) > erase_poof_drive(0.5, 1),
+            "a word kill outweighs a character"
+        );
+        assert!(
+            erase_poof_drive(0.5, 40) > erase_poof_drive(0.5, 8),
+            "a line kill outweighs a word"
+        );
+        // Monotone non-decreasing in BOTH arguments across the range.
+        for cells in [1u16, 2, 5, 13, 40, 200] {
+            let mut prev = -1.0;
+            for i in 0..=20 {
+                let v = erase_poof_drive(i as f32 / 20.0, cells);
+                assert!(v >= prev - 1e-6, "drive rises with momentum");
+                prev = v;
+            }
+        }
+        let mut prev = -1.0;
+        for cells in 1u16..=200 {
+            let v = erase_poof_drive(0.4, cells);
+            assert!(v >= prev - 1e-6, "drive rises with the erased span");
+            prev = v;
+        }
+        // BOUNDED: the weight term saturates, so a 4000-column kill cannot ask
+        // for an unbounded cloud.
+        assert!(
+            erase_poof_drive(1.0, u16::MAX) <= ERASE_WEIGHT_CAP + 1e-6,
+            "the energy law is bounded at the top"
+        );
+        // And the FLOOR: a cold single character still throws a real handful.
+        assert!(
+            (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize >= 6,
+            "a cold single-character erase still throws at least six sparkles"
+        );
+    }
+
     /// FEATURE B — a FAST rainbow kitty jump fires BOTH the ZOOM streak (preserved) AND a
     /// landing starburst (new), scaled by jump distance. The owner likes the
     /// ZOOM/light-burst and it must stay; the starburst is ADDITIONAL. A short
@@ -21091,9 +22781,11 @@ mod tests {
             1,
             "a modest jump now blooms a landing burst too (feedback on any hop)"
         );
-        assert_eq!(
-            near.rainbow.bursts[0].stars, 1,
-            "a short hop scatters exactly ONE small star (graduated by distance)"
+        assert!(
+            (1..=2).contains(&near.rainbow.bursts[0].stars),
+            "a short hop scatters one or two small stars — a token, not a \
+             fireworks show (graduated by distance), got {}",
+            near.rainbow.bursts[0].stars
         );
 
         // Reach scales with distance: a farther leap throws a wider burst.
@@ -21693,8 +23385,12 @@ mod tests {
             stars_for(20.0) > stars_for(CursorGlow::RAINBOW_BURST_MIN_DIST),
             "the count rises with distance"
         );
+        // SATURATION: the ceiling rose 10 -> 18 while the slope steepened
+        // (dist/3.2 -> dist/2.2), so the count tops out around 38 cells rather
+        // than 29 — still well inside one screen-crossing fling, which is what
+        // "the full handful" has always meant.
         assert_eq!(
-            stars_for(30.0),
+            stars_for(40.0),
             CursorGlow::RAINBOW_BURST_STARS as u8,
             "a screen-crossing fling throws the full handful"
         );
@@ -21762,7 +23458,7 @@ mod tests {
         assert!(
             lh.iter().all(|h| {
                 let cap = (h.color >> 24) & 0xff;
-                (1..=150).contains(&cap)
+                (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&cap)
             }),
             "each veil is capped for legibility"
         );
@@ -21774,7 +23470,13 @@ mod tests {
         let (mut d_out, mut d_h) = (Vec::new(), Vec::new());
         dark.emit_rainbow_starburst(mid, &c_dark, g, &mut d_out, &mut d_h);
         assert!(!d_out.is_empty(), "dark fills SOLID additive stars");
-        assert!(d_h.is_empty(), "dark stars never source-over");
+        // The dark arm DOES use the halo stream — the landing FLASH is an
+        // additive radial bloom — so what must never appear on dark is a
+        // SOURCE-OVER halo, not a halo.
+        assert!(
+            d_h.iter().all(|h| h.mode != HaloMode::Over),
+            "dark stars never source-over"
+        );
     }
 
     /// LANDING RING — LIGHT-THEME fork (P0, the clearest additive gap): on dark
@@ -21958,7 +23660,7 @@ mod tests {
         );
         assert!(
             l_h.iter()
-                .all(|h| (1..=150).contains(&((h.color >> 24) & 0xff))),
+                .all(|h| (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&((h.color >> 24) & 0xff))),
             "the light glide veil is capped for legibility"
         );
     }
@@ -22019,7 +23721,7 @@ mod tests {
         );
         assert!(
             l_h.iter()
-                .all(|h| (1..=150).contains(&((h.color >> 24) & 0xff))),
+                .all(|h| (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&((h.color >> 24) & 0xff))),
             "the light ZOOM veil is capped for legibility"
         );
     }
@@ -22074,7 +23776,7 @@ mod tests {
         );
         assert!(
             l_h.iter()
-                .all(|h| (1..=150).contains(&((h.color >> 24) & 0xff))),
+                .all(|h| (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&((h.color >> 24) & 0xff))),
             "the light shooting-star veil is capped for legibility"
         );
     }
@@ -22385,16 +24087,29 @@ mod tests {
         // HEAD (u = 0.01, inside the birth ease): the body already emits, and
         // its stars exist but only as faint condensations — pre-feather they
         // opened at ~20+/255 the instant the body cleared its floor.
-        let (under, stars) = emit_at(10);
+        // Sampled at 6 ms, INSIDE the birth ease. The ease is
+        // [`RAINBOW_EDGE_IN_S`] = 18 ms now (it was 50 ms), so the old 10 ms
+        // sample sits past its midpoint and no longer measures birth at all.
+        // 6 ms is a third of the way up — faint, but past the emit floor, so
+        // the "born WITH their cells" half of the contract is still testable.
+        let (under, stars) = emit_at(6);
         assert!(
             !under.is_empty(),
             "the condensing head cell still lays body light"
         );
         assert!(!stars.is_empty(), "head stars are born with their cells");
+        // The bar moved with [`RAINBOW_EDGE_IN_S`] (50 ms -> 18 ms): the head
+        // still CONDENSES out of the background rather than popping in at full
+        // body, but it does so in about a frame instead of three, so a 10 ms
+        // sample now sits partway up the ease rather than at its very foot.
+        // What is pinned is the SHAPE — birth is a small fraction of mid-life —
+        // not a magnitude that only held for one ease width.
+        let (_, mid_stars) = emit_at(500);
+        let mid_peak = mid_stars.iter().map(chan).max().unwrap_or(0);
         for q in &stars {
             assert!(
-                chan(q) <= 6,
-                "a head star is born faint out of the background, got {}",
+                chan(q) * 2 <= mid_peak,
+                "a head star is born faint out of the background: {} vs mid-life {mid_peak}",
                 chan(q)
             );
         }
@@ -22683,19 +24398,28 @@ mod tests {
                 .any(|q| q.x / cw == 4 && is_ribbon_quad(q.color)),
             "no ribbon band at the vacated cell after a backspace"
         );
-        // A 6-10 particle glitter cloud DID poof, short-lived.
+        // A glitter cloud DID poof, short-lived. The COUNT is no longer a
+        // frozen 6-10: it rides `erase_poof_drive` (momentum x weight), so what
+        // is pinned here is the FLOOR a cold single-cell erase must still throw
+        // — the poof got more expressive, never thinner — and the cap.
         let glitter: Vec<&Particle> = glow
             .particles
             .iter()
             .filter(|p| p.cov_scale < 0.9)
             .collect();
+        let cold_floor = (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize;
         assert!(
-            (6..=10).contains(&glitter.len()),
-            "backspace poofs a 6-10 particle glitter cloud: {}",
+            cold_floor >= 6,
+            "a COLD single-character erase still throws at least the six sparkles \
+             the shipping poof did (got a floor of {cold_floor})"
+        );
+        assert!(
+            (cold_floor..=ERASE_POOF_CAP + 1).contains(&glitter.len()),
+            "backspace poofs a momentum/weight-scaled glitter cloud: {}",
             glitter.len()
         );
         for p in &glitter {
-            assert!(p.life <= 0.6, "glitter is short-lived: {}", p.life);
+            assert!(p.life <= 1.5, "glitter is short-lived: {}", p.life);
         }
     }
 
@@ -22813,7 +24537,7 @@ mod tests {
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
-            11173920322100059508,
+            4115455268542750004,
             17233361164506253445,
             15099317426123974543,
             8477863368341368663,
@@ -25226,7 +26950,7 @@ halo = "add"
     fn light_veil_halos(glow: &CursorGlow) -> Vec<RainHalo> {
         glow.halos()
             .iter()
-            .filter(|h| h.mode == HaloMode::Over && h.color & 0x00FF_FFFF == FRESH_INK_LIGHT_VEIL)
+            .filter(|h| h.mode == HaloMode::Over && is_fresh_ink_veil(h.color))
             .copied()
             .collect()
     }
@@ -25257,54 +26981,60 @@ halo = "add"
             !veils.is_empty(),
             "the light-theme pop emits a source-over darken veil"
         );
-        // CONTRAST-INCREASING: every veil is source-over and DARK (all channels
-        // well under a white ground), so it darkens the surround — the pop —
-        // rather than lifting the ground toward the ink.
+        // CONTRAST-INCREASING: every veil is source-over and lands DARKER than
+        // the white ground it composites onto, so it darkens the surround — the
+        // pop — rather than lifting the ground toward the ink.
+        //
+        // Measured as LUMA of the composited result, not as a per-channel bound
+        // on the veil colour. The veil is tinted toward a band hue now
+        // (`fresh_ink_veil_tinted`), and a saturated band legitimately carries
+        // one high channel — pure red's luma is 54 while its red channel is
+        // full. Luma of `over_rgb(white, veil, cap)` is the property the
+        // sentence above actually claims, so it is the one asserted.
         for h in &veils {
             assert_eq!(
                 h.mode,
                 HaloMode::Over,
                 "the pop darkens source-over, never adds on white"
             );
-            let (r, gg, b) = (
-                (h.color >> 16) & 0xff,
-                (h.color >> 8) & 0xff,
-                h.color & 0xff,
-            );
-            assert!(
-                r < 0x60 && gg < 0x60 && b < 0x60,
-                "a dark veil darkens the white ground (a contrast pop), got {:06X}",
-                h.color & 0x00FF_FFFF
-            );
         }
-        // LEGIBILITY (FINDING 1): the veil's CENTRE over-alpha is BOUNDED — its
-        // per-pixel ceiling rides the colour's high byte, so the renderer clamps
-        // the source-over falloff (which otherwise PEAKS at a glyph-replacing
-        // 255) and the veil only greys the glyph, never buries it. Compose the
-        // centre exactly as `draw_radial_add` does (centre falloff weight 255,
-        // clamped to the cap) over BOTH a near-black ink pixel and a WHITE
-        // counter pixel.
+        // The margin claim is about THE POP — the freshest mark in the frame.
+        // Older bars are deliberately faint (the emphasis ramp) and a
+        // nearly-expired one legitimately darkens almost nothing, so asserting
+        // the margin on every live veil would pin the tail, not the pop.
+        let strongest = veils
+            .iter()
+            .max_by_key(|h| aterm_render::halo_over_cap(h.color))
+            .expect("at least one veil");
+        let cap = aterm_render::halo_over_cap(strongest.color);
+        let over_white = aterm_render::over_rgb(0x00FF_FFFF, strongest.color, cap);
+        assert!(
+            luma709(over_white) < luma709(0x00FF_FFFF) * 0.80,
+            "the pop darkens the white ground by a real margin (a contrast pop): \
+             veil {:06X} cap {cap} -> {over_white:06X}",
+            strongest.color & 0x00FF_FFFF
+        );
+        // LEGIBILITY, STRUCTURALLY. The bound that matters is no longer "how
+        // much may the mark darken the glyph" — it is "the mark is not ON the
+        // glyph". The light pop is two bars on the ribbon's own rail lines
+        // (±`RAINBOW_LIGHT_RAIL_DY`), wholly inside the inter-line leading, so
+        // a fresh letter keeps 100% of its ink-to-ground contrast at every
+        // instant. Asserted as GEOMETRY, which cannot be retuned away.
+        let (_, ccy) = geom().cell_center(3, 3);
+        let glyph_half = geom().ch as f32 * FRESH_INK_LIGHT_GLYPH_HALF;
         for h in &veils {
             let cap = aterm_render::halo_over_cap(h.color);
             assert!(
                 cap > 0 && f32::from(cap) <= FRESH_INK_LIGHT_ALPHA_CAP,
-                "the veil centre over-alpha is bounded by the legibility ceiling (cap {cap})"
+                "the bar's centre over-alpha is bounded by the legibility ceiling (cap {cap})"
             );
-            let centre = cap; // radial falloff peaks at 255, always clamped to cap
-            let max_c = |p: u32| ((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff);
-            let min_c = |p: u32| ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff);
-            // Near-black ink stays near-black — never lifted toward the slate.
-            let over_ink = aterm_render::over_rgb(0x000A_0A0A, h.color, centre);
+            let near_edge = (f32::from(h.cy) - ccy).abs() - f32::from(h.ry);
             assert!(
-                max_c(over_ink) < 0x40,
-                "the veil never buries dark ink toward the slate (got {over_ink:06X})"
-            );
-            // A WHITE counter (the hole in an 'o'/'e') survives as a light grey,
-            // not sealed into a solid dark dot.
-            let over_counter = aterm_render::over_rgb(0x00FF_FFFF, h.color, centre);
-            assert!(
-                min_c(over_counter) > 0x80,
-                "the veil greys — never seals — a white counter (got {over_counter:06X})"
+                near_edge >= glyph_half,
+                "the light pop stays clear of the glyph band: bar cy {} ry {} vs centre {ccy} \
+                 (nearest edge {near_edge}, band half-height {glyph_half})",
+                h.cy,
+                h.ry
             );
         }
         // The additive dark-arm warm-white pop never fires on a light theme.
@@ -25353,21 +27083,26 @@ halo = "add"
             caps.contains(&ceiling),
             "a full-intensity pop's core veil is CLAMPED to the ceiling (caps {caps:?})"
         );
-        // At the ceiling the glyph is still legible: near-black ink stays
-        // near-black, a WHITE counter stays a light grey — never a solid dot.
-        let veil = fresh_ink_veil(ceiling);
-        let over_ink = aterm_render::over_rgb(0x000A_0A0A, veil, ceiling);
-        let over_counter = aterm_render::over_rgb(0x00FF_FFFF, veil, ceiling);
-        let max_c = |p: u32| ((p >> 16) & 0xff).max((p >> 8) & 0xff).max(p & 0xff);
-        let min_c = |p: u32| ((p >> 16) & 0xff).min((p >> 8) & 0xff).min(p & 0xff);
-        assert!(
-            max_c(over_ink) < 0x40,
-            "ink stays dark even at the ceiling ({over_ink:06X})"
-        );
-        assert!(
-            min_c(over_counter) > 0x80,
-            "a counter survives even at the ceiling ({over_counter:06X})"
-        );
+        // At the ceiling every band still DARKENS the white leading it sits in
+        // by a real margin — the mark's whole job — for every band the tint can
+        // reach, not just the neutral slate the veil used to be. What it does
+        // to a GLYPH is no longer asked here and cannot be: the bars live on the
+        // rail lines, clear of the glyph band, which
+        // `fresh_ink_light_theme_pops_with_a_darken_veil` pins geometrically.
+        for &band in &RAINBOW_BANDS {
+            let veil = fresh_ink_veil_tinted(ceiling, band);
+            let over_white = aterm_render::over_rgb(0x00FF_FFFF, veil, ceiling);
+            assert!(
+                luma709(over_white) < luma709(0x00FF_FFFF) * 0.65,
+                "band {band:06X} at the ceiling darkens the leading ({over_white:06X})"
+            );
+            // …and never to solid black: the leading stays leading, not a bar
+            // of ink the eye reads as a strikethrough.
+            assert!(
+                luma709(over_white) > 12.0,
+                "band {band:06X} at the ceiling is a darken, not a blackout ({over_white:06X})"
+            );
+        }
     }
 
     /// FULL VISIBLE LIFE (FINDING 2): OPACITY carries the fade, so the veil stays
@@ -25428,7 +27163,7 @@ halo = "add"
         // into the fade the footprint stays near full size — it rides only the
         // settling size spring (a small swell), never collapsing toward zero as
         // the opacity dies. Compare the late-life radius against the base.
-        let base_rx = (geom().cw as f32 * 0.80).round() as u16;
+        let base_rx = (geom().cw as f32 * FRESH_INK_LIGHT_CORE_RX).round() as u16;
         let late_rx = sample(&mut glow, 0.75)
             .iter()
             .map(|h| h.rx)

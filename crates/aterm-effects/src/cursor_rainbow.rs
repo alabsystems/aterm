@@ -58,6 +58,9 @@ const PULSE_DEPTH: f32 = 0.55;
 
 /// Saturation / value ramps from the calm idle ember to the vivid typing bloom.
 const SAT_IDLE: f32 = 0.32;
+/// The LIGHT theme's idle saturation — see the emit site for why it is so much
+/// higher than the dark one.
+const SAT_IDLE_LIGHT: f32 = 0.88;
 const SAT_MAX: f32 = 1.0;
 const VAL_IDLE: f32 = 0.82;
 const VAL_MAX: f32 = 1.0;
@@ -66,6 +69,23 @@ const VAL_MAX: f32 = 1.0;
 /// a whisper at rest, vivid under the keys.
 const MIX_IDLE: f32 = 0.16;
 const MIX_MAX: f32 = 0.82;
+/// The LIGHT-THEME mixes, which are far higher — and have to be.
+///
+/// The two bases are not symmetric. Mixing a saturated hue toward WHITE gives a
+/// pastel of that hue: still obviously the hue, just gentler. Mixing the same
+/// hue toward a NEAR-BLACK gives mud — at the dark ramp's 0.16..0.82 a
+/// mid-energy caret on white composited to a drab olive-brown, which three
+/// white-ground reviews called out ("a dirt-brown caret", "an opaque vermilion
+/// with no relationship to the trail palette"). The caret is the anchor of this
+/// style's palette; on white it has to be a RAINBOW block, and the near-black
+/// base's job is only to keep it dark enough to invert its glyph.
+///
+/// Only the TOP of the ramp moves. At rest the light block stays the quiet
+/// near-black it has always been (pinned by `light_theme_base_is_dark`) — an
+/// idle caret should not be a lit lamp — and the mud was never the idle state
+/// anyway: every capture that showed it was mid-run, where `e` is high.
+const MIX_IDLE_LIGHT: f32 = MIX_IDLE;
+const MIX_MAX_LIGHT: f32 = 0.95;
 
 /// Halo geometry + brightness. A stack of thin concentric additive rings whose
 /// coverage falls off QUADRATICALLY from the block outward — brightest hugging the
@@ -324,7 +344,19 @@ impl CursorRainbow {
         self.twinkling = self.twinkle_at.is_some();
 
         // The live rainbow: vivid saturation/brightness under the keys, calm at rest.
-        let sat = lerp(SAT_IDLE, SAT_MAX, e);
+        // SATURATION HOLDS ON LIGHT. The light block blooms from a NEAR-BLACK
+        // base, and mixing a PALE hue (idle saturation 0.32) into near-black is
+        // what produces brown — the mud reviews reported on a caret sitting in a
+        // drained delete run, where `e` is low by construction. A saturated hue
+        // mixed into near-black is simply a DARK version of that hue, which is
+        // what a rainbow caret should be at any energy. The dark theme keeps its
+        // ramp: mixing toward WHITE pastels gracefully, so it never had this
+        // problem.
+        let sat = if dark_theme {
+            lerp(SAT_IDLE, SAT_MAX, e)
+        } else {
+            lerp(SAT_IDLE_LIGHT, SAT_MAX, e)
+        };
         let val = lerp(VAL_IDLE, VAL_MAX, e);
         let rainbow = hsv2rgb_turns(self.phase, sat, val);
 
@@ -336,7 +368,12 @@ impl CursorRainbow {
         } else {
             BASE_LIGHT_THEME
         };
-        let mut fill = mix_rgb(base, rainbow, lerp(MIX_IDLE, MIX_MAX, e));
+        let (mix_idle, mix_max) = if dark_theme {
+            (MIX_IDLE, MIX_MAX)
+        } else {
+            (MIX_IDLE_LIGHT, MIX_MAX_LIGHT)
+        };
+        let mut fill = mix_rgb(base, rainbow, lerp(mix_idle, mix_max, e));
         // The twinkle GLINT: mid-flare the block catches the light. On a dark
         // theme it flashes toward star-white; on a light one toward the vivid
         // live hue — white would sink into a light background (the contrast

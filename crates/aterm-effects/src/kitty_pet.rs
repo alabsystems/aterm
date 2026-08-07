@@ -454,6 +454,15 @@ pub struct PetBrain {
     pending_pounce: bool,
     /// Whether the pet has been seen at all yet (drives the fade-in).
     alpha: f32,
+
+    /// The `(coat, iris)` this appearance is WEARING — the pet's copy of the
+    /// flying kitty's per-appearance look latch (`kitty_cursor`'s two-path
+    /// rule: one appearance wears one cat). `None` until the host first
+    /// dresses it.
+    worn: Option<(u8, u8)>,
+    /// A host sync that arrived mid-appearance, parked until the fade
+    /// envelope returns to zero.
+    pending_worn: Option<(u8, u8)>,
 }
 
 impl Default for PetBrain {
@@ -485,6 +494,8 @@ impl Default for PetBrain {
             content: 0.0,
             pending_pounce: false,
             alpha: 0.0,
+            worn: None,
+            pending_worn: None,
         }
     }
 }
@@ -544,6 +555,14 @@ impl PetBrain {
             // from a backspace nobody typed. A caret that went away and came
             // back is a NEW sighting, not a move.
             self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
+            // The envelope has reached zero: a look sync parked mid-appearance
+            // ([`Self::sync_look`]) lands now, so the NEXT appearance is the
+            // one that wears the new cat.
+            if self.alpha == 0.0
+                && let Some(pair) = self.pending_worn.take()
+            {
+                self.worn = Some(pair);
+            }
             self.quiet += elapsed;
             self.speed = 0.0;
             self.last_caret = None;
@@ -1006,6 +1025,36 @@ impl PetBrain {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.alpha > 0.0
+    }
+
+    /// Host sync for the pet's collected identity — the flying kitty's
+    /// per-appearance look latch (`kitty_cursor::CursorCat::set_look`),
+    /// extended to the pet: ONE APPEARANCE WEARS ONE CAT. The host passes
+    /// this frame's GLOBAL `(coat, iris)` verdict and draws whatever comes
+    /// back.
+    ///
+    /// While the fade envelope is at zero (or the pet has never been dressed)
+    /// there is nothing on screen to protect, so the sync applies
+    /// immediately. While the pet is visible, a differing verdict PARKS: the
+    /// walking cat keeps its coat, and the parked pair lands once the
+    /// envelope returns to zero (`tick`'s no-caret arm). The host re-syncs
+    /// every emission, so the parking slot always holds the latest verdict,
+    /// never a stale intermediate. A typed discovery in pet mode therefore
+    /// latches SILENTLY for the next appearance — the pet has no
+    /// collection-hello presentation, by design.
+    pub fn sync_look(&mut self, coat: u8, iris: u8) -> (u8, u8) {
+        let pair = (coat, iris);
+        match self.worn {
+            Some(worn) if self.alpha > 0.0 => {
+                self.pending_worn = (pair != worn).then_some(pair);
+                worn
+            }
+            _ => {
+                self.worn = Some(pair);
+                self.pending_worn = None;
+                pair
+            }
+        }
     }
 
     /// Whether the pet needs the host's 60 fps lane this frame — the
@@ -1655,5 +1704,64 @@ mod tests {
             f = pet.tick(sense(t, Some((3, 5))));
         }
         assert!(f.facing_left, "chasing left, facing left");
+    }
+
+    /// ONE APPEARANCE WEARS ONE CAT — the flying kitty's `set_look` latch,
+    /// extended to the pet: a companion repoint that lands mid-walk (a typed
+    /// discovery in pet mode) must not re-skin the cat on screen. The sync
+    /// parks, the appearance keeps its coat, and the parked pair lands once
+    /// the fade envelope has returned to zero — so the NEXT appearance is the
+    /// one that wears it, even though every sync after the wake arrives while
+    /// the pet is already visible again.
+    #[test]
+    fn a_mid_appearance_look_sync_parks_until_the_pet_has_faded_out() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 5, 10);
+        assert!(pet.is_active(), "the fixture needs a visible pet");
+        assert_eq!(pet.sync_look(3, 1), (3, 1), "the first dress applies");
+        assert_eq!(
+            pet.sync_look(9, 4),
+            (3, 1),
+            "a repoint mid-appearance keeps the worn coat"
+        );
+        // The caret hides; the envelope runs to zero (FADE_OUT is 0.45 s).
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, None));
+        }
+        assert!(!pet.is_active(), "the fade-out must complete");
+        // A fresh appearance: the caret returns and the pet is visible again
+        // BEFORE the next sync arrives — exactly the emission order the host
+        // uses (tick, then sync at draw time).
+        for _ in 0..4 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((5, 10))));
+        }
+        assert!(pet.is_active(), "the next appearance is under way");
+        assert_eq!(
+            pet.sync_look(9, 4),
+            (9, 4),
+            "the parked pair landed at zero alpha, so the new appearance wears it"
+        );
+    }
+
+    /// While hidden the sync applies immediately — there is nothing on screen
+    /// to protect (the same arm `kitty_cursor::set_look` documents).
+    #[test]
+    fn a_hidden_pet_takes_a_look_sync_immediately() {
+        let mut pet = PetBrain::default();
+        assert!(!pet.is_active(), "a fresh pet is hidden");
+        assert_eq!(pet.sync_look(3, 1), (3, 1));
+        assert_eq!(
+            pet.sync_look(9, 4),
+            (9, 4),
+            "hidden: no appearance to protect, the swap is free"
+        );
+        assert_eq!(
+            pet.sync_look(9, 4),
+            (9, 4),
+            "and the agreeing re-sync is a no-op"
+        );
     }
 }

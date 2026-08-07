@@ -2139,7 +2139,11 @@ impl App {
         // session must drain here too or its sightings are lost. Same
         // (session, ident) dedupe as the windowed drain, so a capture racing
         // a present never double-counts.
-        let discovered = self.kitty_log.observe(
+        // AMBIENT PROVENANCE (owner ruling, 2026-08-07): a capture scans the
+        // same OUTPUT text the windowed drains do — count and collect only,
+        // never the companion, so no `on_collect` hello can start from a
+        // capture either.
+        self.kitty_log.observe_ambient(
             front_terminal.session,
             ws.word_decos.drain_kitty_sightings(),
             &lexicon,
@@ -2164,16 +2168,6 @@ impl App {
             now,
             primed_wince_hits.saturating_add(curse_drain.wince_hits),
         );
-        if let Some(look) = discovered {
-            // Match the application-present path: the newly collected identity receives a
-            // guaranteed bounded hello beginning now. The next requested
-            // windowless capture presents its static discovery pose.
-            ws.cursor_cat.on_collect(now, look);
-            // `cat_frame` was resolved before observation, so this capture did
-            // not contain the new hello. Freeze its full hold until the next
-            // capture or application-present frame has a chance to render it.
-            ws.cursor_cat.set_collection_presentable(now, false);
-        }
         if kitty_enabled
             && cat_frame.alpha > 0
             && let Some(cell) = cur
@@ -8785,7 +8779,10 @@ mod encode_worker_tests {
     /// A real headless `image` capture must advance the same feline overlay
     /// path as application-present. This pins the complete app-owned seam: terminal row
     /// scan, focused phase start, bounded cat bake, free-atlas publication,
-    /// and collection observation.
+    /// and collection observation — under the AMBIENT provenance law (owner
+    /// ruling, 2026-08-07): the scanned word still peeks and still collects,
+    /// but it never activates or re-dresses the cursor companion, and no
+    /// discovery hello starts from a capture.
     #[test]
     fn headless_capture_emits_and_collects_an_eligible_cat() {
         let mut app = App::headless_for_test();
@@ -8826,48 +8823,43 @@ mod encode_worker_tests {
                 "a visible cat must publish its atlas"
             );
         }
+        assert_eq!(app.kitty_log.log().sightings, 1);
         assert!(
-            app.kitty_log.companion_look().is_some(),
+            app.kitty_log
+                .log()
+                .collectibles
+                .iter()
+                .any(|item| item.count > 0),
             "the same visible sprite must be observed as a collectible"
         );
-        assert_eq!(app.kitty_log.log().sightings, 1);
-
-        // Discovery starts the guaranteed cursor hello. A second REQUESTED
-        // windowless capture shows the bounded static pose even after far more
-        // than the ordinary hold; no timer or autonomous frame loop existed to
-        // present it in between.
-        app.splice_word_decorations(wid, first_capture + Duration::from_secs(30));
-        let mut input = app.windows[&wid].input_scratch.clone();
-        let cursor_sprite = input
-            .free_sprites
-            .iter()
-            .find(|sprite| sprite.z == aterm_core::render::FreeZ::OverText)
-            .expect("collection hello emits the cursor companion over text");
+        // The AMBIENT half of the law: the collection grew, the companion did
+        // not — a scanned word is output text, not a keystroke.
         assert_eq!(
-            cursor_sprite.alpha, 255,
-            "windowless collection hello is one full-opacity static pose"
+            app.kitty_log.companion_look(),
+            None,
+            "an ambient discovery never becomes the companion"
+        );
+        assert!(
+            !app.windows[&wid].cursor_cat.is_active(),
+            "and no discovery hello starts from a capture"
+        );
+
+        // A second REQUESTED windowless capture, long after any hold: still no
+        // cursor companion over the text — the hello is the TYPED path's
+        // presentation alone.
+        app.splice_word_decorations(wid, first_capture + Duration::from_secs(30));
+        assert!(
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .all(|sprite| sprite.z != aterm_core::render::FreeZ::OverText),
+            "an ambient discovery presents no over-text cursor hello"
         );
         assert_eq!(
             app.kitty_log.log().sightings,
             1,
             "a no-damage capture continues the episode without recollecting it"
-        );
-
-        // Pixel-level pin: removing only the over-text companion changes the
-        // same CPU frame `image` renders, while the peeking word cat remains.
-        let mut without_cursor = input.clone();
-        without_cursor
-            .free_sprites
-            .retain(|sprite| sprite.z != aterm_core::render::FreeZ::OverText);
-        let with_cursor = app
-            .backend
-            .render_input(&mut app.introspect_gpu, &mut input, None);
-        let without_cursor =
-            app.backend
-                .render_input(&mut app.introspect_gpu, &mut without_cursor, None);
-        assert_ne!(
-            with_cursor.pixels, without_cursor.pixels,
-            "cursor companion must land in the captured framebuffer"
         );
 
         // A later no-damage capture advances the original one-shot; it does

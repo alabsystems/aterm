@@ -1063,7 +1063,12 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     let _ = std::fs::remove_file(&part);
     // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
-    if let Err(e) = aterm_update_core::download_to(&asset.url, tok.as_deref(), &part, 536_870_912) {
+    if let Err(e) = aterm_update_core::download_to(
+        &asset.url,
+        tok.as_deref(),
+        &part,
+        aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
+    ) {
         let _ = std::fs::remove_file(&part);
         crate::health::Health::record_failure(
             &staging.health(),

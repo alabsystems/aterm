@@ -11745,13 +11745,16 @@ impl App {
             // Invalid asset disables the companion and remains diagnosable; no
             // presentation path expands a path, reads a file, or decodes PNG.
             // O(1) scalar sync from the durable collection (no ledger scan/I/O).
-            // A discovery later in this tick calls `on_collect`; this keeps new
-            // windows and restored sessions on the latest collected identity.
+            // It keeps new windows and restored sessions on the latest
+            // collected identity. `on_collect` fires from the TYPED path only
+            // (`summon_typed_kitty`); this tick's ambient drain below records
+            // to the ledger and can never repoint the companion (owner
+            // ruling, 2026-08-07).
             // TWO-PATH RULE (owner: switching character mid-flight is
             // distracting): this per-frame sync is LATCHED per appearance —
             // while the companion is on screen `set_look` parks the change and
             // the one body keeps the same latched look until the next wake.
-            // Only `on_collect` below swaps mid-appearance, because the discovery
+            // Only `on_collect` swaps mid-appearance, because the discovery
             // hello legitimately presents the newly unlocked collectible.
             // THE SESSION KITTY (owner, 2026-07-26). An explicitly COLLECTED
             // companion wins — the user picked it, and only a reason may change
@@ -12063,25 +12066,21 @@ impl App {
                     // build that produced the match (LangIds are build-scoped).
                     // `kitty_log_on = false` drains-and-drops; recording is
                     // observation-only — nothing rendered changes.
-                    let discovered = self.kitty_log.observe(
+                    // AMBIENT PROVENANCE (owner ruling, 2026-08-07): these
+                    // sightings are grid-scanned OUTPUT text — `cat` in a man
+                    // page, not a keystroke. They count and collect only;
+                    // `observe_ambient` returns nothing, so no `on_collect`
+                    // hello and no companion repoint can start here. The
+                    // peeking word-cats themselves still draw. Presenting a
+                    // discovery is the TYPED path's alone
+                    // (`summon_typed_kitty`).
+                    self.kitty_log.observe_ambient(
                         front_terminal.session,
                         ws.word_decos.drain_kitty_sightings(),
                         &rs.lexicon,
                         frame_started,
                         kitty_log_on,
                     );
-                    if let Some(look) = discovered {
-                        ws.cursor_cat.on_collect(frame_started, look);
-                        ws.cursor_cat
-                            .set_collection_presentable(frame_started, cat_presentable);
-                        // `cat_frame` was resolved before this tick. Full
-                        // motion already owns a frame cadence; reduced motion
-                        // needs one immediate redraw to paint its static hello
-                        // before the single expiry wake erases it.
-                        if !animate_cat && let Some(window) = ws.os_window.as_ref() {
-                            window.request_redraw();
-                        }
-                    }
                     // Curse-BONK drain (the sparkle-words sound seam):
                     // PROMPTLY after the tick, beside the kitty drain — the
                     // cue vec clears at the next tick's start. A disabled
@@ -12163,13 +12162,20 @@ impl App {
                             );
                             ws.cursor_cat.colors_for_episode(sampled)
                         });
+                        // ONE APPEARANCE WEARS ONE CAT (`kitty_pet::sync_look`
+                        // — the flying kitty's `set_look` latch, extended to
+                        // the pet): `cat_frame.look` is this frame's GLOBAL
+                        // verdict, which a typed discovery can repoint
+                        // mid-walk, so it is the SYNC input — the pet draws
+                        // the pair its current appearance latched.
                         let look = cat_frame.look.normalized();
+                        let (coat, iris) = ws.cursor_pet.sync_look(look.coat, look.iris);
                         if let Some(pet_fp) = ws.word_decos.pet_cursor(
                             aterm_effects::word_decorations::PetCursorFrame {
                                 geom: effect_geom,
                                 colors,
-                                coat: look.coat,
-                                iris: look.iris,
+                                coat,
+                                iris,
                                 pet: pet_frame,
                             },
                             &mut ws.free_scratch,
@@ -14411,16 +14417,16 @@ impl App {
             // Drain PROMPTLY, per pane: both vecs clear at the NEXT tick's
             // start, so the next pane's tick would eat this pane's. The Kitty
             // Log dedupe key is (session, ident) — already exactly the pane key.
-            let discovered = kitty_log.observe(
+            // AMBIENT PROVENANCE (owner ruling, 2026-08-07): pane output is
+            // still output — count and collect only, never the companion, so
+            // no `on_collect` hello can start from a drain.
+            kitty_log.observe_ambient(
                 input.session,
                 ws.word_decos.drain_kitty_sightings(),
                 lexicon,
                 ctx.now,
                 kitty_log_on,
             );
-            if let Some(look) = discovered {
-                ws.cursor_cat.on_collect(ctx.now, look);
-            }
             let bonk_gain = bonk_sound_gain(
                 ws.focused,
                 bonk_enabled && !ws.resize_sound_quiet(std::time::Instant::now()),
@@ -14535,14 +14541,17 @@ impl App {
                 ws.cursor_cat.colors_for_episode(sampled)
             }
         };
+        // ONE APPEARANCE WEARS ONE CAT: same latch as the single-pane twin —
+        // the global verdict is the SYNC input, the worn pair is what draws.
         let look = ctx.cat_frame.look.normalized();
+        let (coat, iris) = ws.cursor_pet.sync_look(look.coat, look.iris);
         ws.pane_free.clear();
         let fp = ws.word_decos.pet_cursor(
             aterm_effects::word_decorations::PetCursorFrame {
                 geom,
                 colors,
-                coat: look.coat,
-                iris: look.iris,
+                coat,
+                iris,
                 pet: ctx.pet,
             },
             &mut ws.pane_free,

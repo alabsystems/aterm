@@ -1154,6 +1154,20 @@ struct RingSlot {
     at: Instant,
 }
 
+/// Where a batch of sightings came from — the provenance that decides what a
+/// first-ever discovery is ALLOWED to do (owner ruling, 2026-08-07: words in
+/// OUTPUT text must never activate or re-dress the cursor companion).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SightingSource {
+    /// The committed keystream (`summon_typed_kitty`): the user did this on
+    /// purpose, so a discovery repoints the companion (favourite permitting)
+    /// and is returned for its hello.
+    Typed,
+    /// The grid scanner's peeking word-cats: whatever a program happened to
+    /// print. Counts and collects only — the companion is out of reach.
+    Ambient,
+}
+
 /// The App-side Kitty Log state: in-memory totals, the unflushed delta, the
 /// dedupe ring, and the flush debounce. See the module doc.
 pub(crate) struct KittyLogHost {
@@ -1475,12 +1489,15 @@ impl KittyLogHost {
         }
     }
 
-    /// Drain-site entry point: dedupe, record, and debounce-flush this tick's
-    /// sightings. `enabled=false` (`[sparkle_words.feline] log = false`)
-    /// drains-and-drops — the effects-side recorder always runs (§F4.7), the
-    /// host gate is here. `now` is the tick's existing frame Instant (no new
-    /// clock reads on the render path); the RFC3339 stamp is taken once per
-    /// RECORDED sighting (rare), not per tick.
+    /// TYPED drain-site entry point (`summon_typed_kitty`): dedupe, record,
+    /// and debounce-flush this tick's sightings. A first-ever discovery
+    /// repoints the companion (unless a favourite is pinned) and is RETURNED
+    /// so the caller can present its hello — the user typed the word, so the
+    /// unlock is theirs to see. `enabled=false` (`[sparkle_words.feline]
+    /// log = false`) drains-and-drops — the effects-side recorder always runs
+    /// (§F4.7), the host gate is here. `now` is the tick's existing frame
+    /// Instant (no new clock reads on the render path); the RFC3339 stamp is
+    /// taken once per RECORDED sighting (rare), not per tick.
     pub(crate) fn observe<I>(
         &mut self,
         session: u64,
@@ -1488,6 +1505,59 @@ impl KittyLogHost {
         lexicon: &Lexicon,
         now: Instant,
         enabled: bool,
+    ) -> Option<KittyLook>
+    where
+        I: IntoIterator<Item = KittySighting>,
+    {
+        self.observe_from(
+            session,
+            sightings,
+            lexicon,
+            now,
+            enabled,
+            SightingSource::Typed,
+        )
+    }
+
+    /// AMBIENT drain-site entry point: the grid scanner's peeking word-cats —
+    /// `cat` in a man page, not a keystroke. The ledger still counts, and a
+    /// first-ever glyph still mints its collectible row (collections keep
+    /// growing from watching output), but the companion is out of reach and
+    /// nothing is returned BY TYPE: no ambient call site can arm an
+    /// `on_collect` hello (owner ruling, 2026-08-07 — words in OUTPUT text
+    /// must never activate or re-dress the cursor companion). The dedupe,
+    /// `enabled`, and flush contracts are [`Self::observe`]'s exactly.
+    pub(crate) fn observe_ambient<I>(
+        &mut self,
+        session: u64,
+        sightings: I,
+        lexicon: &Lexicon,
+        now: Instant,
+        enabled: bool,
+    ) where
+        I: IntoIterator<Item = KittySighting>,
+    {
+        let _ = self.observe_from(
+            session,
+            sightings,
+            lexicon,
+            now,
+            enabled,
+            SightingSource::Ambient,
+        );
+    }
+
+    /// The shared drain core. `source` is the ONE divergence between the two
+    /// public entry points: only [`SightingSource::Typed`] may repoint the
+    /// companion or surface a discovery for presentation.
+    fn observe_from<I>(
+        &mut self,
+        session: u64,
+        sightings: I,
+        lexicon: &Lexicon,
+        now: Instant,
+        enabled: bool,
+        source: SightingSource,
     ) -> Option<KittyLook>
     where
         I: IntoIterator<Item = KittySighting>,
@@ -1502,12 +1572,14 @@ impl KittyLogHost {
                 continue; // recently logged (shared window / vim round-trip)
             }
             let stamp = now_rfc3339();
-            if self.mem.record(&s, lexicon, &stamp) {
+            if self.mem.record(&s, lexicon, &stamp) && source == SightingSource::Typed {
                 let look = s.look.normalized();
-                // The hello still plays for a genuine discovery, but an
+                // The hello still plays for a genuine TYPED discovery, but an
                 // explicit favourite is a stronger reason than stumbling on a
                 // new glyph: the pinned cat comes back once the newcomer's
-                // hello ends, rather than being silently displaced.
+                // hello ends, rather than being silently displaced. An AMBIENT
+                // discovery gets neither arm — the row above is all output
+                // text may earn.
                 if self.mem.favourite_look().is_none() {
                     self.companion = Some(look);
                 }
@@ -3137,6 +3209,91 @@ mod tests {
             host.companion_look(),
             Some(pinned),
             "…but the companion returns to the pin once that hello ends"
+        );
+    }
+
+    /// OWNER RULING (2026-08-07): words in OUTPUT text never activate the
+    /// cursor companion. An ambient first-ever discovery still mints its
+    /// collectible row — collections grow from watching output — but the
+    /// companion stays exactly where it was, and `observe_ambient` returns
+    /// nothing a call site could hand to `on_collect`.
+    #[test]
+    fn an_ambient_discovery_collects_without_touching_the_companion() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let newcomer = coated(CatGlyphId::SpecWitch, 12);
+        let now = Instant::now();
+
+        host.observe_ambient(4, [look_sighting(41, newcomer)], lex, now, true);
+
+        assert_eq!(
+            host.companion_look(),
+            None,
+            "watching output earns no companion"
+        );
+        assert!(
+            host.log()
+                .collectibles
+                .iter()
+                .any(|item| item.key == glyph_key(CatGlyphId::SpecWitch)),
+            "…but the collectible row still mints"
+        );
+        assert_eq!(host.log().sightings, 1, "and the ledger still counts");
+    }
+
+    /// The re-dress half of the same ruling: with a companion already
+    /// collected, an ambient discovery of a NEW glyph must not repoint it —
+    /// `cat` scrolling by in a man page is not a reason to change the cat at
+    /// the cursor.
+    #[test]
+    fn an_ambient_discovery_never_redresses_an_existing_companion() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let typed = coated(CatGlyphId::S100, 3);
+        let printed = coated(CatGlyphId::SpecWitch, 12);
+        let now = Instant::now();
+
+        let discovery = host.observe(4, [look_sighting(51, typed)], lex, now, true);
+        assert_eq!(discovery, Some(typed));
+        assert_eq!(host.companion_look(), Some(typed));
+
+        host.observe_ambient(4, [look_sighting(52, printed)], lex, now, true);
+
+        assert_eq!(
+            host.companion_look(),
+            Some(typed),
+            "output text never re-dresses the companion"
+        );
+        assert!(
+            host.log()
+                .collectibles
+                .iter()
+                .any(|item| item.key == glyph_key(CatGlyphId::SpecWitch)),
+            "the printed cat still joins the collection"
+        );
+    }
+
+    /// The typed contrast pin: everything TYPED stays exactly as it was — a
+    /// first-ever typed discovery repoints the companion AND returns the
+    /// unlocked look so `summon_typed_kitty` can present its hello.
+    #[test]
+    fn a_typed_discovery_still_repoints_and_reports() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let unlocked = coated(CatGlyphId::S101, 6);
+        let now = Instant::now();
+
+        let discovery = host.observe(4, [look_sighting(61, unlocked)], lex, now, true);
+
+        assert_eq!(
+            discovery,
+            Some(unlocked),
+            "the typed path still reports the unlock for its hello"
+        );
+        assert_eq!(
+            host.companion_look(),
+            Some(unlocked),
+            "and the companion follows the user's own discovery"
         );
     }
 

@@ -50,9 +50,19 @@ bundle = []
 # becomes an announced no-op.
 [workspace.metadata.aterm]
 update_channel = "alabsystems/aterm"
+# THE COMMITTED CHANNEL-SIGNING PIN. With this key present, every `cargo ship
+# cut` for `update_channel` MUST be Ed25519-signed by exactly this key: a
+# machine without the signing configuration fails the pre-claim gates instead
+# of publishing unsigned (v0.16.0 shipped unsigned + unpinned from a keyless
+# machine because signing was only per-machine opt-in). This is tracked
+# POLICY, never derived from published history (the retired ratchet); forks
+# and private channels that omit the key keep opt-in signing. Removing it is
+# a normal reviewed commit — the same deliberate act as removing
+# `update_channel` above.
+update_channel_pubkey = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8="
 
 [workspace.package]
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"

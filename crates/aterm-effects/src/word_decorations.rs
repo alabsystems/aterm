@@ -277,8 +277,10 @@ pub struct PetCursorFrame {
     pub geom: EffectGeom,
     /// Quantized local foreground/background context (drives the contrast ink).
     pub colors: CatColorKey,
-    /// `COAT_RAMP` / `EYE_RAMP` indices — the pet wears the session's collected
-    /// kitty identity, so switching companions does not change who the cat is.
+    /// `COAT_RAMP` / `EYE_RAMP` indices — the WORN pair the brain latched for
+    /// this appearance ([`crate::kitty_pet::PetBrain::sync_look`]), never the
+    /// live global verdict: one appearance wears one cat, so a mid-walk
+    /// companion repoint cannot re-skin the pet on screen.
     pub coat: u8,
     pub iris: u8,
     pub pet: crate::kitty_pet::PetFrame,

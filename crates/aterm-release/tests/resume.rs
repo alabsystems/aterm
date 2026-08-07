@@ -1354,6 +1354,66 @@ fn signing_is_never_required_by_history_but_metadata_stays_coherent() {
     assert!(publish::channel_signature_required(&orphan).is_err());
 }
 
+/// The COMMITTED channel pin (`[workspace.metadata.aterm]
+/// update_channel_pubkey`), as folded into the signing verdict by
+/// `committed_channel_signature_policy` — the seam behind
+/// `preflight_signature_policy`, which every flavor (cut, resume via
+/// revalidate, recovery, the yank successor) derives its policy from.
+const CHANNEL_PIN: &str = "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=";
+/// A different valid Ed25519 key (the RFC 8032 vector also used above).
+const OTHER_KEY: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+
+#[test]
+fn a_committed_pin_makes_a_keyless_cut_fail_closed_before_any_claim() {
+    // v0.16.0's exact failure: no ~/.aterm/release.conf, so the cutter treated
+    // the missing per-machine opt-in as permission and published the pinned
+    // public channel unsigned. With the pin committed this is a hard pre-claim
+    // error that names the pin, the config path, and the rule.
+    let error = publish::committed_channel_signature_policy(Some(CHANNEL_PIN), None)
+        .expect_err("a keyless machine may not cut for a pinned channel")
+        .to_string();
+    assert!(error.contains(CHANNEL_PIN), "{error}");
+    assert!(error.contains("~/.aterm/release.conf"), "{error}");
+    assert!(
+        error.contains("may not cut for a pinned channel"),
+        "{error}"
+    );
+    // Pre-claim by contract, so a keyless refusal burns no ledger number.
+    assert!(error.contains("no ledger claim was made"), "{error}");
+}
+
+#[test]
+fn a_signing_key_that_is_not_the_committed_pin_is_refused_naming_both() {
+    let error = publish::committed_channel_signature_policy(Some(CHANNEL_PIN), Some(OTHER_KEY))
+        .expect_err("key substitution under a committed pin")
+        .to_string();
+    assert!(
+        error.contains(CHANNEL_PIN) && error.contains(OTHER_KEY),
+        "the refusal must name both identities: {error}"
+    );
+}
+
+#[test]
+fn the_matching_key_under_a_committed_pin_is_required_and_proceeds() {
+    let policy =
+        publish::committed_channel_signature_policy(Some(CHANNEL_PIN), Some(CHANNEL_PIN)).unwrap();
+    assert!(policy.required);
+    assert_eq!(policy.pubkey.as_deref(), Some(CHANNEL_PIN));
+}
+
+#[test]
+fn without_a_committed_pin_signing_stays_per_machine_opt_in() {
+    // Forks and private channels commit no pin, so their behavior is exactly
+    // the pre-pin contract: keyless cuts unsigned, a configured key signs.
+    let unsigned = publish::committed_channel_signature_policy(None, None).unwrap();
+    assert!(!unsigned.required);
+    assert_eq!(unsigned.pubkey, None);
+
+    let opted_in = publish::committed_channel_signature_policy(None, Some(OTHER_KEY)).unwrap();
+    assert!(opted_in.required);
+    assert_eq!(opted_in.pubkey.as_deref(), Some(OTHER_KEY));
+}
+
 #[test]
 fn unsigned_successor_is_allowed_even_when_archived_signatures_exist() {
     // Killed ratchet: an unsigned v0.55.0 head archives cleanly alongside a prior

@@ -34,6 +34,7 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::GrepGuards => grep_guards(ctx, &mut r),
         StageId::InstallChannel => install_channel(ctx, &mut r),
         StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
+        StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
         StageId::StartCompare => start_compare(ctx, &mut r),
         StageId::LicenseHeaders => license_headers(ctx, &mut r),
         StageId::FeatureGates => feature_gates(ctx, &mut r),
@@ -456,6 +457,35 @@ fn trust_gate_verdict(ctx: &Ctx, r: &mut Report) {
     } else {
         r.cannot_run(format!(
             "test-trust-gate-verdict.sh missing or not executable ({})",
+            t.display()
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3.56) TRUST CONTRACT PROBE — two facts about the INSTALLED stage2 that no
+//    cargo stage exercises while the workspace opt-out is on: the off-switch
+//    must compile a contract without ICEing (2026-07-30: the first committed
+//    `ensures` crashed trustc under the then-current off-switch, so contracts
+//    could not land at all), and a `self`-field postcondition must PROVE (same
+//    date: every such predicate was UNPARSEABLE → fail-closed Unknown — the
+//    exact form every lifecycle property in aterm takes). Both held on stage2
+//    51bf8a270 (2026-08-05); tools/trust-probes/self_field_ensures.rs is the
+//    probe. Skips without the toolchain like every stage2 stage; a MISSING
+//    script is cannot-run, because a probe that vanishes is how the ICE class
+//    returns unheralded.
+// ---------------------------------------------------------------------------
+fn trust_contract_probe(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("trust contract probe (no stage2 toolchain)");
+        return;
+    }
+    let t = ctx.tools_dir().join("test-trust-contract-probe.sh");
+    if is_executable_file(&t) {
+        run_labeled(ctx, r, "test-trust-contract-probe.sh", &Cmd::new(&t));
+    } else {
+        r.cannot_run(format!(
+            "test-trust-contract-probe.sh missing or not executable ({})",
             t.display()
         ));
     }

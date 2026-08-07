@@ -39,6 +39,7 @@ pub enum StageId {
     GrepGuards,
     InstallChannel,
     TrustGateVerdict,
+    TrustContractProbe,
     StartCompare,
     LicenseHeaders,
     FeatureGates,
@@ -107,6 +108,11 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::TrustGateVerdict,
         "trust-gate verdict self-test",
+        Lane::Pure,
+    ));
+    v.push(spec(
+        StageId::TrustContractProbe,
+        "trust contract probe (self-field ensures proves; off-switch no ICE)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -218,6 +224,7 @@ mod tests {
                 StageId::GrepGuards,
                 StageId::InstallChannel,
                 StageId::TrustGateVerdict,
+                StageId::TrustContractProbe,
                 StageId::StartCompare,
                 StageId::LicenseHeaders,
                 StageId::FeatureGates,
@@ -309,6 +316,7 @@ mod tests {
                 StageId::GrepGuards
                 | StageId::InstallChannel
                 | StageId::TrustGateVerdict
+                | StageId::TrustContractProbe
                 | StageId::StartCompare
                 | StageId::LicenseHeaders => Lane::Pure,
                 _ => Lane::MainTarget,
@@ -324,6 +332,6 @@ mod tests {
         // names it. A stage that disappeared would be a stage nobody missed.
         let nothing_installed = ctx(Mode::Full, Scope::workspace());
         assert!(!nothing_installed.tools.have_targo());
-        assert_eq!(plan(&nothing_installed).len(), 18);
+        assert_eq!(plan(&nothing_installed).len(), 19);
     }
 }

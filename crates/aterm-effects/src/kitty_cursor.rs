@@ -870,10 +870,14 @@ impl CursorCat {
     ///    continuing, so it deliberately does not consume the latch. While
     ///    hidden the sync applies immediately — there is nothing on screen to
     ///    protect.
-    /// 2. **`on_collect` — IMMEDIATE.** The discovery hello legitimately
-    ///    presents the newly unlocked collectible; swapping to it is the
-    ///    point of the presentation, so it replaces the look (and clears any
-    ///    parked sync) even mid-flight.
+    /// 2. **`on_collect` — IMMEDIATE, and TYPED-ONLY.** The discovery hello
+    ///    legitimately presents the newly unlocked collectible; swapping to
+    ///    it is the point of the presentation, so it replaces the look (and
+    ///    clears any parked sync) even mid-flight. Its only routes are the
+    ///    user's own acts — the typed summon and the favourite pin. A
+    ///    discovery in scanned OUTPUT text records to the ledger but never
+    ///    reaches this companion: the host's ambient drains return no look to
+    ///    present (owner ruling, 2026-08-07).
     pub fn set_look(&mut self, look: KittyLook) {
         let look = look.normalized();
         if self.is_active() || self.collection_hello {
@@ -893,6 +897,12 @@ impl CursorCat {
     /// is seeded full), then rejoins the ordinary fade-out path — beginning
     /// its goodbye at the hold deadline unless live typing has re-earned past
     /// [`REVIVE_GATE`] — and settles back to zero-idle.
+    ///
+    /// TYPED-ONLY BY CONTRACT (owner ruling, 2026-08-07): the host's ambient
+    /// grid-scan drains record to the ledger and return no discovery, so the
+    /// only routes here are the user's own acts (the typed summon, the
+    /// favourite pin). Output text that happens to say `cat` must neither
+    /// activate nor re-dress the companion.
     pub fn on_collect(&mut self, now: Instant, look: KittyLook) {
         self.look = look.normalized();
         // Two-path rule, path 2 ([`Self::set_look`]): the hello IS the

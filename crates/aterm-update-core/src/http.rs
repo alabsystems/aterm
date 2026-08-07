@@ -458,6 +458,17 @@ pub fn download_bytes(
     Ok(out.stdout)
 }
 
+/// GitHub's per-release-asset ceiling, and THE one number both sides of the
+/// update channel must agree on: the client's container download cap
+/// (`aterm-update` github.rs) and the cutter's publish-size guard
+/// (`aterm-release` `UPDATER_MAX_DMG_BYTES`) must be this constant, not private
+/// copies. They drifted once — 2026-08-02 raised the cutter's bound to 2 GiB
+/// for the batteries-included DMGs, the client's container site kept 512 MiB,
+/// and every 0.15.0 install accepted the v0.17.0 manifest and then could never
+/// fetch its 775 MB payload (curl exit 56, "Maximum file size exceeded"),
+/// which reads as a network failure and never escalates.
+pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
+
 /// Download an asset (e.g. a DMG) to a file, following the storage redirect.
 /// Bounded at `max_filesize` bytes (caller-supplied) so an attacker-controlled or
 /// mis-pointed release asset can't fill the disk — curl aborts before writing past
@@ -508,7 +519,10 @@ pub fn download_to(
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpError, curl_argv, curl_bin, curl_fetch, curl_prepared, token_config_safe};
+    use super::{
+        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, curl_argv, curl_bin, curl_fetch, curl_prepared,
+        token_config_safe,
+    };
     use std::process::Command;
 
     /// The curl binary is platform-selected: a pinned absolute path on unix (no
@@ -795,5 +809,16 @@ mod tests {
         ] {
             assert!(!token_config_safe(t), "injection token accepted: {t:?}");
         }
+    }
+
+    /// The bound is GitHub's own per-asset ceiling, so the only thing that can
+    /// strand a payload is GitHub refusing to host it. A private lower copy is
+    /// how 0.15.0 shipped a 512 MiB client cap against 775 MB containers:
+    /// every install accepted the manifest and then failed the download every
+    /// interval, as a "network" failure that never escalates.
+    #[test]
+    fn release_asset_bound_is_githubs_ceiling_and_covers_batteries_included() {
+        assert_eq!(RELEASE_ASSET_DOWNLOAD_BOUND, 2 * 1024 * 1024 * 1024);
+        assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000);
     }
 }

@@ -205,6 +205,18 @@ fn workspace_mirror_slug(repo: &Path) -> Result<Option<String>> {
     mirror::update_channel_slug(&cargo_text)
 }
 
+/// The COMMITTED channel-signing pin for a checkout, from the tracked
+/// `[workspace.metadata.aterm] update_channel_pubkey`. `Ok(None)` = no pin,
+/// signing stays per-machine opt-in. Re-read from the worktree rather than the
+/// journal for the same reason as [`workspace_mirror_slug`]: it is tracked
+/// repository policy at the claim commit, and one reader keeps one answer for
+/// the whole pipeline (pre-claim, lock, preflip, flip, recovery).
+fn workspace_channel_pubkey(repo: &Path) -> Result<Option<String>> {
+    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
+    mirror::update_channel_pubkey(&cargo_text)
+}
+
 /// Parse the GitHub repository addressed by an `origin` URL.  Release state is
 /// split between git refs and GitHub Releases, so accepting two independently
 /// configured repositories would make every later lease check meaningless.
@@ -2457,10 +2469,70 @@ fn update_key_fingerprint(encoded: &str) -> Result<String> {
     Ok(sha256_bytes(&raw))
 }
 
+/// The cut's signing verdict: per-machine opt-in, unless the workspace commits
+/// a channel pin ([`committed_channel_signature_policy`]). Public as the
+/// integration-test seam for the pinned-channel decision table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SignaturePolicy {
-    required: bool,
-    pubkey: Option<String>,
+pub struct SignaturePolicy {
+    pub required: bool,
+    pub pubkey: Option<String>,
+}
+
+/// Fold the COMMITTED channel pin (`[workspace.metadata.aterm]
+/// update_channel_pubkey`) into the per-machine opt-in signing verdict.
+///
+/// No pin ⇒ exactly the opt-in behavior: configured signing material signs,
+/// a keyless machine cuts unsigned (Tier REPO). A pin makes signing tracked
+/// channel POLICY, and both refusals fire pre-claim, before any ledger claim
+/// or remote mutation: a keyless machine may not cut for a pinned channel,
+/// and a configured key that is not the pinned key is refused by name.
+/// v0.16.0 was published unsigned because a keyless machine treated the
+/// missing per-machine opt-in as permission and nothing committed said
+/// otherwise; the pin is that missing committed statement — read from the
+/// manifest, never derived from published history (the retired ratchet).
+pub fn committed_channel_signature_policy(
+    committed_pubkey: Option<&str>,
+    material_pubkey: Option<&str>,
+) -> Result<SignaturePolicy> {
+    let Some(committed) = committed_pubkey else {
+        return Ok(match material_pubkey {
+            Some(pubkey) => SignaturePolicy {
+                required: true,
+                pubkey: Some(canonical_update_pubkey(pubkey)?),
+            },
+            None => SignaturePolicy {
+                required: false,
+                pubkey: None,
+            },
+        });
+    };
+    let committed = canonical_update_pubkey(committed)?;
+    let Some(material) = material_pubkey else {
+        return Err(Error::new(format!(
+            "{} {} = \"{committed}\" commits every cut for the pinned public channel to \
+             that signature, but ~/.aterm/release.conf provides no signing material — a \
+             keyless machine may not cut for a pinned channel; no ledger claim was made. \
+             Recover the offline signing configuration on this machine, or drop the pin \
+             in a tracked commit (the same deliberate act as removing {} itself)",
+            mirror::CHANNEL_TABLE,
+            mirror::CHANNEL_PUBKEY_KEY,
+            mirror::CHANNEL_KEY,
+        )));
+    };
+    let material = canonical_update_pubkey(material)?;
+    if material != committed {
+        return Err(Error::new(format!(
+            "the configured signing key's public identity {material} is not the committed \
+             channel pin {committed} ({} {}); refusing a release the pinned channel's \
+             clients would reject",
+            mirror::CHANNEL_TABLE,
+            mirror::CHANNEL_PUBKEY_KEY,
+        )));
+    }
+    Ok(SignaturePolicy {
+        required: true,
+        pubkey: Some(material),
+    })
 }
 
 /// Decode and re-emit the updater Ed25519 key so journal/config comparisons
@@ -3222,10 +3294,11 @@ pub struct VerifiedReleaseAsset {
     pub sha256: String,
 }
 
-// 2 GiB = GitHub's per-asset ceiling. Raised from 512 MiB 2026-08-02: the
-// batteries-included atpkg seed (715 MiB) pushed DMGs past the old cap.
-// Must stay equal to the client cap in aterm-update/src/github.rs.
-const UPDATER_MAX_DMG_BYTES: u64 = 2_147_483_648;
+// The shared bound in aterm-update-core is what the CLIENT actually enforces;
+// publishing against a private copy is how the two drifted (2026-08-02 raised
+// this side to 2 GiB, the client's container site kept 512 MiB, and 0.15.0
+// installs could accept a manifest whose payload they could never download).
+const UPDATER_MAX_DMG_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
 static RELEASE_ASSET_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn validate_release_asset_download_size(size: u64) -> Result<()> {
@@ -3787,25 +3860,22 @@ fn verify_release_asset_digest_inner(
 }
 
 fn preflight_signature_policy(repo: &Path) -> Result<SignaturePolicy> {
-    // Signing is OPTIONAL opt-in. The channel is Tier REPO (gh-authenticated
-    // private repo + SHA-256 + monotonic build number); no signing key and no
-    // permanent authority file are required to cut. When a complete signing
-    // configuration IS present in ~/.aterm/release.conf the cut signs under
-    // that key, but nothing in the repository or published history can force a
-    // machine without a key to sign — so any gh-authenticated machine can cut.
-    // Recovery uses this same verdict: there is no epoch/authority and no
-    // lost-key retired mode, so a keyless machine can recover an unsigned
-    // release and a key-configured machine keeps signing.
-    match load_signing_material(repo)? {
-        Some(material) => Ok(SignaturePolicy {
-            required: true,
-            pubkey: Some(material.pubkey),
-        }),
-        None => Ok(SignaturePolicy {
-            required: false,
-            pubkey: None,
-        }),
-    }
+    // Signing is opt-in UNLESS the workspace commits a channel pin. Without
+    // `[workspace.metadata.aterm] update_channel_pubkey` the channel is Tier
+    // REPO (SHA-256 + monotonic build number); no signing key is required to
+    // cut, a complete ~/.aterm/release.conf signs under its own key, and
+    // nothing in published history can force a machine without a key to sign
+    // (the ratchet is retired). WITH the pin, signing is committed channel
+    // policy: a keyless machine refuses pre-claim, and a configured key that
+    // is not the pinned key refuses by name. Recovery and the yank successor
+    // cut route through this same verdict, so a pinned channel cannot be
+    // reopened to unsigned bytes by any pipeline flavor.
+    committed_channel_signature_policy(
+        workspace_channel_pubkey(repo)?.as_deref(),
+        load_signing_material(repo)?
+            .as_ref()
+            .map(|material| material.pubkey.as_str()),
+    )
 }
 
 fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
@@ -5533,10 +5603,21 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let signature_policy = preflight_signature_policy(repo)?;
     step(
         "signature",
-        if signature_policy.required {
-            "signing key configured · matches persisted public identity"
-        } else {
-            "channel has no signature history and no signing configuration"
+        &match (
+            mirror::update_channel_pubkey(&cargo_text)?,
+            signature_policy.required,
+        ) {
+            (Some(pin), _) => format!(
+                "committed {} {} pins signing to {pin} · configured key matches",
+                mirror::CHANNEL_TABLE,
+                mirror::CHANNEL_PUBKEY_KEY
+            ),
+            (None, true) => {
+                "signing key configured · matches persisted public identity".to_string()
+            }
+            (None, false) => {
+                "no committed channel pin and no signing configuration".to_string()
+            }
         },
     );
 
@@ -5906,11 +5987,13 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
     assert_publisher_session(&git, lease, fence)
 }
 
-/// Re-derive the local optional-signing verdict while the exact owner+process
-/// token is held.  Equality includes the actual canonical key, not just a
-/// boolean: a cut whose signing key vanished, or whose signing configuration
-/// appeared, mid-cut aborts instead of proceeding under the stale key state it
-/// claimed under.
+/// Re-derive the signing verdict — the per-machine configuration folded with
+/// the committed channel pin — while the exact owner+process token is held.
+/// Equality includes the actual canonical key, not just a boolean: a cut whose
+/// signing key vanished, whose signing configuration appeared, or whose
+/// worktree pin changed mid-cut aborts instead of proceeding under the stale
+/// key state it claimed under. This is what holds the pinned-channel invariant
+/// at lock, preflip, and flip, not only at the pre-claim scan.
 fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
     if ctx.kind != CutKind::Real {
         return Ok(());
@@ -5921,8 +6004,8 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
         || observed.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
         return Err(Error::new(
-            "local signing configuration changed after this cut's pre-claim scan; \
-             refusing to build/upload/flip under stale signing state",
+            "local signing configuration or the committed channel pin changed after this \
+             cut's pre-claim scan; refusing to build/upload/flip under stale signing state",
         ));
     }
     ensure_ctx_release_lease(ctx)
