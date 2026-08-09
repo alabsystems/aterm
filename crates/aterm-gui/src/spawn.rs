@@ -641,6 +641,7 @@ pub(crate) fn spawn_session(
             crate::turn_ledger::TurnLedger::default(),
         )),
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),

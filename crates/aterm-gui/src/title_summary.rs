@@ -1692,9 +1692,15 @@ impl App {
         self.sync_settings_title_summary_health();
     }
 
-    fn refresh_title_presentation(&mut self, session: u64) {
-        let windows: Vec<WindowId> = self
-            .windows
+    pub(crate) fn refresh_title_presentation(&mut self, session: u64) {
+        let windows = self.windows_with_focused_session(session);
+        self.refresh_tab_chrome_windows(windows);
+    }
+
+    /// Windows showing this session as some tab's FOCUS — the tabs whose label
+    /// and composed tooltip are built from it.
+    pub(crate) fn windows_with_focused_session(&self, session: u64) -> Vec<WindowId> {
+        self.windows
             .iter()
             .filter(|(_, state)| {
                 state.tab_set.tabs().iter().any(|tab| {
@@ -1706,7 +1712,11 @@ impl App {
                 })
             })
             .map(|(wid, _)| *wid)
-            .collect();
+            .collect()
+    }
+
+    /// Rebuild and push each window's tab chrome once, then repaint it.
+    pub(crate) fn refresh_tab_chrome_windows(&mut self, windows: Vec<WindowId>) {
         for wid in windows {
             self.refresh_window_tabs(wid);
             if let Some(window) = self

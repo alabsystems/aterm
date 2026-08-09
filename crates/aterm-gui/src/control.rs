@@ -2341,6 +2341,7 @@ fn dispatch_app_verb(
         "act" => control_media::cmd_act(proxy, rest),
         "invoke" => control_media::cmd_invoke(proxy, rest),
         "rain" => control_media::cmd_rain(proxy, rest),
+        "tone" => control_media::cmd_tone(proxy, rest),
         "spawn" => control_media::cmd_spawn(proxy, rest),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         "tab" => control_input::cmd_tab(proxy, rest),
@@ -4826,6 +4827,10 @@ fn handle(
         // focused window's FRONT session. App-level per the rule above (`@peer rain
         // status` reads the peer's front session).
         "rain" => control_media::cmd_rain(proxy, rest),
+        // `tone [status]`: the FRONT window's tone-of-typing mood + every gate on
+        // the classifier. Read-only and App-level like `rain status` (`@peer tone`
+        // reads the peer's front window).
+        "tone" => control_media::cmd_tone(proxy, rest),
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
         // so fleet provisioning is a loop of spawn calls, no exec'ing binaries.
@@ -6746,6 +6751,7 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -6995,6 +7001,7 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -7173,6 +7180,7 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -7395,6 +7403,7 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),
@@ -7755,6 +7764,9 @@ mod tests {
                 "meta",
                 "timeline",
                 "metrics",
+                // `tone` OBSERVES the mood classifier; the knob it reports is
+                // rewritten through `settings` (ConfigWrite), never here.
+                "tone",
                 "scroll",
                 "select",
                 "ready",
@@ -9034,6 +9046,7 @@ mod tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),

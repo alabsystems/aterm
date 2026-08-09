@@ -48,6 +48,50 @@ pub fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Create `dir` (and parents) as a SHARED, world-traversable directory: `0755`.
+///
+/// The system-prefix counterpart of `ensure_private_dir`'s `0700`. A root-owned store
+/// exists precisely so every user can execute out of it, so it must be readable and
+/// traversable by all — while staying writable only by root, which is what the prefix
+/// chain check enforces and what Trust's launcher predicate requires
+/// (`mode & 0o022 == 0`). `0755` satisfies both; `0700` satisfies both checks too and
+/// then denies every non-root user at exec time.
+///
+/// Fails closed on a symlink at the target, mirroring `ensure_private_dir`: a
+/// pre-created link must never capture our writes.
+pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
+    if let Ok(md) = std::fs::symlink_metadata(dir)
+        && md.file_type().is_symlink()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{}: store directory is a symlink; refusing", dir.display()),
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+/// Whether a directory's metadata says it is SYSTEM-owned: owned by root (uid 0) and
+/// not group/other-writable.
+///
+/// The second trusted chain shape, and the one a verified toolchain requires. The
+/// `$HOME` chain check answers "no attacker-writable ancestor" by proving every
+/// component is ours; a root-owned chain answers the same question at least as
+/// strongly — nothing below root can swap a component — while additionally carrying
+/// PATHNAME EXECUTION AUTHORITY, which a user-owned path cannot. Trust's verified
+/// launcher rejects a user-owned toolchain outright ("user-owned toolchains cannot
+/// provide pathname execution authority"), so without this shape the verified lane is
+/// unreachable for anything atpkg installs.
+///
+/// Deliberately NOT "root-owned OR ours": admitting our own uid here would let the
+/// system prefix fall back to exactly the property the verified lane refuses.
+#[must_use]
+pub fn dir_meta_is_system(meta: &Metadata) -> bool {
+    meta.uid() == 0 && meta.mode() & 0o022 == 0
+}
+
 /// Whether a directory's metadata says it is private-write-safe: owned by our uid and
 /// not group/other-writable (the shared [`dir_safe_for_private_write`] predicate).
 #[must_use]

@@ -2099,6 +2099,23 @@ pub(crate) fn cmd_rain(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `tone [status]` -> one status line for the FRONT window's tone-of-typing
+/// state ([`crate::App::tone_status`]). Read-only: there is no `on`/`off`
+/// form because the knob is durable config (`settings set tone_melody …`) —
+/// this verb only ever observes. Main-thread hop like `rain`, since the
+/// tracker is per-window App state.
+pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    match rest.trim() {
+        "" | "status" => {}
+        other => return format!("ERR usage: tone [status] (got {other:?})\n"),
+    }
+    match call_main(proxy, |tx| Wake::ToneStatus { reply: tx }) {
+        Ok(Ok(msg)) => format!("OK {msg}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
 /// `spawn [cwd=<path>]` -> mint ONE new tab session in the frontmost window and
 /// reply `OK <sid>` — birth as a socket primitive. The sid is live in the registry
 /// before the reply is sent, so `@<sid> …` works immediately: an orchestrator

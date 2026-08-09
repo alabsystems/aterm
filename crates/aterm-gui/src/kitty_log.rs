@@ -1480,6 +1480,25 @@ impl KittyLogHost {
         self.companion
     }
 
+    /// The companion split by REASON — `(pinned favourite, discovery)` — for
+    /// the app-kitty precedence seam (`app_kitty::companion_precedence`,
+    /// owner spec 2026-08-07: favourite > app > discovery > session). A
+    /// pinned FAVOURITE is the user's explicit pick and outranks the app
+    /// kitty; a mere ambient/typed DISCOVERY does not. Exactly one side is
+    /// ever `Some`: the host's invariant is that a pinned favourite OWNS
+    /// `self.companion` (restart election, `observe`'s favourite guard, and
+    /// `favourite` itself all enforce it), so when the pin exists the
+    /// discovery slot reports empty. Cost per call: one bounded scan of the
+    /// collectible roster for the pin stamp (`favourite_look`), same as the
+    /// palette's `is_favourite`.
+    pub(crate) fn companion_looks(&mut self) -> (Option<KittyLook>, Option<KittyLook>) {
+        self.poll_initial_load();
+        match self.mem.favourite_look() {
+            Some(pinned) => (Some(pinned), None),
+            None => (None, self.companion),
+        }
+    }
+
     /// Snapshot for the settings overlay (memory only — no IO).
     #[cfg(test)]
     pub(crate) fn view(&self) -> KittyLogView {
@@ -3185,6 +3204,35 @@ mod tests {
         assert_eq!(rows.len(), 1, "a favourite re-stamps, it never duplicates");
         assert_eq!(rows[0].coat, 9, "the pin takes composition ownership");
         assert!(!rows[0].favourite.is_empty(), "and is stamped durably");
+    }
+
+    /// The app-kitty precedence seam's surface: `companion_looks` reports a
+    /// stumbled-on companion in the DISCOVERY slot (the app kitty may outrank
+    /// it) and moves it to the FAVOURITE slot the moment the user pins one
+    /// (nothing outranks a choice). Exactly one slot is ever occupied.
+    #[test]
+    fn companion_looks_splits_favourite_from_discovery() {
+        let lex = Lexicon::builtin();
+        let mut host = KittyLogHost::in_memory();
+        let now = Instant::now();
+
+        assert_eq!(host.companion_looks(), (None, None), "fresh install: floor");
+
+        let stumbled = coated(CatGlyphId::S100, 3);
+        host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
+        assert_eq!(
+            host.companion_looks(),
+            (None, Some(stumbled)),
+            "a stumbled discovery is NOT a favourite — the app kitty may pass it"
+        );
+
+        let pinned = coated(CatGlyphId::S100, 9);
+        host.favourite(&look_sighting(12, pinned), lex, now, true);
+        assert_eq!(
+            host.companion_looks(),
+            (Some(pinned), None),
+            "the pin occupies the favourite slot and empties the discovery slot"
+        );
     }
 
     /// A later automatic discovery still earns its hello, but it must not steal

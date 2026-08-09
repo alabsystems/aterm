@@ -35,6 +35,20 @@ pub const MAX_PACKAGES_CONFIG_BYTES: usize = 512 * 1024;
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct PackagesConfig {
+    /// `[packages].prefix`: the install prefix override. Absent ⇒
+    /// [`crate::store::default_prefix`].
+    ///
+    /// CHAIN-VALIDATED, never trusted as written: [`crate::store::vet_prefix`] admits
+    /// only a `$HOME` chain owned by our uid or a chain from `/` owned by root, each
+    /// with no group/other-writable or symlinked component, and falls back to the
+    /// default on any violation. So a hostile config can redirect the store only to a
+    /// place that is already at least as safe as the default.
+    ///
+    /// The reason to set it is the VERIFIED lane: Trust's verified launcher refuses a
+    /// user-owned toolchain path, so a toolchain installed under `$HOME` can only ever
+    /// be used unverified. Pointing this at a root-owned prefix (and installing as
+    /// root) is what makes `targo trust` usable on an atpkg-delivered toolchain.
+    pub prefix: Option<String>,
     /// Master for the background tools loop (the GUI's `spawn_pkg_update_check`).
     /// Default TRUE (today's behavior). Read by the GUI, not by atpkg's own
     /// verbs — an explicit `atpkg update` always works regardless.
@@ -119,6 +133,32 @@ pub enum LinkTarget {
     Repo(String),
     /// Neither shape (relative path, `~user`, URL-metacharacter slug, …).
     Invalid,
+}
+
+impl PackagesConfig {
+    /// The configured install prefix as an absolute path, or `None` for the default.
+    ///
+    /// `~`/`~/…` expands against `home` (same rule as `[packages.links]`: no `~user`).
+    /// A relative path resolves to `None` rather than being joined onto anything — a
+    /// prefix that depends on the process CWD is not a prefix. This performs NO trust
+    /// check; [`crate::store::vet_prefix`] is the sole authority on whether the result
+    /// is safe, and it fails closed to the default.
+    #[must_use]
+    pub fn prefix_path(&self, home: Option<&Path>) -> Option<PathBuf> {
+        let v = self.prefix.as_deref()?.trim();
+        if v.is_empty() {
+            return None;
+        }
+        if let Some(rest) = v.strip_prefix('~') {
+            let home = home?;
+            return match rest.strip_prefix('/') {
+                Some(tail) => Some(home.join(tail)),
+                None if rest.is_empty() => Some(home.to_path_buf()),
+                None => None, // `~user` is not supported
+            };
+        }
+        Path::new(v).is_absolute().then(|| PathBuf::from(v))
+    }
 }
 
 /// Classify one `[packages.links]` value. `home` backs `~` expansion (injected
@@ -425,5 +465,37 @@ mod tests {
         let map = repo_overrides(&cfg);
         assert_eq!(map.len(), 1, "only the validated owner/repo entry survives");
         assert_eq!(map.get("orc").map(String::as_str), Some("alabsystems/orc"));
+    }
+
+    /// `[packages].prefix` shapes. Trust is NOT decided here — `store::vet_prefix`
+    /// owns that and fails closed — so this only pins what the string resolves to.
+    #[test]
+    fn prefix_path_resolves_absolute_and_tilde_and_refuses_relative() {
+        let home = Path::new("/home/someone");
+        let of = |v: Option<&str>| PackagesConfig {
+            prefix: v.map(str::to_string),
+            ..PackagesConfig::default()
+        }
+        .prefix_path(Some(home));
+
+        assert_eq!(of(None), None, "absent ⇒ the default prefix");
+        assert_eq!(of(Some("   ")), None, "blank ⇒ the default prefix");
+        assert_eq!(
+            of(Some("/opt/aterm/pkg")),
+            Some(PathBuf::from("/opt/aterm/pkg")),
+            "an absolute system prefix survives to vet_prefix"
+        );
+        assert_eq!(
+            of(Some("~/pkgs")),
+            Some(home.join("pkgs")),
+            "`~/…` expands against home"
+        );
+        assert_eq!(of(Some("~")), Some(home.to_path_buf()), "bare `~` is home");
+        assert_eq!(of(Some("~root/pkg")), None, "`~user` is not supported");
+        assert_eq!(
+            of(Some("relative/pkg")),
+            None,
+            "a CWD-dependent prefix is not a prefix"
+        );
     }
 }

@@ -590,6 +590,13 @@ pub fn native_update_admission_model() -> Model {
 /// retained intent eligible. A blocked or failed attempt returns to the same
 /// retryable ready state. The mutant recreates the lost-wake regression by
 /// dropping intent solely because the manual check is active.
+///
+/// Terminal idleness is a bounded PREFERENCE, not a precondition: activity
+/// defers an attempt only while the grace window is open (`GraceWindowCloses`),
+/// because the previous unbounded rule let a machine that is never quiet keep a
+/// verified build staged forever. The mutant still attempts with neither quiet
+/// nor a closed window, which
+/// `AutomaticAttemptRequiresQuietOrClosedGraceWindow` rejects.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_auto_intent_model() -> Model {
@@ -615,6 +622,7 @@ pub fn native_update_auto_intent_model() -> Model {
             var quiet = 0;
             var parked = 0;
             var deferrals = 0;
+            var grace_expired = 0;
             action StartManualCheck when (phase == 0 && active_check == 0) {
                 phase = 1;
                 active_check = 1;
@@ -674,9 +682,19 @@ pub fn native_update_auto_intent_model() -> Model {
             ) {
                 intent = 1;
             }
+            // The bounded idle-preference window closes on a machine that keeps
+            // producing activity. Quiet is PREFERRED, never required forever:
+            // waiting on an unreachable idle sample is indistinguishable from
+            // refusing to update, which is the regression this models.
+            action GraceWindowCloses when (
+                phase == 2 && staged == 1 && intent == 1 &&
+                quiet == 0 && grace_expired == 0
+            ) {
+                grace_expired = 1;
+            }
             action Attempt when (
                 phase == 2 && staged == 1 && intent == 1 &&
-                (if Buggy == 1 { 1 } else { quiet }) == 1
+                (Buggy == 1 || quiet == 1 || grace_expired == 1)
             ) {
                 phase = 3;
                 attempts = if attempts <= MaxAttempts - 1 {
@@ -750,8 +768,12 @@ pub fn native_update_auto_intent_model() -> Model {
                         accepted == 0
                     }
                 };
-            invariant AutomaticAttemptRequiresQuiet:
-                if parked == 1 { quiet == 1 } else { quiet <= 1 };
+            invariant AutomaticAttemptRequiresQuietOrClosedGraceWindow:
+                if parked == 1 {
+                    quiet == 1 || grace_expired == 1
+                } else {
+                    quiet <= 1
+                };
             invariant DeferralsBounded: deferrals <= MaxDeferrals;
             invariant AcceptedAtMostOnce: accepted <= 1;
             invariant AttemptsBounded: attempts <= MaxAttempts;

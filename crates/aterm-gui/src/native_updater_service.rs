@@ -211,9 +211,27 @@ pub(crate) enum ApplyMode {
     /// Background policy: exact stage authority plus a short terminal-idle
     /// epoch is required before readers may park.
     Automatic,
+    /// Background policy whose bounded idle-preference window has closed. Exact
+    /// stage authority is unchanged and every safety gate still applies; only
+    /// the idle wait — and the activity revocation that mirrors it — is
+    /// dropped, so a machine that is never quiet still gets the update instead
+    /// of deferring until the user clicks Install. Distinct from `Immediate`
+    /// because no user asked for this one, so the log/notification wording and
+    /// the automatic retry budget still treat it as background work.
+    AutomaticPastGrace,
     /// Explicit user/control apply: bypasses only the idle delay, never safety.
     Immediate,
     CleanQuit,
+}
+
+impl ApplyMode {
+    /// Whether this attempt came from background policy rather than a person.
+    /// Both automatic lanes share the retry budget and the non-disruptive
+    /// surfacing; they differ only in whether idleness is still awaited.
+    #[must_use]
+    pub(crate) fn is_automatic(self) -> bool {
+        matches!(self, Self::Automatic | Self::AutomaticPastGrace)
+    }
 }
 
 /// Generation-bound request for the host's process-wide quit-readiness reducer.
@@ -314,6 +332,27 @@ impl ApplyAttemptTicket {
     #[must_use]
     pub(crate) fn target_build(&self) -> u64 {
         self.artifact_build
+    }
+
+    /// Test-only: drive a service into the exact state where this ticket is the
+    /// CURRENT apply, so `abort_apply` admits it. Without this seam the
+    /// completion path could only be tested by calling its policy helpers
+    /// directly — which is precisely how a permanently-latching completion path
+    /// survived a green suite: the helpers were tested, the path was not.
+    #[cfg(test)]
+    pub(crate) fn make_current_apply_for_test(&self, service: &mut NativeUpdaterService) {
+        service.snapshot.generation = self.generation;
+        service.snapshot.phase = UpdaterPhase::Applying;
+        service.snapshot.reexec_count = 1;
+        service.snapshot.staged = Some(StagedUpdate {
+            build: self.artifact_build,
+            version: "0.0.0".to_string(),
+            commit: Some(self.artifact_commit.clone()),
+            dmg_sha256: self.artifact_dmg_sha256.clone(),
+            changelog: None,
+            generation: self.generation,
+        });
+        service.active_apply = Some(self.clone());
     }
 
     /// Exact staged artifact digest bound into this apply authority.

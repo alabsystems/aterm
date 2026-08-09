@@ -516,8 +516,34 @@ impl Grid {
     /// every future scroll-off stages into an un-drainable `lazy_buffer` (unbounded
     /// growth) and all tiered history stays invisible (audit #5). No-op if not
     /// mid-window (already re-attached, or a reset re-created the store).
+    ///
+    /// The wedge guard — on EVERY exit, including the no-op early return, the
+    /// detach window is closed.
+    ///
+    /// This was stated as a compiler obligation (`ensures
+    /// !self.storage.scrollback_detached_for_reflow`, first measured provable
+    /// on stage2 51bf8a270, 2026-08-05). The clause is WITHDRAWN for now
+    /// because it ICEs the toolchain rather than proving anything:
+    /// `trustc 1.99.0-dev (6fbfab9f8)` panics with `trimmed_def_paths called,
+    /// diagnostics were expected but none were emitted` (rustc_errors/src/
+    /// lib.rs:478, in `DiagCtxtInner::drop`) whenever this crate is compiled
+    /// under `-Ztrust-verify=off` — which is the workspace-wide setting at
+    /// `.cargo/config.toml:35`, i.e. every ordinary build. Isolated to this one
+    /// clause by single-variable bisect: removing it compiles the crate clean,
+    /// restoring it panics, all else held equal. It also cannot survive the
+    /// public snapshot, whose `rust-toolchain.toml` is swapped to stock 1.97.1
+    /// by `publish/transforms.sh:81` and cannot PARSE `ensures` at all (`#[cfg]`
+    /// strips after parsing, so gating would not have helped).
+    ///
+    /// The obligation is kept as debug assertions on both exits until the
+    /// toolchain can carry it. RESTORE THE CLAUSE once trustc stops ICEing with
+    /// verification off and the public lane can parse contracts.
     pub fn abort_reflow_offload(&mut self) {
         if !self.storage.scrollback_detached_for_reflow {
+            debug_assert!(
+                !self.storage.scrollback_detached_for_reflow,
+                "abort_reflow_offload must close the detach window on every exit"
+            );
             return;
         }
         self.storage.scrollback_detached_for_reflow = false;
@@ -548,6 +574,10 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        debug_assert!(
+            !self.storage.scrollback_detached_for_reflow,
+            "abort_reflow_offload must close the detach window on every exit"
+        );
     }
 }
 

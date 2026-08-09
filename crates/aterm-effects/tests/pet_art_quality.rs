@@ -4,10 +4,10 @@
 //! The pet roster's art gate — the twin of `cat_art_quality.rs` for the
 //! full-body companion under `art/pet/`.
 //!
-//! The cat roster's assets are independent characters; the pet's 23 poses are
+//! The cat roster's assets are independent characters; the pet's 29 poses are
 //! frames of ONE animal that the renderer swaps in place at gait rate. That
 //! changes what needs pinning: a head glyph is wrong if it is ugly, but a pose
-//! is wrong if it disagrees with the other twenty-two. So the checks here are
+//! is wrong if it disagrees with the other twenty-eight. So the checks here are
 //! mostly about the roster being internally consistent, and about the two
 //! silent-corruption traps the pipeline has — coordinates outside the viewbox
 //! are CLAMPED without a word by the codegen's `quant`, and a mismatched viewbox
@@ -31,8 +31,16 @@ const PLANT_TOL: f32 = 4.5;
 /// that arc starts and ends at zero — so the leap ART is planted, and floating
 /// it too would double the clearance at exactly the frames the cat is meant to
 /// be touching down. A gallop, by contrast, gets no lift from the brain, so its
-/// two suspension frames carry their own.
-const AIRBORNE: &[&str] = &["pet_run_1", "pet_run_3"];
+/// two suspension frames carry their own. The rise/descend flight frames are
+/// mid-arc by definition (rise serves flight u < 0.25, descend u > 0.6, never
+/// the endpoints where lift returns to zero), so like the gallop's suspension
+/// frames they carry authored clearance.
+const AIRBORNE: &[&str] = &[
+    "pet_leap_descend",
+    "pet_leap_rise",
+    "pet_run_1",
+    "pet_run_3",
+];
 
 /// Layer ceiling — the hero budget from `docs/CAT_ART.md`, which the pet roster
 /// meets unchanged.

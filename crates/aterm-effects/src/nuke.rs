@@ -122,9 +122,9 @@ pub fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
 pub fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
     let (cw, ch) = (f32::from(cell_w.max(1)), f32::from(cell_h.max(1)));
     let (cols, rows) = match part {
-        NukePart::Cap => (6.0, 1.50),
-        NukePart::Stem => (2.0, 1.90),
-        NukePart::Skirt => (8.0, 0.55),
+        NukePart::Cap => (8.0, 2.00),
+        NukePart::Stem => (2.6, 2.00),
+        NukePart::Skirt => (10.0, 0.70),
     };
     let w = (cols * cw).round().clamp(4.0, 4.0 * ch) as u16;
     let h = (rows * ch).round().clamp(4.0, 2.0 * ch) as u16;
@@ -147,7 +147,10 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
     match part {
         NukePart::Cap => {
             fill_path(&mut tile, &[&NUKE_CAP_DOME], white, NUKE_A, fit);
-            fill_path(&mut tile, &[&NUKE_CAP_CURL], white, NUKE_A * 0.82, fit);
+            // Underside torus at a clearly lower alpha than the dome: the one
+            // tonal band that gives the dust-phase head its volume (UX
+            // re-review nit, 2026-08-07).
+            fill_path(&mut tile, &[&NUKE_CAP_CURL], white, NUKE_A * 0.66, fit);
             tile.disc(
                 0.26 * wf,
                 0.30 * hf,
@@ -169,6 +172,30 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
                 white,
                 NUKE_A * 0.90,
             );
+            // Crown highlights: brighter-alpha lobes along the top so the
+            // tint shades the head instead of filling it flat (a single-tint
+            // sprite can only shade through alpha — UX review, 2026-08-07:
+            // "one step from brown smudge").
+            tile.disc(0.40 * wf, 0.12 * hf, (0.11 * hf).max(1.0), white, 1.0);
+            tile.disc(0.62 * wf, 0.14 * hf, (0.09 * hf).max(1.0), white, 1.0);
+            // Edge speckle: eroded dust flecks just outside the silhouette's
+            // shoulders — fixed offsets, deterministic like everything baked.
+            for &(sx, sy, sr, sa) in &[
+                (0.035f32, 0.44f32, 0.045f32, 0.38f32),
+                (0.075, 0.28, 0.035, 0.30),
+                (0.955, 0.42, 0.045, 0.38),
+                (0.925, 0.26, 0.035, 0.30),
+                (0.30, 0.02, 0.030, 0.34),
+                (0.72, 0.03, 0.030, 0.34),
+            ] {
+                tile.disc(
+                    sx * wf,
+                    sy * hf,
+                    (sr * hf.max(wf * 0.4)).max(1.0),
+                    white,
+                    NUKE_A * sa,
+                );
+            }
         }
         NukePart::Stem => {
             fill_path(&mut tile, &[&NUKE_STEM], white, NUKE_A, fit);
@@ -180,6 +207,22 @@ pub fn bake_nuke(w: u16, h: u16, part: NukePart) -> Tile {
                 white,
                 NUKE_A * 0.70,
             );
+            // CHARRED, not swallowed (UX review nit 7, 2026-08-08): the
+            // column's base ramps translucent over its bottom ~30% so the
+            // word it stands on ghosts through dimmed — reading as scorched
+            // under the blast — and re-saturates untouched when the cloud
+            // ends. A straight per-pixel alpha ramp after the fills; the
+            // tile stays a pure function of `(part, w, h)`.
+            let ramp_top = (0.70 * hf) as u32;
+            let span = (u32::from(h).saturating_sub(ramp_top)).max(1) as f32;
+            let px = tile.pixels_mut();
+            for y in ramp_top..u32::from(h) {
+                let scale = 1.0 - 0.58 * ((y - ramp_top) as f32 / span);
+                for x in 0..u32::from(w) {
+                    let a = &mut px[((y * u32::from(w) + x) * 4 + 3) as usize];
+                    *a = (f32::from(*a) * scale) as u8;
+                }
+            }
         }
         NukePart::Skirt => {
             fill_path(&mut tile, &[&NUKE_SKIRT], white, NUKE_A * 0.62, fit);
@@ -200,16 +243,21 @@ pub struct NukeDraw {
 }
 
 const FLASH_CORE: u32 = 0x00FF_F6E0;
-const CAP_HOT: u32 = 0x00FF_C466;
-const CAP_DUST: u32 = 0x009A_8272;
-const STEM_HOT: u32 = 0x00FF_D79A;
+const CAP_HOT: u32 = 0x00FF_A94A;
+const CAP_DUST: u32 = 0x008F_7668;
+const STEM_HOT: u32 = 0x00FF_C070;
 const STEM_DUST: u32 = 0x00B0_8D74;
 const SKIRT_TONE: u32 = 0x00C8_B49C;
+/// The molten heart under the cap — the fire the dust hasn't swallowed yet.
+const CORE_HOT: u32 = 0x00FF_E9B0;
 
 /// Heat → dust. The whole cloud cools on ONE clock so the cap and the stem can
-/// never disagree about how old the blast is.
+/// never disagree about how old the blast is. Cooling starts only once the
+/// bloom is well underway (owner, 2026-08-07 "the mushroom cloud isn't good
+/// enough": the old 900 ms onset had the cap ~60% dust the moment it appeared
+/// — the hero moment rendered washed-out tan instead of fire-lit).
 fn cool(t_ms: u64) -> f32 {
-    aterm_scene::smoothstep((t_ms.saturating_sub(900) as f32 / 1700.0).clamp(0.0, 1.0))
+    aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
 }
 
 /// The tier's flash-core tint, for the host's `0..FLASH_END_MS` crown.
@@ -240,11 +288,10 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             // Ease-out cubic: the column leaves the ground fast and settles.
             let rise = 1.0 - (1.0 - q) * (1.0 - q) * (1.0 - q);
             Some(NukeDraw {
-                sx: 0.70 + 0.30 * rise,
+                sx: 0.85 + 0.35 * rise,
                 sy: 0.15 + 0.85 * rise,
                 dy_cells: -0.35 * (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0),
-                alpha: (q * 3.0).min(1.0)
-                    * fade(CAP_BLOOM_END_MS, NUKE_TOTAL_MS - CAP_BLOOM_END_MS),
+                alpha: (q * 3.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
                 tint: aterm_scene::mix_rgb(STEM_HOT, STEM_DUST, c),
             })
         }
@@ -260,14 +307,18 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             // it read as billowing rather than inflating.
             let bloom = (1.0 - (1.0 - q) * (1.0 - q) * (1.0 - q))
                 + 0.06 * (core::f32::consts::PI * q).sin();
-            let spread = 1.0
-                + 0.25 * (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0).clamp(0.0, 1.0);
+            let tail = (t_ms.saturating_sub(CAP_BLOOM_END_MS) as f32 / 1700.0).clamp(0.0, 1.0);
+            let spread = 1.0 + 0.55 * tail;
             Some(NukeDraw {
-                sx: (0.35 + 0.65 * bloom) * spread,
-                sy: (0.40 + 0.60 * bloom) * (1.0 + 0.10 * (spread - 1.0)),
-                dy_cells: -0.60 * (t_ms.saturating_sub(CAP_BLOOM_START_MS) as f32 / 2700.0),
-                alpha: (q * 4.0).min(1.0)
-                    * fade(CAP_BLOOM_END_MS, NUKE_TOTAL_MS - CAP_BLOOM_END_MS),
+                sx: (0.45 + 0.75 * bloom) * spread,
+                sy: (0.50 + 0.62 * bloom) * (1.0 + 0.15 * (spread - 1.0)),
+                // The cap rides the TOP of the column from the moment it
+                // blooms (UX review, 2026-08-07: anchored at the baseline it
+                // swallowed the stem and read as a ground blob, not a
+                // mushroom) — up ~a row above the stem at bloom, then the
+                // whole head keeps climbing through the dust tail.
+                dy_cells: -(0.90 + 0.60 * q) - 0.70 * tail,
+                alpha: (q * 4.0).min(1.0) * fade(SKIRT_END_MS, NUKE_TOTAL_MS - SKIRT_END_MS),
                 tint: aterm_scene::mix_rgb(CAP_HOT, CAP_DUST, c),
             })
         }
@@ -278,7 +329,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             let q = ((t_ms - SKIRT_START_MS) as f32 / (SKIRT_END_MS - SKIRT_START_MS) as f32)
                 .clamp(0.0, 1.0);
             Some(NukeDraw {
-                sx: 0.40 + 1.50 * q,
+                sx: 0.60 + 2.60 * q,
                 sy: 1.0,
                 dy_cells: 0.10 * q,
                 alpha: 0.70 * (core::f32::consts::PI * q).sin().max(0.0),
@@ -286,6 +337,38 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
             })
         }
     }
+}
+
+/// The MOLTEN CORE pass — the same baked cap tile drawn a second time, smaller
+/// and hotter, hugging the underside of the head where the torus rolls. One
+/// tint per sprite is the lane's rule, so hue contrast inside the cloud takes
+/// a second sprite, not a second tile: same `(part, w, h)` cache slot, zero
+/// extra bake budget. It dies while the dust cap is still spreading — fire
+/// first, dust after — which is what makes the head read as burning from
+/// inside instead of flat-tinted.
+#[must_use]
+pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
+    const CORE_END_MS: u64 = 2_900;
+    if !(CAP_BLOOM_START_MS..CORE_END_MS).contains(&t_ms) {
+        return None;
+    }
+    let cap = nuke_draw(t_ms, NukePart::Cap)?;
+    let q = ((t_ms - CAP_BLOOM_START_MS) as f32 / (CAP_BLOOM_END_MS - CAP_BLOOM_START_MS) as f32)
+        .clamp(0.0, 1.0);
+    let die = 1.0
+        - ((t_ms.saturating_sub(CAP_BLOOM_END_MS)) as f32
+            / (CORE_END_MS - CAP_BLOOM_END_MS) as f32)
+            .clamp(0.0, 1.0);
+    Some(NukeDraw {
+        sx: cap.sx * 0.58,
+        sy: cap.sy * 0.52,
+        dy_cells: cap.dy_cells,
+        alpha: (q * 4.0).min(1.0) * die * 0.92,
+        // Warm cream toward orange — never the near-white FLASH_CORE (UX
+        // review, 2026-08-07: at small cell sizes a white core is
+        // indistinguishable from the block cursor on the same line).
+        tint: aterm_scene::mix_rgb(CORE_HOT, CAP_HOT, 0.35 + 0.45 * q),
+    })
 }
 
 #[cfg(test)]
@@ -361,6 +444,32 @@ mod tests {
                 nuke_draw(NUKE_TOTAL_MS, part).is_none(),
                 "{part:?} outlived the detonation"
             );
+        }
+        // The molten core lives strictly inside the cap's window and dies
+        // while the dust is still spreading — fire first, dust after.
+        assert!(nuke_core_draw(CAP_BLOOM_START_MS - 1).is_none());
+        assert!(nuke_core_draw(CAP_BLOOM_START_MS).is_some());
+        assert!(
+            nuke_core_draw(NUKE_TOTAL_MS - 1).is_none(),
+            "core must die before the dust"
+        );
+        let core = nuke_core_draw(1_400).expect("core mid-bloom");
+        let cap = nuke_draw(1_400, NukePart::Cap).expect("cap mid-bloom");
+        assert!(
+            core.sx < cap.sx && core.sy < cap.sy,
+            "the core sits INSIDE the cap"
+        );
+        assert_ne!(core.tint, cap.tint, "the core must be hotter than the dust");
+        for t in (0..NUKE_TOTAL_MS + 200).step_by(10) {
+            if let Some(d) = nuke_core_draw(t) {
+                assert!(d.sx.is_finite() && d.sy.is_finite() && d.dy_cells.is_finite());
+                assert!(
+                    (0.0..=1.0).contains(&d.alpha),
+                    "core alpha {} at {t}ms",
+                    d.alpha
+                );
+                assert!(d.sx > 0.0 && d.sy > 0.0);
+            }
         }
     }
 

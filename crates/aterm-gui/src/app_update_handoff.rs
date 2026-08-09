@@ -1569,6 +1569,12 @@ impl App {
 
         let live: Vec<(u64, i32, i32)> =
             self.pool.iter().map(|s| (s.id, s.master, s.pid)).collect();
+        // Watching this epoch is what lets activity REVOKE a parked handoff
+        // mid-flight. `AutomaticPastGrace` deliberately opts out: it exists
+        // precisely because the machine never went quiet, so arming a revocation
+        // on activity would guarantee the rollback it is supposed to avoid.
+        // The rollback stays lossless either way — this only decides whether a
+        // keystroke is allowed to cancel an update that is already landing.
         let automatic_activity_epoch = (mode
             == crate::native_updater_service::ApplyMode::Automatic)
             .then_some(self.update_handoff_activity_epoch);
@@ -1817,7 +1823,11 @@ impl App {
         // Classified as an activity deferral (matching the old disposition for
         // a death observed here): intent is retained and the next quiet-window
         // attempt sees the post-exit session set.
-        if automatic_activity_epoch.is_some() && handoff_masters_closed(&live) {
+        // GATED ON THE LANE, NOT ON THE ACTIVITY EPOCH. Session DEATH is a
+        // safety fact, not an idleness preference: `AutomaticPastGrace` opts out
+        // of activity revocation above, but it must still refuse to commit an
+        // adoption proof whose live set died underneath it.
+        if mode.is_automatic() && handoff_masters_closed(&live) {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::activity(
                 "a PTY session closed during automatic reader park",
@@ -2421,7 +2431,7 @@ impl App {
         // PreparationFailed/plain Rejected without the flag) stay manual-only.
         let activity_revoked = (outcome == crate::UpdateHandoffOutcome::ActivityRevoked
             || pending.revoked_by_activity)
-            && pending.mode == crate::native_updater_service::ApplyMode::Automatic;
+            && pending.mode.is_automatic();
         let teardown = match (pending.mode, pending.teardown) {
             // Construction records this eagerly; keep a fail-safe derivation from
             // the typed mode so a future constructor cannot strand an authorized
@@ -2446,6 +2456,7 @@ impl App {
             (Some(attempt), None) => Some(self.abort_reaped_native_apply_before_reconcile(
                 &attempt,
                 format!("overlap handoff failed safely: {detail}"),
+                activity_revoked,
             )),
         };
         if let Some(surfaced) = surfaced {

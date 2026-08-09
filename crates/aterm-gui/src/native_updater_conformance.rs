@@ -635,6 +635,7 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
             work_active: service.snapshot().active.is_some(),
             applying: false,
             activity_quiet: true,
+            activity_grace_expired: false,
             staged_ready: false,
             staged_build: None,
             staged_exact_target: false,
@@ -674,11 +675,15 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
             work_active: service.snapshot().active.is_some(),
             applying: false,
             activity_quiet: true,
+            activity_grace_expired: false,
             staged_ready: true,
             staged_build,
             staged_exact_target: true,
         }),
-        PollDecision::Attempt { build: 11 }
+        PollDecision::Attempt {
+            build: 11,
+            quiet: true
+        }
     );
     let quiet = model.successors("QuietElapsed", &modeled)[0].clone();
     assert_exact_model_action(&model, "QuietElapsed", &modeled, &quiet);
@@ -709,6 +714,78 @@ fn real_auto_intent_survives_manual_check_collision_and_unsuccessful_attempts() 
     let manual_only = model.successors("AttemptPhysicalFailure", &modeled)[0].clone();
     assert_exact_model_action(&model, "AttemptPhysicalFailure", &modeled, &manual_only);
     assert!(model.check_invariant("PhysicalFailureIsManualOnly", &manual_only));
+}
+
+/// Bind the model's `GraceWindowCloses` transition to the genuine poll policy.
+///
+/// THE REGRESSION: `activity_quiet` samples a MACHINE-WIDE input clock plus every
+/// live PTY's latest output. On a daily driver those are basically never
+/// simultaneously idle, so the old "activity always defers" rule meant a
+/// verified staged build waited for a moment that never arrived — and the user
+/// ended up clicking Install by hand, which is the exact outcome automatic apply
+/// exists to remove. Deferral is now bounded: inside the window activity still
+/// wins, past it the lossless lane lands anyway and reports `quiet: false` so the
+/// host takes the lane that activity cannot revoke.
+#[test]
+fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
+    let model = native_update_auto_intent_model();
+    let mut modeled = model.init_state();
+    for action in ["StageWakeIdle", "Activity"] {
+        let after = model.successors(action, &modeled)[0].clone();
+        assert_exact_model_action(&model, action, &modeled, &after);
+        modeled = after;
+    }
+    assert_eq!(modeled["quiet"], 0, "the machine is busy");
+
+    let busy = PollFacts {
+        enabled: true,
+        deadline_ready: true,
+        current_build: 10,
+        target_build: 11,
+        work_active: false,
+        applying: false,
+        activity_quiet: false,
+        activity_grace_expired: false,
+        staged_ready: true,
+        staged_build: Some(11),
+        staged_exact_target: true,
+    };
+    // Inside the window the real policy waits, exactly as the model's `Activity`
+    // step leaves it: intent retained, nothing consumed.
+    assert_eq!(poll(busy), PollDecision::Wait(WaitReason::Activity));
+    assert!(model.check_invariant("UnsuccessfulAttemptRetainsIntent", &modeled));
+
+    let closed = model.successors("GraceWindowCloses", &modeled)[0].clone();
+    assert_exact_model_action(&model, "GraceWindowCloses", &modeled, &closed);
+    assert_eq!(closed["grace_expired"], 1);
+
+    // Past it, the same still-busy facts attempt.
+    assert_eq!(
+        poll(PollFacts {
+            activity_grace_expired: true,
+            ..busy
+        }),
+        PollDecision::Attempt {
+            build: 11,
+            quiet: false
+        }
+    );
+    let attempted = model.successors("Attempt", &closed)[0].clone();
+    assert_exact_model_action(&model, "Attempt", &closed, &attempted);
+    assert_eq!(attempted["parked"], 1);
+    assert!(model.check_invariant(
+        "AutomaticAttemptRequiresQuietOrClosedGraceWindow",
+        &attempted
+    ));
+
+    // Negative control: parking with neither a quiet machine nor a closed window
+    // is the unsafe shape the invariant exists to reject.
+    let mut unbounded = attempted.clone();
+    unbounded.insert("grace_expired", 0);
+    assert!(!model.check_invariant(
+        "AutomaticAttemptRequiresQuietOrClosedGraceWindow",
+        &unbounded
+    ));
 }
 
 #[test]
@@ -788,11 +865,15 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
             work_active: false,
             applying: false,
             activity_quiet: crate::automatic_output_activity_quiet(quiet_now_ns, latest_output_ns,),
+            activity_grace_expired: false,
             staged_ready: true,
             staged_build: Some(11),
             staged_exact_target: true,
         }),
-        PollDecision::Attempt { build: 11 }
+        PollDecision::Attempt {
+            build: 11,
+            quiet: true
+        }
     );
     let attempted = model.successors("Attempt", &state)[0].clone();
     assert_exact_model_action(&model, "Attempt", &state, &attempted);

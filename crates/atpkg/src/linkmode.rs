@@ -156,7 +156,7 @@ pub fn link(
     // Validate the complete marker before mutating any shim, so a request
     // which cannot be recorded never leaves a partially linked dev loop.
     serialize_marker(&marker).map_err(|e| LinkError::Io(e.to_string()))?;
-    ensure_private_dir(&layout.bin_dir()).map_err(|e| LinkError::Io(e.to_string()))?;
+    layout.ensure_dir(&layout.bin_dir()).map_err(|e| LinkError::Io(e.to_string()))?;
     ensure_private_dir(&layout.links_dir()).map_err(|e| LinkError::Io(e.to_string()))?;
 
     let mut linked = Vec::new();

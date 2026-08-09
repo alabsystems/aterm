@@ -86,7 +86,7 @@ impl std::error::Error for StoreLockError {}
 /// separate open file descriptions independently, same-process or not).
 pub fn try_lock_store(layout: &Layout) -> Result<StoreLock, StoreLockError> {
     let path = layout.store_lock();
-    if let Err(e) = crate::platform::ensure_private_dir(&layout.prefix) {
+    if let Err(e) = layout.ensure_dir(&layout.prefix) {
         return Err(StoreLockError::Io(path, e));
     }
     let mut opts = std::fs::OpenOptions::new();

@@ -294,7 +294,7 @@ pub fn reconcile_source(
     // The hardened prefix must exist BEFORE the first ledger write / installing-shim (those
     // are best-effort and would otherwise silently no-op until `build_and_install` creates
     // it), so the `building` state + progress UX are observable from the start.
-    let _ = crate::platform::ensure_private_dir(&layout.prefix);
+    let _ = layout.ensure_dir(&layout.prefix);
     let mut ledger = Ledger::read(layout);
     let mut out = Vec::new();
 

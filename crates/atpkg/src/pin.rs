@@ -16,7 +16,6 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::platform::ensure_private_dir;
 use crate::store::Layout;
 
 const MAX_PIN_FILE_BYTES: usize = 256 * 1024;
@@ -80,7 +79,7 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
         set.remove(program)
     };
     // Harden the (vetted) prefix and write atomically.
-    ensure_private_dir(&layout.prefix)?;
+    layout.ensure_dir(&layout.prefix)?;
     let dest = pins_path(layout);
     let tmp = layout
         .prefix

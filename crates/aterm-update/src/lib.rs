@@ -308,9 +308,11 @@ pub enum ApplyOutcome {
 /// `ATERM_NO_AUTO_UPDATE`. It no longer requires a pinned anchor — the default Tier
 /// REPO works with none (see the crate-level trust model), so an internal build with no
 /// Apple Developer ID and no signing key still self-updates. Dev-build inertness comes
-/// from [`bundle::resolve`] (a `cargo run` / `target/` binary is not an installed
-/// `.app`), not from a missing pin. On non-macOS targets both entry points are
-/// unconditional no-ops, so this is false.
+/// from [`bundle::resolve`], not from a missing pin, and has two sources there: the
+/// LAYOUT (a `cargo run` / `target/` binary is not an installed `.app`) and the
+/// codesign-sealed [`bundle::DEV_BUILD_KEY`] mark (a local build installed in place,
+/// which layout alone cannot distinguish from a release). On non-macOS targets both
+/// entry points are unconditional no-ops, so this is false.
 #[must_use]
 pub fn enabled() -> bool {
     cfg!(target_os = "macos") && std::env::var_os("ATERM_NO_AUTO_UPDATE").is_none()
@@ -605,7 +607,9 @@ pub struct InstalledUpdateFacts {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
-    let installed = bundle::resolve()?;
+    // Pure observation — a dev-marked build's provenance is no less true, so report
+    // it rather than blanking the panel. See `bundle::resolve_layout`.
+    let installed = bundle::resolve_layout()?;
     // Info.plist values are only codesign-sealed evidence after the complete
     // configured policy gate succeeds. This runs on the updater facts worker,
     // never the event loop, so fail-closed verification adds no input latency.
@@ -718,6 +722,10 @@ pub fn spawn_background_check(
             loop {
                 match check_lane().try_lock() {
                     Ok(_lane) => {
+                        // Stamped BEFORE the check so the ledger can be asked, after
+                        // it, whether THIS check recorded a failure (see the `Ok(None)`
+                        // arm). RFC3339 strings compare chronologically.
+                        let check_started = install::now_rfc3339();
                         match github::check_and_stage(current_build, &source) {
                             Ok(Some(v)) => {
                                 emit(failures.success());
@@ -762,8 +770,36 @@ pub fn spawn_background_check(
                             Ok(None) => {
                                 // A completed check that found nothing to do is a
                                 // SUCCESS: the network and the token both worked.
-                                emit(failures.success());
-                                schedule.succeeded();
+                                //
+                                // Unless it wrote a FAILURE to the ledger on its way
+                                // here. The manifest dead-end — an authoritative
+                                // release that cannot be trusted — records its class
+                                // and then returns `Ok(None)`, so it used to land in
+                                // this arm and be counted as a success: no failure
+                                // line, and `schedule.succeeded()` kept the cadence at
+                                // full speed. That is why the 2026-07-25 machine
+                                // reached 597 failures instead of backing off — ~13h
+                                // at an un-backed-off 75s cadence is ~624 checks.
+                                // Ask the ledger rather than trusting the return
+                                // value: a check that recorded a failure is not a
+                                // success, whatever it returned.
+                                let recorded_failure =
+                                    paths::Staging::resolve().is_some_and(|s| {
+                                        health::Health::read(&s.health())
+                                            .last_failure_at
+                                            .as_str()
+                                            >= check_started.as_str()
+                                    });
+                                if recorded_failure {
+                                    emit(Some(failures.failure(
+                                        "no usable release this check — run \
+                                         `aterm-ctl update status` for the reason",
+                                    )));
+                                    schedule.failed();
+                                } else {
+                                    emit(failures.success());
+                                    schedule.succeeded();
+                                }
                             }
                             Err(e) => {
                                 emit(Some(failures.failure(&e)));
@@ -804,16 +840,43 @@ pub fn spawn_background_check(
                     let streak_secs =
                         install::rfc3339_delta_secs(&h.failing_since, &install::now_rfc3339());
                     let long_lived = streak_secs.is_some_and(|d| d >= 30 * 60);
-                    if h.is_persistent() && active && long_lived && !notified_failing {
+                    if let Some((class, count)) = h.persistent_class()
+                        && active
+                        && long_lived
+                        && !notified_failing
+                    {
                         notified_failing = true;
+                        // The COUNT and the sentence both come from the class that
+                        // escalated. A single hardcoded pipeline story told an
+                        // apply-stranded machine "0 consecutive checks … cannot be
+                        // downloaded" — wrong number, wrong lane, and it sent the
+                        // reader hunting a download fault that did not exist.
+                        let cause = match class {
+                            "manifest" => format!(
+                                "the newest release cannot be trusted ({}) — this Mac \
+                                 stays on build {current_build} until it is republished",
+                                h.last_error
+                            ),
+                            "stage" => format!(
+                                "updates download but will not verify or install ({})",
+                                h.last_error
+                            ),
+                            "apply" => format!(
+                                "an update is downloaded and verified but will not start \
+                                 ({})",
+                                h.last_apply_error
+                            ),
+                            // "pipeline", and any future class, keeps the original text.
+                            _ => "release manifests exist but cannot be downloaded — \
+                                  this build's update pipeline is likely broken"
+                                .to_string(),
+                        };
                         cb(
                             "aterm auto-update is failing".to_string(),
                             format!(
-                                "{} consecutive checks since {}: release manifests exist \
-                                 but cannot be downloaded — this build's update pipeline \
-                                 is likely broken. Run `aterm-ctl update status` for \
-                                 details.",
-                                h.pipeline_failures, h.failing_since
+                                "{count} consecutive checks since {}: {cause}. Run \
+                                 `aterm-ctl update status` for details.",
+                                h.failing_since
                             ),
                         );
                     } else if !h.is_persistent() {

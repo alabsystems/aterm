@@ -25,7 +25,9 @@ use aterm_render::{
 };
 
 use crate::effect_util::{
-    fire_ramp, lerp_rgb, push_fx_rect as push_rect, push_twinkle_star, twinkle_rgb, water_ramp,
+    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT,
+    STAR_GLINT_COV, STAR_WAIST, dust_r, fire_ramp, lerp_rgb, push_fx_rect as push_rect,
+    push_twinkle_star, star_accent, star_arm, twinkle_env, twinkle_peak, twinkle_rgb, water_ramp,
 };
 use crate::trail_sweep::{line_cells_tail, row_sweep_cells, wrap_fold_cells};
 use crate::typing_momentum::TypingMomentum;
@@ -179,6 +181,25 @@ pub struct GlowConfig {
     /// [`HaloMode::Over`] source-over veils so it reads on white too.
     /// Default true.
     pub dark_theme: bool,
+    /// The theme's resolved DEFAULT FOREGROUND and BACKGROUND, `0x00RRGGBB`,
+    /// with OSC 10/11 and DECSCNM already folded in by the host (the canonical
+    /// expression wherever a `Terminal` is in scope is
+    /// `rgb_to_u32(terminal_blank_cell(term).fg / .bg)`).
+    ///
+    /// Only the fresh-typed GLYPH TINT reads them, and it reads them for two
+    /// things it cannot do without: it ANCHORS on `theme_fg` so the tint hands
+    /// the foreground back bit-exactly instead of stepping to a guessed
+    /// constant, and it BOUNDS itself against `theme_bg` by real WCAG contrast
+    /// instead of against a fixed luminance chosen for the light themes that
+    /// happened to be considered.
+    ///
+    /// A host that cannot resolve one may pass [`aterm_core::render::COLOR_UNSET`];
+    /// the tint suppresses itself rather than masking the sentinel's high byte
+    /// into a colour (which would read as pure black and flip the ink side).
+    /// `fg == bg` — a conceal-shaped theme — suppresses for the same reason
+    /// `floor_min_contrast_fg` refuses to reveal what a theme concealed.
+    pub theme_fg: u32,
+    pub theme_bg: u32,
     /// Whether this style draws its OWN additive comet BEAM (the anti-aliased
     /// streak of light along the swept path). FALSE for the two styles whose
     /// streak is drawn elsewhere: `water` (its fluid wave wake — no laser
@@ -288,6 +309,27 @@ const RAINBOW_BANDS: [u32; 6] = [
     0x0066_33FF, // indigo/violet
 ];
 
+/// [`RAINBOW_BANDS`] pre-decomposed into HSV (degrees, s, v) — the INVARIANT
+/// half of the momentum iridescence.
+///
+/// `rotate_hue` is an RGB→HSV→RGB round trip, and the ribbon spins all six
+/// anchors on every swept cell of every hot frame. But the input side of that
+/// round trip is six COMPILE-TIME CONSTANTS: `rgb2hsv` was being handed
+/// `0x00FF_0000` and friends ~60 times a frame to be told, again, that red is
+/// at 0°. Only the `+ turns` and the way back out actually depend on the frame.
+/// Decomposing once here and keeping [`rotate_hue`] to the hsv2rgb half leaves
+/// the emitted bytes untouched — the surviving expression is character-for-
+/// character the one that used to run — while deleting the whole rgb2hsv side
+/// from the per-cell path.
+static RAINBOW_BANDS_HSV: std::sync::LazyLock<[(f32, f32, f32); RAINBOW_BANDS.len()]> =
+    std::sync::LazyLock::new(|| {
+        let mut out = [(0.0f32, 0.0f32, 0.0f32); RAINBOW_BANDS.len()];
+        for (slot, &band) in out.iter_mut().zip(RAINBOW_BANDS.iter()) {
+            *slot = crate::color_math::rgb2hsv(band);
+        }
+        out
+    });
+
 // ---- ADDITIVE-LIGHT BUDGET OVER TEXT (the legibility bound) ---------------
 //
 // TWO caps below, not one budget divided, because the layers compose along
@@ -372,10 +414,18 @@ const RAINBOW_TRANSIENT_COV_CAP: f32 = 118.0;
 /// only ever darken, because its bright half re-clamped. Every "magic" channel
 /// in this emitter was arithmetically dead wherever the ribbon was hot — the
 /// only place it exists.
+/// RE-DERIVED 2026-08-04 for the FLAT-SLAB colour law ([`rainbow_slab_at`]).
+/// The previous table was fitted against a continuous gradient and was a smooth
+/// ramp; it is WRONG for slabs, because a slab holds its band's brightest
+/// representative across its whole width where the gradient only touched it at
+/// a point. Emitting flat bands under the old ramp measured 5.168:1 against the
+/// 5.25:1 bar. This table is stepped — one solution per band, which is what a
+/// flat band admits — and is produced by the `generate_rainbow_band_cov_caps`
+/// generator that this doc has always named but that did not exist until now.
 const RAINBOW_BAND_COV_CAPS: [f32; 33] = [
-    90.0, 82.0, 76.0, 69.0, 64.0, 59.0, 58.0, 58.0, 58.0, 58.0, 59.0, 59.0, 57.0, 57.0, 57.0, 59.0,
-    60.0, 62.0, 63.0, 62.0, 62.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 66.0, 73.0, 80.0, 91.0,
-    103.0, 120.0,
+    99.0, 99.0, 99.0, 99.0, 99.0, 58.0, 58.0, 58.0, 58.0, 58.0, 58.0, 57.0, 57.0, 57.0, 57.0, 57.0,
+    57.0, 62.0, 62.0, 62.0, 62.0, 62.0, 63.0, 63.0, 63.0, 63.0, 63.0, 63.0, 120.0, 120.0, 120.0,
+    120.0, 120.0,
 ];
 
 /// The largest value any entry of [`RAINBOW_BAND_COV_CAPS`] can take — the bound
@@ -410,9 +460,17 @@ fn rainbow_band_coverage(requested: f32, t: f32) -> f32 {
 /// by `OVER_INK_COV_CAP * 1.5` (72): stars are placed off-glyph by design, so
 /// they get more than the on-glyph share, but the clamp must actually BIND —
 /// every envelope factor here is <= 1, so a ceiling at or above
-/// [`RAINBOW_STAR_COV`] would be dead code. At 88 the peak is 62 at the shipping
-/// 0.7 intensity — ground (26,27,38) -> (88,89,100), still clearly a starfield.
-const RAINBOW_STAR_COV: f32 = 88.0;
+/// [`RAINBOW_STAR_COV`] would be dead code.
+///
+/// RAISED 88 -> 118 on 2026-08-06 (owner: "more white sparkles and more bright
+/// stars. I'd like more"). At 88 the peak was 62 at the shipping 0.7 intensity —
+/// under the 72 clamp, so the CLAMP WAS DEAD and the stars were intensity-bound
+/// rather than bounded by the certified ceiling. At 118 the shipping peak is
+/// 82.6, so the `OVER_INK_COV_CAP * 1.5` clamp now genuinely BINDS at 72, which
+/// is what this doc has always claimed it does. The stars get brighter AND the
+/// legibility bound becomes load-bearing instead of vacuous — strictly better on
+/// both axes. The clamp, not this constant, is the safety property.
+const RAINBOW_STAR_COV: f32 = 118.0;
 
 /// The OVER-ink twin of [`rainbow_occupied_coverage`], with the same totality
 /// contract (NaN / negative / -inf -> 0.0, +inf -> the cap). Applied at every
@@ -547,8 +605,36 @@ fn rainbow_edge_envelope(u: f32, life: f32) -> f32 {
     // exactly zero) — the "melts out gradually" half of the longer tail. The
     // birth ease keeps the plain smoothstep: responsiveness wants the head to
     // condense QUICKLY out of the background.
-    smoothstep01(u / birth)
-        * smoothstep01((1.0 - u) / RAINBOW_EDGE_OUT).powf(RAINBOW_TAIL_MELT_GAMMA)
+    let taper = smoothstep01((1.0 - u) / RAINBOW_EDGE_OUT);
+    // THE MELT IS THE IDENTITY OVER MOST OF A LIFE, and `powf` is the single
+    // most expensive call on this path: every swept ribbon cell evaluates this
+    // envelope, and a starred cell used to evaluate it twice. `smoothstep01`
+    // CLAMPS, so it returns exactly 1.0 for the whole mid-body and head — i.e.
+    // for every `u` outside the final [`RAINBOW_EDGE_OUT`] of life, which at the
+    // shipped 0.30 is the first 70% of every spark. `powf(1.0, γ)` is exactly
+    // 1.0 for every finite γ (IEEE-754 / C99 `pow(+1, y) == 1`), so skipping it
+    // there is a bit-for-bit no-op, not an approximation. The 0.0 end is left
+    // alone: `powf(0.0, 0.6)` is already exactly 0.0 and costs nothing extra to
+    // route through the same branch.
+    let melt = if taper == 1.0 {
+        taper
+    } else {
+        taper.powf(RAINBOW_TAIL_MELT_GAMMA)
+    };
+    smoothstep01(u / birth) * melt
+}
+
+/// [`rainbow_ribbon_profile`] for a caller that has ALREADY evaluated the
+/// spark's [`rainbow_edge_envelope`] — the ribbon body and its starfield share
+/// one spark's feather (see `emit_rainbow`), and the envelope is the priciest
+/// term in the law. Identical arithmetic in identical order to the wrapper
+/// below; the two exist only so the shared factor is computed once.
+#[inline]
+fn rainbow_ribbon_profile_edged(u: f32, edge: f32) -> f32 {
+    let onset =
+        RAINBOW_HEAD_FLOOR + (1.0 - RAINBOW_HEAD_FLOOR) * smoothstep01(u / RAINBOW_HEAD_RAMP);
+    let d = (u - RAINBOW_CREST_POS) / RAINBOW_CREST_WIDTH;
+    onset * (1.0 + RAINBOW_CREST_GAIN * (-(d * d)).exp()) * edge * RAINBOW_EDGE_RENORM
 }
 
 /// The ribbon's per-cell brightness multiplier at normalized age `u` for a
@@ -562,13 +648,7 @@ fn rainbow_edge_envelope(u: f32, life: f32) -> f32 {
 /// `rainbow_ribbon_profile_feathers_both_ends_to_zero`.
 #[inline]
 fn rainbow_ribbon_profile(u: f32, life: f32) -> f32 {
-    let onset =
-        RAINBOW_HEAD_FLOOR + (1.0 - RAINBOW_HEAD_FLOOR) * smoothstep01(u / RAINBOW_HEAD_RAMP);
-    let d = (u - RAINBOW_CREST_POS) / RAINBOW_CREST_WIDTH;
-    onset
-        * (1.0 + RAINBOW_CREST_GAIN * (-(d * d)).exp())
-        * rainbow_edge_envelope(u, life)
-        * RAINBOW_EDGE_RENORM
+    rainbow_ribbon_profile_edged(u, rainbow_edge_envelope(u, life))
 }
 
 // ---- rainbow kitty HEAD CLEARANCE ---------------------------------------------------
@@ -660,6 +740,29 @@ fn luma709(rgb: u32) -> f32 {
         + 0.0722 * (rgb & 0xff) as f32
 }
 
+// ---- THE ONE LIGHT-INK RULE ------------------------------------------------
+//
+// There are exactly TWO darkening policies on a light ground, and which one a
+// mark takes is decided by its COMPOSITING ROLE — never by which emitter
+// happens to draw it, and never twice inside one event:
+//
+//   * [`light_ink_bold`] — the LEADING-ONLY role. Marks that provably land in
+//     the inter-line leading and therefore never composite over a glyph: the
+//     rail, the rail-riding streak, the meteor nucleus, the landing bloom, and
+//     the fresh-ink bar's tint. Vivid, because nothing they darken is ink.
+//   * [`light_ink`] — the MAY-TOUCH-TEXT role. Everything else: every star,
+//     sparkle and dot ([`push_twinkle_over`] applies it INTERNALLY, so a star
+//     caller cannot get this wrong), the erase-poof grains, and the cursor
+//     cat's exit flourish. Conservative, because any of them can land on a
+//     letterform at any moment.
+//
+// The rule has to be stated because the two are NOT interchangeable: bold sits
+// at [`LIGHT_INK_BOLD_MAX_LUMA`] and conservative at [`LIGHT_INK_MAX_LUMA`], a
+// ~1.8x difference in ink weight. Composite both inside ONE landing and half
+// the event reads visibly washier than the other half, which is precisely what
+// a white-ground capture of a landing burst showed. Pinned by
+// `one_light_ink_policy_per_compositing_role`.
+
 /// THE LEADING-ONLY INK — vivid, for marks that provably never touch a glyph.
 ///
 /// [`light_ink`] is deliberately conservative because its marks CAN land on
@@ -668,23 +771,44 @@ fn luma709(rgb: u32) -> f32 {
 /// converged on the same sentence — "the palette collapses on white",
 /// "desaturated olive/gray smear" — and this is the arithmetic behind it.
 ///
-/// The marks that live wholly in the inter-line leading (the rail, the pop's
-/// bar, the streak that rides the rail line, the landing bloom) are under no
-/// such constraint, and they are the ones that carry the rainbow. They get:
+/// The marks that live wholly in the inter-line leading are under no such
+/// constraint, and they are the ones that carry the rainbow. They get:
 ///
-///   * FULL SATURATION — the hue's own channel ratios pushed to S = 1, so the
-///     low channels go to zero instead of letting white through them. This is
-///     what separates "green" from "grey-green" once composited.
-///   * A HIGHER luma allowance, because contrast on white is bought by ALPHA
-///     (these marks composite near-opaque) rather than by crushing the hue.
-///     A dark-yellow is olive no matter what alpha it is drawn at; the fix for
-///     the warm middle of the spectrum is to stop crushing it.
+///   * A SINGLE INK WEIGHT — every hue lands ON [`LIGHT_INK_BOLD_MAX_LUMA`], so
+///     a sweep that rolls the whole spectrum under a moving cursor keeps ONE
+///     weight instead of pulsing light and dark as the band changes.
+///   * THE MOST SATURATION THAT WEIGHT ALLOWS, so the low channels go as close
+///     to zero as the bar permits instead of letting paper through them. This
+///     is what separates "green" from "grey-green" once composited.
+///
+/// THE BAR NOW BINDS FOR ALL SIX BANDS. The retired recipe saturated to S = 1
+/// and then only ever SCALED DOWN — `k = min(luma_bar/y, channel_bar/hi, 1)` —
+/// so the bar could bind only for a hue whose own luma was already ABOVE it.
+/// At S = 1 that is true of orange, yellow and green and false of red, blue and
+/// violet, whose pure luma (54, 128, 32 of 255) sits under the bar and can
+/// never be scaled UP to it without clipping past `FF`. Measured across the six
+/// bands the ink came out at luma 46 / 120 / 120 / 120 / 108 / 27 — a 4.4x
+/// swing, i.e. the light underline visibly THICKENED into red and violet and
+/// thinned through the warm middle as the sweep rolled. It read as a rainbow
+/// drawn with six different pens.
+///
+/// A hue below the bar can only be lifted to it by letting some white back in,
+/// so the recipe now solves for the pair `(S, V)` that hits the bar with the
+/// MAXIMUM saturation — scaling alone where that suffices (orange, yellow and
+/// green are byte-identical to the retired recipe) and backing saturation off
+/// only as far as the bar demands (red, blue, violet). That is the honest
+/// generalization of "one bar": the bar governs the weight, and saturation gets
+/// everything the bar has left over.
 const LIGHT_INK_BOLD_MAX_LUMA: f32 = 120.0;
 const LIGHT_INK_BOLD_MAX_CHANNEL: f32 = 215.0;
 
-/// [`light_ink`]'s vivid twin — see the constants above. Saturates first (the
-/// dominant channel to its ceiling, the others scaled by the SAME factor about
-/// zero so the hue is preserved), then applies the luma bar.
+/// [`light_ink`]'s vivid twin — see the constants above and THE ONE LIGHT-INK
+/// RULE. Normalizes `rgb` to its PURE hue (achromatic floor removed, peak
+/// renormalized to 1), then re-mixes it at the `(S, V)` that lands exactly on
+/// [`LIGHT_INK_BOLD_MAX_LUMA`] with as much saturation as
+/// [`LIGHT_INK_BOLD_MAX_CHANNEL`] leaves available. Channel ORDER is preserved,
+/// so every band is still recognisably its own colour. Pinned by
+/// `light_ink_bold_holds_one_ink_weight_across_the_spectrum`.
 #[inline]
 fn light_ink_bold(rgb: u32) -> u32 {
     let (r, g, b) = (
@@ -695,21 +819,40 @@ fn light_ink_bold(rgb: u32) -> u32 {
     let hi = r.max(g).max(b);
     let lo = r.min(g).min(b);
     if hi <= 0.5 {
-        return 0;
+        return 0; // a black input carries no hue to weigh
     }
-    // SATURATE: subtract the achromatic floor, then renormalize. `lo` is the
-    // white the hue was carrying; removing it is exactly what stops the paper
-    // showing through the low channels after compositing.
-    let span = (hi - lo).max(1e-3);
-    let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
-    let (r, g, b) = (sat(r), sat(g), sat(b));
-    let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    let hi = r.max(g).max(b);
-    let k = (LIGHT_INK_BOLD_MAX_LUMA / y.max(1.0))
-        .min(LIGHT_INK_BOLD_MAX_CHANNEL / hi.max(1.0))
-        .min(1.0);
-    let ch = |c: f32| ((c * k) + 0.5) as u32;
-    (ch(r) << 16) | (ch(g) << 8) | ch(b)
+    // THE PURE HUE: `lo` is the white this colour was carrying; removing it and
+    // renormalizing gives the same hue at S = 1, V = 1 (peak channel exactly 1).
+    //
+    // AN ACHROMATIC INPUT IS NOT BLACK. `r == g == b` leaves a zero span, and
+    // the retired recipe divided by `max(span, 1e-3)` and multiplied by `hi` —
+    // which drove every channel of a WHITE input to 0, i.e. `light_ink_bold`
+    // silently returned BLACK for the single most common "invisible on paper"
+    // hue there is. A grey has no hue to saturate, so it simply keeps its
+    // ratios (all 1) and takes the bar as a neutral grey.
+    let span = hi - lo;
+    let pure = |c: f32| {
+        if span <= 1e-3 { 1.0 } else { (c - lo) / span }
+    };
+    let (pr, pg, pb) = (pure(r), pure(g), pure(b));
+    // The pure hue's OWN luma, 0..1 — the whole reason a single scale factor
+    // could never reach the bar for red (0.21) or violet (0.13).
+    let y0 = 0.2126 * pr + 0.7152 * pg + 0.0722 * pb;
+    let yt = LIGHT_INK_BOLD_MAX_LUMA / 255.0;
+    let vmax = LIGHT_INK_BOLD_MAX_CHANNEL / 255.0;
+    // At value `v` and saturation `s` a channel is `v·(1 − s + s·c)` and the
+    // luma is `v·(1 − s + s·y0)`. Luma falls with `s` (for `y0 < 1`), so the
+    // most saturated solution takes `v` as high as the channel bar allows and
+    // then solves for `s`. `s ≥ 1` means scaling alone reaches the bar — the
+    // retired behaviour, kept byte-for-byte for the warm middle.
+    let s = if y0 >= 1.0 - 1e-4 {
+        0.0 // achromatic: nothing to desaturate
+    } else {
+        ((1.0 - yt / vmax) / (1.0 - y0)).clamp(0.0, 1.0)
+    };
+    let v = (yt / (1.0 - s + s * y0)).min(vmax);
+    let ch = |c: f32| ((255.0 * v * (1.0 - s + s * c)) + 0.5).clamp(0.0, 255.0) as u32;
+    (ch(pr) << 16) | (ch(pg) << 8) | ch(pb)
 }
 
 /// THE LIGHT-THEME INK: `rgb` scaled down (hue and saturation intact — every
@@ -734,7 +877,110 @@ fn light_ink(rgb: u32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
+/// THE COMPOSITING ROLE of one light-theme mark — see THE ONE LIGHT-INK RULE
+/// above. It is the ONE thing a light arm declares, and it picks BOTH halves of
+/// the recipe: the darkening policy and the centre over-alpha ceiling. Those
+/// two always agreed in intent and did not always agree in code — the flying
+/// shower's streak asked for the conservative CEILING while its ink came out of
+/// the leading-only policy, so a mark that can cross a glyph at any moment was
+/// drawn in the vivid ink reserved for marks that provably cannot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InkRole {
+    /// Provably confined to the inter-line leading (the rail line): nothing it
+    /// darkens is ever a glyph, so it may be vivid and go to the rail's ceiling.
+    Leading,
+    /// Can composite over a letterform at any moment: the conservative ink and
+    /// the shared legibility ceiling.
+    OverText,
+}
+
+impl InkRole {
+    /// This role's darkening policy.
+    #[inline]
+    pub(crate) fn ink(self, rgb: u32) -> u32 {
+        match self {
+            Self::Leading => light_ink_bold(rgb),
+            Self::OverText => light_ink(rgb),
+        }
+    }
+
+    /// This role's per-pixel CENTRE over-alpha ceiling.
+    #[inline]
+    pub(crate) fn alpha_cap(self) -> f32 {
+        match self {
+            Self::Leading => RAINBOW_LIGHT_RAIL_ALPHA_CAP,
+            Self::OverText => LIGHT_INK_ALPHA_CAP,
+        }
+    }
+
+    /// `rgb` darkened for this role and stamped with `cov` (an ADDITIVE
+    /// coverage — [`LIGHT_INK_GAIN`] converts it) as the centre over-alpha
+    /// ceiling in the high byte, bounded by [`Self::alpha_cap`].
+    #[inline]
+    fn stamp(self, rgb: u32, cov: f32) -> u32 {
+        let cap = ((cov * LIGHT_INK_GAIN) as u32).clamp(1, self.alpha_cap() as u32);
+        (self.ink(rgb) & 0x00FF_FFFF) | (cap << 24)
+    }
+}
+
 // ---- rainbow kitty LIGHT-THEME RAILS ------------------------------------------------
+/// THE ONE SWEEP. Where a cell sits on the spectrum, given its column and the
+/// ribbon's own phase clock — the single source every mark that lands on the
+/// light rail line reads.
+///
+/// Three call sites hand-rolled this expression (the rail, the fresh-ink bar,
+/// the glyph tint), and two of them then mapped it through a DIFFERENT
+/// function: the rail took `rainbow_gradient_of` (continuous) while the other
+/// two quantized to the six anchors. On every keystroke the underline under a
+/// letter and the letter's own ink could therefore be two different colours
+/// for the same conceptual position — the "different rainbows" the owner
+/// pointed at.
+///
+/// IT PING-PONGS. The six bands are an ACYCLIC ramp (red at one end, violet at
+/// the other), so wrapping the position with `rem_euclid` walks violet
+/// straight back into red and prints a hard seam every `1 / SPREAD` ≈ 22
+/// columns. Reflecting instead — a triangle wave — runs red→violet→red with no
+/// discontinuity anywhere, which is what a spectrum drawn on a line should do.
+///
+/// THE CARET READS IT TOO. [`crate::cursor_rainbow`]'s block cursor used to run
+/// its own HSV wheel on its own clock, so the caret and the ribbon leaving it
+/// were literally two different rainbows meeting at one cell. It now resolves
+/// its hue through this sweep at its OWN column, so the block and the underline
+/// under it are the same colour.
+#[inline]
+pub(crate) fn rainbow_sweep_at(col: u16, phase: f32) -> f32 {
+    rainbow_sweep_reflect(col as f32 * RAINBOW_LIGHT_RAIL_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW)
+}
+
+/// Fold an unbounded spectrum position onto the sweep's PING-PONG `0..1` —
+/// the reflection [`rainbow_sweep_at`] is built from, exposed so a caller that
+/// wants a spectrum position OFFSET from a resolved one (the caret's halo rings
+/// step outward along the wheel) folds it the one way this family folds.
+#[inline]
+pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
+    let raw = x.rem_euclid(2.0);
+    if raw <= 1.0 { raw } else { 2.0 - raw }
+}
+
+/// THE ONE BAND. The six-anchor band at a sweep position — the quantized
+/// spectrum every mark of this family shares.
+///
+/// Quantized rather than continuous, deliberately: the six stacked stripes ARE
+/// this style's identity, a discrete band is what makes red and violet
+/// nameable on a thin underline, and [`is_fresh_ink_veil`] needs the pop's
+/// colour to come from a finite set to stay independently assertable.
+#[inline]
+pub(crate) fn rainbow_band_of(sweep: f32) -> u32 {
+    RAINBOW_BANDS[((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)]
+}
+
+/// [`rainbow_band_of`] at a column and phase — the one call every mark on the
+/// light rail line (and the caret above it) makes.
+#[inline]
+pub(crate) fn rainbow_band_at(col: u16, phase: f32) -> u32 {
+    rainbow_band_of(rainbow_sweep_at(col, phase))
+}
+
 /// The light ribbon's ONE rail: how far BELOW the glyph centre it sits, how
 /// THIN it is, and how far it reaches sideways. `DY − RY` (0.62 − 0.13 = 0.49)
 /// keeps it wholly in the inter-line leading — clear of every descender —
@@ -766,6 +1012,12 @@ const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 236.0;
 /// cell sits AT the ceiling and only a dimmed/low-intensity one falls below it
 /// — the band is meant to be ink, and the ceiling is meant to bind.
 const RAINBOW_LIGHT_RAIL_PEAK: f32 = 255.0;
+/// How flat a RAIL-RIDING streak is drawn, as a fraction of its own length
+/// radius. Sized so the streak's thickness lands on the rail's own
+/// (`RAINBOW_LIGHT_RAIL_RY` of a cell): the meteor then reads as the underline
+/// running ahead of itself rather than as a separate round-bodied comet laid
+/// beside it — which is what "more like the bottom underline" asks for.
+const RAINBOW_STREAK_RAIL_SQUASH: f32 = 0.34;
 /// The light rail's own tail melt: how much of a life the dissolve occupies,
 /// and how sub-linear it is.
 ///
@@ -820,6 +1072,12 @@ const RAINBOW_CLEAR_CELLS: f32 = 1.6;
 /// trail being FORMED — light thrown off the cursor and widening as it settles
 /// behind you — rather than as one uniform band turned down. Never zero: the
 /// ribbon must still visibly start at the cursor.
+///
+/// RAISED 0.62 -> 0.86 on 2026-08-06 (owner: "more vibrant and bright"). The
+/// third near-caret term, and the only one that costs no per-pixel coverage at
+/// all: it is pure AREA — a taller band at the caret, not a brighter one — so
+/// the contrast oracle, which measures a band's own worst pixel, does not move
+/// by construction.
 const RAINBOW_TAPER_FLOOR: f32 = 0.62;
 
 // ---- rainbow kitty CROWN, tightened + leaned FORWARD --------------------------------
@@ -969,6 +1227,9 @@ const FRESH_INK_SCALE_AMP: f32 = 0.40;
 /// swell lands ON the keystroke rather than a frame or two after it. Pulled in
 /// from 0.18 (155 ms) so the pop reads as struck, not as inflating.
 const FRESH_INK_SCALE_PEAK: f32 = 0.13;
+/// Forward phase bias on the size spring, in units of
+/// [`FRESH_INK_SCALE_PEAK`] — see [`fresh_ink_scale`].
+const FRESH_INK_SCALE_BIAS: f32 = 0.18;
 /// The pop's hue: WARM white (`0x00RRGGBB`) — reads as fresh ink catching the
 /// light, distinct from the ribbon's six saturated bands and from the pure
 /// white starfield.
@@ -995,6 +1256,38 @@ const FRESH_INK_WARM: u32 = 0x00FF_EDD2;
 /// 48 — both layers always present, and the cap still BINDS when hot, so it is
 /// not a vacuous bound.
 const FRESH_INK_CORE_COV: f32 = 36.0;
+/// THE POP IS WARM LIGHT OR IT IS NOTHING — the floor under which a fresh-ink
+/// halo is culled rather than drawn (owner, 2026-08-04: the trail "isn't
+/// smooth", against a screenshot whose last few typed characters sit under a
+/// dirty grey-olive wash).
+///
+/// [`FRESH_INK_WARM`] is `0xFFEDD2`, and the emitter premultiplies it by the
+/// faded coverage. That is the whole defect: at a coverage of 10 the emitted
+/// colour is `(10, 9, 8)`, whose channels differ by ONE 8-bit step — a neutral
+/// dim grey, not "fresh ink catching the light". The pop lives
+/// [`FRESH_INK_LIFE_S`] = 0.70 s, so at any real typing cadence four to six of
+/// these exhausted greys are on screen at once, lying over exactly the
+/// characters the eye is reading. What looked like a smudge over the text WAS
+/// the tail of the per-character flash.
+///
+/// A LIFE CUT WAS THE WRONG TOOL: the owner asked on 2026-08-06 for "an effect
+/// per character I type", and shortening the life to hide the tail would thin
+/// that effect for every keystroke. This bounds the pop by whether it still
+/// READS instead: full strength while it is light, gone the moment it is only
+/// grey. The flash per character is untouched — at the shipping 0.7 intensity a
+/// pop is culled around 40 % into its life, so what disappears is only the part
+/// that had already stopped being warm.
+///
+/// 8 is derived, not chosen. A cold lone keystroke runs
+/// `FRESH_INK_CORE_COV (36) x env x FRESH_INK_MOM_FLOOR (0.90) x intensity
+/// (0.7)` = `22.68 x env`, and `fresh_ink_env_stepped`'s three steps are 1.0,
+/// 0.5 and 0.22 -> coverages 22.7, 11.3 and 5.0. A floor of 8 culls exactly the
+/// exhausted third step and everything under it while leaving the mid-fade
+/// intact, so the pop still visibly FADES rather than switching off. It also
+/// keeps "the FIRST casual keystroke pops" true: that pop peaks at 22.7, nearly
+/// three times the floor. (12 was tried and is too tight: it culls the MIDDLE
+/// step too, which turns the fade into a switch.)
+const FRESH_INK_MIN_READABLE_COV: f32 = 8.0;
 /// Peak coverage of the wide birth halo (dimmer than the core — a soft flash,
 /// not a second cursor). The FLASH, not the core, is what spills onto
 /// already-typed text — the restraint is carried by the FOOTPRINT
@@ -1182,6 +1475,10 @@ const RAINBOW_WAKE_PULSE: f32 = 0.38;
 /// neither can lift a pixel past [`RAINBOW_WAKE_COV`].
 const RAINBOW_WAKE_PULSE_TAU: f32 = 0.22;
 const RAINBOW_WAKE_PULSE_W: f32 = 0.60;
+/// Distance (in cells) past which a travelling pulse contributes nothing an f32
+/// can represent at the plume's own magnitude — see the cull at the pulse sum.
+/// 3.5 is ~5.8 gaussian widths at [`RAINBOW_WAKE_PULSE_W`].
+const RAINBOW_WAKE_PULSE_CULL: f32 = 3.5;
 /// Peak coverage at the nozzle (premultiplied 0..255 scale) before the
 /// throttle/momentum/intensity scaling. It may sit well above the ribbon's
 /// [`RAINBOW_OCCUPIED_COV_CAP`] — that cap bounds the CONTINUOUS under-ink body a
@@ -1449,9 +1746,9 @@ const FRESH_INK_LIGHT_VEIL: u32 = 0x0026_2E36;
 /// the last half-word. Tinting it re-colours the same bounded darken into
 /// SATURATED INK: the fresh letter looks freshly written rather than dirtied.
 ///
-/// The hue is sampled from the SAME expression the rail under the glyph uses
-/// ([`RAINBOW_LIGHT_RAIL_SPREAD`] / [`RAINBOW_LIGHT_RAIL_FLOW`]), so the pop and
-/// the ribbon beneath it are never two different colours in one cell.
+/// The hue comes from [`rainbow_slab_at`] — the ONE sweep and the ONE band
+/// resolver the rail beneath the glyph also reads — so the pop and the ribbon
+/// under it can never be two different colours in one cell.
 /// How far the light-theme veil is tinted toward the ribbon's live band hue
 /// (0 = the neutral slate above, 1 = the darkened band itself).
 ///
@@ -1524,40 +1821,33 @@ const FRESH_INK_LIGHT_GLYPH_HALF: f32 = 0.34;
 // mid-path dip to tune around. Pinned across all six bands and the whole weight
 // range by `fresh_ink_glyph_tint_is_always_legible`.
 /// How long the tint lasts, as a fraction of [`FRESH_INK_LIFE_S`]. Short on
-/// purpose: this substitutes the cell's resolved foreground, so the shorter it
-/// is on screen the less the hand-back at the end can matter (see
-/// [`FRESH_INK_GLYPH_ANCHOR_LIGHT`]).
+/// purpose: this substitutes the cell's resolved foreground, and a brief
+/// substitution is a smaller claim than a long one even now that the hand-back
+/// is exact.
 const FRESH_INK_GLYPH_SPAN: f32 = 0.32;
-/// Ceiling on the tint ink's WCAG RELATIVE LUMINANCE.
-///
-/// Not a luma bar — luma is the wrong measure here and using one is what the
-/// first cut of this got wrong. Pure red's luma is only 54, so a luma bar never
-/// bound it, yet red on white is 4.0:1: below the AA bar for small text. The
-/// bound that matters is the one the contrast ratio is computed from.
-///
-/// 0.15 is the largest value that still clears the AA bar for small text on
-/// the light grounds that actually exist — 5.3:1 on pure white, 4.9:1 on
-/// Solarized Light's `#FDF6E3` — which is what lets this be a fixed constant
-/// instead of a per-theme calculation the engine has no input for. It is set at
-/// the edge rather than comfortably inside it because CHROMA is the whole point
-/// of the layer: at 0.09 the bands are legible but nearly monochrome once
-/// composited, and a tint you cannot see is a foreground substitution that buys
-/// nothing.
-const FRESH_INK_GLYPH_MAX_LUM: f32 = 0.15;
-/// The colour the tint fades back TO — a theme-appropriate neutral ink, not the
-/// cell's real foreground, which the engine cannot see (`GlowConfig` carries no
-/// theme fg). The hand-back at the end of the fade is therefore a small step
-/// from this anchor to whatever the theme actually uses; it is chosen to sit
-/// within a few counts of the common default (`#1F2328` on GitHub Light), so
-/// the step is imperceptible in the ordinary case and never a flash in any
-/// case — both are dark inks on a light ground.
-const FRESH_INK_GLYPH_ANCHOR_LIGHT: u32 = 0x001E_2228;
+/// The contrast ratio the tint aims for against the theme's own ground: WCAG
+/// AA for small text.
+const FRESH_INK_GLYPH_TARGET_RATIO: f32 = 4.5;
+/// Below this ratio the theme has no usable side — an equiluminant or
+/// near-invisible fg/bg pair — and the tint suppresses itself entirely rather
+/// than inventing a side the theme does not have.
+const FRESH_INK_GLYPH_MIN_THEME_RATIO: f32 = 1.5;
+/// The ink must BE a hue (max channel − min channel) and must visibly DIFFER
+/// from the foreground it replaces, or the substitution buys nothing.
+const FRESH_INK_GLYPH_MIN_SPREAD: i32 = 24;
+const FRESH_INK_GLYPH_MIN_DELTA: i32 = 24;
+/// Bisection depth on the one-parameter ink family. 24 halvings resolve `k` far
+/// below the 1/255 quantization step, so the result is exact in u8 terms.
+const FRESH_INK_GLYPH_BISECT: usize = 24;
 /// Below this tint weight nothing is emitted: an entry at zero weight would be
 /// a foreground substitution that changes nothing but still costs the renderer a
-/// merge-walk entry, and it is the point at which the anchor hand-back happens.
+/// merge-walk entry.
 const FRESH_INK_GLYPH_MIN_W: f32 = 0.06;
 
-/// WCAG relative luminance of a `0x00RRGGBB` colour.
+/// WCAG relative luminance of a `0x00RRGGBB` colour. The transfer is the
+/// piecewise sRGB one (a linear toe below 0.03928, a 2.4 power above), NOT a
+/// plain power law — the two disagree by enough near black to move a ratio
+/// across the AA line.
 #[inline]
 fn rel_luminance(c: u32) -> f32 {
     let ch = |sh: u32| {
@@ -1571,22 +1861,110 @@ fn rel_luminance(c: u32) -> f32 {
     0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
 }
 
-/// The band hue as GLYPH INK on a LIGHT theme: saturated about zero, then
-/// scaled down until its relative luminance clears
-/// [`FRESH_INK_GLYPH_MAX_LUM`].
-///
-/// LIGHT ONLY, deliberately. The tint exists to answer a defect measured on
-/// white, and on a dark ground the additive fresh-ink pop ALREADY brightens the
-/// letterform — that is emphasis expressed in the glyph without recolouring it,
-/// so the dark arm needs nothing here and keeps the no-recolor law intact. It
-/// also avoids the bound this side does not have: "bright enough for any dark
-/// theme" lands near white, which would wash the hue out to no purpose.
-///
-/// The scale is found by bisection on the exact luminance rather than by a
-/// closed form, because `rel_luminance` is a gamma curve — a linear guess
-/// undershoots on the saturated bands and overshoots on the dim ones.
+/// WCAG contrast ratio between two `0x00RRGGBB` colours. Named apart from
+/// the test module's own long-standing `contrast_ratio` helper, which returns
+/// `f64` and would silently shadow this one inside `mod tests`.
 #[inline]
-fn fresh_ink_glyph_ink_light(band: u32) -> u32 {
+fn wcag_ratio(a: u32, b: u32) -> f32 {
+    let (x, y) = (rel_luminance(a), rel_luminance(b));
+    let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Per-channel max / min of two colours, repacked. These are the corners of the
+/// BOX the whole tint path lives in — see [`glyph_ink_bound`].
+#[inline]
+fn chan_max(a: u32, b: u32) -> u32 {
+    let m = |sh: u32| ((a >> sh) & 0xff).max((b >> sh) & 0xff);
+    (m(16) << 16) | (m(8) << 8) | m(0)
+}
+#[inline]
+fn chan_min(a: u32, b: u32) -> u32 {
+    let m = |sh: u32| ((a >> sh) & 0xff).min((b >> sh) & 0xff);
+    (m(16) << 16) | (m(8) << 8) | m(0)
+}
+/// Chroma presence: how far apart this colour's extreme channels are.
+#[inline]
+fn chan_spread(c: u32) -> i32 {
+    let (r, g, b) = (
+        ((c >> 16) & 0xff) as i32,
+        ((c >> 8) & 0xff) as i32,
+        (c & 0xff) as i32,
+    );
+    r.max(g).max(b) - r.min(g).min(b)
+}
+/// Largest per-channel difference — "is this visibly a different colour".
+#[inline]
+fn chan_dist(a: u32, b: u32) -> i32 {
+    let d = |sh: u32| (((a >> sh) & 0xff) as i32 - ((b >> sh) & 0xff) as i32).abs();
+    d(16).max(d(8)).max(d(0))
+}
+
+/// Which side of the ground the theme's own ink sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GlyphInkSide {
+    /// Dark ink on a light ground — the tint mixes DOWN toward black.
+    Dark,
+    /// Light ink on a dark ground — the tint mixes UP toward white.
+    Light,
+}
+
+/// THE BOUND. The side the theme's ink is on, and the luminance every point of
+/// the tint path must satisfy — or `None` when this theme gets no tint at all.
+///
+/// WHY A LUMINANCE AND NOT A RATIO PER POINT. The tint is a per-channel lerp
+/// from the foreground to the band ink, so every channel of every intermediate
+/// colour lies in the BOX between the two endpoints' channels. `rel_luminance`
+/// is monotone non-decreasing in each channel, so the worst luminance anywhere
+/// on the path is bounded by the box CORNER — [`chan_max`] on the dark side,
+/// [`chan_min`] on the light side. Bounding that one corner bounds the whole
+/// path, with no sampling and no convexity argument (the sRGB toe makes the
+/// transfer slightly non-convex at its join, so a convexity argument would not
+/// actually hold).
+///
+/// WHY `max(cap_AA, L(fg))` AND NOT THE RATIO ROUND-TRIP. When a theme's own
+/// body text sits BELOW AA — Solarized Light's `#657B83` on `#FDF6E3` is
+/// 4.13:1 — demanding AA of the tint would demand more than the theme delivers,
+/// and the honest bound is the theme's own ratio. Writing that as
+/// `(L(bg)+0.05)/min(4.5, contrast(fg,bg)) - 0.05` round-trips `L(fg)` through
+/// two divisions and lands an ulp BELOW it, which makes every candidate
+/// infeasible and collapses the palette. The `max` form is feasible at the
+/// foreground itself by identity, because both sides evaluate the same
+/// `rel_luminance(fg)`.
+#[inline]
+fn glyph_ink_bound(fg: u32, bg: u32) -> Option<(GlyphInkSide, f32)> {
+    // A sentinel (or any set high byte) is NOT a colour: masking it would read
+    // as pure black and flip the side.
+    if fg > 0x00FF_FFFF || bg > 0x00FF_FFFF || fg == bg {
+        return None;
+    }
+    let theme = wcag_ratio(fg, bg);
+    if !theme.is_finite() || theme < FRESH_INK_GLYPH_MIN_THEME_RATIO {
+        return None;
+    }
+    let (lfg, lbg) = (rel_luminance(fg), rel_luminance(bg));
+    if lfg < lbg {
+        let aa = (lbg + 0.05) / FRESH_INK_GLYPH_TARGET_RATIO - 0.05;
+        Some((GlyphInkSide::Dark, aa.max(lfg)))
+    } else {
+        let aa = FRESH_INK_GLYPH_TARGET_RATIO * (lbg + 0.05) - 0.05;
+        Some((GlyphInkSide::Light, aa.min(lfg)))
+    }
+}
+
+/// One band as GLYPH INK for this theme: saturated about zero, then walked along
+/// a one-parameter family toward black (dark side) or white (light side) until
+/// the BOX CORNER against the foreground satisfies the bound.
+///
+/// The family is per-channel MONOTONE in `k` even after quantization, which is
+/// what makes bisection exact rather than approximate: the predicate is
+/// evaluated on the quantized candidate, so the answer that comes back is the
+/// answer that ships.
+///
+/// `None` when the band is achromatic (not a hue), or when even the extreme of
+/// the family cannot satisfy the bound.
+#[inline]
+fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f32) -> Option<u32> {
     let (r, g, b) = (
         ((band >> 16) & 0xff) as f32,
         ((band >> 8) & 0xff) as f32,
@@ -1594,36 +1972,83 @@ fn fresh_ink_glyph_ink_light(band: u32) -> u32 {
     );
     let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
     if hi <= 0.5 {
-        return FRESH_INK_GLYPH_ANCHOR_LIGHT;
+        return None;
     }
-    // Saturate about zero, exactly as `light_ink_bold` does — a hue carrying an
-    // achromatic floor reads as a tinted grey rather than as a colour.
     let span = (hi - lo).max(1e-3);
     let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
-    let (sr, sg, sb) = (sat(r), sat(g), sat(b));
-    let pack = |k: f32| -> u32 {
-        let ch = |c: f32| (((c * k) + 0.5) as u32).min(255);
-        (ch(sr) << 16) | (ch(sg) << 8) | ch(sb)
+    let s = [sat(r), sat(g), sat(b)];
+    // k = 0 is the SAFE extreme (black / white), k = 1 the most chromatic.
+    let cand = |k: f32| -> u32 {
+        let ch = |i: usize| -> u32 {
+            let v = match side {
+                GlyphInkSide::Dark => s[i] * k,
+                GlyphInkSide::Light => s[i] + (255.0 - s[i]) * (1.0 - k),
+            };
+            ((v + 0.5) as u32).min(255)
+        };
+        (ch(0) << 16) | (ch(1) << 8) | ch(2)
     };
-    if rel_luminance(pack(1.0)) <= FRESH_INK_GLYPH_MAX_LUM {
-        return pack(1.0);
+    let ok = |ink: u32| -> bool {
+        let corner = match side {
+            GlyphInkSide::Dark => chan_max(ink, fg),
+            GlyphInkSide::Light => chan_min(ink, fg),
+        };
+        let l = rel_luminance(corner);
+        match side {
+            GlyphInkSide::Dark => l <= cap,
+            GlyphInkSide::Light => l >= cap,
+        }
+    };
+    if ok(cand(1.0)) {
+        return Some(cand(1.0));
+    }
+    if !ok(cand(0.0)) {
+        // Even the extreme fails — the foreground alone already breaches the
+        // bound, which only happens on a theme this function should not have
+        // been asked about. Fail closed.
+        return None;
     }
     let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
-    for _ in 0..16 {
+    for _ in 0..FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo_k + hi_k);
-        if rel_luminance(pack(mid)) > FRESH_INK_GLYPH_MAX_LUM {
-            hi_k = mid;
+        if ok(cand(mid)) {
+            lo_k = mid
         } else {
-            lo_k = mid;
+            hi_k = mid
         }
     }
-    pack(lo_k)
+    Some(cand(lo_k))
+}
+
+/// The six band inks for one theme, or `None` when this theme gets no tint.
+///
+/// ALL SIX OR NONE, deliberately. A per-band suppression would draw a rainbow
+/// with holes — the exact defect the [`LIGHT_INK_MAX_LUMA`] note records from a
+/// white-ground review — so if any band fails the chroma gates the whole layer
+/// stands down and the text simply keeps its own colour.
+fn fresh_ink_glyph_palette(fg: u32, bg: u32) -> Option<[u32; RAINBOW_BANDS.len()]> {
+    let (side, cap) = glyph_ink_bound(fg, bg)?;
+    let mut out = [0u32; RAINBOW_BANDS.len()];
+    for (slot, &band) in out.iter_mut().zip(RAINBOW_BANDS.iter()) {
+        let ink = fresh_ink_glyph_ink(band, fg, side, cap)?;
+        if chan_spread(ink) < FRESH_INK_GLYPH_MIN_SPREAD
+            || chan_dist(ink, fg) < FRESH_INK_GLYPH_MIN_DELTA
+        {
+            return None;
+        }
+        *slot = ink;
+    }
+    Some(out)
 }
 
 /// The emphasis floor a pop must clear to earn its own SPARKLE (see the emit
 /// site). Set high on purpose: [`fresh_ink_emphasis`] is 1.0 AT the caret and
-/// decays over [`FRESH_INK_EMPH_CELLS`], so at 0.82 only the newest cell or two
-/// spark. A star on every letter of a typed word is a starfield, not emphasis.
+/// decays over [`FRESH_INK_EMPH_CELLS`], so at 0.92 only the newest cell
+/// sparks. A star on every letter of a typed word is a starfield, not
+/// emphasis. RAISED 0.82 → 0.92 in the sparkle rebalance (owner: "the extra
+/// '+' sparkles on cursor are too extreme"): at 0.82 the newest cell OR TWO
+/// sparked, and under fast typing that still trailed a run of pluses — the
+/// pop's own bar is the emphasis; the star is the accent.
 /// How sharply the LIGHT bar's emphasis ramp is concentrated on the newest
 /// cells — see the emit site. Tried at 3.0 first and backed off: that
 /// concentrated the bar so hard that the older half of the run vanished and the
@@ -1631,14 +2056,17 @@ fn fresh_ink_glyph_ink_light(band: u32) -> u32 {
 /// point. 1.7 keeps a visible body behind the caret while leaving the newest
 /// cell unmistakably the strongest.
 const FRESH_INK_LIGHT_EMPH_GAMMA: f32 = 1.7;
-const FRESH_INK_SPARK_EMPH: f32 = 0.82;
+const FRESH_INK_SPARK_EMPH: f32 = 0.92;
 /// How far ABOVE the cell centre the fresh-ink sparkle sits, in cell heights —
 /// the same sky band the ribbon's own light twinkle uses, so the two never
 /// occupy different heights for the same cell.
 const FRESH_INK_SPARK_DY: f32 = 0.86;
-/// The sparkle's arm, in cell heights. A touch larger than the sky twinkle's
-/// (0.26): this one marks an event, not ambience.
-const FRESH_INK_SPARK_ARM: f32 = 0.32;
+// (The sparkle's arm used to be a private `FRESH_INK_SPARK_ARM = 0.24` cell
+// heights, "a touch SMALLER than the sky twinkle's 0.26". Both were bare floats
+// with no relation to the additive star they are the ink twin of; the fresh-ink
+// spark is the sky twinkle — the same mark on the same band above the same cell
+// — so it is now the SAME `star_arm(ch, STAR_ARM_STD * STAR_ARM_INK)` and the
+// two cannot drift apart again.)
 /// Peak CENTRE over-alpha (0..255) of the core rail bar at birth/full
 /// momentum/full intensity, before the `env·momentum·intensity` scaling — the
 /// darken twin of the dark arm's `FRESH_INK_CORE_COV`. Deliberately ABOVE the
@@ -1714,7 +2142,13 @@ fn fresh_ink_env_stepped(u: f32) -> f32 {
 /// Pinned by `fresh_ink_spring_peaks_early_and_settles_to_unity`.
 #[inline]
 fn fresh_ink_scale(u: f32) -> f32 {
-    let x = u.clamp(0.0, 1.0) / FRESH_INK_SCALE_PEAK;
+    // `x·e^(1−x)` is exactly 0 at x = 0, so the swell — the one cue that says
+    // "this letter is NEW" — contributed nothing on the frame the letter
+    // landed, and did not peak for another 91 ms. Biasing the phase forward
+    // starts the spring already in motion: the pop's first drawn frame is
+    // already swelling and the peak arrives sooner. Still the critically-damped
+    // impulse (no oscillating wobble), still asymptotic to exactly 1.0.
+    let x = u.clamp(0.0, 1.0) / FRESH_INK_SCALE_PEAK + FRESH_INK_SCALE_BIAS;
     1.0 + FRESH_INK_SCALE_AMP * x * (1.0 - x).exp()
 }
 
@@ -1740,7 +2174,7 @@ fn fresh_ink_scale(u: f32) -> f32 {
 fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
     let ink = lerp_rgb(
         FRESH_INK_LIGHT_VEIL,
-        light_ink_bold(band),
+        InkRole::Leading.ink(band),
         FRESH_INK_LIGHT_TINT,
     );
     (ink & 0x00FF_FFFF) | ((cap as u32) << 24)
@@ -2172,10 +2606,10 @@ const ERASE_WEIGHT_CAP: f32 = 3.4;
 /// energy law must make deletes MORE expressive, never quietly thin out the
 /// most common one — while a hot word kill lands near 27 and a hot line kill
 /// hits [`ERASE_POOF_CAP`].
-const ERASE_POOF_STARS: f32 = 11.0;
+const ERASE_POOF_STARS: f32 = 7.0;
 /// Hard ceiling on one poof's sparkle count, well under `MAX_PARTICLES` so a
 /// held Ctrl-U mash can never crowd out the rest of the family.
-const ERASE_POOF_CAP: usize = 26;
+const ERASE_POOF_CAP: usize = 15;
 /// How wide, in CELLS, one poof's debris may spread — regardless of how long
 /// the erased span was.
 ///
@@ -2200,6 +2634,20 @@ const ERASE_HERO_SCALE_SPAN: f32 = 0.09;
 /// killed line.
 const ERASE_HERO_ARM_MIN: f32 = 2.0;
 const ERASE_HERO_ARM_MAX: f32 = 3.2;
+/// The ROUND-SPARK band, at the bottom of the GLITTER sentinel range: the
+/// poof's BODY grains spawn at [`ERASE_ROUND_SCALE`], and `emit_particles`
+/// reads anything under [`ERASE_ROUND_SCALE_MAX`] as "draw ROUND" — the
+/// old-style spark, a radial point of cool light — instead of the 4-point
+/// plus. Owner: "the extra '+' sparkles on cursor are too extreme. I like the
+/// older style of sparks … but a few of the '+' are nice." The all-plus poof
+/// was worse than an aesthetic miss: a cloud of small crosses at glyph size
+/// reads as literal '+' characters typed into the buffer, and a terminal must
+/// never appear to emit glyphs it didn't. The poof keeps exactly ONE plus —
+/// the hero band above — so the accent survives while the body goes back to
+/// sparks. The middle of the glitter band (the trail's own star and the
+/// terminus melt-out, both 0.7) still draws the plus twinkle, unchanged.
+const ERASE_ROUND_SCALE: f32 = 0.5;
+const ERASE_ROUND_SCALE_MAX: f32 = 0.6;
 
 /// Decode a particle's `cov_scale` into the hero size multiplier: `1.0` for an
 /// ordinary glitter grain, [`ERASE_HERO_ARM_MIN`]..=[`ERASE_HERO_ARM_MAX`] for
@@ -2269,11 +2717,11 @@ const RAINBOW_LAND_FLASH_GROW: f32 = 3.6;
 /// round disc on the landing cell — see the emit site — so on white the bloom
 /// is squashed into the leading and spreads sideways instead.
 const RAINBOW_LAND_FLASH_LIGHT_SQUASH: f32 = 0.30;
-/// How much larger a landing star is drawn on LIGHT than on dark. Additive
-/// light buys presence with per-pixel coverage; source-over ink has to buy it
-/// with AREA, so the same radius that reads as a star on black reads as a
-/// speck on white.
-const RAINBOW_LAND_STAR_LIGHT_SCALE: f32 = 1.55;
+// (How much larger a landing star is drawn on LIGHT than on dark used to live
+// here as `RAINBOW_LAND_STAR_LIGHT_SCALE = 1.55`. It is the whole family's ink
+// tax, not the landing's private one, so it is now `effect_util::STAR_ARM_INK`
+// and every light star pays it — the light ribbon twinkle, the fresh-ink spark,
+// the poof hero and the landing sparkles used to pay 1.86, 1.71, 1.06 and 1.0.)
 
 /// One FIRE METEOR — the fire style's inter-line / long-jump streak: a
 /// straight pixel-space line of fire drawn ALONG the true jump vector, whose
@@ -2459,6 +2907,13 @@ pub struct CursorGlow {
     path_scratch: Vec<(i32, i32)>,
     particles: Vec<Particle>,
     ring: Option<Ring>,
+    /// The cell height (device px) of the most recent [`Self::tick`], so
+    /// [`Self::note_scroll`] — which the host calls with a ROW count and no
+    /// geometry — can translate the PIXEL-addressed light pools. Zero until the
+    /// first tick; that case fails closed (the pools are dropped rather than
+    /// left stranded), because a scroll before any frame has been drawn cannot
+    /// have light worth keeping.
+    last_ch: u16,
     /// The whole RAINBOW KITTY family (ribbon tail + press ledger, retract, ink pops,
     /// wake nozzle, jump streaks + bursts, momentum/phase spines); see
     /// [`RainbowState`].
@@ -2686,6 +3141,20 @@ pub struct CursorGlow {
     /// When the last erase poof fired — the rate limiter ([`Self::POOF_MIN_GAP`])
     /// so a held kill-key repeat billows at a readable cadence, not per frame.
     last_poof: Option<Instant>,
+    /// The fresh-typed GLYPH TINT's palette, memoized on the `(theme_fg,
+    /// theme_bg)` it was derived from.
+    ///
+    /// [`fresh_ink_glyph_palette`] bisects up to [`FRESH_INK_GLYPH_BISECT`]
+    /// times per band over six bands, and each probe evaluates a `powf`-based
+    /// luminance — a few hundred gamma evaluations. That is nothing once, and
+    /// silly every frame for a value that only changes when the THEME changes.
+    /// Refreshed in [`Self::tick`], where `&mut self` exists; the emitter is
+    /// `&self` and reads it.
+    ///
+    /// `Some((key, None))` is a memoized REFUSAL — a theme with no usable side
+    /// costs one evaluation too, and re-deciding it every frame would be the
+    /// same waste.
+    glyph_palette: Option<((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>)>,
     /// ERASE MOMENTUM — the mirror of the canonical typing metric, for the
     /// gesture going the other way (owner, 2026-08-06: bring the delete poof
     /// back "with a similar momentum as forward typing").
@@ -3032,7 +3501,7 @@ impl CursorGlow {
     /// in one frame and a mash would strew four times that; 14 is enough to
     /// read as a burning trail and leaves the shared `MAX_PARTICLES` budget to
     /// the landing burst that follows immediately behind it.
-    const METEOR_SPARK_CAP: usize = 14;
+    const METEOR_SPARK_CAP: usize = 6;
     // ---- FAST-GLIDE rainbow shooting star (velocity-triggered) --------------
     /// EMA attack coefficient for [`GlideState::vel`] on each observed move: a
     /// couple of consecutive fast frames ramp the spine toward the true speed.
@@ -3067,7 +3536,16 @@ impl CursorGlow {
     /// [`RAINBOW_TRANSIENT_COV_CAP`] and far below the typing starfield's own peak,
     /// because a landing fires a handful at once on one spot and the owner
     /// cannot read text through bright art.
-    const GLIDE_LAND_STAR_COV: f32 = 118.0;
+    ///
+    /// THE CODE MOVED, NOT THE DOC. This read 118.0 — which is not below
+    /// [`RAINBOW_TRANSIENT_COV_CAP`] (it was EXACTLY it) and is 1.34x ABOVE the
+    /// typing starfield's [`RAINBOW_STAR_COV`], i.e. both halves of the sentence
+    /// above were false and the landing's white/gold garnish outshone the
+    /// starfield it is meant to echo. Stated as a SHARE of the starfield peak so
+    /// the two cannot drift apart again: the landing sparkle is the same star,
+    /// three-quarters as bright because a handful of them land on one spot.
+    const GLIDE_LAND_STAR_SHARE: f32 = 0.75;
+    const GLIDE_LAND_STAR_COV: f32 = RAINBOW_STAR_COV * Self::GLIDE_LAND_STAR_SHARE;
     /// Twinkle sparkles scattered at a glide landing.
     const GLIDE_LAND_SPARKLES: u8 = 5;
     /// Landing scatter reach, in cell heights.
@@ -3099,7 +3577,7 @@ impl CursorGlow {
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
     /// scanline rows × ≤2 spans, capped by [`Self::MAX_QUADS`]).
     /// RAISED 10 → 18 (owner: "an even bigger brighter landing").
-    const RAINBOW_BURST_STARS: usize = 18;
+    const RAINBOW_BURST_STARS: usize = 11;
     /// Starburst life (seconds): a brisk celebratory bloom-and-fade, in the same
     /// register as the ZOOM streak's `0.26..0.78` so the two read as one event.
     /// Lengthened with the streak it lands from, and for the same reason — the
@@ -3112,11 +3590,17 @@ impl CursorGlow {
     /// and none of the white/gold twinkle the cursor trail scatters while you
     /// type. Owner: the landing should include "same sparkles that appear in
     /// the cursor trail".
-    const RAINBOW_BURST_SPARKLES: usize = 9;
+    /// DIALED 9 → 2 in the sparkle rebalance (owner: "the extra '+' sparkles
+    /// on cursor are too extreme … a few of the '+' are nice"): these are
+    /// 4-point pluses, and nine of them out-shouted the colour stars they were
+    /// meant to garnish. Two keeps the trail's twinkle present at a real fling
+    /// without turning the landing into a field of crosses; the earning ramp
+    /// steepened to match (`dist/5 → dist/12` at the spawn site).
+    const RAINBOW_BURST_SPARKLES: usize = 2;
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
-    const RAINBOW_TERMINUS_STARS: usize = 14;
+    const RAINBOW_TERMINUS_STARS: usize = 8;
     /// How near the last column (in cells) counts as "at the far-right margin"
     /// for the graceful end-of-line terminus dissolve.
     const RAINBOW_TERMINUS_MARGIN: usize = 1;
@@ -4031,6 +4515,19 @@ impl CursorGlow {
         }
     }
 
+    /// The GRIEF GATE (0.19.0 gauntlet F4a) — [`Self::celebrate`]'s inverse.
+    /// While the pet's failure droop is on glass
+    /// (`kitty_pet::PetBrain::grieving`), the host calls this every frame:
+    /// zeroing the rainbow momentum defuels the jump meteor's star shower
+    /// and its terminus scatter, so the fresh prompt after a FAILED command
+    /// never arrives under a celebration ring with '+' crosses landing on
+    /// the very words that broke. Natural decay already heads to zero —
+    /// this only refuses to let the failure's own prompt jump re-arm the
+    /// party mid-grief; momentum re-earns normally once the droop ends.
+    pub fn hush_fanfare(&mut self, now: Instant) {
+        self.rainbow.momentum.set_value(now, 0.0);
+    }
+
     /// DISARM a dangling typed/backspace hint. Called when a key with its OWN
     /// move semantics arrives (Enter, Tab, nav, kill): a hint left over from a
     /// no-move echo (a password prompt swallowing the char, vim `x`/`r`) must
@@ -4129,6 +4626,53 @@ impl CursorGlow {
                 }
                 None => false,
             });
+        // THE PIXEL-ADDRESSED POOLS. The two above are addressed by grid cell,
+        // so a row subtraction moves them. The starfield, the landing ring, the
+        // ZOOM streaks and the landing starbursts are addressed in WINDOW-
+        // ABSOLUTE PIXELS instead, and were left behind entirely: after a scroll
+        // they hung in place while the text slid out from under them, which is
+        // the "stray rainbow pieces" the owner still sees — detached dots and
+        // dashes sitting a row or two off the trail that earned them.
+        //
+        // They need a pixel translation, and `note_scroll` is handed only a row
+        // count, which is why the earlier sweep could not carry them. `last_ch`
+        // closes that gap. With no tick yet observed the height is unknown, so
+        // every pool is DROPPED — fail closed, exactly as the cell-addressed
+        // pools drop anything pushed past the top rather than clamping it into a
+        // bar along row 0.
+        let dy = f32::from(rows) * f32::from(self.last_ch);
+        if self.last_ch == 0 {
+            self.particles.clear();
+            self.ring = None;
+            self.rainbow.jumps.clear();
+            self.rainbow.bursts.clear();
+            return;
+        }
+        // Dropped once past the window top, with ONE CELL of allowance — the
+        // starfield deliberately places light in the sky band just above row 0,
+        // so the cut cannot sit exactly at zero. Measured against the window,
+        // never against this scroll's distance: a pool that survived an earlier
+        // scroll must not be rescued by a later, larger one.
+        let top = -f32::from(self.last_ch);
+        // A particle is advanced ANALYTICALLY from `born`, so translating its
+        // birth origin translates its whole trajectory.
+        self.particles.retain_mut(|p| {
+            p.y0 -= dy;
+            p.y0 > top
+        });
+        self.ring = self.ring.take().and_then(|mut r| {
+            r.cy -= dy;
+            (r.cy > top).then_some(r)
+        });
+        self.rainbow.jumps.retain_mut(|j| {
+            j.y0 -= dy;
+            j.y1 -= dy;
+            j.y0.max(j.y1) > top
+        });
+        self.rainbow.bursts.retain_mut(|b| {
+            b.cy -= dy;
+            b.cy + b.reach > top
+        });
     }
 
     /// PER-FRAME ROW PROBE: hand the engine the cursor row's content as
@@ -4564,6 +5108,7 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
+        self.last_ch = geom.ch.min(u16::MAX as usize) as u16;
         out.clear();
         self.halo_out.clear();
         self.patch_out.clear();
@@ -5053,6 +5598,15 @@ impl CursorGlow {
         // The radial-halo / under-ink / charred-ink streams ride beside `out`
         // (the emitters are `&self`; the vecs are taken and restored so no
         // borrow overlaps).
+        // Refresh the tint palette if (and only if) the theme moved. See
+        // [`Self::glyph_palette`].
+        let glyph_key = (cfg.theme_fg, cfg.theme_bg);
+        if self.glyph_palette.map(|(k, _)| k) != Some(glyph_key) {
+            self.glyph_palette = Some((
+                glyph_key,
+                fresh_ink_glyph_palette(cfg.theme_fg, cfg.theme_bg),
+            ));
+        }
         let mut halos = std::mem::take(&mut self.halo_out);
         let mut patches = std::mem::take(&mut self.patch_out);
         // `under_out` (the glow_under stream, composited BENEATH the glyph ink)
@@ -6836,8 +7390,10 @@ impl CursorGlow {
             // cell — `(cr, cc)`, the cell the cursor lands on as the shell erases
             // its glyph. ~6-10 short-lived sparkles, omnidirectional with a slight
             // UPWARD bias and gentle gravity, in cool white / silver / pastel
-            // tones (never a band hue), drawn as the 4-point twinkle via the
-            // GLITTER sentinel (`cov_scale < 0.9`) in `emit_particles`. Repeated
+            // tones (never a band hue), drawn as ROUND old-style sparks via the
+            // ROUND band of the GLITTER sentinel ([`ERASE_ROUND_SCALE`], `< 0.9`)
+            // in `emit_particles` — the poof's one 4-point plus is its HERO grain
+            // (the sparkle rebalance: sparks are the body, '+' the accent). Repeated
             // backspaces lay a train of poofs chasing the cursor leftward.
             // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-rainbow kitty styles
             // fall through to the comet path, so their deletion read is unchanged.
@@ -8028,7 +8584,27 @@ impl CursorGlow {
         // into the wake below (streaming down and back, full gravity pulling
         // them further clear). Bounded by the life prune + cap; pinned by
         // `rainbow_stars_spawn_clear_of_the_typed_row_band`.
+        // A STAR MUST HAVE A RIBBON TO COME OFF (owner, 2026-08-04: "i still
+        // sometimes see stray rainbow pieces").
+        //
+        // The density gate below is the eased momentum spine, and `d256e9f5`
+        // established what is wrong with that class of witness: the spine is a
+        // PROXY that outlives the visible ribbon by seconds and survives a focus
+        // blip or a load-shed dip. Stars are born up to 1.4 rows off the row and
+        // live up to 1.4 s, so a shower licensed by a spine with no ribbon under
+        // it puts free white particles in open space — detached dots and dashes
+        // sitting a row or two from any trail, which is precisely the population
+        // the owner keeps seeing. (The scroll half of this was fixed by carrying
+        // the pixel-addressed pools; this is the birth half.)
+        //
+        // So it asks the ribbon itself, the same way the terminus and the ZOOM
+        // streak do. This does NOT thin the shower during typing — a live typed
+        // ribbon is always present then, which is the only time the spine is
+        // above the onset anyway — so the owner's 2026-08-06 "more white
+        // sparkles and more bright stars" is untouched. It only refuses the
+        // births that had nothing to attach to.
         if matches!(cfg.style, GlowStyle::RainbowKitty)
+            && self.sparks.iter().any(|s| s.typing)
             && self.particles.len() < Self::MAX_PARTICLES
         {
             // EARNED THRESHOLD: density rides
@@ -8854,13 +9430,16 @@ impl CursorGlow {
                 gy: 0.9 * cell,
                 life: (0.42 + r4 * 0.55) * (0.85 + 0.45 * heft),
                 hue: r0, // twinkle seed
-                // GLITTER sentinel (`cov_scale < 0.9`): the delete poof is
-                // a DELETION gesture, not the momentum shower, so it keeps
-                // FULL brightness regardless of TYPING momentum (the
+                // ROUND-SPARK sentinel ([`ERASE_ROUND_SCALE`], still inside
+                // the GLITTER band `< 0.9`): the delete poof is a DELETION
+                // gesture, not the momentum shower, so it keeps FULL
+                // brightness regardless of TYPING momentum (the
                 // `emit_particles` glitter arm pins `mom = 1.0`). Plain
                 // twinkle stars would take `rainbow_star_momentum(rainbow.disp)`
-                // instead and go barely-there on a cold delete.
-                cov_scale: 0.7,
+                // instead and go barely-there on a cold delete. The BODY
+                // draws ROUND — the old-style spark — never the 4-point plus;
+                // the hero below is the poof's ONE plus.
+                cov_scale: ERASE_ROUND_SCALE,
                 born: now,
             });
         }
@@ -10644,8 +11223,11 @@ impl CursorGlow {
             // interleaved with the colour stars (see `emit_rainbow_starburst`).
             // Zero on a short hop for the same anti-noise reason the star floor
             // exists: sparkles are the celebration, and a two-cell hop is not
-            // one.
-            let sparkles = ((dist / 5.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
+            // one. The ramp steepened `dist/5 → dist/12` with the sparkle
+            // rebalance (the plus is an accent now): the first plus arrives
+            // only at a real leap (~12 cells), the second at a genuine fling —
+            // see [`Self::RAINBOW_BURST_SPARKLES`].
+            let sparkles = ((dist / 12.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
             self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
@@ -10697,9 +11279,11 @@ impl CursorGlow {
     /// FEATURE A — scatter a small "melt-out" glitter of twinkle stars at a
     /// dissolving ribbon TERMINUS `(cx, cy)` (window px), so the rainbow's end
     /// FEATHERS into the background instead of terminating on a hard vertical
-    /// edge. Reuses the exact GLITTER twinkle-star particle path the backspace
-    /// poof rides (`cov_scale` sentinel `< 0.9`, drawn as the cool 4-point plus
-    /// in [`Self::emit_particles`]) — "a small scatter of the existing twinkle
+    /// edge. Rides the GLITTER particle path (`cov_scale` 0.7 — the
+    /// plus-drawing middle of the sentinel band; the backspace poof's BODY
+    /// moved DOWN to the ROUND band, [`ERASE_ROUND_SCALE`], in the sparkle
+    /// rebalance, so this melt-out keeps the cool 4-point plus in
+    /// [`Self::emit_particles`]) — "a small scatter of the existing twinkle
     /// stars at the terminus", per the owner. Each star's LIFE is graded by the
     /// shared [`rainbow_terminus_feather`]: the outermost sparkle (smallest `frac`)
     /// gets the shortest life and winks out FIRST, so the dissolve retreats
@@ -10871,9 +11455,6 @@ impl CursorGlow {
                         // Dropped into the leading and squashed, it is the same
                         // impact bloom spreading along the underline the meteor
                         // arrived on.
-                        let ink = light_ink_bold(hue);
-                        let cap = ((fcov * LIGHT_INK_GAIN) as u32)
-                            .clamp(1, RAINBOW_LIGHT_RAIL_ALPHA_CAP as u32);
                         push_halo_over(
                             halos,
                             geom,
@@ -10881,7 +11462,9 @@ impl CursorGlow {
                             b.cy + chf * RAINBOW_LIGHT_RAIL_DY,
                             fr,
                             (fr * RAINBOW_LAND_FLASH_LIGHT_SQUASH).max(1.0),
-                            (ink & 0x00FF_FFFF) | (cap << 24),
+                            // LEADING role: dropped onto the rail line and
+                            // squashed into it, so it darkens no glyph.
+                            InkRole::Leading.stamp(hue, fcov),
                             255,
                         );
                     }
@@ -10895,8 +11478,17 @@ impl CursorGlow {
                 // overlay star-for-star (reuses the old ray-angle law).
                 let ang = (i as f32 / n as f32 + b.seed * 0.5) * TAU;
                 let (dx, dy) = (ang.cos(), ang.sin());
-                // One solid hue per star; the handful spans the spectrum.
-                let hue = RAINBOW_BANDS[(i + (b.seed * 6.0) as usize) % RAINBOW_BANDS.len()];
+                // One solid hue per star; the handful spans the spectrum IN THE
+                // CANONICAL ORDER. It used to be `(i + seed·6) % 6` — a cyclic
+                // permutation per burst, so one landing scattered red→violet
+                // around its fan and the next scattered green→…→violet→red→…,
+                // against a ribbon that had already been canonicalized to
+                // red-top for exactly this reason. The fan's ANGLE still rotates
+                // per burst (see `ang` above), which is what actually keeps
+                // stacked bursts from overlaying star-for-star; rotating the
+                // SPECTRUM as well only made the family's order stop being one
+                // order. Pinned by `rainbow_band_order_is_canonical_everywhere`.
+                let hue = RAINBOW_BANDS[i % RAINBOW_BANDS.len()];
                 let (d, cy_i, scale) = if self.reduced_motion {
                     // One static rest frame: final scattered offset, full size —
                     // no scatter, arc, or pulse.
@@ -10925,6 +11517,20 @@ impl CursorGlow {
                 if r_i < 0.75 {
                     continue;
                 }
+                // THE ONE TWINKLE, seeded per star. A landing colour star was
+                // one of the three members of the family that never pulsed at
+                // all — a still mark in a scatter of blinking ones, on both
+                // grounds — which is most of what read as "a different artist".
+                // Static under reduced motion, like every other pulse here.
+                let tw = if self.reduced_motion {
+                    1.0
+                } else {
+                    twinkle_env(age, i as f32 * 1.7 + b.seed * TAU)
+                };
+                let cov = cov * tw;
+                if cov < 1.0 {
+                    continue;
+                }
                 if !cfg.dark_theme {
                     // LIGHT ARM: additive light does nothing on white, so each
                     // star inverts to a DARKENED SATURATED source-over mark
@@ -10938,13 +11544,14 @@ impl CursorGlow {
                     // from full-coverage pixels; the ink star has to buy the
                     // same presence with area, or a landing reads as "a handful
                     // of tiny sparkles" with "almost no luminance".
-                    push_twinkle_over(
+                    self.push_twinkle_over_text_first(
                         halos,
                         geom,
                         cx_i,
                         cy_i,
-                        r_i * RAINBOW_LAND_STAR_LIGHT_SCALE,
+                        r_i * STAR_ARM_INK,
                         hue,
+                        false,
                         (cov * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
                     );
                     continue;
@@ -10983,7 +11590,10 @@ impl CursorGlow {
             // specks, so the sparkles now land on both grounds.
             if b.sparkles > 0 {
                 let ns = b.sparkles as usize;
-                let arm = ((chf * 0.11) as i32).max(1);
+                // THE STARFIELD GRAIN — the same ratio the ribbon's own stars
+                // take at rest, because this IS that star, thrown at a landing.
+                let arm_f = star_arm(chf, STAR_ARM_FINE);
+                let arm = (arm_f as i32).max(1);
                 let (cwi, chi) = (geom.cw as i32, geom.ch as i32);
                 for i in 0..ns {
                     if out.len() >= Self::MAX_QUADS {
@@ -10998,13 +11608,12 @@ impl CursorGlow {
                     let d = b.reach * spread;
                     let sx = (b.cx + ang.cos() * d) as i32;
                     let sy = (b.cy + ang.sin() * d) as i32;
-                    // The SAME twinkle sine the typing starfield pulses on,
-                    // seeded per sparkle so they blink out of phase. Static
-                    // under reduced motion.
+                    // THE ONE TWINKLE, seeded per sparkle so they blink out of
+                    // phase. Static under reduced motion.
                     let tw = if self.reduced_motion {
                         1.0
                     } else {
-                        0.55 + 0.45 * (age * 9.0 + i as f32 * 1.7 + b.seed * TAU).sin().abs()
+                        twinkle_env(age, i as f32 * 1.7 + b.seed * TAU)
                     };
                     let scov = (Self::GLIDE_LAND_STAR_COV * fade * tw * cfg.intensity)
                         .clamp(0.0, 255.0) as u8;
@@ -11026,13 +11635,14 @@ impl CursorGlow {
                         // the palette as its hue seed and lets the shared
                         // darken carry it — a warm ink fleck, distinct from the
                         // colour stars' band hues beside it.
-                        push_twinkle_over(
+                        self.push_twinkle_over_text_first(
                             halos,
                             geom,
                             sx as f32,
                             sy as f32,
-                            arm as f32,
+                            arm_f * STAR_ARM_INK,
                             twinkle_rgb(true),
+                            sgold,
                             (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
                         );
                         continue;
@@ -11124,14 +11734,20 @@ impl CursorGlow {
                     hy + dy,
                     thick,
                     (head_cov * LIGHT_INK_GAIN).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8,
-                    g.seed,
-                    RAINBOW_LIGHT_RAIL_ALPHA_CAP,
+                    InkRole::Leading,
+                    RAINBOW_STREAK_RAIL_SQUASH,
                 );
                 continue;
             }
             // DARK ARM: a rainbow tail — chained RAINBOW_BANDS comet_beam segments,
             // dim(tail) → bright(head) — topped by a white twinkle head.
-            let seed_rot = (g.seed * 6.0) as usize;
+            //
+            // IN THE CANONICAL ORDER. The band index used to be `(k + seed·6) %
+            // 6`, so the spectrum along a glide tail started wherever the seed
+            // said and wrapped violet straight back into red mid-streak — a
+            // cyclic permutation of the ribbon's canonicalized order, and a hard
+            // seam where the wrap landed. `k` runs red at the tail to violet at
+            // the head for every star.
             for k in 0..bands {
                 if out.len() >= Self::MAX_QUADS {
                     return;
@@ -11140,7 +11756,7 @@ impl CursorGlow {
                 let f1 = (k + 1) as f32 / bands as f32;
                 let p0 = (tx + (hx - tx) * f0, ty + (hy - ty) * f0);
                 let p1 = (tx + (hx - tx) * f1, ty + (hy - ty) * f1);
-                let hue = RAINBOW_BANDS[(k + seed_rot) % bands];
+                let hue = RAINBOW_BANDS[k];
                 let c0 = (head_cov * (0.2 + 0.8 * f0)) as u8;
                 let c1 = (head_cov * (0.2 + 0.8 * f1)) as u8;
                 if c1 == 0 {
@@ -11189,10 +11805,10 @@ impl CursorGlow {
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
-            let twinkle = 0.6 + 0.4 * (age * 13.0 + g.seed * std::f32::consts::TAU).sin();
+            let twinkle = twinkle_env(age, g.seed * std::f32::consts::TAU);
             let hcov = (head_cov * twinkle).clamp(0.0, 255.0) as u8;
             if hcov > 0 {
-                let arm = ((chf * 0.14) as i32).max(1);
+                let arm = (star_arm(chf, STAR_ARM_STD) as i32).max(1);
                 let (ix, iy) = (hx as i32, hy as i32);
                 if !push_twinkle_star(
                     out,
@@ -11299,9 +11915,6 @@ impl CursorGlow {
                     // The streak was already dropped into the leading for the
                     // same reason; the nucleus has to follow it or the meteor
                     // arrives somewhere its own body does not.
-                    let ink = light_ink_bold(hue);
-                    let cap = ((nuc * LIGHT_INK_GAIN) as u32)
-                        .clamp(1, RAINBOW_LIGHT_RAIL_ALPHA_CAP as u32);
                     push_halo_over(
                         halos,
                         geom,
@@ -11309,7 +11922,9 @@ impl CursorGlow {
                         j.y1 + chf * RAINBOW_LIGHT_RAIL_DY,
                         rn,
                         (rn * RAINBOW_LAND_FLASH_LIGHT_SQUASH).max(1.0),
-                        (ink & 0x00FF_FFFF) | (cap << 24),
+                        // LEADING role: it follows its own body onto the rail
+                        // line, so nothing it darkens is a glyph.
+                        InkRole::Leading.stamp(hue, nuc),
                         255,
                     );
                 }
@@ -11339,8 +11954,8 @@ impl CursorGlow {
                     j.y1 + dy,
                     total * 0.5,
                     (head_cov * LIGHT_INK_GAIN).min(RAINBOW_LIGHT_RAIL_ALPHA_CAP) as u8,
-                    u * 0.5,
-                    RAINBOW_LIGHT_RAIL_ALPHA_CAP,
+                    InkRole::Leading,
+                    RAINBOW_STREAK_RAIL_SQUASH,
                 );
                 continue;
             }
@@ -11493,13 +12108,12 @@ impl CursorGlow {
             // Where this cell sits on the band ramp: a slow travelling
             // sweep (the ribbon's own phase + the column) so the rail reads
             // as a rainbow flowing past rather than one flat bar.
-            let sweep = (s.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
-                + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
-                .rem_euclid(1.0);
-            // The FULL spectrum along the line, pulled to the shared
-            // [`LIGHT_INK_MAX_LUMA`] bar so every band survives source-over on
-            // white with comparable weight.
-            let hue = light_ink_bold(rainbow_gradient_of(&RAINBOW_BANDS, sweep));
+            // THE SHARED band — the same one the pop's bar and the glyph tint
+            // read for this cell, so the underline, the flare on it and the
+            // letter above it are one colour rather than three.
+            // LEADING role: `DY − RY` puts the rail wholly in the inter-line
+            // leading, clear of every descender.
+            let hue = InkRole::Leading.ink(rainbow_band_at(s.col, self.rainbow.phase));
             // rx spans well past the cell so neighbouring rails merge
             // into ONE continuous band with no ripple (the radii are
             // constant now, so the merge is actually smooth).
@@ -11529,25 +12143,37 @@ impl CursorGlow {
         if sh.is_multiple_of(6)
             && self.probed_cell_glyph(i32::from(s.row) - 1, s.col, geom.rows) != Some(true)
         {
-            let twinkle = 0.55 + 0.45 * (age * 9.0 + (sh >> 3) as f32).sin().abs();
+            let twinkle = twinkle_env(age, (sh >> 3) as f32);
             let mom = rainbow_star_momentum(self.rainbow.disp);
             let scov = (RAINBOW_LIGHT_RAIL_COV_CAP * retract * twinkle * mom * cfg.intensity)
                 .min(LIGHT_INK_ALPHA_CAP);
             if scov >= 1.0 {
                 // A saturated sparkle hue (rolls per cell so the sky isn't
-                // monochrome); `push_twinkle_over` applies the shared darken +
-                // legibility cap and draws it as the 4-point plus.
+                // monochrome).
                 let hue = rainbow_gradient_of(&RAINBOW_BANDS, ((sh >> 5) & 0xff) as f32 / 255.0);
                 let jx = ((sh >> 9) % (cwf.max(2.0) as u32)) as f32 - cwf * 0.5;
-                push_twinkle_over(
-                    halos,
-                    geom,
-                    scx + jx,
-                    scy - chf * 1.1,
-                    chf * 0.26,
-                    hue,
-                    scov as u8,
-                );
+                if star_accent(sh >> 5) {
+                    // THE STARDUST LAW's dealt accent: the 4-point plus via
+                    // `push_twinkle_over` (shared darken + legibility cap),
+                    // FINE times the family's ink tax — the accent is a grace
+                    // note on ink too.
+                    push_twinkle_over(
+                        halos,
+                        geom,
+                        scx + jx,
+                        scy - chf * 1.1,
+                        star_arm(chf, STAR_ARM_FINE * STAR_ARM_INK),
+                        hue,
+                        false,
+                        scov as u8,
+                    );
+                } else {
+                    // The BODY: one round darkened mote — stardust in ink.
+                    let dot = (InkRole::OverText.ink(hue) & 0x00FF_FFFF)
+                        | ((scov as u32).clamp(1, InkRole::OverText.alpha_cap() as u32) << 24);
+                    let r = dust_r(chf, ((sh >> 17) & 0xFF) as f32 / 255.0) * STAR_ARM_INK;
+                    push_halo_over(halos, geom, scx + jx, scy - chf * 1.1, r, r, dot, 255);
+                }
             }
         }
     }
@@ -11556,10 +12182,16 @@ impl CursorGlow {
     /// coverage, feathered gradient rows, momentum wave. Returns `false` when
     /// the quad budget ran out — the caller aborts the pass exactly as the
     /// inlined original did.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one swept cell: its spark, its spatial place on the ribbon (sp/dsp/tail_dir), its resolved coverage, and the output stream"
+    )]
     fn emit_rainbow_body_dark(
         &self,
         s: &Spark,
-        u: f32,
+        sp: f32,
+        dsp: f32,
+        tail_dir: f32,
         cov_f: f32,
         clearance: f32,
         geom: Geom,
@@ -11595,7 +12227,11 @@ impl CursorGlow {
             let disp2 = self.rainbow.disp * self.rainbow.disp;
             let shimmer = 1.0 + Self::RAINBOW_IRID_AMP * disp2 * noise;
             let gc = self.rainbow.phase.fract(); // glint centre: head(0)→tail(1)
-            let gd = (u - gc) / Self::RAINBOW_GLINT_WIDTH;
+            // Rides the SPATIAL parameter: a highlight travelling DOWN the
+            // ribbon is a claim about where light sits, not about how old a
+            // cell is. On `u` the glint landed on scattered cells whenever the
+            // cadence varied, because `u`'s denominator is per-spark.
+            let gd = (sp - gc) / Self::RAINBOW_GLINT_WIDTH;
             let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
             let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
             (base * shimmer + glint_add).clamp(0.0, RAINBOW_BAND_COV_CAP_MAX)
@@ -11645,6 +12281,15 @@ impl CursorGlow {
         // `rainbow_hot_ribbon_cell_cost_fits_the_quad_budget`). The COLD branch
         // keeps its single strip and 1-px rows BYTE-EXACT — the iridescence
         // contract above pins the cold ribbon as a flat crisp rect.
+        // EDGE SOFTENING. Thinning this to expose more of the red and violet
+        // outer stripes was tried and REVERTED: at 1/6 the pixel oracle
+        // (`rainbow_hot_body_preserves_default_text_contrast`) measured 5.168:1
+        // against this crate's certified 5.25:1 bar. The feather is load-bearing
+        // for legibility, not decoration — the outer bands carry the most
+        // generous coverage caps precisely because they are the darkest hues,
+        // and letting them reach those caps un-feathered is what spends the
+        // margin. The crispness the owner asked for comes from the six FLAT
+        // slabs (`rainbow_slab_at`), which cost no light at all.
         const RAINBOW_FEATHER: f32 = 0.18;
         let hot = self.rainbow.disp >= 0.005;
         // MOMENTUM IRIDESCENT SPECTRUM — the "dynamic range" dial: at speed
@@ -11663,8 +12308,8 @@ impl CursorGlow {
                 RAINBOW_BANDS
             } else {
                 let mut b = RAINBOW_BANDS;
-                for c in &mut b {
-                    *c = rotate_hue(*c, hue_off);
+                for (c, &hsv) in b.iter_mut().zip(RAINBOW_BANDS_HSV.iter()) {
+                    *c = rotate_hue(hsv, hue_off);
                 }
                 b
             }
@@ -11699,14 +12344,25 @@ impl CursorGlow {
             // bouncing the join between the cat and its rainbow as you typed
             // across the line. It now rides the ribbon's OWN head→tail parameter,
             // so the wave travels WITH the trail: one lazy S at any length.
-            let wave_phase = u * std::f32::consts::TAU * Self::RAINBOW_WAVE_CYCLES
+            // SUB-CELL SAMPLE. The strip's own place on the ribbon, not its
+            // cell's: `sp` steps once per cell, so a cell-constant wave is a
+            // STAIRCASE — the trail's edge stepped once per column instead of
+            // curving. (The three strips existed for exactly this and were
+            // documented as "three samples trace it smoothly", but nothing in
+            // the loop body ever depended on `si`: every strip recomputed an
+            // identical `top_f`, so the cell paid 3× the quad budget for one
+            // sample. This is that intent, wired.) Strip centres map across the
+            // cell toward the tail, so the curve joins its neighbours seamlessly.
+            let fc = (si as f32 + 0.5) / strips as f32;
+            let sp_strip = sp + tail_dir * (0.5 - fc) * dsp;
+            let wave_phase = sp_strip * std::f32::consts::TAU * Self::RAINBOW_WAVE_CYCLES
                 - self.rainbow.phase * Self::RAINBOW_WAVE_RAD;
             // HEAD PIN: exactly zero at the cursor, opening over the first
             // [`Self::RAINBOW_WAVE_HEAD_PIN`] of the ribbon, so the rainbow
             // leaves the cat dead straight and only breathes further back.
             let wave_amp = (Self::RAINBOW_WAVE_AMP_CELLS * ch as f32 * self.rainbow.disp)
                 .min(room * 0.5)
-                * smoothstep01(u / Self::RAINBOW_WAVE_HEAD_PIN);
+                * smoothstep01(sp_strip / Self::RAINBOW_WAVE_HEAD_PIN);
             // FRACTIONAL vertical displacement — no rounding, so the curve
             // is smooth across columns instead of snapping to whole pixels.
             let wave = wave_phase.sin() * wave_amp;
@@ -11751,7 +12407,7 @@ impl CursorGlow {
                     y,
                     sw,
                     h,
-                    premul_rgb(rainbow_gradient_of(&bands, t), rcov as u8),
+                    premul_rgb(rainbow_slab_at(&bands, t), rcov as u8),
                 );
             }
         }
@@ -11769,8 +12425,11 @@ impl CursorGlow {
         &self,
         s: &Spark,
         age: f32,
-        u: f32,
         env: f32,
+        // The spark's [`rainbow_edge_envelope`], evaluated ONCE by the caller
+        // and shared with the body profile — see the star-cov comment below for
+        // why the two must be the same feather.
+        edge: f32,
         cfg: &GlowConfig,
         geom: Geom,
         out: &mut Vec<GlowQuad>,
@@ -11811,7 +12470,10 @@ impl CursorGlow {
             // legacy stars (the cold 1-in-6 population) are never dimmed or
             // recoloured, so the hot/cold boundary is seamless for them.
             let u = m as f32 / u32::MAX as f32;
-            let p = 0.30 * self.rainbow.disp; // ~1-in-3 extra at full spine
+            // THINNED 0.30 -> 0.13. Recruiting to ~1-in-3 starred cells made
+            // the sky a texture rather than a scatter; at 1-in-5 an individual
+            // star is a thing you notice again.
+            let p = 0.13 * self.rainbow.disp;
             let recruited = !legacy && u < p;
             let dim = if recruited {
                 (((p - u) / p.max(1e-6)) * 3.0).min(1.0)
@@ -11841,10 +12503,17 @@ impl CursorGlow {
         // Cells outside the probes' knowledge (wrapped-away lines,
         // headless embedders that never wire the seam) keep their stars —
         // IN-CELL, exactly the shipped pre-displacement behavior.
-        let on_glyph = self.probed_cell_glyph(i32::from(s.row), s.col, geom.rows) == Some(true);
-        if starred && !on_glyph {
-            // Twinkle: brightness pulses over the spark's life so stars blink.
-            let twinkle = 0.55 + 0.45 * (age * 9.0 + (h >> 3) as f32).sin().abs();
+        //
+        // ORDERED `starred` FIRST, deliberately: check 1 only decides whether a
+        // star that EXISTS may print, and two thirds of swept cells never draw
+        // one at all. `probed_cell_glyph` is a pure `&self` read of the frozen
+        // PREV probe slot with no side effect to preserve, so short-circuiting
+        // past it on an unstarred cell cannot change a byte — it just stops the
+        // whole ribbon from walking the glyph grid for nothing.
+        if starred && self.probed_cell_glyph(i32::from(s.row), s.col, geom.rows) != Some(true) {
+            // THE ONE TWINKLE: brightness pulses over the spark's life so stars
+            // blink, on a per-cell phase from the placement hash.
+            let twinkle = twinkle_env(age, (h >> 3) as f32);
             // SUBTLE-START: the momentum envelope scales brightness AND arm
             // size, so a cold star is a faint small glint and the shipped
             // full-punch star returns only at full spine (rationale at
@@ -11860,14 +12529,9 @@ impl CursorGlow {
             // fade through zero in lockstep: the star is born out of the
             // background with its cell and is spent before the cell is.
             // Pinned by `rainbow_stars_fade_with_the_ribbon_edge_feather`.
-            let star_cov = (RAINBOW_STAR_COV
-                * env
-                * rainbow_edge_envelope(u, s.life)
-                * twinkle
-                * cfg.intensity
-                * recruit_dim
-                * mom)
-                .min(OVER_INK_COV_CAP * 1.5) as u8;
+            let star_cov =
+                (RAINBOW_STAR_COV * env * edge * twinkle * cfg.intensity * recruit_dim * mom)
+                    .min(OVER_INK_COV_CAP * 1.5) as u8;
             if star_cov > 0 {
                 // Sub-cell x jitter from the hash; a small plus (h-bar + v-bar).
                 let sx = x + cw / 4 + ((h >> 5) % (cw.max(2) as u32 / 2)) as i32;
@@ -11894,7 +12558,11 @@ impl CursorGlow {
                 let land_row = i32::from(s.row) + if sky { -1 } else { 1 };
                 let land_clear = self.probed_cell_glyph(land_row, s.col, geom.rows) == Some(false);
                 let sy = if land_clear {
-                    let a_max = ((ch as f32 * 0.125) as i32).max(1);
+                    // The FULL-spine arm bound: the family's own ceiling for
+                    // this star (momentum only grows the arm toward it), so the
+                    // drift span provably keeps the whole plus inside the
+                    // landing row's band.
+                    let a_max = (star_arm(ch as f32, STAR_ARM_STD) as i32).max(1);
                     let span = (ch * 3 / 4 - a_max).max(1) as u32;
                     let drift = ((h >> 9) % span) as i32;
                     if sky {
@@ -11905,24 +12573,53 @@ impl CursorGlow {
                 } else {
                     cy0 + ch / 6 + ((h >> 9) % (ch.max(2) as u32 / 2)) as i32
                 };
-                // Arm half-length breathes with the same envelope: ~70% of
-                // the shipped ch/8 at rest, exactly ch/8 at full spine.
-                let a = ((ch as f32 * (0.085 + 0.04 * mom)) as i32).max(1);
-                // Gold stars carry a faint diagonal glint — the classic
-                // four-point sparkle — kept dim so text stays legible.
-                // Shared with the glide LANDING via `push_twinkle_star`.
-                if !push_twinkle_star(
-                    out,
-                    geom,
-                    sx,
-                    sy,
-                    a,
-                    star_cov,
-                    gold,
-                    twinkle_rgb(gold),
-                    Self::MAX_QUADS,
-                ) {
-                    return false;
+                // THE STARDUST LAW: the field's BODY is round dust — a tiny
+                // seed-sized point riding the same env/twinkle/momentum
+                // brightness — and the 4-point star is dealt to the recruited
+                // GOLD plus 1-in-8 of the hash. The plus stopped being the
+                // population (owner, 2026-08-08: "cute small stardust ...
+                // fewer of the '+'").
+                if gold || star_accent(h >> 5) {
+                    // Arm half-length breathes with the same envelope, between
+                    // two NAMED ratios of the family's arm scale: the
+                    // starfield grain at rest, the family default at full
+                    // spine. Gold stars carry a faint diagonal glint — the
+                    // classic four-point sparkle — kept dim so text stays
+                    // legible. Shared with the glide LANDING via
+                    // `push_twinkle_star`.
+                    let a = (star_arm(
+                        ch as f32,
+                        STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * mom,
+                    ) as i32)
+                        .max(1);
+                    if !push_twinkle_star(
+                        out,
+                        geom,
+                        sx,
+                        sy,
+                        a,
+                        star_cov,
+                        gold,
+                        twinkle_rgb(gold),
+                        Self::MAX_QUADS,
+                    ) {
+                        return false;
+                    }
+                } else {
+                    if out.len() >= Self::MAX_QUADS {
+                        return false;
+                    }
+                    let d = ((dust_r(ch as f32, ((h >> 17) & 0xFF) as f32 / 255.0) * 1.4) as i32)
+                        .max(2);
+                    push_rect(
+                        out,
+                        geom,
+                        sx - d / 2,
+                        sy - d / 2,
+                        d,
+                        d,
+                        premul_rgb(twinkle_rgb(false), star_cov),
+                    );
                 }
             }
         }
@@ -11977,9 +12674,36 @@ impl CursorGlow {
         // hide-bridge — which blanks the cursor for ~20-35 ms on every keystroke
         // echo — cannot make the ribbon head pulse bright once per key.
         let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
+        // THE RIBBON'S SPATIAL COORDINATE (`sp`), distinct from its temporal one
+        // (`u = age/life`).
+        //
+        // The undulating wave, the head pin and the specular glint are all
+        // SPATIAL claims — "one lazy S along the trail", "dead straight where it
+        // leaves the cat", "a highlight sweeping head→tail down a glass ribbon".
+        // They used to ride `u`, which is NOT a position: every spark's `life` is
+        // priced at birth from the momentum spine AND the observed inter-key gap
+        // (see `move_spark_life`'s RainbowKitty arm), so two cells typed a beat
+        // apart get different denominators and their `u` values are unrelated to
+        // how far apart they SIT. The wave height and the glint therefore jumped
+        // between neighbouring cells instead of flowing along the trail — the
+        // ribbon read as lumpy exactly when the cadence varied, which is what
+        // real typing is. (A metronomic burst hides it: uniform gaps ⇒ uniform
+        // lives ⇒ `u` happens to be smooth. That is why it was only "sometimes".)
+        //
+        // `sparks` is push-ordered, so reversing it walks the ribbon head→tail in
+        // CELL order. The ordinal, normalized by the live span, is a true spatial
+        // parameter: uniform steps of `dsp`, independent of cadence, and it keeps
+        // the authored "0.75 cycles across the whole ribbon however long it is"
+        // law that `RAINBOW_WAVE_CYCLES` encodes.
+        let span = self.sparks.len().saturating_sub(1).max(1) as f32;
+        let dsp = 1.0 / span;
+        // The dissolve length is a property of THE FRAME's spine, not of a
+        // spark, so it is read once here rather than rebuilt for each of the
+        // (up to [`Self::RAINBOW_MAX_CELLS`]) swept cells below.
+        let tail = 0.32 + 0.45 * self.rainbow.disp;
         // Newest first so a saturated output budget preserves the responsive
         // ribbon head and sheds only the oldest tail.
-        for s in self.sparks.iter().rev() {
+        for (ord, s) in self.sparks.iter().rev().enumerate() {
             if under.len() >= Self::MAX_QUADS {
                 return;
             }
@@ -11991,7 +12715,6 @@ impl CursorGlow {
             // interior wink-out), only the trailing TAIL fades, and the tail
             // LENGTHENS with heat (a longer, softer dissolve the faster you fly).
             let u = (age / s.life).clamp(0.0, 1.0);
-            let tail = 0.32 + 0.45 * self.rainbow.disp;
             let env = if u < 1.0 - tail {
                 1.0
             } else {
@@ -12005,7 +12728,11 @@ impl CursorGlow {
             // is a separate multiplier rather than a clamp on `life`.
             let retract = self.retract_fade_of(now, s);
             let env = env * retract;
-            let head = rainbow_ribbon_profile(u, s.life);
+            // ONE feather per spark, shared by the body profile and the
+            // starfield's alpha (both are documented as riding the SAME
+            // envelope, and it was being evaluated twice for a starred cell).
+            let edge = rainbow_edge_envelope(u, s.life);
+            let head = rainbow_ribbon_profile_edged(u, edge);
             let raw_cov = (s.born_cov as f32) * env * head * cfg.intensity;
             // The age profile (temporal) × the cell-distance CLEARANCE (spatial).
             // Off-row ribbon and an unknown head both clear to 1.0, i.e.
@@ -12028,6 +12755,23 @@ impl CursorGlow {
             };
             let cov_f = if raw_cov >= 1.0 {
                 (raw_cov * clearance).max(1.0)
+            } else if age <= RAINBOW_EDGE_IN_S {
+                // THE HEAD IS NEVER CULLED ON ITS OWN FIRST FRAME.
+                //
+                // `rainbow_ribbon_profile` multiplies in a birth feather that is
+                // exactly 0 at u = 0, so the cell carrying the letter you just
+                // typed asked for sub-floor coverage and was dropped entirely —
+                // a flat frame of nothing on EVERY keystroke, and the residual
+                // "responsiveness lag in typing" the owner still reported after
+                // the onset constants were already cut.
+                //
+                // Fixed HERE rather than in the profile: the profile's
+                // both-ends-zero contract is what stops a TERMINATING spark
+                // printing a hard vertical edge, and four tests rightly pin it.
+                // A spark inside its birth window is not terminating — it is
+                // arriving — so the floor belongs to the emitter's cull, which
+                // is the thing that was actually wrong.
+                raw_cov.max(1.0)
             } else {
                 raw_cov
             };
@@ -12038,10 +12782,20 @@ impl CursorGlow {
                 self.emit_rainbow_rails_light(s, age, u, retract, cov_f, cfg, geom, halos);
                 continue;
             }
-            if !self.emit_rainbow_body_dark(s, u, cov_f, clearance, geom, under) {
+            // Spatial position along the ribbon: 0 at the head (the cell under
+            // the cursor), 1 at the oldest live tail cell.
+            let sp = ord as f32 * dsp;
+            // Which way the tail runs on this row, so a strip's SUB-CELL offset
+            // moves toward the older light rather than away from it. Off-row and
+            // unknown-head both take the ordinary leftward tail.
+            let tail_dir = match head_cell {
+                Some((hr, hc)) if hr == s.row && hc < s.col => -1.0,
+                _ => 1.0,
+            };
+            if !self.emit_rainbow_body_dark(s, sp, dsp, tail_dir, cov_f, clearance, geom, under) {
                 return;
             }
-            if !self.emit_rainbow_starfield(s, age, u, env, cfg, geom, out) {
+            if !self.emit_rainbow_starfield(s, age, env, edge, cfg, geom, out) {
                 return;
             }
         }
@@ -12067,6 +12821,49 @@ impl CursorGlow {
     /// so the stream must be `(row, col)`-sorted with unique cells. Uniqueness
     /// is structural — [`Self::born_ink_pop`] keeps at most one pop per cell —
     /// and the sort is done here, exactly as the charred stream does it.
+    /// TEXT FIRST, for the LIGHT star kit — the source-over twin of the rule
+    /// every additive star already obeys.
+    ///
+    /// The dark arm has always refused to stamp a star over a PROVABLY occupied
+    /// cell (`probed_cell_glyph(..) == Some(true)`), because a white plus on a
+    /// letterform muddies it. The light arm never got that rule: its stars were
+    /// small enough to pass unnoticed, so the omission sat there until the star
+    /// kit was unified and the light stars grew to the ink tax the ladder
+    /// charges — at which point a white-ground review reported trails that
+    /// "cross text and materially hurt legibility", with visible sparkles
+    /// sitting on `lazy`, `dog`, `and`, `keeps` and `typing`.
+    ///
+    /// Source-over ink is strictly worse over a glyph than additive light is:
+    /// additive light on dark text LIFTS it, while ink on dark text simply
+    /// replaces part of the letterform. So the light rule is the stricter one —
+    /// an occupied cell sheds the star entirely rather than dimming it.
+    /// UNPROBED cells still draw, exactly like the dark contract.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the shared light star's parameters plus the geometry the text-first probe needs"
+    )]
+    fn push_twinkle_over_text_first(
+        &self,
+        halos: &mut Vec<RainHalo>,
+        geom: Geom,
+        cx: f32,
+        cy: f32,
+        arm: f32,
+        rgb: u32,
+        gold: bool,
+        cov: u8,
+    ) {
+        let col = ((cx - f32::from(geom.origin_x)) / (geom.cw as f32).max(1.0)).floor();
+        let row = ((cy - f32::from(geom.origin_y)) / (geom.ch as f32).max(1.0)).floor();
+        if col >= 0.0
+            && (0..geom.cols as i32).contains(&(col as i32))
+            && self.probed_cell_glyph(row as i32, col as u16, geom.rows) == Some(true)
+        {
+            return;
+        }
+        push_twinkle_over(halos, geom, cx, cy, arm, rgb, gold, cov);
+    }
+
     fn emit_fresh_ink_glyphs(&self, now: Instant, cfg: &GlowConfig, charred: &mut Vec<CharFg>) {
         if !matches!(cfg.style, GlowStyle::RainbowKitty)
             || cfg.dark_theme
@@ -12074,6 +12871,18 @@ impl CursorGlow {
         {
             return;
         }
+        // THE THEME'S OWN PALETTE, or nothing. `fresh_ink_glyph_palette` is the
+        // whole legibility argument: it refuses outright on a theme with no
+        // usable side (a sentinel, `fg == bg`, an equiluminant pair) and
+        // otherwise returns six inks whose entire fade path against THIS
+        // foreground is bounded against THIS ground.
+        let Some(palette) = self
+            .glyph_palette
+            .filter(|(k, _)| *k == (cfg.theme_fg, cfg.theme_bg))
+            .and_then(|(_, p)| p)
+        else {
+            return;
+        };
         let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
         let first = charred.len();
         for p in &self.rainbow.ink_pops {
@@ -12104,18 +12913,22 @@ impl CursorGlow {
             if w < FRESH_INK_GLYPH_MIN_W {
                 continue;
             }
-            // The SAME band the rail under this glyph is drawing, quantized to
-            // the six anchors — the letter and its underline are one mark.
-            let sweep = (p.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
-                + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
-                .rem_euclid(1.0);
-            let band = RAINBOW_BANDS
+            // THE SAME band the rail under this glyph is drawing — the letter
+            // and its underline are one mark. `rainbow_sweep_at` is the one
+            // sweep; the palette is indexed by the same band position, so the
+            // tint can never disagree with the ink beneath it.
+            let sweep = rainbow_sweep_at(p.col, self.rainbow.phase);
+            let ink = palette
                 [((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)];
-            let ink = fresh_ink_glyph_ink_light(band);
             charred.push(CharFg {
                 row: p.row,
                 col: p.col,
-                fg: lerp_rgb(FRESH_INK_GLYPH_ANCHOR_LIGHT, ink, w),
+                // ANCHORED ON THE REAL FOREGROUND: at `w == 0` this is
+                // `theme_fg` bit-exactly, so the hand-back at the end of the
+                // fade is not a step at all. The engine used to anchor on a
+                // fixed near-black because `GlowConfig` carried no theme fg;
+                // it does now.
+                fg: lerp_rgb(cfg.theme_fg, ink, w),
             });
         }
         charred[first..].sort_unstable_by_key(|c| (c.row, c.col));
@@ -12162,6 +12975,19 @@ impl CursorGlow {
         // THE CARET POCKET's anchor — the same head the ribbon body clears
         // against, so the two layers dim over one shared span.
         let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
+        // THE NEWEST POP IS EXEMPT FROM THE POCKET (owner, 2026-08-06: "I still
+        // want to see an effect per character I type"). The pocket answers an
+        // EARLIER owner report ("too bright right where I was typing"), and both
+        // are satisfied at once by scoping it: what was too bright was the STACK
+        // of several fresh pops piled under the hand during a fast run, not the
+        // single character you just committed. Exempting exactly the newest pop
+        // gives every keystroke one unmistakable flash of its own while the pops
+        // behind it stay pocketed, so the stack never rebuilds.
+        //
+        // Ties (a coalesced multi-cell echo stamps one `born`) all read as
+        // newest, which is correct: that batch IS one keystroke's worth of
+        // freshly typed cells, and it is bounded by RAINBOW_TYPED_SWEEP_MAX.
+        let newest = self.rainbow.ink_pops.iter().map(|p| p.born).max();
         for p in &self.rainbow.ink_pops {
             if (p.row as usize) >= geom.rows || (p.col as usize) >= geom.cols {
                 continue;
@@ -12226,11 +13052,7 @@ impl CursorGlow {
                 // The band is read from the light rail's own sweep expression so
                 // the pop and the rail it swells are never two colours, then
                 // QUANTIZED to the six anchors (see [`is_fresh_ink_veil`]).
-                let sweep = (p.col as f32 * RAINBOW_LIGHT_RAIL_SPREAD
-                    + self.rainbow.phase * RAINBOW_LIGHT_RAIL_FLOW)
-                    .rem_euclid(1.0);
-                let band = RAINBOW_BANDS
-                    [((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)];
+                let band = rainbow_band_at(p.col, self.rainbow.phase);
                 let rail_dy = chf * RAINBOW_LIGHT_RAIL_DY;
                 // THE POP MARKS THE NEW CHARACTER; THE RAIL MARKS THE TRAIL.
                 //
@@ -12298,8 +13120,21 @@ impl CursorGlow {
                     let earn = ((emphasis - FRESH_INK_SPARK_EMPH)
                         / (1.0 - FRESH_INK_SPARK_EMPH).max(1e-3))
                     .clamp(0.0, 1.0);
-                    let scov =
-                        (LIGHT_INK_ALPHA_CAP * env * earn * cfg.intensity).min(LIGHT_INK_ALPHA_CAP);
+                    // THE ONE TWINKLE. This was the third star in the family
+                    // that never pulsed: a dead cross sitting in the same sky
+                    // band as the ribbon's blinking twinkles. Phase from the
+                    // cell so neighbouring pops don't wink in lockstep; static
+                    // under reduced motion like every other pulse.
+                    let tw = if self.reduced_motion {
+                        1.0
+                    } else {
+                        twinkle_env(
+                            u * FRESH_INK_LIFE_S,
+                            f32::from(p.row) * 1.7 + f32::from(p.col) * 0.9,
+                        )
+                    };
+                    let scov = (LIGHT_INK_ALPHA_CAP * env * earn * tw * cfg.intensity)
+                        .min(LIGHT_INK_ALPHA_CAP);
                     if scov >= 1.0 {
                         let dy = chf * FRESH_INK_SPARK_DY * if sky_up { -1.0 } else { 1.0 };
                         push_twinkle_over(
@@ -12307,8 +13142,9 @@ impl CursorGlow {
                             geom,
                             cx,
                             cy + dy,
-                            chf * FRESH_INK_SPARK_ARM * scale,
+                            star_arm(chf, STAR_ARM_STD * STAR_ARM_INK) * scale,
                             band,
+                            false,
                             scov as u8,
                         );
                     }
@@ -12341,7 +13177,9 @@ impl CursorGlow {
             // reads brighter (and, via the spring on the radii, momentarily
             // LARGER) then settles to the normal look.
             let cov = rainbow_over_ink_coverage(FRESH_INK_CORE_COV * env * m * cfg.intensity);
-            if cov >= 1.0 {
+            // Culled once it is grey rather than warm — see
+            // `FRESH_INK_MIN_READABLE_COV`.
+            if cov >= FRESH_INK_MIN_READABLE_COV {
                 push_halo(
                     halos,
                     geom,
@@ -12366,7 +13204,7 @@ impl CursorGlow {
                 // byte-identical — the golden runs 0.7).
                 let hcov = rainbow_over_ink_coverage(FRESH_INK_HALO_COV * fl * m * cfg.intensity)
                     .min((FRESH_INK_CENTRE_CAP - cov).max(0.0));
-                if hcov >= 1.0 {
+                if hcov >= FRESH_INK_MIN_READABLE_COV {
                     push_halo(
                         halos,
                         geom,
@@ -12621,6 +13459,23 @@ impl CursorGlow {
             // free to read, at every cadence.
             let mut beat = 0.0f32;
             for &(pd, decay) in &pulses[..n_pulses] {
+                // NUMERICALLY DEAD BEYOND THE CULL RADIUS, and this loop is the
+                // single hottest thing the family does: it is
+                // O(segments x live pulses), and under key-repeat that reaches
+                // 160 x 32 = 5120 `exp` calls in ONE frame — measured as ~420 of
+                // a typical frame's ~509.
+                //
+                // BYTE-IDENTICAL, not "close enough". At the cull radius the
+                // gaussian is e^-34 ~ 1.8e-15, while `w` below is floored by
+                // `RAINBOW_WAKE_BASE * exp(-RAINBOW_WAKE_EXTENT)` >= 0.05,
+                // whose f32 ULP is ~3.7e-9 — seven orders of magnitude larger
+                // than the largest term this can drop. `beat` feeds only `w`
+                // and the swell (nothing compares it to zero), so no emitted
+                // byte can move. Verified by sweeping the full length range x
+                // 3000 positions for zero bit differences.
+                if (d - pd).abs() >= RAINBOW_WAKE_PULSE_CULL {
+                    continue;
+                }
                 beat = beat.max(rainbow_wake_pulse_space(d - pd) * decay);
             }
             let w = RAINBOW_WAKE_BASE * rainbow_wake_body(d, len) + RAINBOW_WAKE_PULSE * beat;
@@ -13332,13 +14187,25 @@ impl CursorGlow {
             // Sparkles rotate their hue over the flight; embers/droplets keep the
             // birth seed. The colour ramp itself lives in `style_particle_color`,
             // shared with the settings-card demo.
-            let hue = match cfg.style {
-                // Fire/Water/Comet use `hue` as a per-particle SEED (temperature,
-                // droplet depth, grain size + twinkle phase) — it must not roll.
-                GlowStyle::Fire | GlowStyle::Water | GlowStyle::Comet => p.hue,
-                _ => (p.hue + age * 0.5).fract(),
+            //
+            // DEMAND-DRIVEN, not computed up front: three of the arms below —
+            // RainbowKitty, Fire and Beam — draw with their OWN colours
+            // (twinkle_rgb / the star tints, `fire_ramp` off the ember's own
+            // temperature seed, the stardust tint ladder) and never read this
+            // value at all. Evaluating it eagerly cost every rainbow-kitty
+            // frame a full `fract` + `hsv2rgb` + `lerp_rgb` per live particle
+            // (~20 of each) whose result was dropped on the floor. The ramp is
+            // pure, so deferring it into the arms that consume it cannot move a
+            // byte; the arms that don't simply never call it.
+            let particle_color = || {
+                let hue = match cfg.style {
+                    // Fire/Water/Comet use `hue` as a per-particle SEED (temperature,
+                    // droplet depth, grain size + twinkle phase) — it must not roll.
+                    GlowStyle::Fire | GlowStyle::Water | GlowStyle::Comet => p.hue,
+                    _ => (p.hue + age * 0.5).fract(),
+                };
+                style_particle_color(cfg.style, cfg.color, hue, fade)
             };
-            let color = style_particle_color(cfg.style, cfg.color, hue, fade);
             // Water droplets support the connected wake rather than competing
             // with it: lower coverage keeps a hot seven-drop burst from becoming
             // a cyan knot at the cursor. Other particle styles keep their punch.
@@ -13368,7 +14235,7 @@ impl CursorGlow {
                         0.05,              // seconds of motion the dash trails
                         (geom.ch as f32 * 0.11).max(1.5),
                         cfg.color,
-                        color,
+                        particle_color(),
                         cov,
                     );
                     continue;
@@ -13378,7 +14245,7 @@ impl CursorGlow {
                 // sleeve) — hanging weightless in the wake. The rainbow kitty star-power
                 // pattern, re-cooled for deep space.
                 GlowStyle::Beam => {
-                    let twinkle = 0.45 + 0.55 * (age * 9.0 + p.hue * std::f32::consts::TAU).sin();
+                    let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                     let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                     if scov > 0 {
                         let tint = if p.hue < 0.45 {
@@ -13388,7 +14255,15 @@ impl CursorGlow {
                         } else {
                             0x00A9_8BFF // bright nebula violet
                         };
-                        let arm = ((geom.ch as f32 * 0.14) as i32).max(1);
+                        // THE STARDUST LAW: deep space is DUST with the odd
+                        // star — the wake's body is round motes; a dealt
+                        // 1-in-8 keeps the 4-point twinkle, FINE.
+                        if !star_accent((p.hue * 4096.0) as u32) {
+                            let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
+                            push_halo(halos, geom, x, y, r, r, premul_rgb(tint, scov));
+                            continue;
+                        }
+                        let arm = (star_arm(geom.ch as f32, STAR_ARM_FINE) as i32).max(1);
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -13410,11 +14285,15 @@ impl CursorGlow {
                 // catching the light, not a steady dot. Grain size rides the hue
                 // seed (no two match); the brightest instant of a twinkle throws a
                 // tiny 4-point GLINT (diffraction spikes off an ice facet). Budget:
-                // ≤3 quads per grain, count-capped at spawn well under fire's shower.
+                // one body quad plus, at the twinkle's peak only, the shared
+                // 4-point star; count-capped at spawn well under fire's shower.
                 GlowStyle::Comet => {
-                    let twinkle = 0.40
-                        + 0.60 * (age * (7.0 + 6.0 * p.hue) + p.hue * std::f32::consts::TAU).sin();
-                    let gcov = ((cov as f32) * twinkle.max(0.0)) as u8;
+                    // THE ONE TWINKLE, on the grain's own seeded phase. The
+                    // frequency used to ride the hue seed (7..13 rad/s), which
+                    // is the one thing a family of stars must NOT disagree on:
+                    // the size seed still varies, the blink rate no longer does.
+                    let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
+                    let gcov = ((cov as f32) * twinkle) as u8;
                     if gcov == 0 {
                         continue;
                     }
@@ -13427,19 +14306,33 @@ impl CursorGlow {
                         iy - d / 2,
                         d,
                         d,
-                        premul_rgb(color, gcov),
+                        premul_rgb(particle_color(), gcov),
                     );
-                    if twinkle > 0.82 {
+                    // THE STARDUST LAW: only a dealt 1-in-8 grain throws the
+                    // 4-point glint at its twinkle peak — the rest of the
+                    // tail shimmers as the dust it is (the peak still brights
+                    // the grain via `gcov`'s twinkle term). Accent glints
+                    // stay FINE.
+                    if twinkle_peak(twinkle) && star_accent((p.hue * 4096.0) as u32) {
                         if out.len() >= Self::MAX_QUADS {
                             return;
                         }
-                        let arm = ((geom.ch as f32 * 0.14) as i32).max(1);
-                        let glint = premul_rgb(0x00FF_FFFF, gcov / 2);
-                        push_rect(out, geom, ix - arm, iy, 2 * arm + 1, 1, glint);
-                        if out.len() >= Self::MAX_QUADS {
+                        // THE ONE STAR — this glint used to be two hand-rolled
+                        // `push_rect` bars, the eleventh star mark in the audit
+                        // and the only one that could never grow a nucleus.
+                        if !push_twinkle_star(
+                            out,
+                            geom,
+                            ix,
+                            iy,
+                            (star_arm(geom.ch as f32, STAR_ARM_FINE) as i32).max(1),
+                            gcov / 2,
+                            false,
+                            0x00FF_FFFF,
+                            Self::MAX_QUADS,
+                        ) {
                             return;
                         }
-                        push_rect(out, geom, ix, iy - arm, 1, 2 * arm + 1, glint);
                     }
                     continue;
                 }
@@ -13473,8 +14366,11 @@ impl CursorGlow {
                                 y,
                                 thick,
                                 cov,
-                                p.hue,
-                                LIGHT_INK_ALPHA_CAP,
+                                // A FLYING particle's streak can cross a glyph
+                                // at any moment: the conservative pair.
+                                InkRole::OverText,
+                                // A flying comet is round.
+                                1.0,
                             );
                             continue;
                         }
@@ -13487,19 +14383,18 @@ impl CursorGlow {
                             vy,
                             TRAIL_S,
                             (geom.ch as f32 * 0.11).max(1.5),
-                            0x00FF_F2C0, // warm-gold tail
-                            0x00FF_FFFF, // white-hot head
+                            twinkle_rgb(true),  // the family's warm gold, tail
+                            twinkle_rgb(false), // white-hot head
                             cov,
                         );
                         // A small twinkle head — the sparkle at the comet's tip.
-                        let twinkle =
-                            0.55 + 0.45 * (age * 13.0 + p.hue * std::f32::consts::TAU).sin();
+                        let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                         let hcov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                         if hcov > 0 {
                             if out.len() >= Self::MAX_QUADS {
                                 return;
                             }
-                            let arm = ((geom.ch as f32 * 0.14) as i32).max(1);
+                            let arm = (star_arm(geom.ch as f32, STAR_ARM_STD) as i32).max(1);
                             let (ix, iy) = (x as i32, y as i32);
                             if !push_twinkle_star(
                                 out,
@@ -13518,11 +14413,17 @@ impl CursorGlow {
                         continue;
                     }
                     // GLITTER poof (cov_scale sentinel < 0.9) vs the default twinkle
-                    // star (== 1.0): both draw as the 4-point plus below; only the
-                    // tint differs (cool silver/pastel for glitter, warm white/gold
-                    // for the star).
+                    // star (== 1.0). Since the sparkle rebalance (owner: "the extra
+                    // '+' sparkles on cursor are too extreme") the glitter band also
+                    // splits by SHAPE: under [`ERASE_ROUND_SCALE_MAX`] the grain is
+                    // the delete poof's BODY and draws ROUND — the old-style spark —
+                    // while the band's top half (the trail's star, the terminus
+                    // melt, the poof's HERO) keeps the 4-point plus. Tint still
+                    // splits glitter (cool silver/pastel) from the star (warm
+                    // white/gold).
                     let glitter = p.cov_scale < 0.9;
-                    let twinkle = 0.55 + 0.45 * (age * 11.0 + p.hue * std::f32::consts::TAU).sin();
+                    let round = p.cov_scale < ERASE_ROUND_SCALE_MAX;
+                    let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                     // SUBTLE-START: the flying
                     // star shower rides the SAME live momentum envelope as the
                     // ribbon's per-cell stars — dim/small when the spine is barely
@@ -13558,6 +14459,19 @@ impl CursorGlow {
                         continue;
                     }
                     if self.own_row_glyph_at_px(geom, x, y) {
+                        // TEXT FIRST, and the LIGHT rule is the stricter one.
+                        // Additive light over a glyph LIFTS it, so a third of it
+                        // is a fair compromise; source-over ink over a glyph
+                        // REPLACES part of the letterform, and a third of that
+                        // is still ink on a letter. A white-ground review saw
+                        // exactly this as sparkles sitting on `lazy`, `dog`,
+                        // `and`, `keeps` and `typing` — trails that "cross text
+                        // and materially hurt legibility". On light the grain
+                        // sheds entirely; it keeps flying and reappears the
+                        // moment it clears the ink.
+                        if !cfg.dark_theme {
+                            continue;
+                        }
                         scov /= 3;
                     }
                     // LIGHT-THEME GLITTER (delete poof): additive white/silver is
@@ -13570,22 +14484,45 @@ impl CursorGlow {
                     // gives on dark. Only the delete GLITTER family forks — the
                     // momentum shower (twinkle stars) stays dark-only by design.
                     if !cfg.dark_theme && glitter && scov > 0 {
+                        let sat = hsv2rgb(p.hue, 0.9, 1.0);
+                        let a = (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8;
+                        // THE STARDUST LAW on ink: the glitter band's body
+                        // (trail stars, the terminus melt) goes round like
+                        // the poof's; the plus is the hero's — or a dealt
+                        // 1-in-8 accent's — alone.
+                        let seed = (p.hue * 4096.0) as u32;
+                        let hero = p.cov_scale >= ERASE_HERO_SCALE_MIN;
+                        let round = round || !(hero || star_accent(seed));
+                        if round {
+                            // The poof's BODY, round in ink: one capped
+                            // source-over nucleus — crossing arms are reserved
+                            // for the hero. A white-ground line kill once read
+                            // as "a row of pale dots", but that was the even
+                            // span-wide spread's fault, not the shape's: debris
+                            // now clusters at the collapse point
+                            // ([`ERASE_POOF_SPREAD_CELLS`]) and the hero plus
+                            // carries the crisp accent.
+                            let r = (geom.ch as f32 * (0.10 + 0.05 * p.hue)).max(1.5);
+                            // OVER-TEXT role: a poof grain lands wherever the
+                            // deleted span was, glyphs included.
+                            let dot = (InkRole::OverText.ink(sat) & 0x00FF_FFFF)
+                                | (u32::from(a).clamp(1, InkRole::OverText.alpha_cap() as u32)
+                                    << 24);
+                            push_halo_over(halos, geom, x, y, r, r, dot, 255);
+                            continue;
+                        }
                         // The SAME 4-point plus the dark arm draws, in ink:
                         // `push_twinkle_over` applies the shared darken and the
-                        // legibility ceiling. This used to be a round blob,
-                        // which is why a white-ground line kill read as a row of
-                        // pale dots where dark read as a shower of sparkles.
-                        let sat = hsv2rgb(p.hue, 0.9, 1.0);
-                        let arm = (geom.ch as f32 * 0.17 * erase_hero_arm(p.cov_scale)).max(1.5);
-                        push_twinkle_over(
-                            halos,
-                            geom,
-                            x,
-                            y,
-                            arm,
-                            sat,
-                            (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
-                        );
+                        // legibility ceiling. The hero keeps the family
+                        // default times its multiplier; a dealt accent stays
+                        // FINE — a grace note over the dust, not the body.
+                        let ratio = if hero {
+                            STAR_ARM_STD * erase_hero_arm(p.cov_scale)
+                        } else {
+                            STAR_ARM_FINE
+                        };
+                        let arm = (star_arm(geom.ch as f32, ratio * STAR_ARM_INK)).max(1.5);
+                        push_twinkle_over(halos, geom, x, y, arm, sat, false, a);
                         continue;
                     }
                     if scov > 0 {
@@ -13599,18 +14536,44 @@ impl CursorGlow {
                             } else {
                                 0x00C8_D0DC // pale silver
                             }
-                        } else if p.hue < 0.5 {
-                            0x00FF_FFFF
                         } else {
-                            0x00FF_F2C0
+                            // THE ONE PALETTE: the family's white/gold pair, not
+                            // a fourth private warm white (this was 0x00FF_F2C0).
+                            twinkle_rgb(p.hue >= 0.5)
                         };
-                        // Momentum breathes the star's SIZE too: ~72% of the
-                        // shipped 0.16·ch arm at the spawn floor, the full arm at
-                        // full spine (glitter keeps the shipped size).
-                        let arm =
-                            ((geom.ch as f32 * (0.11 + 0.05 * mom) * erase_hero_arm(p.cov_scale))
-                                as i32)
-                                .max(1);
+                        // THE STARDUST LAW: the population's body is round
+                        // dust; the 4-point star is dealt to 1-in-8 by the
+                        // particle's stored seed. Only the erase poof's HERO
+                        // band sits outside the deal.
+                        let seed = (p.hue * 4096.0) as u32;
+                        let hero = glitter && p.cov_scale >= ERASE_HERO_SCALE_MIN;
+                        if round || !(hero || star_accent(seed)) {
+                            // STARDUST — one radial mote, a glowing point,
+                            // not a crossing. Seed-sized so no two match,
+                            // shrinking a little as it dies; the shimmer is
+                            // already in `scov` (the twinkle sine), so the
+                            // spark still glints — it just stopped
+                            // spelling '+'.
+                            let r = if round {
+                                // The poof's round body keeps its shipped size.
+                                (geom.ch as f32 * (0.09 + 0.06 * p.hue)).max(1.5)
+                            } else {
+                                dust_r(geom.ch as f32, p.hue)
+                            } * (0.6 + 0.4 * fade);
+                            push_halo(halos, geom, x, y, r, r, premul_rgb(tint, scov));
+                            continue;
+                        }
+                        // The ACCENT (or the poof's hero): momentum still
+                        // breathes the hero between the family's named
+                        // ratios, but a dealt accent stays FINE — it is a
+                        // grace note over the dust, not the body.
+                        let ratio = if hero {
+                            (STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * mom)
+                                * erase_hero_arm(p.cov_scale)
+                        } else {
+                            STAR_ARM_FINE
+                        };
+                        let arm = (star_arm(geom.ch as f32, ratio) as i32).max(1);
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -13701,18 +14664,43 @@ impl CursorGlow {
                 // plain glitter for texture, the occasional pale silver MOON (a
                 // crescent of three limbs), and now and then a MINI-COMET — a
                 // velocity-aligned rainbow streak (the laser-dash rasterizer,
-                // re-dressed). Budget: ≤6 quads per grain, guarded per push.
+                // re-dressed). Budget: a small constant per grain (the shared
+                // star's arms + nucleus, plus at most four glints), guarded per
+                // push and hard-bounded by [`Self::MAX_QUADS`].
                 GlowStyle::Sparkle => {
                     let seed = (p.hue * 4096.0) as u32;
                     let (ix, iy) = (x as i32, y as i32);
                     match seed % 8 {
-                        0..=3 => {
-                            // Four-point star, twinkling on its own seeded phase.
-                            let twinkle =
-                                0.5 + 0.5 * (age * 8.0 + p.hue * std::f32::consts::TAU).sin();
+                        1..=3 => {
+                            // THE STARDUST LAW: the pour's former star lion's
+                            // share (buckets 1-3) is round celestial dust now
+                            // — the 4-point star kept exactly ONE bucket (0,
+                            // 1-in-8) below. Brightness keeps the same
+                            // twinkle; the dust still glints, it just stopped
+                            // spelling '+'.
+                            let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                             let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                             if scov > 0 {
-                                let arm = ((geom.ch as f32 * (0.12 + 0.08 * p.hue)) as i32).max(1);
+                                let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
+                                push_halo(halos, geom, x, y, r, r, premul_rgb(particle_color(), scov));
+                            }
+                            continue;
+                        }
+                        0 => {
+                            // Four-point star, twinkling on its own seeded phase.
+                            let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
+                            let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
+                            if scov > 0 {
+                                // Size rides the seed between two NAMED ratios —
+                                // the starfield grain at rest to the family
+                                // default — the hero span retired with the
+                                // stardust law: one dealt accent per eight
+                                // grains, never a fat plus in the pour.
+                                let arm = (star_arm(
+                                    geom.ch as f32,
+                                    STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * p.hue,
+                                ) as i32)
+                                    .max(1);
                                 // Arms via the shared star; the glint stays local —
                                 // Sparkle's is WHITE and fires only at the twinkle
                                 // peak, unlike the helper's gold glint.
@@ -13724,16 +14712,20 @@ impl CursorGlow {
                                     arm,
                                     scov,
                                     false,
-                                    color,
+                                    particle_color(),
                                     Self::MAX_QUADS,
                                 ) {
                                     return;
                                 }
-                                if twinkle > 0.85 {
+                                if twinkle_peak(twinkle) {
                                     // The brightest instant throws diffraction
-                                    // glints off the points.
-                                    let d = (arm / 2).max(1);
-                                    let glint = premul_rgb(0x00FF_FFFF, scov / 3);
+                                    // glints off the points — at the family's own
+                                    // glint offset and dimming.
+                                    let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
+                                    let glint = premul_rgb(
+                                        0x00FF_FFFF,
+                                        (f32::from(scov) * STAR_GLINT_COV) as u8,
+                                    );
                                     for (gx, gy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
                                         if out.len() >= Self::MAX_QUADS {
                                             return;
@@ -13754,7 +14746,7 @@ impl CursorGlow {
                                 iy - sz / 2,
                                 sz,
                                 sz,
-                                premul_rgb(color, cov),
+                                premul_rgb(particle_color(), cov),
                             );
                             continue;
                         }
@@ -13777,6 +14769,9 @@ impl CursorGlow {
                         _ => {
                             // Mini-comet: a short rainbow streak trailing the
                             // grain's live motion, dim tail to bright head.
+                            // Bound once: the dash takes the SAME hue at both
+                            // ends, so this is one ramp evaluation, not two.
+                            let dash = particle_color();
                             push_velocity_dash(
                                 out,
                                 geom,
@@ -13786,8 +14781,8 @@ impl CursorGlow {
                                 p.vy + p.gy * age,
                                 0.08,
                                 (geom.ch as f32 * 0.09).max(1.2),
-                                color,
-                                color,
+                                dash,
+                                dash,
                                 cov,
                             );
                             continue;
@@ -13817,7 +14812,7 @@ impl CursorGlow {
                         y as i32 - h / 2,
                         w,
                         h,
-                        premul_rgb(color, cov),
+                        premul_rgb(particle_color(), cov),
                     );
                 }
             }
@@ -13961,13 +14956,21 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
 /// fast-glide star): additive rainbow light is INVISIBLE on a white ground, so a
 /// streak from `(x0,y0)` (tail) to `(x1,y1)` (head) is laid as a short chain of
 /// DARKENED SATURATED source-over dots — the ribbon-rail recipe — each dot's
-/// [`RAINBOW_BANDS`] hue mixed ~28 % toward black, [`HaloMode::Over`], its high-byte
-/// centre over-alpha CAPPED at [`LIGHT_INK_ALPHA_CAP`] for legibility so it darkens the ground into
+/// [`RAINBOW_BANDS`] hue darkened by its [`InkRole`], [`HaloMode::Over`], its high-byte
+/// centre over-alpha capped by that same role for legibility so it darkens the ground into
 /// a contrast INCREASE without ever burying ink. The hue rolls tail→head across
-/// the spectrum (offset by `hue_roll`) and the alpha brightens toward the head.
+/// the spectrum IN THE CANONICAL ORDER — red at the tail, violet at the head —
+/// and the alpha brightens toward the head.
 /// `peak` is the head coverage byte; `thick` the dot radius (px). Bounded to
 /// `STREAK_DOTS` dots — cheap on the shared halo budget. Never called on dark, so
 /// every dark path stays byte-identical.
+///
+/// THE ROLL IS GONE. The hue used to be `(f + hue_roll).rem_euclid(1.0)` with
+/// `hue_roll` a per-caller offset (`u·0.5`, the glide seed, the particle hue) —
+/// a cyclic permutation of the six anchors, so a streak could start at green and
+/// wrap violet straight back into red partway along its own body. That is the
+/// same acyclic-ramp-wrapped-cyclically bug `rainbow_sweep_at` was fixed for,
+/// and it put the family's spectrum in a different order on every streak.
 fn push_rainbow_streak_over(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -13977,12 +14980,19 @@ fn push_rainbow_streak_over(
     y1: f32,
     thick: f32,
     peak: u8,
-    hue_roll: f32,
-    // The centre over-alpha CEILING this caller is entitled to. A streak that
-    // rides the RAIL LINE is leading-only and may go to the rail's ceiling; a
-    // streak trailing a FLYING particle can cross a glyph at any moment and
-    // takes the conservative shared one.
-    cap_max: f32,
+    // THE COMPOSITING ROLE (see THE ONE LIGHT-INK RULE): it picks BOTH the
+    // darkening policy and the centre over-alpha ceiling. A streak that rides
+    // the RAIL LINE is leading-only; a streak trailing a FLYING particle can
+    // cross a glyph at any moment and takes the conservative pair. This used to
+    // be a bare `cap_max`, which meant a flying streak asked for the
+    // conservative CEILING and still got the leading-only INK.
+    role: InkRole,
+    // Vertical squash. A streak that RIDES THE RAIL is the underline extending
+    // itself, so it takes the rail's own thickness and reads as one continuous
+    // mark with it (owner: "I want the cursor streak to be more like the bottom
+    // underline"). A streak trailing a FLYING particle is a comet and stays
+    // round. `1.0` is round; smaller is flatter.
+    ry_scale: f32,
 ) {
     // CONTINUOUS, not six beads. Six fixed dots is a legible streak across two
     // cells and a dotted line across a window: on a screen-crossing Ctrl-A the
@@ -14007,23 +15017,33 @@ fn push_rainbow_streak_over(
         let f = k as f32 / (dots as f32 - 1.0); // 0 tail .. 1 head
         let cx = x0 + (x1 - x0) * f;
         let cy = y0 + (y1 - y0) * f;
-        // Rainbow rolls along the length; darken toward black so the saturated
-        // hue survives source-over on white.
-        let hue = rainbow_gradient_of(&RAINBOW_BANDS, (f + hue_roll).rem_euclid(1.0));
-        let veil = light_ink_bold(hue);
+        // The rainbow rolls along the length in the CANONICAL order (red at the
+        // tail, violet at the head), darkened by this streak's own role so the
+        // saturated hue survives source-over on white.
+        let hue = rainbow_gradient_of(&RAINBOW_BANDS, f);
+        let veil = role.ink(hue);
         // Brighten into the head. The ramp is steep on purpose: a chain whose
         // tail is 40 % of its head reads as a rule of even weight — "no
         // directional shape: uniform dotted line, no head, no taper, no fade",
         // in a white-ground review's words. From an eighth to full, a still
         // frame shows which way the thing was going.
         let a = (peak as f32 * (0.12 + 0.88 * f * f)) as u32;
-        let cap = a.clamp(1, cap_max as u32);
+        let cap = a.clamp(1, role.alpha_cap() as u32);
         let veil_capped = (veil & 0x00FF_FFFF) | (cap << 24);
         // METEOR TAPER: a thread at the tail swelling into the head, so the
         // streak reads as a body with a direction rather than a rule of even
         // thickness.
         let rk = r * (STREAK_TAPER_MIN + (1.0 - STREAK_TAPER_MIN) * f);
-        push_halo_over(halos, geom, cx, cy, rk, rk, veil_capped, 255);
+        push_halo_over(
+            halos,
+            geom,
+            cx,
+            cy,
+            rk,
+            (rk * ry_scale).max(1.0),
+            veil_capped,
+            255,
+        );
     }
 }
 
@@ -14041,6 +15061,14 @@ fn push_rainbow_streak_over(
 /// here (callers pass the same hue they would give the additive star) and its
 /// centre over-alpha is bounded by [`LIGHT_INK_ALPHA_CAP`], so a sparkle can
 /// grey the ground into a contrast INCREASE but never bury ink.
+///
+/// ONE SILHOUETTE. The arms' waist ([`STAR_WAIST`]), the nucleus
+/// ([`STAR_CORE`]), the diagonal glint offset ([`STAR_GLINT`]) and its dimming
+/// ([`STAR_GLINT_COV`]) are the FAMILY's numbers, shared verbatim with
+/// [`push_twinkle_star`]; this rasterizer only realizes them in source-over
+/// falloff ellipses instead of hard additive rects. They used to be private
+/// `LIGHT_STAR_*` constants the additive star had never heard of, so a sparkle
+/// changed shape when the theme changed.
 fn push_twinkle_over(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -14048,27 +15076,42 @@ fn push_twinkle_over(
     cy: f32,
     arm: f32,
     rgb: u32,
+    gold: bool,
     cov: u8,
 ) {
     if cov == 0 || arm < 0.75 {
         return;
     }
-    let ink = light_ink(rgb);
-    let cap = u32::from(cov).clamp(1, LIGHT_INK_ALPHA_CAP as u32);
+    // A star is an OVER-TEXT mark by construction — it is thrown into the row,
+    // not laid on the rail line — so this rasterizer pins the role and no star
+    // caller can pick the wrong policy. (THE ONE LIGHT-INK RULE.)
+    const ROLE: InkRole = InkRole::OverText;
+    let ink = ROLE.ink(rgb);
+    let cap = u32::from(cov).clamp(1, ROLE.alpha_cap() as u32);
     let star = (ink & 0x00FF_FFFF) | (cap << 24);
     // The arms carry MASS. A source-over hairline on white is dust: the dark
     // arm's additive plus reads because every lit pixel is at full coverage,
     // while a 1 px source-over arm behind a radial falloff is a few counts off
-    // the paper. Thicker arms plus a CORE — a small round nucleus at the
-    // crossing — give the mark the bright centre the additive star gets for
-    // free, so a sparkle reads as a sparkle rather than as a stray '+'.
-    const LIGHT_STAR_WAIST: f32 = 0.34;
-    const LIGHT_STAR_CORE: f32 = 0.40;
-    let waist = (arm * LIGHT_STAR_WAIST).max(1.0);
+    // the paper. The shared waist plus the shared CORE — a small round nucleus
+    // at the crossing — give the mark the bright centre the additive star gets
+    // (in part) from its own crossing, so a sparkle reads as a sparkle rather
+    // than as a stray '+'.
+    let waist = (arm * STAR_WAIST).max(1.0);
     push_halo_over(halos, geom, cx, cy, arm, waist, star, 255);
     push_halo_over(halos, geom, cx, cy, waist, arm, star, 255);
-    let core = (arm * LIGHT_STAR_CORE).max(1.0);
+    let core = (arm * STAR_CORE).max(1.0);
     push_halo_over(halos, geom, cx, cy, core, core, star, 255);
+    if gold {
+        // The classic four-point sparkle's secondary points, dim — the same
+        // accent the additive gold star throws, so the WARM half of the palette
+        // is the same mark on both grounds.
+        let d = arm * STAR_GLINT;
+        let gcap = ((cap as f32 * STAR_GLINT_COV) as u32).clamp(1, LIGHT_INK_ALPHA_CAP as u32);
+        let glint = (ink & 0x00FF_FFFF) | (gcap << 24);
+        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
+            push_halo_over(halos, geom, cx + ox, cy + oy, 1.0, 1.0, glint, 255);
+        }
+    }
 }
 
 #[allow(
@@ -14296,12 +15339,42 @@ fn rainbow_gradient_of(bands: &[u32; 6], t: f32) -> u32 {
     lerp_rgb(bands[bi], bands[bi + 1], p - bi as f32)
 }
 
-/// Rotate a `0x00RRGGBB` colour's hue by `turns` (fraction of the full wheel),
-/// preserving saturation and value — the ribbon's momentum iridescence. Leans
-/// on the shared [`crate::color_math`] HSV round-trip (degrees).
-fn rotate_hue(rgb: u32, turns: f32) -> u32 {
-    let (h, s, v) = crate::color_math::rgb2hsv(rgb);
+/// Rotate a colour's hue by `turns` (fraction of the full wheel), preserving
+/// saturation and value — the ribbon's momentum iridescence. Leans on the
+/// shared [`crate::color_math`] HSV round-trip (degrees).
+///
+/// Takes the colour ALREADY decomposed, because every caller rotates one of six
+/// fixed anchors whose decomposition never changes — see [`RAINBOW_BANDS_HSV`],
+/// which holds the other half of the round trip.
+fn rotate_hue(hsv: (f32, f32, f32), turns: f32) -> u32 {
+    let (h, s, v) = hsv;
     crate::color_math::hsv2rgb(h + turns * 360.0, s, v)
+}
+
+/// SIX FLAT SLABS — the ribbon body's colour law (owner, 2026-08-04: the trail
+/// "isn't smooth enough", shown against a screenshot where the stripes are an
+/// unreadable smear).
+///
+/// The doc on [`GlowStyle::RainbowKitty`] has always promised "six crisp stacked
+/// stripes", but the body asked [`rainbow_gradient_of`] for a CONTINUOUS lerp
+/// between the six anchors and then sampled it in 1-2 px rows. Six hues cannot
+/// resolve across the ~11-13 device px a hot ribbon actually occupies once the
+/// width taper and the edge feather have taken their share: what reaches the eye
+/// is one soft vertical blend, which is why it reads as a smudge rather than as
+/// a rainbow.
+///
+/// Nyan's rainbow is legible because it is FLAT PIXEL ART — equal slabs, hard
+/// boundaries, stable order. This is that law: `t` selects its band and returns
+/// the band's own colour, unmixed. Boundaries land wherever the row grid puts
+/// them, so a slab is never thinner than the sampling row.
+///
+/// [`rainbow_gradient_of`] is retained for the populations that genuinely want a
+/// blend and are not the banded body — the sparkle-dot hue roll and the jump
+/// streak's own ramp — so this change is scoped to the ribbon.
+#[inline]
+fn rainbow_slab_at(bands: &[u32; 6], t: f32) -> u32 {
+    let i = (t.clamp(0.0, 1.0) * 6.0) as usize;
+    bands[i.min(5)]
 }
 
 #[cfg(test)]
@@ -14368,6 +15441,10 @@ mod tests {
         GlowConfig {
             enabled,
             dark_theme: true,
+            // The documented default dark palette — a COHERENT pair, never 0/0
+            // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+            theme_fg: 0x00C8_D3F5,
+            theme_bg: 0x001A_1B26,
             style,
             color: 0x0050_FA7B,
             accent: 0x007A_A2F7,
@@ -16558,7 +17635,8 @@ mod tests {
     /// cell. CAT-INDEPENDENT by construction: `poof_scan` runs unconditionally
     /// and never consults the cursor cat (there is no cat in a `CursorGlow` at
     /// all), so the burst fires whether or not the cat is flying. On rainbow kitty/dark
-    /// the poof is the momentum-independent GLITTER star burst.
+    /// the poof is the momentum-independent GLITTER burst — round sparks with
+    /// one hero '+' since the sparkle rebalance.
     #[test]
     fn plain_backspace_always_poofs_cat_independent() {
         let g = geom(); // cols 40, cw 8
@@ -18700,8 +19778,11 @@ mod tests {
                 &mut out,
             );
             if i > 1 {
+                // Since the stardust law the wake's body rides the HALO
+                // stream (round motes); the quad stream carries the rod and
+                // the dealt star accents. Lit is lit on either channel.
                 assert!(
-                    lum(&out) > 0,
+                    lum(&out) > 0 || !glow.halos().is_empty(),
                     "key {i}: the rod went dark inside a 150ms rhythm"
                 );
             }
@@ -19883,13 +20964,18 @@ mod tests {
             v.resize(40, ' ');
             v
         };
+        // A starfield MARK is either the dealt 4-point accent (a white
+        // hairline bar) or, since the stardust law, the population's round
+        // body (a small white near-square point). Both obey the same
+        // placement rules, so the text-first contract is asserted over both.
         let is_star = |q: &GlowQuad| {
             let (r, gc, b) = (
                 (q.color >> 16) & 0xff,
                 (q.color >> 8) & 0xff,
                 q.color & 0xff,
             );
-            r == gc && gc == b && r > 0 && (q.w == 1 || q.h == 1)
+            let white = r == gc && gc == b && r > 0;
+            white && (q.w == 1 || q.h == 1 || (q.w == q.h && q.w <= 6))
         };
         // Star-eligible cells on row 3 in this sweep: cols 3 and 9 (the 1-in-6
         // placement hash) — the run must cross at least one. The canonical
@@ -21647,13 +22733,35 @@ mod tests {
                 "gradient rows tile with NO gap between them"
             );
         }
-        // FEATHER — an edge row is dimmer than the ribbon centre.
-        let centre = cov(rows[rows.len() / 2].color);
+        // FEATHER — the outermost row is dimmer than the row just inside it.
+        //
+        // Stated against each row's OWN ceiling, never row-against-row: `cov` is
+        // a max-CHANNEL reading, and `RAINBOW_BAND_COV_CAPS` deliberately hands
+        // each band the coverage at which it reaches the SAME contrast bar — a
+        // dark red sits at 99 where a luminous yellow sits at 57 for equal
+        // perceived lift. So a red edge legitimately reads "brighter" in raw
+        // channel than a yellow centre while carrying no more light, and any
+        // cross-hue comparison here measures the hue, not the feather.
         assert!(
-            cov(top) < centre || cov(bot) < centre,
-            "edges feather dimmer than the centre (top {} bot {} centre {centre})",
+            cov(top) < RAINBOW_BAND_COV_CAPS[0] as u32,
+            "the top edge is feathered below its band ceiling ({} vs {})",
             cov(top),
-            cov(bot)
+            RAINBOW_BAND_COV_CAPS[0]
+        );
+        assert!(
+            cov(bot) < RAINBOW_BAND_COV_CAPS[32] as u32,
+            "the bottom edge is feathered below its band ceiling ({} vs {})",
+            cov(bot),
+            RAINBOW_BAND_COV_CAPS[32]
+        );
+        // …and the ribbon's interior DOES reach a ceiling, so the feather is a
+        // real taper rather than a blanket dimming.
+        let tightest = RAINBOW_BAND_COV_CAPS
+            .iter()
+            .fold(f32::INFINITY, |m, &v| m.min(v)) as u32;
+        assert!(
+            rows.iter().any(|q| cov(q.color) >= tightest),
+            "an interior row reaches its band ceiling (tightest {tightest})"
         );
         // Coverage cap held everywhere.
         for q in out.iter().filter(|q| is_ribbon_quad(q.color)) {
@@ -21832,9 +22940,9 @@ mod tests {
             });
         }
         glow.rainbow.disp = 1.0;
-        // Mid-ribbon cell col 8 (u = 6 × 0.03 = 0.18 — partway up the gentle
-        // head onset; the momentum glint pins the swept cell at the coverage
-        // cap regardless): its red-band coverage at a given glint phase.
+        // Mid-ribbon cell col 8. The glint rides the ribbon's SPATIAL parameter
+        // (`sp`), not `age/life`: ten live cells span `sp ∈ [0, 1]` in steps of
+        // 1/9 from the head at col 14, so col 8 sits at `sp = 6/9`.
         let mid_cov = |glow: &mut CursorGlow, phase: f32| -> u32 {
             glow.rainbow.phase = phase;
             let mut out = Vec::new();
@@ -21849,8 +22957,8 @@ mod tests {
                 .max()
                 .unwrap_or(0)
         };
-        let on = mid_cov(&mut glow, 0.18); // gc lands the glint on col 8 (u ≈ 0.18)
-        let off = mid_cov(&mut glow, 0.68); // gc = u + 0.5 sweeps it toward the tail
+        let on = mid_cov(&mut glow, 6.0 / 9.0); // gc lands the glint on col 8
+        let off = mid_cov(&mut glow, 6.0 / 9.0 + 0.5); // half a ribbon away
         assert!(
             on > off + 10 && on >= 50,
             "specular glint brightens the cell it sweeps over: on {on} vs off {off}"
@@ -21875,6 +22983,280 @@ mod tests {
             warm.rainbow.phase - p0 > 0.02,
             "phase scrolls while momentum is live ({p0} -> {})",
             warm.rainbow.phase
+        );
+    }
+
+    /// THE DERIVATION behind [`RAINBOW_BAND_COV_CAPS`]. The table's doc has
+    /// always named this function as its source, but it never existed in the
+    /// tree — the numbers were generated once, out of band, and the recipe was
+    /// lost. That is exactly the gap that bites when the ribbon's COLOUR LAW
+    /// changes: caps fitted for a continuous gradient are wrong for flat slabs,
+    /// because a slab holds its band's brightest representative across its whole
+    /// width where the gradient only touched it at a point.
+    ///
+    /// Run it to regenerate after any change to [`RAINBOW_BANDS`],
+    /// [`rainbow_slab_at`] or [`CursorGlow::RAINBOW_HUE_SWING`]:
+    ///
+    /// ```text
+    /// cargo test -p aterm-effects --lib generate_rainbow_band_cov_caps \
+    ///     -- --ignored --nocapture
+    /// ```
+    ///
+    /// Each entry is the largest coverage whose additive light still clears the
+    /// crate's 5.25:1 bar against the default palette — solved over the whole
+    /// hue-rotation range the momentum iridescence can reach, so a hot ribbon
+    /// cannot rotate itself past the bound.
+    #[test]
+    #[ignore = "generator: prints the certified table, run explicitly"]
+    fn generate_rainbow_band_cov_caps() {
+        // The same default-palette pair the oracle
+        // `rainbow_hot_body_preserves_default_text_contrast` measures against.
+        const DEFAULT_BG: u32 = 0x001A_1B26;
+        const DEFAULT_FG: u32 = 0x00C8_D3F5;
+        const BAR: f64 = 5.25;
+        // A margin under the bar: the emitter's own rounding (coverage is a u8,
+        // and `push_rect` premultiplies) must not be able to cross it.
+        const GUARD: f64 = 0.02;
+        let mut out = Vec::new();
+        for i in 0..33usize {
+            // THE NEIGHBOURHOOD, not the point. `rainbow_band_cap_at` ROUNDS,
+            // so entry `i` is the ceiling applied across the whole half-open
+            // span that rounds to it — and that span straddles a band boundary
+            // five times over, because the 33-entry grid and the six slabs do
+            // not share divisors. Solving at `i/32` alone hands the darker band
+            // its brighter neighbour's ceiling: measured 3.547:1 against the
+            // 5.25 bar, worse than the un-rederived table it replaced.
+            let lo = ((i as f32 - 0.5) / 32.0).max(0.0);
+            let hi = ((i as f32 + 0.5) / 32.0).min(1.0);
+            let mut cap = u32::MAX;
+            for j in 0..=64u32 {
+                let t = lo + (hi - lo) * j as f32 / 64.0;
+                let mut here = 0u32;
+                for c in 1..=RAINBOW_BAND_COV_CAP_MAX as u32 {
+                    // Every rotation the iridescence can apply, both directions.
+                    let ok = (-8..=8).all(|k| {
+                        let turns = CursorGlow::RAINBOW_HUE_SWING * k as f32 / 8.0;
+                        let mut bands = RAINBOW_BANDS;
+                        for b in &mut bands {
+                            // `rotate_hue` now takes the colour pre-decomposed
+                            // (its callers rotate fixed anchors); the generator
+                            // rotates arbitrary bands, so it decomposes here.
+                            *b = rotate_hue(crate::color_math::rgb2hsv(*b), turns);
+                        }
+                        let colour = premul_rgb(rainbow_slab_at(&bands, t), c as u8);
+                        let lit = aterm_render::add_sat(DEFAULT_BG, colour);
+                        contrast_ratio(DEFAULT_FG, lit) >= BAR + GUARD
+                    });
+                    if ok {
+                        here = c;
+                    } else {
+                        break;
+                    }
+                }
+                cap = cap.min(here);
+            }
+            out.push(cap);
+        }
+        println!("const RAINBOW_BAND_COV_CAPS: [f32; 33] = [");
+        for chunk in out.chunks(8) {
+            let row: Vec<String> = chunk.iter().map(|c| format!("{c}.0")).collect();
+            println!("    {},", row.join(", "));
+        }
+        println!("];");
+        assert!(
+            out.iter().all(|&c| c > 0),
+            "every band must admit SOME light: {out:?}"
+        );
+    }
+
+    /// A SCROLL CARRIES THE PIXEL-ADDRESSED LIGHT TOO — the second half of the
+    /// stray-light sweep (owner, 2026-08-04: "i still sometimes see stray
+    /// rainbow pieces").
+    ///
+    /// `d256e9f5` translated the two CELL-addressed pools (ribbon sparks, fresh-
+    /// ink pops) so the trail could not detach from the text that earned it. The
+    /// starfield, the landing ring, the ZOOM streaks and the landing starbursts
+    /// are addressed in window-absolute PIXELS and were not carried at all: they
+    /// hung exactly where they were while the text slid out from under them,
+    /// which is the detached dots-and-dashes population still on screen.
+    ///
+    /// They could not be carried before because `note_scroll` receives a ROW
+    /// count and no geometry; the engine now remembers the last tick's cell
+    /// height for exactly this.
+    #[test]
+    fn a_scroll_carries_the_pixel_addressed_light() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let now = Instant::now();
+        let mut glow = CursorGlow::default();
+        // One tick so the engine has observed a cell height.
+        let mut out = Vec::new();
+        glow.tick(Some((3, 4)), now, &c, g, &mut out);
+
+        let y0 = 10.0 * g.ch as f32;
+        glow.particles.push(Particle {
+            x0: 40.0,
+            y0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.0,
+            cov_scale: 1.0,
+            born: now,
+        });
+        glow.ring = Some(Ring {
+            cx: 40.0,
+            cy: y0,
+            born: now,
+            life: 5.0,
+        });
+
+        glow.note_scroll(2);
+        let dy = 2.0 * g.ch as f32;
+        assert_eq!(
+            glow.particles.first().map(|p| p.y0),
+            Some(y0 - dy),
+            "a star must ride the scroll, not hang over whatever replaced its text"
+        );
+        assert_eq!(
+            glow.ring.map(|r| r.cy),
+            Some(y0 - dy),
+            "the landing ring must ride the scroll too"
+        );
+
+        // Scrolled clean off the top: DROPPED, never clamped into a bar on row 0
+        // (the same discipline the cell-addressed pools already follow).
+        glow.note_scroll(40);
+        assert!(
+            glow.particles.is_empty() && glow.ring.is_none(),
+            "light scrolled off the top is dropped"
+        );
+
+        // Fail closed: a scroll before any tick has established a cell height
+        // cannot translate, so it must not leave stranded light either.
+        let mut fresh = CursorGlow::default();
+        fresh.particles.push(Particle {
+            x0: 1.0,
+            y0: 1.0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.0,
+            cov_scale: 1.0,
+            born: now,
+        });
+        fresh.note_scroll(1);
+        assert!(
+            fresh.particles.is_empty(),
+            "with no observed geometry the pools drop rather than strand"
+        );
+    }
+
+    /// THE RIBBON'S SHAPE IS SPATIAL, NOT TEMPORAL — the guard for the "the
+    /// rainbow trail isn't smooth enough" report (owner, 2026-08-04).
+    ///
+    /// The wave and the glint used to ride `u = age / life`, and every spark's
+    /// `life` is priced at birth from the momentum spine AND the observed
+    /// inter-key gap. Two cells sitting side by side could therefore hold wildly
+    /// different `u`, so the undulation and the highlight jumped between
+    /// neighbours instead of flowing along the trail — visibly lumpy exactly
+    /// when the typing cadence varied.
+    ///
+    /// `rainbow_glint_sweeps_with_momentum` above could not catch it: it builds
+    /// every spark with `life: 1.0` and a uniform 30 ms stagger, which is the
+    /// metronomic case where `u` happens to be smooth. This one builds the REAL
+    /// case — same cells, same ages, wildly different lives — and asserts the
+    /// glint still lands on the cell its POSITION earns. Under the old temporal
+    /// law the two ribbons disagree; under the spatial law they are identical.
+    #[test]
+    fn rainbow_ribbon_shape_ignores_per_spark_lifetime() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let cw = g.cw as u16;
+        let base = Instant::now();
+        let now = base + Duration::from_millis(500);
+
+        // Two ribbons over the SAME ten cells with the SAME birth times. The
+        // only difference is each spark's lifetime: uniform in one, scattered
+        // across a 4x range in the other — exactly what a varying cadence
+        // produces through `move_spark_life`'s chain-to-the-gap arm.
+        let build = |lives: &dyn Fn(u16) -> f32| {
+            let mut glow = CursorGlow::default();
+            glow.sparks.clear();
+            for col in 5..15u16 {
+                let age_ms = (14 - col) as u64 * 30;
+                glow.sparks.push(Spark {
+                    row: 3,
+                    col,
+                    born_cov: 28,
+                    pos: 0.9,
+                    life: lives(col),
+                    typing: true,
+                    hue: 0.0,
+                    born: base + Duration::from_millis(500 - age_ms),
+                    // Not retracting: this fixture measures the ribbon's SHAPE,
+                    // and the finger-lift fade is a separate brightness
+                    // multiplier that would confound it.
+                    fade_at: None,
+                });
+            }
+            glow.rainbow.disp = 1.0;
+            glow
+        };
+
+        // WHERE THE GLINT SITS as the phase scrolls. The highlight is the
+        // ribbon's loudest spatial channel (`RAINBOW_GLINT_COV` = 82 against a
+        // ~60 body), so the brightest cell IS the glint's position. Sweeping the
+        // phase across a full pass must walk it monotonically head → tail; that
+        // is precisely the claim "a highlight travelling down a glass ribbon"
+        // makes, and it is what the eye reads as smooth.
+        //
+        // Under the old temporal law this walk was not monotone once lifetimes
+        // varied: the highlight landed wherever `age/life` happened to collide
+        // with the phase, so it hopped around the trail instead of sweeping it.
+        let brightest = |glow: &mut CursorGlow, phase: f32| -> Option<u16> {
+            glow.rainbow.phase = phase;
+            let mut out = Vec::new();
+            glow.emit_rainbow(now, &c, g, &mut out, &mut Vec::new(), &mut Vec::new());
+            (5..15u16)
+                .filter_map(|col| {
+                    out.iter()
+                        .filter(|q| q.row == 3 && q.x / cw == col && is_ribbon_quad(q.color))
+                        .map(|q| {
+                            ((q.color >> 16) & 0xff)
+                                .max((q.color >> 8) & 0xff)
+                                .max(q.color & 0xff)
+                        })
+                        .max()
+                        .map(|cov| (cov, col))
+                })
+                .max()
+                .map(|(_, col)| col)
+        };
+
+        // Lifetimes scattered 2x between neighbours — what `move_spark_life`
+        // produces when the cadence wobbles — and long enough that every cell
+        // sits in the FLAT part of the fade envelope, so this measures the
+        // glint's position rather than the tail dissolve.
+        let mut glow = build(&|col| if col.is_multiple_of(2) { 2.0 } else { 4.0 });
+
+        let track: Vec<u16> = (0..10)
+            .filter_map(|i| brightest(&mut glow, i as f32 / 10.0))
+            .collect();
+        assert!(
+            track.len() >= 8,
+            "the fixture must light the ribbon at most phases: {track:?}"
+        );
+        assert!(
+            track.windows(2).all(|w| w[0] >= w[1]),
+            "the glint must SWEEP head→tail in cell order, whatever each spark's \
+             lifetime happens to be — got {track:?}"
+        );
+        assert!(
+            track[0] > *track.last().expect("non-empty"),
+            "the sweep must actually travel the ribbon: {track:?}"
         );
     }
 
@@ -22467,60 +23849,404 @@ mod tests {
         assert_eq!(rainbow_terminus_feather(-1.0), 0.0);
     }
 
-    /// THE GLYPH TINT IS ALWAYS LEGIBLE — the structural claim the tint rests
-    /// on, checked rather than argued.
+    /// The themes the tint is proved against: a real light spread including
+    /// two that sit BELOW AA on their own body text, so the "never demand more
+    /// than the theme delivers" arm is exercised rather than assumed.
+    const TINT_THEMES: [(&str, u32, u32); 5] = [
+        ("GitHub Light", 0x001F_2328, 0x00FF_FFFF),
+        ("GitHub canvas", 0x001F_2328, 0x00F6_F8FA),
+        ("Solarized Light", 0x0065_7B83, 0x00FD_F6E3), // 4.13:1 — sub-AA
+        ("Grey on grey", 0x0064_6464, 0x00E0_E0E0),    // 3.86:1 — sub-AA
+        ("Paper", 0x0033_3333, 0x00FA_F8F5),
+    ];
+
+    /// ONE SPECTRUM, NO SEAM — the unification, pinned.
     ///
-    /// The tint substitutes a cell's resolved foreground, so unlike every other
-    /// layer in this family it cannot be bounded by "it never touches a glyph".
-    /// Instead both ends of its fade are DARK inks bounded by
-    /// [`FRESH_INK_GLYPH_MAX_LUM`], and a lerp between two colours below a
-    /// luminance ceiling cannot rise above it. This walks the whole path —
-    /// every band, every weight — against two real light-theme grounds.
+    /// Every mark that lands on the light rail line reads `rainbow_sweep_at` /
+    /// `rainbow_band_at`. Two properties matter and neither is obvious:
+    /// the sweep must be CONTINUOUS (the six bands are an acyclic ramp, so a
+    /// wrapping sweep walks violet straight into red and prints a hard seam),
+    /// and the band a given cell resolves to must be THE SAME for the rail, the
+    /// pop's bar and the glyph tint.
     #[test]
-    fn fresh_ink_glyph_tint_is_always_legible() {
-        let ratio = |a: u32, b: u32| {
-            let (x, y) = (rel_luminance(a), rel_luminance(b));
-            let (hi, lo) = if x > y { (x, y) } else { (y, x) };
-            (hi + 0.05) / (lo + 0.05)
-        };
-        // GitHub Light's pure white, and a dimmer light ground (Solarized
-        // Light's `#FDF6E3`) so the bound is not tuned to one theme.
-        for ground in [0x00FF_FFFF, 0x00FD_F6E3] {
-            assert!(
-                ratio(FRESH_INK_GLYPH_ANCHOR_LIGHT, ground) >= 7.0,
-                "the anchor is legible ink on {ground:06X} ({:.2}:1)",
-                ratio(FRESH_INK_GLYPH_ANCHOR_LIGHT, ground)
-            );
-            for &band in &RAINBOW_BANDS {
-                let ink = fresh_ink_glyph_ink_light(band);
+    fn one_rainbow_sweep_is_continuous_and_shared() {
+        // CONTINUITY: no jump bigger than one step of the sweep's own rate,
+        // anywhere across several full traversals — a `rem_euclid` wrap shows
+        // up here as a jump of nearly 1.0.
+        let step = RAINBOW_LIGHT_RAIL_SPREAD;
+        for phase_i in 0..8 {
+            let phase = phase_i as f32 * 0.37;
+            let mut prev = rainbow_sweep_at(0, phase);
+            for col in 1..400u16 {
+                let now = rainbow_sweep_at(col, phase);
                 assert!(
-                    rel_luminance(ink) <= FRESH_INK_GLYPH_MAX_LUM + 1e-4,
-                    "band {band:06X} -> {ink:06X} clears the luminance ceiling"
+                    (now - prev).abs() <= step * 1.5 + 1e-5,
+                    "seam at col {col}, phase {phase}: {prev} -> {now}"
                 );
-                for step in 0..=20 {
-                    let w = step as f32 / 20.0;
-                    let fg = lerp_rgb(FRESH_INK_GLYPH_ANCHOR_LIGHT, ink, w);
-                    let r = ratio(fg, ground);
-                    assert!(
-                        r >= 4.5,
-                        "band {band:06X} at weight {w:.2} -> {fg:06X} is {r:.2}:1 on {ground:06X}"
-                    );
-                }
-                // The tint is a COLOUR, not a re-shade of the anchor: at full
-                // weight it must read as the band, or the layer buys nothing.
-                let chan = |c: u32, sh: u32| ((c >> sh) & 0xff) as i32;
-                let spread = |c: u32| {
-                    let (r, g, b) = (chan(c, 16), chan(c, 8), chan(c, 0));
-                    r.max(g).max(b) - r.min(g).min(b)
-                };
+                assert!((0.0..=1.0).contains(&now), "sweep stays in range: {now}");
+                prev = now;
+            }
+        }
+        // …and it is a real traversal, not a constant: both ends of the
+        // spectrum are actually reached.
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for col in 0..400u16 {
+            let v = rainbow_sweep_at(col, 0.0);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        assert!(
+            lo < 0.05 && hi > 0.95,
+            "the sweep spans the spectrum: {lo}..{hi}"
+        );
+        // SHARED: the band a cell resolves to is a function of (col, phase)
+        // alone, so every consumer that calls it agrees by construction. Pin
+        // that the resolver is drawn from the six anchors and nothing else.
+        for col in 0..64u16 {
+            for phase_i in 0..8 {
+                let band = rainbow_band_at(col, phase_i as f32 * 0.37);
                 assert!(
-                    spread(ink) > spread(FRESH_INK_GLYPH_ANCHOR_LIGHT) + 24,
-                    "band {band:06X} reads as a hue, not as the anchor (spread {} vs {})",
-                    spread(ink),
-                    spread(FRESH_INK_GLYPH_ANCHOR_LIGHT)
+                    RAINBOW_BANDS.contains(&band),
+                    "col {col}: {band:06X} is one of the six anchors"
                 );
             }
         }
+    }
+
+    /// THE GLYPH TINT IS ALWAYS LEGIBLE — the structural claim, checked at its
+    /// SOURCE rather than only at samples.
+    ///
+    /// The tint lerps per-channel from the theme foreground to a band ink, so
+    /// every channel of every intermediate colour lies in the BOX between the
+    /// two. `rel_luminance` is monotone in each channel, so bounding the box
+    /// CORNER (`chan_max` on the dark side) bounds the entire path — no
+    /// sampling, and no convexity argument, which would not even hold: the sRGB
+    /// transfer is piecewise and slightly non-convex at its toe join.
+    ///
+    /// The walk is asserted anyway, so a regression that breaks the corner
+    /// argument shows up as a failing sample rather than as a silently weakened
+    /// proof.
+    #[test]
+    fn fresh_ink_glyph_tint_is_always_legible() {
+        for (name, fg, bg) in TINT_THEMES {
+            let palette = fresh_ink_glyph_palette(fg, bg)
+                .unwrap_or_else(|| panic!("{name} is a usable light theme"));
+            let (side, cap) = glyph_ink_bound(fg, bg).expect("…and has a bound");
+            assert_eq!(
+                side,
+                GlyphInkSide::Dark,
+                "{name} is dark ink on a light ground"
+            );
+            // The cap is STRICTLY inside the ground, or the "never crosses"
+            // property is vacuous.
+            assert!(
+                cap < rel_luminance(bg),
+                "{name}: the bound sits strictly below its own ground"
+            );
+            // The theme's own ratio is the floor the tint is allowed to relax
+            // to — never more legible than the body text, never less.
+            let theme_ratio = wcag_ratio(fg, bg);
+            let worst_allowed = (rel_luminance(bg) + 0.05) / (cap + 0.05);
+            assert!(
+                worst_allowed >= theme_ratio.min(FRESH_INK_GLYPH_TARGET_RATIO) - 0.01,
+                "{name}: the bound never demands more than min(AA, the theme's own {theme_ratio:.2}:1)"
+            );
+            for (idx, &ink) in palette.iter().enumerate() {
+                // THE GUARD AT ITS SOURCE: the box corner, not the endpoint.
+                assert!(
+                    rel_luminance(chan_max(ink, fg)) <= cap + 1e-6,
+                    "{name} band {idx}: the box corner clears the bound"
+                );
+                // …and the walk agrees, at 21 weights.
+                for step in 0..=20 {
+                    let w = step as f32 / 20.0;
+                    let px = lerp_rgb(fg, ink, w);
+                    let r = wcag_ratio(px, bg);
+                    assert!(
+                        r + 0.01 >= theme_ratio.min(FRESH_INK_GLYPH_TARGET_RATIO),
+                        "{name} band {idx} at w={w:.2} -> {px:06X} is {r:.2}:1"
+                    );
+                    // NON-CROSSING, strictly: the path never reaches the ground.
+                    assert!(
+                        rel_luminance(px) < rel_luminance(bg),
+                        "{name} band {idx} at w={w:.2} stays on the ink side"
+                    );
+                }
+                // EXACT HAND-BACK — the whole point of threading the real fg.
+                assert_eq!(
+                    lerp_rgb(fg, ink, 0.0),
+                    fg,
+                    "{name} band {idx}: w=0 is the theme foreground, bit-exactly"
+                );
+                // …and the first EMITTED step is a small one, so the gate at
+                // `FRESH_INK_GLYPH_MIN_W` cannot become a visible pop.
+                assert!(
+                    chan_dist(lerp_rgb(fg, ink, FRESH_INK_GLYPH_MIN_W), fg) <= 24,
+                    "{name} band {idx}: the emit gate is not a step"
+                );
+                // HUE PRESENCE: it must be a colour, and a different one.
+                assert!(
+                    chan_spread(ink) >= FRESH_INK_GLYPH_MIN_SPREAD,
+                    "{name} band {idx} is a hue"
+                );
+                assert!(
+                    chan_dist(ink, fg) >= FRESH_INK_GLYPH_MIN_DELTA,
+                    "{name} band {idx} differs from fg"
+                );
+            }
+            // The six are pairwise distinct, or it is not a rainbow.
+            for a in 0..palette.len() {
+                for b in (a + 1)..palette.len() {
+                    assert_ne!(
+                        palette[a], palette[b],
+                        "{name}: bands {a} and {b} are distinct"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE BOX GUARD IS NOT DECORATION — a negative control.
+    ///
+    /// An ENDPOINT-only bound (`L(ink) <= cap`, which is what a natural reading
+    /// of "both ends are dark" would give you) is UNSOUND: a lerp between a
+    /// bluish foreground and a reddish ink passes through a colour whose
+    /// channels are the max of both, and that corner can be brighter than
+    /// either end. This pins that the corner bound is strictly stronger, so a
+    /// future simplification back to endpoints fails here instead of shipping.
+    #[test]
+    fn glyph_tint_box_corner_is_stronger_than_its_endpoints() {
+        let mut found = false;
+        for &(_, fg, bg) in &TINT_THEMES {
+            let Some((_, cap)) = glyph_ink_bound(fg, bg) else {
+                continue;
+            };
+            for &band in &RAINBOW_BANDS {
+                // A candidate that passes the ENDPOINT test but fails the BOX
+                // test must exist somewhere in the family, or the guard is
+                // vacuous on this palette.
+                for step in 0..=64 {
+                    let k = step as f32 / 64.0;
+                    let ink = {
+                        let (r, g, b) = (
+                            ((band >> 16) & 0xff) as f32,
+                            ((band >> 8) & 0xff) as f32,
+                            (band & 0xff) as f32,
+                        );
+                        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+                        let span = (hi - lo).max(1e-3);
+                        let ch = |c: f32| ((((c - lo) / span * hi) * k + 0.5) as u32).min(255);
+                        (ch(r) << 16) | (ch(g) << 8) | ch(b)
+                    };
+                    if rel_luminance(ink) <= cap && rel_luminance(chan_max(ink, fg)) > cap {
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            found,
+            "the box corner rejects candidates the endpoint test accepts — \
+             if this ever stops being true the guard has gone vacuous"
+        );
+    }
+
+    /// BISECTION SOUNDNESS — the property the palette's exactness rests on.
+    ///
+    /// `fresh_ink_glyph_ink` finds its scale by bisection, which is only valid
+    /// if the predicate is MONOTONE in `k` — and the predicate is evaluated on
+    /// the QUANTIZED candidate, so it has to stay monotone after rounding to
+    /// u8, not merely in the reals. This walks 257 values of `k` per band per
+    /// theme and asserts the predicate never goes false→true, and separately
+    /// that the RETURNED ink satisfies the predicate it was selected by (a
+    /// bisection can converge on the wrong side of a step if the endpoints are
+    /// mishandled).
+    #[test]
+    fn glyph_tint_bisection_predicate_is_monotone_and_its_answer_holds() {
+        for (name, fg, bg) in TINT_THEMES {
+            let (side, cap) = glyph_ink_bound(fg, bg).expect("a usable theme");
+            for &band in &RAINBOW_BANDS {
+                // Rebuild the family exactly as the emitter's helper does.
+                let (r, g, b) = (
+                    ((band >> 16) & 0xff) as f32,
+                    ((band >> 8) & 0xff) as f32,
+                    (band & 0xff) as f32,
+                );
+                let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+                let span = (hi - lo).max(1e-3);
+                let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
+                let s3 = [sat(r), sat(g), sat(b)];
+                let cand = |k: f32| -> u32 {
+                    let ch = |i: usize| -> u32 {
+                        let v = match side {
+                            GlyphInkSide::Dark => s3[i] * k,
+                            GlyphInkSide::Light => s3[i] + (255.0 - s3[i]) * (1.0 - k),
+                        };
+                        ((v + 0.5) as u32).min(255)
+                    };
+                    (ch(0) << 16) | (ch(1) << 8) | ch(2)
+                };
+                let ok = |ink: u32| -> bool {
+                    let corner = match side {
+                        GlyphInkSide::Dark => chan_max(ink, fg),
+                        GlyphInkSide::Light => chan_min(ink, fg),
+                    };
+                    let l = rel_luminance(corner);
+                    match side {
+                        GlyphInkSide::Dark => l <= cap,
+                        GlyphInkSide::Light => l >= cap,
+                    }
+                };
+                let mut seen_false = false;
+                for step in 0..=256 {
+                    let k = step as f32 / 256.0;
+                    let v = ok(cand(k));
+                    if !v {
+                        seen_false = true;
+                    } else {
+                        assert!(
+                            !seen_false,
+                            "{name} band {band:06X}: the predicate went false -> true at k={k:.4}, \
+                             so bisection is not valid on this family"
+                        );
+                    }
+                }
+                // …and the answer that ships satisfies the predicate.
+                let ink = fresh_ink_glyph_ink(band, fg, side, cap).expect("a usable band");
+                assert!(
+                    ok(ink),
+                    "{name} band {band:06X}: the RETURNED ink {ink:06X} fails its own predicate"
+                );
+            }
+        }
+    }
+
+    /// THE PALETTE IS MEMOIZED ON THE THEME, not recomputed per frame — and it
+    /// re-derives the moment the theme moves.
+    #[test]
+    fn glyph_tint_palette_is_memoized_on_the_theme_key() {
+        let g = geom();
+        let mut c = rainbow_pop_light_cfg();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 2)), t0, &c, g, &mut out);
+        let first = glow
+            .glyph_palette
+            .expect("a key is memoized on the first tick");
+        assert_eq!(first.0, (c.theme_fg, c.theme_bg));
+        assert!(first.1.is_some(), "the fixture theme is usable");
+        // A tick with an unchanged theme keeps the SAME memo (bit-identical).
+        glow.tick(
+            Some((3, 3)),
+            t0 + Duration::from_millis(16),
+            &c,
+            g,
+            &mut out,
+        );
+        assert_eq!(glow.glyph_palette, Some(first));
+        // Moving the theme re-derives it.
+        c.theme_fg = 0x0065_7B83;
+        c.theme_bg = 0x00FD_F6E3;
+        glow.tick(
+            Some((3, 4)),
+            t0 + Duration::from_millis(32),
+            &c,
+            g,
+            &mut out,
+        );
+        let second = glow.glyph_palette.expect("re-derived");
+        assert_eq!(second.0, (0x0065_7B83, 0x00FD_F6E3));
+        assert_ne!(
+            second.1, first.1,
+            "a different theme yields a different palette"
+        );
+        // A REFUSAL is memoized too, so it is decided once and not per frame.
+        c.theme_fg = 0x0012_3456;
+        c.theme_bg = 0x0012_3456;
+        glow.tick(
+            Some((3, 5)),
+            t0 + Duration::from_millis(48),
+            &c,
+            g,
+            &mut out,
+        );
+        assert_eq!(glow.glyph_palette, Some(((0x0012_3456, 0x0012_3456), None)));
+        assert!(
+            glow.charred().is_empty(),
+            "a conceal-shaped theme substitutes no foreground"
+        );
+    }
+
+    /// PATHOLOGICAL THEMES GET NO TINT — the layer stands down rather than
+    /// inventing a side the theme does not have.
+    #[test]
+    fn glyph_tint_suppresses_itself_on_a_theme_with_no_usable_side() {
+        // A sentinel is not a colour — masking its high byte would read as
+        // pure black and flip the ink side.
+        assert!(fresh_ink_glyph_palette(aterm_core::render::COLOR_UNSET, 0x00FF_FFFF).is_none());
+        assert!(fresh_ink_glyph_palette(0x001F_2328, aterm_core::render::COLOR_UNSET).is_none());
+        // Conceal-shaped: never reveal what the theme hid.
+        assert!(fresh_ink_glyph_palette(0x0012_3456, 0x0012_3456).is_none());
+        // Below the usable floor.
+        assert!(fresh_ink_glyph_palette(0x00FF_FFFF, 0x00CC_CCCC).is_none());
+        // Equiluminant but different hues: contrast is ~1:1, so there is no
+        // side at all. Caught by the floor, not by the side test.
+        let a = 0x00D3_0000;
+        let b = 0x0000_7A00;
+        assert!(
+            (rel_luminance(a) - rel_luminance(b)).abs() < 0.02,
+            "fixture is equiluminant ({:.3} vs {:.3})",
+            rel_luminance(a),
+            rel_luminance(b)
+        );
+        assert!(fresh_ink_glyph_palette(a, b).is_none());
+    }
+
+    /// GREYSCALE-EXHAUSTIVE: over every grey (fg, bg) pair, wherever the
+    /// palette exists the invariant holds at nine weights across all six bands.
+    /// This is the sweep that turns "the argument is sound" into "the argument
+    /// is sound for every input the type admits", within the grey slice.
+    #[test]
+    fn glyph_tint_invariant_holds_across_every_grey_theme() {
+        let mut usable = 0usize;
+        for f in 0..=255u32 {
+            for b in 0..=255u32 {
+                let fg = (f << 16) | (f << 8) | f;
+                let bg = (b << 16) | (b << 8) | b;
+                let Some(palette) = fresh_ink_glyph_palette(fg, bg) else {
+                    continue;
+                };
+                usable += 1;
+                let (side, cap) = glyph_ink_bound(fg, bg).expect("a palette implies a bound");
+                let bar = wcag_ratio(fg, bg).min(FRESH_INK_GLYPH_TARGET_RATIO);
+                for &ink in &palette {
+                    let corner = match side {
+                        GlyphInkSide::Dark => chan_max(ink, fg),
+                        GlyphInkSide::Light => chan_min(ink, fg),
+                    };
+                    match side {
+                        GlyphInkSide::Dark => assert!(rel_luminance(corner) <= cap + 1e-6),
+                        GlyphInkSide::Light => assert!(rel_luminance(corner) >= cap - 1e-6),
+                    }
+                    for step in 0..=8 {
+                        let w = step as f32 / 8.0;
+                        let px = lerp_rgb(fg, ink, w);
+                        assert!(
+                            wcag_ratio(px, bg) + 0.02 >= bar,
+                            "fg {f:02X} bg {b:02X} ink {ink:06X} w {w:.2}: \
+                             {:.2}:1 under the {bar:.2}:1 bar",
+                            wcag_ratio(px, bg)
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            usable > 4000,
+            "the sweep actually exercised the tint on {usable} grey themes"
+        );
     }
 
     /// DARK KEEPS THE NO-RECOLOR LAW. The tint is a light-theme answer to a
@@ -22654,6 +24380,255 @@ mod tests {
         assert_eq!(light_ink(0x0010_2030), 0x0010_2030);
     }
 
+    /// THE LEADING-ONLY BAR BINDS FOR ALL SIX BANDS. [`light_ink_bold`]'s job
+    /// is ONE ink weight across the whole spectrum, so a sweep rolling under a
+    /// moving cursor keeps a constant underline weight.
+    ///
+    /// The retired recipe only ever scaled DOWN, so the bar could bind only for
+    /// a hue whose own saturated luma already exceeded it — true of orange,
+    /// yellow and green, false of red, blue and violet. Measured across the six
+    /// bands the ink came out at luma 46 / 120 / 120 / 120 / 108 / 27: a 4.4x
+    /// swing in ink weight as the sweep rolled.
+    #[test]
+    fn light_ink_bold_holds_one_ink_weight_across_the_spectrum() {
+        let order = |c: u32| {
+            let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            (r >= g, g >= b, r >= b)
+        };
+        for &band in &RAINBOW_BANDS {
+            let ink = light_ink_bold(band);
+            let y = luma709(ink);
+            assert!(
+                (y - LIGHT_INK_BOLD_MAX_LUMA).abs() <= 1.5,
+                "band {band:06X} -> {ink:06X} lands at luma {y}, not ON the bar"
+            );
+            let hi = ((ink >> 16) & 0xff).max((ink >> 8) & 0xff).max(ink & 0xff) as f32;
+            assert!(
+                hi <= LIGHT_INK_BOLD_MAX_CHANNEL + 1.0,
+                "band {band:06X} -> {ink:06X} peaks at {hi}, over the channel bar"
+            );
+            // HUE PRESERVED: the band is still recognisably its own colour.
+            assert_eq!(
+                order(band),
+                order(ink),
+                "band {band:06X} keeps its hue at ink weight ({ink:06X})"
+            );
+        }
+        // THE WARM MIDDLE IS UNTOUCHED. Orange, yellow and green already met
+        // the bar by scaling alone, and are byte-identical to the retired
+        // recipe — the change reached exactly the bands the bar never governed.
+        assert_eq!(light_ink_bold(0x00FF_9900), 0x00BB_7000);
+        assert_eq!(light_ink_bold(0x00FF_FF00), 0x0081_8100);
+        assert_eq!(light_ink_bold(0x0033_FF00), 0x0020_9E00);
+        // AN ACHROMATIC INPUT IS NOT BLACK. `r == g == b` leaves a zero chroma
+        // span; the retired recipe divided by it and returned literal BLACK for
+        // WHITE — the single most common "invisible on paper" hue there is.
+        assert_eq!(light_ink_bold(0x00FF_FFFF), 0x0078_7878);
+        assert_eq!(light_ink_bold(0x0080_8080), 0x0078_7878);
+        // A genuinely black input still has no hue to weigh.
+        assert_eq!(light_ink_bold(0), 0);
+    }
+
+    /// THE ONE LIGHT-INK RULE: exactly one darkening policy per COMPOSITING
+    /// ROLE, and the role — not the emitter — picks both the ink and the
+    /// centre over-alpha ceiling.
+    ///
+    /// The two policies are a visible ~1.8x difference in ink weight, so
+    /// composing both inside one event splits it into a vivid half and a washy
+    /// half. The rasterizers therefore pin the role themselves: a star is
+    /// always OVER-TEXT, and a streak declares its role instead of declaring a
+    /// bare ceiling and inheriting the other policy's ink.
+    #[test]
+    fn one_light_ink_policy_per_compositing_role() {
+        assert!(InkRole::Leading.alpha_cap() > InkRole::OverText.alpha_cap());
+        for &band in &RAINBOW_BANDS {
+            let leading = InkRole::Leading.ink(band);
+            let over = InkRole::OverText.ink(band);
+            assert_ne!(
+                leading, over,
+                "band {band:06X}: the two policies must be distinguishable"
+            );
+            assert!(
+                luma709(leading) > luma709(over) + 20.0,
+                "band {band:06X}: leading ink {leading:06X} must outweigh over-text ink {over:06X}"
+            );
+        }
+        let g = geom();
+        let hue = RAINBOW_BANDS[0];
+        // EVERY STAR is an over-text mark, whatever hue its caller hands it.
+        let mut star = Vec::new();
+        push_twinkle_over(&mut star, g, 40.0, 40.0, 5.0, hue, false, 180);
+        assert!(!star.is_empty(), "a star draws");
+        assert!(
+            star.iter()
+                .all(|h| h.color & 0x00FF_FFFF == InkRole::OverText.ink(hue)),
+            "the star rasterizer pins the over-text policy"
+        );
+        // A STREAK takes the policy AND the ceiling of the role it declares.
+        for role in [InkRole::Leading, InkRole::OverText] {
+            let mut streak = Vec::new();
+            push_rainbow_streak_over(&mut streak, g, 20.0, 40.0, 120.0, 40.0, 3.0, 250, role, 1.0);
+            assert!(!streak.is_empty(), "a streak draws for {role:?}");
+            assert_eq!(
+                streak[0].color & 0x00FF_FFFF,
+                role.ink(hue),
+                "{role:?} streak's tail dot takes its own ink"
+            );
+            assert!(
+                streak
+                    .iter()
+                    .all(|h| ((h.color >> 24) & 0xff) as f32 <= role.alpha_cap()),
+                "{role:?} streak stays under its own ceiling"
+            );
+        }
+    }
+
+    /// ONE BAND ORDER. The spectrum runs red → violet wherever this family
+    /// draws it; nothing cyclically permutes it per event.
+    ///
+    /// The glide tail indexed its six chained segments `(k + seed·6) % 6` and
+    /// the light streak sampled `(f + hue_roll).rem_euclid(1.0)`, so a tail
+    /// could start at green and wrap violet straight back into red partway
+    /// along its own body — against a ZOOM that had already been canonicalized
+    /// to red-top (`rainbow_zoom_bands_stay_red_on_top_both_directions`).
+    #[test]
+    fn rainbow_band_order_is_canonical_everywhere() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        // The light STREAK: red at the tail, violet at the head, no wrap.
+        let mut streak = Vec::new();
+        push_rainbow_streak_over(
+            &mut streak,
+            g,
+            20.0,
+            40.0,
+            160.0,
+            40.0,
+            3.0,
+            250,
+            InkRole::Leading,
+            1.0,
+        );
+        assert_eq!(
+            streak[0].color & 0x00FF_FFFF,
+            InkRole::Leading.ink(RAINBOW_BANDS[0]),
+            "the streak's tail is RED"
+        );
+        assert_eq!(
+            streak.last().unwrap().color & 0x00FF_FFFF,
+            InkRole::Leading.ink(RAINBOW_BANDS[5]),
+            "the streak's head is VIOLET"
+        );
+
+        // The dark GLIDE TAIL: red near the tail, violet near the head, for
+        // EVERY seed. Band 0 is the only anchor with both G and B at zero;
+        // band 5 the only one with all three channels lit — premultiplication
+        // scales the ratios but preserves both facts.
+        let is_red = |q: &GlowQuad| {
+            let (r, gg, b) = (
+                (q.color >> 16) & 0xff,
+                (q.color >> 8) & 0xff,
+                q.color & 0xff,
+            );
+            r > 0 && gg == 0 && b == 0
+        };
+        let is_violet = |q: &GlowQuad| {
+            let (r, gg, b) = (
+                (q.color >> 16) & 0xff,
+                (q.color >> 8) & 0xff,
+                q.color & 0xff,
+            );
+            r > 0 && gg > 0 && b > 2 * r
+        };
+        let mean_x = |out: &[GlowQuad], f: &dyn Fn(&GlowQuad) -> bool| -> f32 {
+            let xs: Vec<f32> = out
+                .iter()
+                .filter(|q| f(q))
+                .map(|q| q.x as f32 + q.w as f32 * 0.5)
+                .collect();
+            assert!(!xs.is_empty(), "the band has to be drawn at all");
+            xs.iter().sum::<f32>() / xs.len() as f32
+        };
+        for i in 0..6 {
+            let born = Instant::now();
+            let mut glow = CursorGlow::default();
+            glow.glide.stars.push(GlideStar {
+                x0: 10.0,
+                y0: 40.0,
+                x1: 200.0,
+                y1: 40.0,
+                born,
+                life: CursorGlow::GLIDE_STAR_LIFE,
+                vel: CursorGlow::GLIDE_VEL_MAX,
+                seed: i as f32 / 6.0 + 0.05,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_rainbow_glide_stars(born, &c, g, &mut out, &mut halos);
+            let (red, violet) = (mean_x(&out, &is_red), mean_x(&out, &is_violet));
+            assert!(
+                red < violet,
+                "glide seed {i}: red must sit at the TAIL and violet at the HEAD \
+                 (red {red} vs violet {violet})"
+            );
+        }
+
+        // A SHORT LANDING throws the family's FIRST bands, not the seed's.
+        // Two stars used to mean "bands rot and rot+1", so a small landing's
+        // colours depended on the seed while every other small mark starts red.
+        for i in 0..6 {
+            let born = Instant::now();
+            let mut glow = CursorGlow::default();
+            glow.reduced_motion = true; // one static rest frame: no scatter phase
+            glow.rainbow.bursts.push(Starburst {
+                cx: 160.0,
+                cy: 40.0,
+                born,
+                life: 1.0,
+                reach: 20.0,
+                seed: i as f32 / 6.0 + 0.05,
+                stars: 2,
+                sparkles: 0,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_rainbow_starburst(born, &c, g, &mut out, &mut halos);
+            assert!(!out.is_empty(), "a landing draws");
+            let bands: std::collections::BTreeSet<usize> = out
+                .iter()
+                .filter_map(|q| {
+                    let (r, gg, b) = (
+                        (q.color >> 16) & 0xff,
+                        (q.color >> 8) & 0xff,
+                        q.color & 0xff,
+                    );
+                    let hi = r.max(gg).max(b).max(1) as f32;
+                    // Nearest anchor by normalized channel ratios.
+                    RAINBOW_BANDS
+                        .iter()
+                        .enumerate()
+                        .map(|(bi, &band)| {
+                            let (br, bg, bb) = (
+                                ((band >> 16) & 0xff) as f32 / 255.0,
+                                ((band >> 8) & 0xff) as f32 / 255.0,
+                                (band & 0xff) as f32 / 255.0,
+                            );
+                            let d = (r as f32 / hi - br).abs()
+                                + (gg as f32 / hi - bg).abs()
+                                + (b as f32 / hi - bb).abs();
+                            (bi, d)
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .filter(|&(_, d)| d < 0.12)
+                        .map(|(bi, _)| bi)
+                })
+                .collect();
+            assert_eq!(
+                bands,
+                [0usize, 1].into_iter().collect(),
+                "landing seed {i}: a two-star landing is RED + ORANGE, whatever the seed"
+            );
+        }
+    }
+
     /// THE LIGHT-THEME LEGIBILITY BOUND: at [`LIGHT_INK_ALPHA_CAP`] — the
     /// ceiling every light-theme transient's centre over-alpha is clamped to —
     /// near-black ink stays dark and a white counter survives, for every band.
@@ -22721,10 +24696,14 @@ mod tests {
             erase_poof_drive(1.0, u16::MAX) <= ERASE_WEIGHT_CAP + 1e-6,
             "the energy law is bounded at the top"
         );
-        // And the FLOOR: a cold single character still throws a real handful.
+        // And the FLOOR: a cold single character still throws a few grains.
+        // The fewer-sparkles ruling (owner via 0405571c, 2026-08-08) cut the
+        // poof back to ERASE_POOF_STARS = 7 — the erase's WEIGHT lives in the
+        // hero grain's size and the debris speed now, not the count — so the
+        // cold floor is a visible three, not the old six-grain cloud.
         assert!(
-            (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize >= 6,
-            "a cold single-character erase still throws at least six sparkles"
+            (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize >= 3,
+            "a cold single-character erase still throws a visible few sparkles"
         );
     }
 
@@ -23726,6 +25705,109 @@ mod tests {
         );
     }
 
+    /// ONE SILHOUETTE — a sparkle is the SAME MARK on both grounds.
+    ///
+    /// The dark star ([`push_twinkle_star`]) and its light twin
+    /// ([`push_twinkle_over`]) used to be different shapes: the light one had a
+    /// waist and a nucleus from private `LIGHT_STAR_*` constants, the dark one
+    /// had a hairline cross and neither. That is most of what the owner saw as
+    /// "sparkle icons … not drawn by the same artist", because the terminal's
+    /// theme decided which shape you got. Both now take their arm span, waist,
+    /// nucleus and glint offset from the ONE family spec in `effect_util`; only
+    /// the compositing (hard additive rects vs source-over falloff ellipses)
+    /// differs. This walks the two emissions and checks them against the SAME
+    /// constants, so a future edit to one rasterizer cannot quietly re-fork the
+    /// mark.
+    #[test]
+    fn a_sparkle_is_the_same_mark_on_both_grounds() {
+        let g = geom();
+        let (cx, cy, arm) = (100.0f32, 40.0f32, 10.0f32);
+        let mut dark = Vec::new();
+        assert!(push_twinkle_star(
+            &mut dark,
+            g,
+            cx as i32,
+            cy as i32,
+            arm as i32,
+            200,
+            true,
+            0x00FF_FFFF,
+            4096,
+        ));
+        let mut light = Vec::new();
+        push_twinkle_over(&mut light, g, cx, cy, arm, 0x00FF_FFFF, true, 180);
+
+        // The light star's geometry lives in each halo's (rx, ry); a halo is
+        // split per cell row, so dedupe the distinct ellipses it drew.
+        let mut ell: Vec<(u16, u16, u16, u16)> = light
+            .iter()
+            .map(|h| (h.cx, h.cy, h.rx, h.ry))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        ell.sort();
+        let has = |rx: f32, ry: f32, ox: f32, oy: f32| {
+            ell.iter().any(|&(hx, hy, hrx, hry)| {
+                f32::from(hx) == (cx + ox).round()
+                    && f32::from(hy) == (cy + oy).round()
+                    && f32::from(hrx) == rx.round().max(1.0)
+                    && f32::from(hry) == ry.round().max(1.0)
+            })
+        };
+        // ARMS — same half-length, same shared waist on both grounds.
+        let waist = (arm * STAR_WAIST).max(1.0);
+        assert!(
+            has(arm, waist, 0.0, 0.0),
+            "no horizontal ink arm at the shared waist"
+        );
+        assert!(
+            has(waist, arm, 0.0, 0.0),
+            "no vertical ink arm at the shared waist"
+        );
+        let t = crate::effect_util::star_waist_px(arm as i32);
+        assert_eq!(
+            t,
+            (2.0 * waist).round() as i32,
+            "the additive arm's thickness left the light arm's waist"
+        );
+        assert!(
+            dark.iter()
+                .any(|q| i32::from(q.w) == 2 * arm as i32 + 1 && i32::from(q.h) == t),
+            "no additive arm of 2*arm+1 at the shared waist"
+        );
+        // NUCLEUS — both grounds draw one, at the same shared extent.
+        let core = (arm * STAR_CORE).max(1.0);
+        assert!(has(core, core, 0.0, 0.0), "the light star lost its nucleus");
+        assert_eq!(
+            crate::effect_util::star_core_px(arm as i32),
+            (2.0 * core).round() as i32,
+            "the additive nucleus left the light nucleus's extent"
+        );
+        // GLINTS — the gold half throws its four diagonal points on BOTH
+        // grounds (the light star used to throw none at all).
+        let d = arm * STAR_GLINT;
+        for (ox, oy) in [(-d, -d), (d, -d), (-d, d), (d, d)] {
+            assert!(has(1.0, 1.0, ox, oy), "no ink glint at {ox},{oy}");
+            assert!(
+                dark.iter().any(|q| f32::from(q.x) == cx + ox
+                    && f32::from(q.y) == cy + oy
+                    && q.w == 1
+                    && q.h == 1),
+                "no additive glint at {ox},{oy}"
+            );
+        }
+        // …and a plain (non-gold) star throws none on either ground.
+        let mut plain = Vec::new();
+        push_twinkle_over(&mut plain, g, cx, cy, arm, 0x00FF_FFFF, false, 180);
+        let plain_ell: std::collections::BTreeSet<_> =
+            plain.iter().map(|h| (h.cx, h.cy, h.rx, h.ry)).collect();
+        assert_eq!(
+            plain_ell.len(),
+            3,
+            "a plain ink star is arms + nucleus, nothing else"
+        );
+    }
+
     /// TASK 5 P1 — the SHOOTING-STAR shower (the `cov_scale > 1.25` rainbow kitty comet)
     /// is LIGHT-MODE FORKED: DARK draws the additive `comet_beam` + twinkle head
     /// (GlowQuads); LIGHT inverts it to a DARKENED SATURATED rainbow source-over
@@ -24047,6 +26129,56 @@ mod tests {
         assert!(
             mid.particles.is_empty(),
             "a mid-line advance needs no terminus dissolve"
+        );
+    }
+
+    /// THE STARDUST LAW's population census (owner, 2026-08-08: "cute small
+    /// stardust ... fewer of the '+' like sparkles"; the check the 2026-08-06
+    /// rebalance lacked, which is how the star-kit unification silently made
+    /// every trail mark a plus). Across a full-spine ribbon the 4-point stars
+    /// — counted by their silhouette: the one wide hairline bar each star
+    /// pushes — must stay under the promised ≤15% of the emitted population;
+    /// the body is round dust (small near-square points and radial motes).
+    /// Any future star-kit refactor that routes the population back through
+    /// the plus fails HERE, not in the owner's eyes.
+    #[test]
+    fn stardust_is_the_body_the_plus_is_the_accent() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let born = Instant::now();
+        let mut glow = CursorGlow::default();
+        rainbow_uniform_ribbon(&mut glow, born, 255, 0..40);
+        // Full spine: momentum recruits extra star cells and the arm
+        // breathing peaks — the plus-heaviest the field gets.
+        glow.rainbow.disp = 1.0;
+        glow.rainbow.phase = 0.0;
+        let (mut under, mut out) = (Vec::new(), Vec::new());
+        glow.emit_rainbow(
+            born + Duration::from_millis(500),
+            &c,
+            g,
+            &mut under,
+            &mut out,
+            &mut Vec::new(),
+        );
+        // A star's signature is its horizontal arm bar: one wide hairline
+        // quad per star (w at least 4 and at least triple its height). Dust
+        // rects are near-square points.
+        let stars = out
+            .iter()
+            .filter(|q| q.w >= 4 && u32::from(q.w) >= 3 * u32::from(q.h.max(1)))
+            .count();
+        let dust = out
+            .iter()
+            .filter(|q| q.w == q.h && q.w <= 6)
+            .count();
+        let pop = stars + dust;
+        assert!(pop > 8, "the full-spine field must emit a real population, got {pop}");
+        assert!(dust > 0, "the body must be dust, not plus");
+        assert!(
+            (stars as f32) <= (pop as f32) * 0.15 + 1.0,
+            "the plus is the accent: {stars} stars in a population of {pop} \
+             breaks the <=15% share the stardust law promises"
         );
     }
 
@@ -24408,10 +26540,13 @@ mod tests {
             .filter(|p| p.cov_scale < 0.9)
             .collect();
         let cold_floor = (ERASE_POOF_STARS * erase_poof_drive(0.0, 1)) as usize;
+        // The fewer-sparkles ruling (0405571c, 2026-08-08) cut the poof's
+        // count back to 7 grains — weight lives in the hero's size and the
+        // debris speed — so the cold floor is a visible three, not six.
         assert!(
-            cold_floor >= 6,
-            "a COLD single-character erase still throws at least the six sparkles \
-             the shipping poof did (got a floor of {cold_floor})"
+            cold_floor >= 3,
+            "a COLD single-character erase still throws a visible few sparkles \
+             (got a floor of {cold_floor})"
         );
         assert!(
             (cold_floor..=ERASE_POOF_CAP + 1).contains(&glitter.len()),
@@ -24534,16 +26669,23 @@ mod tests {
         // momentum spine stays at zero, the wake and the spine-scaled
         // clearance/taper/star-shower are provably inert, and displaced stars
         // take the in-cell fallback because their landing rows are UNKNOWN.
+        //
+        // RECAPTURED at the STARDUST LAW (owner, 2026-08-08: dust is the body,
+        // the plus a dealt 1-in-8 accent): the same four star-kit indices as
+        // the unification — 2 (RainbowKitty), 3 (Sparkle), 6 (Beam), 8
+        // (Comet) — moved and ONLY those. Lumen, Phaser, Fire, Laser and
+        // Water are byte-identical, i.e. the change reached the star kit and
+        // nothing else, again.
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
-            4115455268542750004,
-            17233361164506253445,
+            4009512679956847361,
+            16738082778528137437,
             15099317426123974543,
             8477863368341368663,
-            1763852658742721962,
+            17563734566908079188,
             18198127167938565682,
-            3467831129035952030,
+            5200910487073069437,
         ];
         let styles = [
             GlowStyle::Lumen,
@@ -25008,8 +27150,23 @@ halo = "add"
     /// per-keystroke wobble).
     #[test]
     fn fresh_ink_spring_peaks_early_and_settles_to_unity() {
-        assert!((fresh_ink_scale(0.0) - 1.0).abs() < 1e-6, "starts at 1.0");
-        let peak = fresh_ink_scale(FRESH_INK_SCALE_PEAK);
+        // ALREADY IN MOTION at birth, and never a jump: the pop APPEARS on
+        // this frame, so there is nothing for it to jump FROM — what a zero
+        // here actually bought was a frame of the swell being invisible. It
+        // must still open well under the peak, or the spring has become a step.
+        let birth = fresh_ink_scale(0.0);
+        assert!(
+            birth > 1.0,
+            "the swell is already moving on frame one: {birth}"
+        );
+        assert!(
+            birth < 1.0 + FRESH_INK_SCALE_AMP * 0.6,
+            "…but well under the peak, so it is still a spring: {birth}"
+        );
+        // The impulse still peaks where `x == 1`; with the forward bias that
+        // is reached EARLIER in the pop's life, which is the point.
+        let peak_u = (1.0 - FRESH_INK_SCALE_BIAS) * FRESH_INK_SCALE_PEAK;
+        let peak = fresh_ink_scale(peak_u);
         assert!(
             (peak - (1.0 + FRESH_INK_SCALE_AMP)).abs() < 1e-5,
             "peak overshoot is exactly the configured amplitude, got {peak}"
@@ -26850,6 +29007,68 @@ halo = "add"
     /// halo footprint is frozen at base size while the full-motion twin's
     /// spring visibly swells it).
     #[test]
+    /// THE POP IS LIGHT OR IT IS NOTHING (owner, 2026-08-04: the trail "isn't
+    /// smooth", against a screenshot whose last few typed characters lay under a
+    /// dirty grey-olive wash).
+    ///
+    /// `FRESH_INK_WARM` is premultiplied by the faded coverage, so an exhausted
+    /// pop emits channels one 8-bit step apart — a neutral grey. At a 0.70 s
+    /// life several of those sit over the text being read at once. The pop is
+    /// now culled at [`FRESH_INK_MIN_READABLE_COV`] instead, which keeps every
+    /// character's flash (the owner asked for that on 2026-08-06) and drops only
+    /// the part that had stopped being warm light.
+    #[test]
+    fn fresh_ink_pop_is_light_or_nothing() {
+        let g = geom();
+        let c = rainbow_pop_cfg();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        glow.note_typed(t0 + Duration::from_millis(16));
+        glow.tick(
+            Some((2, 3)),
+            t0 + Duration::from_millis(16),
+            &c,
+            g,
+            &mut out,
+        );
+        let pops = |glow: &mut CursorGlow, at: Instant, out: &mut Vec<GlowQuad>| -> Vec<u32> {
+            glow.tick(Some((2, 3)), at, &c, g, out);
+            glow.halo_out
+                .iter()
+                .filter(|h| is_fresh_ink_halo(h.color))
+                .map(|h| h.color)
+                .collect()
+        };
+        // The keystroke still flashes.
+        let born = pops(&mut glow, t0 + Duration::from_millis(20), &mut out);
+        assert!(!born.is_empty(), "every typed character still pops");
+
+        // EVERY emitted pop, at every instant of its life, reads as WARM light:
+        // its channels stay meaningfully apart rather than collapsing to grey.
+        for step in 0..40u64 {
+            let at = t0 + Duration::from_secs_f32(FRESH_INK_LIFE_S * step as f32 / 40.0);
+            for color in pops(&mut glow, at, &mut out) {
+                let (r, gg, b) = (
+                    (color >> 16) & 0xff,
+                    (color >> 8) & 0xff,
+                    color & 0xff,
+                );
+                assert!(
+                    r >= FRESH_INK_MIN_READABLE_COV as u32,
+                    "an emitted pop is never under the readable floor: {color:#08x}"
+                );
+                assert!(
+                    r > b && (r - b) >= 2,
+                    "an emitted pop is WARM, not neutral grey: {color:#08x} \
+                     (r {r}, g {gg}, b {b})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn fresh_ink_reduced_motion_is_a_step_fade_without_scale() {
         let g = geom();
         let c = rainbow_pop_cfg();
@@ -26923,9 +29142,16 @@ halo = "add"
         // SYMBOLIC in [`FRESH_INK_LIFE_S`]: a hard-coded 600 ms silently expired
         // the whole pop when the life was shortened 0.85 → 0.45 (2026-07-24),
         // turning this into an empty-vec failure rather than a brightness check.
-        // Two thirds of the life is always a strictly later envelope step.
+        //
+        // HALF the life, not two thirds. `fresh_ink_env_stepped` has three steps
+        // — 1.0, 0.5, 0.22 — and the last one is exactly the exhausted grey that
+        // [`FRESH_INK_MIN_READABLE_COV`] now culls (36 × 0.22 × 0.7 = 5.5, well
+        // under the floor). Sampling there measured the cull, not the fade. The
+        // MIDDLE step is still strictly later than the first and still light, so
+        // it tests the step-fade contract this owns rather than the cull's
+        // threshold, which `fresh_ink_pop_is_light_or_nothing` owns.
         let late =
-            t0 + Duration::from_millis(16) + Duration::from_secs_f32(FRESH_INK_LIFE_S * 0.66);
+            t0 + Duration::from_millis(16) + Duration::from_secs_f32(FRESH_INK_LIFE_S * 0.50);
         let red_late = sample(&mut reduced, late, &mut out);
         assert!(
             !red_late.is_empty() && red_late[0].color < red_peak_color[0],

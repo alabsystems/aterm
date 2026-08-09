@@ -1042,6 +1042,18 @@ pub struct RenderInput {
     /// (which resolves per-cell from the same live value). Equals the configured bg
     /// until a program changes it, so the default path is byte-identical.
     pub default_bg: u32,
+    /// The LIVE default FOREGROUND (`0x00RRGGBB`) for this frame — the twin of
+    /// [`Self::default_bg`], resolved through the same OSC 10 / OSC 110 /
+    /// DECSCNM policy, so the pair is coherent (DECSCNM swaps BOTH or neither).
+    ///
+    /// Added for the cursor-effect layer, which needs a real foreground to
+    /// anchor the fresh-typed glyph tint on and to bound it against the real
+    /// ground; the renderer itself resolves per-cell foregrounds and does not
+    /// read this. `COLOR_UNSET` means the producer did not resolve one — a
+    /// pristine, unconfigured `Terminal::new` — and every consumer must treat
+    /// it as "unknown" rather than masking the sentinel's high byte into a
+    /// colour, which would read as pure black.
+    pub default_fg: u32,
     /// The LIVE cursor colour (`0x00RRGGBB`) for this frame: an explicit OSC 12
     /// value/configured OSC 112 baseline, or the live OSC 10 foreground while OSC 21
     /// `cursor=` selects dynamic behavior. The terminal snapshot resolves that policy
@@ -1125,6 +1137,7 @@ impl Clone for RenderInput {
             default_bg_spans: self.default_bg_spans.clone(),
             images: self.images.clone(),
             default_bg: self.default_bg,
+            default_fg: self.default_fg,
             cursor_color: self.cursor_color,
             snapshot_seq: self.snapshot_seq,
             input_hot: self.input_hot,
@@ -1190,6 +1203,7 @@ impl Clone for RenderInput {
         self.default_bg_spans.clone_from(&source.default_bg_spans);
         self.images.clone_from(&source.images);
         self.default_bg = source.default_bg;
+        self.default_fg = source.default_fg;
         self.cursor_color = source.cursor_color;
         self.snapshot_seq = source.snapshot_seq;
         self.input_hot = source.input_hot;
@@ -1253,6 +1267,7 @@ impl PartialEq for RenderInput {
             && self.default_bg_spans == other.default_bg_spans
             && self.images == other.images
             && self.default_bg == other.default_bg
+            && self.default_fg == other.default_fg
             && self.cursor_color == other.cursor_color
         // `snapshot_seq` intentionally NOT compared — see the impl comment.
         // `scroll_frac_px` / `grid_top_row` / `grid_bot_row` are also NOT compared:
@@ -1333,6 +1348,7 @@ impl RenderInput {
             default_bg_spans: Vec::new(),
             images: Vec::new(),
             default_bg: COLOR_UNSET,
+            default_fg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
             snapshot_seq: 0,
             input_hot: false,

@@ -183,6 +183,14 @@ impl EffectsPipeline {
             focused: true,
             glow: CursorGlow::default(),
             glow_cfg: GlowConfig {
+                // A COHERENT cold-start pair for `dark_theme: true` — the
+                // documented default palette. Never `0`/`0`: that is `fg == bg`,
+                // which the glyph tint reads as a conceal-shaped theme and
+                // suppresses on, silently killing the layer in every fixture
+                // that never folds a real ground in. Overwritten each frame by
+                // the fold in `apply`.
+                theme_fg: 0x00C8_D3F5,
+                theme_bg: 0x001A_1B26,
                 dark_theme: true,
                 enabled: false,
                 style: GlowStyle::Lumen,
@@ -515,6 +523,12 @@ impl EffectsPipeline {
         self.glow_color_from_cursor = color_from_cursor;
         self.glow_accent_from_cursor = accent_from_cursor;
         self.glow_cfg = GlowConfig {
+            // CARRIED FORWARD, not reset — the same discipline `pack` and
+            // `wake_persist_s` follow below. A reconfigure between two frames
+            // must not clobber a ground the fold already resolved, or a live
+            // light theme would flip to the dark default for one frame.
+            theme_fg: self.glow_cfg.theme_fg,
+            theme_bg: self.glow_cfg.theme_bg,
             dark_theme: true,
             enabled,
             style: resolved,
@@ -1053,6 +1067,14 @@ impl EffectsPipeline {
         // sentinel's high byte as a real color.
         self.glow_cfg.dark_theme =
             input.default_bg == aterm_core::render::COLOR_UNSET || theme_is_dark(input.default_bg);
+        // The RESOLVED PAIR for the fresh-typed glyph tint. Same sentinel
+        // discipline as the line above and for the same reason: an unset value
+        // is not a colour, and masking its high byte would read as pure black —
+        // which on the foreground side would flip the tint's ink SIDE, not just
+        // dim it. Passed through unmasked so the engine can recognise the
+        // sentinel and stand the layer down; it masks the real values itself.
+        self.glow_cfg.theme_fg = input.default_fg;
+        self.glow_cfg.theme_bg = input.default_bg;
         // Match the native cursor-wake rule: automatic colors follow the live
         // cursor sampled into this coherent frame. Explicit colors/accents stay
         // fixed, and Laser remains electric in its configured/default hue
@@ -2434,10 +2456,41 @@ mod tests {
         p.advance(5000.0);
         term.cell_frame_into(&mut input, 4, 24);
         p.apply(&mut term, &mut input, 10, 20);
+        // A MASS REPLAY would show up as a different REVEAL — a restarted
+        // entrance re-crops the source window and re-grows the dest height, and
+        // a silently-completed peek emits nothing at all. So the anti-replay
+        // guarantee is stated over the reveal, which is what the entrance owns.
+        //
+        // The dest ORIGIN is compared with a small tolerance instead of exactly:
+        // a settled word-cat now breathes (`CatIdlePose`), a pure ±2 px
+        // translation on the dwell clock, so its position advances with time
+        // while its reveal does not. Pinning the origin exactly would pin the
+        // idle phase, which is not what "no mass replay" means.
         assert_eq!(
-            input.free_sprites, sprites_before,
-            "thaw resumes the peek exactly where it froze (no mass replay)"
+            input.free_sprites.len(),
+            sprites_before.len(),
+            "thaw resumes the peek (no mass replay, and it did not silently end)"
         );
+        for (after, before) in input.free_sprites.iter().zip(sprites_before.iter()) {
+            assert_eq!(
+                (after.w, after.h, after.ax, after.ay, after.aw, after.ah),
+                (
+                    before.w,
+                    before.h,
+                    before.ax,
+                    before.ay,
+                    before.aw,
+                    before.ah
+                ),
+                "thaw resumes the peek exactly where it froze (no mass replay)"
+            );
+            assert!(
+                (after.x - before.x).abs() <= 2 && (after.y - before.y).abs() <= 2,
+                "…and resumes in place, within the idle breath ({:?} vs {:?})",
+                (after.x, after.y),
+                (before.x, before.y)
+            );
+        }
     }
 
     /// A 24×80 snapshot of `term` whose cells are all MATERIALIZED default-bg

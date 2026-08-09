@@ -5331,6 +5331,12 @@ pub(crate) fn resolve_cursor_glow(
     style: ResolvedTrailStyle,
     theme_cursor: u32,
     dark_theme: bool,
+    // The theme's resolved default foreground / background (`0x00RRGGBB`, or
+    // `COLOR_UNSET` when the caller has none). Parameters rather than
+    // constants for the same reason `dark_theme` is: this is the cold-path
+    // construction, and the live values are folded per frame.
+    theme_fg: u32,
+    theme_bg: u32,
     head_dx: f32,
 ) -> aterm_effects::cursor_glow::GlowConfig {
     use aterm_effects::cursor_glow::{
@@ -5362,6 +5368,8 @@ pub(crate) fn resolve_cursor_glow(
     let radius = finite_clamp_or_off(inputs.radius, 0.0, 2.0);
     let style_token = style.canonical.unwrap_or(inputs.style_raw.trim());
     aterm_effects::cursor_glow::GlowConfig {
+        theme_fg,
+        theme_bg,
         enabled: inputs.enabled && style.style.is_some(),
         style: glow_style,
         color,

@@ -79,6 +79,10 @@ fn cfg(style: GlowStyle) -> GlowConfig {
     GlowConfig {
         enabled: true,
         dark_theme: true,
+        // The documented default dark palette — a COHERENT pair, never 0/0
+        // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+        theme_fg: 0x00C8_D3F5,
+        theme_bg: 0x001A_1B26,
         style,
         color: 0x0050_FA7B,
         accent: 0x007A_A2F7,

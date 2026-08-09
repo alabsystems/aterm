@@ -4871,6 +4871,136 @@ mod pane_free_crop_tests {
     }
 }
 
+/// The pet's petting hit-box for one frame: the brain's LIVE drawn body
+/// (`PetFrame::body_px`, grid-interior px) offset into FRAME px by the
+/// effects origin — plus, on the composed path, the focused pane's own
+/// pixel origin folded into `origin` by the caller. `None` propagates
+/// "nothing drawn", which is what CLEARS the stash on undrawn frames.
+pub(crate) fn pet_hit_rect_win(
+    body: Option<(i32, i32, i32, i32)>,
+    origin: (i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    body.map(|(x0, x1, y0, y1)| {
+        (
+            x0.saturating_add(origin.0),
+            x1.saturating_add(origin.0),
+            y0.saturating_add(origin.1),
+            y1.saturating_add(origin.1),
+        )
+    })
+}
+
+/// PERK-AND-WATCH (wave 2): the burst conjunction, in one pure function so
+/// the law is testable without a terminal. A frame is a BURST only when the
+/// pane visibly gained output (`scrolled` — new scrollback rows — or
+/// `seq_advanced` — the content clock moved within one session) AND the
+/// shell reports an executing command (OSC 133/633 C..D — this conjunct is
+/// what keeps keystroke echo, which also moves the content clock, from ever
+/// perking the pet) AND the viewport is at the live bottom (scrolled-back
+/// history is not a stream the pet can see).
+pub(crate) fn pet_output_burst(
+    scrolled: bool,
+    seq_advanced: bool,
+    shell_executing: bool,
+    live_bottom: bool,
+) -> bool {
+    (scrolled || seq_advanced) && shell_executing && live_bottom
+}
+
+/// POINTER PLAY (wave 2): map the raw window-pixel pointer onto the pet's
+/// pane as a fractional cell `(col, row)` — pointer px minus the pane's
+/// frame-space origin (the effects origin, plus the focused pane's own
+/// pixel offset on the composed path — exactly `pet_hit_rect_win`'s
+/// geometry), over the cell metrics. `None` once the pointer leaves the
+/// pane's grid: outside the pane the pointer does not exist for the pet.
+pub(crate) fn pet_pointer_cell(
+    pointer_px: (f64, f64),
+    origin: (i32, i32),
+    cell: (usize, usize),
+    grid: (usize, usize),
+) -> Option<(f32, f32)> {
+    let (cw, ch) = cell;
+    if cw == 0 || ch == 0 {
+        return None;
+    }
+    let col = (pointer_px.0 - f64::from(origin.0)) / cw as f64;
+    let row = (pointer_px.1 - f64::from(origin.1)) / ch as f64;
+    (col >= 0.0 && row >= 0.0 && col < grid.0 as f64 && row < grid.1 as f64)
+        .then_some((col as f32, row as f32))
+}
+
+#[cfg(test)]
+mod pet_pointer_cell_tests {
+    use super::pet_pointer_cell;
+
+    /// The px→cell map is the hit-rect's geometry inverted: origin off,
+    /// cell metrics down, and anything off the grid is `None`.
+    #[test]
+    fn pointer_maps_into_pane_cells_and_dies_at_the_edge() {
+        // Origin (20, 40), 10×20 cells, 80×24 grid.
+        assert_eq!(
+            pet_pointer_cell((125.0, 90.0), (20, 40), (10, 20), (80, 24)),
+            Some((10.5, 2.5))
+        );
+        // Left/above the origin: outside.
+        assert_eq!(
+            pet_pointer_cell((19.0, 90.0), (20, 40), (10, 20), (80, 24)),
+            None
+        );
+        // Past the last column: outside.
+        assert_eq!(
+            pet_pointer_cell((20.0 + 800.0, 90.0), (20, 40), (10, 20), (80, 24)),
+            None
+        );
+        // Degenerate metrics never divide.
+        assert_eq!(pet_pointer_cell((5.0, 5.0), (0, 0), (0, 20), (80, 24)), None);
+    }
+}
+
+#[cfg(test)]
+mod pet_output_burst_tests {
+    use super::pet_output_burst;
+
+    /// The echo law: content movement alone is NEVER a burst — the shell
+    /// must be executing, and the viewport must be live.
+    #[test]
+    fn typing_echo_never_reads_as_a_burst() {
+        // Echo: the content clock moves, the shell is NOT executing.
+        assert!(!pet_output_burst(false, true, false, true));
+        // A real stream: rows scrolled while the shell runs, live bottom.
+        assert!(pet_output_burst(true, false, true, true));
+        assert!(pet_output_burst(false, true, true, true));
+        // Scrolled-back history is not a stream the pet can see.
+        assert!(!pet_output_burst(true, true, true, false));
+        // An executing shell that wrote nothing this frame is quiet.
+        assert!(!pet_output_burst(false, false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod pet_hit_rect_tests {
+    use super::pet_hit_rect_win;
+
+    /// The offset math is exactly the emitter's: body px + effects origin
+    /// (x on both x's, y on both y's), and `None` — pet not drawn — stays
+    /// `None`, which is what clears the stash.
+    #[test]
+    fn pet_hit_rect_win_offsets_the_body_by_the_effects_origin() {
+        assert_eq!(pet_hit_rect_win(None, (7, 9)), None);
+        assert_eq!(
+            pet_hit_rect_win(Some((10, 30, 40, 60)), (7, 9)),
+            Some((17, 37, 49, 69))
+        );
+        // A row-0 pet's head rises above the grid top: the rect keeps the
+        // negative overhang (the strip/modals still win the click by ORDER,
+        // not by clamping the cat's face away).
+        assert_eq!(
+            pet_hit_rect_win(Some((0, 20, -12, 8)), (4, 30)),
+            Some((4, 24, 18, 38))
+        );
+    }
+}
+
 pub(crate) fn translate_free_into_pane(
     free: &mut Vec<aterm_core::render::FreeSprite>,
     place: PanePlace,
@@ -4964,20 +5094,24 @@ pub(crate) fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, p
 /// The sing-along's once-per-visual-bar RIFF gesture. Shared by both render
 /// paths so the celebration sounds the same in a split as it does whole.
 ///
-/// `key` is the held character's pentatonic transposition (`KittySing::key`):
-/// the SAME authored tune in a different key, so changing which key you hold
-/// changes the song over one continuous bar grid instead of restarting it.
-fn sing_riff_event(bar: u64, gain: f32, key: i8) -> aterm_effects::trail_sound::SoundEvent {
+/// `sig` is the held character's bijective SONG SIGNATURE
+/// (`KittySing::signature`): the synth derives every per-key axis from it —
+/// the verse melody walk, the root transpose, the mode rotation — so holding
+/// a different key sings a DIFFERENT VERSE of the same celebration, over one
+/// continuous bar grid instead of restarting it.
+fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
         style: crate::cursor_glow::GlowStyle::RainbowKitty,
         // The sing-along riff is its own authored song — the
         // `trail_sound_style` override never re-voices it.
         voice: aterm_effects::trail_sound::SoundVoice::Style,
         kind: aterm_effects::trail_sound::SoundGesture::Celebration(
-            aterm_effects::trail_sound::CelebrationGesture::RiffBar {
-                bar: (bar & 0xffff) as u16,
-                key,
-            },
+            // Through the stable constructor (not the variant literal), so
+            // the planned post-shim variant rename touches no call site.
+            aterm_effects::trail_sound::CelebrationGesture::riff_bar(
+                (bar & 0xffff) as u16,
+                sig,
+            ),
         ),
         pan: 0.0,
         // Momentum is pinned to 1.0 while armed — that IS maximal flow; the
@@ -4988,6 +5122,124 @@ fn sing_riff_event(bar: u64, gain: f32, key: i8) -> aterm_effects::trail_sound::
         // Tone-blind like the bonk, and it never feeds the bed.
         tone: aterm_effects::tone::Tone::Technical,
         bed: false,
+    }
+}
+
+/// The SINGING FACE is LIVE: the sing drive at/above the S115 face-swap
+/// threshold (0.33 — `CatFrame::render_look` swaps to the authored open-mouth
+/// meow head there). ONE predicate for both render paths' pet caret feeds:
+/// while the face is live the pet's caret is withheld, so the pet fades out
+/// HOLDING POSITION and the singing face takes the caret; the moment the
+/// drive drops back below the threshold the caret re-feeds, and the pet's
+/// return is a fresh sighting at its keep-ahead station — never a flinch.
+/// A non-finite drive reads as "not live" so a poisoned detector can never
+/// starve the pet of its caret.
+fn sing_face_live(drive: f32) -> bool {
+    drive >= 0.33
+}
+
+/// THE SONG'S CUSTODY LAW: may the FLYING companion be drawn this frame?
+/// Outside pet mode an earned flight always may. In pet mode the resident pet
+/// owns the caret, and the flying kitty — the singing face — is admitted ONLY
+/// while the sing-along holds the frame (`sing > 0`: the armed hold plus the
+/// whole wind-down crossfade). Admission ends exactly when the drive drains
+/// to 0; the pet is already padding back by then, because its caret re-fed at
+/// the 0.33 face swap ([`sing_face_live`]).
+fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
+    !pet_mode || sing > 0.0
+}
+
+/// Pin a PET-MODE episode's exit flourish to Plain, on the frame copy the
+/// host is about to draw (the state machine's roll becomes presentation-dead;
+/// no engine state changes). In pet mode the flying companion exists solely
+/// for the sing-along, and its admission ([`flying_kitty_admitted`]) ends the
+/// instant the drive drains — a rolled heart/star would either play over the
+/// pet's return or be chopped mid-flourish when admission cuts `kitty_alpha`
+/// to 0 (the exit emitter gates on it). The song's goodbye is the pet padding
+/// back, not a firework.
+fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
+    if pet_mode {
+        frame.exit = crate::kitty_cursor::CatExit::Plain;
+    }
+}
+
+#[cfg(test)]
+mod pet_sing_swap_tests {
+    use super::{flying_kitty_admitted, pin_pet_mode_exit, sing_face_live};
+    use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
+
+    /// The pet yields exactly at the S115 face-swap threshold — below it the
+    /// pet keeps the caret, at/above it the singing face owns it — and a
+    /// poisoned (NaN) drive must read "not live" so the pet never starves.
+    #[test]
+    fn face_goes_live_at_the_swap_threshold() {
+        assert!(!sing_face_live(0.0));
+        assert!(!sing_face_live(0.3299));
+        assert!(sing_face_live(0.33));
+        assert!(sing_face_live(0.34));
+        assert!(sing_face_live(1.0));
+        assert!(!sing_face_live(f32::NAN));
+    }
+
+    /// The swap, end to end at the gate level: an armed song in pet mode
+    /// admits the flying kitty's alpha and withholds the pet's caret; a
+    /// drained song (drive 0) cuts admission and restores the caret in the
+    /// same frame; outside pet mode nothing changes.
+    #[test]
+    fn armed_song_swaps_the_companions_and_the_drain_swaps_back() {
+        let (pet_mode, kitty_enabled, cat_alpha) = (true, true, 200u8);
+        // Armed (drive 1): the singing face is the companion.
+        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 1.0) {
+            cat_alpha
+        } else {
+            0
+        };
+        assert!(kitty_alpha > 0, "armed drive must admit the singing face");
+        assert!(
+            sing_face_live(1.0),
+            "armed drive must withhold the pet caret (fed None)"
+        );
+        // Drained (drive 0): admission ends, the pet's caret is restored.
+        let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, 0.0) {
+            cat_alpha
+        } else {
+            0
+        };
+        assert_eq!(kitty_alpha, 0, "drained drive must cut admission");
+        assert!(
+            !sing_face_live(0.0),
+            "drained drive must re-feed the pet caret"
+        );
+        // Outside pet mode the earned flight is untouched by the song.
+        assert!(flying_kitty_admitted(false, 0.0));
+        assert!(flying_kitty_admitted(false, 1.0));
+    }
+
+    /// A pet-mode summon EXITS PLAIN: whatever flourish the machine rolled,
+    /// the pinned frame keeps the plain fade — and outside pet mode the roll
+    /// is untouched.
+    #[test]
+    fn pet_mode_summons_exit_plain() {
+        let frame = |exit| CatFrame {
+            alpha: 128,
+            exit,
+            fade_out: 0.5,
+            look: aterm_effects::kitty_registry::KittyLook::default(),
+            reaction: CatReaction::Cruise,
+            discovery: false,
+            collection_hello: false,
+            bob: 0.0,
+            sing: 0.4,
+            pose: CatPose::STILL,
+        };
+        for rolled in [CatExit::StarWink, CatExit::HeartMeow, CatExit::Plain] {
+            let mut f = frame(rolled);
+            pin_pet_mode_exit(true, &mut f);
+            assert_eq!(f.exit, CatExit::Plain, "pet-mode episodes exit Plain");
+            let mut f = frame(rolled);
+            pin_pet_mode_exit(false, &mut f);
+            assert_eq!(f.exit, rolled, "earned flights keep their roll");
+        }
     }
 }
 
@@ -5015,7 +5267,10 @@ pub(crate) struct ComposeDecoCtx<'a> {
     /// The PET companion's resolved frame, already ticked for this composed
     /// present (the brain advances outside this path so it can never freeze —
     /// see the tick site). Emitted only when `pet_visible`; `kitty_alpha` is 0
-    /// whenever it is, so the two companions can never both be drawn.
+    /// whenever it is EXCEPT during the sing-along's admission
+    /// ([`flying_kitty_admitted`]), when the singing face takes the caret —
+    /// the composed path still draws one companion per frame (the pet-first
+    /// return in `compose_cursor_companion` yields while `sing > 0`).
     pub(crate) pet: aterm_effects::kitty_pet::PetFrame,
     pub(crate) pet_visible: bool,
     pub(crate) accent: u32,
@@ -5124,10 +5379,16 @@ pub(crate) fn terminal_cursor_color(term: &Terminal) -> u32 {
 /// snapshot stamps the same values in `cell_frame_into`; this helper lets
 /// animation decisions sample them before the commit extraction while preserving
 /// the same implicit-padding and dynamic-cursor policy.
-fn terminal_frame_colors(term: &Terminal) -> (u32, u32) {
+fn terminal_frame_colors(term: &Terminal) -> (u32, u32, u32) {
+    // ONE blank cell for the whole pair: `implicit_blank_render_cell` runs
+    // `Cell::EMPTY` through `resolve_colors(.., reverse_video)`, so DECSCNM
+    // swaps fg and bg together. Resolving them from two calls is how a swapped
+    // frame ends up with a foreground from one side and a background from the
+    // other.
     let blank = terminal_blank_cell(term);
     let default_bg = aterm_render::rgb_to_u32(blank.bg);
-    (default_bg, terminal_cursor_color(term))
+    let default_fg = aterm_render::rgb_to_u32(blank.fg);
+    (default_bg, default_fg, terminal_cursor_color(term))
 }
 
 #[cfg(test)]
@@ -5145,7 +5406,7 @@ mod terminal_cursor_color_tests {
             "OSC 21 empty cursor selects dynamic foreground fallback"
         );
 
-        let (_, cursor) = terminal_frame_colors(&term);
+        let (_, _, cursor) = terminal_frame_colors(&term);
         assert_eq!(cursor, 0x00FE_017F);
         assert_eq!(terminal_cursor_rgb(&term), [0xfe, 0x01, 0x7f]);
 
@@ -5173,17 +5434,14 @@ mod terminal_cursor_color_tests {
         let fx = app
             .tick_cursor_fx(
                 wid,
+                // Only the fields this test is ABOUT are spelled out; the rest
+                // ride the shared fixture, so a new field lands in one place.
                 CursorFxInputs {
-                    now: Instant::now(),
+                    default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(&term).fg),
                     rows: 2,
                     cols: 4,
-                    cur: Some((0, 0)),
-                    cursor_visible: true,
-                    cursor_style: CursorStyle::SteadyBlock,
-                    blink_phase: true,
                     live_cursor_rgb: terminal_cursor_rgb(&term),
-                    default_bg: Theme::default().bg,
-                    row_probe: None,
+                    ..CursorFxInputs::sample_for_test(Instant::now())
                 },
             )
             .expect("fixture window");
@@ -5294,6 +5552,12 @@ pub(crate) fn fill_divider_grid_cells(
     dst.selection_bg = aterm_core::render::COLOR_UNSET;
     dst.selection_fg = aterm_core::render::COLOR_UNSET;
     dst.default_bg = aterm_core::render::COLOR_UNSET;
+    // …and its twin. A reused scratch that previously held a terminal frame
+    // would otherwise carry that frame's foreground into a divider/native/
+    // composed frame whose background has been reset — a pair from two
+    // different observations, which is exactly what the effects layer's tint
+    // bound must never be handed (found in review).
+    dst.default_fg = aterm_core::render::COLOR_UNSET;
     dst.cursor_color = aterm_core::render::COLOR_UNSET;
     dst.input_hot = false;
 }
@@ -7703,6 +7967,44 @@ pub(crate) struct CursorFxInputs {
     /// or the caller doesn't probe (headless without a capture) — the engine
     /// then keeps its previous probe and the poof detector idles.
     pub row_probe: Option<(u16, u16)>,
+    /// The live default FOREGROUND (`0x00RRGGBB`), the twin of `default_bg`.
+    /// The cursor-effect layer anchors its fresh-typed glyph tint on it, and
+    /// the pair must come from ONE observation or a DECSCNM-swapped frame gets
+    /// a foreground from one side and a background from the other.
+    pub default_fg: u32,
+}
+
+#[cfg(test)]
+impl CursorFxInputs {
+    /// A neutral frame for tests that drive [`App::tick_cursor_fx`] without
+    /// caring about the terminal's exact state.
+    ///
+    /// ADDING A FIELD ABOVE? Give it a value HERE, in the same edit. This
+    /// constructor exists because the alternative — each test writing its own
+    /// bare `CursorFxInputs { .. }` literal — produced a break that no one
+    /// could see: `59b20942` records a new field landing on one line while a
+    /// test fixture 13,000 lines away was added on another, the merge coming
+    /// out textually clean and semantically broken. `cargo build` stayed green
+    /// (the fixture is `cfg(test)`), so `cargo test -p aterm-gui` would not
+    /// COMPILE while every signal said the tree was healthy. One constructor
+    /// beside the struct cannot make that invisible break impossible, but it
+    /// puts the thing to update in the field-adder's own file, a screen away
+    /// from the field they just wrote.
+    pub(crate) fn sample_for_test(now: Instant) -> Self {
+        Self {
+            now,
+            rows: 24,
+            cols: 80,
+            cur: Some((0, 0)),
+            cursor_visible: true,
+            cursor_style: CursorStyle::SteadyBlock,
+            blink_phase: true,
+            live_cursor_rgb: [255, 255, 255],
+            default_bg: Theme::default().bg,
+            row_probe: None,
+            default_fg: Theme::default().fg,
+        }
+    }
 }
 
 /// What [`App::tick_cursor_fx`] resolved and produced for one frame: the fold
@@ -7780,6 +8082,11 @@ struct FocusedComposedCursorFxSample {
     display_offset: usize,
     live_cursor_rgb: [u8; 3],
     default_bg: u32,
+    /// Its twin — the effect layer's tint anchor. Sampled from the SAME blank
+    /// cell as `default_bg` so a DECSCNM-swapped frame stays coherent, and
+    /// carried ON the sample rather than refreshed at projection time, which
+    /// this struct's own contract forbids.
+    default_fg: u32,
     alt: bool,
     blink_epoch: u64,
     scrollback_lines: usize,
@@ -7809,6 +8116,7 @@ fn focused_composed_cursor_fx_sample(
         display_offset,
         live_cursor_rgb: terminal_cursor_rgb(terminal),
         default_bg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).bg),
+        default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).fg),
         alt: terminal.is_alternate_screen(),
         blink_epoch: terminal.repaint_blink_epoch(),
         scrollback_lines: terminal.grid().scrollback_lines(),
@@ -8242,6 +8550,46 @@ impl App {
         }
     }
 
+    /// THE APP KITTY resolve rung (owner spec, 2026-08-07): the focused
+    /// pane's app-derived breed, or `None` when no app claims the pane (no
+    /// shell integration, unknown session, or an Executing block with no
+    /// commandline). Identity comes from the pane's CURRENT shell block —
+    /// `current_block().or_else(last)`, the `title_summary::Snapshot`
+    /// precedent — and is cached in `SessionCtx::app_kitty` keyed by
+    /// `(block id, state, commandline present)`, so per frame this is one
+    /// short `Terminal` lock plus a leaf-mutex check; a commandline is parsed
+    /// only on block-state transitions. Lock order term → app_kitty, never
+    /// reversed (documented on the field).
+    pub(crate) fn app_kitty_look(
+        &self,
+        session: u64,
+    ) -> Option<aterm_effects::kitty_registry::KittyLook> {
+        let s = self.pool.get(session)?;
+        let term = term_lock(&s.term);
+        let block = term.current_block().or_else(|| term.all_blocks().last());
+        let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
+        slot.resolve(block).map(|identity| identity.look)
+    }
+
+    /// THE ONE COMPANION VERDICT (gauntlet F3 hardening): every surface that
+    /// dresses the cursor companion — the single-pane present, the composed
+    /// present, and BOTH capture splices in `app_introspect` — resolves the
+    /// look through this method, so the precedence law
+    /// ([`crate::app_kitty::companion_precedence`]: favourite > app >
+    /// discovery > session) cannot be true on the glass and false in the
+    /// capture lens (or vice versa). Before this seam existed the capture
+    /// splices still called the pre-precedence `companion_look()` — no app
+    /// rung, no session floor — so a capture could stomp the present's
+    /// verdict and a headless probe never saw the app breeds at all.
+    pub(crate) fn companion_verdict(
+        &mut self,
+        focus_session: u64,
+    ) -> aterm_effects::kitty_registry::KittyLook {
+        let (favourite, discovery) = self.kitty_log.companion_looks();
+        let app = self.app_kitty_look(focus_session);
+        crate::app_kitty::companion_precedence(favourite, app, discovery, focus_session)
+    }
+
     /// WINDOW-SPACE effects geometry for window `wid`'s effect streams
     /// (fire/glow/halo/nova): `(origin_x, origin_y, win_w, win_h)` in window px —
     /// the grid-interior top-left (`pad`, `pad + head + strip_px`) and the FULL
@@ -8645,6 +8993,11 @@ impl App {
             self.theme.cursor,
             // Folded to the live theme each frame in `tick_cursor_fx`.
             true,
+            // …and so are these. A COHERENT dark pair, never `0`/`0`: `fg == bg`
+            // reads as a conceal-shaped theme and would stand the glyph tint
+            // down on any path that somehow reached the engine unfolded.
+            0x00C8_D3F5,
+            0x001A_1B26,
             0.5,
         )
     }
@@ -8729,6 +9082,7 @@ impl App {
             blink_phase,
             live_cursor_rgb,
             default_bg,
+            default_fg,
             row_probe,
         } = fx;
         // MOTION POLICY (W11): the one resolved gate for every decorative
@@ -8778,6 +9132,10 @@ impl App {
         // Fold the LIVE theme ground: on light themes the vapor (smoke/steam)
         // switches to source-over veils (HaloMode::Over) so it reads on white.
         glow_cfg.dark_theme = aterm_render::theme_is_dark(default_bg);
+        // The resolved PAIR for the fresh-typed glyph tint — from one blank
+        // cell, so DECSCNM swaps both or neither.
+        glow_cfg.theme_fg = default_fg;
+        glow_cfg.theme_bg = default_bg;
         // Cadence-comet motion-trail config (the directional `TrailCell` body under the
         // aurora crown). Reduced motion (W11) forces the whole comet OFF — the trail
         // shares the CursorGlow motion seam, so an unfocused / reduced window emits no
@@ -8934,12 +9292,12 @@ impl App {
             // The melody's tone: the window's cached typed-line verdict, or
             // the neutral identity with the knob off (a disabled knob must
             // sound bit-exactly like the pre-tone build even if a stale
-            // verdict is still cached from before the toggle).
-            let tone = if self.config.tone_melody_or_default() {
-                ws.tone_tracker.current()
-            } else {
-                aterm_effects::tone::Tone::Technical
-            };
+            // verdict is still cached from before the toggle). ONE author for
+            // that rule across all three drain seams — see
+            // `ToneTracker::effective`.
+            let tone = ws
+                .tone_tracker
+                .effective(self.config.tone_melody_or_default());
             drain_trail_sound_cues(
                 &mut ws.cursor_glow,
                 glow_cfg.style,
@@ -9473,6 +9831,7 @@ impl App {
             display_offset,
             live_cursor_rgb,
             default_bg,
+            default_fg,
             alt,
             blink_epoch,
             scrollback_lines,
@@ -9540,6 +9899,8 @@ impl App {
         let mut glow_config = self.glow_config();
         glow_config.intensity *= policy.amplitude(crate::motion::MotionEffect::CursorGlow) * shed;
         glow_config.dark_theme = aterm_render::theme_is_dark(default_bg);
+        glow_config.theme_fg = default_fg;
+        glow_config.theme_bg = default_bg;
         glow_config.head_dx = if matches!(
             cursor_style,
             CursorStyle::BlinkingBar | CursorStyle::SteadyBar
@@ -9621,11 +9982,7 @@ impl App {
             geometry,
             &mut window.glow_scratch,
         );
-        let tone = if tone_melody {
-            window.tone_tracker.current()
-        } else {
-            aterm_effects::tone::Tone::Technical
-        };
+        let tone = window.tone_tracker.effective(tone_melody);
         drain_trail_sound_cues(
             &mut window.cursor_glow,
             glow_config.style,
@@ -11394,6 +11751,13 @@ impl App {
             let cmd_done = term
                 .last_completed_command()
                 .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)));
+            // The same mark's C→D execution span (ms) — the pet's exit-code
+            // empathy needs to know whether the command actually RAN (a
+            // two-second build cheers, a bare `ls` only nudges). `None`
+            // when the shell reported no timestamps.
+            let cmd_dur_ms = term
+                .last_completed_command()
+                .and_then(|m| m.exec_duration_ms());
             // OSC 133/633 C is an authenticated, observable shell execution
             // phase. It carries no command text; its rising edge gives the
             // native rain one bounded Execute choreography license.
@@ -11551,7 +11915,7 @@ impl App {
             // the renderer PADDING band + cursor, resolved under the lock so OSC
             // 11/111/12/112 (and DECSCNM ?5) track. Applied to `input_scratch` after
             // LOCK B. Default path (no OSC) is byte-identical to the theme.
-            let (default_bg_u32, cursor_color_u32) = terminal_frame_colors(&term);
+            let (default_bg_u32, default_fg_u32, cursor_color_u32) = terminal_frame_colors(&term);
             let title = term.title_arc();
             // Sparkle rescan is the ONE grid extraction that must precede the decision
             // (a rescan always forces a present via `deco_rescan`, so the extract is
@@ -11661,6 +12025,7 @@ impl App {
                     blink_phase,
                     live_cursor_rgb,
                     default_bg: default_bg_u32,
+                    default_fg: default_fg_u32,
                     row_probe,
                 },
             ) else {
@@ -11709,9 +12074,13 @@ impl App {
             }
             self.install_window_config_assets(id);
             // Resolved BEFORE the mutable window borrow: the session kitty is a
-            // pure function of the focused pane's session id.
+            // pure function of the focused pane's session id, the collected
+            // companion is split by reason (favourite vs discovery), and the
+            // app kitty is the cached identity of the pane's shell block —
+            // folded by the ONE verdict seam every dressing surface shares
+            // ([`Self::companion_verdict`]).
             let front_session = self.focused_session_id(id).unwrap_or(0);
-            let collected_look = self.kitty_log.companion_look();
+            let companion_verdict = self.companion_verdict(front_session);
             // Likewise a pure config read, hoisted above the window borrow: it
             // selects WHICH companion the draw block below emits.
             let pet_mode = self.trail_is_kitty_pet();
@@ -11756,17 +12125,20 @@ impl App {
             // the one body keeps the same latched look until the next wake.
             // Only `on_collect` swaps mid-appearance, because the discovery
             // hello legitimately presents the newly unlocked collectible.
-            // THE SESSION KITTY (owner, 2026-07-26). An explicitly COLLECTED
-            // companion wins — the user picked it, and only a reason may change
-            // the kitty. With nothing collected the companion used to fall back
-            // to `KittyLook::default()`, so every session on a fresh install
-            // wore the identical cat; it now wears one derived from its own
-            // session id: unique per session, stable for the session's life,
-            // and free to restore because it is a pure function of the id.
-            let look = collected_look.unwrap_or_else(|| {
-                aterm_effects::kitty_registry::KittyLook::for_session(front_session)
-            });
-            ws.cursor_cat.set_look(look);
+            // THE COMPANION PRECEDENCE LAW (owner, 2026-08-07; stated once in
+            // `app_kitty::companion_precedence`): favourite > app > discovery
+            // > session. A PINNED FAVOURITE still owns the companion look —
+            // the user picked it, and only a reason may change the kitty.
+            // Below the pin sits THE APP KITTY: while the focused pane runs
+            // `claude`, the claude cat rides the cursor; at the prompt, the
+            // shell's own tuxedo. A mere ambient/typed DISCOVERY (collected,
+            // never pinned) ranks under the app — earned, but not chosen —
+            // and the floor stays THE SESSION KITTY (owner, 2026-07-26):
+            // unique per session, stable for the session's life, free to
+            // restore because it is a pure function of the id. Mid-appearance
+            // switches ride the existing `set_look` latch — the body swaps
+            // breeds only between appearances.
+            ws.cursor_cat.set_look(companion_verdict);
             // Full motion advances the fade/bob machine. Reduced motion samples
             // a collection hello as one opaque still; ordinary earned flights
             // remain hidden and the scheduler arms only its one erase deadline.
@@ -11817,11 +12189,13 @@ impl App {
                         self.config.trail_sounds_or_default(),
                         self.config.trail_sound_volume(),
                     ) {
-                        // The HELD CHARACTER picks the key, so switching which
-                        // key you hold changes the song — over the same bar
-                        // grid, so the change is seamless rather than a restart.
+                        // The HELD CHARACTER picks the song — its bijective
+                        // signature drives the verse, root and mode, so
+                        // switching which key you hold changes the tune — over
+                        // the same bar grid, so the change is seamless rather
+                        // than a restart.
                         self.trail_audio
-                            .push(sing_riff_event(bar, gain, ws.kitty_sing.key()));
+                            .push(sing_riff_event(bar, gain, ws.kitty_sing.signature()));
                     }
                 }
             } else {
@@ -11836,11 +12210,18 @@ impl App {
                 ws.kitty_sing.beat(frame_started).unwrap_or(0.0),
             );
             let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
-            let cat_frame = if animate_cat {
+            let mut cat_frame = if animate_cat {
                 ws.cursor_cat.frame(frame_started)
             } else {
                 ws.cursor_cat.static_frame(frame_started)
             };
+            // PET-MODE EPISODES EXIT PLAIN ([`pin_pet_mode_exit`]): the
+            // sing-along summon in `set_singing` above is the ONLY way this
+            // companion appears in pet mode, and its admission ends the
+            // instant the drive drains to 0 — a rolled heart/star exit would
+            // fire from nowhere over the pet's return. The song's goodbye is
+            // the pet padding back.
+            pin_pet_mode_exit(pet_mode, &mut cat_frame);
             // Reduced motion: the STATIC CELEBRATION has no frame cadence of
             // its own (the state machine's 60 fps rearm rides `animate_cat`),
             // so keep one-present-ahead wakes flowing while any sing drive
@@ -11888,7 +12269,18 @@ impl App {
             // scanner to hide a word-cat for a companion that is not there —
             // exactly the "invisible-cat wake train" the comment above warns
             // against. Gate everything on what can be drawn.
-            let kitty_alpha = if kitty_enabled && !pet_mode {
+            //
+            // ONE EXCEPTION, through [`flying_kitty_admitted`] (owner: "bring
+            // back the singing kitty face"): while the sing-along holds the
+            // frame (`cat_frame.sing > 0` — the armed hold plus the whole
+            // wind-down crossfade) the pet steps aside and the SINGING FACE
+            // is the companion, so pet mode admits the flying kitty for
+            // exactly that span. Everything that reads `kitty_alpha` — the
+            // exit-flourish emitter, the `glow_fp` fold, the one-cat-per-caret
+            // gate, the MusicNotes emission — turns on and off with the same
+            // admission, and the pet-mode exit is pinned Plain above so the
+            // cut at drive 0 can never chop a heart/star mid-flourish.
+            let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                 cat_frame.alpha
             } else {
                 0
@@ -11920,9 +12312,89 @@ impl App {
             // A pet that cannot be drawn is fed `caret: None`, which is the
             // truth (there is no caret it could be chasing on this surface):
             // it fades out, settles, and releases the lane on its own.
+            //
+            // THE SONG TAKES THE CARET ([`sing_face_live`]): while the singing
+            // face is live the pet is fed `caret: None` too — it fades out
+            // over its 0.45 s envelope HOLDING POSITION. `pet_visible` is
+            // deliberately NOT flipped: the draw gate below must keep
+            // rendering the fading body. When the drive drops back below the
+            // 0.33 face swap the caret re-feeds, and the pet returns as a NEW
+            // SIGHTING at its keep-ahead station — FADE_IN, no flinch.
+            //
+            // EXIT-CODE EMPATHY (wave 1): the pet is the SECOND consumer of
+            // the LOCK-A completion probe, keyed (session, seq) with its OWN
+            // latch — the rain's (`rain_last_cmd`) only advances inside the
+            // rain-enabled gate, and the pet must feel a finished command
+            // when no rain is falling. Same laws otherwise: a tab switch
+            // re-baselines SILENTLY (no stale replay from another session's
+            // history), the None→Some edge within one session is a real
+            // first completion, and the note itself only latches — the tick
+            // below is what acts, under the brain's precedence ladder.
+            {
+                let seq = cmd_done.map_or(0, |(e, _)| e);
+                let key = (front_terminal.session, seq);
+                if ws.pet_last_cmd != Some(key) {
+                    let same_session = ws
+                        .pet_last_cmd
+                        .is_some_and(|(sid, _)| sid == front_terminal.session);
+                    ws.pet_last_cmd = Some(key);
+                    if same_session && let Some((_, code)) = cmd_done {
+                        ws.cursor_pet
+                            .note_command_done(frame_started, code != 0, cmd_dur_ms);
+                    }
+                }
+            }
+            // PERK-AND-WATCH (wave 2): is the pane genuinely STREAMING this
+            // frame? Every input is per-frame state the LOCK-A probe already
+            // read — new scrollback rows, the content clock, the OSC 133/633
+            // Execute phase, the live bottom. The content-clock diff rides
+            // the pet's own (session, seq) latch, re-baselined SILENTLY on a
+            // tab switch exactly like `pet_last_cmd` (a session change is
+            // never a burst). The AND with `shell_executing` is what keeps
+            // keystroke echo from ever perking the cat (`pet_output_burst`).
+            let pet_burst = {
+                let advanced = ws.pet_content_seq.is_some_and(|(sid, s)| {
+                    sid == front_terminal.session && content_seq > s
+                });
+                ws.pet_content_seq = Some((front_terminal.session, content_seq));
+                pet_output_burst(
+                    scrolled_rows > 0,
+                    advanced,
+                    shell_executing,
+                    display_offset == 0,
+                )
+            };
+            // POINTER PLAY (wave 2): the pointer in fractional grid cells —
+            // `last_cursor_px` (tracked on every CursorMoved) minus the
+            // effects origin, over the cell metrics; `None` once it leaves
+            // the grid. Pixels-to-cells only: the brain is its own motion
+            // sensor (the own-sensor doctrine).
+            let pet_pointer = pet_pointer_cell(
+                ws.last_cursor_px,
+                (i32::from(origin_x), i32::from(origin_y)),
+                (glow_geom.cw, glow_geom.ch),
+                (glow_geom.cols, glow_geom.rows),
+            );
+            // THE INK SEAM (0.19.0 gauntlet F1/F5/F8): hand the pet the
+            // scanner's per-row ink map + live output edge before it thinks.
+            // One frame stale by construction (the rescan runs later in this
+            // frame) — content that has not changed has not moved its ink.
+            {
+                let (spans, live) = ws.word_decos.pet_ink();
+                ws.cursor_pet.sense_ink(0, spans, live);
+            }
+            // THE GRIEF GATE (gauntlet F4a): a failed command's droop window
+            // hushes the caret-jump fanfare — no party ring at a failure.
+            if ws.cursor_pet.grieving() {
+                ws.cursor_glow.hush_fanfare(frame_started);
+            }
             let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
                 now: frame_started,
-                caret: if pet_visible { cur } else { None },
+                caret: if pet_visible && !sing_face_live(sing_drive) {
+                    cur
+                } else {
+                    None
+                },
                 rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
                 cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
                 cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
@@ -11931,7 +12403,26 @@ impl App {
                 // one motion policy — so a reduced-motion window cannot animate
                 // one companion and freeze the other.
                 reduced_motion: !animate_cat,
+                output_burst: pet_burst,
+                pointer: pet_pointer,
             });
+            // PETTING (wave 1): stash the body the emitter is about to draw,
+            // in FRAME px, for the mouse seam's hit test — and CLEAR it on
+            // every frame the pet is not drawn, so a stale rect can never
+            // eat a click after a style switch or a fade-out. Post-tick by
+            // construction: the rect is THIS frame's body, not last frame's.
+            ws.pet_hit_rect = if pet_visible && pet_frame.alpha > 0 {
+                pet_hit_rect_win(
+                    pet_frame.body_px(
+                        glow_geom.cw.min(usize::from(u16::MAX)) as u16,
+                        glow_geom.ch.min(usize::from(u16::MAX)) as u16,
+                        glow_geom.cols.min(usize::from(u16::MAX)) as u16,
+                    ),
+                    (i32::from(origin_x), i32::from(origin_y)),
+                )
+            } else {
+                None
+            };
             let glow_fp = glow_fp ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
             // On the way out, the cat sometimes does a flourish — a heart rising
             // (heart meow) or a sparkling star (star wink). It is emitted LATER
@@ -12049,8 +12540,24 @@ impl App {
                         // features are otherwise blind to each other, so typing
                         // `kitty` drew both at once.
                         // ONE COMPANION PER CARET: whichever animal is actually
-                        // on screen claims the cell, so the pet counts here too.
-                        cur.filter(|_| kitty_alpha > 0 || (pet_visible && pet_frame.alpha > 0)),
+                        // on screen claims the cell, so the pet counts here too
+                        // — and the pet additionally hands in its LIVE drawn
+                        // body, because its pixel footprint is a ~2.8-col ×
+                        // 1.70-row animal standing wherever its brain walked
+                        // it, not the flying head's caret-anchored band.
+                        cur.filter(|_| kitty_alpha > 0 || (pet_visible && pet_frame.alpha > 0))
+                            .map(|cell| crate::word_decorations::CompanionOnGlass {
+                                cell,
+                                body_px: (pet_visible && pet_frame.alpha > 0)
+                                    .then(|| {
+                                        pet_frame.body_px(
+                                            effect_geom.cell_w,
+                                            effect_geom.cell_h,
+                                            effect_geom.cols,
+                                        )
+                                    })
+                                    .flatten(),
+                            }),
                         Some(sel_view),
                         ws.focused,
                         &mut ws.deco_scratch,
@@ -12081,6 +12588,32 @@ impl App {
                         frame_started,
                         kitty_log_on,
                     );
+                    // WORD-CAT BAT (wave 2): drain the positioned peek cues
+                    // PROMPTLY beside the sightings (same clear-at-tick-
+                    // start law) and forward the landed HEAD to the pet as
+                    // fractional cells of this grid — the head peeks rows
+                    // away from its word, and the bat swipes at the head.
+                    // A pet-less frame drains-and-drops; the note only
+                    // latches (range-checked brain-side, retired by its
+                    // TTL), and the brain consumes it on the ground next
+                    // tick — the latch law's one frame of latency.
+                    {
+                        let (word_decos, cursor_pet) =
+                            (&mut ws.word_decos, &mut ws.cursor_pet);
+                        let bat_on = pet_visible;
+                        for cue in word_decos.drain_peek_cues() {
+                            if bat_on {
+                                let (x0, x1, y0, y1) = cue.head_px;
+                                cursor_pet.note_peek(
+                                    frame_started,
+                                    (x0 + x1) as f32 * 0.5
+                                        / f32::from(effect_geom.cell_w.max(1)),
+                                    (y0 + y1) as f32 * 0.5
+                                        / f32::from(effect_geom.cell_h.max(1)),
+                                );
+                            }
+                        }
+                    }
                     // Curse-BONK drain (the sparkle-words sound seam):
                     // PROMPTLY after the tick, beside the kitty drain — the
                     // cue vec clears at the next tick's start. A disabled
@@ -12183,7 +12716,13 @@ impl App {
                             fp ^= pet_fp.rotate_left(29);
                         }
                     }
-                    if !pet_mode
+                    // The flying kitty's sprite — and, nested in its frame,
+                    // the MusicNotes update/emission. In pet mode this arm is
+                    // admitted ONLY while the sing-along holds the frame
+                    // ([`flying_kitty_admitted`]): the singing face takes the
+                    // caret, and the notes finally run in pet mode too —
+                    // before this admission they never did.
+                    if flying_kitty_admitted(pet_mode, cat_frame.sing)
                         && kitty_alpha > 0
                         && let Some(cell) = cur
                     {
@@ -12641,7 +13180,10 @@ impl App {
                 // `snapshot_seq` with the grid's CURRENT damage epoch (render_cells.rs).
                 let mut term = term_lock(&front_terminal.term);
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-                (presented_default_bg_u32, presented_cursor_color_u32) =
+                // The presented pair is re-sampled here; the foreground half is
+                // not read on this path (the effect config was already folded
+                // above from the same observation), so it is discarded by name.
+                (presented_default_bg_u32, _, presented_cursor_color_u32) =
                     terminal_frame_colors(&term);
                 term.take_damage();
                 drop(term);
@@ -14396,9 +14938,24 @@ impl App {
             // ONE CAT PER CARET, sharpened per pane: only the FOCUSED pane has
             // a caret, so only there can the ambient scanner collide with the
             // companion. Every other pane hands the engine `None`.
-            let companion_at = (input.session == ctx.focus && ctx.kitty_alpha > 0)
+            // ONE COMPANION PER CARET: the companion is whichever animal is
+            // actually on glass. `kitty_alpha` is forced 0 in pet mode, so
+            // without the pet term a split in pet mode had NO suppression at
+            // all — the single-pane path has carried it since the pet landed.
+            // The pet also hands in its LIVE drawn body: its world is the
+            // focused pane (see `compose_pet_companion`), so the rect is
+            // already in this pane's pixel space, same as the word-cats'.
+            let companion_pet = ctx.pet_visible && ctx.pet.alpha > 0;
+            let companion_at = (input.session == ctx.focus
+                && (ctx.kitty_alpha > 0 || companion_pet))
                 .then_some(input.cursor)
-                .flatten();
+                .flatten()
+                .map(|cell| crate::word_decorations::CompanionOnGlass {
+                    cell,
+                    body_px: companion_pet
+                        .then(|| ctx.pet.body_px(geom.cell_w, geom.cell_h, geom.cols))
+                        .flatten(),
+                });
             let pane_fp = ws.word_decos.tick(
                 ctx.now,
                 tick_cfg,
@@ -14427,6 +14984,25 @@ impl App {
                 ctx.now,
                 kitty_log_on,
             );
+            // WORD-CAT BAT (wave 2): the peek-cue drain, per pane — every
+            // pane drains (the vec clears at the next tick's start), but
+            // only the FOCUSED pane's cues reach the pet: its world IS that
+            // pane, and the engine's rects are pane-local px, which is
+            // exactly the pet's own pixel space (no translate needed).
+            {
+                let (word_decos, cursor_pet) = (&mut ws.word_decos, &mut ws.cursor_pet);
+                let bat_on = input.session == ctx.focus && ctx.pet_visible;
+                for cue in word_decos.drain_peek_cues() {
+                    if bat_on {
+                        let (x0, x1, y0, y1) = cue.head_px;
+                        cursor_pet.note_peek(
+                            ctx.now,
+                            (x0 + x1) as f32 * 0.5 / (ctx.cell_w.max(1) as f32),
+                            (y0 + y1) as f32 * 0.5 / (ctx.cell_h.max(1) as f32),
+                        );
+                    }
+                }
+            }
             let bonk_gain = bonk_sound_gain(
                 ws.focused,
                 bonk_enabled && !ws.resize_sound_quiet(std::time::Instant::now()),
@@ -14572,7 +15148,18 @@ impl App {
         // one translate/crop helper. Its brain was already ticked for this
         // present (outside this function, which the sparkle master can skip), so
         // this is pure emission.
-        if ctx.pet_visible {
+        //
+        // …except while the SINGING FACE holds the caret: the sing-along
+        // admits the flying kitty in pet mode ([`flying_kitty_admitted`]), so
+        // the pet-first return yields for the song's whole admission. THE
+        // SPLIT-PATH ASYMMETRY, documented and deliberate: this path composes
+        // ONE companion per frame, so the pet returns only once `sing` hits
+        // exactly 0 — slightly LATER than the single-pane path, which draws
+        // the fading pet body and the singing face side by side through the
+        // wind-down crossfade. By the time the pet composes again its caret
+        // has been re-fed since the 0.33 face swap, so it is already mid
+        // fade-in at its keep-ahead station.
+        if ctx.pet_visible && ctx.cat_frame.sing <= 0.0 {
             return self.compose_pet_companion(wid, ctx, focus_place);
         }
         if ctx.kitty_alpha == 0 {
@@ -14860,7 +15447,18 @@ impl App {
         let mut focus_epoch = 0u64;
         let mut focus_content_seq = 0u64;
         let mut focus_cmd_done: Option<(u64, i32)> = None;
+        // The completed mark's C→D execution span — the pet's exit-code
+        // empathy probe, the single-pane `cmd_dur_ms`'s split twin.
+        let mut focus_cmd_dur_ms: Option<u64> = None;
         let mut focus_shell_edge = false;
+        // The Execute LEVEL (not the edge): the pet's perk-and-watch burst
+        // probe wants "is a command running this frame", the single-pane
+        // `shell_executing`'s split twin.
+        let mut focus_shell_exec = false;
+        // New scrollback rows this frame — the single-pane `scrolled_rows`'s
+        // split twin, read where the focus pane's scroll translation already
+        // computes it.
+        let mut focus_scrolled_rows = 0usize;
         let mut focus_alt = false;
         let mut focus_d_off = 0usize;
         let mut focus_sel_clone = aterm_core::selection::TextSelection::new();
@@ -14982,6 +15580,7 @@ impl App {
                     } else {
                         0
                     };
+                    focus_scrolled_rows = scrolled;
                     if scrolled > 0 {
                         let d = (scrolled.min(u16::MAX as usize) as u16).min(r.rows);
                         ws.cursor_glow.note_scroll(d);
@@ -15009,11 +15608,17 @@ impl App {
                     focus_cmd_done = term
                         .last_completed_command()
                         .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)));
+                    focus_cmd_dur_ms = term
+                        .last_completed_command()
+                        .and_then(|m| m.exec_duration_ms());
+                    let shell_exec =
+                        term.shell_state() == aterm_core::terminal::ShellState::Executing;
                     focus_shell_edge = rain_shell_execute_rising_edge(
                         &mut ws.rain_shell_executing,
                         r.session,
-                        term.shell_state() == aterm_core::terminal::ShellState::Executing,
+                        shell_exec,
                     );
+                    focus_shell_exec = shell_exec;
                     focus_alt = pane_alt;
                     focus_d_off = d_off;
                     focus_sel_clone = term.text_selection().clone();
@@ -15219,6 +15824,9 @@ impl App {
         // not the window theme: these streams are clipped to that pane, so the
         // window-wide ambiguity a split has does not apply to them.
         glow_cfg.dark_theme = aterm_render::theme_is_dark(focus_default_bg);
+        // The PAIR from one blank cell, so DECSCNM swaps both or neither.
+        glow_cfg.theme_fg = aterm_render::rgb_to_u32(focus_blank.fg);
+        glow_cfg.theme_bg = focus_default_bg;
         // Cursor WAKE follows the FOCUSED pane's effective live cursor colour —
         // OSC 12 when set, otherwise OSC 10 — the
         // single-pane recolour block's compose twin (same rules: an explicit
@@ -15308,11 +15916,9 @@ impl App {
                     .tick(win_cur, now, &glow_cfg, glow_geom, &mut ws.glow_scratch);
             // Tone resolution — the single-pane seam verbatim (knob off ⇒
             // the neutral identity, stale cache included).
-            let tone = if self.config.tone_melody_or_default() {
-                ws.tone_tracker.current()
-            } else {
-                aterm_effects::tone::Tone::Technical
-            };
+            let tone = ws
+                .tone_tracker
+                .effective(self.config.tone_melody_or_default());
             drain_trail_sound_cues(
                 &mut ws.cursor_glow,
                 glow_cfg.style,
@@ -15356,7 +15962,10 @@ impl App {
         // The companion presents only while this window can show it; load shed
         // sheds it with every other decoration.
         let cat_presentable = focused && !load_shed;
-        let collected_look = self.kitty_log.companion_look();
+        // The companion's identity verdict, hoisted above the `ws` borrow like
+        // the single-pane seam — the same one function every dressing surface
+        // resolves through ([`Self::companion_verdict`]).
+        let companion_verdict = self.companion_verdict(focus);
         let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();
         let sound_volume = self.config.trail_sound_volume();
@@ -15374,14 +15983,24 @@ impl App {
             .iter()
             .find(|(r, _)| r.session == focus)
             .map(|(r, _)| (r.rows, r.cols));
+        // PETTING (wave 1): the hit-box's frame-space origin — the effects
+        // origin plus the FOCUSED pane's pixel offset, because the pet's
+        // world (and so `body_px`) is that pane's grid, exactly like
+        // `compose_pet_companion`'s translate step. Derived before the `ws`
+        // borrow (it reads `&self`).
+        let (fx_ox, fx_oy, _, _, _) = self.effects_origin_win(wid, rows, cols, glow_ch);
+        let pet_origin = (
+            i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
+            i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
+        );
         let (cat_frame, kitty_alpha, riff, pet_frame) =
             {
                 let ws = self.windows.get_mut(&wid)?;
-                // THE SESSION KITTY: an explicitly collected companion wins;
-                // otherwise the look is a pure function of the focused session id.
-                ws.cursor_cat.set_look(collected_look.unwrap_or_else(|| {
-                    aterm_effects::kitty_registry::KittyLook::for_session(focus)
-                }));
+                // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
+                // through the same one verdict (favourite > app > discovery
+                // > session; see `app_kitty::companion_precedence`, resolved
+                // by [`Self::companion_verdict`] above).
+                ws.cursor_cat.set_look(companion_verdict);
                 ws.cursor_cat
                     .set_collection_presentable(now, cat_presentable);
                 // SING-ALONG: the held-key celebration drives the ribbon,
@@ -15391,7 +16010,7 @@ impl App {
                 } else {
                     0.0
                 };
-                let mut riff: Option<(u64, f32, i8)> = None;
+                let mut riff: Option<(u64, f32, u32)> = None;
                 if sing_drive > 0.0 {
                     ws.cursor_glow.celebrate(now, sing_drive);
                     if let Some(bar) = ws.kitty_sing.bar(now)
@@ -15399,7 +16018,7 @@ impl App {
                     {
                         ws.sing_riff_bar = Some(bar);
                         riff = trail_sound_gain(ws.focused, sound_on, sound_volume)
-                            .map(|gain| (bar, gain, ws.kitty_sing.key()));
+                            .map(|gain| (bar, gain, ws.kitty_sing.signature()));
                     }
                 } else {
                     ws.kitty_sing.settle(now);
@@ -15407,11 +16026,16 @@ impl App {
                 }
                 ws.cursor_cat
                     .set_singing(now, sing_drive, ws.kitty_sing.beat(now).unwrap_or(0.0));
-                let cat_frame = if animate_cat {
+                let mut cat_frame = if animate_cat {
                     ws.cursor_cat.frame(now)
                 } else {
                     ws.cursor_cat.static_frame(now)
                 };
+                // PET-MODE EPISODES EXIT PLAIN — the single-pane twin's law
+                // ([`pin_pet_mode_exit`]): the sing-along summon is the only
+                // way this companion appears in pet mode, and admission ends
+                // at drive 0, so no rolled heart/star may outlive it.
+                pin_pet_mode_exit(pet_mode, &mut cat_frame);
                 // `sparkle_on` gates the sprite: with the master off an earned
                 // flight is invisible, so folding its fp would force presents of
                 // unchanged pixels (the invisible-cat wake train).
@@ -15426,7 +16050,11 @@ impl App {
                 // `!pet_mode` for the same reason as the single-pane path: an
                 // un-drawable flying kitty must not fire an exit flourish, move
                 // the RepaintKey, or claim the caret cell from a word-cat.
-                let alpha = if kitty_enabled && !pet_mode {
+                // Same sing-along exception too ([`flying_kitty_admitted`]):
+                // while the song holds the frame the SINGING FACE is the
+                // companion and the pet steps aside — admission spans the
+                // armed hold plus the wind-down, then ends at drive 0.
+                let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                     cat_frame.alpha
                 } else {
                     0
@@ -15439,10 +16067,77 @@ impl App {
                 // permanent wake train (the single-pane path learned this the
                 // hard way). A pet that cannot be drawn is fed `caret: None`, so
                 // it fades out and releases the lane honestly.
+                //
+                // THE SONG TAKES THE CARET — the single-pane twin's law
+                // ([`sing_face_live`]): while the singing face is live the pet
+                // is fed `caret: None` too, fading out in place with
+                // `pet_visible` untouched; below the 0.33 face swap the caret
+                // re-feeds and the pet returns fresh at its keep-ahead station.
                 let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
+                // EXIT-CODE EMPATHY (wave 1) — the single-pane dedupe's
+                // split twin, on the pet's OWN (session, seq) latch: a
+                // pane-focus switch re-baselines silently, only a genuinely
+                // new completion in the same session notes the brain, and
+                // the note only latches (the tick below acts). Pass 1's
+                // snapshot is proven valid by the early return above, so
+                // these locals are the focused pane's real probe.
+                {
+                    let seq = focus_cmd_done.map_or(0, |(e, _)| e);
+                    let key = (focus, seq);
+                    if ws.pet_last_cmd != Some(key) {
+                        let same_session =
+                            ws.pet_last_cmd.is_some_and(|(sid, _)| sid == focus);
+                        ws.pet_last_cmd = Some(key);
+                        if same_session && let Some((_, code)) = focus_cmd_done {
+                            ws.cursor_pet
+                                .note_command_done(now, code != 0, focus_cmd_dur_ms);
+                        }
+                    }
+                }
+                // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
+                // split twin: the focused pane's scroll delta, content
+                // clock, Execute LEVEL and live bottom, through the same
+                // `pet_output_burst` conjunction and the same silent
+                // (session, seq) re-baseline on a pane-focus switch.
+                let pet_burst = {
+                    let advanced = ws
+                        .pet_content_seq
+                        .is_some_and(|(sid, s)| sid == focus && focus_content_seq > s);
+                    ws.pet_content_seq = Some((focus, focus_content_seq));
+                    pet_output_burst(
+                        focus_scrolled_rows > 0,
+                        advanced,
+                        focus_shell_exec,
+                        focus_d_off == 0,
+                    )
+                };
+                // POINTER PLAY (wave 2): the single-pane pointer map at the
+                // focused PANE's frame-space origin (`pet_origin` — the same
+                // origin the hit-rect stash uses), bounded by the pane grid.
+                let pet_pointer = pet_pointer_cell(
+                    ws.last_cursor_px,
+                    pet_origin,
+                    (glow_cw, glow_ch),
+                    (usize::from(pane_cols), usize::from(pane_rows)),
+                );
+                // THE INK SEAM (gauntlet F1/F5/F8), split-path twin — NOTE
+                // for the applier: `ws.word_decos` must be bound to the
+                // FOCUSED pane at this point (the pane-park swap); if it is
+                // not, feed empty spans instead of another pane's ink.
+                {
+                    let (spans, live) = ws.word_decos.pet_ink();
+                    ws.cursor_pet.sense_ink(0, spans, live);
+                }
+                // THE GRIEF GATE (gauntlet F4a), split-path twin.
+                if ws.cursor_pet.grieving() {
+                    ws.cursor_glow.hush_fanfare(now);
+                }
                 let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
                     now,
-                    caret: if pet_visible && focus_pane_dims.is_some() {
+                    caret: if pet_visible
+                        && !sing_face_live(sing_drive)
+                        && focus_pane_dims.is_some()
+                    {
                         (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
                     } else {
                         None
@@ -15452,11 +16147,27 @@ impl App {
                     cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
                     cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
                     reduced_motion: !animate_cat,
+                    output_burst: pet_burst,
+                    pointer: pet_pointer,
                 });
+                // PETTING (wave 1): stash/clear the hit-box post-tick — the
+                // single-pane law verbatim, at the focused pane's origin.
+                ws.pet_hit_rect = if pet_visible && pet_frame.alpha > 0 {
+                    pet_hit_rect_win(
+                        pet_frame.body_px(
+                            glow_cw.min(usize::from(u16::MAX)) as u16,
+                            glow_ch.min(usize::from(u16::MAX)) as u16,
+                            pane_cols,
+                        ),
+                        pet_origin,
+                    )
+                } else {
+                    None
+                };
                 (cat_frame, alpha, riff, pet_frame)
             };
-        if let Some((bar, gain, key)) = riff {
-            self.trail_audio.push(sing_riff_event(bar, gain, key));
+        if let Some((bar, gain, sig)) = riff {
+            self.trail_audio.push(sing_riff_event(bar, gain, sig));
         }
         let deco_fp = self.compose_word_decorations(
             wid,
@@ -20725,5 +21436,209 @@ mod find_panel_visual_tests {
             app.search_edit_in(narrow, SearchEdit::Insert(ch.to_string()));
         }
         capture(&mut app, narrow, &dir, "6-narrow");
+    }
+}
+
+/// THE TONE-MELODY SEAM — the host wiring between the typed line and the
+/// sound the synth is asked to make.
+///
+/// Both halves already had unit proofs before this module existed: the
+/// classifier + tracker (`tone_infer`, `aterm_effects::tone`) and the synth's
+/// tone tables (`aterm_effects::trail_sound`). NOTHING pinned the seam BETWEEN
+/// them — the `let tone = …` at each of the three drain sites — so a site that
+/// stopped consulting the tracker, or hardcoded the neutral identity, would
+/// have passed every test in the repository while silently reverting the
+/// feature to the pre-tone build. That is the regression these tests exist to
+/// catch, and they catch it end to end: real key presses through
+/// [`App::input`], the real classifier under its real activation gate, the
+/// real [`App::tick_cursor_fx`] drain, and the real
+/// [`crate::trail_audio::TrailAudio::push`] the audio worker sits behind.
+#[cfg(test)]
+mod tone_melody_seam_tests {
+    use std::time::Instant;
+
+    use aterm_effects::tone::Tone;
+    use aterm_effects::trail_sound::{SoundEvent, SoundGesture};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+    use super::{CursorFxInputs, CursorStyle};
+    use crate::input::{InputEvent, Source};
+    use crate::trail_audio::TrailAudio;
+    use crate::{App, Theme, WindowId};
+
+    fn key(character: char) -> InputEvent {
+        InputEvent::Key {
+            key: Key::Character(character),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    /// A headless App whose audio host is LIVE-but-capturing, which is what
+    /// makes this an end-to-end test rather than a mock: `is_live()` is the
+    /// conjunct that gates BOTH the classifier (`tone_infer_active`) and the
+    /// key-time cue (`keystroke_click_audible`), so a sealed test host would
+    /// silently short-circuit the very wiring under test.
+    fn app_with_capturing_audio() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        app.trail_audio = TrailAudio::capturing_for_test();
+        assert!(app.trail_audio.is_live(), "the capturing host reports live");
+        (app, WindowId(0))
+    }
+
+    /// One frame of the REAL single-pane cursor-effects tick — the seam that
+    /// resolves the tone and drains the glow's cues into the audio host.
+    fn tick(app: &mut App, wid: WindowId) {
+        app.tick_cursor_fx(wid, CursorFxInputs::sample_for_test(Instant::now()))
+            .expect("the fixture window ticks");
+    }
+
+    fn type_line(app: &mut App, wid: WindowId, line: &str) {
+        for ch in line.chars() {
+            let _ = app.input(wid, key(ch), Source::Human);
+        }
+    }
+
+    /// Trail gestures only: the bonk is tone-blind BY DESIGN (a wrong note is
+    /// wrong in every mood), so folding it in would make this test assert the
+    /// opposite of the synth's actual contract.
+    fn trail_tones(events: &[SoundEvent]) -> Vec<Tone> {
+        events
+            .iter()
+            .filter(|ev| matches!(ev.kind, SoundGesture::Trail(_)))
+            .map(|ev| ev.tone)
+            .collect()
+    }
+
+    /// THE END-TO-END PIN: a frustrated line typed through the real input path
+    /// reaches the audio host as sound events whose `tone` is Frustrated.
+    ///
+    /// The first tick is not ceremony — the glow arms its key-cue seam only on
+    /// a tick that actually DRAWS (`cursor_glow::sound_live`), exactly as a
+    /// live session interleaves frames with keys, so keys pressed before the
+    /// first frame are legitimately silent.
+    #[test]
+    fn a_typed_mood_reaches_the_audio_host_on_every_trail_event() {
+        let (mut app, wid) = app_with_capturing_audio();
+        assert!(
+            app.config.tone_melody_or_default()
+                && app.config.trail_sounds_or_default()
+                && app.config.trail_sound_volume() > 0.0,
+            "the shipped defaults are what this test claims to exercise",
+        );
+        tick(&mut app, wid);
+        let _ = app.trail_audio.take_captured_for_test();
+
+        // The line is drawn from the committed training distribution (the same
+        // conformance pin `tone_infer`'s unit test uses), so a miss here is a
+        // broken SEAM, not a model that generalized differently today.
+        type_line(&mut app, wid, "why is this broken again ugh");
+        assert_eq!(
+            app.windows[&wid].tone_tracker.current(),
+            Tone::Frustrated,
+            "the real input path must have fed the classifier",
+        );
+        assert!(
+            app.windows[&wid].tone_tracker.inferences > 0,
+            "the classifier must actually have run under the live-audio gate",
+        );
+
+        tick(&mut app, wid);
+        let tones = trail_tones(&app.trail_audio.take_captured_for_test());
+        assert!(
+            !tones.is_empty(),
+            "typing with sound live must produce trail cues to carry a mood",
+        );
+        assert!(
+            tones.iter().all(|&t| t == Tone::Frustrated),
+            "every event must carry the typed mood, got {tones:?}",
+        );
+    }
+
+    /// The knob-off identity ACROSS the same seam: with `tone_melody = false`
+    /// the events carry the neutral melodic identity even though the tracker
+    /// still holds a real verdict from before the toggle — the property that
+    /// makes a disabled knob sound bit-exactly like the pre-tone build.
+    #[test]
+    fn a_disabled_knob_stamps_the_neutral_identity_over_a_cached_verdict() {
+        let (mut app, wid) = app_with_capturing_audio();
+        tick(&mut app, wid);
+        type_line(&mut app, wid, "why is this broken again ugh");
+        assert_eq!(app.windows[&wid].tone_tracker.current(), Tone::Frustrated);
+
+        app.config.tone_melody = Some(false);
+        type_line(&mut app, wid, " and again");
+        tick(&mut app, wid);
+
+        let tones = trail_tones(&app.trail_audio.take_captured_for_test());
+        assert!(!tones.is_empty(), "the sound path is still live");
+        assert!(
+            tones.iter().all(|&t| t == Tone::Technical),
+            "a disabled knob must stamp the identity, got {tones:?}",
+        );
+        assert_eq!(
+            app.windows[&wid].tone_tracker.current(),
+            Tone::Frustrated,
+            "the cached verdict is masked at the seam, not erased",
+        );
+    }
+
+    /// EVERY drain seam resolves its tone through the ONE helper. The three
+    /// sites (single-pane, composed, split-pane compose) are far apart in this
+    /// file and a fourth is easy to add; a behavioural test can only reach the
+    /// seam its fixture happens to drive, so the remaining sites are pinned at
+    /// the source level — the idiom this file's own capture-path conformance
+    /// tests already use.
+    ///
+    /// It refuses two specific regressions: a policy literal that stops taking
+    /// the tracker's answer (a hardcoded `Tone::Technical`, the silent revert),
+    /// and one that reads `current()` directly, which would keep stamping a
+    /// stale mood after the knob was switched off.
+    #[test]
+    fn every_trail_sound_policy_takes_its_tone_from_the_tracker() {
+        // Scan the CODE only: this module's own prose mentions both spellings,
+        // and a test that matches itself proves nothing.
+        let source = include_str!("app_render.rs");
+        let code = source
+            .split("/// THE TONE-MELODY SEAM")
+            .next()
+            .expect("this module's doc block terminates the scanned region");
+        let policies: Vec<&str> = code
+            .match_indices("TrailSoundPolicy {")
+            .filter(|(at, _)| !code[..*at].ends_with("struct "))
+            .filter_map(|(at, _)| code[at..].split('}').next())
+            .collect();
+        assert_eq!(
+            policies.len(),
+            3,
+            "expected the three known drain seams; a new one must be wired here too",
+        );
+        for policy in &policies {
+            assert!(
+                policy.contains("tone,"),
+                "a policy must take the resolved `tone` binding, not an inline \
+                 literal: {policy:?}",
+            );
+        }
+        // Every `tone` binding in this file comes from the shared helper.
+        let bindings: Vec<&str> = code
+            .split("let tone = ")
+            .skip(1)
+            .filter_map(|tail| tail.split(';').next())
+            .collect();
+        assert_eq!(bindings.len(), policies.len(), "one binding per drain seam");
+        for binding in &bindings {
+            assert!(
+                binding.contains("tone_tracker") && binding.contains(".effective("),
+                "a drain seam must resolve its tone through \
+                 `ToneTracker::effective` (knob folded in one place): {binding:?}",
+            );
+            assert!(
+                !binding.contains(".current()"),
+                "`current()` ignores the knob — a stale verdict would survive a \
+                 toggle-off: {binding:?}",
+            );
+        }
     }
 }

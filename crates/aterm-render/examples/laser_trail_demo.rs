@@ -64,6 +64,10 @@ fn main() {
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         dark_theme: true,
+        // `theme` is in scope here, so render the TRUTH rather than a
+        // stand-in: these demos exist to be looked at.
+        theme_fg: theme.fg & 0x00ff_ffff,
+        theme_bg: theme.bg & 0x00ff_ffff,
     };
 
     let mut term = Terminal::new(ROWS as u16, COLS as u16);

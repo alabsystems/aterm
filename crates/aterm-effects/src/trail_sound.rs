@@ -167,12 +167,50 @@ pub enum CelebrationGesture {
     /// ([`CELEBRATION_BAR_SECONDS`] is pinned equal to
     /// `kitty_sing::SING_BAR_SECONDS`), with the documented ± ~60 ms host
     /// buffer/scheduling tolerance (`kitty_sing` module doc).
-    /// The payload is `u16`, not `u8`, for the ESCALATION: a `u8` wraps every
+    /// `bar` is `u16`, not `u8`, for the ESCALATION: a `u8` wraps every
     /// 256 bars (409.6 s of held key) and would restart the build ramp. `u16`
     /// wraps at 65 536 bars (~29 h) and, because `CELEBRATION_PHRASE_BARS` is a
     /// power of two, the FORM survives even that wrap in phase (pinned by
     /// `celebration_form_is_wrap_safe`).
+    ///
+    /// `sig` is the held character's BIJECTIVE song signature
+    /// (`kitty_sing::KittySing::signature`). Every per-key axis of the
+    /// celebration is a pure function of it — the verse melody walk, the
+    /// root transpose, the mode rotation (`design_celebration`) — because
+    /// the seamless hand-over law forbids synth-side per-key state: a
+    /// mid-hold key change simply changes the payload the NEXT bar carries,
+    /// over the same uninterrupted bar grid.
+    ///
+    /// NAMING (transition): this is the spec's `RiffBar { bar, sig }` under
+    /// a temporary name while the deprecated `RiffBar { bar, key }` shim
+    /// below holds the old name for the not-yet-patched host builder
+    /// (`backups/PENDING-sing-sig-app_render.patch`). Once that patch lands,
+    /// delete the shim and rename this variant to `RiffBar` — hosts that
+    /// construct through [`CelebrationGesture::riff_bar`] survive the rename
+    /// untouched.
+    RiffBarSig { bar: u16, sig: u32 },
+    /// COMPATIBILITY SHIM — DELETE WITH THE PENDING GUI PATCH. The pre-
+    /// signature payload: a clamped 5-class pentatonic root, which is
+    /// exactly the defect the signature exists to fix ('a'/'f'/'k'/'p'/'u'/
+    /// 'z'/space were bit-identical). Decoded by delegating into a synthetic
+    /// signature whose derived root IS this key (home mode), so the
+    /// unpatched host keeps its old per-class transpose while every axis
+    /// stays a pure function of one payload.
+    #[deprecated(note = "carries only 5 key classes; construct via \
+                         CelebrationGesture::riff_bar with KittySing::signature() — \
+                         see backups/PENDING-sing-sig-app_render.patch")]
     RiffBar { bar: u16, key: i8 },
+}
+
+impl CelebrationGesture {
+    /// Build the canonical riff-bar gesture from the bar index and the held
+    /// character's song signature. Hosts construct through THIS (not the
+    /// variant literal) so the planned `RiffBarSig` → `RiffBar` rename after
+    /// the pending GUI patch lands touches no call site.
+    #[must_use]
+    pub fn riff_bar(bar: u16, sig: u32) -> Self {
+        Self::RiffBarSig { bar, sig }
+    }
 }
 
 /// One namespaced gesture: WHICH effect spoke, and WHAT it said. The
@@ -438,19 +476,36 @@ const BONK_TRITONE: f32 = 45.0 / 32.0;
 
 /// TIER 1 — the FLOOR. A keystroke is the unit everything else is measured in.
 const TYPED_KIND_GAIN: f32 = 1.0;
-/// TIER 1. Deletions arrive at typing speed, so they sit ON the floor, not
-/// under it; the mirrored PITCH carries "undo" instead.
-const BACKSPACE_KIND_GAIN: f32 = 1.0;
-/// TIER 1. Above 1.0 because a glide's whole voice is one bare sine pluck,
-/// intrinsically ~1 dB under a palette keystroke at equal gain.
-const GLIDE_KIND_GAIN: f32 = 1.11;
-/// TIER 2 — one per gesture, not one per character. No production path cues
+/// TIER 1, a shade UNDER the floor. A deletion is a CORRECTION: it should not
+/// announce itself as loudly as the character it removes, and a burst of them
+/// (hold backspace) must not out-shout the typing it is undoing. The mirrored
+/// PITCH (-3 degrees) carries "undo" alongside this.
+///
+/// `e8d1a1d9` moved this to 1.0 as part of flattening the ladder; the owner's
+/// 2026-08-04 mix pass puts deletions back under typing.
+const BACKSPACE_KIND_GAIN: f32 = 0.85;
+/// TIER 0 — the SUB-FLOOR. Cursor motion is not authorship: it accompanies what
+/// you are doing rather than being the thing you did, so the three movement
+/// gestures sit AUDIBLY under the typing floor.
+///
+/// These three were 0.32 / 0.32 / 0.30 until `e8d1a1d9` raised them ~11 dB in a
+/// single pass, which put a cursor move at the same level as a keystroke and
+/// thickened the texture around every key (the held-key repeat work in
+/// `3803f0d7` then cues far more of them). The original values were too quiet
+/// to read at all; these land the movement family ~3 dB under the floor, which
+/// is present but plainly subordinate — the balance the owner asked for on
+/// 2026-08-04 ("tune the noises in relative volume").
+///
+/// Above the others in the family because a glide's whole voice is one bare
+/// sine pluck, intrinsically ~1 dB under a palette keystroke at equal gain.
+const GLIDE_KIND_GAIN: f32 = 0.78;
+/// TIER 0 — one per gesture, not one per character. No production path cues
 /// `Navigation` (`cursor_glow` splits every hinted move into Glide/Sweep);
 /// the arm serves the audition harness and hosts that still speak it.
-const NAVIGATION_KIND_GAIN: f32 = 1.19;
-/// TIER 2. The per-note taper in `design_cursor` drops the run's tail; this
+const NAVIGATION_KIND_GAIN: f32 = 0.68;
+/// TIER 0. The per-note taper in `design_cursor` drops the run's tail; this
 /// sets where its FIRST note lands.
-const SWEEP_KIND_GAIN: f32 = 1.14;
+const SWEEP_KIND_GAIN: f32 = 0.73;
 /// TIER 3 — a kill is per-command and destroys a line, so it may not be the
 /// quietest thing in the engine. Most of the level correction lives in the
 /// swoosh's own voice gain rather than here, because the deficit is a VOICE
@@ -615,6 +670,176 @@ const CELEBRATION_BASE_HZ: f32 = 523.25;
 /// full build and clap. It still audibly grows — it grows INTO the ceiling
 /// instead of through it.
 const CELEBRATION_KIND_GAIN: f32 = 0.6;
+
+// ---------------------------------------------------------------------------
+// The per-key song axes (owner: "I also want a more obvious difference in the
+// tune generation when pressing different keys")
+// ---------------------------------------------------------------------------
+//
+// Every axis below is a PURE FUNCTION of the gesture payload's `sig` — the
+// bijective per-character song signature (`kitty_sing::song_signature`). The
+// seamless hand-over law forbids synth-side per-key state, so a mid-hold key
+// change is nothing but the next bar arriving with a different payload.
+//
+// The walk encoding is re-implemented from the salvaged held-key-songs design
+// (the crashed 2026-07 branch): its mixer + mixed-radix decode predate the
+// loudness ladder so the code could not be cherry-picked, but the scheme is
+// its — first symbol radix 5, then base-4 interval transitions;
+// `5 * 4^15 > 2^32`, so sixteen coded notes carry the ENTIRE signature
+// injectively.
+
+/// THE VERSE WALK's four moves — the mixed-radix decode spends one base-4
+/// digit of `sig / 5` per transition. No move is 0 (mod 5), so adjacent
+/// coded notes ALWAYS land on a different scale degree: no key's verse can
+/// degenerate into a drone, and nearby characters get different CONTOURS,
+/// not transposed copies of one authored line.
+const SONG_INTERVALS: [i32; 4] = [-1, 1, -2, 2];
+
+/// Coded notes per walk cycle: sixteen carry every bit of the `u32`
+/// signature without collision, plus one BRIDGE note ([`SONG_STEPS`]) chosen
+/// away from both endpoints so the walk also moves across its own wrap.
+const SONG_CODED_STEPS: u32 = 16;
+const SONG_STEPS: u32 = SONG_CODED_STEPS + 1;
+
+/// Decode coded walk symbol `index` of `sig`: reversible mixed radix —
+/// symbol zero is `sig % 5`, each transition one base-4 digit of `sig / 5`
+/// spent on [`SONG_INTERVALS`], the degree wrapped into the pentatonic
+/// window `0..=4` (a wrap is itself a move — a compound leap, never a
+/// repeat).
+fn song_coded_degree(sig: u32, index: u32) -> i32 {
+    debug_assert!(index < SONG_CODED_STEPS);
+    let mut code = u64::from(sig);
+    let mut degree = (code % 5) as i32;
+    code /= 5;
+    for _ in 0..index {
+        let choice = (code & 3) as usize;
+        code >>= 2;
+        degree = (degree + SONG_INTERVALS[choice]).rem_euclid(5);
+    }
+    degree
+}
+
+/// The walk degree (`0..=4`) at verse-note `ordinal`, cycling every
+/// [`SONG_STEPS`] notes with the bridge at index 16.
+fn song_degree(sig: u32, ordinal: u32) -> i32 {
+    let index = ordinal % SONG_STEPS;
+    if index < SONG_CODED_STEPS {
+        return song_coded_degree(sig, index);
+    }
+    let first = song_coded_degree(sig, 0);
+    let last = song_coded_degree(sig, SONG_CODED_STEPS - 1);
+    for interval in SONG_INTERVALS {
+        let bridge = (last + interval).rem_euclid(5);
+        if bridge != first {
+            return bridge;
+        }
+    }
+    unreachable!("four distinct nonzero pentatonic moves cannot all land on the first note")
+}
+
+/// AXIS 2 — THE ROOT the whole celebration transposes to: `sig % 5 - 2`,
+/// structurally inside one pentatonic octave (-2..=2). The register guard is
+/// unchanged from the old `key` payload: no character can transpose the riff
+/// into a register that reads as a different instrument.
+fn celebration_root(sig: u32) -> i32 {
+    (sig % 5) as i32 - 2
+}
+
+/// AXIS 3 — MODE-FEEL: an integer degree rotation folded (with the root)
+/// into every sounding degree BEFORE [`TrailSynth::melody_hz`]. Pentatonic
+/// modes ARE rotations, and the lattice is JUST intonation — its five steps
+/// are unequal — so rotating the song's degrees changes the interval COLOR
+/// under the same contour while staying on the shared consonant lattice (the
+/// de8589d9 mood seam multiplies on top, and tone tables are NEVER swapped
+/// per key — that would hand the bonk's no-beating law to a keyboard). The
+/// rotation class is `sig % 3` ∈ {0, 2, 4}; the 4-rotation is realized
+/// octave-folded as −1 (a five-note rotation by 4 IS the rotation by −1, one
+/// octave apart), so the register guard extends to this axis: the combined
+/// root+mode offset stays in −3..=4.
+const MODE_ROTATIONS: [i32; 3] = [0, 2, -1];
+fn celebration_mode(sig: u32) -> i32 {
+    MODE_ROTATIONS[(sig % 3) as usize]
+}
+
+/// AXIS 4 — per-key pulse DUTY for the riff's lead (chip timbre families
+/// {0.25, 0.375, 0.5}), wired but GATED OFF: an owner decision pending the
+/// owner's ear. Duty is the loudest timbral lever the chip voice has — three
+/// keys apart would read as three different instruments — so it ships dark
+/// until it has been heard. Flipping the flag is the whole change.
+const CELEBRATION_KEY_DUTY: bool = false;
+fn celebration_duty(sig: u32) -> f32 {
+    if CELEBRATION_KEY_DUTY {
+        [0.25, 0.375, 0.5][((sig >> 8) % 3) as usize]
+    } else {
+        0.25
+    }
+}
+
+/// Which form slots are VERSE (per-key walk) vs the SHARED CHORUS. The
+/// verses are the A-family (bars 0/1/3) and the lift pair C/C' (bars 4/5);
+/// the syncopated B (2), the breathing bridge B' (6) and the turnaround D
+/// (7, fill included) keep the AUTHORED phrase for every key — the shared
+/// chorus that keeps every key's song recognizably THE celebration.
+const CELEBRATION_VERSE: [bool; CELEBRATION_PHRASE_BARS] =
+    [true, true, false, true, true, true, false, false];
+
+/// Register shelf lifting the walk's `0..=4` window into each verse
+/// family's authored tessitura: the A-family verses sit just over the hook's
+/// shelf, the C-family verses keep THE LIFT — the form still rises into
+/// bars 4/5 for every key.
+fn verse_register(idx: usize) -> i32 {
+    if idx == 4 || idx == 5 { 4 } else { 1 }
+}
+
+/// The walk ordinal of the FIRST sounding slot of verse bar `idx` (`None`
+/// for chorus bars): sounding verse slots are numbered consecutively across
+/// the form, so the walk keeps striding instead of restarting per bar.
+/// Counted from the authored REST pattern, never hand-pinned.
+fn verse_ordinal_base(idx: usize) -> Option<u32> {
+    if !CELEBRATION_VERSE[idx] {
+        return None;
+    }
+    let mut base = 0u32;
+    for (i, row) in CELEBRATION_PHRASE.iter().enumerate().take(idx) {
+        if CELEBRATION_VERSE[i] {
+            base += row.iter().filter(|&&d| d != REST).count() as u32;
+        }
+    }
+    Some(base)
+}
+
+/// AXIS 1 — THE VERSE. This bar's CONTOUR row for `sig`: chorus bars return
+/// the AUTHORED row verbatim (byte-identical for every signature — pinned by
+/// `chorus_bars_are_byte_identical_across_sigs`); verse bars keep the
+/// authored RHYTHM (the REST pattern, and with it the groove, swing, span
+/// and bass-carrier laws) and replace each sounding degree with the
+/// signature's walk. Root and mode are NOT applied here — this is the
+/// contour; `design_celebration` folds the shift in at pitch time so the
+/// chorus modulates with the song while its contour stays shared.
+fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
+    let mut row = CELEBRATION_PHRASE[idx];
+    let Some(base) = verse_ordinal_base(idx) else {
+        return row;
+    };
+    let shelf = verse_register(idx);
+    let mut ordinal = base;
+    for slot in &mut row {
+        if *slot != REST {
+            *slot = song_degree(sig, ordinal) + shelf;
+            ordinal += 1;
+        }
+    }
+    row
+}
+
+/// The synthetic signature the DEPRECATED `RiffBar { key }` shim delegates
+/// through: `6 · (key + 2)` decodes to root == the clamped key (`% 5`) in
+/// the home mode (`% 3 == 0`), so the unpatched host keeps its old 5-class
+/// transpose semantics until the pending patch lands. `key == 0` lands on
+/// `kitty_sing::NEUTRAL_SIGNATURE` exactly (cross-pinned by test).
+fn legacy_key_signature(key: i8) -> u32 {
+    6 * (i32::from(key).clamp(-2, 2) + 2) as u32
+}
 
 /// The pre-delay of eighth-grid slot `slot`, SWUNG: odd slots land
 /// [`CELEBRATION_SWING`] of an eighth late. Slot 0 is always exactly 0.0, so
@@ -986,6 +1211,22 @@ pub struct TrailSynth {
     /// `1 − DEPTH · sing` factor: exactly ×1.0 while at rest, so every
     /// pinned path (v056 references, brrrring, bonk) renders bit-identical.
     sing: f32,
+    /// THE SONG'S KEY, borrowed by the TYPING (owner, 2026-08-04: "more musical
+    /// in kitty rainbow").
+    ///
+    /// The held-key sing-along transposes its authored riff by a pentatonic root
+    /// offset picked from the held character (`kitty_sing::KittySing::key`), but
+    /// the typed melody had no notion of a key at all: it kept walking its own
+    /// lattice at its own anchor while the riff played in a different one. The
+    /// two were only ACCIDENTALLY compatible — the anchors sit a near-just fourth
+    /// apart — and nothing bound a typed note to the chord under it, so the
+    /// typing was simply ducked out of the way rather than made to agree.
+    ///
+    /// Latched from every `RiffBar` and released with the sing duck, so it is
+    /// exactly as live as the song is: while the cat sings, what you type is IN
+    /// THE SAME KEY and reads as counterpoint; the moment the song ends the
+    /// typing is back on the neutral lattice, note for note as before.
+    song_key: i8,
     /// Seconds of full sing-duck hold remaining (block-rate countdown).
     sing_hold: f32,
     /// DC blockers (one-pole highpass ~20 Hz) per channel.
@@ -1032,7 +1273,14 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => 0.95,
             GlowStyle::Phaser => 0.94,
-            GlowStyle::RainbowKitty => 1.39,
+            // RE-FITTED 2026-08-04 alongside the cuter voice. The brighter
+            // register, the 25 % pulse's restored second harmonic, the 0.52
+            // fundamental and the 2600 Hz corner together measured +2.06 dB
+            // against the mellow voice this trim was fitted for
+            // (`cargo run -p aterm-effects --example mix_meter`: -12.97 → -10.91
+            // dBFS at gain 1.0). A cuter keystroke must not also be a LOUDER
+            // one, so the trim gives that back exactly: 1.39 × 10^(-2.06/20).
+            GlowStyle::RainbowKitty => 1.097,
             GlowStyle::Sparkle => 1.27,
             GlowStyle::Fire => 0.88,
             GlowStyle::Laser => 0.77,
@@ -1071,6 +1319,7 @@ impl TrailSynth {
             tone: Tone::Technical,
             duck: 0.0,
             sing: 0.0,
+            song_key: 0,
             sing_hold: 0.0,
             dc_x_l: 0.0,
             dc_y_l: 0.0,
@@ -1242,8 +1491,20 @@ impl TrailSynth {
                 self.design_trail(ev, kind, duck);
             }
             SoundGesture::Words(WordGesture::Bonk) => self.design_bonk(ev, duck),
+            SoundGesture::Celebration(CelebrationGesture::RiffBarSig { bar, sig }) => {
+                self.design_celebration(ev, bar, sig);
+            }
+            #[allow(deprecated)]
             SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key }) => {
-                self.design_celebration(ev, bar, key);
+                // Latch the song's key so the typing that continues underneath
+                // the riff walks the SAME lattice (see `song_key`).
+                self.song_key = key;
+                // COMPAT (delete with the pending GUI patch): the unpatched
+                // host still speaks the 5-class key. Delegate through a
+                // synthetic signature whose derived root IS that key, so the
+                // legacy path keeps its old transpose while the design stays
+                // a pure function of ONE payload.
+                self.design_celebration(ev, bar, legacy_key_signature(key));
             }
         }
     }
@@ -1413,7 +1674,11 @@ impl TrailSynth {
         // pitch, so a long line drifts by at most a single scale-step instead
         // of the column swamping the tune.
         let col_off = (ev.pan).round() as i32;
-        let deg = self.walk + col_off;
+        // IN THE SONG'S KEY WHILE THE SONG IS PLAYING (see `song_key`). It is
+        // zero whenever the cat is not singing, so the ordinary typed melody is
+        // untouched and every neutral-path proof — including the v0.56 byte-pin
+        // oracle, which has no such field — stays exact.
+        let deg = self.walk + col_off + i32::from(self.song_key);
 
         // CURSOR MOVEMENT (Glide/Sweep) is a style-agnostic, IN-KEY gesture
         // designed once here (like Kill/Bonk), before palette dispatch: it
@@ -1711,6 +1976,27 @@ impl TrailSynth {
     /// armed + held for the bar so the ordinary melody makes way and hands back
     /// on wind-down.
     ///
+    /// EVERY KEY SINGS ITS OWN VERSE (owner: "I also want a more obvious
+    /// difference in the tune generation when pressing different keys").
+    /// Three audible axes derive from `sig` — the held character's bijective
+    /// song signature — and nothing else, so the design is a pure function
+    /// of the payload (the seamless hand-over law: no synth-side per-key
+    /// state, a key change is just the next bar's payload):
+    ///
+    /// * AXIS 1 — the VERSE MELODY: the verse bars' sounding degrees come
+    ///   from `sig`'s mixed-radix walk ([`celebration_bar_degrees`]) while
+    ///   the chorus bars keep the authored phrase for every key — a
+    ///   different verse of the same recognizable celebration. Rhythm,
+    ///   groove, swing, build and clap tables stay shared.
+    /// * AXIS 2 — the ROOT: [`celebration_root`], clamped -2..=2 (the
+    ///   register guard stands), applied to every sounding degree — the
+    ///   turnaround FILL included, which the old code dropped (it tumbled
+    ///   back to the reference key mid-modulation).
+    /// * AXIS 3 — the MODE: [`celebration_mode`]'s pentatonic rotation,
+    ///   folded in with the root — felt color, same lattice.
+    /// * AXIS 4 — per-key pulse DUTY ([`celebration_duty`]) — wired but
+    ///   gated OFF pending the owner's ear.
+    ///
     /// Deliberate deviations from the trail path, each an anti-annoyance
     /// inversion: NO governor duck (the armed state IS a key-repeat flood —
     /// rate-ducking the headline riff would crush it to a whisper exactly
@@ -1734,11 +2020,19 @@ impl TrailSynth {
     /// PENTA, transpose ×1.0) — every pinned neutral-path celebration proof is
     /// byte-untouched. The bonk alone keeps the raw `penta` (its clash is
     /// anchored to the untransposed lattice by design).
-    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, key: i8) {
+    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
         let idx = usize::from(bar) % CELEBRATION_PHRASE_BARS;
-        let phrase = &CELEBRATION_PHRASE[idx];
+        // AXIS 1 — this key's verse (chorus bars come back authored).
+        let phrase = &celebration_bar_degrees(sig, idx);
         let bass_bar = &CELEBRATION_BASS[idx];
+        // AXES 2 + 3 — root and mode rotation: ONE combined integer degree
+        // shift applied to every sounding degree (lead, bass, fill) before
+        // `melody_hz`, so the whole song modulates coherently and stays on
+        // the shared consonant lattice.
+        let shift = celebration_root(sig) + celebration_mode(sig);
+        // AXIS 4 — per-key duty, owner-gated (see [`CELEBRATION_KEY_DUTY`]).
+        let duty = celebration_duty(sig);
         // Escalation ramp 0..1 across the opening bars of the hold. A PURE
         // function of the bar index — no rng draw — so the riff replays
         // independently of the typed layer's consumption of the shared stream.
@@ -1756,18 +2050,16 @@ impl TrailSynth {
                 continue; // held by the note before it
             }
             let span = celebration_span(phrase, i, sustain_limit);
-            // THE HELD KEY PICKS THE ROOT (owner: "when I changed the repeating
-            // key, the song played needs to also change seamlessly"). `key` is a
-            // pentatonic scale-degree offset from `KittySing::key`, bounded to one
-            // octave, applied to every note of the authored phrase — so the tune,
-            // its rhythm and its bar grid are untouched and only the KEY moves.
-            // The riff used to be bit-identical for every held character.
-            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + i32::from(key));
+            // THE HELD KEY PICKS THE SONG: `deg` is this key's contour degree
+            // (verse walk or shared chorus), `shift` its root + mode. The
+            // rhythm and the bar grid are untouched, so a mid-hold key change
+            // is a modulation on the next bar boundary, never a restart.
+            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
             // The BASSLINE rides the lead voice that opens its beat — third
             // partial, no extra voice. `build` fades the low end in over the
             // opening bars.
             let sub = if i.is_multiple_of(2) && bass_bar[i / 2] != REST {
-                let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2] + i32::from(key));
+                let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2] + shift);
                 Partial {
                     lvl: 0.42 * build,
                     f0: b,
@@ -1796,7 +2088,7 @@ impl TrailSynth {
                         lvl: 0.55,
                         f0: hz,
                         f1: hz,
-                        wave: Wave::Pulse { duty: 0.25 },
+                        wave: Wave::Pulse { duty },
                         ..Partial::default()
                     },
                     Partial {
@@ -1827,7 +2119,11 @@ impl TrailSynth {
         // and crescendo back onto the hook.
         if turnaround {
             for (k, &deg) in CELEBRATION_FILL.iter().enumerate() {
-                let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg);
+                // THE FILL CARRIES THE SHIFT (the fix): it used to call
+                // `melody_hz(BASE, deg)` bare, so the turnaround's four
+                // sixteenths tumbled back to the REFERENCE key — a wrong-key
+                // hiccup once every eight bars for every transposed hold.
+                let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
                 let v = Voice {
                     delay: (6.0 + 0.5 * k as f32) * CELEBRATION_EIGHTH,
                     dur: CELEBRATION_EIGHTH,
@@ -1838,7 +2134,7 @@ impl TrailSynth {
                             lvl: 0.55,
                             f0: hz,
                             f1: hz,
-                            wave: Wave::Pulse { duty: 0.25 },
+                            wave: Wave::Pulse { duty },
                             ..Partial::default()
                         },
                         Partial {
@@ -1895,6 +2191,7 @@ impl TrailSynth {
             // its voices on a starved host clock).
             self.sing = 0.0;
             self.sing_hold = 0.0;
+            self.song_key = 0;
             return;
         }
 
@@ -2608,35 +2905,53 @@ impl Palette for RainbowKittyPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // MELLOW DOOPS: a 50 % square (hollow, odd-harmonic) rather than a
-        // buzzy narrow pulse, a sub-octave sine for warmth, an eased attack,
-        // and notes that linger.
-        let base = 392.0; // G4 — the mellow chip register
+        // CUTE DOOPS (owner, 2026-08-04: "I want the typing noise to be a bit
+        // cuter, more like it was before").
+        //
+        // "Before" is precise: the founding voice (`c48b10e4`, restored by
+        // `92bf23c1` with the note "the original voices were the right ones")
+        // was C5 / 25 % pulse / 0.09 s / attack 0.001 / decay 0.045 / lp 2600.
+        // `45252f03` mellowed every one of those axes at once on a live-review
+        // brief ("more mellow… make the doop doop sound a bit longer") and the
+        // measured spectral centroid fell 3532 → 2587 Hz while the lowest
+        // content dropped 654 → 245 Hz — an octave and a fourth of added weight.
+        // That is the sound being asked to come back.
+        //
+        // This is "a BIT cuter", not a revert: the four axes that CARRY cuteness
+        // go home — the register (a perfect fourth up), the 25 % pulse's second
+        // harmonic (nasal and chirpy, where a 50 % square is hollow and organ-
+        // like), the 1.2 ms attack that puts the tick back on the front, and the
+        // 2600 Hz corner — while the two that carry the July brief keep half
+        // their ground: the note stays a shade longer than the original (0.105 /
+        // 0.052 against 0.09 / 0.045) and the sub-octave survives at HALF level
+        // rather than being deleted, so there is still body under the blip.
+        let base = 523.25; // C5 — the bright chip register
         let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
         let f = s.melody_hz(base, d);
         let mk = |f: f32, delay: f32| Voice {
             delay,
-            dur: 0.13,
-            attack: 0.0025,
-            decay: 0.068,
+            dur: 0.105,
+            attack: 0.0012,
+            decay: 0.052,
             p: [
                 Partial {
-                    lvl: 0.45,
+                    lvl: 0.52,
                     f0: f,
                     f1: f,
-                    wave: Wave::Pulse { duty: 0.5 },
+                    wave: Wave::Pulse { duty: 0.25 },
                     ..Partial::default()
                 },
-                // Sub-octave sine: the warmth under the doop.
+                // Sub-octave sine: the warmth under the doop, at half the
+                // mellow pass's weight.
                 Partial {
-                    lvl: 0.18,
+                    lvl: 0.09,
                     f0: f * 0.5,
                     f1: f * 0.5,
                     ..Partial::default()
                 },
                 Partial::default(),
             ],
-            lp_cut: 1900.0,
+            lp_cut: 2600.0,
             ..Voice::default()
         };
         s.spawn(mk(f, 0.0), g * 0.34, ev.pan);
@@ -2660,8 +2975,14 @@ impl Palette for RainbowKittyPalette {
         (b.lp1 * lvl * 0.022, 0.0)
     }
 
+    /// Tracks the palette's own `base`. The bonk's clash is defined as an
+    /// interval AGAINST the voice it interrupts (`BONK_MINOR_SECOND` /
+    /// `BONK_TRITONE` against this anchor), so an anchor left behind at the old
+    /// register would stop clashing — the invariant
+    /// `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash` pins the
+    /// two moving together.
     fn bonk_anchor_hz(&self) -> f32 {
-        392.0
+        523.25
     }
 }
 
@@ -4675,6 +4996,64 @@ mod tests {
         );
     }
 
+    /// TYPING JOINS THE SONG'S KEY (owner, 2026-08-04: "more musical in kitty
+    /// rainbow"). While the cat sings, a typed note transposes with the riff, so
+    /// the two layers are one piece of music instead of two lattices that only
+    /// happened to be a near-just fourth apart. When the song ends, the typed
+    /// melody is back on the neutral lattice exactly as before.
+    #[test]
+    fn typing_transposes_with_the_song_and_returns_when_it_ends() {
+        let hz_of = |s: &TrailSynth| {
+            s.voices
+                .iter()
+                .filter(|v| v.on)
+                .flat_map(|v| v.p.iter())
+                .filter(|p| p.lvl > 0.0)
+                .map(|p| p.f1)
+                .fold(0.0f32, f32::max)
+        };
+        // A neutral typed note.
+        let mut plain = TrailSynth::new(48_000.0, 7);
+        plain.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        let neutral = hz_of(&plain);
+        assert!(neutral > 0.0, "the typed note speaks");
+
+        // The same note, with the song live in a transposed key.
+        let mut singing = TrailSynth::new(48_000.0, 7);
+        singing.push(SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 0, key: 2 }),
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
+        });
+        assert_eq!(singing.song_key, 2, "the riff latches its key");
+        let mut after = TrailSynth::new(48_000.0, 7);
+        after.song_key = 2;
+        after.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        let transposed = hz_of(&after);
+        assert!(
+            transposed > neutral * 1.05,
+            "a typed note rides the song's key: {neutral} -> {transposed}"
+        );
+
+        // …and the key is released with the song, not left parked.
+        let mut ended = TrailSynth::new(48_000.0, 7);
+        ended.song_key = 2;
+        ended.sing = 1.0;
+        let mut buf = vec![0.0f32; 48_000 * 2 * 4];
+        ended.render(&mut buf); // long enough for every voice + hold to die
+        assert!(ended.is_quiet(), "the fixture reaches silence");
+        assert_eq!(
+            ended.song_key, 0,
+            "the borrowed key is handed back when the song ends"
+        );
+        let mut back = TrailSynth::new(48_000.0, 7);
+        back.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+        assert_eq!(
+            hz_of(&back),
+            neutral,
+            "and the neutral typed melody is unchanged, note for note"
+        );
+    }
+
     /// The bonk is the one deliberately discordant voice: its clash partials
     /// sit a just-intonation minor second and tritone above the melody's
     /// CURRENT walk degree — ratios that exist nowhere in the pentatonic
@@ -4683,9 +5062,10 @@ mod tests {
     fn bonk_is_discordant_against_the_walk_and_moves_nothing() {
         let mut s = TrailSynth::new(48_000.0, 33);
         let walk_before = s.walk;
-        // the rainbow kitty's bonk anchor (G4) at the current degree — the anchor tracks
-        // the palette's own melodic register.
-        let root = penta(392.0, walk_before);
+        // the rainbow kitty's bonk anchor (C5) at the current degree — the anchor tracks
+        // the palette's own melodic register, and moved with it when the typing
+        // voice went back to the bright chip register on 2026-08-04.
+        let root = penta(523.25, walk_before);
         s.push(bonk(GlowStyle::RainbowKitty));
         assert_eq!(s.walk, walk_before, "a bonk must not step the melody walk");
         assert_eq!(
@@ -4791,15 +5171,16 @@ mod tests {
 
     // -- SING-ALONG sing-along proofs ----------------------------------------
 
-    /// One sing-along riff bar (the celebration gesture helper). `heat` 1.0:
-    /// the host pins momentum to full while armed — that IS maximal flow.
-    /// `bed` false: the host states the policy the gesture actually gets
-    /// (Celebration, like Words, structurally never reaches the bed feed).
-    fn riff(style: GlowStyle, bar: u16) -> SoundEvent {
+    /// One sing-along riff bar for a held key's signature (the celebration
+    /// gesture helper). `heat` 1.0: the host pins momentum to full while
+    /// armed — that IS maximal flow. `bed` false: the host states the policy
+    /// the gesture actually gets (Celebration, like Words, structurally
+    /// never reaches the bed feed).
+    fn riff_sig(style: GlowStyle, bar: u16, sig: u32) -> SoundEvent {
         SoundEvent {
             style,
             voice: SoundVoice::Style,
-            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key: 0 }),
+            kind: SoundGesture::Celebration(CelebrationGesture::riff_bar(bar, sig)),
             pan: 0.0,
             heat: 1.0,
             hue: 0.0,
@@ -4809,17 +5190,26 @@ mod tests {
         }
     }
 
+    /// The neutral-signature riff bar — the reference voicing (root 0, home
+    /// mode) the axis-agnostic celebration proofs speak in.
+    fn riff(style: GlowStyle, bar: u16) -> SoundEvent {
+        riff_sig(style, bar, crate::kitty_sing::NEUTRAL_SIGNATURE)
+    }
+
     /// RIFF DETERMINISM: the samples are a pure function of (seed, events) —
-    /// two synths fed the identical two-bar celebration script render
-    /// byte-identical audio, and the riff genuinely sounds (non-zero).
+    /// two synths fed the identical two-phrase celebration script for the
+    /// SAME held key ('w''s signature, so the per-key verse path is on the
+    /// line too) render byte-identical audio, and the riff genuinely sounds
+    /// (non-zero).
     #[test]
     fn celebration_riff_is_deterministic_given_seed_and_events() {
+        let w = crate::kitty_sing::song_signature('w');
         let run = || {
             let mut s = TrailSynth::new(48_000.0, 42);
             let mut out = Vec::new();
             let mut buf = [0.0f32; 960]; // 10 ms blocks
             for bar in 0..(CELEBRATION_PHRASE_BARS as u16 * 2) {
-                s.push(riff(GlowStyle::RainbowKitty, bar));
+                s.push(riff_sig(GlowStyle::RainbowKitty, bar, w));
                 for _ in 0..160 {
                     // one bar = 1.6 s
                     s.render(&mut buf);
@@ -5090,6 +5480,290 @@ mod tests {
                 penta(CELEBRATION_BASE_HZ, deg).to_bits(),
                 "neutral riff degree {deg} must be the exact untransposed identity"
             );
+        }
+    }
+
+    // -- per-key song-axis proofs ---------------------------------------------
+
+    /// SAME KEY, SAME SONG — and NO synth-side per-key state: the voices a
+    /// `sig('w')` bar schedules are identical whether the synth is fresh or
+    /// just sang a DIFFERENT key's bar first (the seamless hand-over law —
+    /// the design must be a pure function of the payload, or a mid-hold key
+    /// change would drag stale identity across the bar boundary).
+    #[test]
+    fn same_key_stability() {
+        let fingerprint = |v: &Voice| {
+            (
+                v.delay.to_bits(),
+                v.dur.to_bits(),
+                v.p[0].f0.to_bits(),
+                v.p[1].f0.to_bits(),
+                v.p[2].f0.to_bits(),
+            )
+        };
+        let w = crate::kitty_sing::song_signature('w');
+        // Fresh synth: the reference 'w' bar.
+        let mut a = TrailSynth::new(48_000.0, 7);
+        a.push(riff_sig(GlowStyle::RainbowKitty, 0, w));
+        let mut reference: Vec<_> = a.voices.iter().filter(|v| v.on).map(fingerprint).collect();
+        reference.sort_unstable();
+        // Same seed, but ANOTHER key's bar spoke first (the bridge bar — its
+        // four voices leave room in the pool for the full 'w' bar).
+        let mut b = TrailSynth::new(48_000.0, 7);
+        b.push(riff_sig(
+            GlowStyle::RainbowKitty,
+            6,
+            crate::kitty_sing::song_signature('a'),
+        ));
+        let before: Vec<_> = b.voices.iter().filter(|v| v.on).map(fingerprint).collect();
+        b.push(riff_sig(GlowStyle::RainbowKitty, 0, w));
+        let mut after: Vec<_> = b.voices.iter().filter(|v| v.on).map(fingerprint).collect();
+        // Multiset-subtract the first bar's voices; what remains is exactly
+        // what the 'w' bar scheduled (subtraction is collision-safe: equal
+        // fingerprints are interchangeable in a multiset).
+        for f in before {
+            let i = after
+                .iter()
+                .position(|x| *x == f)
+                .expect("the 'a' bar's voices must still be present");
+            after.swap_remove(i);
+        }
+        after.sort_unstable();
+        assert_eq!(
+            after, reference,
+            "a 'w' bar must schedule identical voices with or without another \
+             key's bar before it"
+        );
+    }
+
+    /// CROSS-KEY DIFFERENCE — the owner's ask, pinned at the melody level:
+    /// 'w', 'a' and 'z' get verse INTERVAL SEQUENCES that differ pairwise.
+    /// Intervals, not degrees: a transpose preserves every interval, so this
+    /// can only pass if the verses differ in CONTOUR — different tunes, not
+    /// one tune nudged.
+    #[test]
+    fn cross_key_difference() {
+        let intervals = |sig: u32| -> Vec<i32> {
+            let mut degs = Vec::new();
+            for idx in 0..CELEBRATION_PHRASE_BARS {
+                if CELEBRATION_VERSE[idx] {
+                    degs.extend(
+                        celebration_bar_degrees(sig, idx)
+                            .into_iter()
+                            .filter(|&d| d != REST),
+                    );
+                }
+            }
+            degs.windows(2).map(|w| w[1] - w[0]).collect()
+        };
+        let keys = ['w', 'a', 'z'];
+        for (i, &a) in keys.iter().enumerate() {
+            for &b in &keys[i + 1..] {
+                assert_ne!(
+                    intervals(crate::kitty_sing::song_signature(a)),
+                    intervals(crate::kitty_sing::song_signature(b)),
+                    "{a:?} and {b:?} must sing different verse contours"
+                );
+            }
+        }
+    }
+
+    /// THE FILL CARRIES THE ROOT: the turnaround's four sixteenths used to
+    /// take the pitch lattice WITHOUT the transpose, so every transposed
+    /// hold got a wrong-key hiccup once per eight bars — the tumble home
+    /// landed in the REFERENCE key, not the held one.
+    #[test]
+    fn fill_carries_root() {
+        // Legacy key +2 == sig 24: root +2, home mode — the shift is pure root.
+        let sig = legacy_key_signature(2);
+        assert_eq!(celebration_root(sig), 2);
+        assert_eq!(celebration_mode(sig), 0);
+        let mut s = TrailSynth::new(48_000.0, 3);
+        s.push(riff_sig(GlowStyle::RainbowKitty, 7, sig)); // the turnaround bar
+        // Fill voices are the only sixteenths: dur == exactly one eighth
+        // (phrase voices hold ≥ 1.5 eighths; `duck_exempt` skips tone_feel,
+        // so the durations are bit-exact).
+        let mut fills: Vec<&Voice> = s
+            .voices
+            .iter()
+            .filter(|v| v.on && v.dur.to_bits() == CELEBRATION_EIGHTH.to_bits())
+            .collect();
+        fills.sort_by(|a, b| a.delay.total_cmp(&b.delay));
+        assert_eq!(fills.len(), CELEBRATION_FILL.len(), "four fill sixteenths");
+        for (k, v) in fills.iter().enumerate() {
+            let deg = CELEBRATION_FILL[k];
+            assert_eq!(
+                v.p[0].f0.to_bits(),
+                penta(CELEBRATION_BASE_HZ, deg + 2).to_bits(),
+                "fill note {k} must sing in the held key's root"
+            );
+            assert_ne!(
+                v.p[0].f0.to_bits(),
+                penta(CELEBRATION_BASE_HZ, deg).to_bits(),
+                "regression guard: fill note {k} fell back to the reference key"
+            );
+        }
+    }
+
+    /// THE SHARED CHORUS: bars B (2), B' (6) and the turnaround D (7) return
+    /// the AUTHORED contour for every signature, byte-identical — what keeps
+    /// every key's song recognizably THE celebration while the verses roam.
+    #[test]
+    fn chorus_bars_are_byte_identical_across_sigs() {
+        let sigs = [
+            0u32,
+            1,
+            11,
+            12,
+            24,
+            0xDEAD_BEEF,
+            u32::MAX,
+            crate::kitty_sing::song_signature('w'),
+            crate::kitty_sing::song_signature('a'),
+            crate::kitty_sing::song_signature('z'),
+        ];
+        for &sig in &sigs {
+            for idx in [2usize, 6, 7] {
+                assert!(!CELEBRATION_VERSE[idx]);
+                assert_eq!(
+                    celebration_bar_degrees(sig, idx),
+                    CELEBRATION_PHRASE[idx],
+                    "chorus bar {idx} drifted for sig {sig:#x}"
+                );
+            }
+        }
+    }
+
+    /// THE VERSE WALK LAWS over a spread of signatures: the authored RHYTHM
+    /// survives verbatim (the REST pattern — and with it the groove, swing,
+    /// span and bass-carrier laws), every sounding degree stays inside the
+    /// singable lattice window, adjacent sounding verse notes always MOVE
+    /// (no key can drone), and the root register guard holds for every sig.
+    #[test]
+    fn verse_walk_always_moves_and_keeps_rhythm_and_register() {
+        let sigs: Vec<u32> = "wazqx09~ \t"
+            .chars()
+            .map(crate::kitty_sing::song_signature)
+            .chain([0, 1, 5, 12, 24, 0x7FFF_FFFF, u32::MAX])
+            .collect();
+        for &sig in &sigs {
+            assert!((-2..=2).contains(&celebration_root(sig)), "root guard");
+            assert!(MODE_ROTATIONS.contains(&celebration_mode(sig)));
+            for idx in 0..CELEBRATION_PHRASE_BARS {
+                let row = celebration_bar_degrees(sig, idx);
+                for slot in 0..row.len() {
+                    assert_eq!(
+                        row[slot] == REST,
+                        CELEBRATION_PHRASE[idx][slot] == REST,
+                        "bar {idx} slot {slot}: the rhythm is authored, never per-key"
+                    );
+                }
+                let sounding: Vec<i32> = row.iter().copied().filter(|&d| d != REST).collect();
+                for &d in &sounding {
+                    assert!(
+                        (0..=9).contains(&d),
+                        "bar {idx}: degree {d} off the singable range (sig {sig:#x})"
+                    );
+                }
+                if CELEBRATION_VERSE[idx] {
+                    for w in sounding.windows(2) {
+                        assert_ne!(w[0], w[1], "bar {idx}: a verse drone (sig {sig:#x})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// AXIS 3 IS AUDIBLE ON ITS OWN: two signatures with the same root and
+    /// the same contour (a chorus bar is authored for every key) but
+    /// different mode classes render differently — and a same-root/same-mode
+    /// pair renders identically, so the difference IS the rotation and a
+    /// chorus bar depends on the payload through (root, mode) alone.
+    #[test]
+    fn mode_rotation_alone_changes_the_chorus_color() {
+        // 12 ≡ 2, 22 ≡ 2, 42 ≡ 2 (mod 5) — one shared root (0);
+        // 12 ≡ 0, 22 ≡ 1, 42 ≡ 0 (mod 3) — modes 0, 2, 0.
+        let render = |sig: u32| {
+            let mut s = TrailSynth::new(48_000.0, 42);
+            s.push(riff_sig(GlowStyle::RainbowKitty, 6, sig));
+            let mut acc = 0u64;
+            let mut buf = [0.0f32; 960];
+            for _ in 0..160 {
+                s.render(&mut buf);
+                for &x in &buf {
+                    acc = acc.rotate_left(7).wrapping_add(u64::from(x.to_bits()));
+                }
+            }
+            acc
+        };
+        assert_eq!(celebration_root(12), celebration_root(22));
+        assert_ne!(celebration_mode(12), celebration_mode(22));
+        assert_ne!(render(12), render(22), "the mode axis must be audible");
+        assert_eq!(celebration_root(12), celebration_root(42));
+        assert_eq!(celebration_mode(12), celebration_mode(42));
+        assert_eq!(
+            render(12),
+            render(42),
+            "chorus bars carry no per-key axis beyond root + mode"
+        );
+    }
+
+    /// The neutral signature (nothing held) IS the reference voicing — root
+    /// 0, home mode — and the legacy key shim lands exactly on it for key 0.
+    /// Cross-pins `kitty_sing::NEUTRAL_SIGNATURE` to this module's decode.
+    #[test]
+    fn neutral_signature_is_the_reference_voicing() {
+        use crate::kitty_sing::NEUTRAL_SIGNATURE;
+        assert_eq!(celebration_root(NEUTRAL_SIGNATURE), 0);
+        assert_eq!(celebration_mode(NEUTRAL_SIGNATURE), 0);
+        assert_eq!(legacy_key_signature(0), NEUTRAL_SIGNATURE);
+    }
+
+    /// The DEPRECATED `RiffBar { key }` shim (alive only until the pending
+    /// GUI patch lands): it decodes to root == clamped key in the home mode,
+    /// and still schedules a full bar through `push` — the unpatched host
+    /// keeps a working (5-class) celebration during the transition window.
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_riff_bar_shim_keeps_the_old_transpose() {
+        for key in -4..=4i8 {
+            let sig = legacy_key_signature(key);
+            assert_eq!(celebration_root(sig), i32::from(key).clamp(-2, 2));
+            assert_eq!(
+                celebration_mode(sig),
+                0,
+                "legacy keys stay in the home mode"
+            );
+        }
+        let mut s = TrailSynth::new(48_000.0, 5);
+        s.push(SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 0, key: 2 }),
+            ..riff(GlowStyle::RainbowKitty, 0)
+        });
+        assert_eq!(
+            s.live_voices(),
+            8,
+            "the legacy gesture still sings a full bar"
+        );
+    }
+
+    /// AXIS 4 stays DARK until the owner has heard it: with the gate off,
+    /// every signature's lead duty is the authored 0.25 — flipping
+    /// [`CELEBRATION_KEY_DUTY`] is the entire enable.
+    #[test]
+    fn per_key_duty_is_gated_off_pending_the_owners_ear() {
+        for sig in [
+            0u32,
+            12,
+            24,
+            crate::kitty_sing::song_signature('w'),
+            u32::MAX,
+        ] {
+            if CELEBRATION_KEY_DUTY {
+                assert!([0.25f32, 0.375, 0.5].contains(&celebration_duty(sig)));
+            } else {
+                assert_eq!(celebration_duty(sig), 0.25);
+            }
         }
     }
 
@@ -5926,32 +6600,33 @@ mod tests {
 
                     // RAINBOW KITTY — see `RainbowKittyPalette::design`.
                     GlowStyle::RainbowKitty => {
-                        let base = 392.0; // G4 — the mellow chip register
+                        let base = 523.25; // C5 — the bright chip register
                         let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
                         let f = penta(base, d);
                         let mk = |f: f32, delay: f32| Voice {
                             delay,
-                            dur: 0.13,
-                            attack: 0.0025,
-                            decay: 0.068,
+                            dur: 0.105,
+                            attack: 0.0012,
+                            decay: 0.052,
                             p: [
                                 Partial {
-                                    lvl: 0.45,
+                                    lvl: 0.52,
                                     f0: f,
                                     f1: f,
-                                    wave: Wave::Pulse { duty: 0.5 },
+                                    wave: Wave::Pulse { duty: 0.25 },
                                     ..Partial::default()
                                 },
-                                // Sub-octave sine: the warmth under the doop.
+                                // Sub-octave sine: the warmth under the doop, at
+                                // half the mellow pass's weight.
                                 Partial {
-                                    lvl: 0.18,
+                                    lvl: 0.09,
                                     f0: f * 0.5,
                                     f1: f * 0.5,
                                     ..Partial::default()
                                 },
                                 Partial::default(),
                             ],
-                            lp_cut: 1900.0,
+                            lp_cut: 2600.0,
                             ..Voice::default()
                         };
                         self.spawn(mk(f, 0.0), g * 0.34, pan);

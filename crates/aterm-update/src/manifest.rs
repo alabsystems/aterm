@@ -207,7 +207,7 @@ fn cheap_staged_identity_matches(ready: &Ready, app: &Path) -> Option<bool> {
 /// Extract the string immediately following one exact XML plist key. Release
 /// bundles are emitted as XML; missing/binary/malformed plists fail closed and
 /// force a fresh verified stage.
-fn xml_plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn xml_plist_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let after_key = text.find(key)? + key.len();
     // The value element must immediately follow the key (modulo whitespace).
     // Searching arbitrarily far forward would let a malformed/intervening key's

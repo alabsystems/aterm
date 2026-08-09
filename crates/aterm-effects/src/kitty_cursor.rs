@@ -27,7 +27,8 @@ use aterm_render::{GlowQuad, HaloMode, RainHalo, premul_rgb};
 
 use crate::cat_baker::{CatColorKey, EyesFrame};
 use crate::cat_glyphs_gen::CatGlyphId;
-use crate::cursor_glow::Geom;
+use crate::cursor_glow::{Geom, InkRole};
+use crate::effect_util::twinkle_rgb;
 use crate::kitty_registry::KittyLook;
 use crate::typing_momentum::TypingMomentum;
 
@@ -174,7 +175,6 @@ const DELIGHT_CHAIN_WINDOW: f32 = 0.9;
 const DELIGHT_ATTACK: f32 = 0.05;
 const DELIGHT_SETTLE: f32 = 0.2;
 /// Peak leap height as a fraction of cell height, added to the hover bob.
-const DELIGHT_LEAP: f32 = 0.42;
 /// Vertical stretch at the top of the hop (and the squash on the way out).
 const DELIGHT_STRETCH: f32 = 0.14;
 const MAX_DELIGHT_CHAIN: u8 = 4;
@@ -1053,10 +1053,16 @@ impl CursorCat {
             Some(_) => (std::f32::consts::TAU * self.stride).sin() * BOB_AMP,
             None => 0.0,
         };
-        // NEGATIVE is up: `bob` is a signed fraction of cell height and the
-        // renderer subtracts it from the dest y, so the hop must push down the
-        // number line to rise on screen.
-        hover - self.delight_leap(now)
+        // THE FELINE-WORD LEAP LEFT THE COMPANION (owner, 2026-08-04: "the
+        // cursor kitty changes too unpredictably. I want the kitty animations to
+        // be in the keyword kitties versus on the cursor"). Hearing its own name
+        // is a reaction to a WORD, and that word now spawns its own living cat
+        // (`word_decorations::CatIdlePose`), so the celebration plays where the
+        // thing being celebrated actually is. The companion keeps the happy eyes
+        // — the feeling reads without the body throwing itself up the screen
+        // mid-sentence, which was the single largest unpredictable displacement
+        // in the whole pose stack (`DELIGHT_LEAP` = 0.42 cells, chain-scaled).
+        hover
     }
 
     /// Normalized 0..1 progress through the delight hop, or 0 when none is
@@ -1077,15 +1083,6 @@ impl CursorCat {
     /// sine over the hold, so the cat rises, hangs, and lands smoothly back on
     /// its anchor. Scaled by the bounded phrase chain — a second `kitty`
     /// inside the window hops higher than the first.
-    fn delight_leap(&self, now: Instant) -> f32 {
-        let arc = self.delight_arc(now);
-        if arc <= 0.0 || arc >= 1.0 {
-            return 0.0;
-        }
-        let chain = f32::from(self.delight_chain.max(1));
-        let strength = 1.0 + 0.16 * (chain - 1.0);
-        (std::f32::consts::PI * arc).sin() * DELIGHT_LEAP * strength
-    }
 
     /// Advance the eased "display momentum" spine toward `target` (the live
     /// score). An exponential follower with `DISP_TAU`: it LAGS the raw momentum,
@@ -1251,12 +1248,13 @@ impl CursorCat {
             });
             let arc = self.delight_arc(now);
             let env = attack * settle;
-            // Stretch on the way up, squash through the landing.
+            // The BODY shaping went with the leap (see `bob`): a spring with
+            // nothing to spring off reads as a twitch, so what is left is a
+            // small, brief swell — the cat perking up at its own name — at a
+            // third of the hop's amplitude and no forward lean at all.
             let stretch = (std::f32::consts::PI * arc).sin() * env;
-            scale_y *= 1.0 + DELIGHT_STRETCH * stretch;
-            scale_x *= 1.0 - DELIGHT_STRETCH * 0.55 * stretch;
-            // A small forward lean into the hop — eagerness, not banking.
-            lead += 0.05 * stretch;
+            scale_y *= 1.0 + DELIGHT_STRETCH * 0.33 * stretch;
+            scale_x *= 1.0 - DELIGHT_STRETCH * 0.18 * stretch;
         }
         // SING-ALONG DANCE overlay (`crate::kitty_sing`): a beat-synced loop
         // over the banking spine — each beat lands as a squash bounce that
@@ -1698,19 +1696,39 @@ impl CursorCat {
     }
 }
 
-/// The light-theme HEART veil colour: a deep, saturated rose. On DARK the heart
-/// is additive pink `0x00FF_5C8A` (added light reads over the near-black ground);
-/// on LIGHT that same additive pink washes out to nothing (you cannot brighten a
-/// pale ground toward white and see a pink), so the light arm paints a
-/// SOURCE-OVER veil in this darker, more saturated rose instead — a mark that
-/// DARKENS the ground and reads on any background (the ribbon-rail / fresh-ink
-/// light-veil law). Luminance ≈ 82, well below any light theme's ground.
-const EXIT_HEART_LIGHT: u32 = 0x00C2_1852;
-/// The light-theme STAR veil colour: a deep saturated amber. The dark arm's
-/// pure white `0x00FF_FFFF` is the WORST possible colour on a light ground
-/// (fully invisible), so on LIGHT the sparkle becomes a source-over amber veil
-/// that darkens the ground and stays legible. Luminance ≈ 104.
-const EXIT_STAR_LIGHT: u32 = 0x00B8_6A00;
+/// The DARK arm's heart pink — additive light over a near-black ground.
+const EXIT_HEART_PINK: u32 = 0x00FF_5C8A;
+
+/// THE EXIT FLOURISH'S LIGHT-THEME INKS, through the SHARED RECIPE.
+///
+/// On LIGHT the additive pink washes out to nothing and the additive white is
+/// the single worst colour there is (you cannot brighten a pale ground toward
+/// white and see a mark), so the light arm paints SOURCE-OVER veils that DARKEN
+/// the ground instead. They used to be two hand-picked constants —
+/// `0x00C2_1852` and `0x00B8_6A00` — i.e. two more independent answers to a
+/// question this crate answers in exactly one place.
+///
+/// The flourish rises beside the cat and can land on a line of text at any
+/// moment, so both take the OVER-TEXT role of
+/// [`crate::cursor_glow::InkRole`]'s ONE LIGHT-INK RULE — the same policy every
+/// star, sparkle and poof grain takes — seeded from the DARK arm's own hue so
+/// the two themes draw the same mark.
+///
+/// The star seeds from the family GOLD rather than from the dark arm's white,
+/// exactly as the rainbow ribbon's landing sparkles do: a white has no hue to
+/// carry, and this way the light sparkle stays warm. It also sidesteps the
+/// LEADING policy's achromatic collapse — `light_ink_bold` normalizes to a PURE
+/// hue and used to return literal BLACK for a white input — which is fixed at
+/// the source, but a white star would still have come out neutral grey.
+/// Pinned by `exit_flourish_inks_come_from_the_shared_recipe`.
+#[inline]
+fn exit_heart_light() -> u32 {
+    InkRole::OverText.ink(EXIT_HEART_PINK)
+}
+#[inline]
+fn exit_star_light() -> u32 {
+    InkRole::OverText.ink(twinkle_rgb(true))
+}
 
 /// Draw the fade-out FLOURISH (a heart rising for HeartMeow, a sparkling star
 /// for StarWink) near the cat anchor `(ax, ay)` in WINDOW-ABSOLUTE pixels —
@@ -1723,7 +1741,7 @@ const EXIT_STAR_LIGHT: u32 = 0x00B8_6A00;
 /// near-black ground). On LIGHT additive white/pink is invisible (you cannot
 /// brighten a pale ground into a visible mark), so the heart/star are instead
 /// emitted as SOURCE-OVER [`RainHalo`] veils ([`HaloMode::Over`]) into `halos`,
-/// in the darkened saturated [`EXIT_HEART_LIGHT`] / [`EXIT_STAR_LIGHT`] inks that
+/// in the darkened saturated [`exit_heart_light`] / [`exit_star_light`] inks that
 /// DARKEN the ground and read on any background — the same veil discipline the
 /// ribbon rails and the fresh-ink light pop use. The two sinks are disjoint per
 /// theme: exactly one is written per call, so a caller may pass the same frame's
@@ -1760,7 +1778,7 @@ pub fn emit_exit_fx(
                 // 7×6 heart, drawn as scaled per-row spans of additive light.
                 let rows: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
                 let bumps = [(4, 5)]; // second top bump on row 0
-                let pink = premul_rgb(0x00FF_5C8A, cov);
+                let pink = premul_rgb(EXIT_HEART_PINK, cov);
                 for (ry, &(x0, x1)) in rows.iter().enumerate() {
                     push_fx(
                         out,
@@ -1777,7 +1795,9 @@ pub fn emit_exit_fx(
                 }
             } else {
                 // LIGHT: one darkened-rose source-over veil centred on the heart.
-                let alpha = (210.0 * pop) as u8;
+                // Bounded by the OVER-TEXT role's legibility ceiling — the ink
+                // comes from that role, so the ceiling has to as well.
+                let alpha = (210.0 * pop).min(InkRole::OverText.alpha_cap()) as u8;
                 let cx = (hx + 3 * u) as f32;
                 let cy = (hy + 3 * u) as f32;
                 push_exit_veil(
@@ -1787,7 +1807,7 @@ pub fn emit_exit_fx(
                     cy,
                     3.5 * u as f32,
                     3.2 * u as f32,
-                    EXIT_HEART_LIGHT,
+                    exit_heart_light(),
                     alpha,
                 );
             }
@@ -1811,7 +1831,7 @@ pub fn emit_exit_fx(
                 if cov == 0 {
                     return;
                 }
-                let star = premul_rgb(0x00FF_FFFF, cov);
+                let star = premul_rgb(twinkle_rgb(false), cov);
                 push_fx(out, geom, sx - a, sy, 2 * a + 1, 1, star); // h arm
                 push_fx(out, geom, sx, sy - a, 1, 2 * a + 1, star); // v arm
                 let d = a / 2;
@@ -1822,13 +1842,13 @@ pub fn emit_exit_fx(
                     sy - d,
                     2 * d + 1,
                     1,
-                    premul_rgb(0x00FF_FFFF, cov / 2),
+                    premul_rgb(twinkle_rgb(false), cov / 2),
                 );
             } else {
                 // LIGHT: a source-over amber sparkle — a cross of two veils so
                 // the star SHAPE survives while darkening (never brightening)
                 // the ground. Twinkle rides the alpha, matching the dark arm.
-                let alpha = (230.0 * pop * twinkle).clamp(0.0, 255.0) as u8;
+                let alpha = (230.0 * pop * twinkle).clamp(0.0, InkRole::OverText.alpha_cap()) as u8;
                 let (cx, cy) = (sx as f32, sy as f32);
                 let af = a as f32;
                 push_exit_veil(
@@ -1838,7 +1858,7 @@ pub fn emit_exit_fx(
                     cy,
                     1.4 * af,
                     0.5 * af,
-                    EXIT_STAR_LIGHT,
+                    exit_star_light(),
                     alpha,
                 ); // h arm
                 push_exit_veil(
@@ -1848,7 +1868,7 @@ pub fn emit_exit_fx(
                     cy,
                     0.5 * af,
                     1.4 * af,
-                    EXIT_STAR_LIGHT,
+                    exit_star_light(),
                     alpha,
                 ); // v arm
             }
@@ -1991,6 +2011,48 @@ mod tests {
         // (the file's own idiom, see `V056_MIN_RUN_KEYS`) because both operands
         // are constants — a runtime assert over constants is what tippy rejects.
         const { assert!(EXIT_STAR_SCINT > 0.0, "the wink still glints") };
+    }
+
+    /// THE EXIT FLOURISH'S LIGHT INKS COME FROM THE SHARED RECIPE, not from two
+    /// more hand-picked constants. Both marks rise beside the cat and can land
+    /// on a line of text, so both take the OVER-TEXT role, seeded from the DARK
+    /// arm's own hue (the star from the family gold — a white has no hue to
+    /// carry, exactly as the ribbon's landing sparkles decided).
+    ///
+    /// AND NEITHER IS BLACK. The LEADING policy normalizes to a PURE hue and
+    /// used to collapse an achromatic input to literal black, which is what a
+    /// naive routing of the white star would have produced.
+    #[test]
+    fn exit_flourish_inks_come_from_the_shared_recipe() {
+        assert_eq!(exit_heart_light(), InkRole::OverText.ink(EXIT_HEART_PINK));
+        assert_eq!(exit_star_light(), InkRole::OverText.ink(twinkle_rgb(true)));
+        for ink in [exit_heart_light(), exit_star_light()] {
+            assert_ne!(ink & 0x00FF_FFFF, 0, "a light-theme ink is never black");
+        }
+        // The white star seed would be neutral; the gold seed stays WARM.
+        let (r, _, b) = (
+            (exit_star_light() >> 16) & 0xff,
+            (exit_star_light() >> 8) & 0xff,
+            exit_star_light() & 0xff,
+        );
+        assert!(r > b, "the light exit sparkle keeps its warmth");
+        // And the LEADING policy — the one this mark must NOT take — no longer
+        // answers black for an achromatic hue either.
+        assert_ne!(InkRole::Leading.ink(twinkle_rgb(false)) & 0x00FF_FFFF, 0);
+        // Both veils stay under the over-text legibility ceiling.
+        let g = geom();
+        for exit in [CatExit::HeartMeow, CatExit::StarWink] {
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            emit_exit_fx(exit, 0.5, 40, 40, false, g, &mut out, &mut halos);
+            assert!(out.is_empty(), "the light arm draws no additive light");
+            assert!(!halos.is_empty(), "{exit:?} draws a veil on light");
+            assert!(
+                halos
+                    .iter()
+                    .all(|h| ((h.color >> 24) & 0xff) as f32 <= InkRole::OverText.alpha_cap()),
+                "{exit:?} veil stays under the over-text ceiling"
+            );
+        }
     }
 
     fn geom() -> Geom {
@@ -2438,31 +2500,51 @@ mod tests {
         assert_eq!(frame.look, look, "a wince never re-skins the companion");
     }
 
-    /// The delight LEAP actually lifts the cat and returns it to its anchor:
-    /// the reaction is pose as well as expression, not a face swap alone.
+    /// THE COMPANION NO LONGER LEAPS AT ITS OWN NAME (owner, 2026-08-04: "the
+    /// cursor kitty changes too unpredictably. I want the kitty animations to be
+    /// in the keyword kitties versus on the cursor").
+    ///
+    /// This test used to assert the opposite — that the feline-word reaction was
+    /// "pose as well as expression, not a face swap alone". It is flipped rather
+    /// than deleted, because the leap's ABSENCE is now the property worth
+    /// pinning: at `DELIGHT_LEAP` = 0.42 cells, chain-scaled, it was the single
+    /// largest unpredictable displacement in the pose stack, and it fired
+    /// mid-sentence on a word the reader had just typed. The celebration moved to
+    /// the cat that word actually spawns (`word_decorations::CatIdlePose`).
+    ///
+    /// What REMAINS is the expression: happy eyes and a small brief swell. The
+    /// cat still hears its name; it just no longer throws itself up the screen.
     #[test]
-    fn delight_leaps_and_lands() {
+    fn delight_is_expression_not_displacement() {
         let t = Instant::now();
         let mut cat = CursorCat::default();
         cat.set_look(KittyLook::for_session(11));
         cat.on_summon(t, 1);
         let rest = cat.frame(t).bob;
-        // Mid-hold is the apex of the half-sine arc.
-        let apex = cat
-            .frame(t + Duration::from_secs_f32(DELIGHT_HOLD / 2.0))
-            .bob;
+        // What was the apex of the hop: the anchor must not move there.
+        let apex = cat.frame(t + Duration::from_secs_f32(DELIGHT_HOLD / 2.0));
         assert!(
-            apex < rest - 0.2,
-            "the cat visibly leaps (bob is negative-up): rest {rest}, apex {apex}"
+            (apex.bob - rest).abs() < 0.05,
+            "the companion holds its anchor through a delight: rest {rest}, \
+             mid-reaction {}",
+            apex.bob
         );
-        // Past the hold the leap has fully released.
-        let after = cat
-            .frame(t + Duration::from_secs_f32(DELIGHT_HOLD * 1.5))
-            .bob;
-        assert!(
-            after.abs() < 0.2,
-            "the hop lands back on the anchor, got {after}"
+        // …but the reaction is genuinely live, and reads on the face.
+        assert_eq!(
+            apex.reaction,
+            CatReaction::Delight,
+            "the reaction is still armed"
         );
+        assert_eq!(
+            apex.pose.eyes,
+            EyesFrame::Happy,
+            "hearing its own name is still the happiest the companion gets"
+        );
+        // The body shaping is deliberately NOT asserted in absolute terms here:
+        // `scale_y` composes with the banking spine (which thins a moving cat),
+        // so a bare `> 1.0` reads the momentum, not the reaction. The swell is
+        // shaped at a third of the retired hop's amplitude at its use site; what
+        // this test owns is that the ANCHOR no longer moves.
     }
 
     #[test]
@@ -2996,7 +3078,6 @@ mod tests {
     }
 
     // ───────────────────── living-cartoon pose animation ─────────────────────
-
 
     /// THE STRIDE PUMP (owner: "the cursor cat can be more dynamic"). The core
     /// defect was that every pose channel is driven by a RATE-NORMALIZED metric

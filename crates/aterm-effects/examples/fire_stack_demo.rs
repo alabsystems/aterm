@@ -125,6 +125,10 @@ fn main() {
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         dark_theme: true,
+        // The documented default dark palette — a COHERENT pair, never 0/0
+        // (`fg == bg` reads as a conceal-shaped theme and suppresses the tint).
+        theme_fg: 0x00C8_D3F5,
+        theme_bg: 0x001A_1B26,
     };
     let fb_cfg = FireballConfig {
         enabled: true,

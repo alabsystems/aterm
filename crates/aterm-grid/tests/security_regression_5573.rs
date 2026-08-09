@@ -283,6 +283,33 @@ fn probe_compiler() -> Option<(std::path::PathBuf, bool)> {
 /// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
 /// `Some(false)` = rejected, `None` = could not run the probe at all (no
 /// usable compiler, no rlib) — reported as a SKIP rather than a silent pass.
+/// The verification off-switch spelling THIS compiler accepts.
+///
+/// Hardcoding one spelling silently voids this whole file. The two spellings
+/// partition the compilers (AGENTS.md "Flag-spelling skew"): a `trustc` that
+/// does not know the one we pass rejects it at flag-parse, so the probe fails to
+/// build a VALID reference, the harness declares itself broken, and every
+/// compile-fail assertion below it proves nothing — on a SECURITY regression
+/// suite. That is exactly what was happening here: the literal
+/// `-Ztrust-verify=off` is rejected by every trust compiler on this machine.
+///
+/// So ask the compiler instead of assuming. `-Z help` lists the options it
+/// actually has; prefer whichever off-switch appears there, and fall back to the
+/// post-rename spelling when the probe cannot be read (an unusable compiler is
+/// already reported as a SKIP downstream, never a silent pass).
+fn trust_off_switch(compiler: &std::path::Path) -> &'static str {
+    let help = std::process::Command::new(compiler)
+        .arg("-Zhelp")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    if help.contains("no-trust-verify") {
+        "-Zno-trust-verify"
+    } else {
+        "-Ztrust-verify=off"
+    }
+}
+
 fn probe_compiles(src: &str) -> Option<bool> {
     let rlib = aterm_grid_rlib()?;
     let deps = deps_dir()?;
@@ -290,7 +317,7 @@ fn probe_compiles(src: &str) -> Option<bool> {
     let (compiler, is_trustc) = probe_compiler()?;
     let mut cmd = std::process::Command::new(&compiler);
     if is_trustc {
-        cmd.arg("-Ztrust-verify=off");
+        cmd.arg(trust_off_switch(&compiler));
     }
     let mut child = cmd
         .arg("--edition=2021")
@@ -304,16 +331,34 @@ fn probe_compiles(src: &str) -> Option<bool> {
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        // KEPT, not discarded. A probe that fails for an environmental reason
+        // (a compiler that rejects the off-switch spelling, an rlib built by a
+        // different rustc) previously failed with a generic "the harness is
+        // broken", and the one line that said WHY was thrown away — so the
+        // positive control could not distinguish "aterm-grid regressed" from
+        // "this machine's toolchain is mixed". On a security suite that is the
+        // difference between a finding and a wild goose chase.
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
     {
         use std::io::Write;
         child.stdin.as_mut()?.write_all(src.as_bytes()).ok()?;
     }
-    let status = child.wait().ok()?;
+    let probe_out = child.wait_with_output().ok()?;
     let _ = std::fs::remove_file(&out);
-    Some(status.success())
+    if !probe_out.status.success() {
+        *last_probe_stderr().lock().expect("probe stderr mutex") =
+            String::from_utf8_lossy(&probe_out.stderr).into_owned();
+    }
+    Some(probe_out.status.success())
+}
+
+/// The last failing probe's compiler stderr, so the positive control can quote
+/// it instead of guessing.
+fn last_probe_stderr() -> &'static std::sync::Mutex<String> {
+    static S: std::sync::OnceLock<std::sync::Mutex<String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(String::new()))
 }
 
 /// POSITIVE CONTROL: the probe harness itself works — a coercion to an
@@ -327,10 +372,28 @@ fn compile_probe_harness_actually_reaches_aterm_grid() {
                = aterm_grid::Row::new; }";
     match probe_compiles(src) {
         Some(true) => {}
-        Some(false) => panic!(
-            "the compile probe could not build a VALID reference to aterm_grid::Row::new — \
-             the harness is broken, so the compile-fail tests below prove nothing"
-        ),
+        Some(false) => {
+            let why = last_probe_stderr().lock().expect("probe stderr mutex").clone();
+            // Name the environmental causes explicitly: both are toolchain skew
+            // on this machine, not a regression in aterm-grid, and both have a
+            // remedy that has nothing to do with this crate.
+            let hint = if why.contains("incompatible version of rustc") {
+                "\nLIKELY CAUSE: the aterm_grid rlib was built by a DIFFERENT rustc than the \
+                 probe compiler (a mixed-compiler build — e.g. RUSTC= overridden to dodge an \
+                 ICE). Build the crate and run the probe with the same toolchain."
+            } else if why.contains("unknown unstable option") {
+                "\nLIKELY CAUSE: the probe compiler rejects the verification off-switch \
+                 spelling — see AGENTS.md \"Flag-spelling skew\". `trust_off_switch` asks the \
+                 compiler which one it knows, so this means it answered with neither."
+            } else {
+                ""
+            };
+            panic!(
+                "the compile probe could not build a VALID reference to aterm_grid::Row::new — \
+                 the harness is broken, so the compile-fail tests below prove nothing.{hint}\n\
+                 --- probe compiler stderr ---\n{why}"
+            )
+        }
         None => eprintln!("SKIP: no rustc / no aterm_grid rlib for the compile probe"),
     }
 }

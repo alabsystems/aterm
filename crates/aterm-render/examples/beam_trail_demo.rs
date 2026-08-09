@@ -42,6 +42,10 @@ fn cfg() -> GlowConfig {
         pack: None,
         wake_persist_s: aterm_effects::cursor_glow::RAINBOW_WAKE_PERSIST,
         dark_theme: true,
+        // `cfg()` takes no arguments, so there is no theme to derive from.
+        // `Theme::default()` is what `main` renders with.
+        theme_fg: 0x00D0_D0D0,
+        theme_bg: 0x0011_1318,
     }
 }
 

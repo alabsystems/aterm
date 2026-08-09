@@ -961,6 +961,47 @@ impl App {
             && self.config.trail_sound_volume() > 0.0
     }
 
+    /// The `tone` control-socket verb ([`crate::Wake::ToneStatus`]): the
+    /// FRONT window's mood tracker, every gate that decides whether it runs,
+    /// and what the sound path is actually stamping — read-only, no
+    /// side-effects, headless-safe.
+    ///
+    /// It exists because the tone was previously audible-only: an owner
+    /// hearing no mood in their typing could not tell a disabled knob from a
+    /// muted synth from an unwired feed from "your shell commands genuinely
+    /// classify as Technical" (the melodic identity — by far the most common
+    /// case, and indistinguishable BY EAR from the feature being broken).
+    /// Every conjunct of [`Self::tone_infer_active`] is reported separately
+    /// so the answer names the gate that stopped it, and `inferences`
+    /// separates "the model ran and said technical" from "the model never
+    /// ran". Deliberately reports the WINDOW-CHAR COUNT and never the typed
+    /// text — that window holds keystrokes the screen never echoed (see
+    /// [`crate::tone_infer::ToneTracker::window_chars`]).
+    ///
+    /// `Err` when there is no focused window to report on — an honest
+    /// refusal, never a fabricated neutral row.
+    pub(crate) fn tone_status(&self) -> Result<String, String> {
+        let Some(wid) = self.frontmost_window else {
+            return Err("no focused window".to_string());
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return Err("no focused window".to_string());
+        };
+        let knob = self.config.tone_melody_or_default();
+        Ok(crate::tone_infer::ToneStatus {
+            tone: ws.tone_tracker.current(),
+            effective: ws.tone_tracker.effective(knob),
+            knob,
+            sounds: self.config.trail_sounds_or_default(),
+            volume: self.config.trail_sound_volume(),
+            audio_live: self.trail_audio.is_live(),
+            active: self.tone_infer_active(),
+            window_chars: ws.tone_tracker.window_chars(),
+            inferences: ws.tone_tracker.inferences,
+        }
+        .line())
+    }
+
     /// Summon the typed-"kitty" cameo (detector: [`crate::kitty_summon`]).
     ///
     /// PRESENTATION reuses the terminal's existing cat machinery wholesale:
@@ -10840,6 +10881,133 @@ mod find_field_key_tests {
             term_lock(&term).content_seq(),
             before,
             "no find-field keystroke reached the shell"
+        );
+    }
+}
+
+/// The `tone` control verb's App half ([`App::tone_status`]): the readout that
+/// makes an audible-only feature diagnosable. Each test pins one of the states
+/// an owner can actually be in, because the whole value of the verb is that it
+/// tells those states APART — by ear they are identical silence.
+#[cfg(test)]
+mod tone_status_tests {
+    use crate::input::{InputEvent, Source};
+    use crate::trail_audio::TrailAudio;
+    use crate::{App, WindowId};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+    fn key(character: char) -> InputEvent {
+        InputEvent::Key {
+            key: Key::Character(character),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    fn type_line(app: &mut App, wid: WindowId, line: &str) {
+        for ch in line.chars() {
+            let _ = app.input(wid, key(ch), Source::Human);
+        }
+    }
+
+    /// A MUTED build: the window still tracks the typed text (window
+    /// maintenance is unconditional, so a later unmute classifies a coherent
+    /// window) but the classifier never ran — `audio=inert active=false
+    /// inferences=0` names exactly which gate stopped it, which is the
+    /// distinction an owner cannot make by ear.
+    #[test]
+    fn a_muted_build_reports_the_gate_that_stopped_the_classifier() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(!app.trail_audio.is_live(), "the headless host is sealed");
+        type_line(&mut app, wid, "why is this broken again ugh");
+
+        let line = app.tone_status().expect("the fixture window is focused");
+        assert!(line.contains("audio=inert"), "{line}");
+        assert!(line.contains("active=false"), "{line}");
+        assert!(line.contains("inferences=0"), "{line}");
+        assert!(line.contains("tone=technical"), "{line}");
+        assert!(
+            line.contains("window_chars=28"),
+            "the window tracks the typed text even while inference is off: {line}",
+        );
+    }
+
+    /// A LIVE build: the same typing reports the classified mood, the same
+    /// value on the wire's `effective=` field (what the synth is being told),
+    /// and a nonzero inference count — the "it is genuinely wired" readout.
+    #[test]
+    fn a_live_build_reports_the_classified_mood_and_that_the_model_ran() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.trail_audio = TrailAudio::capturing_for_test();
+        type_line(&mut app, wid, "why is this broken again ugh");
+
+        let line = app.tone_status().expect("the fixture window is focused");
+        assert!(line.contains("tone=frustrated"), "{line}");
+        assert!(line.contains("effective=frustrated"), "{line}");
+        assert!(line.contains("audio=live"), "{line}");
+        assert!(line.contains("active=true"), "{line}");
+        assert!(line.contains("knob=on sounds=on volume=0.40"), "{line}");
+        assert!(!line.contains("inferences=0"), "the model ran: {line}");
+    }
+
+    /// A DISABLED knob over a live audio host: the verdict is still reported
+    /// (introspection sees the state) while `effective=technical` shows the
+    /// synth is being handed the neutral identity, and `active=false` explains
+    /// why the verdict will now go stale.
+    #[test]
+    fn a_disabled_knob_separates_the_verdict_from_what_the_synth_hears() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.trail_audio = TrailAudio::capturing_for_test();
+        type_line(&mut app, wid, "why is this broken again ugh");
+        app.config.tone_melody = Some(false);
+
+        let line = app.tone_status().expect("the fixture window is focused");
+        assert!(line.contains("tone=frustrated"), "{line}");
+        assert!(line.contains("effective=technical"), "{line}");
+        assert!(line.contains("knob=off"), "{line}");
+        assert!(line.contains("active=false"), "{line}");
+    }
+
+    /// No window to report on is an honest refusal, never a fabricated
+    /// neutral row (a driver must not read "technical" off a windowless app
+    /// and conclude the classifier disagreed with it).
+    #[test]
+    fn a_windowless_app_refuses_rather_than_inventing_a_row() {
+        let mut app = App::headless_for_test();
+        app.frontmost_window = None;
+        assert_eq!(app.tone_status(), Err("no focused window".to_string()));
+    }
+
+    /// The typed WINDOW TEXT never reaches the wire. The tracker is fed from
+    /// the committed key path, so it holds characters typed at a password
+    /// prompt that the screen itself never echoed — `text`/`screen` cannot see
+    /// those, and neither may this verb.
+    #[test]
+    fn the_status_line_never_carries_the_typed_text() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.trail_audio = TrailAudio::capturing_for_test();
+        let secret = "hunter2correcthorse";
+        type_line(&mut app, wid, secret);
+
+        let line = app.tone_status().expect("the fixture window is focused");
+        assert!(
+            !line.contains("hunter") && !line.contains("horse"),
+            "the window text must never reach the wire: {line}",
+        );
+        for ch in secret.chars() {
+            assert!(
+                line.matches(ch).count() < secret.len(),
+                "no per-char leak either: {line}",
+            );
+        }
+        assert!(
+            line.contains(&format!("window_chars={}", secret.len())),
+            "only the count is reported: {line}",
         );
     }
 }

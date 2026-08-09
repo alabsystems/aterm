@@ -162,6 +162,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
         turns: Arc::new(Mutex::new(crate::turn_ledger::TurnLedger::default())),
         meta: Mutex::new(crate::session_timeline::SessionMeta::default()),
+        app_kitty: Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),

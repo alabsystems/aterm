@@ -2138,7 +2138,9 @@ fn check_boot_health(
     if !matches!(sentinel.read_state(), Some((b, _)) if b == current_build) {
         return None;
     }
-    let b = bundle::resolve()?;
+    // Finalizing a swap a previous run already made — installs nothing — so the dev
+    // mark must not strand an armed trial. See `bundle::resolve_layout`.
+    let b = bundle::resolve_layout()?;
     // COUNT THE LAUNCH FIRST. This used to run after the recovery proof below, so a
     // trial whose proof failed every boot never advanced its attempt counter, never
     // reached MAX_BOOT_ATTEMPTS, and therefore never reverted OR confirmed: the
@@ -2387,7 +2389,9 @@ pub fn confirm_boot_health(current_build: u64, current_commit: Option<&str>) -> 
     let Ok(_apply_lock) = FileLock::acquire(&staging.apply_lock) else {
         return false;
     };
-    let Some(installed) = bundle::resolve() else {
+    // Health confirmation of an already-applied swap — dev-mark-independent, same
+    // reasoning as the trial path above.
+    let Some(installed) = bundle::resolve_layout() else {
         return false;
     };
     confirm_health_under_apply_lock(

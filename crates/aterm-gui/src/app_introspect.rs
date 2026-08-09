@@ -1739,7 +1739,12 @@ impl App {
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let glow_cfg = self.glow_config();
-        let companion_look = self.kitty_log.companion_look();
+        // The ONE companion verdict (favourite > app > discovery > session) —
+        // the same seam the composed PRESENT resolves through, so a capture
+        // shows the breed the glass wears instead of the pre-precedence
+        // collected look (gauntlet F3: the old `companion_look()` here had no
+        // app rung and no session floor, so captures stomped the app breeds).
+        let companion_look = self.companion_verdict(focus);
         let windowless = self.headless;
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
         let focus_cursor = self.pool.get(focus).and_then(|s| {
@@ -1753,9 +1758,7 @@ impl App {
             return;
         };
         let (win_rows, win_cols) = (ws.rows, ws.cols);
-        if let Some(look) = companion_look {
-            ws.cursor_cat.set_look(look);
-        }
+        ws.cursor_cat.set_look(companion_look);
         // A capture is itself a presentation boundary (the single-pane arm's rule).
         ws.cursor_cat.set_collection_presentable(now, true);
         let animate_cat = !windowless
@@ -1793,6 +1796,12 @@ impl App {
             cell_w: cell_w.min(usize::from(u16::MAX)) as u16,
             cell_h: cell_h.min(usize::from(u16::MAX)) as u16,
             reduced_motion: !animate_cat,
+            // A capture is one isolated frame: the burst probe is a
+            // frame-over-frame diff the windowed presents own, and a capture
+            // must never charge the watch (or steal the diff's baseline).
+            // No live pointer either — a capture has no mouse.
+            output_burst: false,
+            pointer: None,
         });
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
@@ -1928,7 +1937,15 @@ impl App {
         // before the `ws` borrow — like the Kitty Log recorder gate (§F4.7).
         let (cell_w, cell_h) = self.backend.cell_size();
         let kitty_log_on = self.kitty_log_enabled();
-        let companion_look = self.kitty_log.companion_look();
+        // The ONE companion verdict — the single-pane present's seam
+        // ([`crate::App::companion_verdict`]): favourite > app > discovery >
+        // session, resolved for the window's front session. The old
+        // `companion_look()` read had no app rung and no session floor, so
+        // every `aterm-ctl image` on a windowed target stomped the present's
+        // app-breed verdict, and a headless target never saw it at all
+        // (gauntlet F3).
+        let capture_front_session = self.focused_session_id(wid).unwrap_or(0);
+        let companion_look = self.companion_verdict(capture_front_session);
         let glow_cfg = self.glow_config();
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
@@ -1947,9 +1964,7 @@ impl App {
         // Capture consumes the same admitted catalog Arc as application-present. Asset
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
-        if let Some(look) = companion_look {
-            ws.cursor_cat.set_look(look);
-        }
+        ws.cursor_cat.set_look(companion_look);
         // The capture itself is a presentation boundary. This resumes a hello
         // that was discovered after the preceding capture had already resolved
         // its frame and was therefore paused unseen below.
@@ -1973,6 +1988,20 @@ impl App {
             glow_cfg.style,
             cat_frame.collection_hello,
         );
+        // The PET companion, resolved the same way the composed capture arm
+        // does: a capture is a presentation boundary. `!pet_mode` folds into
+        // `kitty_alpha` for the same reason the windowed present folds it —
+        // in pet mode the flying kitty is un-drawable, so it must not draw
+        // below, claim the caret cell from a word-cat, or veto anything.
+        let pet_mode = crate::cursor_glow::GlowStyle::style_names_kitty_pet(
+            self.config.cursor_trail_style_raw(),
+        );
+        let pet_visible = pet_mode && kitty_enabled;
+        let kitty_alpha = if kitty_enabled && !pet_mode {
+            cat_frame.alpha
+        } else {
+            0
+        };
         let (rows, cols) = (ws.rows as usize, ws.cols as usize);
         let effect_geom = crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
@@ -2073,11 +2102,39 @@ impl App {
         // headless/unfocused capture arms nothing).
         let cpos = term.cursor();
         let cur = term.cursor_visible().then_some((cpos.row, cpos.col));
+        // THE PET BRAIN TICKS on the capture too — the capture shares the
+        // window's live effect state (the composed capture arm has always
+        // ticked it), and the suppression below needs the animal's LIVE body,
+        // not a guess. A pet that cannot be drawn is fed `caret: None`, so it
+        // fades out and releases honestly, exactly as the windowed paths do.
+        let pet = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+            now,
+            caret: if pet_visible { cur } else { None },
+            rows: effect_geom.rows,
+            cols: effect_geom.cols,
+            cell_w: effect_geom.cell_w,
+            cell_h: effect_geom.cell_h,
+            reduced_motion: !animate_cat,
+            // A capture is one isolated frame — see the windowed capture arm.
+            output_burst: false,
+            pointer: None,
+        });
         // ONE CAT PER CARET: exactly the predicate the companion emission below
         // draws under. Told which cell the companion occupies, the engine drops
         // the ambient peek for the word beneath it — a capture must show the
-        // same single cat the glass does, not the pre-fix pair.
-        let companion_at = cur.filter(|_| kitty_enabled && cat_frame.alpha > 0);
+        // same single cat the glass does, not the pre-fix pair. The pet counts
+        // as the companion too (the windowed present's rule), and hands in its
+        // live drawn body as the pixel-yield box.
+        let companion_at = cur
+            .filter(|_| kitty_alpha > 0 || (pet_visible && pet.alpha > 0))
+            .map(|cell| crate::word_decorations::CompanionOnGlass {
+                cell,
+                body_px: (pet_visible && pet.alpha > 0)
+                    .then(|| {
+                        pet.body_px(effect_geom.cell_w, effect_geom.cell_h, effect_geom.cols)
+                    })
+                    .flatten(),
+            });
         // The same selection view the animated tick sees (§6.4 nova ignition
         // deferral / per-quad attenuation) — a capture must not ignite a nova
         // the window itself would defer.
@@ -2168,8 +2225,10 @@ impl App {
             now,
             primed_wince_hits.saturating_add(curse_drain.wince_hits),
         );
-        if kitty_enabled
-            && cat_frame.alpha > 0
+        // `kitty_alpha` (not raw `kitty_enabled`): in pet mode the flying
+        // kitty is un-drawable on the windowed present, so a capture drawing
+        // it showed a companion the glass never has.
+        if kitty_alpha > 0
             && let Some(cell) = cur
         {
             let layout = aterm_effects::word_decorations::KittyCursorLayout {
@@ -2559,6 +2618,14 @@ impl App {
                 blink_phase: ws.blink_phase,
                 live_cursor_rgb: crate::app_render::terminal_cursor_rgb(&term),
                 default_bg: aterm_render::rgb_to_u32([dbg.r, dbg.g, dbg.b]),
+                // THE PAIR FROM ONE BLANK CELL. The hand-rolled `dbg` branch
+                // above swaps in the BACKGROUND direction only; asking the
+                // blank cell for both is what keeps a DECSCNM-swapped capture
+                // coherent, and it is the same expression the windowed twin
+                // uses.
+                default_fg: aterm_render::rgb_to_u32(
+                    crate::app_render::terminal_blank_cell(&term).fg,
+                ),
                 row_probe,
             }
         };

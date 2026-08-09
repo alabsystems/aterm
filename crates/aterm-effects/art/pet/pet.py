@@ -37,7 +37,9 @@ class Pose:
     bry: float = 23.0
     brot: float = 0.0        # body tilt
 
-    # head
+    # head — the artist's proportions: a real cat's head on a real cat's body.
+    # Ship-size legibility is the BAKE's job (pet_baker's face LOD), not the
+    # rig's; the chibi detour proved a balloon head just breaks every pose.
     hx: float = 150.0
     hy: float = 41.0
     hr: float = 29.0
@@ -62,7 +64,7 @@ class Pose:
     tail_thick: float = 8.5
 
     # face
-    eyes: str = "open"       # open | happy | closed | squint | wide | wink
+    eyes: str = "open"       # open | happy | closed | squint | halflid | wide | wink
     mouth: str = "smile"     # smile | open | flat | fang
     blush: bool = True
     gaze: tuple = (0.0, 0.0)
@@ -82,11 +84,41 @@ class Pose:
     airborne: float = 0.0    # viewbox units of clearance under the paws
     fl_root: tuple = ()      # forelimb attach override (x, y)
     tail_root: tuple = ()    # tail attach override (x, y)
+    # Face-on mode: the whole drawing turns to address the viewer. The 3/4
+    # asymmetries (off-side eye smaller, far ear swept back, one whisker fan
+    # shortened, the travel-direction torso arch) all collapse to left-right
+    # symmetry, and both forelegs paint IN FRONT of the chest.
+    front: bool = False
+    # The off-side whisker fan. On most heads it pokes past the far cheek onto
+    # AIR and reads as whiskers; when a settled pose parks body mass BEHIND the
+    # far cheek (the loaf's dome, the peek's shoulder), the same strokes paint
+    # ON the coat and read as scratches — so those poses turn the fan off.
+    whisker_far: bool = True
+    # Where the tabby back bars ride. "torso" is the default topline; a pose
+    # whose head covers the torso's top (the peek's over-the-shoulder seat)
+    # moves them to the haunch's crown instead of wearing them on its cheek.
+    bar_site: str = "torso"
+    # Head yaw: 0 = the rest read (a nearly frontal face, eye contact — the
+    # point of a settled pose), 1 = the full 3/4 locomotion head, where the
+    # face turns WITH the body: far eye foreshortened to ~60% width and pulled
+    # toward the leading edge, muzzle/nose pushed ~0.22 head radii into the
+    # travel direction, near ear rotated out while the far ear narrows behind,
+    # whiskers asymmetric, the skull egg-shaped toward the muzzle. The art is
+    # authored facing right and the engine mirrors the whole sprite
+    # (kitty_pet's flip_x), so the yaw flips with the body for free.
+    yaw: float = 0.0
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
 
 
 # ── attachment points, derived from the torso ──────────────────────────────
 
 FAR_OFFSET = (-7.0, -2.0)   # the off-side pair sits back and up: instant 3/4 read
+FRONT_OFFSET = (-24.0, 0.0)  # face-on: the off-side foreleg mirrors across the chest
+                             # (24 units apart: any closer and the two mitts'
+                             # outlines fuse into one two-toed paw)
 
 
 def hip(p: Pose, far=False):
@@ -96,7 +128,7 @@ def hip(p: Pose, far=False):
 
 
 def shoulder(p: Pose, far=False):
-    dx, dy = FAR_OFFSET if far else (0.0, 0.0)
+    dx, dy = ((FRONT_OFFSET if p.front else FAR_OFFSET) if far else (0.0, 0.0))
     if p.fl_root:
         return (p.fl_root[0] + dx, p.fl_root[1] + dy)
     return rot_about(p.bx + p.brx * 0.62 + dx, p.by + p.bry * 0.48 + dy,
@@ -127,10 +159,18 @@ def torso_paths(p: Pose):
         out = blob(p.bx, p.by, [(a, r * (p.brx + S)) for a, r in spokes],
                    rot=math.radians(p.brot), sy=(p.bry + S) / (p.brx + S))
         return [core], [out]
-    # a standing torso: the chest lifts toward the head, the belly tucks, the
-    # rump stays round — the arch is what stops it reading as a sausage.
-    spokes = [(0, 1.00), (42, 1.10), (78, 1.02), (112, 0.92), (150, 0.85),
-              (180, 0.84), (212, 0.90), (250, 1.00), (285, 1.05), (322, 1.03)]
+    if p.front:
+        # face-on seated chest: an upright pear, left-right symmetric — wide
+        # over the hips, tapering under the chin, no travel direction at all.
+        # The lower spokes stay INSIDE the seated haunch so the forepaws can
+        # break the bottom silhouette instead of drowning in it.
+        spokes = [(0, 0.96), (38, 1.00), (72, 1.04), (106, 1.08), (142, 0.98),
+                  (180, 0.92), (218, 0.98), (254, 1.08), (288, 1.04), (322, 1.00)]
+    else:
+        # a standing torso: the chest lifts toward the head, the belly tucks,
+        # the rump stays round — the arch is what stops it reading as a sausage.
+        spokes = [(0, 1.00), (42, 1.10), (78, 1.02), (112, 0.92), (150, 0.85),
+                  (180, 0.84), (212, 0.90), (250, 1.00), (285, 1.05), (322, 1.03)]
     core = blob(p.bx, p.by, [(a, r * p.brx) for a, r in spokes],
                 rot=math.radians(p.brot), sy=p.bry / p.brx)
     out = blob(p.bx, p.by, [(a, r * (p.brx + S)) for a, r in spokes],
@@ -140,6 +180,14 @@ def torso_paths(p: Pose):
 
 def haunch_paths(p: Pose):
     if p.haunch_at:
+        # (cx, cy, r) — the round seated rump — or (cx, cy, rx, ry, rot_deg)
+        # for a pose that needs the hip mass ORIENTED (the peek's rump swings
+        # away from the viewer, and a circle has no away to swing)
+        if len(p.haunch_at) == 5:
+            cx, cy, rx, ry, rot = p.haunch_at
+            th = math.radians(rot)
+            return ([ellipse(cx, cy, rx, ry, th)],
+                    [ellipse(cx, cy, rx + S, ry + S, th)])
         cx, cy, r = p.haunch_at
         rx, ry = r * 1.02, r
     else:
@@ -151,10 +199,21 @@ def haunch_paths(p: Pose):
 
 
 def head_spokes(p: Pose):
-    # egg-ish 3/4 head: full cheeks, a slightly narrower crown, chin tapering
-    return [(0, 0.94), (35, 0.99), (70, 1.03), (100, 1.02), (135, 0.94),
+    if p.front:
+        # face-on: symmetric about the vertical — full cheeks on both sides,
+        # the chin tapering dead centre
+        return [(0, 0.96), (36, 1.00), (72, 1.03), (108, 1.00), (144, 0.92),
+                (180, 0.88), (216, 0.92), (252, 1.00), (288, 1.03), (324, 1.00)]
+    # rest: an even egg. Yawed, the skull leans into the travel direction —
+    # the muzzle-side spokes swell and the back of the head shaves down, so
+    # the silhouette itself says "turned", not just the features on it.
+    rest = [(0, 0.94), (35, 0.99), (70, 1.03), (100, 1.02), (135, 0.94),
             (168, 0.88), (200, 0.94), (232, 1.02), (262, 1.03), (295, 1.00),
             (325, 0.96)]
+    yawed = [(0, 1.03), (35, 1.05), (70, 1.03), (100, 1.00), (135, 0.90),
+             (168, 0.85), (200, 0.92), (232, 1.01), (262, 1.03), (295, 1.00),
+             (325, 1.01)]
+    return [(a, lerp(r0, r1, p.yaw)) for (a, r0), (_, r1) in zip(rest, yawed)]
 
 
 def head_paths(p: Pose):
@@ -168,15 +227,23 @@ def head_paths(p: Pose):
 
 def ear_tri(p: Pose, side, inset=0.0, flat_scale=1.0):
     """side = +1 near (toward +x), -1 far."""
-    base_a = 30.0 * side + (14.0 if side > 0 else -6.0)
+    if p.front:
+        base_a = 36.0 * side          # face-on: the pair sits symmetric
+    else:
+        base_a = 30.0 * side + (14.0 if side > 0 else -6.0)
+        # yawed, the near ear rotates OUT with the turning skull and the far
+        # ear trails behind the crown
+        base_a += (4.0 if side > 0 else -6.0) * p.yaw
     sweep = (p.ear_near if side > 0 else p.ear_far)
     pin = p.ear_flat
     # base sits on the skull, tip pushed outward and (when pinned) backward
     th = math.radians(base_a - 90.0 + p.hrot)
     bx = p.hx + math.cos(th) * (p.hr - 4.0) * p.hsx
     by = p.hy + math.sin(th) * (p.hr - 4.0) * p.hsy
-    w = (14.0 - inset * 0.55) * flat_scale
-    h = (20.5 - inset) * flat_scale
+    # the far ear foreshortens with the yaw: narrower, and a step shorter
+    ear_k = 1.0 if (p.front or side > 0) else lerp(1.0, 0.80, p.yaw)
+    w = (14.0 - inset * 0.55) * flat_scale * ear_k
+    h = (20.5 - inset) * flat_scale * (1.0 if ear_k == 1.0 else lerp(1.0, 0.92, p.yaw))
     tip_a = base_a + sweep + pin * (-62.0 if side > 0 else -50.0)
     tth = math.radians(tip_a - 90.0 + p.hrot)
     tx = bx + math.cos(tth) * h
@@ -219,6 +286,11 @@ def tail_paths(p: Pose):
 
 def legs(p: Pose, near: bool):
     specs = [(shoulder(p, not near), p.fl_near if near else p.fl_far)]
+    if near and p.front:
+        # face-on both forelegs stand IN FRONT of the chest, side by side —
+        # the far-pass slot would bury one behind the torso, so it joins the
+        # near pass (off-side first, equal width: the pair is symmetric)
+        specs.insert(0, (shoulder(p, True), p.fl_far))
     if not p.hide_hind:
         specs.append((hip(p, not near), p.hl_near if near else p.hl_far))
     coat, out = [], []
@@ -241,92 +313,163 @@ def face_anchor(p: Pose, dx, dy):
     return rot_about(x, y, p.hx, p.hy, p.hrot)
 
 
+def muzzle_dx(p: Pose):
+    """The muzzle group's x offset: at rest it hints toward the near cheek;
+    yawed it pushes hard toward the travel direction (~0.22 head radii — the
+    single strongest 'the face turned' cue); face-on it sits dead centre."""
+    return 0.0 if p.front else lerp(0.08, 0.22, p.yaw)
+
+
 def muzzle_paths(p: Pose):
-    cx, cy = face_anchor(p, 0.08, 0.38)
+    cx, cy = face_anchor(p, muzzle_dx(p), 0.38)
     return [blob(cx, cy, [(0, 13.5), (50, 15.5), (95, 17.0), (140, 14.5),
                           (180, 12.0), (220, 14.5), (265, 17.0), (310, 15.5)])]
 
 
 def eye_centres(p: Pose):
-    near = face_anchor(p, 0.46, 0.02)
-    far = face_anchor(p, -0.33, 0.04)
+    # the artist's placement: the eye line rides the skull's equator
+    if p.front:
+        return face_anchor(p, 0.42, 0.04), face_anchor(p, -0.42, 0.04)
+    # yawed, both eyes slide toward the leading edge — the far eye crosses
+    # most of the way to the nose bridge, which is what "the face turned"
+    # actually looks like (a frontal pair merely SHRUNK still reads frontal).
+    # The pair also rides a step HIGHER: the muzzle group leans down-forward
+    # on a turned head, and the lift keeps the nose out of the near eye.
+    near = face_anchor(p, lerp(0.46, 0.48, p.yaw), lerp(0.02, -0.04, p.yaw))
+    far = face_anchor(p, lerp(-0.33, -0.16, p.yaw), lerp(0.04, -0.01, p.yaw))
     return near, far
+
+
+def eye_scales(p: Pose):
+    """(near_r, far_rx, far_ry): the far eye foreshortens in WIDTH with the
+    yaw (to ~62% of the near eye at full turn) and only mildly in height —
+    a turning eyeball loses azimuth, not elevation."""
+    rn = 8.6
+    if p.front:
+        return rn, rn, rn
+    fw = lerp(0.884, 0.62, p.yaw)   # 7.6/8.6 at rest
+    fh = lerp(0.884, 0.80, p.yaw)
+    return rn, rn * fw, rn * fh
 
 
 def eye_paths(p: Pose):
     near, far = eye_centres(p)
-    rn, rf = 8.6, 7.6
+    # the artist's eye — ship-size legibility comes from the bake's face LOD.
+    # Face-on the pair is equal; in 3/4 the off-side eye foreshortens.
+    rn, rfx, rfy = eye_scales(p)
     if p.eyes == "closed":
-        return [_lid(near, rn, 1.0), _lid(far, rf, 1.0)]
+        return [_lid(near, rn, 1.0), _lid(far, rfx, 1.0)]
     if p.eyes == "happy":
-        return [_arc_eye(near, rn), _arc_eye(far, rf)]
+        return [_arc_eye(near, rn), _arc_eye(far, rfx)]
     if p.eyes == "squint":
-        return [_lid(near, rn, 0.55), _lid(far, rf, 0.55)]
+        return [_lid(near, rn, 0.55), _lid(far, rfx, 0.55)]
+    if p.eyes == "halflid":
+        return [_half(near, rn, 1), _half(far, rfx, -1)]
     if p.eyes == "wink":
-        return [_arc_eye(near, rn), ellipse(far[0], far[1], rf, rf * 1.06)]
+        return [_arc_eye(near, rn), ellipse(far[0], far[1], rfx, rfy * 1.06)]
     k = 1.22 if p.eyes == "wide" else 1.06
     return [ellipse(near[0], near[1], rn, rn * k),
-            ellipse(far[0], far[1], rf, rf * k)]
+            ellipse(far[0], far[1], rfx, rfy * k)]
 
 
 def _lid(c, r, thick):
-    """A closed sleeping lid: shallow downward arc with body."""
+    """A closed sleeping lid: shallow downward arc with body.
+
+    Fat on purpose — a thin lid rasterizes to NOTHING at terminal sizes, and a
+    closed eye that renders zero pixels reads as no face at all. (The chibi
+    pass's 7.0 rescaled to the artist's eye: same ink share of the aperture.)"""
     x, y = c
     w = r * 1.15
-    t = 2.6 * thick
+    t = 4.8 * thick
     return catmull_closed([(x - w, y - 1.5), (x, y + r * 0.52), (x + w, y - 1.5),
                            (x, y + r * 0.52 - t)], tension=0.16)
 
 
+def _half(c, r, sgn):
+    """A half-lidded eye: a slim lens whose OUTER corner (`sgn` = the side it
+    faces, +1 near / -1 far) droops a step lower — drowsy contentment. The
+    squint's pinched arc is a WINCE (a settled loaf wearing it looks like it
+    regrets settling); a level flat-topped block, with a whisker running
+    through at the same height, reads as sunglasses."""
+    x, y = c
+    # The lens rides the UPPER half of the eye aperture — where a half-closed
+    # lid physically sits, and clear of the whisker roots at cheek height.
+    yy = y - r * 0.14
+    w = r * 0.90
+    li = r * (0.16 if sgn < 0 else 0.0)   # left corner drop
+    ri = r * (0.16 if sgn > 0 else 0.0)   # right corner drop
+    return catmull_closed([(x - w, yy + li), (x, yy + r * 0.10), (x + w, yy + ri),
+                           (x + w * 0.55, yy + ri + r * 0.30), (x, yy + r * 0.52),
+                           (x - w * 0.55, yy + li + r * 0.30)], tension=0.10)
+
+
 def _arc_eye(c, r):
-    """A happy ^ eye."""
+    """A happy ^ eye — a fat arc, so the purr and the groom keep a face at 1x.
+    (8.5 on the chibi eye, rescaled to the artist's eye at the same ratio.)"""
     x, y = c
     w = r * 1.18
-    t = 3.0
+    t = 5.8
     return catmull_closed([(x - w, y + r * 0.42), (x, y - r * 0.46), (x + w, y + r * 0.42),
                            (x, y - r * 0.46 + t)], tension=0.14)
 
 
 def iris_paths(p: Pose):
-    if p.eyes in ("closed", "happy", "squint"):
+    if p.eyes in ("closed", "happy", "squint", "halflid"):
         return []
     near, far = eye_centres(p)
+    _, rfx, rfy = eye_scales(p)
     out = [ellipse(near[0], near[1], 6.2, 6.8)]
     if p.eyes != "wink":
-        out.append(ellipse(far[0], far[1], 5.4, 6.0))
+        # the far iris keeps the near iris's share of ITS eye (6.2/8.6 wide,
+        # 6.8/9.1 tall), so it foreshortens exactly with the aperture
+        frx, fry = (6.2, 6.8) if p.front else (rfx * 0.71, rfy * 0.79)
+        out.append(ellipse(far[0], far[1], frx, fry))
     return out
 
 
 def pupil_paths(p: Pose):
-    if p.eyes in ("closed", "happy", "squint"):
+    if p.eyes in ("closed", "happy", "squint", "halflid"):
         return []
     near, far = eye_centres(p)
+    _, rfx, rfy = eye_scales(p)
     gx, gy = p.gaze
     k = 1.9 if p.eyes == "wide" else 2.5
     out = [ellipse(near[0] + gx, near[1] + gy, 2.9, 6.4 / k * 2.5 * 0.62)]
     if p.eyes != "wink":
-        out.append(ellipse(far[0] + gx * 0.85, far[1] + gy, 2.5, 5.6 / k * 2.5 * 0.62))
+        frx, fh = (2.9, 6.4) if p.front else (rfx * 0.33, rfy * 0.74)
+        fgx = gx if p.front else gx * 0.85
+        out.append(ellipse(far[0] + fgx, far[1] + gy, frx, fh / k * 2.5 * 0.62))
     return out
 
 
 def catchlight_paths(p: Pose):
-    if p.eyes in ("closed", "happy", "squint"):
+    if p.eyes in ("closed", "happy", "squint", "halflid"):
         return []
     near, far = eye_centres(p)
+    _, rfx, rfy = eye_scales(p)
     out = [ellipse(near[0] - 2.6, near[1] - 3.4, 2.5, 2.5)]
     if p.eyes != "wink":
-        out.append(ellipse(far[0] - 2.4, far[1] - 3.2, 2.2, 2.2))
+        if p.front:
+            out.append(ellipse(far[0] - 2.6, far[1] - 3.4, 2.5, 2.5))
+        else:
+            out.append(ellipse(far[0] - rfx * 0.32, far[1] - rfy * 0.42,
+                               rfx * 0.29, rfx * 0.29))
     return out
 
 
 def nose_paths(p: Pose):
-    cx, cy = face_anchor(p, 0.08, 0.26)
+    # the nose slides DOWN the muzzle as the head yaws — with the eyes lifted
+    # and the muzzle pushed forward, this is what keeps the pink triangle from
+    # clipping the near eye's lower lid
+    cx, cy = face_anchor(p, muzzle_dx(p), lerp(0.26, 0.32, 0.0 if p.front else p.yaw))
     return [catmull_closed([(cx - 5.2, cy - 2.6), (cx + 5.2, cy - 2.6),
                             (cx, cy + 5.0)], tension=0.22)]
 
 
 def mouth_paths(p: Pose):
-    cx, cy = face_anchor(p, 0.08, 0.26)
+    # anchored at the MUZZLE CENTRE, not its top edge — a smile hung off the
+    # nose line pulls the corners up against the cheeks and reads as a grimace
+    cx, cy = face_anchor(p, muzzle_dx(p), 0.38)
     if p.mouth == "open":
         return [blob(cx, cy + 8.0, [(0, 5.4), (60, 6.8), (120, 7.0), (180, 6.8),
                                     (240, 7.0), (300, 6.8)])]
@@ -344,10 +487,26 @@ def mouth_paths(p: Pose):
 
 def whisker_paths(p: Pose):
     out = []
-    for side, base_dx, scale in ((1, 0.42, 1.0), (-1, -0.80, 0.46)):
-        for dy, sweep, ln0 in ((-0.03, -13.0, 27.0), (0.11, 7.0, 29.0)):
+    if p.front:
+        # face-on: rooted at the cheek edges BELOW the huge eyes and swept
+        # down-and-out — the 3/4 anchors land inside the frontal eye span
+        # and would rake straight across both irises
+        fans = ((1, 0.68, 0.82, 0.0), (-1, -0.68, 0.82, 0.0))
+        rows = ((0.14, 4.0, 26.0), (0.26, 16.0, 27.0))
+    else:
+        # yawed, the near fan roots slide forward with the muzzle and drop
+        # below the lifted eye; the far fan both shortens and migrates in
+        # toward the nose bridge — on a turned head the off-side whiskers are
+        # mostly hidden by the muzzle
+        fans = ((1, lerp(0.42, 0.50, p.yaw), 1.0, 0.08 * p.yaw),
+                (-1, lerp(-0.80, -0.52, p.yaw), lerp(0.46, 0.30, p.yaw), 0.0))
+        rows = ((-0.03, -13.0, 27.0), (0.11, 7.0, 29.0))
+    if not p.whisker_far:
+        fans = tuple(f for f in fans if f[0] > 0)
+    for side, base_dx, scale, droot in fans:
+        for dy, sweep, ln0 in rows:
             ln = ln0 * scale
-            bx, by = face_anchor(p, base_dx, 0.30 + dy)
+            bx, by = face_anchor(p, base_dx, 0.30 + dy + droot)
             th = math.radians(sweep) if side > 0 else math.radians(180.0 - sweep)
             tx = bx + math.cos(th) * ln
             ty = by + math.sin(th) * ln
@@ -361,15 +520,45 @@ def whisker_paths(p: Pose):
 def blush_paths(p: Pose):
     if not p.blush:
         return []
-    a = face_anchor(p, 0.62, 0.24)
-    b = face_anchor(p, -0.52, 0.26)
-    return [ellipse(a[0], a[1], 6.4, 4.4), ellipse(b[0], b[1], 5.6, 4.0)]
+    # tucked just under the eyes (~0.10 head-radii below the lower lids), not
+    # beside the muzzle — under-eye blush is the kawaii placement, kept from
+    # the chibi pass and rescaled to the artist's eye line
+    if p.front:
+        a = face_anchor(p, 0.55, 0.44)
+        b = face_anchor(p, -0.55, 0.44)
+        return [ellipse(a[0], a[1], 5.0, 3.5), ellipse(b[0], b[1], 5.0, 3.5)]
+    a = face_anchor(p, lerp(0.60, 0.64, p.yaw), 0.44)
+    b = face_anchor(p, lerp(-0.48, -0.30, p.yaw), 0.46)
+    return [ellipse(a[0], a[1], 5.0, 3.5),
+            ellipse(b[0], b[1], lerp(4.4, 3.4, p.yaw), lerp(3.1, 2.5, p.yaw))]
 
 
 def pattern_paths(p: Pose):
     """Tabby: three back bars plus two tail rings, riding the torso."""
     out = []
-    if not p.curl:
+    if p.front:
+        # face-on, the back bars would paint across the face (pattern layers
+        # after the head's coat) — so the tabby wears its classic forehead M
+        # between the ears instead
+        for i, t in enumerate((-0.42, 0.0, 0.42)):
+            x, y = face_anchor(p, t * 0.60, -0.64)
+            out.append(ellipse(x, y, 3.4 - abs(i - 1) * 0.3, 7.0))
+    elif p.bar_site == "haunch" and p.haunch_at:
+        # the over-the-shoulder seat: the head parks on the torso's top, so
+        # the topline the bars can actually ride is the haunch's crown
+        if len(p.haunch_at) == 5:
+            cx, cy, hrx, hry, hrot_deg = p.haunch_at
+        else:
+            cx, cy, r = p.haunch_at
+            hrx, hry, hrot_deg = r, r, 0.0
+        for i, a in enumerate((-32.0, 0.0, 32.0)):
+            th = math.radians(a)
+            x0 = math.sin(th) * hrx * 0.74
+            y0 = -math.cos(th) * hry * 0.74
+            x, y = rot_about(cx + x0, cy + y0, cx, cy, hrot_deg)
+            out.append(ellipse(x, y, 3.5 - abs(i - 1) * 0.3, 7.4,
+                               math.radians(a * 0.75 + hrot_deg)))
+    elif not p.curl:
         for i, t in enumerate((-0.40, -0.04, 0.32)):
             cx = p.bx + t * p.brx
             cy = p.by - p.bry * 0.56

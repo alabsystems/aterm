@@ -1477,6 +1477,10 @@ impl SettingsPreviewSpec {
             resolution,
             theme.cursor,
             aterm_render::theme_is_dark(theme.bg),
+            // The preview HAS a theme in scope and no Terminal, so there is
+            // nothing to fold: no OSC 10/11 and no DECSCNM on this path.
+            theme.fg & 0x00FF_FFFF,
+            theme.bg & 0x00FF_FFFF,
             if self.cursor.style == PreviewCursorStyle::Bar {
                 0.08
             } else {

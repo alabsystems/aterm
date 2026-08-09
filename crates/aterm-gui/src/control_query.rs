@@ -2189,6 +2189,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
         images: _,           // frame "images" (F1)
         default_bg: _, // OMITTED: engine-resolved live default-bg for padding, not per-cell content (cells carry their own bg)
+        default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content
         cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)

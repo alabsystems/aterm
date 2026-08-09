@@ -7,7 +7,11 @@
 //! reduced-motion) drives everything:
 //!
 //! * **hue rotation speed** — a slow baseline spin while charged, accelerating
-//!   under sustained fast typing; the final ember freezes when fully settled;
+//!   under sustained fast typing; the final ember freezes when fully settled.
+//!   WHERE that spin lands on the spectrum is not this module's business: the
+//!   caret resolves its colour through the rainbow family's ONE sweep and ONE
+//!   band resolver ([`crate::cursor_glow::rainbow_band_at`]) at its own column,
+//!   so the block and the ribbon leaving it are the same rainbow;
 //! * **saturation + brightness** — the block starts from WHITE (dark theme) or
 //!   near-BLACK (light theme) and blooms toward a vivid rainbow as energy climbs;
 //! * **an additive rainbow HALO** hugging the block — the glow, brightest while
@@ -41,6 +45,7 @@ use aterm_render::{GlowQuad, premul_rgb};
 use crate::cursor_glow::OVER_INK_COV_CAP;
 
 use crate::cursor_glow::Geom;
+use crate::cursor_glow::{rainbow_band_of, rainbow_sweep_at, rainbow_sweep_reflect};
 
 /// The block-cursor base the rainbow blooms FROM: white on a dark theme, a soft
 /// near-black on a light theme — so the "start from white or black" reads on either.
@@ -358,7 +363,12 @@ impl CursorRainbow {
             lerp(SAT_IDLE_LIGHT, SAT_MAX, e)
         };
         let val = lerp(VAL_IDLE, VAL_MAX, e);
-        let rainbow = hsv2rgb_turns(self.phase, sat, val);
+        // THE CARET'S COLUMN is its place on the family's sweep — the same
+        // column the ribbon's rail under this cell resolves. A hidden cursor
+        // still reports a fill, so column 0 stands in when there is no cell.
+        let col = cur.map_or(0, |(_, cc)| cc);
+        let band = spectrum_at(col, self.phase, 0.0);
+        let rainbow = shade(band, sat, val);
 
         // The BLOCK FILL: tint from the theme base toward the rainbow with energy. The
         // renderer floors this against the cell bg (the cut-out glyph colour), so the
@@ -382,7 +392,7 @@ impl CursorRainbow {
             let glint = if dark_theme {
                 0x00FF_FFFF
             } else {
-                hsv2rgb_turns(self.phase, 1.0, 0.85)
+                shade(band, 1.0, 0.85)
             };
             fill = mix_rgb(fill, glint, TWINKLE_MIX * pop * cfg.intensity);
         }
@@ -425,9 +435,11 @@ impl CursorRainbow {
                 if cov == 0 {
                     continue;
                 }
-                // Each ring samples its own point on the wheel — the rim IS a
-                // rainbow, and the whole spectrum still spins with the phase.
-                let ring_hue = hsv2rgb_turns(self.phase + t * HALO_HUE_SPREAD, sat, val);
+                // Each ring samples its own point on the FAMILY's sweep — the
+                // rim IS a rainbow, and the whole spectrum still spins with the
+                // phase. The step is a distance ALONG the sweep now, not an
+                // angle on a private wheel.
+                let ring_hue = shade(spectrum_at(cc, self.phase, t * HALO_HUE_SPREAD), sat, val);
                 push_ring(
                     out,
                     geom,
@@ -468,7 +480,7 @@ impl CursorRainbow {
                 let arm_rgb = if dark_theme {
                     0x00FF_FFFF
                 } else {
-                    hsv2rgb_turns(self.phase, 1.0, 0.9)
+                    shade(spectrum_at(cc, self.phase, 0.0), 1.0, 0.9)
                 };
                 let star = premul_rgb(arm_rgb, arm_cov);
                 let reach_x = ((TWINKLE_REACH * pop * cw as f32) as i32).max(1);
@@ -512,7 +524,11 @@ impl CursorRainbow {
                         2 => (-s - jit, ch + jit),
                         _ => (cw + jit, ch + jit),
                     };
-                    let hue = hsv2rgb_turns(self.phase + 0.13 + k as f32 * 0.29, 0.85, 1.0);
+                    let hue = shade(
+                        spectrum_at(cc, self.phase, 0.13 + k as f32 * 0.29),
+                        0.85,
+                        1.0,
+                    );
                     push_ring_rect(out, geom, cx + dx, cy + dy, s, s, premul_rgb(hue, dot_cov));
                 }
             }
@@ -614,24 +630,46 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
 
-/// HSV with hue in TURNS (`0..1`) → `0x00RRGGBB` (mirrors the aurora's `hsv2rgb`).
-fn hsv2rgb_turns(h: f32, s: f32, v: f32) -> u32 {
-    let h = (h.fract() + 1.0).fract() * 6.0;
-    let i = h.floor() as i32;
-    let f = h - i as f32;
-    let p = v * (1.0 - s);
-    let q = v * (1.0 - s * f);
-    let t = v * (1.0 - s * (1.0 - f));
-    let (r, g, b) = match i.rem_euclid(6) {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-    let u = |c: f32| ((c.clamp(0.0, 1.0)) * 255.0 + 0.5) as u32;
-    (u(r) << 16) | (u(g) << 8) | u(b)
+/// THE FAMILY'S SPECTRUM, at the caret's own place on it.
+///
+/// The block used to run its OWN colour wheel — a private `hsv2rgb_turns`
+/// sampled at `self.phase` turns — while the ribbon leaving that same cell
+/// resolved [`crate::cursor_glow::rainbow_band_at`]'s six anchors. Two
+/// spectrums, two clocks, meeting at one cell: the caret could be a continuous
+/// teal while the underline directly beneath it was flat green, which is the
+/// most literally visible "different rainbows" this family had.
+///
+/// So the caret now asks the SAME question every other mark of this style asks:
+/// where is this COLUMN on the sweep, and which band is that? `phase` still
+/// comes from the block's own spin law (see [`IDLE_SPIN`] / [`ACTIVE_SPIN`] —
+/// that law is what makes the caret a typing meter and is deliberately kept),
+/// but it is now a position on the family's ping-ponged sweep rather than an
+/// angle on a wheel nothing else reads. `off` steps a further distance ALONG
+/// that sweep — the halo rings walking outward, the glitter dots — folded by
+/// the family's own reflection so an offset can never wrap violet into red.
+#[inline]
+fn spectrum_at(col: u16, phase: f32, off: f32) -> u32 {
+    rainbow_band_of(rainbow_sweep_reflect(rainbow_sweep_at(col, phase) + off))
+}
+
+/// A family band re-mixed at saturation `s` and value `v`, hue intact — the
+/// block's ENERGY LAW applied to a colour it did not choose.
+///
+/// This is HSV's own S/V re-application written for an RGB input: each channel
+/// is pulled toward the colour's peak by `1 − s` (the achromatic direction) and
+/// then scaled by `v`. At `s = 1, v = 1` it is the IDENTITY, so a caret at full
+/// energy is EXACTLY the band the ribbon under it draws — which is the property
+/// `caret_ribbon_and_streaks_share_one_spectrum` pins.
+#[inline]
+fn shade(rgb: u32, s: f32, v: f32) -> u32 {
+    let (r, g, b) = (
+        ((rgb >> 16) & 0xff) as f32,
+        ((rgb >> 8) & 0xff) as f32,
+        (rgb & 0xff) as f32,
+    );
+    let hi = r.max(g).max(b);
+    let ch = |c: f32| (((hi - s * (hi - c)) * v) + 0.5).clamp(0.0, 255.0) as u32;
+    (ch(r) << 16) | (ch(g) << 8) | ch(b)
 }
 
 /// Clamped per-channel RGB mix (`t` from a → b).
@@ -1510,6 +1548,79 @@ mod tests {
             minch < 160,
             "the light-theme glint keeps saturation (never washes to white), got {f:#08x}"
         );
+    }
+
+    /// ONE RAINBOW, from the caret outward. The block cursor, the ribbon's rail
+    /// and the rail-riding streaks must resolve THE SAME SPECTRUM POSITION TO
+    /// THE SAME HUE — the property the block's private HSV wheel made
+    /// impossible, since a wheel angle and a six-anchor band index are not the
+    /// same coordinate at all.
+    ///
+    /// Three claims, and all three are needed:
+    ///   1. the caret's spectrum lookup IS the family's band resolver, at the
+    ///      caret's own column and phase (so the underline under the block is
+    ///      the block's colour);
+    ///   2. the energy law is a pure SHADE of that band — the identity at full
+    ///      energy — so the agreement is exact and not merely close;
+    ///   3. the whole tick honours it: a hot block's FILL is the theme base
+    ///      mixed toward exactly that band.
+    #[test]
+    fn caret_ribbon_and_streaks_share_one_spectrum() {
+        use crate::cursor_glow::rainbow_band_at;
+        for &col in &[0u16, 1, 5, 17, 22, 39, 137, 400] {
+            for i in 0..9 {
+                let phase = i as f32 * 0.37;
+                let band = rainbow_band_at(col, phase);
+                // (1) the caret asks the family, not a wheel of its own.
+                assert_eq!(
+                    spectrum_at(col, phase, 0.0),
+                    band,
+                    "caret vs ribbon at col {col} phase {phase}"
+                );
+                // (2) full energy ⇒ the shade is the identity.
+                assert_eq!(
+                    shade(band, SAT_MAX, VAL_MAX),
+                    band,
+                    "the energy law recolours nothing at full energy ({band:06X})"
+                );
+                // A shaded band never leaves its own hue: channel ORDER holds.
+                let order = |c: u32| {
+                    let (r, g, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+                    (r >= g, g >= b, r >= b)
+                };
+                assert_eq!(
+                    order(band),
+                    order(shade(band, SAT_IDLE, VAL_IDLE)),
+                    "an idle caret keeps the band's hue ({band:06X})"
+                );
+            }
+        }
+        // (3) end to end: a hot block's fill is the base mixed toward the band
+        // the ribbon draws at that very cell.
+        let g = geom();
+        let c = cfg();
+        for &col in &[3u16, 11, 30] {
+            let mut cr = CursorRainbow::default();
+            let mut out = Vec::new();
+            let f = cr
+                .tick(
+                    Some((1, col)),
+                    Instant::now(),
+                    1.0,
+                    true,
+                    true,
+                    g,
+                    &c,
+                    &mut out,
+                )
+                .fill
+                .unwrap();
+            assert_eq!(
+                f,
+                mix_rgb(BASE_DARK_THEME, rainbow_band_at(col, 0.0), MIX_MAX),
+                "the caret at col {col} is the ribbon's band at col {col}"
+            );
+        }
     }
 
     /// The additive halo HUGS the block: even at full energy no ring reaches more than

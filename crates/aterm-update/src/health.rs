@@ -171,19 +171,57 @@ impl Health {
             .saturating_add(self.apply_failures)
     }
 
-    /// Whether the ledger shows a PERSISTENT failure of a lane that strands the
-    /// machine: either `pipeline` (releases visible, downloads impossible) or
-    /// `apply` (a verified build staged but never able to become the running
-    /// build) for [`PERSISTENT_AFTER`]+ consecutive attempts. Both are the
-    /// surface-it-loudly state; per-class streaks mean an interleaved network blip
-    /// cannot reset either.
+    /// The class whose streak has crossed [`PERSISTENT_AFTER`], with its own count —
+    /// or `None` while nothing is persistently failing.
     ///
-    /// `apply` is included because the user-visible symptom is identical — the
-    /// machine does not move to the new version — and leaving it out is what let a
-    /// 100%-failing handoff lane report healthy for three releases.
+    /// Callers need the CLASS, not just the boolean: the count and the sentence a
+    /// user is shown have to come from the streak that actually escalated. Reporting
+    /// `pipeline_failures` for an `apply`-class escalation printed "0 consecutive
+    /// checks … cannot be downloaded" — a nonsense count attached to the wrong lane —
+    /// because a healthy check zeroes the acquisition streaks and deliberately
+    /// preserves only `apply` ([`Self::record_success`]).
+    ///
+    /// Order is severity-of-diagnosis, not precedence: the earlier a class sits in
+    /// the acquire→apply pipeline, the more it explains, so it wins the report.
+    #[must_use]
+    pub fn persistent_class(&self) -> Option<(&'static str, u32)> {
+        [
+            ("pipeline", self.pipeline_failures),
+            ("manifest", self.manifest_failures),
+            ("stage", self.stage_failures),
+            ("apply", self.apply_failures),
+        ]
+        .into_iter()
+        .find(|(_, n)| *n >= PERSISTENT_AFTER)
+    }
+
+    /// Whether the ledger shows a PERSISTENT failure of a lane that strands the
+    /// machine, for [`PERSISTENT_AFTER`]+ consecutive attempts. Per-class streaks
+    /// mean an interleaved network blip cannot reset any of them.
+    ///
+    /// EVERY class that cannot heal itself on the client counts, because the
+    /// user-visible symptom is identical in all of them — the machine does not move
+    /// to the new version:
+    ///
+    /// * `pipeline` — releases visible, downloads impossible;
+    /// * `manifest` — the authoritative release cannot be trusted (unsigned under a
+    ///   pinned channel, bad signature, unparseable). Retrying cannot fix it: it
+    ///   stays broken until the PUBLISHER republishes;
+    /// * `stage` — the artifact downloads but will not verify or become a bundle;
+    /// * `apply` — a verified build staged but never able to become the running one.
+    ///
+    /// `network` is deliberately excluded: it is the one genuinely transient class
+    /// (GitHub unreachable, auth blip), and it already slows the cadence rather than
+    /// alarming the user.
+    ///
+    /// Omitting `manifest` and `stage` is not hypothetical. On 2026-07-25 a machine
+    /// carried `manifest_failures = 597` — an unsigned release under a pinned channel,
+    /// ~13 hours — and nothing escalated, because this predicate watched only
+    /// `pipeline` and `apply`. That is precisely the silent stranding this ledger
+    /// exists to prevent; see the regression test below.
     #[must_use]
     pub fn is_persistent(&self) -> bool {
-        self.pipeline_failures >= PERSISTENT_AFTER || self.apply_failures >= PERSISTENT_AFTER
+        self.persistent_class().is_some()
     }
 
     /// Record one failed check of `kind` (`network` / `pipeline` / `manifest` /
@@ -502,6 +540,66 @@ mod tests {
         // And a healthy check does not silence it.
         Health::record_success(&p);
         assert!(Health::read(&p).is_persistent());
+    }
+
+    /// THE 2026-07-25 INCIDENT, pinned. A machine carried `manifest_failures = 597`
+    /// with `last_error = "authoritative update v0.61 is unsigned under the pinned
+    /// channel"` for ~13 hours and NOTHING escalated, because `is_persistent` watched
+    /// only `pipeline` and `apply`. The class cannot heal on the client — an unsigned
+    /// release stays unsigned until the publisher republishes — so a streak of it
+    /// means this Mac can never update again, which is the loudest thing this ledger
+    /// can be asked to say.
+    #[test]
+    fn a_manifest_streak_escalates_and_names_its_own_class() {
+        let p = tmp("manifest-persistent");
+        for _ in 0..PERSISTENT_AFTER {
+            Health::record_failure(
+                &p,
+                "manifest",
+                "authoritative update v0.61 is unsigned under the pinned channel",
+            );
+        }
+        let h = Health::read(&p);
+        assert_eq!(h.manifest_failures, PERSISTENT_AFTER);
+        assert!(
+            h.is_persistent(),
+            "an untrustworthy authoritative release strands the machine exactly as \
+             surely as one that cannot be downloaded"
+        );
+        // The notification takes its count and its sentence from HERE, so the class
+        // must be named and the count must be its own — never `pipeline_failures`,
+        // which is 0 in this state and produced "0 consecutive checks".
+        assert_eq!(h.persistent_class(), Some(("manifest", PERSISTENT_AFTER)));
+        assert_eq!(h.pipeline_failures, 0, "the incident's pipeline lane was fine");
+    }
+
+    /// `stage` strands too: the artifact arrives and then refuses to become a bundle.
+    #[test]
+    fn a_stage_streak_escalates_and_names_its_own_class() {
+        let p = tmp("stage-persistent");
+        for _ in 0..PERSISTENT_AFTER {
+            Health::record_failure(&p, "stage", "sha256 mismatch");
+        }
+        let h = Health::read(&p);
+        assert!(h.is_persistent());
+        assert_eq!(h.persistent_class(), Some(("stage", PERSISTENT_AFTER)));
+    }
+
+    /// `network` is the one class that must NOT alarm: it is genuinely transient and
+    /// is already answered by slowing the cadence.
+    #[test]
+    fn a_network_streak_never_escalates() {
+        let p = tmp("network-not-persistent");
+        for _ in 0..(PERSISTENT_AFTER * 4) {
+            Health::record_failure(&p, "network", "dns");
+        }
+        let h = Health::read(&p);
+        assert!(h.network_failures >= PERSISTENT_AFTER);
+        assert!(
+            !h.is_persistent(),
+            "a flaky network must not tell the user their updater is broken"
+        );
+        assert_eq!(h.persistent_class(), None);
     }
 
     #[test]

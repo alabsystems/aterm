@@ -11,10 +11,23 @@
 //!   `dir_safe_for_private_write` only checks one dir's owner+mode; it does not walk the
 //!   parent chain. Because `prefix` is config-controlled (§11), a prefix under a
 //!   shared/attacker-writable *parent* would reintroduce a CWE-379 symlink-swap window.
-//!   So [`resolve`] requires the prefix to sit under `$HOME`, contain no `..`, and have
-//!   **every existing directory from `$HOME` down** owned-by-uid, not group/other-writable,
-//!   and **not a symlink** — any violation falls back to the trusted default prefix
-//!   (mirroring the slug-fail-closed-to-default pattern).
+//!   So [`resolve`] admits exactly TWO chain shapes, and never a mixture; anything else
+//!   falls back to the trusted default prefix (mirroring the
+//!   slug-fail-closed-to-default pattern). Neither shape may contain `..`.
+//!
+//!   1. **HOME prefix** — strictly under `$HOME`, with **every existing directory from
+//!      `$HOME` down** owned-by-uid, not group/other-writable, and not a symlink.
+//!   2. **SYSTEM prefix** — anywhere outside `$HOME`, with **every existing directory
+//!      from `/` down** owned by ROOT, not group/other-writable, and not a symlink.
+//!
+//!   The system shape exists because a user-owned prefix cannot carry PATHNAME
+//!   EXECUTION AUTHORITY: Trust's verified launcher refuses a user-owned toolchain
+//!   component outright, so an atpkg that could only install under `$HOME` left the
+//!   verified lane permanently unreachable for every toolchain it delivers. It is not a
+//!   weakening — a root-owned chain answers the same "no attacker-writable ancestor"
+//!   question at least as strongly — and writing there requires root, which is checked
+//!   rather than assumed. Both shapes are AND-checks over the FULL chain: one
+//!   world-writable ancestor (`/private/tmp`, say) disqualifies the whole prefix.
 //! * **Shim names that collide with sensitive commands are refused** ([`shim_allowed`]).
 //!   `bin/` is appended to the child `PATH` (never prepended, so a managed tool can't
 //!   shadow a system one), but a tool honestly or maliciously named `sudo`/`ssh`/`git`/…
@@ -32,6 +45,42 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Whether this is a SYSTEM prefix: the root-owned shape, as opposed to the
+    /// per-user `$HOME` shape.
+    ///
+    /// Decided by the ACTUAL on-disk chain ([`system_chain_trusted`]), not by location.
+    /// Location alone is not sound here: a `Layout` can be built directly (tests do,
+    /// at 28 sites) without passing through [`vet_prefix`], and "outside `$HOME`" would
+    /// then wrongly classify an ordinary user-owned temp dir as a system prefix and
+    /// publish it `0755`. Asking the filesystem instead means the mode always follows
+    /// the trust shape that is really there, and a prefix that is not root-owned can
+    /// never be widened.
+    #[must_use]
+    pub fn is_system_prefix(&self) -> bool {
+        system_chain_trusted(&self.prefix)
+    }
+
+    /// Create and harden a directory belonging to this layout, with the mode the
+    /// PREFIX SHAPE calls for.
+    ///
+    /// A `$HOME` prefix is private state: `0700`, owned by us, nobody else's business.
+    /// A SYSTEM prefix is the opposite — root writes it and every user must be able to
+    /// traverse and execute out of it, so it is `0755`. Hardening a system prefix to
+    /// `0700` installs a toolchain that only root can run, which passes every ownership
+    /// check (`0700 & 0o022 == 0` satisfies even Trust's launcher predicate) and then
+    /// fails at the only moment that matters — the first non-root invocation, with a
+    /// bare `Permission denied`. Observed exactly that way before this existed.
+    ///
+    /// The write itself is still guarded by the prefix chain check: this only decides
+    /// who may READ and TRAVERSE, never who may write.
+    pub fn ensure_dir(&self, dir: &Path) -> std::io::Result<()> {
+        if self.is_system_prefix() {
+            crate::platform::ensure_shared_dir(dir)
+        } else {
+            crate::platform::ensure_private_dir(dir)
+        }
+    }
+
     /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
     #[must_use]
     pub fn build_dir(&self, program: &str, build: u64) -> PathBuf {
@@ -234,14 +283,30 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     let Some(p) = configured else {
         return default;
     };
-    // Must be an absolute path strictly under $HOME, with no `..` escape components.
-    // Containment is compared with `under_home` (case-insensitively on Windows, whose
-    // filesystem is case-insensitive — else a validly-configured prefix that differs only
-    // in case from %USERPROFILE% is wrongly rejected and silently ignored).
-    if !p.is_absolute() || !under_home(p, home) || p == home {
+    // No `..` escape components, ever, in either shape.
+    if !p.is_absolute() || p.components().any(|c| matches!(c, Component::ParentDir)) {
         return default;
     }
-    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+    // SYSTEM PREFIX — the second trusted shape. A prefix OUTSIDE $HOME is admissible
+    // only when every existing component from `/` down is root-owned and not
+    // group/other-writable. That answers the same question the $HOME chain answers
+    // (no attacker-writable ancestor can swap a component) at least as strongly, and
+    // it is the ONLY shape a verified Trust toolchain can execute from: the verified
+    // launcher refuses a user-owned path component outright, so a home prefix leaves
+    // the verified lane permanently unreachable. Installing here needs root; that is
+    // the point, and it is checked rather than assumed.
+    if !under_home(p, home) {
+        return if system_chain_trusted(p) {
+            p.to_path_buf()
+        } else {
+            default
+        };
+    }
+    // HOME PREFIX — must be strictly under $HOME. Containment is compared with
+    // `under_home` (case-insensitively on Windows, whose filesystem is
+    // case-insensitive — else a validly-configured prefix that differs only in case
+    // from %USERPROFILE% is wrongly rejected and silently ignored).
+    if p == home {
         return default;
     }
     // Walk every EXISTING directory from `home` down to the leaf (the not-yet-created
@@ -261,6 +326,26 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// Whether EVERY existing directory from `/` down to `p` is root-owned and not
+/// group/other-writable — the system-prefix chain check.
+///
+/// Same fail-closed shape as the `$HOME` walk in [`vet_prefix`]: a non-existent tail is
+/// the part atpkg will create (as root, since it must already be root to write here);
+/// any existing component that is a symlink/reparse point, or is not root-owned, or is
+/// group/other-writable, disqualifies the whole prefix. One writable component anywhere
+/// in the chain is enough to reintroduce the CWE-379 swap window this exists to close,
+/// so this is an AND over the full chain, not a leaf check.
+#[must_use]
+fn system_chain_trusted(p: &Path) -> bool {
+    p.ancestors().all(|anc| {
+        // A component that does not exist yet is the tail we will create; skip it. An
+        // existing one must be a real dir, root-owned, and not group/other-writable.
+        std::fs::symlink_metadata(anc).is_ok_and(|m| {
+            !crate::platform::is_reparse(&m) && crate::platform::dir_meta_is_system(&m)
+        }) || std::fs::symlink_metadata(anc).is_err()
+    })
 }
 
 /// Containment check `p` is at/under `home`. Case-sensitive on Unix (`starts_with`);
@@ -560,6 +645,62 @@ mod tests {
         assert_eq!(vet_prefix(Some(&sneaky), &home), default_prefix(&home));
         // home itself is not a valid prefix (the manager must own a subdir).
         assert_eq!(vet_prefix(Some(&home), &home), default_prefix(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The SYSTEM prefix shape: outside `$HOME` is admissible when every existing
+    /// ancestor is root-owned and not group/other-writable. This is what makes the
+    /// verified Trust lane reachable at all — its launcher refuses a user-owned path
+    /// component, so an atpkg that can only install under `$HOME` can never provide a
+    /// toolchain with pathname execution authority.
+    #[cfg(unix)]
+    #[test]
+    fn root_owned_prefix_outside_home_is_accepted() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = temp_home("sysprefix");
+        // Precondition, asserted rather than assumed: /usr/lib must really be
+        // root-owned and not group/other-writable on this machine.
+        let Ok(meta) = std::fs::symlink_metadata("/usr/lib") else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+        // A non-existent leaf is the tail the installer creates (as root).
+        let prefix = Path::new("/usr/lib/aterm-pkg-system-prefix-test");
+        assert_eq!(
+            vet_prefix(Some(prefix), &home),
+            prefix.to_path_buf(),
+            "a fully root-owned chain outside $HOME is a trusted system prefix"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The system shape is an AND over the WHOLE chain, not a leaf check: one
+    /// world-writable ancestor reintroduces the CWE-379 swap window, so the prefix must
+    /// fail closed to the default even though the leaf itself would be created by root.
+    /// `/private/tmp` is mode 0777 and root-owned — exactly that trap.
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_system_ancestor_is_refused() {
+        use std::os::unix::fs::MetadataExt as _;
+        let home = temp_home("wwancestor");
+        let Ok(meta) = std::fs::symlink_metadata("/private/tmp") else {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        };
+        if meta.mode() & 0o022 == 0 {
+            let _ = std::fs::remove_dir_all(&home);
+            return; // not the world-writable fixture this test needs
+        }
+        let prefix = Path::new("/private/tmp/aterm-pkg-should-not-be-trusted");
+        assert_eq!(
+            vet_prefix(Some(prefix), &home),
+            default_prefix(&home),
+            "a world-writable ancestor must fail closed even when root owns it"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

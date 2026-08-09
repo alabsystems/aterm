@@ -54,6 +54,23 @@ pub fn dir_meta_is_private(_meta: &Metadata) -> bool {
     true
 }
 
+/// Shared-directory creation. On Windows POSIX modes do not apply, so this is just
+/// `create_dir_all`; the per-directory ACL governs access, exactly as it does for
+/// `ensure_private_dir`.
+pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)
+}
+
+/// System-owned predicate: always `false` on Windows. The Unix analogue proves a
+/// root-owned chain from POSIX owner/mode bits, which have no meaning here — and a
+/// best-effort `true` would be the wrong direction for a check whose entire purpose
+/// is to be fail-closed. Returning `false` means a configured system prefix simply
+/// falls back to the trusted default, exactly as any other failed chain check does.
+#[must_use]
+pub fn dir_meta_is_system(_meta: &Metadata) -> bool {
+    false
+}
+
 /// Whether `meta` (from `symlink_metadata`) is a link-like indirection that must NOT be
 /// trusted as a real directory in the fail-closed prefix chain check. On Windows this is
 /// ANY reparse point — crucially including a directory **junction** (`mklink /J`, needs no

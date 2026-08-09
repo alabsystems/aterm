@@ -76,6 +76,36 @@ pub const SING_BAR_BEATS: f32 = 4.0;
 pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 
 // ---------------------------------------------------------------------------
+// Song signature
+// ---------------------------------------------------------------------------
+
+/// The FIXED BIJECTIVE SIGNATURE MIXER over a character's code point —
+/// lowbias32-style (two xorshift + odd-multiply rounds, the constants proven
+/// in the salvaged held-key-songs design). Every round is individually
+/// invertible, so the whole map is a bijection on `u32`: DISTINCT CHARACTERS
+/// CAN NEVER SHARE A SONG (`song_signature_mixer_is_bijective_over_all_chars`
+/// proves the exact round trip), and nearby code points scatter far apart, so
+/// `a` vs `b` is a different VERSE, not a nudged copy. Deliberately not a
+/// synth-rng draw: a key's song is the same on every machine, every session,
+/// every seed.
+#[must_use]
+pub fn song_signature(ch: char) -> u32 {
+    let mut x = ch as u32;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7feb_352d);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846c_a68b);
+    x ^ (x >> 16)
+}
+
+/// The signature of "nothing held": decodes in the synth to the untransposed
+/// reference voicing — root 0 (`12 % 5 == 2` ⇒ degree offset 0) in the home
+/// mode (`12 % 3 == 0`) — exactly where the old `key() == 0` neutral sat.
+/// Pinned against the synth's decode by `trail_sound`'s
+/// `neutral_signature_is_the_reference_voicing`.
+pub const NEUTRAL_SIGNATURE: u32 = 12;
+
+// ---------------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------------
 
@@ -173,26 +203,42 @@ impl KittySing {
         self.handover_from = None;
     }
 
-    /// The MUSICAL KEY the held character sings in: a pentatonic scale-degree
-    /// offset applied to every note of the authored riff.
+    /// The SONG SIGNATURE the held character sings from — the single `u32`
+    /// the synth derives EVERY per-key axis of the celebration from: the
+    /// verse melody walk, the root transpose and the mode rotation
+    /// (`trail_sound::design_celebration`), all pure functions of this one
+    /// payload.
     ///
-    /// OWNER: "when I changed the repeating key, the song played needs to ALSO
-    /// change seamlessly." The song used to be IDENTICAL for every held
-    /// character — `run` was private with no accessor and the host passed a
-    /// hardcoded voicing, so holding `a` and holding `z` produced bit-identical
-    /// audio. Now the character picks the root: the SAME authored tune, rhythm
-    /// and bars, transposed. That is what makes the change audible as a change
-    /// rather than as a restart.
+    /// OWNER: "I also want a more obvious difference in the tune generation
+    /// when pressing different keys." The old `key()` was `(ch % 5) - 2`:
+    /// five transpose classes of ONE authored tune, so holding `a`, `f`,
+    /// `k`, `p`, `u`, `z` or space produced bit-identical audio — while its
+    /// doc claimed a-vs-z differed. (The doc was false; this fixes the
+    /// mechanism instead of the prose.) [`song_signature`] is a fixed
+    /// bijective mixer, so every distinct character owns a distinct
+    /// signature — zero collisions — and the synth turns that identity into
+    /// a different VERSE of the same celebration, not a nudged copy.
     ///
-    /// Deterministic and bounded to one pentatonic octave (-2..=2), so no key can
-    /// transpose the riff into a register that reads as a different instrument.
-    /// `0` when nothing is held — the untransposed reference voicing.
+    /// [`NEUTRAL_SIGNATURE`] when nothing is held — the reference voicing.
+    /// The hand-over law is untouched: identity derives from the CURRENT run
+    /// char per bar, so a mid-hold key change modulates on the next bar
+    /// boundary over the same uninterrupted bar grid.
+    #[must_use]
+    pub fn signature(&self) -> u32 {
+        self.run.map_or(NEUTRAL_SIGNATURE, song_signature)
+    }
+
+    /// COMPATIBILITY SHIM — DELETE WITH THE PENDING GUI PATCH
+    /// (`backups/PENDING-sing-sig-app_render.patch`). The clamped pentatonic
+    /// root the signature decodes to (-2..=2), kept ONLY so the unpatched
+    /// host builder (`app_render::sing_riff_event` and its push sites) still
+    /// compiles; it carries at most five key classes, which is exactly the
+    /// defect [`Self::signature`] exists to fix.
+    #[deprecated(note = "use signature(); the i8 root carries only 5 key classes — \
+                         apply backups/PENDING-sing-sig-app_render.patch")]
     #[must_use]
     pub fn key(&self) -> i8 {
-        match self.run {
-            Some(ch) => (ch as u32 % 5) as i8 - 2,
-            None => 0,
-        }
+        ((self.signature() % 5) as i8) - 2
     }
 
     /// The derived "finger lifted" instant: one repeat gap after the last
@@ -800,7 +846,6 @@ mod tests {
         }
     }
 
-
     /// THE OWNER'S SCENARIO: hold one key until FULL NYAN, then hold a DIFFERENT
     /// key. Both halves of "change seamlessly" are pinned here.
     ///
@@ -819,7 +864,7 @@ mod tests {
         assert!(d.is_armed(armed));
         let bar_before = d.bar(armed).expect("armed runs schedule bars");
         let beat_before = d.beat(armed).expect("armed runs have a beat");
-        let key_before = d.key();
+        let sig_before = d.signature();
 
         let mut t = armed;
         for _ in 0..SING_ARM_REPEATS {
@@ -843,11 +888,16 @@ mod tests {
             d.bar(t).expect("still scheduling") >= bar_before,
             "the bar grid kept counting up — no cold start at bar 0"
         );
-        assert_ne!(d.key(), key_before, "'q' and 'a' must not sing the same song");
-        assert!(
-            (-2..=2).contains(&d.key()),
-            "the transposition stays inside one pentatonic octave, got {}",
-            d.key()
+        assert_ne!(
+            d.signature(),
+            sig_before,
+            "'q' and 'a' must not sing the same song"
+        );
+        assert_eq!(
+            d.signature(),
+            song_signature('q'),
+            "the signature is the CURRENT run char's — the hand-over carries \
+             identity, the synth derives root/mode/verse from it per bar"
         );
 
         // The promise is enforced: two different characters in a row is TYPING,
@@ -1196,5 +1246,91 @@ mod tests {
         assert_eq!(SING_BEAT_SECONDS, 0.4);
         assert_eq!(SING_BAR_SECONDS, 1.6);
         assert_eq!(SING_ARM_REPEATS, 16);
+    }
+
+    /// THE MIXER IS A BIJECTION — the zero-collision proof. Each stage of
+    /// [`song_signature`] is individually invertible (xorshift by 16/15 and
+    /// two odd multiplies), so the whole map round-trips: this test builds
+    /// the exact inverse (Newton–Hensel for the modular inverses of the two
+    /// multipliers, the standard xorshift unwinding for the shifts) and
+    /// walks EVERY valid `char`. Injectivity over the full char range
+    /// follows: two characters sharing a signature would break the round
+    /// trip. This is the property the old `ch % 5` could never have — it
+    /// folded the whole alphabet onto five songs.
+    #[test]
+    fn song_signature_mixer_is_bijective_over_all_chars() {
+        /// Multiplicative inverse of odd `m` mod 2^32 (Newton–Hensel: each
+        /// step doubles the correct low bits; 5 steps ≥ 32 bits).
+        fn minv(m: u32) -> u32 {
+            let mut x = m;
+            for _ in 0..5 {
+                x = x.wrapping_mul(2u32.wrapping_sub(m.wrapping_mul(x)));
+            }
+            x
+        }
+        let (inv_a, inv_b) = (minv(0x7feb_352d), minv(0x846c_a68b));
+        assert_eq!(inv_a.wrapping_mul(0x7feb_352d), 1);
+        assert_eq!(inv_b.wrapping_mul(0x846c_a68b), 1);
+        let unmix = |y: u32| -> u32 {
+            let mut x = y ^ (y >> 16);
+            x = x.wrapping_mul(inv_b);
+            x = x ^ (x >> 15) ^ (x >> 30);
+            x = x.wrapping_mul(inv_a);
+            x ^ (x >> 16)
+        };
+        for ch in (0u32..=0x10_FFFF).filter_map(char::from_u32) {
+            assert_eq!(
+                unmix(song_signature(ch)),
+                ch as u32,
+                "mixer round trip failed at U+{:04X}",
+                ch as u32
+            );
+        }
+    }
+
+    /// The old defect's poster children: `(ch % 5)` made 'a','f','k','p',
+    /// 'u','z' and space BIT-IDENTICAL songs (its doc claimed a-vs-z
+    /// differed). Every pair now carries a distinct signature.
+    #[test]
+    fn old_transpose_collision_classes_now_sing_apart() {
+        let class = ['a', 'f', 'k', 'p', 'u', 'z', ' '];
+        for (i, &a) in class.iter().enumerate() {
+            for &b in &class[i + 1..] {
+                assert_ne!(
+                    song_signature(a),
+                    song_signature(b),
+                    "{a:?} and {b:?} were bit-identical under ch % 5 and must \
+                     never be again"
+                );
+            }
+        }
+    }
+
+    /// Nothing held ⇒ the neutral signature (the synth's untransposed
+    /// reference voicing), and an armed run reports its char's signature.
+    #[test]
+    fn signature_is_neutral_at_rest_and_the_run_chars_while_held() {
+        let mut d = KittySing::default();
+        assert_eq!(d.signature(), NEUTRAL_SIGNATURE);
+        let t0 = Instant::now();
+        let t = hold(&mut d, t0, 'w', SING_ARM_REPEATS, 30);
+        assert!(d.is_armed(t));
+        assert_eq!(d.signature(), song_signature('w'));
+    }
+
+    /// The deprecated 5-class shim (alive only until the pending GUI patch
+    /// lands) stays consistent with the signature it delegates into: the
+    /// derived root is `sig % 5 - 2`, always inside one pentatonic octave.
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_key_shim_tracks_the_signature_root() {
+        for ch in ['a', 'q', 'w', 'z', '0', '~'] {
+            let mut d = KittySing::default();
+            let t = hold(&mut d, Instant::now(), ch, SING_ARM_REPEATS, 30);
+            assert!(d.is_armed(t));
+            let expect = ((song_signature(ch) % 5) as i8) - 2;
+            assert_eq!(d.key(), expect);
+            assert!((-2..=2).contains(&d.key()));
+        }
     }
 }

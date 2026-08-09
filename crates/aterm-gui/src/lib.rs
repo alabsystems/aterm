@@ -53,6 +53,7 @@ mod app_colorscheme;
 mod app_config;
 mod app_input;
 mod app_introspect;
+mod app_kitty;
 mod app_mouse;
 mod app_native;
 #[cfg(feature = "a11y-accesskit")]
@@ -241,6 +242,8 @@ mod seamless {
 mod memory_pressure;
 /// Per-session tooltip/context-menu composer (session-metadata stage 2).
 mod session_chrome;
+/// Pure, GUI-free status classifier for a session (Tab Subject & Status).
+mod session_status;
 mod session_store;
 /// Per-session user metadata + event timeline (session-metadata stage 1).
 mod session_timeline;
@@ -1791,6 +1794,13 @@ enum Wake {
     /// the `toggle_matrix_rain` keybinding flip ([`App::rain_control`]).
     RainControl {
         op: RainCtlOp,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `tone` (control socket): read the FRONT window's tone-of-typing state —
+    /// the cached mood, what the sound path is stamping, and every gate that
+    /// decides whether the classifier runs ([`App::tone_status`]). Pure read;
+    /// the mood is otherwise observable only by ear.
+    ToneStatus {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `spawn` (control socket): open ONE new tab session in the frontmost
@@ -3761,6 +3771,17 @@ pub struct SessionCtx {
     /// nowhere reversed) so racing `meta set`s can never invert the event
     /// stream against the stored value.
     pub meta: std::sync::Mutex<crate::session_timeline::SessionMeta>,
+    /// THE APP KITTY slot (per-app cursor breeds, owner spec 2026-08-07): the
+    /// pane's resolved app identity — canonical id + breed — derived from its
+    /// current shell block and cached by `(block id, state, commandline
+    /// present)` inside [`crate::app_kitty::AppKittySlot`], so the render rung
+    /// re-parses a commandline only on shell-block TRANSITIONS, never per
+    /// frame. Lives HERE and not in [`Self::meta`] because `meta` is the
+    /// USER-settable surface (`meta set …`) and the app identity is engine
+    /// state. A LEAF lock like `meta`: taken briefly by the render path's
+    /// `App::app_kitty_look` WHILE it holds this session's `Terminal` lock
+    /// (order term → app_kitty, never reversed) and by nothing else.
+    pub app_kitty: std::sync::Mutex<crate::app_kitty::AppKittySlot>,
     /// The per-session EVENT TIMELINE (spawned / state-change / title-change /
     /// cwd-change / meta-change), the lifecycle twin of [`Self::turns`]: bounded
     /// drop-oldest ring, read by the `timeline` verb, scanned by the
@@ -5518,6 +5539,25 @@ struct WindowState {
     /// the seq is strictly monotonic, so same-millisecond completions never
     /// collapse).
     rain_last_cmd: Option<(u64, u64)>,
+    /// The PET's own once-per-completion latch, same key and the same silent
+    /// tab-switch re-baseline as `rain_last_cmd` — deliberately a SEPARATE
+    /// field, because the rain's latch only advances inside the rain-enabled
+    /// gate and the pet must feel a finished command even when no rain is
+    /// falling (exit-code empathy is a pet feature, not a rain one).
+    pet_last_cmd: Option<(u64, u64)>,
+    /// The pet's LIVE drawn body this frame, `(x0, x1, y0, y1)` right/bottom-
+    /// exclusive in FRAME px: `PetFrame::body_px` offset by the effects
+    /// origin (plus the focused pane's origin on the composed path), stashed
+    /// post-tick by the redraw and CLEARED whenever the pet is not drawn.
+    /// The petting hit-box — `on_mouse_input` consumes a left press inside
+    /// it (padded by `PET_HIT_SLOP_PX`) before the terminal seam.
+    pet_hit_rect: Option<(i32, i32, i32, i32)>,
+    /// The pet's `(session, content_seq)` latch for the PERK-AND-WATCH burst
+    /// probe (wave 2): the content clock's previous reading, so a frame can
+    /// tell "the pane wrote" from "the pane repainted". Same silent
+    /// tab-switch re-baseline as `pet_last_cmd` — a session change never
+    /// reads as a burst.
+    pet_content_seq: Option<(u64, u64)>,
     /// Last observed `(session, OSC-shell-executing)` state for the native
     /// rain's payload-free Execute pulse. A new session is baselined silently;
     /// only a same-session false→true edge emits, so a long-running agent can
@@ -6808,6 +6848,9 @@ impl WindowState {
             installed_config_assets: None,
             installed_kitty_asset_fp: 0,
             rain_last_cmd: None,
+            pet_last_cmd: None,
+            pet_hit_rect: None,
+            pet_content_seq: None,
             rain_shell_executing: None,
             cursor_trail: crate::cursor_trail::CursorTrail::default(),
             typing_cadence: crate::cursor_trail::TypingCadence::default(),
@@ -6993,14 +7036,37 @@ struct AutoApplyIntent {
     dmg_sha256: [u8; 32],
     retry_at: Instant,
     attempts: u8,
+    /// When the idle PREFERENCE stops being able to defer this intent (see
+    /// [`AUTOMATIC_UPDATE_ACTIVITY_GRACE`]). Set once when the intent is armed,
+    /// so a busy machine converges on a bounded wall-clock deadline instead of
+    /// re-deriving a fresh delay from every fresh keystroke.
+    apply_by: Instant,
 }
 
-/// Automatic replacement must observe a short terminal-idle epoch before it
-/// may stop readers. Manual menu/control application is explicit user intent
-/// and bypasses this delay.
+/// Automatic replacement PREFERS a short terminal-idle epoch before it stops
+/// readers. Manual menu/control application is explicit user intent and
+/// bypasses this delay.
 const AUTOMATIC_UPDATE_QUIET_EPOCH_NS: u64 = 500_000_000;
 const AUTOMATIC_UPDATE_QUIET_EPOCH: Duration =
     Duration::from_nanos(AUTOMATIC_UPDATE_QUIET_EPOCH_NS);
+
+/// How long an armed automatic apply will keep holding out for a quiet moment
+/// before it stops asking and just lands.
+///
+/// The quiet epoch above is sampled against a MACHINE-WIDE input clock
+/// (`CGEventSourceSecondsSinceLastEventType`) and every live PTY's latest
+/// output. On the daily driver this feature exists for — an agent streaming
+/// output into one pane while a human works in another app — that conjunction
+/// is essentially never true, so the previous unbounded wait meant a verified,
+/// staged, notarized build simply never applied itself: the user watched an
+/// "Install & Relaunch" button instead of getting an update. Two minutes is
+/// long enough that an ordinary pause still wins the race (and the update lands
+/// invisibly), and short enough that never pausing costs a single brief hitch
+/// rather than the whole feature. The lane it unblocks is the LOSSLESS seamless
+/// handoff, which parks readers, dups the PTY masters and hands the same shells
+/// to the successor; nothing running is killed, so overriding a *preference*
+/// here spends jank, never work.
+const AUTOMATIC_UPDATE_ACTIVITY_GRACE: Duration = Duration::from_secs(120);
 
 /// True once the most recently consumed PTY burst is old enough for automatic
 /// update admission. A zero stamp means that session has produced no output.
@@ -7879,6 +7945,10 @@ struct App {
     /// coordinator. OSC title identity remains in each `Terminal`; this is separate
     /// display-only chrome state and never blocks the event loop on provider IO.
     title_summaries: title_summary::Coordinator,
+    /// Live per-session Subject/Status classification (Tab Subject & Status).
+    /// Budgeted: a session is classified at most once per `min_interval`, and
+    /// evidence is only ever gathered under `try_lock`.
+    session_status: session_status::StatusObserver,
     /// Effective serious-mode master gate. This is initialized from
     /// `config.serious_mode`, may be changed immediately by UI/control wiring, and is
     /// re-resolved when a changed config snapshot is applied. It never rewrites the
@@ -9824,6 +9894,10 @@ impl App {
             theme,
             config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
+            session_status: session_status::StatusObserver::new(
+                session_status::StatusPolicy::default(),
+                std::time::Duration::from_millis(250),
+            ),
             serious_mode: false,
             sparkle: None,
             prepared_sparkle,
@@ -10452,6 +10526,11 @@ impl App {
             .map(|(wid, _)| *wid)
             .collect();
         for wid in flashing {
+            // PET STARTLE (wave 1): the bell reaches the pet only when it
+            // rang in the pane the pet is actually chasing — this window's
+            // FOCUSED pane's session. A split sibling's bell flashes the
+            // window but must not flinch a cat that lives on another caret.
+            let pet_bell = self.focused_session_id(wid) == Some(session);
             if let Some(ws) = self.windows.get_mut(&wid)
                 && let Some(w) = ws.os_window.clone()
             {
@@ -10461,6 +10540,13 @@ impl App {
                 // hue-ramp; the redraw below ticks it in.
                 if let Some(rain) = ws.matrix_rain.as_mut() {
                     rain.note_bell();
+                }
+                if pet_bell {
+                    // Latch only (`kitty_pet::note_bell` — the note-never-act
+                    // law); the redraw below ticks the brain, which wakes a
+                    // sleeper or flinches a settled cat, and lets a bell
+                    // expire mid-flight per its TTL.
+                    ws.cursor_pet.note_bell(now);
                 }
                 w.request_redraw();
                 if !ws.focused || background {
@@ -12679,6 +12765,25 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::TitleSummary,
             );
         }
+        // TAB SUBJECT & STATUS: a pane that stops printing owes a transition no
+        // byte will ever trigger — a finished build must retire its busy dot
+        // even though nothing writes to the PTY again. Sweep FIRST so the
+        // deadline below reflects what is owed AFTER this turn's publications,
+        // not before them.
+        for changed in self.observe_session_statuses(Instant::now()) {
+            self.refresh_session_status_chrome(changed);
+        }
+        // The observer asks for a deadline only while one is actually owed
+        // (a candidate serving its dwell, or Running aging into Quiet), so an
+        // idle machine still parks indefinitely instead of spinning.
+        if let Some(status_wake) = self.session_status.next_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                status_wake,
+                metrics::DeadlineOwner::TitleSummary,
+            );
+        }
         metrics::record_deadline(deadline_owner, deadline, Instant::now());
         match deadline {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
@@ -12895,6 +13000,16 @@ impl ApplicationHandler<Wake> for App {
                 // an unset flag is harmless.
                 if let Some(s) = self.pool.get(session) {
                     s.output_wake_pending.store(0, Ordering::Relaxed);
+                }
+                // TAB SUBJECT & STATUS: classify every DUE session, not only the
+                // one that produced this burst and not only visible ones — a
+                // background pane's phase is exactly what a fleet badge needs.
+                // The per-session interval bounds the cost, and evidence is
+                // gathered under `try_lock` (contention skips, never waits).
+                // Only a session whose PUBLISHED status moved reaches chrome, so
+                // the fan-out below runs at transition rate, not at burst rate.
+                for changed in self.observe_session_statuses(std::time::Instant::now()) {
+                    self.refresh_session_status_chrome(changed);
                 }
                 // BULK SCROLLBACK MAINTENANCE IS FORBIDDEN HERE. A successful
                 // try-lock does not bound the eviction done while holding it;
@@ -13764,6 +13879,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::RainControl { op, reply } => {
                 let _ = reply.send(self.rain_control(op));
+            }
+            Wake::ToneStatus { reply } => {
+                let _ = reply.send(self.tone_status());
             }
             Wake::SettingsShowSection { route, reply } => {
                 let _ = reply.send(self.settings_show_route(route));
@@ -15183,6 +15301,25 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // inject OSC 133/633 marks into.
     let integrate =
         exec_command.is_none() && std::env::var_os("ATERM_NO_SHELL_INTEGRATION").is_none();
+    // NESTED ATERM (aterm launched from a shell that itself runs inside aterm —
+    // every dev/verification probe rig, and any user nesting terminals): the
+    // parent terminal's integration script `export`s its load-once guard
+    // (`ATERM_SHELL_INTEGRATION_INSTALLED=1`), and that export rides the
+    // environment into the shell THIS instance spawns. The child's loader then
+    // sees the inherited guard and bails before emitting a single OSC 133/633
+    // mark — no blocks, no cwd tracking, and no app-kitty identity source, so
+    // the per-app cursor breeds sit dead on the session kitty (the 0.19.0
+    // gauntlet's F3). The guard is a PER-SHELL-PROCESS fact, not a per-process-
+    // TREE fact, so override the inherited value with an EMPTY one (the pty
+    // seam's `build_child_env` is override-only): the zsh/bash `[[ -n … ]]`
+    // guards pass, the child shell loads its own marks, and its own re-export
+    // keeps the guard working WITHIN that shell. Scoped to `integrate` so an
+    // explicit opt-out keeps plain inheritance. (fish's `set -q` guard trips
+    // even on an empty var — that one needs a script-side fix and is tracked
+    // in the changelog.)
+    if integrate {
+        env_add.push((crate::app_kitty::SHELL_INTEGRATION_LOADED_GUARD.to_string(), String::new()));
+    }
     // SEC-1 + OS-sandbox actuator: gate the single spawn seam on the containment
     // decision. The mode was resolved once at startup (`init_mode_from_env`, see
     // `main`); here we ask the actuator whether the initial shell may spawn for
@@ -15873,6 +16010,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         theme,
         config: config.clone(),
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
+        session_status: session_status::StatusObserver::new(
+            session_status::StatusPolicy::default(),
+            std::time::Duration::from_millis(250),
+        ),
         serious_mode: config.serious_mode_or_default(),
         sparkle: None,
         prepared_sparkle,
@@ -16173,6 +16314,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
             crate::turn_ledger::TurnLedger::default(),
         )),
         meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
         timeline: Arc::new(std::sync::Mutex::new(
             crate::session_timeline::SessionTimeline::default(),
         )),
@@ -23316,6 +23458,7 @@ mod session_pool_tests {
                 crate::turn_ledger::TurnLedger::default(),
             )),
             meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
             timeline: Arc::new(std::sync::Mutex::new(
                 crate::session_timeline::SessionTimeline::default(),
             )),

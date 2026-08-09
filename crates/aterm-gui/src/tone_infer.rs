@@ -78,8 +78,12 @@ pub(crate) struct ToneTracker {
     /// Amortized zero-allocation after warmup: a 160-char window is ≤ 640
     /// bytes, taken and returned around each inference.
     text_buf_slot: String,
-    /// Total inferences run (test observability for the throttle proofs).
-    #[cfg(test)]
+    /// Total inferences run. Ships (not `cfg(test)`) because it is the ONE
+    /// number that distinguishes "the mood is Technical because your typing
+    /// reads technical" from "the classifier never ran at all" — the exact
+    /// ambiguity the `tone` control verb exists to settle. Eight bytes per
+    /// window, incremented on the throttled inference path, never the key
+    /// path.
     pub(crate) inferences: u64,
 }
 
@@ -93,16 +97,41 @@ impl Default for ToneTracker {
             last_infer: None,
             scratch: ToneScratch::default(),
             text_buf_slot: String::new(),
-            #[cfg(test)]
             inferences: 0,
         }
     }
 }
 
 impl ToneTracker {
-    /// The cached verdict — what the render tick stamps onto trail cues.
+    /// The cached verdict — the raw classifier state, BEFORE the `tone_melody`
+    /// knob. Use [`Self::effective`] for what actually rides a sound event;
+    /// this one is for introspection (a driver wants to see a stale verdict
+    /// sitting behind a disabled knob, not have it hidden).
     pub(crate) fn current(&self) -> Tone {
         self.tone
+    }
+
+    /// The tone the sound path must stamp onto every trail [`SoundEvent`]:
+    /// the cached verdict with the knob ON, the neutral melodic identity with
+    /// it OFF. THE ONE PLACE that rule lives — all three drain seams
+    /// (single-pane, composed, split) call this rather than re-deriving it,
+    /// because a knob-off window has to sound bit-exactly like the pre-tone
+    /// build EVEN IF a verdict from before the toggle is still cached, and
+    /// three hand-written copies of that sentence is three chances to ship a
+    /// seam that forgets it (pinned by
+    /// `every_trail_sound_policy_takes_its_tone_from_the_tracker`).
+    pub(crate) fn effective(&self, tone_melody: bool) -> Tone {
+        if tone_melody { self.tone } else { Tone::Technical }
+    }
+
+    /// Chars currently in the window. The COUNT only — never the text: the
+    /// window is fed from the committed key path, so it holds characters typed
+    /// at a password prompt that the screen itself never echoed. Exposing the
+    /// count keeps `tone` diagnosable ("is anything reaching the tracker?")
+    /// without widening the read surface past what `text`/`screen` already
+    /// show.
+    pub(crate) fn window_chars(&self) -> usize {
+        self.buf.len()
     }
 
     /// Bind the window to `session`, clearing it on a switch (the cached
@@ -167,10 +196,7 @@ impl ToneTracker {
     fn infer(&mut self, now: Instant) {
         self.keys_since_infer = 0;
         self.last_infer = Some(now);
-        #[cfg(test)]
-        {
-            self.inferences += 1;
-        }
+        self.inferences = self.inferences.saturating_add(1);
         let Some(model) = tone::builtin() else {
             self.tone = Tone::Technical;
             return;
@@ -187,6 +213,62 @@ impl ToneTracker {
             self.tone = tone;
         }
         self.text_buf_slot = text;
+    }
+}
+
+/// Everything the `tone` control verb reports, gathered from the App in one
+/// place so the WIRE FORMAT is a pure function of plain data (no `App`, no
+/// window, no audio device) and can be pinned by a headless test.
+///
+/// The fields are chosen to answer the ONE question a driver actually asks —
+/// "is the mood steering my typing sounds, and if not, which gate stopped
+/// it?" — so every conjunct of `App::tone_infer_active` appears as its own
+/// field rather than being collapsed into the single `active` verdict.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct ToneStatus {
+    /// The classifier's cached verdict, BEFORE the knob.
+    pub(crate) tone: Tone,
+    /// What the drain seams actually stamp onto events (`tone` with the knob
+    /// on, `technical` with it off) — the field to read when asking what the
+    /// synth HEARD, as opposed to what the model thought.
+    pub(crate) effective: Tone,
+    /// `tone_melody` config knob.
+    pub(crate) knob: bool,
+    /// `trail_sounds` master toggle.
+    pub(crate) sounds: bool,
+    /// `trail_sound_volume`, already clamped to 0..1.
+    pub(crate) volume: f32,
+    /// Whether the trail-audio worker can reach a device at all (false
+    /// headless, off macOS, or after a permanent ingress failure).
+    pub(crate) audio_live: bool,
+    /// The AND of the four above: whether inference may run at all.
+    pub(crate) active: bool,
+    /// Chars in the typed window (never the text — see
+    /// [`ToneTracker::window_chars`]).
+    pub(crate) window_chars: usize,
+    /// Inferences run since the window was created. ZERO with a non-neutral
+    /// `tone` is impossible; zero with `active=true` after typing means the
+    /// feed is broken, not that your prose reads technical.
+    pub(crate) inferences: u64,
+}
+
+impl ToneStatus {
+    /// The wire tail after `OK ` — one line, `key=value` pairs in a fixed
+    /// order, the shape `rain status` established.
+    pub(crate) fn line(&self) -> String {
+        format!(
+            "tone={} effective={} knob={} sounds={} volume={:.2} audio={} \
+             active={} window_chars={} inferences={}",
+            self.tone.label(),
+            self.effective.label(),
+            if self.knob { "on" } else { "off" },
+            if self.sounds { "on" } else { "off" },
+            self.volume,
+            if self.audio_live { "live" } else { "inert" },
+            self.active,
+            self.window_chars,
+            self.inferences,
+        )
     }
 }
 
@@ -316,6 +398,63 @@ mod tests {
             t.current(),
             Tone::Frustrated,
             "abstention must leave the cached mood untouched"
+        );
+    }
+
+    /// The knob-off identity: whatever the classifier currently believes, a
+    /// disabled `tone_melody` reports the neutral melodic identity — a stale
+    /// verdict cached from before the toggle must never leak into the synth.
+    /// `current()` still shows the real verdict (introspection sees the state;
+    /// the sound path sees the policy).
+    #[test]
+    fn effective_is_neutral_with_the_knob_off_even_with_a_cached_verdict() {
+        let mut t = ToneTracker::default();
+        let now = Instant::now();
+        feed(&mut t, now, 1, "why is this broken again ugh");
+        assert_eq!(t.current(), Tone::Frustrated);
+        assert_eq!(t.effective(true), Tone::Frustrated);
+        assert_eq!(t.effective(false), Tone::Technical);
+        assert_eq!(t.current(), Tone::Frustrated, "the cache is not cleared");
+    }
+
+    /// The introspection counters track the real feed: chars land in the
+    /// window, a break empties it, and the inference count moves only when the
+    /// classifier actually ran (it is the field that distinguishes "reads
+    /// technical" from "never ran").
+    #[test]
+    fn introspection_counters_track_the_window_and_the_classifier() {
+        let mut t = ToneTracker::default();
+        let now = Instant::now();
+        assert_eq!((t.window_chars(), t.inferences), (0, 0));
+        feed_inactive(&mut t, now, 1, "hello there");
+        assert_eq!(t.window_chars(), 11, "the window fills while inactive…");
+        assert_eq!(t.inferences, 0, "…but the classifier never ran");
+        feed(&mut t, now, 1, "!");
+        assert!(t.inferences >= 1, "an active feed runs the model");
+        t.note_break();
+        assert_eq!(t.window_chars(), 0, "a break empties the window");
+    }
+
+    /// The wire line: every gate is its own field, in a fixed order, and the
+    /// tone words are the classifier's own labels (so a driver can compare
+    /// them against `Tone::label`, not a second spelling of the same enum).
+    #[test]
+    fn status_line_reports_every_gate_in_a_fixed_order() {
+        let status = ToneStatus {
+            tone: Tone::Frustrated,
+            effective: Tone::Technical,
+            knob: false,
+            sounds: true,
+            volume: 0.4,
+            audio_live: true,
+            active: false,
+            window_chars: 27,
+            inferences: 5,
+        };
+        assert_eq!(
+            status.line(),
+            "tone=frustrated effective=technical knob=off sounds=on volume=0.40 \
+             audio=live active=false window_chars=27 inferences=5",
         );
     }
 

@@ -56,6 +56,112 @@ impl Default for KittyLook {
 /// (`b"sessKit\0"` as big-endian ASCII).
 const SESSION_LOOK_SALT: u64 = 0x7365_7373_4B69_7400;
 
+/// Salt keeping app-derived kitty identities in their own genome namespace —
+/// disjoint from both [`SESSION_LOOK_SALT`] and the word renderer's occurrence
+/// seeds (`b"appKitt\0"` as big-endian ASCII), so "the claude cat" can never
+/// collide with a session kitty by hash coincidence of the input spaces.
+const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
+
+/// Launcher tokens that are TRANSPARENT to app identity: when the first word
+/// of a commandline is one of these, the app is whatever comes next. The
+/// documented, deliberately small list — `sudo` (privilege wrapper), `env`
+/// (environment wrapper), `npx` (package runner; the tool being run is the
+/// identity, not the runner). Leading `VAR=value` assignments and `-flags`
+/// are likewise skipped as launcher plumbing, not apps.
+const TRANSPARENT_PREFIXES: &[&str] = &["sudo", "env", "npx"];
+
+/// The first meaningful token of a shell commandline, basename'd and
+/// lowercased — the raw material for [`canonical_app_id`]. `None` when the
+/// commandline holds no identifiable program (empty, only assignments/flags).
+///
+/// This is a whitespace-token approximation, not a shell parser: quoting is
+/// not interpreted (a commandline is identity input here, never executed).
+/// Both `/` and `\` count as path separators and a trailing `.exe` is
+/// stripped, so the same tool yields the same id across platforms.
+#[must_use]
+pub fn app_basename(commandline: &str) -> Option<String> {
+    for token in commandline.split_whitespace() {
+        // Launcher plumbing, not the app: `FOO=bar cargo …`, `sudo -E cargo …`.
+        if token.starts_with('-') || token.contains('=') {
+            continue;
+        }
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let mut base = base.to_ascii_lowercase();
+        if let Some(stripped) = base.strip_suffix(".exe") {
+            base = stripped.to_owned();
+        }
+        if base.is_empty() {
+            continue;
+        }
+        if TRANSPARENT_PREFIXES.contains(&base.as_str()) {
+            continue;
+        }
+        return Some(base);
+    }
+    None
+}
+
+/// THE CANONICAL APP TABLE — the ONE place basenames become app identities,
+/// so every argv form of a flagship tool lands on the same kitty. Policy,
+/// kept small on purpose:
+///   • every shell is the SAME app ("shell") — the prompt is home, and home
+///     has one cat regardless of which shell renders it;
+///   • the flagship AI coding tools get their canonical ids spelled out so a
+///     rename/wrapper (`claude.exe`, `/opt/bin/codex`) cannot fork the breed;
+///   • everything else IS its basename — unknown tools stay distinct and get
+///     the deterministic name-derived breed from [`KittyLook::for_app`].
+#[must_use]
+pub fn canonical_app_id(basename: &str) -> &str {
+    match basename {
+        "zsh" | "bash" | "fish" | "sh" | "pwsh" | "nu" => "shell",
+        "claude" => "claude",
+        "codex" => "codex",
+        "agy" => "agy",
+        "aider" => "aider",
+        "gemini" => "gemini",
+        "cursor" => "cursor",
+        other => other,
+    }
+}
+
+/// FLAGSHIP BREEDS — hand-picked `(variant, coat, iris, age)` for the apps
+/// people live in, spread across distinct coat families so no two flagships
+/// can be mistaken for hash luck. Everything else goes through the
+/// [`APP_LOOK_SALT`] hash path in [`KittyLook::for_app`].
+///
+/// The picks (COAT_RAMP / EYE_RAMP stops per `cat_baker` §5.3):
+///   • `shell` — S103 (the roster's default head: the baseline face for the
+///     baseline tool), charcoal-black coat 1 with moss-green iris 5: phosphor
+///     green on near-black, the terminal's own colours.
+///   • `claude` — S108 (one of the two tallest, roundest, lowest-eyed faces:
+///     open and friendly), bright-ginger coat 12 — the ramp's closest stop to
+///     Anthropic's warm terracotta — with warm copper iris 0.
+///   • `codex` — S117 (level, mid-set eyes: a precise, even gaze), clean
+///     white coat 15 with storm-teal iris 7: the cool counterpoint to claude.
+///   • `agy` — S122 (the only head in the roster with its own aspect ratio:
+///     one of a kind, like the house tool), blue-slate coat 3 — the ramp's
+///     blue notch — with sea-green iris 6, and the ADOLESCENT age band: the
+///     youngest tool in the pack, still growing.
+fn flagship_look(app_id: &str) -> Option<KittyLook> {
+    let (variant, coat, iris, age) = match app_id {
+        "shell" => (CatGlyphId::S103, 1, 5, CatAge::Adult),
+        "claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
+        "codex" => (CatGlyphId::S117, 15, 7, CatAge::Adult),
+        "agy" => (CatGlyphId::S122, 3, 6, CatAge::Adolescent),
+        _ => return None,
+    };
+    Some(
+        KittyLook {
+            variant,
+            accessory: None,
+            coat,
+            iris,
+            age,
+        }
+        .normalized(),
+    )
+}
+
 impl KittyLook {
     /// THE SESSION KITTY (owner, 2026-07-26: "I like that there is a unique
     /// kitty chosen per session and sticks with that session because that makes
@@ -83,6 +189,39 @@ impl KittyLook {
             variant: crate::genome::cat_variant_v4(gkey),
             // Accessories stay the Kitty Log's business: a bow or crown marks a
             // COLLECTED cat, so minting them for free here would devalue them.
+            accessory: None,
+            coat,
+            iris,
+            age: crate::genome::cat_age_v4(gkey),
+        }
+        .normalized()
+    }
+
+    /// THE APP KITTY (owner spec, 2026-08-07: "each major app gets its own
+    /// cursor kitty"): the deterministic breed for a canonical app id from
+    /// [`canonical_app_id`].
+    ///
+    /// Flagships (`shell`/`claude`/`codex`/`agy`) wear the hand-picked
+    /// [`flagship_look`] tuples so the tools people live in look intentional;
+    /// every other app derives its look from the NAME — `form_hash` (the
+    /// lexicon's canonical FNV-1a-64) salted into its own namespace, decoded
+    /// through the ordinary v4 genome exactly like [`Self::for_session`]. Same
+    /// app ⇒ same cat, on every machine, by construction: the look is a pure
+    /// function of the id, so there is nothing to persist and nothing to sync.
+    ///
+    /// Accessories stay `None` here for the same reason as the session kitty:
+    /// a bow or crown marks a COLLECTED cat, and minting them for free would
+    /// devalue them. The roster is 25 heads × 16 coats × 8 irises × 4 ages =
+    /// 12,800 distinct looks.
+    #[must_use]
+    pub fn for_app(app_id: &str) -> Self {
+        if let Some(look) = flagship_look(app_id) {
+            return look;
+        }
+        let gkey = crate::genome::mix(aterm_lexicon::form_hash(app_id) ^ APP_LOOK_SALT);
+        let (coat, iris) = crate::genome::cat_fills_v4(gkey);
+        Self {
+            variant: crate::genome::cat_variant_v4(gkey),
             accessory: None,
             coat,
             iris,
@@ -493,6 +632,120 @@ mod tests {
             (Accessory::Crown, TRAIT_CROWN),
         ] {
             assert_eq!(accessory_trait_bits(Some(acc)), bit);
+        }
+    }
+
+    /// The commandline → basename extraction: paths (both separators), case
+    /// folding, `.exe` stripping, and the documented transparent launcher
+    /// plumbing (`sudo`/`env`/`npx`, `VAR=value` assignments, `-flags`).
+    #[test]
+    fn app_basename_strips_paths_prefixes_and_case() {
+        assert_eq!(app_basename("cargo build"), Some("cargo".into()));
+        assert_eq!(
+            app_basename("/usr/local/bin/Claude --resume"),
+            Some("claude".into())
+        );
+        assert_eq!(
+            app_basename(r"C:\Tools\Codex.exe run"),
+            Some("codex".into())
+        );
+        assert_eq!(
+            app_basename("sudo env FOO=bar npx somenewtool --flag"),
+            Some("somenewtool".into()),
+            "every transparent prefix defers to the token after it"
+        );
+        assert_eq!(
+            app_basename("sudo -E cargo test"),
+            Some("cargo".into()),
+            "launcher flags are plumbing, not apps"
+        );
+        assert_eq!(
+            app_basename("RUST_LOG=debug ./run.sh"),
+            Some("run.sh".into())
+        );
+        assert_eq!(app_basename(""), None);
+        assert_eq!(app_basename("   "), None);
+        assert_eq!(
+            app_basename("FOO=bar"),
+            None,
+            "assignments alone name no app"
+        );
+    }
+
+    /// The canonical table is policy: every shell is the ONE "shell" app, the
+    /// flagships keep their spelled-out ids, and an unknown basename is its
+    /// own id (distinct, deterministic).
+    #[test]
+    fn canonical_table_folds_shells_and_pins_flagships() {
+        for shell in ["zsh", "bash", "fish", "sh", "pwsh", "nu"] {
+            assert_eq!(canonical_app_id(shell), "shell");
+        }
+        for flagship in ["claude", "codex", "agy", "aider", "gemini", "cursor"] {
+            assert_eq!(canonical_app_id(flagship), flagship);
+        }
+        assert_eq!(canonical_app_id("somenewtool"), "somenewtool");
+    }
+
+    /// The flagship breeds are FIXED tuples (never hash luck) and pairwise
+    /// distinct — pinned here so a ramp or roster refactor that would silently
+    /// re-dress the claude cat fails loudly instead.
+    #[test]
+    fn flagship_breeds_are_fixed_and_distinct() {
+        let expect = [
+            ("shell", (CatGlyphId::S103, 1, 5, CatAge::Adult)),
+            ("claude", (CatGlyphId::S108, 12, 0, CatAge::Adult)),
+            ("codex", (CatGlyphId::S117, 15, 7, CatAge::Adult)),
+            ("agy", (CatGlyphId::S122, 3, 6, CatAge::Adolescent)),
+        ];
+        let mut looks = Vec::new();
+        for (id, (variant, coat, iris, age)) in expect {
+            let look = KittyLook::for_app(id);
+            assert_eq!(
+                (look.variant, look.coat, look.iris, look.age),
+                (variant, coat, iris, age),
+                "{id} wears its hand-picked tuple"
+            );
+            looks.push(look);
+        }
+        for i in 0..looks.len() {
+            for j in i + 1..looks.len() {
+                assert_ne!(looks[i], looks[j], "flagships are pairwise distinct");
+            }
+        }
+    }
+
+    /// An unknown app derives its breed from the NAME and is stable: two
+    /// resolutions yield the identical tuple (a pure function — same app,
+    /// same cat, every machine), and different names may differ.
+    #[test]
+    fn unknown_app_breed_is_name_derived_and_stable() {
+        let first = KittyLook::for_app("somenewtool");
+        let second = KittyLook::for_app("somenewtool");
+        assert_eq!(
+            (first.variant, first.coat, first.iris, first.age),
+            (second.variant, second.coat, second.iris, second.age),
+            "the exact tuple resolves identically twice"
+        );
+        assert_eq!(first, second);
+        assert_eq!(first, first.normalized(), "emitted looks are renderable");
+        assert_eq!(
+            GLYPHS[first.variant as usize].kind,
+            GlyphKind::Head,
+            "the hash path only ever deals heads"
+        );
+    }
+
+    /// `for_app` never mints an accessory — bows and crowns mark COLLECTED
+    /// cats (same law as the session kitty), across flagships and the hash
+    /// path alike.
+    #[test]
+    fn for_app_never_emits_an_accessory() {
+        for id in ["shell", "claude", "codex", "agy"] {
+            assert_eq!(KittyLook::for_app(id).accessory, None);
+        }
+        for n in 0..64 {
+            let name = format!("tool{n}");
+            assert_eq!(KittyLook::for_app(&name).accessory, None, "{name}");
         }
     }
 

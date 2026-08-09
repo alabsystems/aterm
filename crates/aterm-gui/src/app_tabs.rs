@@ -325,6 +325,7 @@ impl App {
         let dropped = self.pool.detach(session);
         if dropped {
             self.retire_title_summary(session);
+            self.retire_session_status(session);
             // These caches can carry authored descriptions, generated activity,
             // cwd/title text, and debounce deadlines. The final view is the
             // lifecycle boundary: erase them immediately instead of waiting for
@@ -504,12 +505,16 @@ impl App {
     ) -> Option<crate::tab_model::TabPresentation> {
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
+                // The leaf carries its OWN session's status so the aggregate can
+                // OR it with its siblings' — a busy background pane stays visible
+                // instead of being hidden by whichever pane happens to be focused.
+                let indicators = self.session_status_indicators(terminal.session);
                 let session = self.pool.get(terminal.session)?;
-                let terminal = term_lock(&session.term);
-                let title = terminal.title();
-                Some(crate::tab_model::TabPresentation::terminal(
-                    if title.is_empty() { "Terminal" } else { title },
-                ))
+                let title = term_lock(&session.term).title().to_string();
+                let label = if title.is_empty() { "Terminal" } else { &title };
+                let mut presentation = crate::tab_model::TabPresentation::terminal(label);
+                presentation.indicators = indicators;
+                Some(presentation)
             }
             crate::tab_model::View::Native(native) => {
                 let presentation = self
@@ -542,23 +547,29 @@ impl App {
         }
     }
 
+    /// Fold one tab's live leaf presentations without storing the result.
+    fn aggregated_tab_presentation(
+        &self,
+        wid: WindowId,
+        tab_id: crate::tab_model::TabId,
+    ) -> Option<crate::tab_model::TabPresentation> {
+        let (focus, leaves) = self.windows.get(&wid).and_then(|window| {
+            let tab = window.tab_set.get(tab_id)?;
+            Some((tab.focus, tab.root.leaves()))
+        })?;
+        let presentations = leaves
+            .into_iter()
+            .filter_map(|view| self.live_view_presentation(view).map(|value| (view, value)))
+            .collect::<Vec<_>>();
+        crate::tab_model::aggregate_presentations(focus, presentations)
+    }
+
     pub(crate) fn refresh_aggregate_tab_presentation(
         &mut self,
         wid: WindowId,
         tab_id: crate::tab_model::TabId,
     ) {
-        let Some((focus, leaves)) = self.windows.get(&wid).and_then(|window| {
-            let tab = window.tab_set.get(tab_id)?;
-            Some((tab.focus, tab.root.leaves()))
-        }) else {
-            return;
-        };
-        let presentations = leaves
-            .into_iter()
-            .filter_map(|view| self.live_view_presentation(view).map(|value| (view, value)))
-            .collect::<Vec<_>>();
-        let Some(presentation) = crate::tab_model::aggregate_presentations(focus, presentations)
-        else {
+        let Some(presentation) = self.aggregated_tab_presentation(wid, tab_id) else {
             return;
         };
         if let Some(tab) = self.windows.get_mut(&wid).and_then(|window| {
@@ -571,6 +582,109 @@ impl App {
         }) {
             tab.presentation = presentation;
         }
+    }
+
+    /// Every tab that VIEWS this session, addressed by leaf rather than by
+    /// focus: a split's background pane owns indicator state of its own.
+    pub(crate) fn tabs_viewing_session(
+        &self,
+        session: u64,
+    ) -> Vec<(WindowId, crate::tab_model::TabId)> {
+        let mut tabs = Vec::new();
+        for (wid, ws) in &self.windows {
+            for tab in ws.tab_set.tabs() {
+                if tab.root.any_leaf(&mut |view| {
+                    self.view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(session)
+                }) {
+                    tabs.push((*wid, tab.id));
+                }
+            }
+        }
+        tabs
+    }
+
+    /// Refold ONE tab's indicator bits from its leaves, leaving the rest of its
+    /// presentation untouched. Returns whether the stored bits moved.
+    ///
+    /// The status path deliberately does not reuse
+    /// [`Self::refresh_aggregate_tab_presentation`]: that replaces the whole
+    /// presentation, which would drop the composed tooltip `tab_chrome_ext`
+    /// writes back until the next chrome pass. Bits only, and change-gated —
+    /// this runs at status-change rate, and a steady prompt must not dirty the
+    /// tab model.
+    pub(crate) fn refresh_tab_status_indicators(
+        &mut self,
+        wid: WindowId,
+        tab_id: crate::tab_model::TabId,
+    ) -> bool {
+        // Fold the leaves' OWN status bits directly. Deliberately NOT via
+        // `aggregated_tab_presentation`: that path resolves a live title through
+        // a BLOCKING `term_lock` per leaf, and this runs on the output path — a
+        // pane flooding inside `process()` would park the UI thread on exactly
+        // the tab it is trying to light up. That regression is already fixed and
+        // regression-tested for tab titles (`tab_titles_keep_stale_on_contention_
+        // and_never_block`); it must not come back through the status path. No
+        // lock is needed anyway: indicators come from the classifier, not the
+        // grid.
+        let Some(sessions) = self.windows.get(&wid).and_then(|window| {
+            let tab = window.tab_set.get(tab_id)?;
+            let mut sessions = Vec::new();
+            tab.root.any_leaf(&mut |view| {
+                if let Some(crate::tab_model::View::Terminal(terminal)) = self.view_store.get(*view)
+                {
+                    sessions.push(terminal.session);
+                }
+                false
+            });
+            Some(sessions)
+        }) else {
+            return false;
+        };
+        if sessions.is_empty() {
+            return false;
+        }
+        // OR across leaves so one pane never hides another (the invariant
+        // `TabIndicators` exists for). A native sibling contributes nothing here
+        // and keeps whatever it wrote out of band: `dirty` and its own
+        // `attention` are preserved, and only bits terminals actually own are
+        // recomputed.
+        let folded = sessions
+            .into_iter()
+            .map(|session| self.session_status_indicators(session))
+            .fold(
+                crate::tab_model::TabIndicators::default(),
+                |acc, bits| crate::tab_model::TabIndicators {
+                    dirty: acc.dirty,
+                    busy: acc.busy || bits.busy,
+                    attention: acc.attention || bits.attention,
+                },
+            );
+        let Some(tab) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| {
+                let index = window
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == tab_id)?;
+                window.tab_set.tab_at_mut(index)
+            })
+        else {
+            return false;
+        };
+        let indicators = crate::tab_model::TabIndicators {
+            dirty: tab.presentation.indicators.dirty,
+            busy: folded.busy,
+            attention: folded.attention || tab.presentation.indicators.attention,
+        };
+        let changed = tab.presentation.indicators != indicators;
+        tab.presentation.indicators = indicators;
+        changed
     }
 
     fn promote_terminal_projection_if_needed(
@@ -1235,8 +1349,14 @@ impl App {
         else {
             return chrome::TabChromeExt::default();
         };
-        let activity_revision = self.title_summary_activity_revision(session);
-        let activity = self.title_summary_activity(session).map(str::to_owned);
+        // Tab Subject & Status owns the live activity line when it has anything
+        // honest to say; the older generated summary remains the fallback so
+        // nothing regresses while the two subsystems coexist (RFC §11).
+        let status_text = self.session_status_text(session);
+        let activity_revision = self
+            .title_summary_activity_revision(session)
+            .wrapping_add(self.session_status_revision(session));
+        let activity = status_text.or_else(|| self.title_summary_activity(session).map(str::to_owned));
         let high_id = ctx
             .timeline
             .lock()

@@ -1480,7 +1480,7 @@ mod tests {
             app.act_app(ActRequest {
                 view,
                 ui_key: "settings/nav/appearance".to_string(),
-                action: "updates/install-relaunch".to_string(),
+                action: "updates/install-now".to_string(),
                 value: None,
             })
             .unwrap_err()

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! POSIX backend of the PTY seam: every raw `libc` PTY syscall — `forkpty`,
+//! POSIX backend of the PTY seam: every raw `libc` PTY syscall —
+//! `posix_openpt`/`fork`/`login_tty` (originally `forkpty`, replaced to close a
+//! close-on-exec window — see [`open_pty_pair_cloexec`]), the slave open
+//! (`ioctl(TIOCGPTPEER)` on Linux, `open` of the `ptsname` elsewhere — see
+//! [`open_pts_slave`]),
 //! `execve`, `read`, `write`, `ioctl(TIOCSWINSZ)` — moved VERBATIM from the
 //! pre-split `lib.rs` (zero semantic change). The shared, portable items
 //! ([`SpawnedShell`], [`crate::UTF8_LOCALE`], `build_child_env`) live in
@@ -79,7 +83,7 @@ const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
 ///
 /// # Errors
 /// Returns `PermissionDenied` if the capability's tier is too low, the OS error
-/// if `forkpty`/`pipe` fails, or `PermissionDenied`/`Other` if the child failed
+/// if the PTY pair / `pipe` / `fork` fails, or `PermissionDenied`/`Other` if the child failed
 /// to confine itself (sandbox `apply` error) or to `execve` before exec. On any
 /// pre-exec child failure the master fd is closed and NO unconfined shell is
 /// returned.
@@ -202,7 +206,7 @@ fn is_utf8_locale(loc: &str) -> bool {
 ///
 /// Pure in its inputs (like [`build_child_env`]) so it is unit-tested without
 /// mutating the process-global environment, and called in the PARENT before
-/// `forkpty` where allocation / env reads are safe. The property "the child's
+/// the fork, where allocation / env reads are safe. The property "the child's
 /// effective `LC_CTYPE` is UTF-8 for every inherited locale shape" is proven by the
 /// `SpawnLocale` Tier-0 `ty` model (`aterm_spec::derive::spawn_locale_model`) and
 /// bound to this real function by the `spawn_locale_*` conformance tests below.
@@ -232,30 +236,341 @@ pub fn resolve_spawn_locale(
     overrides
 }
 
+/// Size of the buffer a PTY slave's device path is fetched into. macOS's own
+/// `openpty` calls `ptsname_r(master, buf, 128)` and `TIOCPTYGNAME` is an
+/// `_IOC_OUT` ioctl with a FIXED 128-byte payload, so 128 is the size the
+/// platform itself assumes; Linux's `/dev/pts/N` names are far shorter. Both
+/// primitives report a name that would not fit as an error rather than
+/// truncating, so this can never yield a half path.
+const PTS_NAME_LEN: usize = 128;
+
+/// The slave device path for `master` — deliberately NOT via `ptsname`.
+///
+/// `ptsname` returns a pointer into storage it owns, and `man 3 posix_openpt`
+/// states plainly: "The `ptsname()` function is not guaranteed to be reentrant
+/// or thread safe." aterm spawns sessions from more than one thread (the GUI
+/// thread and the update-handoff worker), so this seam uses the reentrant
+/// primitive each platform actually provides:
+///
+///  * Darwin — `ioctl(TIOCPTYGNAME)`, the exact ioctl `ptsname_r` wraps there.
+///    macOS *has* `ptsname_r` (since 10.13.4), but the `libc` crate does not
+///    declare it for apple targets, and an ad-hoc `extern "C"` block would be an
+///    unchecked availability claim; the ioctl is already in `libc`.
+///  * Everywhere else — `ptsname_r`, which `libc` does declare.
+fn pts_name(master: libc::c_int) -> io::Result<CString> {
+    let mut buf = [0 as libc::c_char; PTS_NAME_LEN];
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    // SAFETY: `TIOCPTYGNAME` is an `_IOC_OUT` ioctl whose payload size is
+    // exactly `PTS_NAME_LEN`; `buf` is a live, owned buffer of precisely that
+    // size, and the kernel NUL-terminates the name it writes into it.
+    let rc = unsafe {
+        libc::ioctl(
+            master,
+            libc::TIOCPTYGNAME as libc::c_ulong,
+            buf.as_mut_ptr(),
+        )
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    // SAFETY: `buf` is a live, owned buffer and we pass its exact length;
+    // `ptsname_r` either NUL-terminates within that length or fails (ERANGE).
+    let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `rc == 0` means the primitive wrote a NUL-terminated path into
+    // `buf`, which is live for this borrow; `to_owned` copies it out at once.
+    Ok(unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_owned())
+}
+
+/// The SLAVE end of `master` — close-on-exec and NOT a controlling terminal from
+/// the moment it exists.
+///
+/// ## Why Linux does not reach it by path
+///
+/// `ptsname_r` + `open("/dev/pts/N")` is a NAME lookup in the caller's mount
+/// namespace, and it is correct only while the devpts instance the master
+/// belongs to is the instance currently mounted at `/dev/pts`. glibc's `openpty`
+/// — which the `forkpty` this seam replaced called — does NOT depend on that:
+/// since glibc 2.27 (login/openpty.c, 2017-10-08) it asks the KERNEL for the
+/// peer first, `ioctl(ptmx, TIOCGPTPEER, O_RDWR | O_NOCTTY)` (Linux 4.13+), and
+/// consults the path only when that ioctl is unsupported. A path-only slave open
+/// is therefore a NARROWING of what already worked on Linux, and it was MEASURED
+/// to be one — on Linux 6.8 aarch64 against glibc 2.36 and 2.39:
+///
+///  * In a STEADY-STATE topology where `/dev/ptmx` resolves into a devpts that is
+///    not the one mounted at `/dev/pts` (a second devpts instance, the shape a
+///    container/chroot with its own `/dev` produces; nothing perturbed after the
+///    master was opened), `openpty` SUCCEEDS while the by-path open fails
+///    `ENOENT` — the session simply would not spawn where it used to.
+///  * When the instance at `/dev/pts` happens to hold a pty at the SAME index,
+///    the by-path open SUCCEEDS onto a DIFFERENT terminal: measured, a byte
+///    written into that slave never arrives on this master. A silent
+///    cross-terminal misconnection, in the very seam that exists to stop
+///    terminals from crossing.
+///  * The same divergence appears whenever the mount topology moves under a live
+///    master (`/dev/pts` unmounted, over-mounted, replaced by a fresh instance,
+///    or left behind by a `chroot`): by-path fails or mispoints, `TIOCGPTPEER`
+///    returns the right peer every time.
+///
+/// `TIOCGPTPEER` has none of those failure modes and is strictly better than the
+/// path on every axis this seam cares about: one syscall, no name lookup, no
+/// namespace dependency, and it returns the peer OF THIS MASTER by construction
+/// rather than by name. Its argument IS the `open(2)` flag word, so the
+/// descriptor is born `O_CLOEXEC` — the property [`open_pty_pair_cloexec`] exists
+/// to guarantee — with no window at all. MEASURED on Linux 6.8: the returned fd
+/// has `FD_CLOEXEC` set, and like `open(pts, O_NOCTTY)` it does NOT become this
+/// process's controlling terminal (with the `O_NOCTTY`-dropped control adopting
+/// one, so the observation is not vacuous).
+///
+/// The path stays as the FALLBACK, taken on any refusal — pre-4.13 kernels
+/// answer `EINVAL`/`ENOTTY` — which is the same two-step glibc itself performs.
+/// Non-Linux platforms take the path unconditionally and unchanged: Darwin has no
+/// `TIOCGPTPEER` and its own `openpty` is path-based, so nothing there moves.
+///
+/// # Errors
+/// The OS error from `ptsname_r` or from the `open`. No descriptor escapes on any
+/// error path — the only fd this can produce is the one it returns.
+fn open_pts_slave(master: libc::c_int) -> io::Result<libc::c_int> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `master` is a live `/dev/ptmx` descriptor. `TIOCGPTPEER` takes
+        // its argument BY VALUE — an `open(2)` flag word, not a pointer — and
+        // returns a fresh descriptor or -1, writing through no memory we own.
+        let peer = unsafe {
+            libc::ioctl(
+                master,
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        if peer >= 0 {
+            return Ok(peer);
+        }
+        // Any refusal falls through to the path, exactly as glibc's `openpty`
+        // does with the same failure: a pre-4.13 kernel that never heard of the
+        // ioctl is the case this fallback is FOR, and a newer kernel that
+        // declines is no worse off than the path-only code this replaces.
+    }
+
+    let name = pts_name(master)?;
+    // SAFETY: `name` is the NUL-terminated pts path the kernel just reported for
+    // `master`; `open` reads it and returns a fresh fd or -1.
+    let slave = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(slave)
+}
+
+/// Confirm `fd` is close-on-exec, setting the flag if the OPEN did not.
+///
+/// This is a VERIFICATION with a fallback, never the primary mechanism. The only
+/// window-free way to get a close-on-exec descriptor is `O_CLOEXEC` at the
+/// `open(2)` that creates it — a `fcntl` afterwards leaves a gap in which a fork
+/// on another thread yields an exec-surviving copy, which is the entire defect
+/// [`open_pty_pair_cloexec`] exists to remove. But POSIX does not *require*
+/// `posix_openpt` to honor `O_CLOEXEC` (it is undocumented-but-real on Darwin —
+/// `posix_openpt` there is a bare `open("/dev/ptmx", oflag)`), and aterm ships
+/// back to macOS 11, so the flag is read back and only repaired if absent.
+/// Taking the fallback re-opens the window, narrowed to the handful of
+/// instructions between the `open` and this `fcntl` — the narrowest correct
+/// behavior available on a platform that ignores the flag, and still strictly
+/// better than the `forkpty` this replaces, which never set the flag on the
+/// slave at all and set it on the master only AFTER the fork.
+/// `pty_open_honors_cloexec_flag` asserts the fallback is NOT what runs here.
+fn fd_is_cloexec_or_make_it(fd: libc::c_int) -> bool {
+    // SAFETY: `fd` is a descriptor the caller just opened and still owns;
+    // `F_GETFD`/`F_SETFD` only read and write the descriptor-flag word.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags == -1 {
+            return false;
+        }
+        if flags & libc::FD_CLOEXEC != 0 {
+            return true;
+        }
+        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) != -1
+    }
+}
+
+/// Open a PTY pair in which BOTH descriptors are close-on-exec FROM BIRTH, and
+/// apply `termp`/`winp` to the slave — `openpty(3)` minus its defect.
+///
+/// ## Why not `openpty`/`forkpty`
+///
+/// `openpty` (and therefore `forkpty`, which is `openpty` + `fork` +
+/// `login_tty`) opens BOTH ends without `O_CLOEXEC`, VERIFIED at the instruction
+/// level on macOS 26.5.1: `posix_openpt(0x20002 = O_RDWR|O_NOCTTY)` → `grantpt`
+/// → `unlockpt` → `ptsname_r` → `open(path, 0x20002)`, with the `O_CLOEXEC` bit
+/// (`0x1000000`) absent from both flag words. So from the moment `openpty`
+/// returns until the parent's `close(slave)` on the far side of the fork, BOTH
+/// fds sit in the parent's table with no close-on-exec flag. aterm is
+/// multi-threaded and the update-handoff worker calls `Command::spawn` on its
+/// own thread while the GUI thread may be spawning a session; a `posix_spawn`
+/// landing in that window (MEASURED: 414 inheritance events across 400 real
+/// spawns, ~1.5e-3 slave / ~1.1e-2 master per spawn pair) hands an unrelated
+/// process a live, WRITABLE descriptor onto another session's terminal — a
+/// confirmed cross-session injection and exfiltration channel that bypasses the
+/// WriteInput/EdgeToken gate entirely. Setting `FD_CLOEXEC` after the fact does
+/// NOT close it: a thread that forked microseconds ago already holds a copy that
+/// its own `exec` will preserve. The flag has to be there at birth.
+///
+/// ## The sequence, and what each step preserves
+///
+/// 1. `posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC)` — master, flagged by the
+///    `open(2)` itself. There is NO window on the master.
+/// 2. `grantpt` + `unlockpt`. On Darwin these are the single ioctls
+///    `TIOCPTYGRANT` / `TIOCPTYUNLK`; unlike historical glibc there is no
+///    `pt_chown` helper fork, so they open no window of their own.
+/// 3. The SLAVE with `O_RDWR | O_NOCTTY | O_CLOEXEC`, likewise flagged at birth —
+///    `ioctl(TIOCGPTPEER)` on Linux, `open(pts, …)` everywhere else and as the
+///    fallback ([`open_pts_slave`] carries the measurements for why the path
+///    alone is a regression on Linux; both forms take the same flag word, and
+///    both honor it). `O_NOCTTY` is LOAD-BEARING and newly so: `openpty` opened
+///    the slave inside libutil, but this open happens in ATERM'S OWN PROCESS,
+///    and a parent that is a session leader with no controlling terminal (the
+///    launchd/Finder `.app` shape aterm ships in) would SILENTLY ADOPT it as its
+///    controlling terminal without it (MEASURED: `/dev/tty` goes from unopenable
+///    to openable). The child acquires the ctty later and explicitly, via
+///    `login_tty`'s `TIOCSCTTY`, which is unaffected by `O_NOCTTY`.
+/// 4. `tcsetattr(slave, TCSAFLUSH, termp)` then `ioctl(slave, TIOCSWINSZ, winp)`
+///    — the same two calls, in the same order, with the same `TCSAFLUSH`, that
+///    `openpty` makes internally. Applying them HERE, in the parent, before any
+///    fork, is what preserves the atomicity the seam has always relied on: the
+///    child's very first `tcgetattr`/`TIOCGWINSZ` already answers with these
+///    values, so there is no post-fork `tcsetattr` race with the shell's own
+///    termios reads. MEASURED byte-for-byte identical (`memcmp` of the whole
+///    `termios`, plus the `winsize`) to `openpty(&termp, &winp)`, and
+///    non-vacuously so — a kernel-default slave differs. Like `openpty`, both
+///    are BEST-EFFORT: `openpty` discards their return values, and failing the
+///    spawn on a `tcsetattr` that cannot fail on a freshly-opened pts would be a
+///    new error path, not a preserved one.
+///
+/// Both fds are close-on-exec before this returns, VERIFIED by reading the flag
+/// back rather than assumed (see [`fd_is_cloexec_or_make_it`]). The master stays
+/// an ordinary, flag-mutable descriptor whose number is stable — `set_cloexec`
+/// must be able to CLEAR the flag so the master survives the seamless-update
+/// re-exec, and that fd number rides `ATERM_SEAMLESS_FDS` across the handoff.
+///
+/// # Errors
+/// The OS error from whichever step failed. FAIL-CLOSED on every path: no
+/// descriptor and no half-built pair escapes — the master is closed before
+/// returning any error raised after it was opened.
+fn open_pty_pair_cloexec(
+    termp: Option<&libc::termios>,
+    winp: Option<&libc::winsize>,
+) -> io::Result<(libc::c_int, libc::c_int)> {
+    // (1) MASTER — close-on-exec at the `open(2)` that creates it.
+    // SAFETY: `posix_openpt` takes only a flag word and returns a fresh fd or -1.
+    let opened = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    let master = if opened >= 0 {
+        opened
+    } else {
+        let first = io::Error::last_os_error();
+        // Only EINVAL can mean "this platform rejects the O_CLOEXEC bit" (POSIX
+        // spells an unsupported `oflag` bit exactly that way). Anything else —
+        // ENXIO/EAGAIN/EMFILE, i.e. out of ptys or out of descriptors — is a
+        // real failure that a retry would only repeat, so surface it as-is.
+        if first.raw_os_error() != Some(libc::EINVAL) {
+            return Err(first);
+        }
+        // SAFETY: as above; the retry drops only the flag bit.
+        let retry = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        if retry < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        retry
+    };
+    if !fd_is_cloexec_or_make_it(master) {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing the master we just opened; nothing else exists yet.
+        unsafe {
+            libc::close(master);
+        }
+        return Err(err);
+    }
+
+    // (2) grant + unlock the slave side.
+    // SAFETY: `master` is a live /dev/ptmx descriptor; both calls are ioctls on
+    // it and write nothing through any pointer we own.
+    let granted = unsafe { libc::grantpt(master) == 0 && libc::unlockpt(master) == 0 };
+    if !granted {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing the master we opened above.
+        unsafe {
+            libc::close(master);
+        }
+        return Err(err);
+    }
+
+    // (3) SLAVE — close-on-exec at birth, and NOT this process's ctty.
+    let slave = match open_pts_slave(master) {
+        Ok(s) => s,
+        Err(err) => {
+            // SAFETY: closing the master we opened above; no slave exists yet.
+            unsafe {
+                libc::close(master);
+            }
+            return Err(err);
+        }
+    };
+    if !fd_is_cloexec_or_make_it(slave) {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing both ends we opened above.
+        unsafe {
+            libc::close(slave);
+            libc::close(master);
+        }
+        return Err(err);
+    }
+
+    // (4) termios + winsize on the SLAVE, in the parent, before any fork —
+    //     exactly the two calls `openpty` makes, and best-effort exactly as it
+    //     makes them (it discards both return values).
+    if let Some(t) = termp {
+        // SAFETY: `t` is a live, fully-initialized termios and `slave` is a
+        // freshly-opened pts; `tcsetattr` only reads through the pointer.
+        unsafe {
+            libc::tcsetattr(slave, libc::TCSAFLUSH, ptr::from_ref(t));
+        }
+    }
+    if let Some(w) = winp {
+        // SAFETY: `w` is a live, fully-initialized winsize; `TIOCSWINSZ` reads
+        // exactly that struct through the pointer.
+        unsafe {
+            libc::ioctl(slave, libc::TIOCSWINSZ, ptr::from_ref(w));
+        }
+    }
+    Ok((master, slave))
+}
+
 /// The termios a NULL-termios `openpty`/`forkpty` gives the slave — the kernel's
 /// compiled-in defaults — probed ONCE per process via a throwaway PTY pair and
 /// cached. Probing (instead of hardcoding `TTYDEF_*`) guarantees "identical to
 /// the NULL path except our documented deltas" by construction. `None` when the
 /// probe fails; the spawn then passes NULL exactly as before.
+///
+/// The throwaway pair comes from [`open_pty_pair_cloexec`], not `openpty`, for
+/// the same reason the real spawn does: `openpty` would put two NON-close-on-exec
+/// descriptors in this multi-threaded process for the duration of the probe. The
+/// window is narrower here (both fds are closed inside this function, once per
+/// process) but it is the SAME defect, and leaving one live counter-example in
+/// the file that fixes it would be an oversight, not a simplification.
 fn kernel_default_termios() -> Option<libc::termios> {
     static DEFAULTS: std::sync::OnceLock<Option<libc::termios>> = std::sync::OnceLock::new();
     *DEFAULTS.get_or_init(|| {
-        let mut m: libc::c_int = -1;
-        let mut s: libc::c_int = -1;
-        // SAFETY: valid out-params; null name/termios/winsize is the documented
-        // "kernel defaults" form of `openpty`. Both fds are closed before return,
-        // `tcgetattr` only fills the zeroed out-param.
+        // `None`/`None` is the "kernel defaults" form: open the pair and change
+        // nothing about the slave, so `tcgetattr` reports what the kernel chose.
+        let (m, s) = open_pty_pair_cloexec(None, None).ok()?;
+        // SAFETY: `s`/`m` are the live pair just opened and owned here;
+        // `tcgetattr` only fills the zeroed out-param, and both are closed
+        // before this returns on every path.
         unsafe {
-            if libc::openpty(
-                &mut m,
-                &mut s,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            ) != 0
-            {
-                return None;
-            }
             let mut t: libc::termios = std::mem::zeroed();
             let ok = libc::tcgetattr(s, &mut t) == 0;
             libc::close(s);
@@ -265,7 +580,7 @@ fn kernel_default_termios() -> Option<libc::termios> {
     })
 }
 
-/// Build the slave termios handed to `forkpty`: the probed kernel defaults with
+/// Build the slave termios applied at slave-open time: the probed kernel defaults with
 /// exactly two deltas (everything else — cc chars, lflags, iflags, oflags — is
 /// bit-identical):
 ///
@@ -300,11 +615,13 @@ fn build_spawn_termios(mut t: libc::termios, bench_no_opost: bool) -> libc::term
     t
 }
 
-/// The termios passed to `forkpty` — `None` means NULL (kernel defaults), which
-/// is the historical spawn path, byte-identical behavior. `ATERM_PTY_NULL_TERMIOS=1`
-/// forces that historical path (the A/B revert switch for the
-/// [`build_spawn_termios`] deltas). Runs in the PARENT before `forkpty` (env
-/// reads + the one-time probe allocate; the post-fork child stays
+/// The termios applied to the spawn's slave — `None` means "apply none", i.e.
+/// the kernel defaults, which is the historical spawn path (`forkpty`'s NULL
+/// `termp`), byte-identical behavior. `ATERM_PTY_NULL_TERMIOS=1` forces that
+/// historical path (the A/B revert switch for the [`build_spawn_termios`]
+/// deltas), and with the explicit slave open it means exactly what it always
+/// meant: open the slave and do NOT `tcsetattr` it. Runs in the PARENT before
+/// the fork (env reads + the one-time probe allocate; the post-fork child stays
 /// async-signal-safe and untouched).
 fn spawn_termios() -> Option<libc::termios> {
     if std::env::var_os("ATERM_PTY_NULL_TERMIOS").is_some_and(|v| v == "1") {
@@ -314,17 +631,765 @@ fn spawn_termios() -> Option<libc::termios> {
     kernel_default_termios().map(|t| build_spawn_termios(t, bench_no_opost))
 }
 
+// ===========================================================================
+// THE EXEC-STATUS CHANNEL
+//
+// `spawn_shell_with_pid` needs one bit back from its child across the fork:
+// "did you reach `execve`, or did you fail before it?". The protocol is one
+// byte plus EOF, and it is unchanged by everything below:
+//
+//   child writes 1 byte then `_exit`  ->  FAILED before exec (b'S' / b'E')
+//   `execve` succeeds, O_CLOEXEC closes the write end  ->  parent reads EOF
+//
+// What changed is HOW the channel is built and HOW the parent waits on it.
+//
+// ## The defect this replaces
+//
+// The channel used to be `pipe(2)` followed by two separate
+// `fcntl(F_SETFD, FD_CLOEXEC)` calls. `pipe(2)` returns two descriptors with NO
+// close-on-exec flag (MEASURED on macOS 26.5.1: `F_GETFD` = 0x0 on both ends the
+// instant `pipe` returns), so between the `pipe` and the second `fcntl` BOTH ends
+// sat unflagged in a MULTI-THREADED process. This is the identical defect
+// [`open_pty_pair_cloexec`] exists to remove on the pty pair, simply missed on
+// the status pipe.
+//
+// aterm reaches it from its OWN code: the update-handoff worker calls
+// `Command::spawn` on its own thread (aterm-gui `app_update_handoff.rs`) while
+// the GUI thread opens sessions, and `Command::spawn` bottoms out in
+// `posix_spawn(2)` — ONE syscall, which libSystem does NOT serialise against
+// anything (MEASURED: a registered `pthread_atfork` prepare handler runs 1 time
+// for `fork()` and 0 times for `posix_spawn()`). So no application-level lock can
+// ever cover the window, and an unrelated process ends up holding a copy of
+// `status_wr`.
+//
+// The harm is worse than it first looks, and it is TWO distinct bugs:
+//
+//  1. THE HANG (success path only). A stranger holding a copy of the write end
+//     keeps it open, so EOF NEVER ARRIVES until the stranger exits, and the
+//     parent's blocking `read` waits exactly that long. MEASURED against this
+//     very function: 6 write-end inherits in 1500 spawns run against a 3-thread
+//     `Command::spawn` storm, and EXACTLY 6 calls blocked, each for 20.005-20.238 s
+//     against a stranger told to live 20 s — a 1:1 correlation, with the block
+//     ending at the instant the stranger died. In production the stranger is the
+//     SUCCESSOR ATERM PROCESS the update handoff spawns, which lives for the rest
+//     of the user's login session; the thread opening the session is simply gone.
+//  2. SILENT CORRUPTION OF A GOOD SPAWN (and NO timeout can fix this one). A
+//     stranger that WRITES into the inherited write end makes the parent's read
+//     return n=1 from a child that exec'd PERFECTLY — MEASURED 3/3, ~1-2 ms. The
+//     parent then takes the failure branch, closes the master, kills a healthy
+//     shell and reports "child failed to exec". Only closing the window prevents
+//     this, which is why a bounded read is defence in depth here and NOT the fix.
+//
+// A pre-exec FAILURE is unaffected by a stranger either way: the byte is in the
+// channel's BUFFER and `read` returns it regardless of who else holds a write end
+// (MEASURED with the stranger verified still alive at unblock — `waitpid(WNOHANG)
+// == 0` — read n=1 in 1-2 ms). That asymmetry is what makes a bounded wait sound:
+// a bound can never convert a real pre-exec failure into a false success.
+//
+// ## What is actually available on Darwin
+//
+// The entire atomic-close-on-exec surface on this platform is THREE constants:
+// `O_CLOEXEC`, `F_DUPFD_CLOEXEC` and `FD_CLOEXEC`. Verified absent, each three
+// independent ways (header grep, `dlsym`, and a link attempt): `pipe2`,
+// `accept4`, `dup3`, `SOCK_CLOEXEC` (`socketpair` with the Linux bit fails
+// `EPROTONOSUPPORT`), and `MSG_CMSG_CLOEXEC` (an SCM_RIGHTS broker just relocates
+// the window into the receiver — the received fds arrive `F_GETFD` = 0x0).
+// `F_DUPFD_CLOEXEC` produces a correctly-flagged COPY but cannot help: `pipe(2)`
+// already ran, so the ORIGINALS were unflagged for the whole duration.
+//
+// So on Darwin only `open(2)` can create an already-flagged descriptor, which
+// means a window-free carrier must have a PATHNAME. Hence the FIFO.
+//
+// ## Rejected, with the measurement that rejected it
+//
+//  * A PTY PAIR as the carrier (atomic, no filesystem, and it would reuse
+//    [`open_pty_pair_cloexec`] which is already in this file and already
+//    audited). It is an ATTRACTIVE TRAP and a naive test PASSES: Darwin's
+//    `read(master)` really does return 0/EOF after the last slave closes. But the
+//    tty OUTPUT QUEUE IS FLUSHED at last-slave-close, so if the parent does not
+//    reach its `read` before the child fully exits — the ORDINARY case under load —
+//    the failure byte is GONE and `read` returns 0. MEASURED 15/15 deterministic,
+//    with pipe and fifo both retaining the byte in the same harness. Shipping it
+//    would turn a sandbox-confinement failure into the EOF SUCCESS verdict: a
+//    fail-OPEN on the one path this seam fails closed on. If anyone re-proposes a
+//    pty carrier, that is the test to run first.
+//  * A POOL of pre-created pipes. A pipe is single-use (after EOF it re-reads
+//    n=0 forever, and an anonymous pipe has no name to reopen a write end
+//    through), and a RETAINED template write end suppresses EOF exactly like a
+//    stranger does — MEASURED: `select` on the read end times out at 300 ms while
+//    the template is held, and EOF arrives the instant it is closed. So a pool is
+//    a finite stock whose refill reopens the window; it would bound the damage
+//    invisibly and ship as a false fix.
+//  * A SPAWN LOCK. Provably cannot cover `posix_spawn` (the `pthread_atfork`
+//    measurement above), so it cannot cover `Command::spawn` or any third-party
+//    spawn.
+// ===========================================================================
+
+/// How long the parent waits for the child's exec-status verdict before giving
+/// up and FAILING CLOSED.
+///
+/// This is DEFENCE IN DEPTH, not the fix — [`open_exec_status_channel`] closes
+/// the window that made an unbounded wait reachable. The bound exists so that a
+/// FUTURE leak (a new unflagged descriptor somewhere, a platform that drops to
+/// [`ExecStatusCarrier::RacyPipe`], a child stopped by a debugger between fork
+/// and exec) degrades to a slow, visible, recoverable failure instead of the
+/// unbounded freeze measured above.
+///
+/// TEN SECONDS, against measurements of the legitimate path:
+///  * fork -> EOF on a successful spawn: p50 2.99 ms, p99 6.0 ms, max 12.7 ms
+///    over n=5000 at ordinary load.
+///  * the whole `spawn_shell_with_pid` call: p50 3.2 ms, p99 5.3 ms.
+///  * under a DELIBERATELY pathological load (loadavg 118 on 18 cores, spawner
+///    at `nice -n 20`), n=20000: p50 4.5 ms, p99 206 ms, MAX 523 ms. That 523 ms
+///    is the slowest legitimate success reproducible on this machine.
+///  * the FAILURE paths are consistently FASTER (they skip `execve`): b'E' max
+///    182 ms, b'S' max 405 ms under the same pathological load.
+///  * the exec TARGET does not move the number — EOF fires at the kernel image
+///    switch, before dyld runs the new image: /bin/zsh, 40 freshly-copied
+///    binaries with cold code-signature validation, and a quarantined binary all
+///    land at p50 ~2.9-3.0 ms.
+///
+/// So the margin is 19x over the slowest legitimate outcome ever observed and
+/// ~3000x over the median, while the measured HANGS were 5 s, 20 s and 65 s
+/// (whatever the stranger's lifetime happened to be). Margin is deliberately
+/// generous rather than tight because two legitimate slow paths could NOT be
+/// measured here: an exec target on a stalled network filesystem (the wait
+/// includes the kernel image load) and severe swap thrash.
+const EXEC_STATUS_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The longest single sleep [`wait_for_exec_status`] will take inside its budget.
+///
+/// LOAD-BEARING, and not a tuning knob. All the CORRECTNESS of the wait lives in
+/// the non-blocking `read` at the top of each iteration; the readiness primitive
+/// is only there to avoid busy-waiting. Capping each wait slice means that even a
+/// readiness primitive that never fires at all degrades the wait to a 100 ms-granular
+/// poll — a LATENCY bug, never a hang and never a wrong verdict.
+///
+/// That is not hypothetical on this platform. MEASURED on macOS 26.5.1 against a
+/// FIFO read end whose last writer closes: `poll()` returns n=0 with revents 0x0
+/// and `kqueue`/`EVFILT_READ` returns n=0 — NEITHER EVER REPORTS EOF, even at a
+/// 2 s timeout — while `read()` on the same descriptor correctly returns 0. Only
+/// `select()` is right (it woke at 100.2 ms on a delayed EOF). The same three
+/// mechanisms are all correct on a PIPE, which is exactly why this is a trap: a
+/// maintainer who "modernises" the `select` below into a `poll` would see every
+/// pipe-based test still pass.
+///
+/// The blast radius of that mistake is EXACTLY one slice, and that is this
+/// constant's whole job. VERIFIED by mutation: replacing the `select` with a
+/// `poll` leaves every correctness test green and costs up to 100 ms of latency
+/// per successful spawn — a real regression on every session open, but a
+/// LATENCY one, not the 10 s hang the same mistake would cause if the wait
+/// slept for its whole remaining budget in one call.
+/// The Darwin-only `darwin_fifo_eof_is_invisible_to_poll_and_kqueue_but_not_select`
+/// test pins both the platform fact and [`wait_readable_briefly`]'s own behaviour
+/// on it, so that mutation does not pass silently. (Named in prose, not linked:
+/// it is `cfg(target_os = "macos")`, and an intra-doc link to it would dangle in
+/// a Linux docs build.)
+const EXEC_STATUS_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Which mechanism produced the exec-status channel — recorded so a fallback to
+/// the racy carrier is OBSERVABLE rather than a silent security regression.
+///
+/// The two atomic variants are `cfg`-gated to the platform that can produce
+/// them, so a build in which the atomic route was silently compiled out fails
+/// to NAME it rather than carrying a variant nothing constructs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExecStatusCarrier {
+    /// Linux `pipe2(fds, O_CLOEXEC)`: ONE syscall, both ends flagged by the call
+    /// that creates them. No window, no filesystem, no cost.
+    #[cfg(target_os = "linux")]
+    Pipe2,
+    /// Darwin: a FIFO created with `mkfifo(2)` and opened twice with `O_CLOEXEC`,
+    /// then immediately unlinked. Both descriptors are flagged BY `open(2)`
+    /// ITSELF, so there is no instant at which either exists unflagged.
+    #[cfg(target_os = "macos")]
+    Fifo,
+    /// `pipe(2)` + two `fcntl(F_SETFD)` — the ORIGINAL, RACY carrier, kept ONLY
+    /// as a last resort for a platform with neither of the above or a machine
+    /// where the atomic route failed (a read-only or full temp filesystem, an
+    /// exhausted inode table, a sandbox profile that denies `mkfifo`). It
+    /// reintroduces the window, so taking it is counted and announced, and
+    /// [`EXEC_STATUS_BUDGET`] is what stops it becoming an unbounded hang.
+    RacyPipe,
+}
+
+/// How many times this process fell back to [`ExecStatusCarrier::RacyPipe`].
+///
+/// The honest answer to "what should the fallback do?": refusing to spawn would
+/// turn a temp-directory problem into an inability to open a terminal at all,
+/// while falling back SILENTLY would reintroduce the defect on exactly the
+/// machines where it cannot be seen. So it falls back, bounded, and says so.
+static RACY_EXEC_STATUS_CARRIERS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record — and, the first time only, announce — a fallback to the racy carrier.
+fn note_racy_exec_status_carrier(why: &io::Error) {
+    use std::sync::atomic::Ordering;
+    let prior = RACY_EXEC_STATUS_CARRIERS.fetch_add(1, Ordering::Relaxed);
+    if prior == 0 {
+        eprintln!(
+            "aterm-pty: the atomic exec-status channel could not be created ({why}); falling \
+             back to pipe(2)+fcntl, which leaves both ends briefly inheritable by a concurrent \
+             spawn. The spawn's status wait stays bounded at {EXEC_STATUS_BUDGET:?}, so this \
+             degrades to a slow visible failure rather than a hang."
+        );
+    }
+}
+
+/// Confirm `fd` really is close-on-exec, WITHOUT the repairing fallback
+/// [`fd_is_cloexec_or_make_it`] offers.
+///
+/// The pty pair tolerates a repair because `posix_openpt` is not REQUIRED by
+/// POSIX to honor `O_CLOEXEC`. Here the flag came from `pipe2`/`open(2)`, both of
+/// which are specified to honor it, so a missing flag means the atomic property
+/// this carrier exists for does not hold — and the answer is to fall back to the
+/// carrier that at least announces itself, not to paper over it with an `fcntl`.
+fn fd_is_cloexec(fd: libc::c_int) -> bool {
+    // SAFETY: `fd` is a descriptor the caller just opened and still owns;
+    // `F_GETFD` only reads the descriptor-flag word.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    flags != -1 && flags & libc::FD_CLOEXEC != 0
+}
+
+/// Put `fd` in non-blocking mode.
+///
+/// Applied to the READ end of every carrier, because [`wait_for_exec_status`]
+/// derives its whole verdict from a non-blocking `read` (the one primitive that
+/// is correct on every carrier and platform combination measured). `O_NONBLOCK`
+/// is a status flag on THIS file description — the parent's own, created above
+/// and not yet shared with anyone — so setting it races with nothing, and it does
+/// not touch the WRITE end's description, which the child uses blocking exactly
+/// as before.
+fn fd_set_nonblocking(fd: libc::c_int) -> bool {
+    // SAFETY: `fd` is a descriptor the caller just opened and still owns;
+    // `F_GETFL`/`F_SETFL` only read and write the file-status flag word.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags != -1 && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
+    }
+}
+
+/// The directory the per-spawn status FIFO is created in, resolved ONCE.
+///
+/// ## Why NOT `confstr(_CS_DARWIN_USER_TEMP_DIR)`
+///
+/// That is the obvious choice — it asks the OS instead of trusting `$TMPDIR`,
+/// and it answers `/var/folders/…/T/`, already mode 0700 owned by the invoking
+/// uid. This code called it, and it was WRONG in a way worth recording, because
+/// nothing about the API suggests it:
+///
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)` goes through libsystem_notify, whose
+/// shared region is lazily built under an `os_alloc_once` gate. `fork(2)` runs
+/// libSystem's own `pthread_atfork` CHILD handlers before returning, one of which
+/// is `notify_fork_child`, and it takes that same gate. If any OTHER thread was
+/// inside that once-gate when a thread forked, the child finds it held by a
+/// thread that does not exist in the child, and libplatform ABORTS:
+///
+/// ```text
+///   BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt
+///   libsystem_c.dylib: crashed on child side of fork pre-exec
+///   _os_once_gate_corruption_abort <- _os_once <- _os_alloc_once
+///     <- notify_fork_child <- libSystem_atfork_child <- fork <- forkpty
+/// ```
+///
+/// The child is killed with **SIGKILL** — inside `fork()` itself, before a single
+/// instruction of our post-fork branch runs, so nothing in the child branch can
+/// prevent or even observe it. MEASURED, and not as a subtlety: with unmodified
+/// production code and a test that does nothing but call
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)` on six threads, a concurrent `forkpty`
+/// child died 16 times in 25 runs. In aterm that is a session's shell being
+/// SIGKILLed at random because an unrelated thread asked where the temp
+/// directory is. It is the same class of hazard as everything else in this file:
+/// a multi-threaded process forking is allowed to touch almost nothing.
+///
+/// ## What is used instead
+///
+/// `std::env::temp_dir()` — a plain `getenv("TMPDIR")` with a `/tmp` fallback. No
+/// notify, no XPC, no lazily-initialised gate, so it cannot arm the abort above.
+/// Resolved ONCE into a `OnceLock` so even the environment read happens a single
+/// time, off the per-spawn path.
+///
+/// ## The `$TMPDIR` question, answered rather than waved away
+///
+/// This does trust an environment variable, which `confstr` did not. It is
+/// nonetheless the right trade, because a redirected `TMPDIR` cannot get an
+/// attacker anything: [`open_exec_status_fifo`] creates the node with `mkfifo`
+/// (which FAILS `EEXIST` rather than opening something already there), names it
+/// unpredictably, opens both ends `O_NOFOLLOW`, and then VERIFIES the result is
+/// one fifo, owned by our own euid, mode 0600, with both descriptors on the same
+/// `st_dev`/`st_ino` ([`fifo_ends_are_one_private_object`]). A hostile directory
+/// therefore yields a failed `mkfifo` or a rejected verification — a DoS that
+/// degrades to the announced racy carrier — never a channel someone else can
+/// read or write. And anyone who can set aterm's `TMPDIR` already controls the
+/// environment aterm launches with, which is a strictly larger capability than
+/// this. Against a SIGKILLed shell, that is not a close call.
+#[cfg(target_os = "macos")]
+fn exec_status_fifo_dir() -> &'static [u8] {
+    static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut dir = std::env::temp_dir().as_os_str().as_bytes().to_vec();
+        if dir.is_empty() {
+            dir.push(b'/');
+        }
+        if dir.last() != Some(&b'/') {
+            dir.push(b'/');
+        }
+        dir
+    })
+}
+
+/// A fresh, unique, unguessable path for one spawn's FIFO.
+///
+/// UNIQUE PER SPAWN IS MANDATORY, not hygiene: two reader/writer pairs opened on
+/// the SAME fifo path share ONE kernel object — MEASURED, pair #2 wrote a byte
+/// and pair #1's READER received it. A single long-lived fifo path would make
+/// concurrent session opens read each other's exec verdicts.
+///
+/// Uniqueness and unpredictability come from different sources on purpose: the
+/// process-wide counter guarantees no two spawns IN THIS PROCESS can collide even
+/// if the entropy source repeated itself, and `getentropy` makes the name
+/// unguessable to anything outside it. If `getentropy` somehow fails, the clock
+/// stands in — a predictable name is a much smaller problem than no channel at
+/// all, and the counter still guarantees correctness.
+#[cfg(target_os = "macos")]
+fn exec_status_fifo_path() -> io::Result<CString> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let mut path = exec_status_fifo_dir().to_vec();
+    let mut rnd = [0u8; 8];
+    // SAFETY: `getentropy` fills exactly the 8-byte buffer it is given (its
+    // documented limit is 256 bytes) and returns 0 on success.
+    let entropy_ok = unsafe { libc::getentropy(rnd.as_mut_ptr().cast::<libc::c_void>(), rnd.len()) }
+        == 0;
+    let unpredictable = if entropy_ok {
+        u64::from_ne_bytes(rnd)
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+    };
+    // SAFETY: `getpid` reads process state and takes no arguments.
+    let pid = unsafe { libc::getpid() };
+    let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+    path.extend_from_slice(format!("aterm-xstatus-{pid:x}-{seq:x}-{unpredictable:016x}").as_bytes());
+    CString::new(path).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "per-user temp directory path contains an interior NUL",
+        )
+    })
+}
+
+/// Both fifo descriptors name ONE object, and it is the private fifo we made.
+///
+/// This is the TOCTOU check for the only interval that matters: the two `open`
+/// calls are separate syscalls, so in principle the name could be replaced
+/// between them. Comparing `st_dev`/`st_ino` proves the read end and the write
+/// end are the SAME kernel object — which is the property the protocol needs and
+/// the one substitution would break — and `S_ISFIFO` plus the owning uid proves
+/// it is ours. `O_NOFOLLOW` on both opens already refuses a symlink at the final
+/// component (MEASURED: accepted on a fifo open, and `O_CLOEXEC` still sticks
+/// alongside it), and the containing directory is 0700, so this is the third
+/// layer rather than the first.
+#[cfg(target_os = "macos")]
+fn fifo_ends_are_one_private_object(rd: libc::c_int, wr: libc::c_int) -> bool {
+    // SAFETY: both are live descriptors this function just opened; `fstat`
+    // writes exactly one `stat` through each pointer, and `geteuid` takes none.
+    unsafe {
+        let mut a: libc::stat = std::mem::zeroed();
+        let mut b: libc::stat = std::mem::zeroed();
+        if libc::fstat(rd, &mut a) != 0 || libc::fstat(wr, &mut b) != 0 {
+            return false;
+        }
+        a.st_mode & libc::S_IFMT == libc::S_IFIFO
+            && b.st_mode & libc::S_IFMT == libc::S_IFIFO
+            && a.st_dev == b.st_dev
+            && a.st_ino == b.st_ino
+            && a.st_uid == libc::geteuid()
+            && a.st_mode & 0o777 == 0o600
+    }
+}
+
+/// Build the Darwin carrier: a FIFO whose two ends are close-on-exec FROM BIRTH.
+///
+/// ORDER IS LOAD-BEARING at every step, and each of these is a silent correctness
+/// bug rather than a compile error if reversed:
+///
+///  1. `mkfifo(path, 0600)` — the name now exists, so EVERY exit path below must
+///     `unlink` it.
+///  2. `chmod(path, 0600)` — `mkfifo`'s mode is masked by the process `umask`, so
+///     a hostile umask could produce a fifo WE cannot open (permission bits are
+///     enforced against the owner too). `chmod` is not masked. Without this, a
+///     weird umask would silently demote every spawn to the racy carrier. Best
+///     effort: if it fails the opens below may still succeed.
+///  3. READ END FIRST, and with `O_NONBLOCK`. `open(O_RDONLY)` on a fifo blocks
+///     until a writer appears and `open(O_WRONLY)` blocks until a READER appears,
+///     so the writer-first order deadlocks and a blocking read-open deadlocks.
+///     `O_NONBLOCK` on `O_RDONLY` returns immediately with no writer present.
+///  4. WRITE END SECOND, and it does NOT need `O_NONBLOCK`: the reader is already
+///     open, so it returns immediately (MEASURED 13 us) and the child then writes
+///     its one status byte with ordinary blocking semantics, exactly as before.
+///  5. `unlink` AFTER BOTH OPENS. The kernel object outlives the name (MEASURED:
+///     the full fork/exec protocol works after the unlink, and the failure byte
+///     survives `waitpid` plus a 50 ms delay), so from here the channel is
+///     anonymous — no other process can reach it by name at all.
+///
+/// COST, measured on this machine: 274 us per channel against 1.2 us for
+/// `pipe`+2x`fcntl`. Absolutely that is 0.27 ms on a path whose median is 3.2 ms
+/// and which already does `fork(2)`, `execve(2)` of a shell and a full pty setup;
+/// it would only matter to something spawning in a tight loop.
+///
+/// THE RESIDUAL, stated plainly: for the ~100 us (max 318 us measured) between
+/// `mkfifo` and `unlink` the fifo has a NAME. A same-uid process that opened that
+/// exact path for writing inside that window would hold a write end and delay
+/// EOF — the same hang by a different route. That is categorically weaker than
+/// what it replaces: the defect being fixed is an ACCIDENT that fires on ordinary
+/// concurrent spawning (measured 126 times in 25 seconds), while this needs a
+/// same-uid process to GUESS a per-spawn random path inside a 100 us window. It
+/// is a trade of an accidental hazard for a much smaller adversarial one, not a
+/// reduction to zero — and [`EXEC_STATUS_BUDGET`] bounds even that.
+///
+/// # Errors
+/// The OS error from whichever step failed. FAIL-CLOSED on every path: no
+/// descriptor and no filesystem name escapes on any error.
+#[cfg(target_os = "macos")]
+fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
+    // A collision means our random name already existed; a couple of retries
+    // costs nothing and makes the (astronomically unlikely) case non-fatal.
+    let mut last = io::Error::new(io::ErrorKind::AlreadyExists, "exec-status fifo path collision");
+    for _attempt in 0..4 {
+        let path = exec_status_fifo_path()?;
+        // (1) create the name.
+        // SAFETY: `path` is a NUL-terminated path in a 0700 per-user directory;
+        // `mkfifo` reads it and creates a fifo, or returns -1.
+        if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+            last = io::Error::last_os_error();
+            if last.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(last);
+        }
+        // (2) undo any umask masking. Best-effort by design (see the doc above).
+        // SAFETY: `path` is the fifo we just created; `chmod` only sets its mode.
+        unsafe {
+            libc::chmod(path.as_ptr(), 0o600);
+        }
+        // (3) READ END — flagged close-on-exec by this `open(2)` itself, and
+        //     non-blocking so it does not wait for a writer that does not exist
+        //     yet. `O_NOFOLLOW` refuses a symlink swapped in at the final
+        //     component.
+        // SAFETY: `path` is the fifo we just created; `open` reads the path and
+        // returns a fresh descriptor or -1.
+        let rd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if rd < 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: removing the name we created above; no fd exists yet.
+            unsafe {
+                libc::unlink(path.as_ptr());
+            }
+            return Err(err);
+        }
+        // (4) WRITE END — likewise flagged by `open(2)`; blocking, and it returns
+        //     immediately because the read end is already open.
+        // SAFETY: as (3).
+        let wr = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if wr < 0 {
+            let err = io::Error::last_os_error();
+            // SAFETY: closing the read end we opened in (3) and removing the
+            // name we created in (1). Nothing else was created.
+            unsafe {
+                libc::close(rd);
+                libc::unlink(path.as_ptr());
+            }
+            return Err(err);
+        }
+        // (5) the channel is now ANONYMOUS: the object lives on in these two
+        //     descriptors and is unreachable by name.
+        // SAFETY: removing the name we created above; both fds stay valid.
+        unsafe {
+            libc::unlink(path.as_ptr());
+        }
+        // Verify what we were handed rather than assuming it: one private fifo,
+        // and both ends really carrying the flag the whole exercise is about.
+        if !fifo_ends_are_one_private_object(rd, wr) || !fd_is_cloexec(rd) || !fd_is_cloexec(wr) {
+            // SAFETY: closing the two descriptors opened in (3) and (4); the
+            // name is already gone.
+            unsafe {
+                libc::close(rd);
+                libc::close(wr);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "exec-status fifo is not the private close-on-exec object we created",
+            ));
+        }
+        return Ok((rd, wr));
+    }
+    Err(last)
+}
+
+/// Create the exec-status channel, close-on-exec FROM BIRTH wherever the
+/// platform can express that, and put its read end in non-blocking mode.
+///
+/// Returns `(read_end, write_end, carrier)`. Both ends are close-on-exec before
+/// this returns; on the atomic carriers (`ExecStatusCarrier::Pipe2` on Linux,
+/// `ExecStatusCarrier::Fifo` on Darwin — named in prose rather than linked,
+/// since each variant is `cfg`-gated to its own platform and a link would dangle
+/// on the other) there is additionally NO INSTANT at which either descriptor
+/// existed without the flag, which is the property that actually closes the defect —
+/// `fcntl(F_SETFD)` afterwards cannot, because a thread that forked microseconds
+/// ago already holds an exec-surviving copy.
+///
+/// # Errors
+/// Only if even the racy fallback cannot be created. FAIL-CLOSED on every path:
+/// no descriptor escapes on any error.
+fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> {
+    // The ATOMIC route for this platform. Both arms verify the flag by reading
+    // it back rather than trusting the call, because the entire point of the
+    // carrier is that flag.
+    #[cfg(target_os = "linux")]
+    let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> = {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is a valid 2-element buffer; `pipe2` fills exactly it and
+        // applies the flag word to BOTH descriptors as it creates them.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+            let (rd, wr) = (fds[0], fds[1]);
+            if fd_is_cloexec(rd) && fd_is_cloexec(wr) {
+                Ok((rd, wr, ExecStatusCarrier::Pipe2))
+            } else {
+                // SAFETY: closing the pair we just created; nothing else exists.
+                unsafe {
+                    libc::close(rd);
+                    libc::close(wr);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "pipe2(O_CLOEXEC) produced a descriptor without FD_CLOEXEC",
+                ))
+            }
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> =
+        open_exec_status_fifo().map(|(rd, wr)| (rd, wr, ExecStatusCarrier::Fifo));
+    // Any other Unix: no atomic route is known to be available here, so say so
+    // once through the same channel a real failure would use, rather than
+    // pretending the window is closed.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no atomic close-on-exec exec-status carrier is implemented for this platform",
+    ));
+
+    let (rd, wr, carrier) = match atomic {
+        Ok(chan) => chan,
+        Err(why) => {
+            note_racy_exec_status_carrier(&why);
+            // THE RACY FALLBACK — the original carrier, verbatim. `pipe(2)`
+            // returns both ends UNFLAGGED, so the window is open from here until
+            // the second `fcntl` lands. Kept only because refusing to spawn at
+            // all would be a worse failure than a bounded, counted, announced
+            // one; `EXEC_STATUS_BUDGET` is what stops it hanging.
+            let mut fds = [0 as libc::c_int; 2];
+            // SAFETY: `fds` is a valid 2-element buffer that `pipe` fills.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let (rd, wr) = (fds[0], fds[1]);
+            // A failure to set FD_CLOEXEC would break the success/failure
+            // distinction outright (the write end would survive into the shell
+            // and EOF would never come), so it is a hard error, not a warning.
+            // SAFETY: both fds are valid; `F_SETFD` only sets a flag word.
+            let flagged = unsafe {
+                libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
+                    && libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
+            };
+            if !flagged {
+                let err = io::Error::last_os_error();
+                // SAFETY: closing the pair we just created.
+                unsafe {
+                    libc::close(rd);
+                    libc::close(wr);
+                }
+                return Err(err);
+            }
+            (rd, wr, ExecStatusCarrier::RacyPipe)
+        }
+    };
+
+    // The parent's whole verdict comes from a non-blocking `read` (see
+    // `wait_for_exec_status`), so the read end must be non-blocking on EVERY
+    // carrier. The fifo's already is, from its `open`; this makes the others
+    // match. Failing here would leave the wait unable to distinguish "not yet"
+    // from a verdict, so it fails the spawn rather than guessing.
+    if !fd_set_nonblocking(rd) {
+        let err = io::Error::last_os_error();
+        // SAFETY: closing the pair created above; no child exists yet.
+        unsafe {
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return Err(err);
+    }
+    Ok((rd, wr, carrier))
+}
+
+/// The child's verdict, as the parent was able to establish it.
+#[derive(Debug)]
+enum ExecStatus {
+    /// EOF: every write end is gone, so the child reached `execve` and the
+    /// kernel closed the close-on-exec write end during the image switch.
+    Execed,
+    /// The child wrote a reason byte and `_exit`ed BEFORE exec.
+    FailedBeforeExec(u8),
+    /// [`EXEC_STATUS_BUDGET`] elapsed with neither a byte nor EOF.
+    NoVerdict,
+    /// The channel itself broke (not `EINTR`, not `EAGAIN`).
+    ChannelBroke(io::Error),
+}
+
+/// Read a verdict from the status channel if one is available RIGHT NOW.
+///
+/// `None` means "no verdict yet" and nothing else. `EINTR` is retried in place —
+/// a signal is not an answer — which is the EINTR semantics the original
+/// blocking read had, preserved.
+///
+/// An unexpected error is reported as [`ExecStatus::ChannelBroke`] rather than
+/// swallowed. The code this replaces broke `read`'s EINTR loop on ANY error and
+/// then tested `n > 0`, so an `EBADF`/`EIO` fell into the success branch and
+/// handed back a master for a child whose fate was never established — a latent
+/// fail-OPEN in a seam whose entire job is to fail closed.
+fn read_exec_status_now(rd: libc::c_int) -> Option<ExecStatus> {
+    let mut byte = [0u8; 1];
+    loop {
+        // SAFETY: `rd` is the parent's live read end; `byte` is a 1-byte buffer
+        // and `read` writes at most the 1 byte it is asked for.
+        let n = unsafe { libc::read(rd, byte.as_mut_ptr().cast::<libc::c_void>(), 1) };
+        if n > 0 {
+            return Some(ExecStatus::FailedBeforeExec(byte[0]));
+        }
+        if n == 0 {
+            return Some(ExecStatus::Execed);
+        }
+        let err = io::Error::last_os_error();
+        return match err.kind() {
+            io::ErrorKind::Interrupted => continue,
+            // EAGAIN on a non-blocking read: writers still exist and none has
+            // spoken. This is the ONLY "not yet" answer.
+            io::ErrorKind::WouldBlock => None,
+            _ => Some(ExecStatus::ChannelBroke(err)),
+        };
+    }
+}
+
+/// Sleep until `rd` looks readable, or until `slice` elapses — whichever first.
+///
+/// PURELY AN OPTIMISATION. The verdict is never taken from here; the caller
+/// always re-reads. That framing is deliberate, because the readiness primitives
+/// on this platform are not all trustworthy (see [`EXEC_STATUS_SLICE`]):
+/// `select(2)` is the only one MEASURED correct on a Darwin FIFO whose last
+/// writer closed — `poll(2)` and `kqueue`/`EVFILT_READ` never report that EOF at
+/// all, while all three are correct on a pipe.
+///
+/// `select` is used with an explicit `FD_SETSIZE` guard because `FD_SET` on a
+/// descriptor at or above it writes past the `fd_set` bitmap — undefined
+/// behaviour, and reachable in a process that raised `RLIMIT_NOFILE` and holds
+/// more than `FD_SETSIZE` descriptors. Above the limit this degrades to a plain
+/// sleep, which the caller's re-read makes correct, just coarser.
+fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
+    if fd >= 0 && (fd as usize) < libc::FD_SETSIZE {
+        // SAFETY: `set` is a zeroed `fd_set` and `fd` is verified in range for
+        // its bitmap, so `FD_SET` writes within it; `select` reads and writes
+        // only `set` and `tv`. A -1 return (EINTR, or anything else) needs no
+        // handling — the caller re-reads the descriptor either way.
+        unsafe {
+            let mut set: libc::fd_set = std::mem::zeroed();
+            libc::FD_SET(fd, &mut set);
+            let mut tv = libc::timeval {
+                tv_sec: slice.as_secs() as libc::time_t,
+                tv_usec: libc::suseconds_t::from(slice.subsec_micros() as u32 as i32),
+            };
+            libc::select(
+                fd + 1,
+                &mut set,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut tv,
+            );
+        }
+        return;
+    }
+    // SAFETY: `ts` is a fully-initialized timespec; `nanosleep` reads it and
+    // writes nothing through the null remainder pointer.
+    unsafe {
+        let ts = libc::timespec {
+            tv_sec: slice.as_secs() as libc::time_t,
+            tv_nsec: libc::c_long::from(slice.subsec_nanos() as i32),
+        };
+        libc::nanosleep(&ts, ptr::null_mut());
+    }
+}
+
+/// Wait for the child's exec-status verdict, for at most `budget`.
+///
+/// The verdict comes ENTIRELY from the non-blocking `read` at the top of each
+/// iteration — the one primitive measured correct on every carrier and platform
+/// here — with [`wait_readable_briefly`] only there to keep the loop from
+/// spinning. The deadline is monotonic and recomputed every iteration, so a
+/// storm of signals cannot extend the bound the way an `EINTR`-retrying blocking
+/// read could.
+///
+/// On expiry it takes ONE FINAL non-blocking read before answering
+/// [`ExecStatus::NoVerdict`], so a byte that landed during the last sleep is
+/// never dropped on the floor. That matters because of the asymmetry measured on
+/// this protocol: a pre-exec failure byte sits in the channel BUFFER and is
+/// readable no matter who else holds a write end (MEASURED n=1 in 1-2 ms with the
+/// stranger verified still alive), so a byte is ALWAYS the true answer when one
+/// exists, and only EOF can be suppressed by a third party.
+fn wait_for_exec_status(rd: libc::c_int, budget: std::time::Duration) -> ExecStatus {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(status) = read_exec_status_now(rd) {
+            return status;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        wait_readable_briefly(rd, left.min(EXEC_STATUS_SLICE));
+    }
+    read_exec_status_now(rd).unwrap_or(ExecStatus::NoVerdict)
+}
+
 /// Like [`spawn_shell`] but also returns the child pid (see [`SpawnedShell`]).
 /// Identical spawn/sandbox/exec behavior — `spawn_shell` is this minus the pid.
 ///
-/// SPEC: the parent-prebuild + child branch of this `forkpty` seam is the real
+/// SPEC: the parent-prebuild + child branch of this fork/exec seam is the real
 /// implementation of the external `ForkExec.tla` model (TRUST_NATIVE_TLA Phase 2,
 /// PTY-spawn SAFETY family, WS-G). The spec's ordered child program-counter walk
 /// `Fork → Setrlimit → Chdir → CloseMaster → Exec` is exactly the child branch
-/// below (`forkpty` at the `pid == 0` branch: `Limits::apply` = `Setrlimit`, `chdir`
+/// below (the `pid == 0` branch: `Limits::apply` = `Setrlimit`, `chdir`
 /// = `Chdir`, `close(master)` = `CloseMaster`, `execve` = `Exec`), and the parent
-/// pre-builds `envp`/argv BEFORE `forkpty` (the spec's `envPrebuilt = ~Buggy`) so
+/// pre-builds `envp`/argv BEFORE the fork (the spec's `envPrebuilt = ~Buggy`) so
 /// `OnlySafeBeforeExec` / `MasterClosedBeforeExec` / `SafeImpliesEnvPrebuilt` hold.
+/// The `login_tty` that replacing `forkpty` moved into this branch (step 0a) is
+/// part of the spec's `Fork` action — "the child branch has been entered", which
+/// is what `login_tty` completes — so the walk and the model's 6-action inventory
+/// are UNCHANGED by that rewrite, and no binding was added, renamed, or dropped
+/// to keep the gate green.
 ///
 /// NO Tier-1 conformance is attached (honest): the modeled trajectory lives in the
 /// real CHILD after `fork`, which `execve`s or `_exit`s — it can never be driven
@@ -335,6 +1400,17 @@ fn spawn_termios() -> Option<libc::termios> {
 /// leaked). `UnsafeEnvOp` is `#[spec_unmodeled]` — it exists ONLY in the spec's
 /// `Buggy` branch (the pre-fix child's setenv/alloc in the window); the fixed code
 /// has NO such step, so there is nothing to bind.
+///
+/// NOT MODELED, stated so nobody reads a green `ty` as more than it is:
+/// `ForkExec.tla` has no notion of a slave fd, of `O_CLOEXEC`, or of a CONCURRENT
+/// actor. `MasterClosedBeforeExec` says THIS child closes THIS master before its
+/// exec; it says nothing about an unrelated process inheriting either descriptor.
+/// The close-on-exec-from-birth property that [`open_pty_pair_cloexec`] provides is
+/// therefore guarded by runtime verification (the flag is read back before the
+/// fork) and by the `pty_open_honors_the_cloexec_open_flag`,
+/// `pty_pair_is_close_on_exec_from_birth` and
+/// `an_unrelated_exec_inherits_neither_end_of_a_live_pty` regression tests below
+/// — NOT by the model checker.
 // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): each fork_exec action projects the
 // real child program-counter walk onto the spec's `<<pc, masterClosed, unsafeOpRan,
 // envPrebuilt>>`. The witness is `aterm_pty::child_spawn::project_pc` — the structural
@@ -391,7 +1467,7 @@ fn spawn_termios() -> Option<libc::termios> {
         reason = "Modeled DEFECT only: UnsafeEnvOp fires solely in ForkExec.tla's Buggy branch \
                   (the pre-fix child running setenv/var_os/current_dir/CString/format!/Vec — \
                   async-signal-UNSAFE work in the fork..exec window). The fixed child runs NONE \
-                  of these (all env/argv/envp is pre-built in the parent before forkpty), so \
+                  of these (all env/argv/envp is pre-built in the parent before the fork), so \
                   there is no shipping code to bind; the action exists to let ty PROVE the \
                   defect is excluded (OnlySafeBeforeExec) at Buggy=TRUE."
     )
@@ -404,6 +1480,15 @@ fn spawn_termios() -> Option<libc::termios> {
 // opt-out channel. The fork..exec window's safety is separately machine-checked
 // by the ForkExec.tla refinement anchors above (OnlySafeBeforeExec proven).
 // Droppable when AddressOfField extraction lands.
+//
+// WHICH shape, kept current: the `forkpty` rewrite REMOVED the
+// `ptr::addr_of_mut!(*t)` that used to hand `forkpty` its optional termios (the
+// pair is now opened by `open_pty_pair_cloexec`, which takes an `Option<&_>`).
+// The field-address shapes that remain in this body are in the child branch —
+// `addr_of_mut!(sa.sa_mask)` / `addr_of!(sa)` in the signal normalisation, and
+// `addr_of!(b)` for the status byte. If the extractor ever stops flagging those,
+// this skip becomes unjustified rather than merely redundant; `xtask gate
+// dormant` and the explicit-full lane are what notice.
 #[cfg_attr(trust_verify, trust::skip)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_shell_with_pid(
@@ -436,7 +1521,7 @@ pub fn spawn_shell_with_pid(
         .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
 
     // EVERYTHING that allocates or reads the environment happens HERE, in the
-    // PARENT, BEFORE forkpty. The frontend is multi-threaded (GPU/Metal + socket
+    // PARENT, BEFORE the fork. The frontend is multi-threaded (GPU/Metal + socket
     // threads are live), and POSIX permits ONLY async-signal-safe calls between
     // fork and exec — so the child below must not allocate, take the std env
     // lock, or call `setenv`. We pre-build the C arrays and hand them to
@@ -564,39 +1649,20 @@ pub fn spawn_shell_with_pid(
         None
     };
 
-    // Exec-status pipe: a close-on-exec pipe whose write end the child holds. A
-    // successful `execve` closes that end (O_CLOEXEC) and the parent reads EOF (0
-    // bytes) = "child exec'd confined". A pre-exec failure (sandbox apply error,
-    // or execve itself failing) makes the child WRITE a one-byte reason then
-    // `_exit`, and the parent reads that byte = "child failed before exec" and
-    // returns an error rather than a master fd for an unconfined shell.
-    let mut status_fds = [0i32; 2];
-    // SAFETY: `status_fds` is a valid 2-element buffer. (`pipe2` with O_CLOEXEC is
-    // not available on macOS, so we set FD_CLOEXEC explicitly below.)
-    let rc = unsafe { libc::pipe(status_fds.as_mut_ptr()) };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (status_rd, status_wr) = (status_fds[0], status_fds[1]);
-    // Mark BOTH ends close-on-exec: the write end's close-on-exec close is the
-    // SUCCESS signal (parent reads EOF after the child execs), and the read end
-    // must not leak into the shell. Set in the PARENT, before fork (still safe to
-    // allocate / call fcntl here). A failure to set CLOEXEC would break the
-    // success/failure distinction, so treat it as a hard error.
-    // SAFETY: both fds are valid; `fcntl(F_SETFD, FD_CLOEXEC)` only sets a flag.
-    let cloexec_ok = unsafe {
-        libc::fcntl(status_rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-            && libc::fcntl(status_wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-    };
-    if !cloexec_ok {
-        let err = io::Error::last_os_error();
-        // SAFETY: closing the two pipe fds we just opened.
-        unsafe {
-            libc::close(status_rd);
-            libc::close(status_wr);
-        }
-        return Err(err);
-    }
+    // Exec-status channel: a close-on-exec channel whose write end the child
+    // holds. A successful `execve` closes that end (O_CLOEXEC) and the parent
+    // reads EOF (0 bytes) = "child exec'd confined". A pre-exec failure (sandbox
+    // apply error, or execve itself failing) makes the child WRITE a one-byte
+    // reason then `_exit`, and the parent reads that byte = "child failed before
+    // exec" and returns an error rather than a master fd for an unconfined shell.
+    //
+    // BOTH ends are close-on-exec FROM BIRTH — `pipe2(O_CLOEXEC)` on Linux, an
+    // unlinked `O_CLOEXEC` FIFO on Darwin — so, unlike the `pipe(2)` + two
+    // `fcntl(F_SETFD)` this replaces, there is no instant at which a concurrent
+    // `Command::spawn` on another thread can inherit either one. See the long
+    // comment on `open_exec_status_channel` for the defect, the measurements, and
+    // the carriers that were tried and rejected.
+    let (status_rd, status_wr, status_carrier) = open_exec_status_channel()?;
 
     let ws = libc::winsize {
         ws_row: rows,
@@ -606,28 +1672,40 @@ pub fn spawn_shell_with_pid(
     };
     // Explicit slave termios (kernel defaults + IUTF8 + B230400 — see
     // `build_spawn_termios`); `None` = the historical NULL path. Built here in
-    // the parent so `forkpty` applies it atomically at slave-open time (no
-    // post-fork tcsetattr race with the shell's own termios reads).
-    let mut termp = spawn_termios();
-    let mut master: libc::c_int = -1;
-    // SAFETY: `forkpty` is called with a valid out-param for the master fd, null
-    // for the (unused) slave-name buffer, the optional stack-owned termios (or
-    // null = kernel defaults), and a valid `winsize`. It returns the child pid
-    // in the parent (and 0 in the child), per POSIX.
-    let pid = unsafe {
-        libc::forkpty(
-            &mut master,
-            ptr::null_mut(),
-            termp
-                .as_mut()
-                .map_or(ptr::null_mut(), |t| ptr::addr_of_mut!(*t)),
-            ptr::addr_of!(ws).cast_mut(),
-        )
+    // the parent so it is applied atomically at slave-open time (no post-fork
+    // tcsetattr race with the shell's own termios reads).
+    let termp = spawn_termios();
+    // The PTY pair, BOTH ends close-on-exec FROM BIRTH — this is `openpty`'s
+    // job, done without `openpty`'s window (see `open_pty_pair_cloexec` for the
+    // full rationale: `forkpty` = `openpty` + `fork` + `login_tty`, and it leaves
+    // two unflagged pty descriptors in this multi-threaded parent across the
+    // fork, which a concurrent `Command::spawn` inherits straight through its
+    // `exec`). termios and winsize are applied to the SLAVE here, before the
+    // fork, exactly where `openpty` applied them.
+    let (master, slave) = match open_pty_pair_cloexec(termp.as_ref(), Some(&ws)) {
+        Ok(pair) => pair,
+        Err(err) => {
+            // SAFETY: closing the two pipe fds we just opened; no pty exists —
+            // `open_pty_pair_cloexec` fails closed and leaks no descriptor.
+            unsafe {
+                libc::close(status_rd);
+                libc::close(status_wr);
+            }
+            return Err(err);
+        }
     };
+    // The fork `forkpty` used to do for us. Everything the child needs was
+    // pre-built above; the child branch below is async-signal-safe only.
+    // SAFETY: `fork` takes no arguments and returns the child pid in the parent,
+    // 0 in the child, or -1 on failure.
+    let pid = unsafe { libc::fork() };
     if pid < 0 {
         let err = io::Error::last_os_error();
-        // SAFETY: closing the two pipe fds we just opened (fork failed).
+        // SAFETY: closing the pty pair and the two pipe fds (fork failed, so
+        // there is no child holding a copy of any of them).
         unsafe {
+            libc::close(slave);
+            libc::close(master);
             libc::close(status_rd);
             libc::close(status_wr);
         }
@@ -641,6 +1719,51 @@ pub fn spawn_shell_with_pid(
         // SAFETY: `status_rd` is the inherited read-end fd; `close` is a-s-safe.
         unsafe {
             libc::close(status_rd);
+        }
+        // (0a) ACQUIRE THE CONTROLLING TERMINAL — the step `forkpty` used to
+        //     perform for us, explicit now that the pair above is opened here.
+        //     `login_tty` is, VERIFIED by disassembly of libsystem_c on macOS
+        //     26.5.1: `setsid()`; `ioctl(fd, TIOCSCTTY, NULL)` (→ -1 on
+        //     failure); `dup2(fd,0)`; `dup2(fd,1)`; `dup2(fd,2)`; `close(fd)`
+        //     when fd >= 3. Every one of those is async-signal-safe — no
+        //     allocation, no locks, no libc state — so it is legal in this
+        //     window. It is what makes the child a SESSION LEADER with
+        //     pid == sid == pgid, the identity `hangup`'s `killpg`, `reap`'s
+        //     `getpgid` check, and the GUI's `tcgetpgrp(master)` all depend on.
+        //
+        //     The `dup2`s CLEAR FD_CLOEXEC on the copies (dup2 never carries the
+        //     flag over), so a close-on-exec slave still yields stdio that
+        //     SURVIVES `execve` — the property that would silently leave the
+        //     shell with no terminal if this design were wrong, which is why
+        //     `spawned_child_stdio_is_an_inherited_tty_with_a_ctty_and_our_winsize`
+        //     asserts it end to end.
+        //     They land on 0/1/2 and nowhere else: the status pipe's write end
+        //     and the master keep their numbers, exactly as under `forkpty`.
+        //
+        //     The child must NOT close the slave afterwards — `login_tty` has
+        //     already closed it (any fd >= 3), and a defensive close here would
+        //     hit whatever number was recycled into its place, which in this
+        //     child could be `status_wr` — silently turning the status
+        //     protocol's "EOF means the child exec'd" into a lie.
+        //
+        //     On failure, reproduce `forkpty`'s OWN fallback (it syslogs and
+        //     still wires up stdio rather than exec'ing a shell with none):
+        //     dup2 the slave over 0/1/2 by hand and close the original. The
+        //     shell then runs without a controlling terminal — degraded, but
+        //     byte-identical to what this seam has always done, and so NOT a new
+        //     status-byte case the parent would have to learn to interpret.
+        // SAFETY: `slave` is this child's inherited pty slave fd; `login_tty`,
+        // `dup2` and `close` are all async-signal-safe. Nothing allocates, takes
+        // a lock, or reads the environment.
+        unsafe {
+            if libc::login_tty(slave) == -1 {
+                libc::dup2(slave, libc::STDIN_FILENO);
+                libc::dup2(slave, libc::STDOUT_FILENO);
+                libc::dup2(slave, libc::STDERR_FILENO);
+                if slave > libc::STDERR_FILENO {
+                    libc::close(slave);
+                }
+            }
         }
         // (0b) NORMALIZE SIGNALS — hand the shell a POSIX-clean slate. `execve`
         //     auto-resets CAUGHT signals to SIG_DFL, but IGNORED dispositions AND the
@@ -697,11 +1820,28 @@ pub fn spawn_shell_with_pid(
             }
         }
         // (3) close the inherited master fd: the slave is already this child's
-        //     controlling tty (forkpty's login_tty), so the master must not leak
-        //     into the shell or any process it spawns.
-        // SAFETY: `master` is the forkpty master fd; `close` is async-signal-safe.
+        //     controlling tty (step 0a), so the master must not leak into the
+        //     shell or any process it spawns. This is the spec's `CloseMaster`.
+        //
+        //     This step only became REAL work with the `forkpty` replacement.
+        //     `forkpty` assigns the master out-param in its PARENT branch only —
+        //     MEASURED: the child read back `master == -1` — and closes the
+        //     child's copy itself, inside libc, before `login_tty`. So the call
+        //     that used to stand here was `close(-1)`: an EBADF no-op standing in
+        //     for work libc had already done. It now closes the actual fd.
+        //
+        //     Guarded on `master > 2` because step (0a)'s `dup2` closes its
+        //     destination: had the master landed on 0/1/2, it is ALREADY closed
+        //     and that number now holds the slave — closing it here would hand
+        //     the shell no stdio. Unreachable in any real launch (aterm always
+        //     has stdio open, so a pty master is >= 3), and cheap to be exact
+        //     about in a branch that cannot be tested from inside the child.
+        // SAFETY: `master` is this child's inherited master fd; `close` is
+        // async-signal-safe.
         unsafe {
-            libc::close(master);
+            if master > libc::STDERR_FILENO {
+                libc::close(master);
+            }
         }
         // (4) exec. `execve` (not `execvp`) takes the pre-built `envp` and does no
         //     PATH-search allocation; the target is an absolute path ($SHELL, or a
@@ -718,33 +1858,38 @@ pub fn spawn_shell_with_pid(
             libc::_exit(127);
         }
     }
-    // PARENT. Mark the master close-on-exec FIRST: the master must not leak into
-    // shells spawned by LATER sessions. Each session keeps its master open for
-    // its whole lifetime (the SinkWriter Arc owns it), so without FD_CLOEXEC a
-    // subsequent `forkpty`'s child would inherit every prior session's master
-    // straight through `execve` — an ungated cross-session input-injection /
-    // output-exfiltration channel that bypasses the WriteInput/EdgeToken gate.
-    // Setting it now (post-fork) affects only FUTURE execs, so the current child
-    // — which already closed its own master copy in step (3) — is unaffected;
-    // and FD_CLOEXEC does not affect this parent's own read/write of the fd.
-    // SAFETY: `master` is the parent's valid forkpty master fd (pid > 0 here);
-    // `fcntl(F_SETFD)` is a simple fd-flag set.
-    if unsafe { libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-        let err = io::Error::last_os_error();
-        // Fail-closed (mirrors the status-pipe handling): tear everything down —
-        // close the master + both status-pipe ends, then SIGKILL and reap the
-        // child so no leaky session is ever handed back to the caller.
-        // SAFETY: all fds/pid are valid here; these calls are self-contained.
-        unsafe {
-            libc::close(master);
-            libc::close(status_wr);
-            libc::close(status_rd);
-            libc::kill(pid, libc::SIGKILL);
-            let mut wstatus: libc::c_int = 0;
-            libc::waitpid(pid, &mut wstatus, 0);
-        }
-        return Err(err);
+    // PARENT. Drop our copy of the SLAVE immediately — this is the `close(slave)`
+    // that used to live inside `forkpty`'s parent branch, and it is not
+    // optional: the child holds the slave as its controlling terminal and its
+    // stdio, and a copy left open HERE would hold the pty open for as long as
+    // this process lives. The master could then never report hangup after the
+    // shell died (the "no ctty-owning leader exits" shape — MEASURED: `poll`
+    // revents stay 0x0000 indefinitely), and `handoff_masters_closed` is
+    // fail-closed on exactly that condition, so the seamless update would wait
+    // forever on a session that is already gone. Every error path above closes
+    // it too; from here on the parent owns only the master and the status pipe.
+    // SAFETY: `slave` is the parent's own copy of the pty slave fd (pid > 0
+    // here, so the child has its own); `close` releases just this copy.
+    unsafe {
+        libc::close(slave);
     }
+    // There is deliberately NO `fcntl(master, F_SETFD, FD_CLOEXEC)` here, and
+    // that absence is the point of the rewrite rather than an omission. The
+    // property that call established — the master must not leak into shells
+    // spawned by LATER sessions, since each session holds its master open for
+    // its whole lifetime (the SinkWriter Arc owns it) and an inherited one is an
+    // ungated cross-session input-injection / output-exfiltration channel that
+    // bypasses the WriteInput/EdgeToken gate — now holds from the `open(2)` that
+    // created the fd, VERIFIED before the fork by `open_pty_pair_cloexec`. Doing
+    // it again post-fork would be dead code setting a flag that is already set,
+    // and would re-imply that the window between fork and here was ever the
+    // interesting one; it was not, which is precisely the defect. Its old
+    // fail-closed teardown moved with it: a master that cannot be made
+    // close-on-exec now fails the spawn BEFORE the fork, where there is no child
+    // to SIGKILL and reap. `spawned_master_is_close_on_exec` still asserts the
+    // returned fd carries the flag, and the flag stays ordinary and mutable —
+    // `set_cloexec` CLEARS it so the master survives the seamless-update re-exec.
+    //
     // Close our copy of the write end so the read sees EOF once the only
     // remaining write end (the child's) is gone (exec-closed or after the child
     // exits). Then read the status: 0 bytes (EOF) = success; any byte = the child
@@ -753,39 +1898,84 @@ pub fn spawn_shell_with_pid(
     unsafe {
         libc::close(status_wr);
     }
-    let mut indicator = [0u8; 1];
-    // EINTR-retrying read of the single status byte (or EOF).
-    let n = loop {
-        // SAFETY: `status_rd` is a valid read fd; `indicator` is a 1-byte buffer.
-        let r = unsafe { libc::read(status_rd, indicator.as_mut_ptr().cast::<libc::c_void>(), 1) };
-        if r < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        break r;
-    };
-    // SAFETY: done with the read end.
+    // BOUNDED wait for the verdict, where this used to be an unbounded blocking
+    // read. The bound is defence in depth, not the fix — the carrier above is
+    // what makes an unbounded wait unreachable in the first place — but it means
+    // a future leak of a write end cannot resurrect the freeze this seam was
+    // measured taking (5 s, 20 s and 65 s blocks, each exactly the lifetime of the
+    // unrelated process that had inherited the write end).
+    let status = wait_for_exec_status(status_rd, EXEC_STATUS_BUDGET);
+    // SAFETY: done with the read end, on every branch below.
     unsafe {
         libc::close(status_rd);
     }
-    if n > 0 {
-        // Child reported a pre-exec failure. Close the master (no unconfined
-        // shell escapes) and reap the child so it is not left as a zombie.
-        // SAFETY: `master` is the parent's forkpty master fd.
+    let failure: Option<(io::ErrorKind, String)> = match status {
+        // EOF. The child reached `execve` and the kernel closed its close-on-exec
+        // write end during the image switch. This is the ONLY success verdict.
+        ExecStatus::Execed => None,
+        ExecStatus::FailedBeforeExec(b'S') => Some((
+            io::ErrorKind::PermissionDenied,
+            "sandbox confinement failed in child (fail-closed: shell not exec'd, _exit(126))"
+                .to_owned(),
+        )),
+        ExecStatus::FailedBeforeExec(_) => Some((
+            io::ErrorKind::Other,
+            "child failed to exec the shell before exec (_exit(127))".to_owned(),
+        )),
+        // The budget elapsed with neither a byte nor EOF. FAIL CLOSED.
+        //
+        // With an ATOMIC carrier this is not ambiguous, and the reasoning is
+        // worth spelling out because it is what makes the choice principled
+        // rather than a coin flip. EOF fires at the kernel image switch, and no
+        // process other than this parent and this child can hold a write end, so
+        // a child that exec'd successfully has ALREADY produced EOF. A byte, if
+        // one was ever written, sits in the buffer and would have been returned
+        // by the final read regardless of who else holds a write end. So neither
+        // outcome is merely late: expiry means the child has NOT exec'd — it is
+        // stopped (a debugger, a stray job-control signal in the window before
+        // its `sigprocmask`) or the machine is wedged far past anything
+        // measurable here. Handing back a master would be exactly the §5.6
+        // unconfined-shell hole the b'S' byte exists to plug.
+        //
+        // On the RACY fallback carrier the verdict is genuinely ambiguous — a
+        // stranger holding a write end suppresses EOF from a healthy child — and
+        // failing is still the right answer: a session that refuses to open with
+        // a clear error is recoverable and visible, while returning a master for
+        // a child whose confinement was never confirmed is not.
+        ExecStatus::NoVerdict => Some((
+            io::ErrorKind::TimedOut,
+            format!(
+                "child never reported exec status within {EXEC_STATUS_BUDGET:?} \
+                 (fail-closed: no confirmed exec, so no master is handed back; \
+                 status carrier: {status_carrier:?})"
+            ),
+        )),
+        ExecStatus::ChannelBroke(err) => Some((
+            io::ErrorKind::Other,
+            format!(
+                "exec-status channel failed before the child reported ({err}); fail-closed \
+                 (status carrier: {status_carrier:?})"
+            ),
+        )),
+    };
+    if let Some((kind, what)) = failure {
+        // No confirmed, confined shell — so NOTHING usable escapes to the caller.
+        // Kill first, then close the master: `kill` is unignorable and needs no
+        // grace (we have already waited out the whole budget on the timeout
+        // path), while closing the master revokes the pty and would only HUP a
+        // child that had got far enough to have a controlling terminal.
+        // `reap` is the crate's own BOUNDED collector (WNOHANG polling with a
+        // ~2 s deadline, then it gives up rather than parking) — deliberately not
+        // a blocking `waitpid`, because a `waitpid(…, 0)` here would reintroduce
+        // an unbounded wait on the very path that exists to end one. A child it
+        // cannot collect is left to the kernel at process exit.
+        // SAFETY: `pid` is this call's own child and `master` the parent's pty
+        // master fd; `kill` posts a signal and `close` releases one descriptor.
         unsafe {
+            libc::kill(pid, libc::SIGKILL);
             libc::close(master);
-            let mut wstatus: libc::c_int = 0;
-            libc::waitpid(pid, &mut wstatus, 0);
         }
-        let (kind, what) = match indicator[0] {
-            b'S' => (
-                io::ErrorKind::PermissionDenied,
-                "sandbox confinement failed in child (fail-closed: shell not exec'd, _exit(126))",
-            ),
-            _ => (
-                io::ErrorKind::Other,
-                "child failed to exec the shell before exec (_exit(127))",
-            ),
-        };
+        reap(pid);
         return Err(io::Error::new(kind, what));
     }
     Ok(SpawnedShell { master, pid })
@@ -806,7 +1996,8 @@ pub fn hangup(pid: i32) {
         return;
     }
     // SAFETY: `killpg` with a signal merely posts SIGHUP to the process group;
-    // `pid` is the session-leader pid we got from `forkpty`, so the group is the
+    // `pid` is the session-leader pid the spawn returned (`login_tty` = setsid),
+    // so the group is the
     // child's own job tree. Any error (already-reaped child) is ignored.
     unsafe {
         libc::killpg(pid, libc::SIGHUP);
@@ -857,7 +2048,7 @@ pub fn reap(pid: i32) {
         if r == -1 {
             not_ours = true;
             // Not our child. IDENTITY CHECK before anything else: an adopted
-            // shell is a SESSION LEADER (forkpty = setsid), so its pgid == its
+            // shell is a SESSION LEADER (login_tty = setsid), so its pgid == its
             // pid. A recycled pid (the shell died and the kernel reissued the
             // number) is overwhelmingly NOT a fresh group leader — treating
             // `getpgid` mismatch (or `ESRCH`) as "gone" makes the escalation
@@ -1306,18 +2497,38 @@ pub fn poll_writable(fd: i32, timeout_ms: i32) -> io::Result<bool> {
     }
 }
 
-/// `dup(2)` an fd into an [`std::os::fd::OwnedFd`] the caller owns outright — same
+/// Duplicate an fd into an [`std::os::fd::OwnedFd`] the caller owns outright — same
 /// open file description (shared offset/flags), independent lifetime. Lets a detached
 /// helper thread (the sink's spill drainer) keep writing safely without pinning the
 /// original owner: even if the original fd number is closed and recycled, the dup
 /// still names the PTY, so no write can land on a stranger's fd.
+///
+/// The duplicate is CLOSE-ON-EXEC, atomically — see the body for why a bare
+/// `dup(2)` would reopen the very leak the spawn seam above closes.
 // #[inline] so the MIR crosses the crate boundary (write_some precedent):
 // aterm-session's spill path bundles and VERIFIES this body.
 #[inline]
 pub fn dup_fd(fd: i32) -> io::Result<std::os::fd::OwnedFd> {
-    // SAFETY: `dup` on a caller-supplied fd; a negative return is checked before the
-    // from_raw_fd, so ownership is only assumed for a real, freshly-dup'd fd.
-    let d = unsafe { libc::dup(fd) };
+    // `F_DUPFD_CLOEXEC`, NOT `dup`. POSIX defines `dup(2)` to CLEAR `FD_CLOEXEC`
+    // on the new descriptor, so a bare `dup` of a session's PTY master hands back
+    // a copy that survives `exec` — reintroducing, on the duplicate, exactly the
+    // leak the `forkpty` replacement above exists to close. The one consumer is
+    // the spill drainer (`aterm_session::sink::Shared::arrange_drainer`), which
+    // holds its copy for as long as a wedged shell keeps the write queue spilling,
+    // so the exposure is a long-lived duplicate rather than a fork-window race:
+    // any `Command::spawn` during that whole period inherits a writable descriptor
+    // onto that session's terminal.
+    //
+    // `F_DUPFD_CLOEXEC` sets the flag ATOMICALLY with the duplication, so unlike
+    // `dup` + `fcntl` it leaves no window at all. It is POSIX 2008 and present on
+    // macOS and Linux. The drainer only ever reads/writes the fd from a thread —
+    // nothing here is meant to be inherited by a child — so close-on-exec is the
+    // correct default, not a behaviour change the caller must opt into.
+    //
+    // SAFETY: `fcntl(F_DUPFD_CLOEXEC, 0)` on a caller-supplied fd returns a fresh
+    // descriptor >= 0 or -1; the negative return is checked before `from_raw_fd`,
+    // so ownership is only assumed for a real, freshly-duplicated fd.
+    let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if d < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1352,9 +2563,9 @@ pub fn set_nonblocking(master: i32, nonblocking: bool) -> io::Result<()> {
 }
 
 /// Toggle `FD_CLOEXEC` on `fd` — the DESCRIPTOR flag (`F_GETFD`/`F_SETFD`), distinct
-/// from the STATUS flags [`set_nonblocking`] touches. The parent marks every PTY master
-/// `FD_CLOEXEC` right after `forkpty` (so a later session's child can't inherit a prior
-/// master — the cross-session isolation gate). Proof-carrying DSU's seamless re-exec
+/// from the STATUS flags [`set_nonblocking`] touches. Every PTY master is born
+/// `FD_CLOEXEC` ([`open_pty_pair_cloexec`], so a later session's child can't inherit a
+/// prior master — the cross-session isolation gate). Proof-carrying DSU's seamless re-exec
 /// (RFC Rung 1b) must CLEAR it (`on = false`) on each master it hands to the new binary,
 /// so the master SURVIVES `execve` and the running shell is not killed. Idempotent;
 /// reads the current flags first so it never clobbers unrelated `fcntl` state.
@@ -2247,12 +3458,23 @@ mod tests {
     /// the public fn (env unset ⇒ the measured `IDLE_POLL_DEFAULT_US` = 50 µs
     /// wait, still far under this test's 1 ms park bound) and the inner body
     /// with an explicit 0 (the immediate-deliver revert path).
+    ///
+    /// ATTEMPT BUDGET: the assertion is "at least one attempt delivers inside the
+    /// idle wait", so a single clean run proves the cutoff and only a REGRESSED
+    /// cutoff — which parks ≥1 ms on EVERY attempt — can exhaust the budget. The
+    /// budget is therefore about scheduler noise, not about the property, and 3
+    /// was too few: an unrelated CPU-hungry test running in parallel can push all
+    /// three attempts past a 1 ms bound (OBSERVED, ~1 run in 20-40, once this
+    /// file gained a test that forks 300 times against 6 busy threads). Raising
+    /// it makes the test robust to that without weakening it by one bit — a real
+    /// regression still fails all 12 (VERIFIED by removing the cutoff: caught
+    /// 6/6).
     #[test]
     fn drain_more_nonblocking_idle_parser_delivers_without_parking() {
         use std::sync::atomic::AtomicUsize;
         for explicit_zero in [false, true] {
             let mut ok = false;
-            for _ in 0..3 {
+            for _ in 0..12 {
                 let mut m = [0i32; 2];
                 // SAFETY: valid 2-int out-array for pipe(2).
                 assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
@@ -2681,19 +3903,19 @@ mod tests {
     /// open — the exact "the shell's master survives the seamless re-exec" contract.
     #[test]
     fn cloexec_controls_master_survival_across_exec() {
-        // A real pty pair (no shell).
-        let (mut master, mut slave) = (0i32, 0i32);
-        // SAFETY: valid out-params; openpty fills master/slave on success.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(rc, 0, "openpty failed");
+        // A real pty pair (no shell), from the seam's own opener rather than
+        // `openpty`. The MASTER's flag is what this test toggles and asserts, so
+        // the starting state is immaterial to it — but `openpty`'s SLAVE is
+        // never close-on-exec, and this pair stays open for the whole test, so
+        // using `openpty` here would park an inheritable pty slave in a
+        // multi-threaded harness. Any concurrent `Command::spawn` (the sibling
+        // leak-detection test does exactly that) would inherit it and keep that
+        // pts alive after this test closed it — and when the device number was
+        // recycled by the next test's session, the stranger's exit would hang up
+        // THAT session. Measured: it did, killing an unrelated test's child with
+        // SIGHUP ~1 run in 8. That is precisely the defect this file now fixes,
+        // so the test scaffolding must not re-create it.
+        let (master, slave) = open_pty_pair_cloexec(None, None).expect("pty pair");
 
         // fd_is_tty is a SANITY backstop, not a master discriminator: it accepts any
         // tty (master AND slave) and rejects the obviously-wrong (pipe / bad fd).
@@ -2735,7 +3957,7 @@ mod tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
         };
 
-        // CLOEXEC set (the isolation default the parent applies after forkpty) ⇒ the
+        // CLOEXEC set (the isolation default the spawn seam opens the master with) ⇒ the
         // master is CLOSED at exec (a naive re-exec would orphan the shell). Cleared ⇒
         // it SURVIVES (the seamless handoff's contract).
         set_cloexec(master, true).unwrap();
@@ -2920,6 +4142,1499 @@ mod tests {
         }
     }
 
+    // ---- PTY pair creation: close-on-exec FROM BIRTH (the forkpty window) ----
+
+    /// Read `fd`'s descriptor flags, failing the test if the fd is not live.
+    fn fd_flags(fd: libc::c_int, what: &str) -> libc::c_int {
+        // SAFETY: `F_GETFD` only reads the descriptor-flag word of `fd`.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags >= 0,
+            "F_GETFD must succeed on {what} (fd {fd}): {}",
+            io::Error::last_os_error()
+        );
+        flags
+    }
+
+    /// The winsize `fd` reports, as `(rows, cols)`.
+    fn win_size(fd: libc::c_int, what: &str) -> (u16, u16) {
+        // SAFETY: `TIOCGWINSZ` fills the zeroed, stack-owned out-param.
+        unsafe {
+            let mut w: libc::winsize = std::mem::zeroed();
+            assert_eq!(
+                libc::ioctl(fd, libc::TIOCGWINSZ, &mut w),
+                0,
+                "TIOCGWINSZ on {what} (fd {fd}): {}",
+                io::Error::last_os_error()
+            );
+            (w.ws_row, w.ws_col)
+        }
+    }
+
+    /// Does a byte written into `slave` come out of `master`?
+    ///
+    /// The ONLY observation that separates a real pty pair from two
+    /// correctly-flagged descriptors onto DIFFERENT terminals. Bounded by a
+    /// poll, so a broken pairing fails the test instead of hanging it.
+    fn byte_crosses(slave: libc::c_int, master: libc::c_int, byte: u8) -> bool {
+        // SAFETY: `slave` is a live pts fd the caller owns; `write` reads
+        // exactly the one byte living at `byte`'s address.
+        let wrote = unsafe { libc::write(slave, ptr::from_ref(&byte).cast(), 1) };
+        if wrote != 1 {
+            return false;
+        }
+        if poll_revents(master, std::time::Duration::from_millis(500)) & libc::POLLIN == 0 {
+            return false;
+        }
+        let mut buf = [0u8; 16];
+        // SAFETY: `read` fills at most `buf.len()` bytes of this live, owned
+        // buffer, and we pass exactly that length.
+        let got = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        let Ok(n) = usize::try_from(got) else {
+            return false;
+        };
+        buf[..n].contains(&byte)
+    }
+
+    /// `poll(fd, POLLIN)` for at most `budget`, returning the revents once any
+    /// arrive (or 0 on timeout). Mirrors `handoff_masters_closed`'s poll shape
+    /// exactly, including `events: POLLIN` — with `events: 0` macOS reports
+    /// nothing at all.
+    fn poll_revents(fd: libc::c_int, budget: std::time::Duration) -> libc::c_short {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let mut p = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: a single valid pollfd with a 20 ms timeout.
+            let rc = unsafe { libc::poll(&mut p, 1, 20) };
+            if rc > 0 {
+                return p.revents;
+            }
+            if std::time::Instant::now() >= deadline {
+                return 0;
+            }
+        }
+    }
+
+    /// THE PLATFORM FACT THE WHOLE SEAM RESTS ON: `O_CLOEXEC` passed to the
+    /// `open(2)` that CREATES a pty descriptor is honored, so the descriptor is
+    /// close-on-exec before it exists anywhere else. That is the only window-free
+    /// way to get there — an `fcntl` afterwards leaves a gap in which a fork on
+    /// another thread yields an exec-surviving copy.
+    ///
+    /// This is not redundant with the tests below: `open_pty_pair_cloexec` will
+    /// SILENTLY fall back to `fcntl` (correct, but with the narrow window back)
+    /// if a platform ever ignores the flag, and every other assertion here would
+    /// still pass. This test is what says so out loud. Both halves are checked,
+    /// so "the flag was set" cannot be trivially true of every descriptor.
+    #[test]
+    fn pty_open_honors_the_cloexec_open_flag() {
+        // NEGATIVE CONTROL: the same call WITHOUT the flag must NOT be
+        // close-on-exec. This is the state `openpty`/`forkpty` leave both ends
+        // in, i.e. the defect itself, asserted rather than assumed.
+        // SAFETY: `posix_openpt` takes only a flag word; both fds are closed below.
+        let plain = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(
+            plain >= 0,
+            "posix_openpt failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: as above, with the flag added.
+        let flagged =
+            unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        assert!(
+            flagged >= 0,
+            "posix_openpt(O_CLOEXEC) failed — the seam would fall back to a racy \
+             fcntl: {}",
+            io::Error::last_os_error()
+        );
+        let plain_flags = fd_flags(plain, "master opened without O_CLOEXEC");
+        let flagged_flags = fd_flags(flagged, "master opened with O_CLOEXEC");
+
+        // Same question for the SLAVE open, which is the end `forkpty` never
+        // flagged at all. Open the SAME pts twice off the flagged master.
+        // SAFETY: `flagged` is a live /dev/ptmx fd; both are ioctls on it.
+        assert_eq!(unsafe { libc::grantpt(flagged) }, 0, "grantpt");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::unlockpt(flagged) }, 0, "unlockpt");
+        let name = pts_name(flagged).expect("pts_name must resolve the slave path");
+        // SAFETY: `name` is the NUL-terminated pts path just reported for `flagged`.
+        let slave_plain = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        // SAFETY: as above, with the flag added.
+        let slave_flagged = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            slave_plain >= 0 && slave_flagged >= 0,
+            "opening the pts failed"
+        );
+        let slave_plain_flags = fd_flags(slave_plain, "slave opened without O_CLOEXEC");
+        let slave_flagged_flags = fd_flags(slave_flagged, "slave opened with O_CLOEXEC");
+
+        // Close everything BEFORE asserting so a failure cannot leak descriptors.
+        for fd in [plain, flagged, slave_plain, slave_flagged] {
+            // SAFETY: each is a live fd this test opened and owns.
+            unsafe { libc::close(fd) };
+        }
+
+        assert_eq!(
+            plain_flags & libc::FD_CLOEXEC,
+            0,
+            "control: posix_openpt WITHOUT O_CLOEXEC must leave the master \
+             inheritable — this is the forkpty state the seam replaces"
+        );
+        assert_ne!(
+            flagged_flags & libc::FD_CLOEXEC,
+            0,
+            "posix_openpt must HONOR O_CLOEXEC — otherwise the master is only \
+             close-on-exec after a follow-up fcntl, and a concurrent \
+             fork+exec in that gap still inherits it"
+        );
+        assert_eq!(
+            slave_plain_flags & libc::FD_CLOEXEC,
+            0,
+            "control: opening the pts WITHOUT O_CLOEXEC must leave it inheritable"
+        );
+        assert_ne!(
+            slave_flagged_flags & libc::FD_CLOEXEC,
+            0,
+            "opening the pts must HONOR O_CLOEXEC — the slave is the end \
+             forkpty never flagged at all"
+        );
+    }
+
+    /// BOTH ends of the pair this seam hands the spawn are close-on-exec from the
+    /// moment they exist, and the pair is a REAL, correctly-configured pty — not
+    /// a pair of flags on nothing. The precondition is asserted alongside the
+    /// property: two distinct live descriptors, both ttys, carrying the requested
+    /// winsize and the requested termios deltas, readable from both ends.
+    #[test]
+    fn pty_pair_is_close_on_exec_from_birth() {
+        let want = build_spawn_termios(
+            kernel_default_termios().expect("kernel termios probe"),
+            false,
+        );
+        let ws = libc::winsize {
+            ws_row: 41,
+            ws_col: 137,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (master, slave) =
+            open_pty_pair_cloexec(Some(&want), Some(&ws)).expect("pty pair must open");
+
+        // PRECONDITION — a real pair actually came into existence. Without this
+        // the FD_CLOEXEC assertions could be true of two closed/bogus numbers.
+        assert!(master >= 0 && slave >= 0, "both ends must be live fds");
+        assert_ne!(master, slave, "the two ends must be distinct descriptors");
+        let master_is_tty = fd_is_tty(master);
+        let slave_is_tty = fd_is_tty(slave);
+        let master_flags = fd_flags(master, "pty master");
+        let slave_flags = fd_flags(slave, "pty slave");
+        let slave_ws = win_size(slave, "pty slave");
+        let master_ws = win_size(master, "pty master");
+        // SAFETY: `tcgetattr` fills the zeroed out-param from the live slave.
+        let slave_termios = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut t), 0, "tcgetattr(slave)");
+            t
+        };
+
+        // NEGATIVE CONTROL, on this same machine and in this same process: the
+        // `openpty` this replaced leaves BOTH ends inheritable. It is what makes
+        // the assertions above non-trivial.
+        let (mut om, mut os) = (-1i32, -1i32);
+        // SAFETY: valid out-params; the null name/termios/winsize form. Both fds
+        // are closed below.
+        let orc = unsafe {
+            libc::openpty(
+                &mut om,
+                &mut os,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(orc, 0, "control openpty failed");
+        let open_pty_master_flags = fd_flags(om, "openpty master");
+        let open_pty_slave_flags = fd_flags(os, "openpty slave");
+
+        for fd in [master, slave, om, os] {
+            // SAFETY: each is a live fd this test owns.
+            unsafe { libc::close(fd) };
+        }
+
+        assert!(master_is_tty && slave_is_tty, "both ends must be ttys");
+        assert_ne!(
+            master_flags & libc::FD_CLOEXEC,
+            0,
+            "the MASTER must be close-on-exec from birth: an unrelated \
+             fork+exec must never inherit a readable/writable handle on \
+             another session's terminal"
+        );
+        assert_ne!(
+            slave_flags & libc::FD_CLOEXEC,
+            0,
+            "the SLAVE must be close-on-exec from birth: this is the end \
+             forkpty never flagged at all, and an inherited copy both holds \
+             the pty open (suppressing the master's hangup) and is a live \
+             bidirectional channel onto the session"
+        );
+        assert_eq!(
+            (
+                open_pty_master_flags & libc::FD_CLOEXEC,
+                open_pty_slave_flags & libc::FD_CLOEXEC
+            ),
+            (0, 0),
+            "control: openpty (what forkpty uses) leaves BOTH ends inheritable — \
+             if this ever changes, the assertions above stopped being meaningful"
+        );
+        // The winsize/termios were applied to the slave in the parent, before any
+        // fork could observe them — the atomicity property the seam relies on.
+        assert_eq!(slave_ws, (41, 137), "winsize must be live on the slave");
+        assert_eq!(master_ws, (41, 137), "and visible from the master");
+        assert_ne!(
+            slave_termios.c_iflag & libc::IUTF8,
+            0,
+            "the spawn termios must be applied at slave-open time"
+        );
+        // SAFETY: `cfgetospeed` only reads the termios.
+        assert_eq!(unsafe { libc::cfgetospeed(&slave_termios) }, libc::B230400);
+    }
+
+    /// The two descriptors this seam returns are ACTUALLY each other's ends.
+    ///
+    /// Everything else asserted about the pair is a FLAG — close-on-exec,
+    /// `O_NOCTTY`, termios, winsize — and every one of those assertions would
+    /// still pass if the slave belonged to a DIFFERENT terminal. That is not
+    /// hypothetical: reaching the slave by path (`ptsname_r` →
+    /// `open("/dev/pts/N")`) was MEASURED on Linux 6.8 returning a live,
+    /// correctly-flagged pts from another devpts instance — one of the reasons
+    /// [`open_pts_slave`] asks the kernel for the peer instead of asking the
+    /// filesystem for a name. So prove the pairing the one way flags cannot
+    /// fake, and prove the proof is non-vacuous with a pair that must NOT cross.
+    #[test]
+    fn pty_pair_ends_are_peers_of_each_other() {
+        let (master, slave) = open_pty_pair_cloexec(None, None).expect("pty pair");
+        let (other_master, other_slave) =
+            open_pty_pair_cloexec(None, None).expect("second pty pair");
+
+        let paired = byte_crosses(slave, master, b'A');
+        // NEGATIVE CONTROL: an unrelated pair's slave must not reach this master.
+        let crossed = byte_crosses(other_slave, master, b'B');
+
+        // Close BEFORE asserting so a failure cannot leak descriptors.
+        for fd in [master, slave, other_master, other_slave] {
+            // SAFETY: each is a live fd this test owns.
+            unsafe { libc::close(fd) };
+        }
+
+        assert!(
+            paired,
+            "the slave must be the peer OF THIS MASTER: a byte written into it \
+             has to come out of the master handed back alongside it"
+        );
+        assert!(
+            !crossed,
+            "control: a foreign pty's slave must NOT reach this master — if it \
+             could, the positive assertion above would prove nothing"
+        );
+    }
+
+    /// Linux takes the slave FROM THE MASTER, not from a path.
+    ///
+    /// `ioctl(TIOCGPTPEER)` returns the peer of this exact ptmx with the
+    /// `open(2)` flag word applied, so the slave is close-on-exec from birth AND
+    /// cannot be a descriptor onto another devpts instance's terminal — the two
+    /// failure modes measured for the path route ([`open_pts_slave`]). On a
+    /// kernel too old to know the ioctl (pre-4.13) the seam falls back to the
+    /// path, so this asserts THAT route is a true peer too rather than
+    /// pretending the ioctl exists everywhere.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_slave_comes_from_the_master_via_tiocgptpeer() {
+        // SAFETY: `posix_openpt` takes only a flag word; the fd is closed below.
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+        assert!(master >= 0, "posix_openpt: {}", io::Error::last_os_error());
+        // SAFETY: `master` is a live /dev/ptmx descriptor; both are ioctls on it.
+        assert_eq!(unsafe { libc::grantpt(master) }, 0, "grantpt");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0, "unlockpt");
+
+        // SAFETY: `TIOCGPTPEER` takes its argument BY VALUE (an `open(2)` flag
+        // word, not a pointer) and returns a fresh descriptor or -1.
+        let peer = unsafe {
+            libc::ioctl(
+                master,
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+        let peer_errno = io::Error::last_os_error();
+
+        // NEGATIVE CONTROL: the ioctl is specific to a ptmx. If it handed out a
+        // descriptor for an ordinary pipe, its success above would mean nothing.
+        let mut pipe_fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` fills exactly the two-element array it is given.
+        assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: as the peer call above, on a descriptor that is not a ptmx.
+        let non_ptmx = unsafe {
+            libc::ioctl(
+                pipe_fds[0],
+                libc::TIOCGPTPEER,
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            )
+        };
+
+        // Whichever route this kernel supports, the seam's own opener must end
+        // up with a close-on-exec descriptor that is a TRUE peer of `master`.
+        let slave = open_pts_slave(master).expect("the slave must open by SOME route");
+        let slave_flags = fd_flags(slave, "pts slave");
+        let slave_is_tty = fd_is_tty(slave);
+        let slave_is_peer = byte_crosses(slave, master, b'P');
+
+        // Close BEFORE asserting so a failure cannot leak descriptors.
+        for fd in [master, slave, pipe_fds[0], pipe_fds[1]] {
+            // SAFETY: each is a live fd this test owns.
+            unsafe { libc::close(fd) };
+        }
+        if peer >= 0 {
+            // SAFETY: the peer descriptor this test opened and still owns.
+            unsafe { libc::close(peer) };
+        }
+        if non_ptmx >= 0 {
+            // SAFETY: as above, on the (unexpected) pipe-derived descriptor.
+            unsafe { libc::close(non_ptmx) };
+        }
+
+        assert!(
+            non_ptmx < 0,
+            "control: TIOCGPTPEER must refuse a non-ptmx descriptor"
+        );
+        if peer < 0 {
+            // Only "this kernel has no such ioctl" may send the seam down the
+            // path fallback. Any other errno means the primary route broke.
+            assert!(
+                matches!(peer_errno.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY)),
+                "TIOCGPTPEER must either work or be unsupported (pre-4.13 \
+                 kernel), not fail for some other reason: {peer_errno}"
+            );
+        }
+        assert!(slave_is_tty, "the slave must be a tty");
+        assert_ne!(
+            slave_flags & libc::FD_CLOEXEC,
+            0,
+            "TIOCGPTPEER applies the open(2) flag word it is given, so the peer \
+             is close-on-exec from birth exactly as the path open is"
+        );
+        assert!(
+            slave_is_peer,
+            "the descriptor must be the peer OF THIS MASTER — the property a \
+             path lookup cannot guarantee once /dev/pts is not the devpts this \
+             master came from"
+        );
+    }
+
+    /// THE DEFECT, as a deterministic regression: while a session's pty pair is
+    /// open in this (multi-threaded) parent, an UNRELATED `Command::spawn` — the
+    /// exact shape of the update-handoff worker's `job.command.spawn()` — must
+    /// inherit NEITHER end.
+    ///
+    /// Deterministic by construction, with no race and no timing: the pair is
+    /// open across the whole `spawn`, so anything inheritable WOULD be inherited.
+    /// (The historical window was narrower only because `forkpty` closed the
+    /// slave promptly; the inheritance rule being tested is the same one.)
+    ///
+    /// NON-VACUITY is carried by a control fd in the same run: a plain `dup` of
+    /// the slave, which POSIX defines to clear `FD_CLOEXEC`, is handed to the
+    /// same helper. It must be inherited AND must be able to write onto this
+    /// session's terminal — which simultaneously proves the detector can see a
+    /// leak at all, and reproduces the actual harm (forged output injected into
+    /// aterm's render path from a process that was never given a terminal).
+    #[test]
+    fn an_unrelated_exec_inherits_neither_end_of_a_live_pty() {
+        use std::time::Duration;
+        let ws = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (master, slave) = open_pty_pair_cloexec(None, Some(&ws)).expect("pty pair");
+        // The control leak: `dup` never copies FD_CLOEXEC, so this is a slave
+        // handle in exactly the state forkpty left the real one in.
+        // SAFETY: `slave` is live; `dup` returns a new fd onto the same pty.
+        let leaked = unsafe { libc::dup(slave) };
+        assert!(leaked >= 0, "dup(slave) failed");
+        assert_eq!(
+            fd_flags(leaked, "control dup of the slave") & libc::FD_CLOEXEC,
+            0,
+            "PRECONDITION: the control fd must be inheritable, or it proves nothing"
+        );
+
+        // The unrelated process: reports which of the three fd numbers it was
+        // actually handed, then writes a marker through each. Its stdout is a
+        // pipe (fd 1), so nothing it prints can be confused with pty traffic.
+        // The `/dev/fd` probes all run BEFORE any redirection, so a shell reusing
+        // a freed number internally cannot fake an inheritance.
+        let script = format!(
+            "for f in {master} {slave} {leaked}; do [ -e /dev/fd/$f ] && printf 'got:%s ' \"$f\"; done; \
+             printf 'ran '; \
+             {{ printf 'LEAKMARK' >&{leaked}; }} 2>/dev/null; \
+             {{ printf 'SLAVEMARK' >&{slave}; }} 2>/dev/null; \
+             {{ printf 'MASTERMARK' >&{master}; }} 2>/dev/null; \
+             printf 'end'"
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("the unrelated helper must run");
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        // Parse the reported fd NUMBERS rather than substring-matching them:
+        // with concurrent tests the descriptors reach two digits, and "got:3"
+        // is a substring of "got:33" — a false leak report waiting to happen.
+        let inherited: Vec<libc::c_int> = report
+            .split_whitespace()
+            .filter_map(|tok| tok.strip_prefix("got:"))
+            .filter_map(|n| n.parse::<libc::c_int>().ok())
+            .collect();
+
+        // Drain whatever reached our terminal.
+        set_nonblocking(master, true).expect("nonblocking master");
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 256];
+            let n = read(master, &mut buf);
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+                if seen.len() >= b"LEAKMARK".len() {
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let seen = String::from_utf8_lossy(&seen).into_owned();
+
+        for fd in [leaked, slave, master] {
+            // SAFETY: each is a live fd this test owns.
+            unsafe { libc::close(fd) };
+        }
+
+        // PRECONDITION: the helper really ran and really reported.
+        assert!(
+            report.contains("ran") && report.contains("end"),
+            "the unrelated helper did not run to completion; report: {report:?}"
+        );
+        // NON-VACUITY: an inheritable slave IS inherited, and IS a live channel
+        // onto this session's terminal.
+        assert!(
+            inherited.contains(&leaked),
+            "control: an fd WITHOUT FD_CLOEXEC must be inherited across exec, \
+             else this test cannot detect a leak at all; report: {report:?}"
+        );
+        assert!(
+            seen.contains("LEAKMARK"),
+            "control: a leaked slave lets an unrelated process forge output into \
+             this session's terminal; master saw: {seen:?}"
+        );
+        // THE PROPERTY.
+        assert!(
+            !inherited.contains(&master),
+            "an unrelated exec'd process inherited the pty MASTER (fd {master}); \
+             report: {report:?}"
+        );
+        assert!(
+            !inherited.contains(&slave),
+            "an unrelated exec'd process inherited the pty SLAVE (fd {slave}); \
+             report: {report:?}"
+        );
+        assert!(
+            !seen.contains("SLAVEMARK") && !seen.contains("MASTERMARK"),
+            "an unrelated exec'd process wrote onto this session's terminal \
+             through an inherited pty end; master saw: {seen:?}"
+        );
+    }
+
+    // ---- The EXEC-STATUS CHANNEL: the window, and the bound behind it ----
+
+    /// Build the ORIGINAL, RACY carrier — `pipe(2)` + two `fcntl(F_SETFD)` —
+    /// so the tests below can reproduce the defect deliberately.
+    ///
+    /// This is the shape `open_exec_status_channel` now only reaches as a
+    /// last-resort fallback. Reproducing it by hand is the point: the fix makes
+    /// the leak unreachable through the real seam, so the only honest way to test
+    /// that the BOUND still ends the wait is to re-create the leak on purpose.
+    fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` fills exactly the two-element array it is given.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        // SAFETY: both fds are live; `F_SETFD` only sets a flag word.
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        assert!(
+            fd_set_nonblocking(fds[0]),
+            "the read end must be non-blocking, as the real carrier makes it"
+        );
+        (fds[0], fds[1])
+    }
+
+    /// Is the channel still WITHOUT a verdict after `grace`?
+    ///
+    /// `true` means someone other than us holds a write end: every copy we own is
+    /// closed, so if nobody else had one the read would answer EOF (0) at once.
+    /// This is the precondition that makes the bound tests non-vacuous — it is
+    /// exactly the state in which the ORIGINAL blocking `read` was measured
+    /// parking for the stranger's entire lifetime (5 s, 20 s, 65 s).
+    fn eof_is_suppressed(rd: libc::c_int, grace: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if read_exec_status_now(rd).is_some() {
+                return false; // a verdict arrived — nothing is suppressing EOF
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+
+    /// Spawn an unrelated process that INHERITS `fd` and holds it open.
+    ///
+    /// Deliberately `std::process::Command::spawn` and nothing more exotic: that
+    /// is the literal call the update-handoff worker makes on its own thread
+    /// (aterm-gui `app_update_handoff.rs`), it bottoms out in `posix_spawn(2)`,
+    /// and it closes nothing but 0/1/2 — so any descriptor without `FD_CLOEXEC`
+    /// rides straight through its `exec`. That is the whole defect, reproduced
+    /// with the production mechanism rather than a stand-in.
+    fn stranger_holding(fd: libc::c_int) -> std::process::Child {
+        assert_eq!(
+            fd_flags(fd, "the fd handed to the stranger") & libc::FD_CLOEXEC,
+            0,
+            "PRECONDITION: the fd must be inheritable, or the stranger cannot \
+             receive it and the test proves nothing"
+        );
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the unrelated helper must spawn")
+    }
+
+    /// THE FIX: the exec-status channel's two ends are close-on-exec FROM BIRTH.
+    ///
+    /// The carrier is asserted to be an ATOMIC one, not the racy fallback,
+    /// because the flag alone is not the property that matters — `pipe(2)` plus
+    /// two `fcntl`s ends up with the same two flags set and is precisely the
+    /// defect. What matters is that no unflagged instant ever existed, and the
+    /// only machine-checkable proxy for that from here is WHICH carrier ran.
+    ///
+    /// NON-VACUITY is carried by a plain `pipe(2)` in the same run: it must show
+    /// both ends unflagged, or this test could not tell the two apart at all.
+    #[test]
+    fn exec_status_channel_is_close_on_exec_from_birth() {
+        let (rd, wr, carrier) =
+            open_exec_status_channel().expect("the exec-status channel must open");
+
+        // The control: the carrier this replaces, built the way it used to be.
+        let mut racy = [0 as libc::c_int; 2];
+        // SAFETY: `pipe` fills exactly the two-element array it is given.
+        assert_eq!(unsafe { libc::pipe(racy.as_mut_ptr()) }, 0, "pipe");
+        let racy_flags = (
+            fd_flags(racy[0], "control pipe read end"),
+            fd_flags(racy[1], "control pipe write end"),
+        );
+
+        let flags = (
+            fd_flags(rd, "status read end"),
+            fd_flags(wr, "status write end"),
+        );
+        // Close BEFORE asserting so a failure cannot leak descriptors.
+        for fd in [rd, wr, racy[0], racy[1]] {
+            // SAFETY: each is a live fd this test owns.
+            unsafe { libc::close(fd) };
+        }
+
+        assert_eq!(
+            (
+                racy_flags.0 & libc::FD_CLOEXEC,
+                racy_flags.1 & libc::FD_CLOEXEC
+            ),
+            (0, 0),
+            "control: `pipe(2)` must return BOTH ends unflagged — that unflagged \
+             instant IS the defect, and if it were not observable here this test \
+             would be comparing nothing"
+        );
+        assert_ne!(
+            flags.0 & libc::FD_CLOEXEC,
+            0,
+            "the status READ end must be close-on-exec"
+        );
+        assert_ne!(
+            flags.1 & libc::FD_CLOEXEC,
+            0,
+            "the status WRITE end must be close-on-exec — this is the end whose \
+             exec-close IS the success signal"
+        );
+        assert_ne!(
+            carrier,
+            ExecStatusCarrier::RacyPipe,
+            "the channel must come from a carrier that flags both ends AT BIRTH \
+             ({:?} on this platform), not from `pipe(2)` + `fcntl`, which sets \
+             the same flags a moment too late",
+            if cfg!(target_os = "linux") {
+                "pipe2(O_CLOEXEC)"
+            } else {
+                "an unlinked O_CLOEXEC fifo"
+            }
+        );
+    }
+
+    /// THE DEFECT, as a deterministic regression: an unrelated `Command::spawn`
+    /// running while a status channel is open must inherit NEITHER end.
+    ///
+    /// Deterministic by construction — the channel is open across the whole
+    /// `spawn`, so anything inheritable WOULD be inherited. NON-VACUITY comes
+    /// from a control fd in the same run: a plain `dup` of the write end, which
+    /// POSIX defines to clear `FD_CLOEXEC`, must be inherited, and must still be
+    /// able to suppress EOF — which is not just "the detector works" but the
+    /// actual harm, since that suppression is what parked the session-opening
+    /// thread for the stranger's entire lifetime.
+    #[test]
+    fn an_unrelated_exec_inherits_neither_end_of_the_exec_status_channel() {
+        let (rd, wr, _carrier) =
+            open_exec_status_channel().expect("the exec-status channel must open");
+        // The control leak: `dup` never copies FD_CLOEXEC.
+        // SAFETY: `wr` is live; `dup` returns a new fd onto the same channel.
+        let leaked = unsafe { libc::dup(wr) };
+        assert!(leaked >= 0, "dup(status_wr) failed");
+        assert_eq!(
+            fd_flags(leaked, "control dup of the status write end") & libc::FD_CLOEXEC,
+            0,
+            "PRECONDITION: the control fd must be inheritable, or it proves nothing"
+        );
+
+        // Report which of the three numbers actually arrived, then hold them.
+        let script = format!(
+            "for f in {rd} {wr} {leaked}; do [ -e /dev/fd/$f ] && printf 'got:%s ' \"$f\"; done; \
+             printf 'ran '; printf 'end'"
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("the unrelated helper must run");
+        let report = String::from_utf8_lossy(&out.stdout).into_owned();
+        // Parse fd NUMBERS, not substrings: "got:3" is a substring of "got:33".
+        let inherited: Vec<libc::c_int> = report
+            .split_whitespace()
+            .filter_map(|tok| tok.strip_prefix("got:"))
+            .filter_map(|n| n.parse::<libc::c_int>().ok())
+            .collect();
+
+        // The harm, demonstrated with the control fd: hand it to a LIVE stranger,
+        // drop every copy the "parent" holds, and EOF still does not arrive.
+        let mut stranger = stranger_holding(leaked);
+        // SAFETY: these are the parent's own copies; the stranger has its own.
+        unsafe {
+            libc::close(leaked);
+            libc::close(wr);
+        }
+        let control_suppressed = eof_is_suppressed(rd, std::time::Duration::from_millis(300));
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        // SAFETY: the read end is the last descriptor this test owns.
+        unsafe { libc::close(rd) };
+
+        // PRECONDITION: the helper really ran and really reported.
+        assert!(
+            report.contains("ran") && report.contains("end"),
+            "the unrelated helper did not run to completion; report: {report:?}"
+        );
+        // NON-VACUITY: an inheritable write end IS inherited, and IS enough to
+        // suppress the success verdict indefinitely.
+        assert!(
+            inherited.contains(&leaked),
+            "control: an fd WITHOUT FD_CLOEXEC must be inherited across exec, \
+             else this test cannot detect a leak at all; report: {report:?}"
+        );
+        assert!(
+            control_suppressed,
+            "control: a stranger holding an inherited WRITE end must suppress EOF \
+             — that suppression is the hang, and without it the property below \
+             would be asserting nothing"
+        );
+        // THE PROPERTY.
+        assert!(
+            !inherited.contains(&wr),
+            "an unrelated exec'd process inherited the status WRITE end (fd {wr}) \
+             — it can now suppress this spawn's EOF for its whole lifetime; \
+             report: {report:?}"
+        );
+        assert!(
+            !inherited.contains(&rd),
+            "an unrelated exec'd process inherited the status READ end (fd {rd}); \
+             report: {report:?}"
+        );
+    }
+
+    /// THE HANG, bounded: with a stranger holding a duplicate of the write end,
+    /// the status wait must END — by the budget — instead of parking forever.
+    ///
+    /// The leak is re-created ON PURPOSE (the fix makes it unreachable through
+    /// the real seam), using the production mechanism: a non-close-on-exec
+    /// duplicate inherited by a real `Command::spawn`.
+    ///
+    /// NON-VACUITY is the whole design of this test:
+    ///  * the stranger is asserted to be ALIVE at the end, so the wait ended
+    ///    because of the bound and not because the holder happened to exit;
+    ///  * `eof_is_suppressed` asserts the channel genuinely has no verdict — every
+    ///    copy the "parent" owns is closed, so without the stranger EOF would be
+    ///    immediate, which is exactly the state the ORIGINAL blocking read was
+    ///    measured parking in for 5 s / 20 s / 65 s;
+    ///  * a CONTROL run with no stranger must answer `Execed` promptly, proving
+    ///    the harness can see a verdict when one exists.
+    ///
+    /// A short budget is passed explicitly rather than using
+    /// `EXEC_STATUS_BUDGET`: what is under test is that the bound is what ends
+    /// the wait, not how long the shipping bound is (that is a separate
+    /// assertion below, and waiting 10 s here would buy nothing).
+    #[test]
+    fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+
+        // CONTROL first: same protocol, no stranger. A verdict must arrive.
+        let (crd, cwr) = racy_status_pipe();
+        // SAFETY: the only write end; closing it is the "child exec'd" signal.
+        unsafe { libc::close(cwr) };
+        let control = wait_for_exec_status(crd, BUDGET);
+        // SAFETY: the read end this test owns.
+        unsafe { libc::close(crd) };
+
+        // THE DEFECT: a stranger inherits a duplicate of the write end.
+        let (rd, wr) = racy_status_pipe();
+        // SAFETY: `wr` is live; `dup` copies it WITHOUT FD_CLOEXEC — exactly what
+        // `pipe(2)`'s unflagged window handed to a concurrent `posix_spawn`.
+        let leaked = unsafe { libc::dup(wr) };
+        assert!(leaked >= 0, "dup(status_wr) failed");
+        let mut stranger = stranger_holding(leaked);
+        // Drop every copy the "parent" holds — including the one that stands in
+        // for the child's, which a successful `execve` would have closed.
+        // SAFETY: all three are this process's own copies.
+        unsafe {
+            libc::close(leaked);
+            libc::close(wr);
+        }
+
+        let suppressed = eof_is_suppressed(rd, std::time::Duration::from_millis(250));
+        let started = std::time::Instant::now();
+        let status = wait_for_exec_status(rd, BUDGET);
+        let waited = started.elapsed();
+        let stranger_alive = stranger.try_wait().expect("try_wait").is_none();
+
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        // SAFETY: the read end is the last descriptor this test owns.
+        unsafe { libc::close(rd) };
+
+        assert!(
+            matches!(control, ExecStatus::Execed),
+            "control: with no stranger, closing the last write end must answer \
+             `Execed` — if it did not, the harness could not tell a suppressed \
+             verdict from a missing one; got {control:?}"
+        );
+        assert!(
+            suppressed,
+            "PRECONDITION: with every parent-side copy closed, the channel must \
+             still have NO verdict — that is the state the original unbounded \
+             `read` parked in for the stranger's entire lifetime"
+        );
+        assert!(
+            stranger_alive,
+            "PRECONDITION: the stranger must STILL hold the write end when the \
+             wait returns — otherwise the wait ended because the holder exited, \
+             which is the old behaviour passing as the new one"
+        );
+        assert!(
+            matches!(status, ExecStatus::NoVerdict),
+            "a suppressed EOF must expire as `NoVerdict` (which the seam turns \
+             into a fail-closed error), got {status:?}"
+        );
+        assert!(
+            waited >= BUDGET && waited < BUDGET * 8,
+            "the wait must be ended BY THE BUDGET: expected ~{BUDGET:?}, took \
+             {waited:?}"
+        );
+    }
+
+    /// The case a naive timeout would silently turn into a FALSE SUCCESS: a
+    /// pre-exec failure, reported while a stranger holds the write end.
+    ///
+    /// This is the asymmetry the whole bounded design rests on. The failure byte
+    /// sits in the channel's BUFFER, so `read` returns it regardless of who else
+    /// holds a write end — only EOF depends on every write end being gone. If
+    /// that were not true, a bound would convert a sandbox-confinement failure
+    /// into the EOF success verdict and hand back an unconfined shell, which is
+    /// precisely the §5.6 hole `b'S'` exists to plug.
+    ///
+    /// NON-VACUITY: the stranger is asserted to be alive AND still holding at the
+    /// moment the byte comes back (so the byte really did cross a channel with a
+    /// third holder), and the verdict is required to arrive in a small fraction
+    /// of the budget — a byte that only appeared at expiry would mean the buffer
+    /// claim is false and the test had merely timed out into the right answer.
+    #[test]
+    fn a_pre_exec_failure_is_still_detected_while_a_stranger_holds_the_write_end() {
+        const BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
+
+        let (rd, wr) = racy_status_pipe();
+        // SAFETY: `wr` is live; `dup` copies it WITHOUT FD_CLOEXEC.
+        let leaked = unsafe { libc::dup(wr) };
+        assert!(leaked >= 0, "dup(status_wr) failed");
+        let mut stranger = stranger_holding(leaked);
+        // SAFETY: the parent's own copy of the leaked duplicate.
+        unsafe { libc::close(leaked) };
+
+        // The child's report: the sandbox-confinement failure byte, then its copy
+        // of the write end goes away exactly as `_exit` would take it.
+        let b: u8 = b'S';
+        // SAFETY: `wr` is live; `write` reads exactly the one byte at `b`.
+        let wrote = unsafe { libc::write(wr, ptr::from_ref(&b).cast::<libc::c_void>(), 1) };
+        // SAFETY: the parent's own copy of the write end.
+        unsafe { libc::close(wr) };
+
+        let started = std::time::Instant::now();
+        let status = wait_for_exec_status(rd, BUDGET);
+        let waited = started.elapsed();
+        let stranger_alive = stranger.try_wait().expect("try_wait").is_none();
+
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        // SAFETY: the read end is the last descriptor this test owns.
+        unsafe { libc::close(rd) };
+
+        assert_eq!(wrote, 1, "the failure byte must have been written");
+        assert!(
+            stranger_alive,
+            "PRECONDITION: the stranger must still hold a write end when the byte \
+             comes back, or this proves nothing about a suppressed channel"
+        );
+        assert!(
+            matches!(status, ExecStatus::FailedBeforeExec(b'S')),
+            "a pre-exec failure must still be read as itself while a third party \
+             holds a write end — a bound must never launder it into success; \
+             got {status:?}"
+        );
+        assert!(
+            waited < BUDGET / 4,
+            "the byte is in the channel BUFFER, so it must come back immediately \
+             rather than at expiry; took {waited:?} of a {BUDGET:?} budget"
+        );
+    }
+
+    /// The real seam, end to end: a spawn that succeeds does so promptly, on the
+    /// ATOMIC carrier, and nowhere near the fail-closed budget.
+    ///
+    /// The counter assertion is what makes this more than a smoke test: if
+    /// `open_exec_status_channel` had quietly fallen back to `pipe(2)` + `fcntl`
+    /// on this machine, every other assertion here would still pass while the
+    /// window sat wide open. The count is required not to move.
+    #[test]
+    fn a_real_spawn_settles_promptly_on_the_atomic_status_carrier() {
+        use std::sync::atomic::Ordering;
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+
+        let before = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let spawned = spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None, // shell_override
+            None, // shell_args
+            None,
+            None,
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+        )
+        .expect("a normal shell must still spawn");
+        let elapsed = started.elapsed();
+        let after = RACY_EXEC_STATUS_CARRIERS.load(Ordering::Relaxed);
+
+        hangup(spawned.pid);
+        // SAFETY: `master` is the fd this test was just handed.
+        unsafe { libc::close(spawned.master) };
+        reap(spawned.pid);
+
+        assert_eq!(
+            before, after,
+            "the spawn fell back to the RACY `pipe(2)`+fcntl status carrier — the \
+             close-on-exec window is open on this machine, and every other \
+             assertion in this test would pass anyway"
+        );
+        assert!(
+            elapsed < EXEC_STATUS_BUDGET / 10,
+            "a successful spawn must settle far inside the fail-closed budget \
+             (measured p50 ~3 ms against a {EXEC_STATUS_BUDGET:?} budget); took \
+             {elapsed:?}"
+        );
+    }
+
+    /// Building the status channel must not KILL a concurrent fork's child.
+    ///
+    /// This is a scar, not a hypothetical. The first version of this carrier
+    /// located its FIFO with `confstr(_CS_DARWIN_USER_TEMP_DIR)` — the
+    /// conservative choice, since it asks the OS instead of trusting `$TMPDIR`.
+    /// That call reaches libsystem_notify, whose shared region sits behind an
+    /// `os_alloc_once` gate, and `fork(2)` runs `notify_fork_child` in the child
+    /// before it returns. A fork that lands while another thread is inside that
+    /// gate leaves the child holding a once-gate owned by a thread that does not
+    /// exist, and libplatform kills it:
+    ///
+    /// ```text
+    ///   BUG IN CLIENT OF LIBPLATFORM: os_once_t is corrupt
+    ///   libsystem_c.dylib: crashed on child side of fork pre-exec
+    ///   _os_once_gate_corruption_abort <- _os_alloc_once <- notify_fork_child
+    ///     <- libSystem_atfork_child <- fork
+    /// ```
+    ///
+    /// SIGKILL, raised INSIDE `fork()` before one instruction of the child branch
+    /// runs — so no amount of care in that branch can prevent it. MEASURED on
+    /// otherwise-unmodified production code, with a test doing nothing but
+    /// `confstr` on six threads: a concurrent `forkpty` child died in 16 of 25
+    /// runs. In aterm that is a user's shell SIGKILLed at random because another
+    /// thread asked where the temp directory was.
+    ///
+    /// So the invariant under test is deliberately broader than "don't call
+    /// `confstr`": building the exec-status channel must not make a CONCURRENT
+    /// FORK'S CHILD DIE, whatever it is built from. Anything added to the carrier
+    /// later — a different directory lookup, a randomness source, a logging call —
+    /// is covered by construction.
+    ///
+    /// NON-VACUITY, and its LIMIT, stated honestly because this one matters: the
+    /// channel builder and the fork loop are both asserted to have actually run,
+    /// and the builder is asserted to have produced the ATOMIC carrier, so the
+    /// fifo path (the one with a directory lookup in it) is the one being
+    /// exercised rather than the pipe fallback. The test was then checked against
+    /// the real defect by putting the `confstr` back: it FAILS, but only in about
+    /// 1-3 runs out of 12 (measured; raising the fork count to 1500 and 4000 did
+    /// not improve it, so the limit is how briefly the once-gate is actually
+    /// held, not how many forks are thrown at it). On fork-safe code it has never
+    /// failed — 0 in 12 runs, and the failure mode is a libSystem abort that
+    /// correct code cannot produce, so there are no false positives.
+    ///
+    /// So: this is a SMOKE ALARM, not a proof. It will catch a re-introduction
+    /// across a handful of runs and it cannot cry wolf, but a single green run is
+    /// not evidence of fork-safety. The primary defence against re-introducing
+    /// `confstr` here is the documentation on [`exec_status_fifo_dir`], which
+    /// says why that obvious-looking call is forbidden; this test is the backstop
+    /// for anyone who changes the carrier without reading it.
+    ///
+    /// DARWIN ONLY, and for a structural reason rather than convenience: the
+    /// hazard belongs to the PATHNAME-based carrier, and the naming path this
+    /// churns ([`exec_status_fifo_path`]) exists only there. Linux's
+    /// `pipe2(O_CLOEXEC)` is one syscall with no directory lookup, no lazily
+    /// initialised subsystem behind it, and therefore nothing of this shape to
+    /// get wrong.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn building_the_status_channel_never_kills_a_concurrent_forks_child() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let built = Arc::new(AtomicU64::new(0));
+        let named = Arc::new(AtomicU64::new(0));
+        let racy = Arc::new(AtomicU64::new(0));
+
+        // TWO kinds of churn, and the split is what makes the test sensitive.
+        //
+        // Building a whole channel costs ~270 us (mkfifo + two opens + unlink), so
+        // threads doing only that touch the NAMING path a few thousand times a
+        // second — far too sparse to reliably catch a once-gate that is only held
+        // for the duration of one lookup. VERIFIED: with channel-building churn
+        // alone, restoring the `confstr` did NOT fail this test in 10 runs. So
+        // most threads hammer the naming path DIRECTLY, in a tight loop, which is
+        // what raises the probability of a fork landing inside the gate to
+        // something a test can rely on.
+        let churn: Vec<_> = (0..6)
+            .map(|i| {
+                let (stop, built, named, racy) =
+                    (stop.clone(), built.clone(), named.clone(), racy.clone());
+                std::thread::spawn(move || {
+                    // Two threads exercise the FULL carrier (so mkfifo/open/unlink
+                    // are in the race too); the rest hammer path resolution.
+                    let full = i < 2;
+                    while !stop.load(Ordering::Relaxed) {
+                        if full {
+                            match open_exec_status_channel() {
+                                Ok((rd, wr, carrier)) => {
+                                    if carrier == ExecStatusCarrier::RacyPipe {
+                                        racy.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    built.fetch_add(1, Ordering::Relaxed);
+                                    // SAFETY: the two ends this thread just opened.
+                                    unsafe {
+                                        libc::close(rd);
+                                        libc::close(wr);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        } else if exec_status_fifo_path().is_ok() {
+                            named.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        // Meanwhile, fork. The child does nothing but `_exit(0)` — so ANY death
+        // by signal is the fork machinery itself dying, never our own code.
+        let mut forks = 0u32;
+        let mut signalled: Vec<(i32, i32)> = Vec::new();
+        for _ in 0..300 {
+            // SAFETY: `fork` takes no arguments; the child below reaches only
+            // `_exit`, which is async-signal-safe.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                // SAFETY: async-signal-safe, and the only call the child makes.
+                unsafe { libc::_exit(0) };
+            }
+            forks += 1;
+            let mut wstatus: libc::c_int = 0;
+            // SAFETY: reaping the child just forked; `wstatus` is a valid out-param.
+            unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+            if !libc::WIFEXITED(wstatus) {
+                signalled.push((pid, libc::WTERMSIG(wstatus)));
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in churn {
+            let _ = t.join();
+        }
+        let built = built.load(Ordering::Relaxed);
+        let named = named.load(Ordering::Relaxed);
+        let racy = racy.load(Ordering::Relaxed);
+
+        // PRECONDITIONS: both sides of the race really ran.
+        assert_eq!(forks, 300, "the fork loop must have run");
+        assert!(
+            built > 50 && named > 10_000,
+            "PRECONDITION: the carrier must have been exercised HARD alongside \
+             the forks, else nothing was raced (and a sparse race is exactly what \
+             was measured to miss this defect); built {built}, named {named}"
+        );
+        assert_eq!(
+            racy, 0,
+            "PRECONDITION: the builder must have produced the ATOMIC carrier — \
+             the pipe fallback has no directory lookup, so racing it would not \
+             exercise the hazard this test exists for"
+        );
+        // THE PROPERTY.
+        assert!(
+            signalled.is_empty(),
+            "a child that does nothing but _exit(0) was killed by a signal while \
+             the exec-status channel was being built on other threads — the \
+             carrier is doing something that is not fork-safe (SIGKILL here means \
+             `fork` itself aborted in libSystem's atfork child handler, e.g. the \
+             `confstr`/libsystem_notify `os_once` corruption this test records). \
+             (pid, signal) pairs: {signalled:?}"
+        );
+    }
+
+    /// The platform trap that dictates `select(2)` in `wait_readable_briefly`.
+    ///
+    /// On macOS a FIFO read end whose LAST WRITER HAS CLOSED is at EOF —
+    /// `read(2)` returns 0 — but `poll(2)` reports nothing at all and
+    /// `kqueue`/`EVFILT_READ` reports nothing at all, indefinitely. Only
+    /// `select(2)` sees it. All three are correct on a pipe, which is what makes
+    /// this a trap rather than a curiosity: a maintainer who "modernises" the
+    /// `select` into a `poll` would watch every pipe-based test stay green and
+    /// silently add the full budget to every successful spawn on macOS.
+    ///
+    /// NON-VACUITY: the same `poll` and `kqueue` calls are run against a PIPE at
+    /// EOF in the same test and must both report it — so a failure here means
+    /// "fifos are special", not "the probe is broken". Pinned as an executable
+    /// fact so that if a future macOS fixes it, this test says so out loud
+    /// instead of leaving the comment to rot.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_fifo_eof_is_invisible_to_poll_and_kqueue_but_not_select() {
+        /// Does `poll` report readability on `fd` within `ms`?
+        fn polls_ready(fd: libc::c_int, ms: libc::c_int) -> bool {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is a live, fully-initialized one-element array.
+            unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+        }
+        /// Does `kqueue`/`EVFILT_READ` report readability on `fd` within `ms`?
+        fn kqueue_ready(fd: libc::c_int, ms: i64) -> bool {
+            // SAFETY: `ch`/`ev` are zeroed, fully-initialized kevents; `kevent`
+            // reads one change and writes at most one event through them.
+            unsafe {
+                let kq = libc::kqueue();
+                let mut ch: libc::kevent = std::mem::zeroed();
+                ch.ident = fd as usize;
+                ch.filter = libc::EVFILT_READ;
+                ch.flags = libc::EV_ADD | libc::EV_ENABLE;
+                let mut ev: libc::kevent = std::mem::zeroed();
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: ms * 1_000_000,
+                };
+                let n = libc::kevent(kq, &ch, 1, &mut ev, 1, &ts);
+                libc::close(kq);
+                n > 0
+            }
+        }
+        /// Does `select` report readability on `fd` within `ms`?
+        fn selects_ready(fd: libc::c_int, ms: i32) -> bool {
+            // SAFETY: `set` is a zeroed fd_set and test fds are far below
+            // FD_SETSIZE; `select` touches only `set` and `tv`.
+            unsafe {
+                let mut set: libc::fd_set = std::mem::zeroed();
+                libc::FD_SET(fd, &mut set);
+                let mut tv = libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: ms * 1000,
+                };
+                libc::select(fd + 1, &mut set, ptr::null_mut(), ptr::null_mut(), &mut tv) > 0
+            }
+        }
+
+        // A fifo at EOF: the real carrier, with its write end closed.
+        let (frd, fwr) = open_exec_status_fifo().expect("the exec-status fifo must open");
+        // SAFETY: the only write end; closing it puts the read end at EOF.
+        unsafe { libc::close(fwr) };
+        let fifo = (
+            selects_ready(frd, 200),
+            polls_ready(frd, 200),
+            kqueue_ready(frd, 200),
+        );
+        // And what `read(2)` says about the very same descriptor.
+        let fifo_verdict = read_exec_status_now(frd);
+        // SAFETY: the read end this test owns.
+        unsafe { libc::close(frd) };
+
+        // THE PRODUCTION FUNCTION, bound to the fact above — on a FRESH carrier,
+        // and in the state `wait_for_exec_status` actually waits in.
+        //
+        // That distinction is load-bearing and was got wrong once: the loop reads
+        // FIRST and returns on EOF, so it never waits on a descriptor already at
+        // EOF. It waits with a writer still open and nothing sent — i.e. the
+        // child has not exec'd yet — and needs to WAKE when that last writer goes
+        // away. (MEASURED aside, which is why this must use a fresh fifo: once an
+        // EOF has been READ on a Darwin fifo, `select` stops reporting the
+        // descriptor ready, so timing a wait after a read measures a state
+        // production never sees and reports a 2 s "hang" that is not one.)
+        //
+        // So: hold the write end, close it 100 ms later, and time the wait.
+        // `select` wakes on that transition; `poll` and `kqueue` never do.
+        // Without this binding, swapping `select` for `poll` in
+        // `wait_readable_briefly` leaves every other test green — the slice cap
+        // keeps it CORRECT, just slow — and the latency regression ships.
+        let (drd, dwr) = open_exec_status_fifo().expect("the exec-status fifo must open");
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // SAFETY: the only write end; this thread owns it now.
+            unsafe { libc::close(dwr) };
+        });
+        let waited = std::time::Instant::now();
+        wait_readable_briefly(drd, std::time::Duration::from_secs(2));
+        let wait_readable_took = waited.elapsed();
+        let after_wake = read_exec_status_now(drd);
+        closer.join().expect("closer thread");
+        // SAFETY: the read end this test owns.
+        unsafe { libc::close(drd) };
+
+        // The CONTROL: a pipe at EOF, probed identically.
+        let (prd, pwr) = racy_status_pipe();
+        // SAFETY: the only write end; closing it puts the read end at EOF.
+        unsafe { libc::close(pwr) };
+        let pipe = (
+            selects_ready(prd, 200),
+            polls_ready(prd, 200),
+            kqueue_ready(prd, 200),
+        );
+        // SAFETY: the read end this test owns.
+        unsafe { libc::close(prd) };
+
+        // CONTROL: on a pipe all three mechanisms see EOF. If this ever fails,
+        // the probes above are broken and the fifo result below means nothing.
+        assert_eq!(
+            pipe,
+            (true, true, true),
+            "control: select/poll/kqueue must ALL report EOF on a PIPE \
+             (select, poll, kqueue) = {pipe:?}"
+        );
+        // The ground truth `wait_for_exec_status` actually relies on.
+        assert!(
+            matches!(fifo_verdict, Some(ExecStatus::Execed)),
+            "a fifo whose last writer closed must read as EOF; got {fifo_verdict:?}"
+        );
+        assert!(
+            fifo.0,
+            "select(2) must report EOF on a fifo — it is the ONLY readiness \
+             primitive `wait_readable_briefly` can use on this platform"
+        );
+        // The binding that makes the fact above load-bearing on real code.
+        assert!(
+            matches!(after_wake, Some(ExecStatus::Execed)),
+            "PRECONDITION: the last writer really did close, so the wait had a \
+             real EOF to wake on; got {after_wake:?}"
+        );
+        assert!(
+            wait_readable_took < std::time::Duration::from_millis(900),
+            "`wait_readable_briefly` must WAKE when a fifo's last writer closes \
+             (~100 ms here) rather than sleeping out its 2 s slice — it took \
+             {wait_readable_took:?}, which is what a readiness primitive blind to \
+             fifo EOF (poll, kqueue) does. Correctness is unaffected (the caller \
+             re-reads), but every successful spawn on macOS pays this in latency"
+        );
+        assert_eq!(
+            (fifo.1, fifo.2),
+            (false, false),
+            "poll/kqueue are expected to MISS fifo EOF on macOS; if this now \
+             fails, the platform was fixed — update `EXEC_STATUS_SLICE`'s and \
+             `wait_readable_briefly`'s comments rather than deleting this test \
+             (poll, kqueue) = {:?}",
+            (fifo.1, fifo.2)
+        );
+    }
+
+    /// The property that would SILENTLY break the shell if the close-on-exec
+    /// design were wrong: the child's stdio must NOT be close-on-exec.
+    ///
+    /// `login_tty` `dup2`s the (close-on-exec) slave onto 0/1/2, and `dup2` never
+    /// carries `FD_CLOEXEC` to the new descriptor — so the copies survive
+    /// `execve`. If that were wrong the exec'd program would start with fds
+    /// 0/1/2 CLOSED and this test could not receive a single byte: the `printf`
+    /// below is written to fd 1, through the real spawn seam, and read off the
+    /// master. Same run also proves the child got a CONTROLLING TERMINAL
+    /// (`/dev/tty` opens) and the parent-applied winsize (`stty size`).
+    #[test]
+    fn spawned_child_stdio_is_an_inherited_tty_with_a_ctty_and_our_winsize() {
+        use std::time::Duration;
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        // Deliberately NOT 24x80: a default-shaped answer would not distinguish
+        // "our winsize arrived" from "the kernel's default happens to match".
+        // The child reports, then PARKS, so the parent can interrogate the
+        // process identities below while the session is still live.
+        let script = "s=n; [ -t 0 ] && [ -t 1 ] && [ -t 2 ] && s=y; \
+                      c=n; { : < /dev/tty; } 2>/dev/null && c=y; \
+                      printf 'PROBE stdio=%s ctty=%s size=[%s] tty=[%s]\\n' \
+                        \"$s\" \"$c\" \"$(stty size)\" \"$(tty)\"; \
+                      exec sleep 30";
+        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script.into()];
+        let sh = spawn_shell_with_pid(
+            41,
+            137,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None, // shell_override
+            None, // shell_args
+            None, // argv_override
+            Some(&exec),
+            None, // cwd
+            None, // sandbox_wrap
+            aterm_sandbox::Limits::inherit(),
+        )
+        .expect("the probe command must spawn");
+
+        set_nonblocking(sh.master, true).expect("nonblocking master");
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 512];
+            let n = read(sh.master, &mut buf);
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+                if seen.windows(1).len() > 0 && seen.ends_with(b"\n") && seen.starts_with(b"PROBE")
+                {
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let seen = String::from_utf8_lossy(&seen).into_owned();
+
+        // The child's controlling terminal must be THIS session's slave, named
+        // exactly. `ctty=y` alone would be satisfied by an inherited terminal
+        // (the harness has one); matching the device proves setsid + TIOCSCTTY
+        // ran against OUR pts.
+        let want_tty = pts_name(sh.master)
+            .expect("the master must still resolve its pts name")
+            .to_string_lossy()
+            .into_owned();
+
+        // Process identities, read from the PARENT while the session is parked:
+        // pid == pgid == sid, and the pty's foreground process group is the
+        // child. These are the exact probes `hangup` (killpg), `reap` (getpgid),
+        // and the GUI's quit_safety/control_input (tcgetpgrp) depend on.
+        // SAFETY: read-only identity probes on a live child pid / our master fd.
+        let (pgid, sid, fg) = unsafe {
+            (
+                libc::getpgid(sh.pid),
+                libc::getsid(sh.pid),
+                libc::tcgetpgrp(sh.master),
+            )
+        };
+
+        hangup(sh.pid);
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        reap(sh.pid);
+
+        // PRECONDITION: bytes arrived at all. This IS the stdio-survives-exec
+        // proof — an exec'd child with close-on-exec 0/1/2 has nothing to write
+        // to, so an empty read here is exactly the failure being guarded.
+        assert!(
+            seen.contains("PROBE"),
+            "no output reached the master: the exec'd child had no usable stdio \
+             (this is what a close-on-exec 0/1/2 would look like). Saw: {seen:?}"
+        );
+        assert!(
+            seen.contains("stdio=y"),
+            "the exec'd child's fds 0/1/2 must all be ttys — dup2 must have \
+             cleared FD_CLOEXEC on the slave copies. Saw: {seen:?}"
+        );
+        assert!(
+            seen.contains("ctty=y"),
+            "the child must have a CONTROLLING TERMINAL (/dev/tty openable) — \
+             login_tty's setsid + TIOCSCTTY. Saw: {seen:?}"
+        );
+        assert!(
+            seen.contains("size=[41 137]"),
+            "the parent-applied winsize must be live before the child's first \
+             read of it. Saw: {seen:?}"
+        );
+        assert!(
+            seen.contains(&format!("tty=[{want_tty}]")),
+            "the child's controlling terminal must be THIS session's slave \
+             ({want_tty}), not an inherited one. Saw: {seen:?}"
+        );
+        assert_eq!(
+            (pgid, sid, fg),
+            (sh.pid, sh.pid, sh.pid),
+            "the child must be a SESSION LEADER with pid == pgid == sid and be \
+             the pty's foreground process group — the identity hangup (killpg), \
+             reap (getpgid) and the GUI's tcgetpgrp all depend on"
+        );
+    }
+
+    /// The parent must not keep its copy of the slave. A retained slave holds the
+    /// pty open for this process's whole life, so the master could never report
+    /// hangup after the shell died — and `handoff_masters_closed` is fail-closed
+    /// on exactly that condition, so the seamless update would wait forever on a
+    /// session that is already gone.
+    ///
+    /// Non-vacuous by asserting the PRECONDITION in the same run: while the child
+    /// is demonstrably alive and attached, the same poll must NOT report hangup.
+    /// Without that half, a master that reported `POLLHUP` unconditionally (or a
+    /// bad fd reporting `POLLNVAL`) would pass.
+    #[test]
+    fn master_reports_hangup_once_the_session_dies() {
+        use std::time::Duration;
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        // Announce liveness, then park: the session stays up until we hang it up.
+        let exec: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'UP\\n'; exec sleep 30".into(),
+        ];
+        let sh = spawn_shell_with_pid(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&exec),
+            None,
+            None,
+            aterm_sandbox::Limits::inherit(),
+        )
+        .expect("the parked session must spawn");
+
+        set_nonblocking(sh.master, true).expect("nonblocking master");
+        let mut alive = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let mut buf = [0u8; 64];
+            let n = read(sh.master, &mut buf);
+            if n > 0 && String::from_utf8_lossy(&buf[..n as usize]).contains("UP") {
+                alive = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // PRECONDITION: a live, attached session does NOT report hangup.
+        let while_alive = poll_revents(sh.master, Duration::from_millis(150));
+
+        // Now end it, exactly as teardown does.
+        hangup(sh.pid);
+        reap(sh.pid);
+        let after_death = poll_revents(sh.master, Duration::from_secs(5));
+
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+
+        assert!(
+            alive,
+            "the child never announced itself; the test proved nothing"
+        );
+        assert_eq!(
+            while_alive & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL),
+            0,
+            "PRECONDITION: a LIVE session must not look dead to \
+             handoff_masters_closed; revents were 0x{while_alive:04x}"
+        );
+        assert_ne!(
+            after_death & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL),
+            0,
+            "the master never reported hangup after the session died — the \
+             parent is still holding a copy of the pty SLAVE, and \
+             handoff_masters_closed would block the seamless update forever"
+        );
+    }
+
     // ---- spawn termios (kernel defaults + IUTF8/B230400 deltas) ----
 
     #[test]
@@ -3019,6 +5734,67 @@ mod tests {
         assert_eq!(unsafe { libc::cfgetospeed(&t) }, libc::B230400);
         // SAFETY: close the master (sleep gets SIGHUP via slave close at exit).
         unsafe {
+            libc::close(master);
+        }
+    }
+
+    /// A DUPLICATE OF THE MASTER IS CLOSE-ON-EXEC TOO.
+    ///
+    /// The spawn seam above opens both PTY ends close-on-exec FROM BIRTH, but
+    /// that guarantee is only as strong as every copy anyone later makes of
+    /// them. `dup(2)` is defined by POSIX to CLEAR `FD_CLOEXEC` on the new
+    /// descriptor, so the spill drainer — which duplicates the master and holds
+    /// its copy for as long as a wedged shell keeps the write queue spilling —
+    /// used to hand any concurrently-`exec`ing process a writable descriptor
+    /// onto that session's terminal, for that whole period. Found by adversarial
+    /// review of the `forkpty` replacement, not by a user report.
+    ///
+    /// Non-vacuous in both directions: it asserts the ORIGINAL is close-on-exec
+    /// (so a regression in the spawn seam cannot make this pass by accident) and
+    /// that a plain `dup` of the same fd is NOT — which is the property that
+    /// makes `F_DUPFD_CLOEXEC` load-bearing rather than decorative.
+    #[test]
+    fn a_duplicated_master_stays_close_on_exec() {
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let exec: Vec<String> = vec!["/bin/sleep".into(), "5".into()];
+        let master = spawn_shell(
+            24, 80, &spawn_cap, &sandbox_cap, &[], None, None, None, Some(&exec), None, None,
+        )
+        .expect("sleep must spawn");
+
+        // SAFETY: F_GETFD only reads the descriptor flags of a valid fd.
+        let flags_of = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(
+            flags_of(master) & libc::FD_CLOEXEC != 0,
+            "PRECONDITION: the spawn seam opens the master close-on-exec"
+        );
+
+        let dup = dup_fd(master).expect("dup_fd must succeed on a live master");
+        assert!(
+            flags_of(std::os::fd::AsRawFd::as_raw_fd(&dup)) & libc::FD_CLOEXEC != 0,
+            "a dup_fd copy of the master must be close-on-exec: the drainer holds \
+             this for the whole spill, so a bare dup(2) leaks the tty into every \
+             process that execs meanwhile"
+        );
+
+        // NON-VACUITY: prove the flag is not simply inherited by duplication —
+        // a plain `dup` of the SAME fd clears it, which is the defect.
+        // SAFETY: `dup` on a valid fd; the result is closed below.
+        let bare = unsafe { libc::dup(master) };
+        assert!(bare >= 0, "dup must succeed");
+        assert_eq!(
+            flags_of(bare) & libc::FD_CLOEXEC,
+            0,
+            "control: POSIX dup(2) clears FD_CLOEXEC, so the assertion above is \
+             testing F_DUPFD_CLOEXEC rather than restating inheritance"
+        );
+
+        // SAFETY: closing fds this test exclusively owns.
+        unsafe {
+            libc::close(bare);
             libc::close(master);
         }
     }
@@ -3395,7 +6171,7 @@ mod tests {
     // ---- fail-closed spawn: under-tier capability is denied WITHOUT forking ----
 
     // An under-tier `Cap<Spawn>` (Untrusted, below the required Trusted) must be
-    // rejected by the PARENT gate BEFORE any `forkpty` — there must be no way to
+    // rejected by the PARENT gate BEFORE any fork — there must be no way to
     // spawn a child with an insufficient capability. We assert PermissionDenied;
     // the absence of a leaked child is implicit (no fork happened, so there is
     // nothing to reap), and the error originates from `aterm_cap::require`, not
@@ -3436,7 +6212,7 @@ mod tests {
     // child writes the b'E' status byte and `_exit(127)`s. The parent reads that
     // byte off the status pipe, reaps the child internally, and surfaces an
     // `io::Error` (ErrorKind::Other) describing the pre-exec exec failure — never a
-    // master fd. This drives a real `forkpty` + the full status-pipe protocol.
+    // master fd. This drives a real fork/exec + the full status-pipe protocol.
     //
     // NOTE on "$SHELL in the child": `spawn_shell` resolves the exec target in the
     // PARENT (it must, to stay async-signal-safe in the child), so a bogus `$SHELL`
@@ -3484,9 +6260,12 @@ mod tests {
 
     // Contract lock for the exit code the design depends on: a child that writes a
     // status byte and `_exit(127)`s after a failed `execve` is reaped by the parent
-    // with the WEXITSTATUS == 127 the spawn protocol claims. This mirrors the exact
-    // child syscall shape of `spawn_shell` (status pipe + write byte + _exit), using
-    // a real `forkpty`, and ASSERTS the raw exit code — which `spawn_shell` itself
+    // with the WEXITSTATUS == 127 the spawn protocol claims. It keeps using the
+    // libc `forkpty` DELIBERATELY, as an independent oracle: `spawn_shell` no
+    // longer calls it (see `open_pty_pair_cloexec`), so this locks the OS
+    // primitive's execve→127 contract without going through the code under test.
+    // It is therefore no longer a mirror of `spawn_shell`'s child syscall shape —
+    // it never asserted that anyway. It ASSERTS the raw exit code — which `spawn_shell` itself
     // consumes during its internal reap, so it cannot be observed through that API.
     // It is a contract test of the OS primitive, NOT a re-implementation of product
     // logic: it locks "bogus execve => _exit(127), reapable" so a future change to
@@ -3545,17 +6324,36 @@ mod tests {
             }
         }
         // PARENT: reap the child and assert the exit code.
-        // SAFETY: `master` is the forkpty master; closing it tears the child's tty.
-        unsafe {
-            libc::close(master);
-        }
+        //
+        // REAP FIRST, CLOSE SECOND — and that order is load-bearing, not style.
+        // `close(master)` REVOKES the pty, which sends SIGHUP to the foreground
+        // process group; this child is that group's leader (`forkpty` =
+        // `openpty` + `fork` + `login_tty`, and `login_tty` calls `setsid`), and
+        // SIGHUP's default disposition is terminate. Closing first therefore
+        // RACES the child's `execve`-fails-then-`_exit(127)`, and when the close
+        // wins the child dies by signal — `WIFEXITED` is false and the exit code
+        // this test exists to lock is never produced. MEASURED at 1-in-30 runs on
+        // otherwise-unmodified code once the machine is CPU-saturated (`sig=1`),
+        // i.e. a latent flake that only ever needed the scheduler to look the
+        // other way. Nothing needs the close to happen first: the child holds the
+        // slave as its own stdio and exits on its own, so waiting for it and only
+        // then dropping the master removes the race entirely rather than making
+        // it rarer.
         let mut wstatus: libc::c_int = 0;
         // SAFETY: reaping the child we just forked; `wstatus` is a valid out-param.
         let w = unsafe { libc::waitpid(pid, &mut wstatus, 0) };
+        // SAFETY: `master` is the forkpty master, closed now that the child has
+        // been reaped and its exit status is already in hand.
+        unsafe {
+            libc::close(master);
+        }
         assert_eq!(w, pid, "waitpid did not reap our child");
         assert!(
             libc::WIFEXITED(wstatus),
-            "child did not exit normally: {wstatus}"
+            "child did not exit normally (signalled: {}, sig {}) — a pty revoke \
+             must not be able to race this child's _exit(127): {wstatus}",
+            libc::WIFSIGNALED(wstatus),
+            libc::WTERMSIG(wstatus)
         );
         assert_eq!(
             libc::WEXITSTATUS(wstatus),

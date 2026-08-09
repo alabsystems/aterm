@@ -74,9 +74,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The chain-validated `[packages].prefix` override, or `None` for the default.
+/// Threaded through `store::resolve` so the override is REACHABLE: both call sites
+/// previously passed a hardcoded `None`, which made `vet_prefix`'s whole
+/// configured-prefix branch dead code and pinned every install to `$HOME` — and
+/// therefore to the unverified lane, since a user-owned toolchain path cannot carry
+/// pathname execution authority.
+fn configured_prefix() -> Option<std::path::PathBuf> {
+    crate::config::load().prefix_path(aterm_types::dirs::home_dir().as_deref())
+}
+
 /// Resolve the install layout, or print why we can't and return `None`.
 fn layout() -> Option<crate::store::Layout> {
-    match crate::store::resolve(None) {
+    match crate::store::resolve(configured_prefix().as_deref()) {
         Some(l) => Some(l),
         None => {
             eprintln!("atpkg: HOME is unset — cannot locate the install prefix");
@@ -119,7 +129,7 @@ fn verb_mutates_store(verb: &str) -> bool {
 /// itself refuses with its own message moments later. Contention or an unusable
 /// lock file is fail-closed: the loud one-line refusal and exit 1.
 fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
-    let Some(layout) = crate::store::resolve(None) else {
+    let Some(layout) = crate::store::resolve(configured_prefix().as_deref()) else {
         return Ok(None);
     };
     match crate::lock::try_lock_store(&layout) {

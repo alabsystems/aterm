@@ -859,6 +859,29 @@ fn fetch_release_catalog(
 /// compare EQUAL on the numeric triple — a version test could not tell them
 /// apart, and build metadata is explicitly not ordered (`VERSIONING.md`).
 pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<String>, String> {
+    let result = check_and_stage_inner(current_build, source);
+    // EVERY exit writes status, including the failing ones. The eight `Err` paths
+    // below all returned without recording, so `status.toml` kept advertising the
+    // last HEALTHY outcome — "staged X — verified and ready to apply", or "up to
+    // date" — while the machine was in fact failing every check. An operator (and
+    // the GUI, which renders this text) then read a stale success as the current
+    // state, which is worse than no status at all: it is confidently wrong.
+    if let Err(error) = &result
+        && let Some(staging) = Staging::resolve()
+    {
+        crate::status::record(
+            &staging,
+            current_build,
+            &format!("update check failed: {error}"),
+        );
+    }
+    result
+}
+
+fn check_and_stage_inner(
+    current_build: u64,
+    source: &Source,
+) -> Result<Option<String>, String> {
     // Only stage for a real installed bundle (a dev build has nothing to swap).
     if bundle::resolve().is_none() {
         return Ok(None);
@@ -890,12 +913,22 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
         Ok(candidate) => candidate,
         Err(error) => {
             crate::warn(&error);
-            crate::health::Health::record_failure(&staging.health(), "manifest", &error);
-            crate::status::record(
-                &staging,
-                current_build,
-                &format!("update check deferred: {error}"),
-            );
+            let h = crate::health::Health::record_failure(&staging.health(), "manifest", &error);
+            // Two-tier wording, exactly like the pipeline branch below. "deferred"
+            // means postponed-and-will-retry, which is a lie for this class: an
+            // untrustworthy authoritative release stays untrustworthy until the
+            // PUBLISHER republishes, so retrying changes nothing. A machine sat at
+            // failure 597 still being told its check was "deferred".
+            let msg = if h.is_persistent() {
+                format!(
+                    "FAILING ({} consecutive checks since {}): {error} — this Mac \
+                     cannot install any release until that is fixed at the publisher",
+                    h.manifest_failures, h.failing_since
+                )
+            } else {
+                format!("update check deferred: {error} (attempt {})", h.manifest_failures)
+            };
+            crate::status::record(&staging, current_build, &msg);
             return Ok(None);
         }
     };
@@ -946,12 +979,22 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
             // Manifests were FETCHED but rejected (unsigned / bad signature /
             // unparseable): the pipeline works; the release side (or an attacker)
             // is the problem. Its own class — it must not clear a streak.
-            crate::health::Health::record_failure(
+            let h = crate::health::Health::record_failure(
                 &staging.health(),
                 "manifest",
                 "manifest(s) fetched but rejected (signature/parse)",
             );
-            "no stageable release: manifest(s) fetched but rejected (signature/parse)".to_string()
+            if h.is_persistent() {
+                format!(
+                    "FAILING ({} consecutive checks since {}): manifest(s) fetched but \
+                     rejected (signature/parse) — this Mac cannot install any release \
+                     until that is fixed at the publisher",
+                    h.manifest_failures, h.failing_since
+                )
+            } else {
+                "no stageable release: manifest(s) fetched but rejected (signature/parse)"
+                    .to_string()
+            }
         } else {
             // The check itself ran fine (list fetched, nothing carries a manifest):
             // clear any stale failure streak so health reflects THIS check.

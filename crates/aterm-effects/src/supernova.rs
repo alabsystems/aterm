@@ -80,11 +80,75 @@ pub const TIER_NOVA_END: u64 = 950;
 /// Decode the tier from the HIGH half of the birth draw.
 #[must_use]
 pub fn tier_of(draw: u64) -> SuperTier {
+    tier_for(draw, 1)
+}
+
+/// THE F-BOMB COMBO (owner, 2026-08-07: "an even MORE extreme f-bomb explosion
+/// as you write more and more fucks … 5 fucks in a sentence or two is
+/// EXTREME!!!! … decays over time").
+///
+/// A TYPED f-bomb landing within [`COMBO_WINDOW_MS`] of recent typed f-bombs
+/// raises the combo LEVEL (= how many recent typed f-bombs, this one
+/// included). The level escalates BOTH decodes of the same birth draw — the
+/// detonation chance climbs [`COMBO_CHANCE_STEP`] points per link, and the
+/// tier decode windows slide toward the mushroom cloud — until level 5 is
+/// simply: every f-bomb detonates, every detonation is a Nuke, for as long as
+/// the streak stays hot. Entries age out of the window, so the ladder cools
+/// back to the baseline on its own.
+///
+/// Still ONE draw, two decodes: the level only picks WHICH window table reads
+/// the high half, so determinism, the row-alignment transfer, and the
+/// `chance_pct == 0` off-switch (enforced at the roll site's outer guard, and
+/// again here) all hold. Level ≤ 1 is byte-identical to the classic ladder —
+/// a lone f-bomb cannot tell this feature exists.
+pub const COMBO_WINDOW_MS: u64 = 30_000;
+/// Ring capacity for recent typed-f-bomb instants; the ladder saturates at
+/// [`COMBO_EXTREME_LEVEL`] well below it, so the cap only bounds memory.
+pub const COMBO_CAP: usize = 8;
+/// Detonation-chance escalation per combo link past the first, percentage
+/// points on top of the configured `chance_pct`.
+pub const COMBO_CHANCE_STEP: u8 = 30;
+/// The level at which the ladder tops out: guaranteed detonation, guaranteed
+/// [`SuperTier::Nuke`].
+pub const COMBO_EXTREME_LEVEL: u32 = 5;
+
+/// Per-level tier decode windows `(flash_end, nova_end)` over the high half's
+/// `% 1000` bucket — index = `min(level, COMBO_EXTREME_LEVEL) - 1` (level 0
+/// clamps to the baseline row). Flash/Nova/Nuke shares per level:
+/// 70/25/5 → 50/35/15 → 25/45/30 → 0/45/55 → 0/0/100. P(Nuke) is strictly
+/// monotone up the ladder and P(Flash) monotone down (pinned by test).
+const COMBO_TIER_WINDOWS: [(u64, u64); COMBO_EXTREME_LEVEL as usize] = [
+    (TIER_FLASH_END, TIER_NOVA_END),
+    (500, 850),
+    (250, 700),
+    (0, 450),
+    (0, 0),
+];
+
+/// Decode the tier from the HIGH half of the birth draw at a combo level.
+/// `tier_for(draw, level <= 1)` is byte-identical to the classic `tier_of`.
+#[must_use]
+pub fn tier_for(draw: u64, level: u32) -> SuperTier {
+    let row = level.clamp(1, COMBO_EXTREME_LEVEL) as usize - 1;
+    let (flash_end, nova_end) = COMBO_TIER_WINDOWS[row];
     match (draw >> 32) % 1000 {
-        d if d < TIER_FLASH_END => SuperTier::Flash,
-        d if d < TIER_NOVA_END => SuperTier::Nova,
+        d if d < flash_end => SuperTier::Flash,
+        d if d < nova_end => SuperTier::Nova,
         _ => SuperTier::Nuke,
     }
+}
+
+/// Escalate the configured detonation chance by the combo level:
+/// `min(100, cfg + COMBO_CHANCE_STEP·(level − 1))`. `cfg == 0` stays 0 — the
+/// combo never overrides the off-switch (the roll site's outer guard already
+/// skips it; this is the same contract restated defensively).
+#[must_use]
+pub fn combo_chance(cfg: u8, level: u32) -> u8 {
+    if cfg == 0 {
+        return 0;
+    }
+    let boost = COMBO_CHANCE_STEP.saturating_mul(level.saturating_sub(1).min(4) as u8);
+    cfg.saturating_add(boost).min(100)
 }
 
 /// Total visible window per tier — the host's `nova_done` edge and ember start.
@@ -702,8 +766,20 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
             } else {
                 hsv2rgb(hue, 0.85, 1.0)
             };
+            // DEPTH from the family's one pulse law; RECTIFICATION deliberately
+            // NOT from it. Every other star in the crate pulses on the
+            // continuous `twinkle_env` sine, but a `WordDecoration` is a
+            // per-cell REGION and WCAG 2.3.1 counts region onsets, not pixels —
+            // hence the shared 350 ms two-phase grid (≤ 3 onsets/s) documented
+            // above, which a per-mote sine would break. The two laws agree on
+            // how DEEP a twinkle dims (`TWINKLE_FLOOR`), which is the part the
+            // eye reads as "the same artist".
             let grid_phase = (t_ms / crate::nova::TWINKLE_GRID_MS + k as u64) % 2;
-            let tw = if grid_phase == 0 { 1.0 } else { 0.55 };
+            let tw = if grid_phase == 0 {
+                1.0
+            } else {
+                crate::effect_util::TWINKLE_FLOOR
+            };
             out.push(WordDecoration {
                 row: row as u16,
                 col: col as u16,
@@ -1234,6 +1310,78 @@ mod tests {
         // A Flash ends before the debris phase even begins, which is what makes
         // it read as the smaller event rather than a truncated supernova.
         assert!(total_ms(SuperTier::Flash) < DEBRIS_START_MS);
+    }
+
+    /// A lone f-bomb cannot tell the combo exists: levels 0 and 1 decode
+    /// byte-identically to the classic `tier_of` over the full draw shape.
+    #[test]
+    fn combo_baseline_is_byte_identical() {
+        for i in 0..200_000u64 {
+            let mut x = i ^ SUPERNOVA_SALT;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let draw = x ^ (x >> 31);
+            assert_eq!(tier_of(draw), tier_for(draw, 0));
+            assert_eq!(tier_of(draw), tier_for(draw, 1));
+        }
+    }
+
+    /// The ladder is monotone: climbing a level never makes the outcome
+    /// smaller. P(Nuke) strictly rises, P(Flash) falls to zero, level 5 (and
+    /// past it) is Nuke on EVERY draw, and the chance escalation tops out at
+    /// 100 without ever lifting a configured 0.
+    #[test]
+    fn combo_ladder_climbs_to_guaranteed_nuke() {
+        let n = 200_000u64;
+        let mut flash_pct = Vec::new();
+        let mut nuke_pct = Vec::new();
+        for level in 1..=COMBO_EXTREME_LEVEL {
+            let (mut flash, mut nuke) = (0u32, 0u32);
+            for i in 0..n {
+                let mut x = i ^ SUPERNOVA_SALT;
+                x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                let draw = x ^ (x >> 31);
+                match tier_for(draw, level) {
+                    SuperTier::Flash => flash += 1,
+                    SuperTier::Nova => {}
+                    SuperTier::Nuke => nuke += 1,
+                }
+            }
+            flash_pct.push(f64::from(flash) * 100.0 / n as f64);
+            nuke_pct.push(f64::from(nuke) * 100.0 / n as f64);
+        }
+        for w in nuke_pct.windows(2) {
+            assert!(w[1] > w[0], "P(Nuke) must climb each level: {nuke_pct:?}");
+        }
+        for w in flash_pct.windows(2) {
+            assert!(
+                w[1] <= w[0],
+                "P(Flash) must never climb: {flash_pct:?}"
+            );
+        }
+        assert!(
+            (nuke_pct[0] - 5.0).abs() < 1.0,
+            "level 1 keeps the classic 5% Nuke: {:.2}%",
+            nuke_pct[0]
+        );
+        assert!(
+            nuke_pct[COMBO_EXTREME_LEVEL as usize - 1] == 100.0,
+            "EXTREME level is Nuke on every draw"
+        );
+        // Past the top the ladder saturates rather than wrapping.
+        assert_eq!(tier_for(7, COMBO_EXTREME_LEVEL + 3), SuperTier::Nuke);
+
+        // Chance escalation: +30 points per link, capped at 100, 0 stays 0.
+        assert_eq!(combo_chance(10, 1), 10);
+        assert_eq!(combo_chance(10, 2), 40);
+        assert_eq!(combo_chance(10, 3), 70);
+        assert_eq!(combo_chance(10, 4), 100);
+        assert_eq!(combo_chance(1, COMBO_EXTREME_LEVEL), 100);
+        assert_eq!(combo_chance(100, 1), 100);
+        for level in 0..=COMBO_EXTREME_LEVEL + 2 {
+            assert_eq!(combo_chance(0, level), 0, "0 is the off-switch");
+        }
     }
 
     #[test]

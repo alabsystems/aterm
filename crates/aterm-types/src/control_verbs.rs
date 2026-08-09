@@ -520,6 +520,20 @@ pub const VERBS: &[VerbSpec] = &[
          scope=window|focused-pane focused= animating=, plus a live engine's \
          weather= density= tick= scanned= material= emitting= vis= drain= seq= streak= diag)",
     ),
+    // Read-only observability for an effect that is otherwise audible-only: the
+    // tone-of-typing mood steering the trail synth's melody. No write form —
+    // the knob is durable config (`settings set tone_melody`).
+    v(
+        "tone",
+        Read,
+        Status,
+        App,
+        "tone [status]: tone-of-typing state for the focused window (prints \
+         tone= effective= knob= sounds= volume= audio=live|inert active= \
+         window_chars= inferences=; `effective` is what the synth is stamping, \
+         `inferences` separates \"the model ran and said technical\" from \
+         \"the model never ran\". The typed window's TEXT is never reported)",
+    ),
     v(
         "hover",
         Write,

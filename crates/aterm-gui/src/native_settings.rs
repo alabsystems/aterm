@@ -2299,9 +2299,17 @@ impl SettingsApp {
                 }
                 EventResult::Handled
             }
-            "updates/check" => {
+            // ONE verb. The page no longer asks the user which updater stage
+            // they are in: install what is already staged, otherwise go look.
+            // `updates/check` remains as the command-palette entry point and
+            // routes to exactly the same reducer.
+            "updates/install-now" | "updates/check" => {
                 let update = self.update.projection();
-                if !update.enabled {
+                if update.staged.is_some() && action == "updates/install-now" {
+                    let operation = cx.update(UpdateRequest::InstallAndRelaunch);
+                    view.pending.insert(operation, PendingAction::Update);
+                    view.feedback = Some("Installing the latest version…".to_string());
+                } else if !update.enabled {
                     view.feedback =
                         Some("Update checks are unavailable for this installation.".to_string());
                 } else if update.checking {
@@ -2314,22 +2322,10 @@ impl SettingsApp {
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
-            "updates/install-relaunch" => {
-                let operation = cx.update(UpdateRequest::InstallAndRelaunch);
-                view.pending.insert(operation, PendingAction::Update);
-                view.feedback = Some("Checking relaunch safety…".to_string());
-                EventResult::Handled
-            }
             "updates/retry" => {
                 let operation = cx.update(UpdateRequest::Retry);
                 view.pending.insert(operation, PendingAction::Update);
                 view.feedback = Some("Retrying update…".to_string());
-                EventResult::Handled
-            }
-            "updates/install-when-safe" => {
-                let operation = cx.update(UpdateRequest::InstallWhenSafe);
-                view.pending.insert(operation, PendingAction::Update);
-                view.feedback = Some("Update will install at the next safe quit.".to_string());
                 EventResult::Handled
             }
             "packages/check" => {
@@ -13142,14 +13138,17 @@ fn metadata_card(
     .children(children)
 }
 
+/// The coherent card count the compact Update page virtualizes over: the status
+/// card, the action when it is too tall to ride inside that card, the
+/// automatic-updates switch, the outcome when it needs its own slice, and every
+/// bounded release-notes page.
 fn update_compact_sections(
-    update: &UpdateProjection,
-    release_note_pages: usize,
+    split_action: bool,
+    automatic: bool,
     outcome_pages: usize,
+    release_note_pages: usize,
 ) -> usize {
-    // Status summary + every available action + three installation facts,
-    // followed by every bounded release-notes page and the optional outcome.
-    1 + if update.staged.is_some() { 3 } else { 1 } + 3 + release_note_pages + outcome_pages
+    1 + usize::from(split_action) + usize::from(automatic) + outcome_pages + release_note_pages
 }
 
 fn update_release_notes_padding() -> f32 {
@@ -13209,11 +13208,12 @@ fn update_release_notes_cards(
     height: f32,
     text_width: f32,
 ) -> Vec<UiNode> {
-    if update.changelog.is_empty() {
-        return Vec::new();
-    }
-    let lines = wrap_release_note_lines(&update.changelog, text_width);
-    let semantic_text = update.changelog.join("\n");
+    // Always at least one card: the notes panel is a standing section of the
+    // page now, so `update_notes_lines` supplies an honest line when there is
+    // no staged build rather than letting the section vanish.
+    let source = update_notes_lines(update);
+    let lines = wrap_release_note_lines(&source, text_width);
+    let semantic_text = source.join("\n");
     let capacity = update_release_notes_capacity(height);
     let total = lines.len().div_ceil(capacity);
     lines
@@ -13282,172 +13282,6 @@ fn update_release_notes_card(
     ])
 }
 
-fn update_outcome_line_height() -> f32 {
-    20.0_f32.max(16.0 * settings_text_scale())
-}
-
-fn update_outcome_padding() -> f32 {
-    // At 2× Dynamic Type the full paint heading `LAST UPDATE RESULT` is 232.8pt
-    // wide.  A 286.5pt phone host leaves 258.5pt for the card, so the release-note
-    // card's 14pt inset would elide the heading by 2.3pt.  Outcome cards use a
-    // slightly denser large-type inset so the complete single-page heading and
-    // the unchanged semantic result remain reachable.
-    if settings_text_scale() > 1.25 {
-        12.0
-    } else {
-        16.0
-    }
-}
-
-fn fit_native_bold_label(value: &str, max_width: f32, px: f32) -> String {
-    let fits = |candidate: &str| {
-        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, candidate, px)
-            <= max_width.max(0.0) + 0.5
-    };
-    if fits(value) {
-        return value.to_string();
-    }
-
-    let graphemes = value.graphemes().collect::<Vec<_>>();
-    for retained in (0..graphemes.len()).rev() {
-        let candidate = format!("{}…", graphemes[..retained].concat());
-        if fits(&candidate) {
-            return candidate;
-        }
-    }
-    String::new()
-}
-
-fn update_outcome_visual_heading(
-    page: usize,
-    total: usize,
-    available_width: f32,
-    padding: f32,
-) -> String {
-    let maximum = (available_width - padding * 2.0).max(0.0);
-    let px = 11.0 * crate::native_appearance::text_scale();
-    let full = if total > 1 {
-        format!("LAST UPDATE RESULT · {} OF {total}", page + 1)
-    } else {
-        "LAST UPDATE RESULT".to_string()
-    };
-    if fit_native_bold_label(&full, maximum, px) == full {
-        return full;
-    }
-
-    // Continuation identity is visual chrome: the parent Status retains the
-    // complete, exact updater outcome. Prefer a compact page fraction before
-    // any elision so maximum Dynamic Type remains useful in short landscape.
-    let compact = if total > 1 {
-        format!("RESULT {}/{total}", page + 1)
-    } else {
-        "RESULT".to_string()
-    };
-    fit_native_bold_label(&compact, maximum, px)
-}
-
-fn update_outcome_cards(
-    update: &UpdateProjection,
-    maximum_height: f32,
-    available_width: f32,
-) -> Vec<(UiNode, f32)> {
-    if update.outcome.is_empty() {
-        return Vec::new();
-    }
-    let padding = update_outcome_padding();
-    let heading_height = 22.0_f32.max(16.0 * settings_text_scale());
-    let line_height = update_outcome_line_height();
-    let fixed_height = padding * 2.0 + heading_height + 8.0;
-    // An updater result is authored prose, not a single implicit paragraph.
-    // `split` (rather than `lines`) retains leading, repeated, and trailing
-    // empty rows; the semantic parent below retains the exact newline bytes.
-    let authored_lines = update
-        .outcome
-        .split('\n')
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let lines = wrap_native_lines(
-        &authored_lines,
-        (available_width - padding * 2.0).max(48.0),
-        11.0 * crate::native_appearance::text_scale(),
-    );
-    let capacity =
-        (((maximum_height - fixed_height).max(line_height) / line_height).floor() as usize).max(1);
-    let total = lines.len().div_ceil(capacity);
-    lines
-        .chunks(capacity)
-        .enumerate()
-        .map(|(page, lines)| {
-            let suffix = if page == 0 {
-                String::new()
-            } else {
-                format!("/continued-{page}")
-            };
-            let height = if total == 1 {
-                (fixed_height + lines.len() as f32 * line_height).min(maximum_height)
-            } else {
-                maximum_height
-            };
-            let heading = update_outcome_visual_heading(page, total, available_width, padding);
-            let body = UiNode::new(
-                format!("updates/outcome/body{suffix}"),
-                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
-            )
-            .layout(Layout::column().height(Length::Fixed(lines.len() as f32 * line_height)))
-            .children(
-                lines
-                    .iter()
-                    .enumerate()
-                    .map(|(index, line)| {
-                        UiNode::new(
-                            format!("updates/outcome/line-{index}{suffix}"),
-                            UiContent::Text(TextSpec {
-                                text: line.clone(),
-                                role: SemanticRole::Status,
-                                style: StyleRef::Quiet,
-                            }),
-                        )
-                        .layout(Layout::default().height(Length::Fixed(line_height)))
-                        .paint_only()
-                    })
-                    .collect(),
-            );
-            let children = vec![
-                UiNode::new(
-                    format!("updates/outcome/heading{suffix}"),
-                    UiContent::Text(TextSpec {
-                        text: heading,
-                        role: SemanticRole::Heading,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(heading_height)))
-                .paint_only(),
-                body,
-            ];
-            (
-                UiNode::new(
-                    format!("updates/outcome{suffix}"),
-                    UiContent::Group(GroupSpec {
-                        label: Some(update.outcome.clone()),
-                        role: SemanticRole::Status,
-                        style: StyleRef::Secondary,
-                    }),
-                )
-                .layout(
-                    Layout::column()
-                        .height(Length::Fixed(height))
-                        .padding(Insets::all(padding))
-                        .gap(8.0)
-                        .clipped(),
-                )
-                .children(children),
-                height,
-            )
-        })
-        .collect()
-}
-
 fn compact_update_headline(update: &UpdateProjection) -> String {
     if update.checking {
         "Checking".to_string()
@@ -13472,6 +13306,25 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
     }
 }
 
+fn fit_native_bold_label(value: &str, max_width: f32, px: f32) -> String {
+    let fits = |candidate: &str| {
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, candidate, px)
+            <= max_width.max(0.0) + 0.5
+    };
+    if fits(value) {
+        return value.to_string();
+    }
+
+    let graphemes = value.graphemes().collect::<Vec<_>>();
+    for retained in (0..graphemes.len()).rev() {
+        let candidate = format!("{}…", graphemes[..retained].concat());
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     if update.checking {
         "Checking…"
@@ -13484,6 +13337,13 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     }
 }
 
+/// A SHORT-LANDSCAPE-ONLY status summary: two elided text columns in one row.
+///
+/// The full status card cannot fit a 320-point landscape host at the platform
+/// maximum Dynamic Type — six rows of copy do not have the space there, and a
+/// clipped card is worse than a compressed one. This is the two-column shape
+/// the page used before, kept for exactly that host; the owning Status node
+/// still carries every complete authored value.
 fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (UiNode, f32) {
     let scale = settings_text_scale();
     let title_height = 20.0_f32.max(16.0 * scale);
@@ -13636,268 +13496,157 @@ fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (U
     )
 }
 
-fn compact_update_service_row(update: &UpdateProjection, index: usize) -> (UiNode, f32) {
-    let service = if update.enabled {
-        "Available".to_string()
-    } else {
-        "Unavailable for this build".to_string()
-    };
-    let staged = update.staged.as_ref().map_or_else(
-        || "No update staged".to_string(),
-        |(build, version)| format!("Version {version} · build {build}"),
+/// How many wrapped lines of the last updater outcome the status card shows.
+/// Enough for a real message, bounded so a pathological ledger string cannot
+/// push the two controls off the page again.
+const MAX_UPDATE_OUTCOME_LINES: usize = 3;
+
+/// The last updater outcome as its own reachable slice.
+///
+/// Only the short-landscape host needs this: there the status card collapses to
+/// [`compact_update_summary`], which has no room for a result line, and losing
+/// the one message that explains a stalled update would be the worst possible
+/// thing to drop.
+fn compact_update_outcome(
+    update: &UpdateProjection,
+    text_width: f32,
+) -> Option<(UiNode, f32)> {
+    let display = update_outcome_line(update)?;
+    let scale = settings_text_scale();
+    let line_height = 24.0_f32.max(20.0 * scale);
+    let mut lines = wrap_native_lines(
+        std::slice::from_ref(&display),
+        text_width,
+        13.0 * crate::native_appearance::text_scale(),
     );
-    let rows = [
-        (
-            "service",
-            "Update service",
-            "Service",
-            service,
-            if update.enabled {
-                "Available".to_string()
-            } else {
-                "Unavailable".to_string()
-            },
-        ),
-        (
-            "running",
-            "Running now",
-            "Running",
-            format!(
-                "{} · build {}",
-                update.current_version, update.current_build
-            ),
-            format!("v{} · b{}", update.current_version, update.current_build),
-        ),
-        (
-            "staged",
-            "Install state",
-            "Install",
-            staged,
-            update.staged.as_ref().map_or_else(
-                || "None".to_string(),
-                |(build, version)| format!("v{version} · b{build}"),
-            ),
-        ),
-    ];
-    let (key, label, compact_label, value, compact_value) = &rows[index.min(rows.len() - 1)];
-    let large_type = settings_text_scale() > 1.25;
-    let height = scaled_control_height();
-    (
+    if lines.len() > MAX_UPDATE_OUTCOME_LINES {
+        lines.truncate(MAX_UPDATE_OUTCOME_LINES);
+        if let Some(last) = lines.last_mut() {
+            last.push('\u{2026}');
+        }
+    }
+    let height = 32.0 + lines.len() as f32 * line_height;
+    Some((
         UiNode::new(
-            format!("updates/service/{key}"),
-            UiContent::Group(
-                GroupSpec::new(format!("{label}: {value}")).style(StyleRef::Secondary),
-            ),
+            "updates/outcome",
+            UiContent::Group(GroupSpec {
+                label: Some(update.outcome.clone()),
+                role: SemanticRole::Status,
+                style: StyleRef::Secondary,
+            }),
         )
         .layout(
-            Layout::row()
+            Layout::column()
+                .width(Length::Fill)
                 .height(Length::Fixed(height))
-                .padding(Insets::symmetric(8.0, 4.0))
-                .gap(8.0),
+                .padding(Insets::all(16.0))
+                .clipped(),
         )
-        .children(vec![
-            UiNode::new(
-                format!("updates/service/{key}/label"),
-                UiContent::Text(TextSpec {
-                    text: if large_type {
-                        (*compact_label).to_string()
-                    } else {
-                        (*label).to_string()
-                    },
-                    role: SemanticRole::Text,
-                    style: StyleRef::Quiet,
-                }),
-            )
-            .layout(
-                Layout::default()
-                    .width(Length::Fraction(0.4))
-                    .height(Length::Fill),
-            ),
-            UiNode::new(
-                format!("updates/service/{key}/value"),
-                UiContent::Text(TextSpec {
-                    text: if large_type {
-                        compact_value.clone()
-                    } else {
-                        value.clone()
-                    },
-                    role: SemanticRole::Status,
-                    style: if *key == "service" && update.enabled {
-                        StyleRef::Success
-                    } else {
-                        StyleRef::Primary
-                    },
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
-        ]),
+        .children(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    UiNode::new(
+                        format!("updates/outcome/line-{index}"),
+                        UiContent::Text(TextSpec {
+                            text: line.clone(),
+                            role: SemanticRole::Text,
+                            style: StyleRef::Quiet,
+                        }),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(line_height)))
+                    .paint_only()
+                })
+                .collect(),
+        ),
         height,
+    ))
+}
+
+/// The one action the page offers, as a verb rather than a state machine.
+///
+/// There used to be three buttons — Check for Updates, Install & Relaunch and
+/// Install When Safe — which asked the user to know which stage the updater was
+/// in and to pick a policy for it. They only ever wanted the newest build, so
+/// this is that: check when nothing is staged, install when something is.
+fn update_action_label(compact_large_type: bool) -> &'static str {
+    if compact_large_type {
+        "Update"
+    } else {
+        "Update to Latest Now"
+    }
+}
+
+fn update_action_node(update: &UpdateProjection, width: SettingsWidth, height: f32) -> UiNode {
+    let compact_large_type = width == SettingsWidth::Compact && settings_text_scale() > 1.25;
+    UiNode::new(
+        "updates/install-now",
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Update to Latest Now")
+                    .visual_label(update_action_label(compact_large_type)),
+                ActionId::new("updates/install-now"),
+            )
+            .state(ControlState {
+                enabled: update.enabled && !update.checking,
+                busy: update.checking,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Primary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(if width == SettingsWidth::Compact {
+                Length::Fill
+            } else {
+                Length::Fixed(196.0)
+            })
+            .height(Length::Fixed(height)),
     )
 }
 
-fn update_page(
-    state: &SettingsViewState,
+/// What the release-notes panel shows.
+///
+/// A staged build's own notes when there is one. Otherwise ONE honest line:
+/// this panel is now a permanent section of the page rather than something that
+/// only exists mid-update, and an empty card reads as a rendering fault instead
+/// of "nothing new".
+fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
+    if !update.changelog.is_empty() {
+        return update.changelog.clone();
+    }
+    vec![if update.checking {
+        "Checking the update service for a newer build\u{2026}".to_string()
+    } else if update.enabled {
+        format!(
+            "aterm {} is the latest build. Notes for a newer version appear here as soon as one is staged.",
+            update.current_version
+        )
+    } else {
+        "Update checks are unavailable for this installation, so no release notes can be shown."
+            .to_string()
+    }]
+}
+
+/// Status: what is running, what is available, and the single action. Also the
+/// last updater outcome when there is one — one quiet line, where a paginated
+/// "LAST UPDATE RESULT" section used to be.
+fn update_status_card(
     update: &UpdateProjection,
     width: SettingsWidth,
-    viewport_width: f32,
-    viewport_height: f32,
-) -> Vec<UiNode> {
+    large_type_narrow: bool,
+    text_width: f32,
+    action: Option<UiNode>,
+    action_height: f32,
+) -> (UiNode, f32) {
     let text_scale = settings_text_scale();
-    let compact_large_type = width == SettingsWidth::Compact && text_scale > 1.25;
-    let large_type_narrow = compact_large_type && viewport_width < 220.0 * text_scale;
-    let compact_budget = (width == SettingsWidth::Compact).then(|| {
-        compact_page_budget(
-            state,
-            LogicalRect::new(0.0, 0.0, viewport_width, viewport_height),
-        )
-    });
-    let compact_section_height = compact_budget.map_or_else(
-        || compact_special_section_height(state, viewport_height),
-        |budget| {
-            if budget.side_by_side_pager {
-                budget.content_height
-            } else {
-                (budget.content_height - page_navigation_height() - 10.0)
-                    .max(scaled_control_height())
-            }
-        },
-    );
-    let short_compact = width == SettingsWidth::Compact && compact_section_height < 270.0;
-    let split_compact_actions =
-        width == SettingsWidth::Compact && (text_scale > 1.25 || short_compact);
-    let split_short_medium_actions =
-        width == SettingsWidth::Medium && viewport_height < 620.0 && update.staged.is_some();
-    let split_actions = split_compact_actions || split_short_medium_actions;
-    let fill_action_width = width == SettingsWidth::Compact || split_short_medium_actions;
-    let mut actions = vec![
-        UiNode::new(
-            "updates/check",
-            UiContent::Button(
-                Control::new(
-                    ButtonSpec::new("Check for Updates").visual_label(if compact_large_type {
-                        "Check"
-                    } else {
-                        "Check for Updates"
-                    }),
-                    ActionId::new("updates/check"),
-                )
-                .state(ControlState {
-                    enabled: update.enabled && !update.checking,
-                    busy: update.checking,
-                    ..ControlState::default()
-                })
-                .style(if update.staged.is_none() {
-                    StyleRef::Primary
-                } else {
-                    StyleRef::Secondary
-                }),
-            ),
-        )
-        .layout(
-            Layout::default()
-                .width(if fill_action_width {
-                    Length::Fill
-                } else {
-                    Length::Fixed(164.0)
-                })
-                .height(Length::Fill),
-        ),
-    ];
-    if update.staged.is_some() {
-        actions.push(
-            UiNode::new(
-                "updates/install-relaunch",
-                UiContent::Button(
-                    Control::new(
-                        ButtonSpec::new("Install & Relaunch").visual_label(if compact_large_type {
-                            "Install"
-                        } else {
-                            "Install & Relaunch"
-                        }),
-                        ActionId::new("updates/install-relaunch"),
-                    )
-                    .style(StyleRef::Primary),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(if fill_action_width {
-                        Length::Fill
-                    } else {
-                        Length::Fixed(164.0)
-                    })
-                    .height(Length::Fill),
-            ),
-        );
-        actions.push(
-            UiNode::new(
-                "updates/install-when-safe",
-                UiContent::Button(
-                    Control::new(
-                        ButtonSpec::new("Install When Safe").visual_label(if compact_large_type {
-                            "When Safe"
-                        } else {
-                            "Install When Safe"
-                        }),
-                        ActionId::new("updates/install-when-safe"),
-                    )
-                    .style(StyleRef::Quiet),
-                ),
-            )
-            .layout(
-                Layout::default()
-                    .width(if fill_action_width {
-                        Length::Fill
-                    } else {
-                        Length::Fixed(164.0)
-                    })
-                    .height(Length::Fill),
-            ),
-        );
-    }
-    let stack_actions = width != SettingsWidth::Wide && actions.len() > 1;
-    let action_control_height = 36.0_f32.max(32.0 * text_scale);
-    let action_height = if stack_actions {
-        actions.len() as f32 * action_control_height + actions.len().saturating_sub(1) as f32 * 8.0
-    } else {
-        action_control_height
-    };
-    let action_layout = if stack_actions {
-        Layout::column()
-            .height(Length::Fixed(action_height))
-            .gap(8.0)
-    } else {
-        Layout::row().height(Length::Fixed(action_height)).gap(8.0)
-    };
-    let actions_node = UiNode::new(
-        "updates/actions",
-        UiContent::Group(GroupSpec::new("Update actions")),
-    )
-    .layout(action_layout)
-    .children(actions.clone());
     let title_height = 20.0_f32.max(16.0 * text_scale);
     let headline_height = 42.0_f32.max(30.0 * text_scale);
     let current_height = 22.0_f32.max(18.0 * text_scale);
     let detail_height = 24.0_f32.max(20.0 * text_scale);
-    let full_detail = update.detail.clone().unwrap_or_else(|| {
-        if update.checking {
-            "Contacting the update service…".to_string()
-        } else if update.enabled {
-            if width == SettingsWidth::Compact {
-                "No newer build is staged."
-            } else {
-                "No newer build is staged for this installation."
-            }
-            .to_string()
-        } else {
-            if width == SettingsWidth::Compact {
-                "Update checks are unavailable."
-            } else {
-                "Update checks are unavailable for this installation."
-            }
-            .to_string()
-        }
-    });
+    let full_detail = update_status_detail(update, width);
     let visual_headline = if large_type_narrow {
         compact_update_headline(update)
     } else {
@@ -13908,16 +13657,46 @@ fn update_page(
     } else {
         full_detail.clone()
     };
-    let mut hero_children = vec![
-        UiNode::new(
-            "updates/title",
-            UiContent::Text(TextSpec {
-                text: "Software Update".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(title_height))),
+    let outcome = update_outcome_line(update);
+    // The outcome is authored prose of unknown length. Wrap it to the card's
+    // real measure, bounded, instead of painting one line off the edge — the
+    // complete text stays available from `aterm update status`.
+    let outcome_lines = outcome
+        .as_ref()
+        .map(|outcome| {
+            let mut lines = wrap_native_lines(
+                std::slice::from_ref(outcome),
+                text_width,
+                13.0 * crate::native_appearance::text_scale(),
+            );
+            if lines.len() > MAX_UPDATE_OUTCOME_LINES {
+                lines.truncate(MAX_UPDATE_OUTCOME_LINES);
+                if let Some(last) = lines.last_mut() {
+                    last.push('\u{2026}');
+                }
+            }
+            lines
+        })
+        .unwrap_or_default();
+    // The card repeats its own name only where the page heading does not
+    // already say it — at desktop widths that was "Software Update" twice,
+    // eight points apart.
+    let titled = width == SettingsWidth::Compact;
+    let mut children = Vec::new();
+    if titled {
+        children.push(
+            UiNode::new(
+                "updates/title",
+                UiContent::Text(TextSpec {
+                    text: "Software Update".to_string(),
+                    role: SemanticRole::Heading,
+                    style: StyleRef::Quiet,
+                }),
+            )
+            .layout(Layout::default().height(Length::Fixed(title_height))),
+        );
+    }
+    children.extend([
         UiNode::new(
             "updates/headline",
             UiContent::Text(TextSpec {
@@ -13931,7 +13710,7 @@ fn update_page(
             "updates/current",
             UiContent::Text(TextSpec {
                 text: format!(
-                    "aterm {}  ·  build {}",
+                    "aterm {}  \u{b7}  build {}",
                     update.current_version, update.current_build
                 ),
                 role: SemanticRole::Status,
@@ -13948,88 +13727,355 @@ fn update_page(
             }),
         )
         .layout(Layout::default().height(Length::Fixed(detail_height))),
-    ];
-    if !split_actions {
-        hero_children.push(actions_node.clone());
+    ]);
+    if outcome.is_some() {
+        children.push(
+            UiNode::new(
+                "updates/outcome",
+                UiContent::Group(GroupSpec {
+                    // The EXACT ledger string, unflattened and unprefixed:
+                    // assistive technology and `controls update` read the real
+                    // outcome, while the paint below is the bounded summary.
+                    label: Some(update.outcome.clone()),
+                    role: SemanticRole::Status,
+                    style: StyleRef::Quiet,
+                }),
+            )
+            .layout(
+                Layout::column()
+                    .height(Length::Fixed(outcome_lines.len() as f32 * detail_height)),
+            )
+            .children(
+                outcome_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        UiNode::new(
+                            format!("updates/outcome/line-{index}"),
+                            UiContent::Text(TextSpec {
+                                text: line.clone(),
+                                role: SemanticRole::Text,
+                                style: StyleRef::Quiet,
+                            }),
+                        )
+                        .layout(Layout::default().height(Length::Fixed(detail_height)))
+                        .paint_only()
+                    })
+                    .collect(),
+            ),
+        );
     }
-    let hero_height = title_height
+    let has_action = action.is_some();
+    if let Some(action) = action {
+        children.push(
+            UiNode::new(
+                "updates/actions",
+                UiContent::Group(GroupSpec::new("Update actions")),
+            )
+            .layout(Layout::row().height(Length::Fixed(action_height)).gap(8.0))
+            .children(vec![action]),
+        );
+    }
+    let height = if titled { title_height } else { 0.0 }
         + headline_height
         + current_height
         + detail_height
-        + if split_actions { 0.0 } else { action_height }
+        + outcome_lines.len() as f32 * detail_height
+        + if has_action { action_height } else { 0.0 }
         + 40.0
-        + hero_children.len().saturating_sub(1) as f32 * 8.0;
-    let hero = UiNode::new(
-        "updates/hero",
-        UiContent::Group(
-            GroupSpec::new(format!(
-                "Software Update status: {}. {full_detail}",
-                update.headline
-            ))
-            .style(StyleRef::Primary),
-        ),
+        + children.len().saturating_sub(1) as f32 * 8.0;
+    (
+        UiNode::new(
+            "updates/hero",
+            UiContent::Group(
+                GroupSpec::new(format!(
+                    "Software Update status: {}. {full_detail}{}",
+                    update.headline,
+                    outcome.map_or_else(String::new, |outcome| format!(" {outcome}"))
+                ))
+                .style(StyleRef::Primary),
+            ),
+        )
+        .layout(
+            Layout::column()
+                .height(Length::Fixed(height))
+                .padding(Insets::symmetric(22.0, 20.0))
+                .gap(8.0),
+        )
+        .children(children),
+        height,
     )
-    .layout(
-        Layout::column()
-            .height(Length::Fixed(hero_height))
-            .padding(Insets::symmetric(22.0, 20.0))
-            .gap(8.0),
-    )
-    .children(hero_children);
+}
 
-    let service_height = if width == SettingsWidth::Compact {
-        220.0_f32.max(166.0 * text_scale)
+fn update_status_detail(update: &UpdateProjection, width: SettingsWidth) -> String {
+    update.detail.clone().unwrap_or_else(|| {
+        if update.checking {
+            "Contacting the update service\u{2026}".to_string()
+        } else if update.enabled {
+            if width == SettingsWidth::Compact {
+                "No newer build is staged."
+            } else {
+                "No newer build is staged for this installation."
+            }
+            .to_string()
+        } else {
+            if width == SettingsWidth::Compact {
+                "Update checks are unavailable."
+            } else {
+                "Update checks are unavailable for this installation."
+            }
+            .to_string()
+        }
+    })
+}
+
+/// The last updater outcome, folded to a single line. Empty and the routine
+/// in-flight/idle values say nothing the headline has not already said, so they
+/// author no row at all.
+fn update_outcome_line(update: &UpdateProjection) -> Option<String> {
+    let outcome = update.outcome.trim();
+    if outcome.is_empty()
+        || outcome.eq_ignore_ascii_case("ok")
+        || outcome.eq_ignore_ascii_case("Checking for updates")
+    {
+        return None;
+    }
+    // The ledger stores authored prose that may span lines; the status line
+    // takes the whole of it as one bounded sentence.
+    Some(format!(
+        "Last update result: {}",
+        outcome.split('\n').collect::<Vec<_>>().join(" ")
+    ))
+}
+
+/// What the automatic-updates card explains, beyond the switch's own label.
+fn update_automatic_caption(width: SettingsWidth) -> String {
+    if width == SettingsWidth::Compact {
+        "aterm installs new builds itself and keeps your sessions."
     } else {
-        hero_height.max(220.0_f32.max(166.0 * text_scale))
-    };
-    let workbench_height = hero_height.max(service_height);
-    let service = update_service_card(update, service_height);
+        "aterm installs new builds on its own and hands your live sessions to the new one. \
+         Turn this off to update only when you press the button."
+    }
+    .to_string()
+}
+
+/// The automatic-update switch, bound to the SAME `update.auto_apply` config
+/// leaf the Settings editor writes, through the same row builder every other
+/// boolean setting uses — so it inherits the switch control, the pending/busy
+/// state, the environment-override disclosure and the accessibility semantics
+/// for free, and cannot drift from the value the updater actually reads.
+fn update_automatic_card(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    text_width: f32,
+    height_budget: Option<f32>,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Option<(UiNode, f32)> {
+    let viewport = LogicalRect::new(0.0, 0.0, viewport_width, viewport_height);
+    let mut row = top_setting_row(state, "update.auto_apply", None, width, viewport)?;
+    // The shared registry label ("Update: apply immediately") is written for a
+    // long alphabetical list; on this page the switch IS the feature, and that
+    // string also overflows a phone row. Retitle the VISUAL label only — the
+    // control keeps the registry's full semantic label and policy disclosure.
+    if let Some(label) = row.children.first_mut()
+        && let Some(visual) = label.children.first_mut()
+        && let UiContent::Text(spec) = &mut visual.content
+    {
+        spec.text = if width == SettingsWidth::Compact {
+            "Automatic"
+        } else {
+            "Automatic updates"
+        }
+        .to_string();
+    }
+    let text_scale = settings_text_scale();
+    let caption_line_height = 24.0_f32.max(20.0 * text_scale);
+    let row_height = width.row_height();
+    let mut caption = wrap_native_lines(
+        std::slice::from_ref(&update_automatic_caption(width)),
+        text_width,
+        13.0 * crate::native_appearance::text_scale(),
+    );
+    // A 320-point landscape host at 2x Dynamic Type has room for the switch or
+    // for the sentence explaining it, not both. Keep the CONTROL: the row's own
+    // semantic label already carries the complete policy text for assistive
+    // technology, so dropping the caption costs decoration, not meaning. It is
+    // all-or-nothing on purpose — half a sentence is worse than none.
+    if let Some(budget) = height_budget {
+        let room = (budget - (40.0 + row_height + 8.0)).max(0.0);
+        if caption.len() as f32 * caption_line_height > room {
+            caption.clear();
+        }
+    }
+    let caption_height = caption.len() as f32 * caption_line_height;
+    let height = 40.0 + row_height + caption_height + if caption.is_empty() { 0.0 } else { 8.0 };
+    let mut children = vec![row];
+    if !caption.is_empty() {
+        children.push(
+            UiNode::new(
+                "updates/automatic/caption",
+                UiContent::Group(GroupSpec {
+                    label: Some(update_automatic_caption(width)),
+                    role: SemanticRole::Text,
+                    style: StyleRef::Quiet,
+                }),
+            )
+            .layout(Layout::column().height(Length::Fixed(caption_height)))
+            .children(
+                caption
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        UiNode::new(
+                            format!("updates/automatic/caption/line-{index}"),
+                            UiContent::Text(TextSpec {
+                                text: line.clone(),
+                                role: SemanticRole::Text,
+                                style: StyleRef::Quiet,
+                            }),
+                        )
+                        .layout(Layout::default().height(Length::Fixed(caption_line_height)))
+                        .paint_only()
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Some((
+        UiNode::new(
+            "updates/automatic",
+            UiContent::Group(GroupSpec::new("Automatic updates").style(StyleRef::Secondary)),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(height))
+                .padding(Insets::all(20.0))
+                .gap(8.0)
+                .clipped(),
+        )
+        .children(children),
+        height,
+    ))
+}
+
+/// The Software Update page: what you are running, ONE button that takes you to
+/// the newest build, the automatic-update switch, and the release notes.
+///
+/// It used to also carry a three-row "THIS INSTALLATION" card that restated the
+/// status line, a "How aterm updates" explainer describing a policy the user
+/// cannot act on, a paginated "LAST UPDATE RESULT" section, and three competing
+/// install buttons — which together pushed the only two controls that matter
+/// off the first screen.
+fn update_page(
+    state: &SettingsViewState,
+    update: &UpdateProjection,
+    width: SettingsWidth,
+    viewport_width: f32,
+    viewport_height: f32,
+) -> Vec<UiNode> {
+    let text_scale = settings_text_scale();
+    let compact = width == SettingsWidth::Compact;
+    let compact_large_type = compact && text_scale > 1.25;
+    let large_type_narrow = compact_large_type && viewport_width < 220.0 * text_scale;
+    let compact_budget = compact.then(|| {
+        compact_page_budget(
+            state,
+            LogicalRect::new(0.0, 0.0, viewport_width, viewport_height),
+        )
+    });
+    let compact_section_height = compact_budget.map_or_else(
+        || compact_special_section_height(state, viewport_height),
+        |budget| {
+            if budget.side_by_side_pager {
+                budget.content_height
+            } else {
+                (budget.content_height - page_navigation_height() - 10.0)
+                    .max(scaled_control_height())
+            }
+        },
+    );
+    let short_compact = compact && compact_section_height < 270.0;
+    // One button is small enough to ride inside the status card at every width
+    // except the shortest compact hosts, where the card alone already fills the
+    // page and the action needs its own reachable slice.
+    let split_action = compact && (text_scale > 1.25 || short_compact);
+    let action_height = 36.0_f32.max(32.0 * text_scale);
+    let action = update_action_node(update, width, action_height);
+
     let maximum = if width == SettingsWidth::Wide {
         1_000.0
     } else {
         760.0
     };
-    let mut outcome_width = settings_page_content_width(viewport_width, width, maximum);
+    let mut notes_width = settings_page_content_width(viewport_width, width, maximum);
     if compact_budget.is_some_and(|budget| budget.side_by_side_pager) {
-        outcome_width =
-            (outcome_width - compact_side_pager_width() - 10.0).max(scaled_control_height());
+        notes_width =
+            (notes_width - compact_side_pager_width() - 10.0).max(scaled_control_height());
     }
-    let ordinary_release_height = 210.0_f32.max(170.0 * text_scale);
-    let noncompact_content_height = (width != SettingsWidth::Compact).then(|| {
+    let notes_text_width = (notes_width - update_release_notes_padding() * 2.0).max(48.0);
+    // Prose inside the two cards wraps to the measure each card really gets:
+    // full width when the page stacks, and the workbench fractions when the
+    // desktop layout sets them side by side. WRAP_SLACK keeps the greedy
+    // wrapper a hair inside the painter's own measure — without it a line can
+    // come back a fraction of a point over and trip the overflow audit.
+    const WRAP_SLACK: f32 = 6.0;
+    let (status_text_width, automatic_text_width) = if compact {
+        (
+            (notes_width - 44.0 - WRAP_SLACK).max(48.0),
+            (notes_width - 40.0 - WRAP_SLACK).max(48.0),
+        )
+    } else {
+        (
+            (notes_width * 0.62 - 44.0 - WRAP_SLACK).max(48.0),
+            (notes_width * 0.38 - 40.0 - WRAP_SLACK).max(48.0),
+        )
+    };
+
+    let (status, status_height) = update_status_card(
+        update,
+        width,
+        large_type_narrow,
+        status_text_width,
+        (!split_action).then(|| action.clone()),
+        action_height,
+    );
+    let automatic = update_automatic_card(
+        state,
+        width,
+        automatic_text_width,
+        compact.then_some(compact_section_height),
+        viewport_width,
+        viewport_height,
+    );
+    let ordinary_notes_height = 210.0_f32.max(170.0 * text_scale);
+    let noncompact_content_height = (!compact).then(|| {
         noncompact_page_content_height(state, width, viewport_width, viewport_height, maximum)
     });
     let paged_section_height = noncompact_content_height.map_or(compact_section_height, |height| {
         (height - page_heading_height() - page_subtitle_height() - page_navigation_height() - 36.0)
-            .max(ordinary_release_height)
+            .max(ordinary_notes_height)
     });
-    let outcome_cards = update_outcome_cards(update, paged_section_height, outcome_width);
-    let compact_release_notes = if width == SettingsWidth::Compact {
-        update_release_notes_cards(
-            update,
-            compact_section_height,
-            (outcome_width - update_release_notes_padding() * 2.0).max(48.0),
-        )
-    } else {
-        Vec::new()
-    };
+
     if let Some(budget) = compact_budget.filter(|budget| budget.side_by_side_pager) {
-        let mut items = Vec::new();
-        items.push(compact_update_summary(update, outcome_width));
-        items.extend(actions.into_iter().map(|mut action| {
-            action.layout.width = Length::Fill;
-            action.layout.height = Length::Fixed(action_control_height);
-            (action, action_control_height)
-        }));
-        for index in 0..3 {
-            items.push(compact_update_service_row(update, index));
-        }
+        // This host shares its row with the side pager and is only ~320 points
+        // tall. The full status card cannot fit there, so it collapses to the
+        // two-column summary and the outcome takes its own reachable slice.
+        let notes = update_release_notes_cards(update, compact_section_height, notes_text_width);
+        let mut items = vec![compact_update_summary(update, notes_width)];
+        let mut action = action.clone();
+        action.layout.width = Length::Fill;
+        action.layout.height = Length::Fixed(action_height);
+        items.push((action, action_height));
+        items.extend(automatic.clone());
+        items.extend(compact_update_outcome(update, notes_text_width));
         items.extend(
-            compact_release_notes
-                .clone()
-                .into_iter()
+            notes
+                .iter()
+                .cloned()
                 .map(|notes| (notes, compact_section_height)),
         );
-        items.extend(outcome_cards.clone());
         let mut sections = atomic_compact_sections(
             "updates/compact-sections",
             "Update section",
@@ -14038,7 +14084,12 @@ fn update_page(
         );
         debug_assert_eq!(
             sections.len(),
-            update_compact_sections(update, compact_release_notes.len(), outcome_cards.len(),)
+            update_compact_sections(
+                true,
+                automatic.is_some(),
+                usize::from(update_outcome_line(update).is_some()),
+                notes.len(),
+            )
         );
         let total = sections.len();
         state.record_result_page_limit(total.saturating_sub(1));
@@ -14062,130 +14113,121 @@ fn update_page(
             budget,
         );
     }
-    let mut compact_sections = if width == SettingsWidth::Compact {
-        let mut sections = vec![hero.clone()];
-        if split_compact_actions {
-            sections.push(actions_node.clone());
+
+    if compact {
+        let mut sections = Vec::new();
+        // The status card and the switch are both small now. A phone that can
+        // hold BOTH shows both: one section per page is the compact contract,
+        // but making someone page past two thirds of an empty screen to reach
+        // the switch is exactly the friction this page was meant to lose.
+        let paired = !split_action
+            && automatic
+                .as_ref()
+                .is_some_and(|(_, height)| status_height + height + 12.0 <= compact_section_height);
+        if paired {
+            let (automatic, automatic_height) = automatic.clone().expect("paired implies present");
+            sections.push(
+                UiNode::new(
+                    "updates/compact-status",
+                    UiContent::Group(GroupSpec::new("Software Update status and settings")),
+                )
+                .layout(
+                    Layout::column()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(status_height + automatic_height + 12.0))
+                        .gap(12.0),
+                )
+                .children(vec![status, automatic]),
+            );
+        } else {
+            sections.push(status);
+            if split_action {
+                sections.push(
+                    UiNode::new(
+                        "updates/actions",
+                        UiContent::Group(GroupSpec::new("Update actions")),
+                    )
+                    .layout(Layout::row().height(Length::Fixed(action_height)).gap(8.0))
+                    .children(vec![action]),
+                );
+            }
+            sections.extend(automatic.map(|(node, _)| node));
         }
-        sections.push(service.clone());
-        sections
-    } else {
-        Vec::new()
-    };
-    if width == SettingsWidth::Compact && (short_compact || service_height > compact_section_height)
-    {
-        // The full three-row installation card is 220px. Split it into two
-        // complete cards when a landscape host owns less than that; every row
-        // remains visible and introspectable rather than disappearing below a
-        // clip edge.
-        compact_sections.pop();
-        compact_sections.extend([
-            update_service_card_rows(update, "updates/detail-card", "THIS INSTALLATION", 0, 2),
-            update_service_card_rows(
-                update,
-                "updates/detail-card/continued",
-                "THIS INSTALLATION · CONTINUED",
-                2,
-                3,
-            ),
-        ]);
-    }
-    if width == SettingsWidth::Compact {
-        compact_sections.extend(compact_release_notes);
-    }
-    if width == SettingsWidth::Compact {
-        compact_sections.extend(outcome_cards.iter().map(|(node, _)| node.clone()));
-    }
-    if width == SettingsWidth::Compact {
-        let total = compact_sections.len();
+        sections.extend(update_release_notes_cards(
+            update,
+            compact_section_height,
+            notes_text_width,
+        ));
+        let total = sections.len();
         state.record_result_page_limit(total.saturating_sub(1));
         let section = state.page_scroll.min(total.saturating_sub(1));
-        let section_node = compact_sections.swap_remove(section);
-        let mut out = vec![page_navigation_node_pages(
-            "updates/pagination",
-            "updates/range",
-            "Update sections",
-            section,
-            section + 1,
-            total,
-        )];
-        out.push(section_node);
-        return out;
+        let section_node = sections.swap_remove(section);
+        return vec![
+            page_navigation_node_pages(
+                "updates/pagination",
+                "updates/range",
+                "Update sections",
+                section,
+                section + 1,
+                total,
+            ),
+            section_node,
+        ];
     }
-    let workbench = UiNode::new(
-        "updates/workbench",
-        UiContent::Group(GroupSpec::new("Update status dashboard")),
-    )
-    .layout(if width == SettingsWidth::Compact {
-        Layout::column()
-            .height(Length::Fixed(hero_height * 2.0 + 12.0))
-            .gap(12.0)
-            .clipped()
-    } else {
-        Layout::row()
-            .height(Length::Fixed(workbench_height))
-            .gap(16.0)
-            .clipped()
-    })
-    .children(vec![
-        hero.layout(
-            Layout::column()
-                .width(if width == SettingsWidth::Compact {
-                    Length::Fill
-                } else {
-                    Length::Fraction(0.62)
-                })
-                .height(Length::Fill)
-                .padding(Insets::symmetric(22.0, 20.0))
-                .gap(8.0),
-        ),
-        service,
-    ]);
 
     let content_height = noncompact_content_height.expect("non-compact Update content height");
-    let release_text_width = (outcome_width - update_release_notes_padding() * 2.0).max(48.0);
-    let ordinary_release_notes =
-        update_release_notes_cards(update, ordinary_release_height, release_text_width);
-    let paged_release_height = paged_section_height;
-    let (release_notes, release_notes_height) = if ordinary_release_notes.len() <= 1 {
-        (ordinary_release_notes, ordinary_release_height)
+    let ordinary_notes = update_release_notes_cards(update, ordinary_notes_height, notes_text_width);
+    let (notes, notes_height) = if ordinary_notes.len() <= 1 {
+        (ordinary_notes, ordinary_notes_height)
     } else {
         (
-            update_release_notes_cards(update, paged_release_height, release_text_width),
-            paged_release_height,
+            update_release_notes_cards(update, paged_section_height, notes_text_width),
+            paged_section_height,
         )
     };
-    let process =
-        (update.changelog.is_empty() && viewport_height >= 620.0).then(update_process_card);
-    let mut sections = vec![workbench.clone()];
-    if split_short_medium_actions {
-        sections.push(actions_node.clone());
-    }
-    sections.extend(release_notes.clone());
-    if let Some(process) = process.clone() {
-        sections.push(process);
-    }
-    sections.extend(outcome_cards.iter().map(|(node, _)| node.clone()));
-
-    let section_heights = workbench_height
-        + if split_short_medium_actions {
-            action_height
-        } else {
-            0.0
+    // Desktop widths put the two controls side by side and the notes beneath,
+    // exactly where the retired service card used to sit. Stacking all three
+    // pushed an ordinary 1424x658 window over its content measure and forced
+    // the pager on for a page with three cards on it.
+    let (workbench, workbench_height) = match automatic {
+        Some((mut automatic, automatic_height)) => {
+            let height = status_height.max(automatic_height);
+            // Both cards own the full row height so the pair reads as one band
+            // rather than two cards of different depth.
+            automatic.layout.height = Length::Fill;
+            (
+                UiNode::new(
+                    "updates/workbench",
+                    UiContent::Group(GroupSpec::new("Update status and automatic updates")),
+                )
+                .layout(Layout::row().height(Length::Fixed(height)).gap(16.0).clipped())
+                .children(vec![
+                    status.layout(
+                        Layout::column()
+                            .width(Length::Fraction(0.62))
+                            .height(Length::Fill)
+                            .padding(Insets::symmetric(22.0, 20.0))
+                            .gap(8.0),
+                    ),
+                    automatic,
+                ]),
+                height,
+            )
         }
-        + release_notes.len() as f32 * release_notes_height
-        + process.as_ref().map_or(0.0, |_| 142.0)
-        + outcome_cards.iter().map(|(_, height)| *height).sum::<f32>();
+        None => (status, status_height),
+    };
+    let mut sections = vec![workbench];
+    sections.extend(notes.clone());
+
+    let section_heights = workbench_height + notes.len() as f32 * notes_height;
     let authored_children = 2 + sections.len();
     let dashboard_height = page_heading_height()
         + page_subtitle_height()
         + section_heights
         + authored_children.saturating_sub(1) as f32 * 12.0;
     if dashboard_height > content_height {
-        // A staged build adds three actions, release notes, and an outcome.
-        // At 849x460 the workbench itself fits, but the old linear dashboard
-        // clipped every following section and ignored `page_scroll`. Window the
-        // complete cards with the shared semantic pager instead.
+        // Window the complete cards with the shared semantic pager rather than
+        // letting a long changelog clip everything after it.
         let total = sections.len();
         state.record_result_page_limit(total.saturating_sub(1));
         let section = state.page_scroll.min(total.saturating_sub(1));
@@ -14207,229 +14249,9 @@ fn update_page(
 
     state.record_result_page_limit(0);
     let mut out = page_heading("Software Update", update_page_subtitle(width));
-    out.push(workbench);
-    out.extend(release_notes);
-    if let Some(process) = process {
-        out.push(process);
-    }
-    out.extend(outcome_cards.into_iter().map(|(node, _)| node));
+    out.extend(sections);
     out
 }
-
-fn update_service_card(update: &UpdateProjection, height: f32) -> UiNode {
-    update_service_card_rows_with_height(
-        update,
-        "updates/detail-card",
-        "THIS INSTALLATION",
-        0,
-        3,
-        height,
-    )
-}
-
-fn update_service_card_rows(
-    update: &UpdateProjection,
-    key: &str,
-    heading: &str,
-    start: usize,
-    end: usize,
-) -> UiNode {
-    let text_scale = settings_text_scale();
-    let heading_height = 24.0_f32.max(16.0 * text_scale);
-    let label_height = 18.0_f32.max(16.0 * text_scale);
-    let value_height = 24.0_f32.max(20.0 * text_scale);
-    let row_height = label_height + value_height + 2.0;
-    let rows = end.saturating_sub(start);
-    let height = 40.0 + heading_height + rows as f32 * row_height + rows as f32 * 8.0;
-    update_service_card_rows_with_height(update, key, heading, start, end, height)
-}
-
-fn update_service_card_rows_with_height(
-    update: &UpdateProjection,
-    key: &str,
-    heading: &str,
-    start: usize,
-    end: usize,
-    height: f32,
-) -> UiNode {
-    let text_scale = settings_text_scale();
-    let heading_height = 24.0_f32.max(16.0 * text_scale);
-    let label_height = 18.0_f32.max(16.0 * text_scale);
-    let value_height = 24.0_f32.max(20.0 * text_scale);
-    let row_height = label_height + value_height + 2.0;
-    let service = if update.enabled {
-        "Available".to_string()
-    } else {
-        "Unavailable for this build".to_string()
-    };
-    let staged = update.staged.as_ref().map_or_else(
-        || "No update staged".to_string(),
-        |(build, version)| format!("Version {version} · build {build}"),
-    );
-    let rows = [
-        (
-            "service",
-            "Update service",
-            service,
-            if update.enabled {
-                "Available".to_string()
-            } else {
-                "Unavailable".to_string()
-            },
-        ),
-        (
-            "running",
-            "Running now",
-            format!(
-                "{} · build {}",
-                update.current_version, update.current_build
-            ),
-            format!("v{} · b{}", update.current_version, update.current_build),
-        ),
-        (
-            "staged",
-            "Install state",
-            staged,
-            update.staged.as_ref().map_or_else(
-                || "None".to_string(),
-                |(build, version)| format!("v{version} · b{build}"),
-            ),
-        ),
-    ];
-    let large_type = text_scale > 1.25;
-    let mut children = vec![
-        UiNode::new(
-            format!("{key}/heading"),
-            UiContent::Text(TextSpec {
-                text: heading.to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(heading_height))),
-    ];
-    children.extend(rows[start.min(rows.len())..end.min(rows.len())].iter().map(
-        |(row_key, label, value, compact_value)| {
-            UiNode::new(
-                format!("updates/service/{row_key}"),
-                UiContent::Group(GroupSpec::new(format!("{label}: {value}"))),
-            )
-            .layout(Layout::column().height(Length::Fixed(row_height)).gap(2.0))
-            .children(vec![
-                UiNode::new(
-                    format!("updates/service/{row_key}/label"),
-                    UiContent::Text(TextSpec {
-                        text: (*label).to_string(),
-                        role: SemanticRole::Text,
-                        style: StyleRef::Quiet,
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(label_height))),
-                UiNode::new(
-                    format!("updates/service/{row_key}/value"),
-                    UiContent::Text(TextSpec {
-                        text: if large_type {
-                            compact_value.clone()
-                        } else {
-                            value.clone()
-                        },
-                        role: SemanticRole::Status,
-                        style: if *row_key == "service" && update.enabled {
-                            StyleRef::Success
-                        } else {
-                            StyleRef::Primary
-                        },
-                    }),
-                )
-                .layout(Layout::default().height(Length::Fixed(value_height))),
-            ])
-        },
-    ));
-    UiNode::new(
-        key,
-        UiContent::Group(GroupSpec::new(heading).style(StyleRef::Secondary)),
-    )
-    .layout(
-        Layout::column()
-            .width(Length::Fill)
-            .height(Length::Fixed(height))
-            .padding(Insets::all(20.0))
-            .gap(8.0)
-            .clipped(),
-    )
-    .children(children)
-}
-
-fn update_process_card() -> UiNode {
-    let steps = [
-        (
-            "check",
-            "1  CHECK",
-            "Compare this build with the update service.",
-        ),
-        ("review", "2  REVIEW", "Review changes before you install."),
-        (
-            "relaunch",
-            "3  RELAUNCH",
-            "Install a staged build only when you choose.",
-        ),
-    ];
-    UiNode::new(
-        "updates/process",
-        UiContent::Group(GroupSpec::new("How aterm updates").style(StyleRef::Secondary)),
-    )
-    .layout(
-        Layout::column()
-            .height(Length::Fixed(142.0))
-            .padding(Insets::all(18.0))
-            .gap(10.0),
-    )
-    .children(vec![
-        UiNode::new(
-            "updates/process-heading",
-            UiContent::Text(TextSpec {
-                text: "A CLEAR, USER-CONTROLLED UPDATE FLOW".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(22.0))),
-        UiNode::new(
-            "updates/process-steps",
-            UiContent::Group(GroupSpec::new("Update flow steps")),
-        )
-        .layout(Layout::row().height(Length::Fill).gap(22.0))
-        .children(
-            steps
-                .into_iter()
-                .map(|(key, heading, detail)| {
-                    UiNode::new(
-                        format!("updates/process/{key}"),
-                        UiContent::Group(GroupSpec::new(heading)),
-                    )
-                    .layout(Layout::column().width(Length::Fill).gap(4.0))
-                    .children(vec![
-                        UiNode::new(
-                            format!("updates/process/{key}/heading"),
-                            UiContent::Text(TextSpec::heading(heading)),
-                        )
-                        .layout(Layout::default().height(Length::Fixed(24.0))),
-                        UiNode::new(
-                            format!("updates/process/{key}/detail"),
-                            UiContent::Text(TextSpec {
-                                text: detail.to_string(),
-                                role: SemanticRole::Text,
-                                style: StyleRef::Quiet,
-                            }),
-                        )
-                        .layout(Layout::default().height(Length::Fixed(42.0))),
-                    ])
-                })
-                .collect(),
-        ),
-    ])
-}
-
 /// The coherent card count the Packages page virtualizes over: the status
 /// hero (with its action row), the consent-switch card, and the program list.
 fn packages_sections(_packages: &PackagesProjection) -> usize {
@@ -15287,9 +15109,9 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
 
 fn update_page_subtitle(width: SettingsWidth) -> &'static str {
     if width == SettingsWidth::Compact {
-        "Build status, changes, and relaunch."
+        "Update now, or let aterm do it."
     } else {
-        "Know what is running, what is available, and exactly when aterm will relaunch."
+        "Update to the latest build now, or leave automatic updates on."
     }
 }
 
@@ -20901,14 +20723,38 @@ mod tests {
             .unwrap()
             .compile(wide.viewport)
             .unwrap();
+        // Desktop Update is the status card beside the automatic-updates
+        // switch, with the release notes beneath — the whole page, unpaginated,
+        // on an ordinary window. The three-row service card that used to own
+        // that right-hand slot and the "How aterm updates" explainer below it
+        // are retired at every width.
         let status = updates.semantic(&UiKey::new("updates/hero")).unwrap();
-        let service = updates
-            .semantic(&UiKey::new("updates/detail-card"))
+        let automatic = updates.semantic(&UiKey::new("updates/automatic")).unwrap();
+        let notes = updates
+            .semantic(&UiKey::new("updates/release-notes-card"))
             .unwrap();
-        assert!(status.rect.right() < service.rect.x);
-        assert_eq!(status.rect.y, service.rect.y);
-        assert_eq!(status.rect.bottom(), service.rect.bottom());
-        assert!(updates.semantic(&UiKey::new("updates/process")).is_some());
+        assert!(status.rect.right() < automatic.rect.x);
+        assert_eq!(status.rect.y, automatic.rect.y);
+        assert_eq!(status.rect.bottom(), automatic.rect.bottom());
+        assert!(notes.rect.y >= status.rect.bottom());
+        assert!(notes.rect.bottom() <= wide.viewport.bottom());
+        assert!(
+            updates.semantic(&UiKey::new("updates/pagination")).is_none(),
+            "an ordinary desktop window shows the whole Update page at once"
+        );
+        // The switch is the real config control, not a lookalike.
+        assert!(
+            updates
+                .semantic(&UiKey::new("settings/control/update.auto_apply"))
+                .is_some(),
+            "the automatic-updates switch is bound to the update.auto_apply leaf"
+        );
+        for key in ["updates/detail-card", "updates/process"] {
+            assert!(
+                updates.semantic(&UiKey::new(key)).is_none(),
+                "{key} is retired"
+            );
+        }
 
         let compact = view_cx_at(600.0, 820.0);
         let compact_updates = runtime
@@ -20925,23 +20771,26 @@ mod tests {
                 .semantic(&UiKey::new("updates/detail-card"))
                 .is_none()
         );
+        // Both controls are small enough to share the first narrow page, so
+        // nobody has to page past an empty screen to reach the switch.
+        let compact_automatic = compact_updates
+            .semantic(&UiKey::new("updates/automatic"))
+            .unwrap();
+        assert!(compact_automatic.rect.y >= compact_status.rect.bottom());
+        assert!(compact_automatic.rect.bottom() <= compact.viewport.bottom());
+        // Whatever does not fit stays reachable whole.
         runtime
             .dispatch(instance, view, AppEvent::ScrollLines(1))
             .unwrap();
-        let compact_details = runtime
+        let compact_next = runtime
             .render(instance, view, &compact)
             .unwrap()
             .compile(compact.viewport)
             .unwrap();
-        let compact_service = compact_details
-            .semantic(&UiKey::new("updates/detail-card"))
+        let compact_notes = compact_next
+            .semantic(&UiKey::new("updates/release-notes-card"))
             .unwrap();
-        assert!(compact_service.rect.bottom() <= compact.viewport.bottom());
-        assert!(
-            compact_details
-                .semantic(&UiKey::new("updates/process"))
-                .is_none()
-        );
+        assert!(compact_notes.rect.bottom() <= compact.viewport.bottom());
     }
 
     #[test]
@@ -21029,7 +20878,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_medium_staged_update_pages_workbench_notes_and_outcome() {
+    fn ordinary_medium_staged_update_pages_workbench_and_notes() {
         let status = update_status(true);
         let (mut runtime, instance, view) =
             setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&status), false));
@@ -21051,7 +20900,7 @@ mod tests {
         // fit all 14 labeled routes intentionally select compact navigation.
         let cx = view_cx_at(849.0, 513.0);
         let mut seen = BTreeSet::new();
-        for section in 0..4 {
+        for section in 0..2 {
             let compiled = runtime
                 .render(instance, view, &cx)
                 .unwrap()
@@ -21077,9 +20926,9 @@ mod tests {
             }
             for (key, minimum_height) in [
                 ("updates/workbench", 220.0),
-                ("updates/actions", 124.0),
+                ("updates/actions", 36.0),
                 ("updates/release-notes-card", 210.0),
-                ("updates/outcome", 28.0),
+                ("updates/outcome", 24.0),
             ] {
                 if let Some(node) = compiled.semantic(&UiKey::new(key)) {
                     assert!(
@@ -21106,7 +20955,7 @@ mod tests {
                         }),
                     )
                     .unwrap();
-            } else if section < 3 {
+            } else if section < 1 {
                 // Wheel/keyboard and the visible Next control reduce to the
                 // same bounded page_scroll state.
                 runtime
@@ -21115,15 +20964,23 @@ mod tests {
             }
         }
         for key in [
-            "updates/check",
-            "updates/install-relaunch",
-            "updates/install-when-safe",
+            "updates/workbench",
+            "updates/install-now",
             "updates/headline",
-            "updates/detail-card",
+            "updates/automatic",
             "updates/release-notes",
             "updates/outcome",
         ] {
             assert!(seen.contains(key), "missing paged Medium update node {key}");
+        }
+        for key in [
+            "updates/check",
+            "updates/install-relaunch",
+            "updates/install-when-safe",
+            "updates/detail-card",
+            "updates/process",
+        ] {
+            assert!(!seen.contains(key), "retired Medium update node {key}");
         }
     }
 
@@ -21247,7 +21104,6 @@ mod tests {
             let mut painted_notes = String::new();
             let mut saw_outcome = false;
             let mut painted_outcome = String::new();
-            let mut saw_outcome_blank_line = false;
             let mut outcome_line_keys = BTreeSet::new();
             for page in 0..total {
                 let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -21279,7 +21135,7 @@ mod tests {
                     {
                         assert!(
                             outcome_line_keys.insert(node.key.clone()),
-                            "{variant}: continuation outcome lines need unique stable keys",
+                            "{variant}: outcome lines need unique stable keys",
                         );
                         assert!(
                             crate::tray_raster::ui_text_width(
@@ -21289,7 +21145,6 @@ mod tests {
                             "{variant}: outcome line {:?} exceeds its authored rect",
                             node.key,
                         );
-                        saw_outcome_blank_line |= spec.text.is_empty();
                         painted_outcome.push_str(&spec.text);
                     }
                 }
@@ -21308,36 +21163,55 @@ mod tests {
                 without_whitespace(&expected_notes),
                 "{variant}: visual release-note pagination must not drop visible content",
             );
-            assert!(saw_outcome, "{variant}: outcome page remains reachable");
+            assert!(saw_outcome, "{variant}: the outcome remains reachable");
             assert!(
                 !outcome_line_keys.is_empty(),
                 "{variant}: outcome must use inspectable per-line paint nodes",
             );
+            // The outcome is a BOUNDED summary inside the status card now,
+            // not its own paginated section: at most a few lines, elided
+            // rather than dropped, with the exact ledger string retained on
+            // the semantic parent asserted above. What it must never do is
+            // scramble or reorder what it does show.
             assert!(
-                saw_outcome_blank_line,
-                "{variant}: an authored empty outcome row must remain a visual row",
+                outcome_line_keys.len() <= MAX_UPDATE_OUTCOME_LINES,
+                "{variant}: outcome is bounded to {MAX_UPDATE_OUTCOME_LINES} lines, saw {}",
+                outcome_line_keys.len(),
             );
-            assert_eq!(
-                without_whitespace(&painted_outcome),
-                without_whitespace(&expected_outcome),
-                "{variant}: outcome pagination must not drop visible content",
+            let painted = without_whitespace(&painted_outcome);
+            let complete = without_whitespace(&format!(
+                "Last update result: {}",
+                expected_outcome.split('\n').collect::<Vec<_>>().join(" ")
+            ));
+            let shown = painted.trim_end_matches('\u{2026}');
+            assert!(
+                complete.starts_with(shown) && !shown.is_empty(),
+                "{variant}: the visible outcome is an exact leading run of the real one\n  shown: {shown}\n  whole: {complete}",
             );
         }
     }
 
+    /// Every section of the simplified Update page stays reachable, complete and
+    /// overflow-free at the platform maximum Dynamic Type in short landscape —
+    /// the shape that used to clip whatever followed the status card.
+    ///
+    /// The retired paginated "LAST UPDATE RESULT" section is what this test
+    /// originally audited. The updater outcome is now ONE line inside the status
+    /// card, so the property to hold is that it is still surfaced exactly once
+    /// and still fits, alongside the two controls the page exists for.
     #[test]
-    fn maximum_type_landscape_update_outcome_pages_are_complete() {
+    fn maximum_type_landscape_update_sections_are_complete() {
         const CHILD: &str = "ATERM_SETTINGS_UPDATE_OUTCOME_CHILD";
         const EXACT: &str =
-            "native_settings::tests::maximum_type_landscape_update_outcome_pages_are_complete";
+            "native_settings::tests::maximum_type_landscape_update_sections_are_complete";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", EXACT, "--nocapture"])
                 .env(CHILD, "1")
                 .env("RUST_TEST_THREADS", "1")
                 .status()
-                .expect("launch isolated 2x Update outcome audit");
-            assert!(status.success(), "isolated 2x Update outcome audit");
+                .expect("launch isolated 2x Update section audit");
+            assert!(status.success(), "isolated 2x Update section audit");
             return;
         }
 
@@ -21347,18 +21221,12 @@ mod tests {
                 ..crate::native_appearance::current_preferences()
             },
         );
-        let mut status = update_status(false);
-        status.outcome = (0..4)
-            .map(|index| {
-                format!(
-                    "Outcome segment {index}: the protected live terminal remains attached until the user explicitly retries the verified updater handoff."
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut status = update_status(true);
+        status.outcome =
+            "The protected live terminal remains attached until the verified handoff retries."
+                .to_string();
         let expected_outcome = status.outcome.clone();
         let update_state = UpdateState::from_status(1, "0.1.0", Some(&status), false);
-        let projection = update_state.projection();
         let (mut runtime, instance, view) = setup_with_update(update_state);
         runtime
             .dispatch(
@@ -21375,23 +21243,12 @@ mod tests {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!();
         };
-        let budget = compact_page_budget(state, cx.viewport);
-        assert!(budget.side_by_side_pager);
-        let outcome_width =
-            (settings_page_content_width(cx.viewport.width, SettingsWidth::Compact, 760.0)
-                - compact_side_pager_width()
-                - 10.0)
-                .max(scaled_control_height());
-        let expected_outcome_pages =
-            update_outcome_cards(&projection, budget.content_height, outcome_width).len();
-        assert!(
-            expected_outcome_pages > 1,
-            "fixture must exercise continuation headings"
-        );
+        assert!(compact_page_budget(state, cx.viewport).side_by_side_pager);
 
         let mut global_total = None;
         let mut visited_pages = 0usize;
-        let mut outcome_pages = BTreeSet::new();
+        let mut keys = BTreeSet::new();
+        let mut saw_outcome = 0usize;
         loop {
             let compiled = compile_settings_view(&runtime, instance, view, &cx);
             let total = pager_total(&compiled, "updates/range");
@@ -21417,93 +21274,30 @@ mod tests {
             );
             assert_zero_top_paint(&compiled, &context);
 
-            if visited_pages == 0 {
-                assert_eq!(
-                    compiled
-                        .semantic(&UiKey::new("updates/hero"))
-                        .map(|node| (node.role, node.label.as_str())),
-                    Some((
-                        SemanticRole::Status,
-                        "Software Update\nYou’re up to date.\naterm 0.1.0 · build 1\nNo newer build is staged.",
-                    )),
-                    "{context}: one exact native summary Status",
-                );
-                for key in [
-                    "updates/summary/identity",
-                    "updates/summary/detail",
-                    "updates/title",
-                    "updates/headline",
-                    "updates/current",
-                    "updates/detail",
-                ] {
-                    assert!(
-                        compiled.semantic(&UiKey::new(key)).is_none(),
-                        "{context}: {key} must not duplicate the summary Status",
-                    );
-                }
-                assert_eq!(
-                    compiled
-                        .semantics
-                        .iter()
-                        .filter(|node| node.key.as_str() == "updates/hero")
-                        .count(),
-                    1,
-                    "{context}: exactly one summary semantic stop",
+            if let Some(hero) = compiled.semantic(&UiKey::new("updates/hero")) {
+                assert_eq!(hero.role, SemanticRole::Status, "{context}: hero is Status");
+                assert!(
+                    hero.label.contains("Update ready"),
+                    "{context}: the status summary states where the build stands, saw {:?}",
+                    hero.label,
                 );
             }
-
-            let visible_outcomes = compiled
-                .semantics
-                .iter()
-                .filter(|node| {
-                    (node.key.as_str() == "updates/outcome"
-                        || node.key.as_str().starts_with("updates/outcome/continued-"))
-                        && node.role == SemanticRole::Status
-                })
-                .collect::<Vec<_>>();
-            assert!(
-                visible_outcomes.len() <= 1,
-                "{context}: one atomic outcome page"
-            );
-            if let Some(outcome) = visible_outcomes.first() {
+            // Whichever slice it lands on, the outcome keeps the EXACT ledger
+            // string on its semantic node — the paint beside it is bounded.
+            if let Some(outcome) = compiled.semantic(&UiKey::new("updates/outcome")) {
                 assert_eq!(
                     outcome.label, expected_outcome,
-                    "{context}: the Status parent retains the exact outcome"
+                    "{context}: exact updater outcome retained",
                 );
-                let ordinal = outcome
-                    .key
-                    .as_str()
-                    .strip_prefix("updates/outcome/continued-")
-                    .map_or(0, |value| value.parse::<usize>().unwrap());
-                assert!(
-                    outcome_pages.insert(ordinal),
-                    "{context}: duplicate outcome page {ordinal}"
-                );
-                let heading_key = if ordinal == 0 {
-                    "updates/outcome/heading".to_string()
-                } else {
-                    format!("updates/outcome/heading/continued-{ordinal}")
-                };
-                let heading = compiled
-                    .paint
-                    .iter()
-                    .find(|node| node.key.as_str() == heading_key)
-                    .unwrap_or_else(|| panic!("{context}: missing outcome heading {heading_key}"));
-                let UiContent::Text(spec) = &heading.content else {
-                    panic!("{context}: outcome heading is not text");
-                };
-                assert!(!spec.text.is_empty(), "{context}: useful visual heading");
-                assert!(
-                    crate::tray_raster::ui_text_width_for(
-                        crate::widget::TextFace::UiBold,
-                        &spec.text,
-                        11.0 * crate::native_appearance::text_scale(),
-                    ) <= heading.rect.width + 0.5,
-                    "{context}: responsive heading {:?} exceeds {:?}",
-                    spec.text,
-                    heading.rect,
-                );
+                saw_outcome += 1;
             }
+            keys.extend(
+                compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with("updates/"))
+                    .map(|node| node.key.as_str().to_string()),
+            );
 
             visited_pages += 1;
             let next = compiled
@@ -21533,11 +21327,18 @@ mod tests {
         }
 
         assert_eq!(visited_pages, global_total.unwrap());
-        assert_eq!(
-            outcome_pages,
-            (0..expected_outcome_pages).collect::<BTreeSet<_>>(),
-            "every generated outcome page is reachable exactly once"
-        );
+        assert_eq!(saw_outcome, 1, "the outcome is surfaced on exactly one page");
+        for key in [
+            "updates/hero",
+            "updates/install-now",
+            "updates/automatic",
+            "updates/release-notes",
+        ] {
+            assert!(
+                keys.contains(key),
+                "2x landscape Update page never reached {key}; saw {keys:?}",
+            );
+        }
     }
 
     #[test]
@@ -23156,7 +22957,13 @@ mod tests {
                     .unwrap();
                 compiled.validate_parity().unwrap();
                 for node in &compiled.semantics {
-                    if node.key.as_str().starts_with("updates/") {
+                    // The Update route also hosts one shared config control
+                    // (`settings/control/update.auto_apply`), so the audit
+                    // follows that namespace too rather than missing the
+                    // automatic-updates switch entirely.
+                    if node.key.as_str().starts_with("updates/")
+                        || node.key.as_str().starts_with("settings/control/update.")
+                    {
                         assert!(
                             node.rect.bottom() <= cx.viewport.bottom() + 0.01,
                             "{} is clipped at {viewport_width}x568: {:?}",
@@ -23187,14 +22994,11 @@ mod tests {
                 }
             }
             for key in [
-                "updates/check",
-                "updates/install-relaunch",
-                "updates/install-when-safe",
+                "updates/install-now",
                 "updates/headline",
                 "updates/current",
-                "updates/service/service/value",
-                "updates/service/running/value",
-                "updates/service/staged/value",
+                "updates/automatic",
+                "settings/control/update.auto_apply",
                 "updates/release-notes",
                 "updates/outcome",
             ] {
@@ -23628,17 +23432,13 @@ mod tests {
                 );
             }
 
-            // Audit both updater shapes. Staged adds two install actions and
-            // release notes; both shapes retain outcome and all service facts.
+            // Audit both updater shapes. Sections are the status summary, the
+            // one action, the automatic-updates switch, the outcome, and every
+            // bounded release-notes page — the same set either way, because the
+            // notes panel always says something.
             for staged in [false, true] {
                 let status = update_status(staged);
                 let update_state = UpdateState::from_status(1, "0.1.0", Some(&status), false);
-                let projection = update_state.projection();
-                let update_total = update_compact_sections(
-                    &projection,
-                    usize::from(!projection.changelog.is_empty()),
-                    usize::from(!projection.outcome.is_empty()),
-                );
                 let (mut runtime, instance, view) = setup_with_update(update_state);
                 {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -23647,6 +23447,13 @@ mod tests {
                     state.navigate(SettingsRoute::SoftwareUpdate);
                     state.feedback = feedback.clone();
                 }
+                // The page count is what the live pager reports; the authored
+                // `update_compact_sections` accounting must agree with it, which
+                // is the anti-divergence property worth pinning here.
+                let update_total = pager_total(
+                    &compile_settings_view(&runtime, instance, view, &cx),
+                    "updates/range",
+                );
                 let mut keys = BTreeSet::new();
                 for page in 0..update_total {
                     let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -23675,29 +23482,32 @@ mod tests {
                 }
                 for key in [
                     "updates/hero",
-                    "updates/check",
-                    "updates/service/service/value",
-                    "updates/service/running/value",
-                    "updates/service/staged/value",
-                    "updates/outcome",
+                    "updates/install-now",
+                    "updates/automatic",
+                    "updates/release-notes",
                 ] {
                     assert!(
                         keys.contains(key),
                         "Update missing {key}: {staged} {scale}× {variant}"
                     );
                 }
-                for key in ["updates/install-relaunch", "updates/install-when-safe"] {
-                    assert_eq!(
-                        keys.contains(key),
-                        staged,
-                        "Update action {key}: staged={staged} {scale}× {variant}"
+                // The retired multi-button, service-card and explainer surfaces
+                // must not come back at any width or Dynamic Type step.
+                for key in [
+                    "updates/check",
+                    "updates/install-relaunch",
+                    "updates/install-when-safe",
+                    "updates/service/service/value",
+                    "updates/service/running/value",
+                    "updates/service/staged/value",
+                    "updates/detail-card",
+                    "updates/process",
+                ] {
+                    assert!(
+                        !keys.contains(key),
+                        "retired Update surface {key} reappeared: {staged} {scale}× {variant}"
                     );
                 }
-                assert_eq!(
-                    keys.contains("updates/release-notes"),
-                    staged,
-                    "release notes: staged={staged} {scale}× {variant}"
-                );
             }
 
             // Packages uses the same stable atomic-page contract for status,
@@ -25876,12 +25686,13 @@ mod tests {
                 }),
             )
             .unwrap();
+        // ONE button. With a build staged it installs it.
         let relaunch = runtime
             .dispatch(
                 instance,
                 view,
                 AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("updates/install-relaunch"),
+                    id: ActionId::new("updates/install-now"),
                     value: None,
                 }),
             )
@@ -25917,38 +25728,53 @@ mod tests {
             Some("Before relaunch: two sessions are still running")
         );
 
-        let safe = runtime
+        // …and with nothing staged the SAME button goes and looks, so the user
+        // never has to know which updater stage they are in.
+        let current = update_status(false);
+        let (mut idle_runtime, idle_instance, idle_view) =
+            setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&current), false));
+        idle_runtime
             .dispatch(
-                instance,
-                view,
+                idle_instance,
+                idle_view,
                 AppEvent::Action(ActionInvocation {
-                    id: ActionId::new("updates/install-when-safe"),
+                    id: route_action(SettingsRoute::SoftwareUpdate),
                     value: None,
                 }),
             )
             .unwrap();
-        let safe_operation = safe
+        let check = idle_runtime
+            .dispatch(
+                idle_instance,
+                idle_view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("updates/install-now"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let check_operation = check
             .effects
             .iter()
             .find_map(|effect| match effect {
                 AppEffect::Update { request, reply } => {
-                    assert_eq!(*request, UpdateRequest::InstallWhenSafe);
+                    assert_eq!(*request, UpdateRequest::Check);
                     Some(reply.operation)
                 }
                 _ => None,
             })
-            .expect("safe install emits typed updater request");
-        runtime
+            .expect("the one button checks when nothing is staged");
+        idle_runtime
             .dispatch(
-                instance,
-                view,
+                idle_instance,
+                idle_view,
                 AppEvent::UpdateFinished {
-                    operation: safe_operation,
+                    operation: check_operation,
                     outcome: UpdateOutcome::Accepted,
                 },
             )
             .unwrap();
-        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+        let Some(AppViewState::Settings(state)) = idle_runtime.view_state(idle_view) else {
             panic!("Settings view")
         };
         assert_eq!(state.feedback.as_deref(), Some("Update request accepted"));
@@ -26166,22 +25992,21 @@ mod tests {
         };
         state.navigate(SettingsRoute::SoftwareUpdate);
         let update = compile_settings_view(&update_runtime, update_instance, update_view, &cx);
-        let process_audit = update
+        // Every painted string the simplified Update page authors — the status
+        // card, the one action, the automatic-updates switch row and its
+        // caption, and the release notes — must fit the box it was measured
+        // into. This replaced an audit of the retired "How aterm updates"
+        // explainer, whose three headings and three details were the only copy
+        // on the page dense enough to overflow.
+        let update_audit = update
             .paint_audit_lines()
             .into_iter()
-            .filter(|line| {
-                line.contains("paint-text key=\"updates/process/")
-                    && (line.contains("/heading\"") || line.contains("/detail\""))
-            })
+            .filter(|line| line.contains("paint-text key=\"updates/"))
             .collect::<Vec<_>>();
-        let process_geometry = update
+        let update_geometry = update
             .paint
             .iter()
-            .filter(|node| {
-                node.key.as_str().starts_with("updates/process/")
-                    && (node.key.as_str().ends_with("/heading")
-                        || node.key.as_str().ends_with("/detail"))
-            })
+            .filter(|node| node.key.as_str().starts_with("updates/"))
             .map(|node| {
                 format!(
                     "{} rect={:?} clip={:?}",
@@ -26191,14 +26016,17 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(process_audit.len(), 6);
         assert!(
-            process_audit
+            update_audit.len() >= 5,
+            "the Update page authors status, action, switch and notes copy: {update_audit:?}"
+        );
+        assert!(
+            update_audit
                 .iter()
                 .all(|line| line.contains("overflow=false")),
             "{}\n{}",
-            process_audit.join("\n"),
-            process_geometry.join("\n")
+            update_audit.join("\n"),
+            update_geometry.join("\n")
         );
     }
 

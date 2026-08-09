@@ -226,7 +226,7 @@ pub fn build_and_install(
     // `seed` verb is in `verb_mutates_store`) holds for the whole command — callers MUST hold
     // it. This replaces the earlier ad-hoc per-program lock; the store-wide lock also covers
     // the signed default-set lane, so both cannot race.
-    ensure_private_dir(&layout.prefix).map_err(|e| SourceBuildError::Io(e.to_string()))?;
+    layout.ensure_dir(&layout.prefix).map_err(|e| SourceBuildError::Io(e.to_string()))?;
 
     // Defense-in-depth: re-assert consent + policy AT THE CHOKE POINT, independent of the
     // seed gate — this `pub fn` must never build without opt-in/policy even if called directly.
@@ -299,7 +299,7 @@ pub fn build_and_install(
 
     // --- 1. fetch, fail-closed: full clone + checkout the pin + assert HEAD == pin --------
     let src = layout.prefix.join("src").join(&c.name);
-    ensure_private_dir(&layout.prefix.join("src"))
+    layout.ensure_dir(&layout.prefix.join("src"))
         .map_err(|e| SourceBuildError::Io(e.to_string()))?;
     fetch_pinned(&src, c, log)?;
 

@@ -7,6 +7,15 @@
 //! owns only the deterministic decisions that must survive event reordering: a
 //! stage wake arms intent even while a manual check is active, active work waits
 //! without consuming that intent, while physical handoff failures become manual-only.
+//!
+//! TERMINAL ACTIVITY IS A PREFERENCE WITH A DEADLINE, NOT A VETO. Parking readers
+//! mid-keystroke is a visible hitch, so an automatic apply would rather land in a
+//! quiet moment — but the lossless seamless lane destroys nothing, and "quiet"
+//! sampled a machine-wide input clock. On the daily driver this feature exists for
+//! (an agent streaming shell output, a human on the mouse) that sample was
+//! essentially never true, so the staged build sat unapplied until the user gave
+//! up and clicked Install. [`PollFacts::activity_grace_expired`] bounds the wait:
+//! inside the window activity defers, past it the update lands anyway.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ArmFacts {
@@ -68,9 +77,14 @@ pub(crate) struct PollFacts {
     pub(crate) applying: bool,
     /// The terminal has observed neither user input nor PTY output for the
     /// host's short monotonic quiet epoch, and no undispatched OS input/output
-    /// latch is pending. Automatic apply alone requires this; manual apply does
+    /// latch is pending. Automatic apply PREFERS this; manual apply does
     /// not use this policy.
     pub(crate) activity_quiet: bool,
+    /// The host's bounded window for preferring a quiet moment has elapsed for
+    /// this retained intent. Past it, activity no longer defers: the lossless
+    /// seamless lane applies while the machine is still busy rather than
+    /// leaving a verified build staged indefinitely.
+    pub(crate) activity_grace_expired: bool,
     pub(crate) staged_ready: bool,
     pub(crate) staged_build: Option<u64>,
     /// Exact build+DMG identity match between the retained intent and reducer stage.
@@ -89,7 +103,11 @@ pub(crate) enum WaitReason {
 pub(crate) enum PollDecision {
     Clear,
     Wait(WaitReason),
-    Attempt { build: u64 },
+    /// Apply this exact staged artifact now. `quiet` reports whether the
+    /// machine was actually idle: `false` means the bounded preference window
+    /// elapsed while it stayed busy, so the host must take the lane that does
+    /// not wait for — or let itself be revoked by — further activity.
+    Attempt { build: u64, quiet: bool },
 }
 
 /// Decide one event-loop poll. Every `Wait` retains the caller-owned intent.
@@ -104,7 +122,9 @@ pub(crate) fn poll(facts: PollFacts) -> PollDecision {
     if facts.work_active || facts.applying {
         return PollDecision::Wait(WaitReason::WorkActive);
     }
-    if !facts.activity_quiet {
+    // Prefer a quiet moment, but only until the host's grace window closes.
+    // Waiting past it is indistinguishable from never updating.
+    if !facts.activity_quiet && !facts.activity_grace_expired {
         return PollDecision::Wait(WaitReason::Activity);
     }
     let Some(staged_build) = facts.staged_build else {
@@ -115,6 +135,7 @@ pub(crate) fn poll(facts: PollFacts) -> PollDecision {
     }
     PollDecision::Attempt {
         build: staged_build,
+        quiet: facts.activity_quiet,
     }
 }
 
@@ -229,6 +250,7 @@ mod tests {
             work_active: true,
             applying: false,
             activity_quiet: true,
+            activity_grace_expired: false,
             staged_ready: false,
             staged_build: None,
             staged_exact_target: false,
@@ -254,7 +276,10 @@ mod tests {
                 staged_exact_target: true,
                 ..base
             }),
-            PollDecision::Attempt { build: 11 }
+            PollDecision::Attempt {
+                build: 11,
+                quiet: true
+            }
         );
         assert_eq!(
             poll(PollFacts {
@@ -266,6 +291,84 @@ mod tests {
             }),
             PollDecision::Wait(WaitReason::StagePending),
             "an intent never silently transfers to different bytes under one build"
+        );
+    }
+
+    /// THE REGRESSION THIS BOUND EXISTS FOR: a machine that is never idle used
+    /// to defer forever, so a verified staged build only ever landed when the
+    /// user gave up and clicked Install. Past the grace window the same facts
+    /// must attempt — and must report `quiet: false`, because the host has to
+    /// pick the lane that activity cannot revoke.
+    #[test]
+    fn a_never_quiet_machine_still_applies_once_the_grace_window_closes() {
+        let busy = PollFacts {
+            enabled: true,
+            deadline_ready: true,
+            current_build: 10,
+            target_build: 11,
+            work_active: false,
+            applying: false,
+            activity_quiet: false,
+            activity_grace_expired: false,
+            staged_ready: true,
+            staged_build: Some(11),
+            staged_exact_target: true,
+        };
+        assert_eq!(poll(busy), PollDecision::Wait(WaitReason::Activity));
+        assert_eq!(
+            poll(PollFacts {
+                activity_grace_expired: true,
+                ..busy
+            }),
+            PollDecision::Attempt {
+                build: 11,
+                quiet: false
+            }
+        );
+        // An expired window is not a licence to skip any OTHER gate: it relaxes
+        // the idleness preference and nothing else.
+        for stalled in [
+            PollFacts {
+                work_active: true,
+                ..busy
+            },
+            PollFacts {
+                applying: true,
+                ..busy
+            },
+            PollFacts {
+                staged_exact_target: false,
+                ..busy
+            },
+            PollFacts {
+                staged_build: None,
+                staged_ready: false,
+                ..busy
+            },
+            PollFacts {
+                deadline_ready: false,
+                ..busy
+            },
+        ] {
+            assert!(
+                matches!(
+                    poll(PollFacts {
+                        activity_grace_expired: true,
+                        ..stalled
+                    }),
+                    PollDecision::Wait(_)
+                ),
+                "the grace window only relaxes activity"
+            );
+        }
+        assert_eq!(
+            poll(PollFacts {
+                enabled: false,
+                activity_grace_expired: true,
+                ..busy
+            }),
+            PollDecision::Clear,
+            "an expired window never revives a disabled automatic lane"
         );
     }
 

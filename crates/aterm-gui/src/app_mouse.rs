@@ -58,6 +58,23 @@ pub(crate) fn press_starts_selection(tracking: bool, option_held: bool) -> bool 
     !tracking || option_held
 }
 
+/// How far outside the pet's drawn body (frame px, each side) a click still
+/// counts as petting. A cat is not a checkbox: the target moves, so a few
+/// pixels of grace keeps an honest aim from sliding off a paw mid-walk.
+pub(crate) const PET_HIT_SLOP_PX: i32 = 4;
+
+/// Whether a pointer at `(x, y)` (frame px) lands on the pet's drawn body
+/// `rect` (`(x0, x1, y0, y1)`, right/bottom exclusive), padded by `slop` on
+/// every side. Pure — the petting seam's hit test, unit-testable without a
+/// window.
+pub(crate) fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32) -> bool {
+    let (x0, x1, y0, y1) = rect;
+    x >= f64::from(x0.saturating_sub(slop))
+        && x < f64::from(x1.saturating_add(slop))
+        && y >= f64::from(y0.saturating_sub(slop))
+        && y < f64::from(y1.saturating_add(slop))
+}
+
 /// Audit M6: selection kind for a single left press. Option+drag is the rectangular
 /// [`SelectionType::Block`] ONLY when the press was local anyway (tracking OFF);
 /// while Option is doing the tracking-bypass job it selects normally (`Simple`) —
@@ -696,6 +713,48 @@ impl App {
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols);
         let (x, y) = self.window_to_frame(wid, x, y);
         strip_col_for_pixel(x, y, cw, ch, cols, self.tab_strip_rows, pad, pad_top, head)
+    }
+
+    /// PETTING THE PET (wave 1): if the last pointer position lands on the
+    /// pet's drawn body (the rect the redraw stashed post-tick, padded by
+    /// [`PET_HIT_SLOP_PX`]), stroke the cat and CONSUME the press. Returns
+    /// whether it did — the caller stops routing on `true`.
+    ///
+    /// POLICY: chrome wins, like the tab strip. The pet is host chrome you
+    /// can touch, not a cell you can select under: a press that pets never
+    /// starts a selection and is never encoded for a mouse-tracking app
+    /// (press/release stay symmetric — the swallowed press sets no reported
+    /// bit, so the matching release is dropped by the orphan-release guard).
+    ///
+    /// KNOWN CAVEAT, accepted: `last_cursor_px` can be STALE on the first
+    /// click after a tab switch (no `CursorMoved` has arrived on the new
+    /// layout yet), so that one click is judged against where the pointer
+    /// last was. The rect itself is fresh per frame.
+    fn pet_press_at(&mut self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let Some(rect) = ws.pet_hit_rect else {
+            return false;
+        };
+        let (px, py) = ws.last_cursor_px;
+        let (fx, fy) = self.window_to_frame(wid, px, py);
+        if !pet_rect_hit(rect, fx, fy, PET_HIT_SLOP_PX) {
+            return false;
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            // Latch only (`kitty_pet::note_petted` — note, never act); the
+            // redraw consumes it on the ground: a purr-flavored hold, a
+            // heart per queued pet, and contentment toward the real purr.
+            ws.cursor_pet.note_petted(Instant::now());
+            // The pet may be settled with the frame lane released — the
+            // latch re-arms `needs_frames`, but only a tick reads it, so
+            // ask for the frame that runs one.
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        true
     }
 
     /// Track which in-grid tab-strip tab the pointer is over, so the `✕` can be a
@@ -2294,6 +2353,15 @@ impl App {
                     return;
                 }
             }
+        }
+        // PETTING THE PET: a left press on the pet's drawn body strokes the
+        // cat and stops HERE — chrome-wins, like the tab strip above (see
+        // [`Self::pet_press_at`] for the policy and the tab-switch caveat).
+        // Below the modals, the strip and the find bar (all of which cover
+        // the pet), above the divider/pane-focus/selection/report layers
+        // (all of which the cat's body occludes).
+        if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
+            return;
         }
         // SPLIT-PANE DIVIDER DRAG: a left press ON a divider grabs it to resize the
         // split (and stops there — no focus change, no selection). Release ends the
@@ -4189,5 +4257,93 @@ mod tests {
             0,
             "the Left (selection) reported bit is cleared on settle"
         );
+    }
+
+    /// PETTING (wave 1): the hit test is pure and pads by the slop on every
+    /// side, with the body's own edges staying right/bottom-exclusive.
+    #[test]
+    fn pet_rect_hit_pads_by_the_slop_on_every_side() {
+        use super::{PET_HIT_SLOP_PX, pet_rect_hit};
+        let r = (10, 20, 30, 40);
+        assert!(pet_rect_hit(r, 10.0, 30.0, 0), "top-left corner is inside");
+        assert!(!pet_rect_hit(r, 20.0, 30.0, 0), "right edge is exclusive");
+        assert!(!pet_rect_hit(r, 10.0, 40.0, 0), "bottom edge is exclusive");
+        assert!(
+            pet_rect_hit(r, 6.0, 26.0, PET_HIT_SLOP_PX),
+            "the slop reaches out past the body"
+        );
+        assert!(
+            pet_rect_hit(r, 23.9, 43.9, PET_HIT_SLOP_PX),
+            "on every side"
+        );
+        assert!(
+            !pet_rect_hit(r, 5.9, 30.0, PET_HIT_SLOP_PX),
+            "and no further"
+        );
+    }
+
+    /// PETTING (wave 1), the chrome-wins policy end to end: a left press
+    /// inside the stashed pet rect strokes the cat and is CONSUMED — it
+    /// never starts a selection — while the same press outside the rect
+    /// still runs the ordinary selection gesture.
+    #[test]
+    fn a_click_on_the_pet_pets_and_never_starts_a_selection() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // Stash a drawn-pet rect the way the redraw does (frame px,
+        // right/bottom exclusive).
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((100, 200, 100, 160));
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        {
+            let ws = app.windows.get(&wid).unwrap();
+            assert_eq!(
+                ws.cursor_pet.pending_pets(),
+                1,
+                "the press latched a pet (note, never act)"
+            );
+            assert!(
+                !ws.selecting,
+                "and was consumed before the selection layer"
+            );
+        }
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            !app.windows.get(&wid).unwrap().selecting,
+            "the orphan release is dropped (press/release stay paired)"
+        );
+        // The control: the same gesture outside the padded rect selects.
+        app.on_cursor_moved(wid, 420.0, 300.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        {
+            let ws = app.windows.get(&wid).unwrap();
+            assert_eq!(
+                ws.cursor_pet.pending_pets(),
+                1,
+                "no second pet off the body"
+            );
+            assert!(ws.selecting, "a plain terminal press still selects");
+        }
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// PETTING (wave 1): a cleared stash (pet not drawn) can never eat a
+    /// click — the guard for stale rects after a style switch or fade-out.
+    #[test]
+    fn no_rect_no_pet_the_click_falls_through() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(app.windows.get(&wid).unwrap().pet_hit_rect, None);
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        let ws = app.windows.get(&wid).unwrap();
+        assert_eq!(ws.cursor_pet.pending_pets(), 0, "nothing to pet");
+        assert!(ws.selecting, "the press reached the selection layer");
     }
 }

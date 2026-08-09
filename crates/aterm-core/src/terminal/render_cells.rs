@@ -850,8 +850,21 @@ impl Terminal {
         // with the live foreground under DECSCNM. A dynamic cursor (OSC 21
         // `cursor=`) follows the live OSC 10 foreground.
         let reverse_video = self.modes().reverse_video();
+        // ONE blank cell feeds BOTH stamps, so whenever both fire they are
+        // coherent by construction: `implicit_blank_render_cell` runs
+        // `Cell::EMPTY` through `resolve_colors(.., reverse_video)`, and
+        // DECSCNM swaps the pair together. But the two AUTHORITY tests are
+        // SEPARATE, and must be.
+        //
+        // Folding the foreground's authority into the background's gate is a
+        // real regression (found in review): a terminal configured with OSC 10
+        // ALONE would then stamp its VT-spec black as an authoritative
+        // background, and the renderer's host-theme fallback for the padding
+        // band and base clear would be lost on a frame where OSC 11 was never
+        // sent. Each half answers only for itself; DECSCNM arms both because it
+        // genuinely makes both authoritative.
+        let implicit_blank = self.implicit_blank_render_cell();
         if self.color.frame_background_authoritative || reverse_video {
-            let implicit_blank = self.implicit_blank_render_cell();
             scratch.default_bg = (u32::from(implicit_blank.bg[0]) << 16)
                 | (u32::from(implicit_blank.bg[1]) << 8)
                 | u32::from(implicit_blank.bg[2]);
@@ -861,6 +874,13 @@ impl Terminal {
             // a host theme decision. Any host/OSC background or DECSCNM state
             // above makes the terminal authoritative.
             scratch.default_bg = crate::render::COLOR_UNSET;
+        }
+        if self.color.frame_foreground_authoritative || reverse_video {
+            scratch.default_fg = (u32::from(implicit_blank.fg[0]) << 16)
+                | (u32::from(implicit_blank.fg[1]) << 8)
+                | u32::from(implicit_blank.fg[2]);
+        } else {
+            scratch.default_fg = crate::render::COLOR_UNSET;
         }
         if self.color.frame_cursor_authoritative
             || (self.color.cursor_color.is_none() && self.color.frame_foreground_authoritative)

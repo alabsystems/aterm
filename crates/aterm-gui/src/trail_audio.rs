@@ -862,6 +862,16 @@ pub struct TrailAudio {
     dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(target_os = "macos")]
     worker: Option<std::thread::JoinHandle<()>>,
+    /// TEST-ONLY cue tap: `Some` makes this host report itself LIVE (so the
+    /// policies that gate on a reachable device — `App::tone_infer_active`,
+    /// `keystroke_click_audible` — behave exactly as they do on a real Mac)
+    /// and records every pushed [`SoundEvent`] instead of queueing it to a
+    /// worker. It exists so a test can assert what the render seams actually
+    /// HANDED the audio host, rather than re-deriving the event and grading
+    /// its own arithmetic. Platform-independent by construction: the seam
+    /// under test is host-side policy, not CoreAudio.
+    #[cfg(test)]
+    capture: Option<Vec<SoundEvent>>,
 }
 
 impl TrailAudio {
@@ -882,6 +892,8 @@ impl TrailAudio {
                     state,
                     dropped,
                     worker: None,
+                    #[cfg(test)]
+                    capture: None,
                 };
             }
             let (tx, rx) = cue_channel();
@@ -901,13 +913,33 @@ impl TrailAudio {
                 state,
                 dropped,
                 worker,
+                #[cfg(test)]
+                capture: None,
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = active;
-            Self {}
+            Self {
+                #[cfg(test)]
+                capture: None,
+            }
         }
+    }
+
+    /// A TEST host that reports LIVE and records every cue (see the `capture`
+    /// field). Never reachable from a shipping build.
+    #[cfg(test)]
+    pub(crate) fn capturing_for_test() -> Self {
+        let mut host = Self::new(false);
+        host.capture = Some(Vec::new());
+        host
+    }
+
+    /// Take the cues recorded since the last call (test-only).
+    #[cfg(test)]
+    pub(crate) fn take_captured_for_test(&mut self) -> Vec<SoundEvent> {
+        self.capture.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
     /// Replace the complete audio host with a freshly resolved active/inert one.
@@ -922,6 +954,11 @@ impl TrailAudio {
     /// Queue one cue without blocking the input/present thread. Full means this
     /// nonessential sound is dropped; disconnected permanently disables ingress.
     pub fn push(&mut self, ev: SoundEvent) {
+        #[cfg(test)]
+        if let Some(captured) = self.capture.as_mut() {
+            captured.push(ev);
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(disposition) = self
             .tx
@@ -944,6 +981,10 @@ impl TrailAudio {
     /// whose sound can only be silence (the "never runs headless-muted"
     /// policy).
     pub fn is_live(&self) -> bool {
+        #[cfg(test)]
+        if self.capture.is_some() {
+            return true;
+        }
         #[cfg(target_os = "macos")]
         {
             self.tx.is_some()
@@ -956,6 +997,12 @@ impl TrailAudio {
 
     #[cfg(test)]
     pub(crate) fn is_inert_for_test(&self) -> bool {
+        // A capturing host accepts cues, so it is NOT inert — keeping this the
+        // exact complement of `is_live` stops the two test predicates from
+        // disagreeing about the same host.
+        if self.capture.is_some() {
+            return false;
+        }
         #[cfg(target_os = "macos")]
         {
             self.tx.is_none() && self.worker.is_none()
@@ -984,6 +1031,9 @@ impl TrailAudio {
                 state: Arc::new(AtomicU8::new(STATE_DORMANT)),
                 dropped: Arc::new(AtomicU64::new(0)),
                 worker: None,
+                // A REAL channel under test: this fixture proves the enqueue
+                // path itself, so it must not divert into the capture tap.
+                capture: None,
             },
             rx,
         )

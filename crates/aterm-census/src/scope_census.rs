@@ -292,21 +292,11 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
 ];
 
 /// Registered standing findings — re-detected and REPRINTED on every run
-/// (OB-18), never silenced.
-const SCOPE_STANDING_FINDINGS: &[StandingScopeFinding] = &[StandingScopeFinding {
-    claim: "supernova-burst-mutex",
-    obligation: "OB-15",
-    detail: "self.parked",
-    finding: "`super_prepass` derives `busy` / `super_until` from `self.persist` ALONE \
-        (`for ep in self.persist.values()`); `self.parked` is read only in the \
-        bind/unbind/prune paths. So the mutex is enforced PER BOUND PANE: two panes each \
-        roll a supernova, both are admitted by the shared limiter (disjoint regions, 2/s \
-        legal), both windows are live for SUPER_TOTAL_MS = 2400 — falsifying both the \
-        'ONE live supernova, window-wide' claim and the MAX_NOVA_QUADS derivation. \
-        REPAIR: make the scan cover `self.persist` PLUS \
-        `self.parked.values().flat_map(|p| p.persist.values())`, then delete this entry \
-        (OB-18 goes stale-RED if you fix it and leave it).",
-}];
+/// (OB-18), never silenced. EMPTY since 2026-08-08: the supernova-burst-mutex
+/// aggregator finding closed when `super_prepass`'s busy scan grew the
+/// `self.parked` shard chain (the exact repair the finding prescribed) — the
+/// celebration path. The regression test below keeps the check honest.
+const SCOPE_STANDING_FINDINGS: &[StandingScopeFinding] = &[];
 
 /// Phrases that assert a scope WIDER than the declaration they sit on. Using
 /// one is a CLAIM, and a claim is an obligation — that is the whole lesson of
@@ -1528,41 +1518,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// OB-15/OB-18 both ways: the registered finding must reproduce on the real
-    /// tree, and must go stale-RED the moment the code is repaired.
+    /// OB-15 both ways, post-celebration: the repaired aggregator passes clean
+    /// on the real tree, and REGRESSING it (dropping the parked-shard chain)
+    /// goes RED immediately — with no standing finding left to excuse it.
     #[test]
-    fn the_supernova_aggregator_standing_finding_is_re_detected() {
+    fn the_supernova_aggregator_regression_goes_red() {
         let root = copy_root("supernova-standing", &all_claim_files());
 
         let out = run_scope_census_over(&root, SCOPE_CLAIMS, SCOPE_STANDING_FINDINGS);
         assert!(
             out.ok,
-            "a registered standing finding is reported, not build-blocking:\n{}",
+            "the repaired aggregator must pass with zero findings:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("STANDING FINDING [OB-15]") && out.log.contains("self.parked"),
-            "the finding must be re-detected and reprinted in full:\n{}",
+            !out.log.contains("STANDING FINDING"),
+            "no standing finding may remain registered for a repaired scan:\n{}",
             out.log
         );
 
-        // Repair the aggregator: the scan now covers the parked shards too.
+        // Regress the aggregator: drop the parked-shard chain from the scan.
         mutate(
             &root,
             "crates/aterm-effects/src/word_decorations.rs",
-            "        for ep in self.persist.values() {",
             "        for ep in self\n            .persist\n            .values()\n            \
              .chain(self.parked.values().flat_map(|p| p.persist.values()))\n        {",
+            "        for ep in self.persist.values() {",
         );
         let out = run_scope_census_over(&root, SCOPE_CLAIMS, SCOPE_STANDING_FINDINGS);
         assert!(
             !out.ok,
-            "a FIXED standing finding must go stale-RED so the entry is deleted:\n{}",
+            "a per-bound-pane scan must fail OB-15 outright now:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("[OB-18]") && out.log.contains("NOT re-detected"),
-            "the stale-RED must say the finding stopped reproducing:\n{}",
+            out.log.contains("[OB-15]") && out.log.contains("self.parked"),
+            "the failure must name the missing shard read:\n{}",
             out.log
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1570,12 +1561,12 @@ mod tests {
 
     /// The live-root smoke test: the shipping registry over the real checkout.
     #[test]
-    fn real_tree_scope_census_is_green_with_one_standing_finding() {
+    fn real_tree_scope_census_is_green_with_no_standing_findings() {
         let out = run_scope_census(&repo_root());
         assert!(out.ok, "the live tree must be GREEN:\n{}", out.log);
         assert!(
-            out.log.contains("STANDING FINDING [OB-15]"),
-            "the supernova aggregator finding must still be reported:\n{}",
+            !out.log.contains("STANDING FINDING"),
+            "the supernova aggregator finding closed on 2026-08-08; nothing may reprint:\n{}",
             out.log
         );
     }

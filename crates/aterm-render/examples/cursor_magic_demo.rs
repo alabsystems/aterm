@@ -40,6 +40,9 @@ fn config(style: GlowStyle, theme: Theme) -> GlowConfig {
         radius: 0.34,
         ring: false,
         dark_theme: true,
+        // This helper already takes a `Theme` and derives `color` from it.
+        theme_fg: theme.fg & 0x00ff_ffff,
+        theme_bg: theme.bg & 0x00ff_ffff,
         beam: false,
         head_dx: 0.5,
         pack: None,
