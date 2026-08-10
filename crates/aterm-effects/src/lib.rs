@@ -56,6 +56,10 @@ mod effect_util;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
+/// THE TYPED-KITTY CAMEO — the standalone toy that appears where you typed the
+/// word. Deliberately not the cursor escort ([`kitty_cursor`]): owner, 2026-08-09,
+/// "when I type 'kitty' … I want THE kitty to appear".
+pub mod kitty_cameo;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
 /// trail style — its art, pose, and exit choreography.
 pub mod kitty_cursor;

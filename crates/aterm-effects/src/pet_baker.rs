@@ -801,7 +801,14 @@ mod tests {
                         [246, 246, 240]
                     };
                     let mut out = format!("P6 {w} {h} 255\n").into_bytes();
-                    for c in px.chunks_exact(4) {
+                    // `as_chunks::<4>()` over `chunks_exact(4)`: the pixel is
+                    // RGBA and the const generic says so in the TYPE, so `c[3]`
+                    // below is a proven-in-bounds field read rather than an
+                    // index into a slice whose length the compiler only knows
+                    // at run time. The `.1` remainder is empty by construction
+                    // (a tile's buffer is 4 bytes per pixel) and dropping it
+                    // keeps the old loop's exact behaviour.
+                    for c in px.as_chunks::<4>().0 {
                         let a = c[3] as u32;
                         for i in 0..3 {
                             out.push(((c[i] as u32 * a + bg[i] as u32 * (255 - a)) / 255) as u8);

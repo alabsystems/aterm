@@ -431,6 +431,10 @@ impl PaletteState {
                     row.checked = Some(live.session_kitty_favourited);
                     row.enabled = live.terminal_front;
                 }
+                // The pin is SESSION metadata, so a native whole tab has nothing
+                // to rename: the row disables (and the invoke fence refuses)
+                // instead of opening an editor over a surface with no session.
+                MenuAction::RenameSession => row.enabled = live.terminal_front,
                 MenuAction::Copy => row.enabled = live.has_selection,
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
                 MenuAction::ReopenClosedTab => row.enabled = live.can_reopen_closed_tab,

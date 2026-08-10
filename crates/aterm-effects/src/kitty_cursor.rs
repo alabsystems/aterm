@@ -1041,9 +1041,16 @@ impl CursorCat {
         }
     }
 
-    /// The airborne hover-bob (fraction of cell height) at `now`, plus the
-    /// feline-delight LEAP when one is live.
-    fn bob(&self, now: Instant) -> f32 {
+    /// The airborne hover-bob, as a fraction of cell height.
+    ///
+    /// Takes NO time argument, and that is the point: since the feline-delight
+    /// leap left the companion (see the note below) the hover is a pure read of
+    /// the STRIDE PUMP, and the pump is advanced by keystrokes in
+    /// [`Self::stride_advance`], not by the wall clock. A `now` parameter
+    /// survived the leap's removal and sat unread — prose that promised a
+    /// time-varying value the body could not deliver. Reading `self.stride`
+    /// alone makes the keystroke-driven dependency the signature's only claim.
+    fn bob(&self) -> f32 {
         // The HOVER rides the STRIDE PUMP rather than a wall clock, so the cat
         // steps in time with your keys: it gallops under a fast run and eases
         // through its step during a pause. A resting cat's drift rate is the
@@ -1078,11 +1085,6 @@ impl CursorCat {
         let elapsed = now.saturating_duration_since(t0).as_secs_f32();
         (elapsed / DELIGHT_HOLD).clamp(0.0, 1.0)
     }
-
-    /// The hop's height at `now` as a positive fraction of cell height: a half
-    /// sine over the hold, so the cat rises, hangs, and lands smoothly back on
-    /// its anchor. Scaled by the bounded phrase chain — a second `kitty`
-    /// inside the window hops higher than the first.
 
     /// Advance the eased "display momentum" spine toward `target` (the live
     /// score). An exponential follower with `DISP_TAU`: it LAGS the raw momentum,
@@ -1508,7 +1510,7 @@ impl CursorCat {
         let now = self.collection_sample_time(now);
         let s = self.decayed(now);
         let bob = {
-            let cruise = self.bob(now);
+            let cruise = self.bob();
             if self.sing > 0.0 {
                 // DANCE BOB, drive-blended over the cruise hover: rides the
                 // shared beat clock (2.5 Hz at the sing-along's 150 BPM vs

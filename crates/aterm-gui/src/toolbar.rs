@@ -109,8 +109,9 @@
 pub(crate) use macos::native_strip_container;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    ToolbarHandle, install_window_toolbar, read_tab_chrome, read_tab_menus, set_active_tab_color,
-    set_strip_dark, set_update_available, set_window_tabs,
+    ToolbarHandle, begin_tab_rename, end_tab_rename, install_window_toolbar, read_tab_chrome,
+    read_tab_menus, rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_dark,
+    set_update_available, set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -854,8 +855,8 @@ mod macos {
     use std::cell::{Cell, RefCell};
 
     use objc2::rc::Retained;
-    use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-    use objc2::{ClassType, DeclaredClass, declare_class, msg_send_id, mutability, sel};
+    use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
+    use objc2::{ClassType, DeclaredClass, declare_class, msg_send, msg_send_id, mutability, sel};
     use objc2_app_kit::{
         NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSAutoresizingMaskOptions,
         NSBezierPath, NSButton, NSCellImagePosition, NSColor, NSEvent, NSEventModifierFlags,
@@ -951,6 +952,11 @@ mod macos {
     /// edge to separate it from the chip before it. Shorter than the pill on purpose:
     /// it should divide two titles, not draw a box around each.
     const TAB_RULE_HEIGHT: f64 = 14.0;
+
+    /// Width cap (points) of the inline rename editor in the SOLO band. The solo
+    /// cell spans the whole window, and a full-width field in the titlebar reads
+    /// as a dialog rather than as editing the name in place.
+    const SOLO_EDITOR_WIDTH: f64 = 280.0;
 
     /// Gap (points) between the SOLO title and its description, and the minimum clear
     /// space kept at each end of the solo band before the title group is compressed.
@@ -1172,6 +1178,35 @@ mod macos {
         /// sit left of it is RETIRED — the update affordance lives in the VERSION menu
         /// now; see `crate::menu::update_version_menu`.)
         plus: Retained<ChromeButton>,
+        /// winit's content `NSView` — the app's permanent first responder. Retained
+        /// at install so [`end_tab_rename`] can hand key focus BACK to the terminal
+        /// deterministically; asking the container for `window().contentView()` later
+        /// is wrong in native fullscreen, where AppKit re-hosts the toolbar in a
+        /// SEPARATE auxiliary window.
+        content_view: Retained<NSView>,
+        /// The live INLINE SESSION-RENAME editor, or `None`. Owned by the HANDLE, not
+        /// by a tab chip: [`set_window_tabs`]'s rebuild path destroys every chip (and
+        /// every chip subview) whenever the tab count or the container width changes,
+        /// which a background session exiting or any window resize causes — mid-edit,
+        /// with no user action. Living beside the chips, the field is repositioned
+        /// across a rebuild instead of dying in one.
+        rename: RefCell<Option<RenameEditor>>,
+    }
+
+    /// The live inline rename editor: an `NSTextField` overlaying one tab chip,
+    /// plus the small relay object AppKit calls back on.
+    struct RenameEditor {
+        /// The editable field. Its `stringValue` is the ONLY home of the in-progress
+        /// text — nothing else needs saving across a strip rebuild.
+        field: Retained<NSTextField>,
+        /// The delegate/relay. Retained here because AppKit holds a delegate weakly.
+        target: Retained<TabRenameTarget>,
+        /// The STABLE id of the tab the editor is painted over — POSITIONING ONLY.
+        /// It follows a reorder and, when it stops resolving, tells the strip the
+        /// edited tab is gone (a cancel, never a commit: the user was renaming
+        /// something that no longer exists). The COMMIT target is the session id
+        /// the relay carries, resolved by `App` at begin.
+        tab: TabId,
     }
 
     /// The live custom-view subtree AppKit places in the unified titlebar.
@@ -1786,6 +1821,31 @@ mod macos {
                     self.show_context_menu(event);
                     return;
                 }
+                // A DOUBLE-click renames the tab's focused session in place. AppKit
+                // has already applied the system double-click interval and movement
+                // slop, so the count IS the whole gesture test — no timer, no
+                // per-chip click FSM. Placed after the ctrl guard (a ctrl
+                // double-click stays "context menu") and before the drag seed:
+                // latching `dragged` makes `mouseDragged:` short-circuit, so a hand
+                // wobble during the double-click cannot also post a reorder — which
+                // would re-stamp every chip's identity under the opening editor. The
+                // first press already posted its `SelectTab`, so this posts no
+                // second selection. `== 2`, not `>= 2`: further clicks land on the
+                // field once it exists, and an early one is harmless because
+                // `begin_session_rename` is idempotent for the same session.
+                // SAFETY: `clickCount` is a side-effect-free getter on the live
+                // event, on the main thread.
+                if unsafe { event.clickCount() } == 2 {
+                    let ivars = self.ivars();
+                    ivars.dragged.set(true);
+                    let _ = ivars.proxy.send_event(Wake::BeginSessionRename {
+                        window: ivars.window,
+                        // Captured NOW: an editor lives for seconds, and the diff
+                        // path re-stamps this chip's live id per POSITION.
+                        tab: ivars.tab_id.get(),
+                    });
+                    return;
+                }
                 let ivars = self.ivars();
                 // SAFETY: `locationInWindow` + `convertPoint_fromView` are
                 // side-effect-free getters on the main thread; `None` source view means
@@ -2284,6 +2344,34 @@ mod macos {
             self.mark_dirty();
         }
 
+        /// Where the INLINE RENAME editor sits for this chip, in the CONTAINER's
+        /// coordinates (the editor is a sibling of the chips, not a subview of
+        /// one — chips are destroyed on every strip rebuild).
+        ///
+        /// Tabbed: exactly the pill `drawRect:` fills, so the field lands on the
+        /// chip it replaces. Solo: the band is the whole window width, so a
+        /// full-width field would read as a dialog — the box is capped and
+        /// centred on the same measured centre the solo title group uses.
+        fn editor_frame(&self) -> NSRect {
+            let ivars = self.ivars();
+            let frame = self.frame();
+            let y = frame.origin.y + ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5;
+            if ivars.solo.get() {
+                let width = frame.size.width.min(SOLO_EDITOR_WIDTH);
+                let center = frame.origin.x + ivars.solo_center_x.get();
+                let x = (center - width * 0.5)
+                    .max(frame.origin.x)
+                    .min(frame.origin.x + frame.size.width - width);
+                return CGRect::new(CGPoint::new(x, y), CGSize::new(width, TAB_PILL_HEIGHT));
+            }
+            CGRect::new(
+                CGPoint::new(frame.origin.x + TAB_PILL_INSET_X, y),
+                CGSize::new(
+                    (frame.size.width - 2.0 * TAB_PILL_INSET_X).max(1.0),
+                    TAB_PILL_HEIGHT,
+                ),
+            )
+        }
         /// SOLO layout: the window's only tab reads as its TITLE — `title` in the
         /// primary ink beside its description in the secondary, centred as ONE group on
         /// the window's centre line, with the app icon leading and the status canvas
@@ -2512,6 +2600,15 @@ mod macos {
         /// the whole point of splitting the two.
         fn set_tab_id(&self, id: TabId) {
             self.ivars().tab_id.set(id);
+        }
+
+        /// The STABLE tab identity this chip currently displays. Read only where a
+        /// gesture CAPTURES identity at its own start (the context menu's
+        /// `menu_tab` snapshot, the rename editor's install) — never re-read to
+        /// resolve a gesture already in flight, because the diff path re-stamps
+        /// this per POSITION and would hand back the tab that slid into the slot.
+        fn tab_id(&self) -> TabId {
+            self.ivars().tab_id.get()
         }
 
         /// Build + pop this tab's native CONTEXT MENU at the pointer from the
@@ -3014,6 +3111,8 @@ mod macos {
             window: wid,
             tabs: RefCell::new(Vec::new()),
             plus,
+            content_view: view.retain(),
+            rename: RefCell::new(None),
         })
     }
 
@@ -3168,10 +3267,15 @@ mod macos {
             // A transient no-tab window retains only New Tab. Every real tab count,
             // including one, gets a visible identity chip.
             // SAFETY: `removeFromSuperview` is a main-thread mutator.
-            let mut tabs = handle.tabs.borrow_mut();
-            for old in tabs.drain(..) {
-                unsafe { old.removeFromSuperview() };
+            {
+                let mut tabs = handle.tabs.borrow_mut();
+                for old in tabs.drain(..) {
+                    unsafe { old.removeFromSuperview() };
+                }
             }
+            // An editor must not be left floating over an empty strip: with no
+            // chips there is no tab to be editing, so this cancels.
+            sync_rename_overlay(handle, &[]);
             return;
         }
 
@@ -3241,6 +3345,8 @@ mod macos {
                     tab.set_chrome_ext(ext_at(i));
                     tab.set_active(i == active);
                 }
+                drop(tabs);
+                sync_rename_overlay(handle, ids);
                 return;
             }
         }
@@ -3280,6 +3386,11 @@ mod macos {
             new_tabs.push(tab);
         }
         *handle.tabs.borrow_mut() = new_tabs;
+        // The chips were just appended, i.e. ON TOP: a live editor is re-framed
+        // over its (possibly moved) chip and re-raised above them here, or
+        // cancelled if its tab is gone. Never removed — the field's own
+        // `stringValue` is the only home of the in-progress text.
+        sync_rename_overlay(handle, ids);
     }
 
     /// Read the title chrome's complete introspection line for the `chrome` verb, or
@@ -3328,4 +3439,410 @@ mod macos {
     /// `Apprt::set_toolbar_update_available` seam — owned by concurrent work in
     /// `platform.rs` — keeps one uniform signature; remove them together.
     pub fn set_update_available(_handle: &ToolbarHandle, _available: bool) {}
+
+    /// The mutable state the rename relay needs at callback time.
+    pub(crate) struct RenameIvars {
+        /// The `Wake` channel every outcome relays through.
+        proxy: EventLoopProxy<Wake>,
+        /// The window whose strip owns the editor.
+        window: WindowId,
+        /// The session being renamed — captured by `App` at begin from the tab's
+        /// FOCUSED pane, and carried verbatim so the commit `App` finally applies
+        /// is validated against the identity the edit started on.
+        session: u64,
+        /// Byte cap for the edited field, enforced LIVE (see `controlTextDidChange:`).
+        cap: usize,
+        /// Escape was pressed — the next end-of-editing is a CANCEL, not a commit.
+        cancelled: Cell<bool>,
+        /// This editor has already reported its outcome. AppKit can end editing more
+        /// than once around a teardown (abort, resign, remove-from-superview), and the
+        /// strip also ends it deliberately when the edited tab disappears; the latch
+        /// makes "exactly one Commit or Cancel per editor" structural.
+        done: Cell<bool>,
+    }
+
+    declare_class!(
+        /// The inline rename field's delegate: a pure relay from AppKit's text-field
+        /// editing callbacks into the typed `Wake` channel, in the shape of
+        /// `MenuTarget`. It owns no rename policy — `App` resolves the session,
+        /// validates, and writes.
+        pub(crate) struct TabRenameTarget;
+
+        // SAFETY:
+        // - NSObject imposes no subclassing requirements.
+        // - InteriorMutable matches the `Cell` latches, mutated only on the main
+        //   thread from AppKit callbacks.
+        // - TabRenameTarget has no Drop impl beyond the auto-generated ivar drop.
+        unsafe impl ClassType for TabRenameTarget {
+            type Super = objc2::runtime::NSObject;
+            type Mutability = mutability::InteriorMutable;
+            const NAME: &'static str = "ATermTabRenameTarget";
+        }
+
+        impl DeclaredClass for TabRenameTarget {
+            type Ivars = RenameIvars;
+        }
+
+        unsafe impl NSObjectProtocol for TabRenameTarget {}
+
+        unsafe impl TabRenameTarget {
+            /// `controlTextDidChange:` — canonicalize as the user types.
+            ///
+            /// The field is held in the SAME representation the store accepts:
+            /// forbidden formatting (control/bidi/invisible) is dropped and the
+            /// value is clamped to the field's byte cap on a GRAPHEME boundary. The
+            /// wire refuses those inputs instead, because a script must learn its
+            /// label was rejected; a human typing gets the ordinary macOS
+            /// length-limited-field behaviour — the field simply stops taking more,
+            /// which IS the visible refusal. The consequence is that what the user
+            /// sees is exactly what gets stored, with no rejection dialog and no
+            /// divergence between the stored value and the recorded event.
+            #[method(controlTextDidChange:)]
+            #[allow(non_snake_case)]
+            fn controlTextDidChange(&self, notification: &AnyObject) {
+                // SAFETY: `object` on the live NSNotification AppKit passed; the
+                // sender of this notification is always the edited NSControl.
+                let field: *mut AnyObject = unsafe { msg_send![notification, object] };
+                if field.is_null() {
+                    return;
+                }
+                // SAFETY: the notification's object IS the NSTextField we installed.
+                let field: &NSTextField = unsafe { &*field.cast::<NSTextField>() };
+                // SAFETY: plain main-thread value getter/setter on that field.
+                let current = unsafe { field.stringValue() }.to_string();
+                let canonical = crate::session_timeline::sanitize_presentation_line(
+                    &current,
+                    self.ivars().cap,
+                );
+                // Compare before writing: `setStringValue:` while editing resets the
+                // insertion point, so it must run ONLY when something real changed.
+                // The canonical form is trimmed, so compare against the trimmed
+                // input — otherwise a space typed mid-word would yank the caret.
+                // Edge whitespace is trimmed at commit anyway.
+                if current.trim() != canonical {
+                    unsafe { field.setStringValue(&NSString::from_str(&canonical)) };
+                }
+            }
+
+            /// `control:textView:doCommandBySelector:` — ESCAPE is the only key this
+            /// intercepts. It latches a cancel and aborts the edit, which restores the
+            /// field's original value and ends editing; the single exit below then
+            /// reports the cancel. Every other command (Return, Tab, motion, deletion)
+            /// is left to the field editor, so IME composition, undo, selection and
+            /// the emoji picker behave exactly as in any native field.
+            ///
+            /// Escape during an IME composition never reaches here — the input method
+            /// consumes it to cancel the composition, which is correct: the FIRST
+            /// Escape ends the composition, the second cancels the rename.
+            #[method(control:textView:doCommandBySelector:)]
+            #[allow(non_snake_case)]
+            fn control_textView_doCommandBySelector(
+                &self,
+                control: &AnyObject,
+                _text_view: &AnyObject,
+                command: Sel,
+            ) -> objc2::runtime::Bool {
+                if command != sel!(cancelOperation:) {
+                    return objc2::runtime::Bool::NO;
+                }
+                let ivars = self.ivars();
+                ivars.cancelled.set(true);
+                // Drive the cancel from HERE rather than through
+                // `controlTextDidEndEditing:`. `abortEditing` nils the field
+                // editor's delegate before it ends editing, so it does NOT
+                // deliver that notification (verified against AppKit, not
+                // assumed) — relying on it left the dead field painted over the
+                // chip, the edit state set forever, and the window's first
+                // responder dropped to the NSWindow, which silently kills every
+                // keystroke in that window. Latch `done` so a late notification
+                // from any other path is ignored, then let `App`'s cancel run
+                // the ONE teardown that also restores the responder.
+                if !ivars.done.replace(true) {
+                    let _ = ivars.proxy.send_event(Wake::CancelSessionRename {
+                        window: ivars.window,
+                        session: ivars.session,
+                    });
+                }
+                let _ = control;
+                objc2::runtime::Bool::YES
+            }
+
+            /// `controlTextDidEndEditing:` — the COMMIT exit. Return, Tab and a
+            /// click away all commit (the Finder/Xcode convention: leaving a field
+            /// keeps what you typed). Escape does NOT arrive here: `abortEditing`
+            /// suppresses this notification, so the cancel is posted directly by
+            /// the selector handler above and this guard's `done` latch only has
+            /// to make a late duplicate harmless. `App` re-validates
+            /// the session before writing, so a late notification cannot land on the
+            /// wrong session even though this fires from inside AppKit's teardown.
+            #[method(controlTextDidEndEditing:)]
+            #[allow(non_snake_case)]
+            fn controlTextDidEndEditing(&self, notification: &AnyObject) {
+                if self.ivars().done.replace(true) {
+                    return;
+                }
+                let ivars = self.ivars();
+                if ivars.cancelled.get() {
+                    let _ = ivars.proxy.send_event(Wake::CancelSessionRename {
+                        window: ivars.window,
+                        session: ivars.session,
+                    });
+                    return;
+                }
+                // SAFETY: `object` on the live NSNotification; the sender is the
+                // edited NSControl, whose `stringValue` is a plain getter.
+                let text = unsafe {
+                    let field: *mut AnyObject = msg_send![notification, object];
+                    if field.is_null() {
+                        String::new()
+                    } else {
+                        (*field.cast::<NSTextField>()).stringValue().to_string()
+                    }
+                };
+                let _ = ivars.proxy.send_event(Wake::CommitSessionRename {
+                    window: ivars.window,
+                    session: ivars.session,
+                    text,
+                });
+            }
+        }
+    );
+
+    impl TabRenameTarget {
+        fn build(
+            mtm: MainThreadMarker,
+            proxy: EventLoopProxy<Wake>,
+            window: WindowId,
+            session: u64,
+            cap: usize,
+        ) -> Retained<Self> {
+            let this = mtm.alloc().set_ivars(RenameIvars {
+                proxy,
+                window,
+                session,
+                cap,
+                cancelled: Cell::new(false),
+                done: Cell::new(false),
+            });
+            // SAFETY: `init` is NSObject's designated initializer.
+            unsafe { msg_send_id![super(this), init] }
+        }
+    }
+
+    /// Open the INLINE SESSION-RENAME editor over the chip carrying `tab`.
+    ///
+    /// The field is a sibling of the chips (a direct subview of the strip
+    /// container), because chips are torn down and rebuilt by ordinary background
+    /// events — see [`ToolbarHandle::rename`]. `seed` is the CURRENT PIN, not the
+    /// chip's text: the chip shows a composed, ⌘-hint-decorated label, and
+    /// seeding from it would let the first Return pin an OSC-derived string as if
+    /// the user had typed it. `placeholder` is the label the ladder falls back to,
+    /// so an empty field visibly says what clearing the pin will show.
+    ///
+    /// Returns whether an editor is on screen; `App` refuses to hold edit state
+    /// nothing is presenting (an invisible modal mode that swallows commands).
+    pub fn begin_tab_rename(
+        handle: &ToolbarHandle,
+        tab: TabId,
+        session: u64,
+        seed: &str,
+        placeholder: &str,
+    ) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        // Replacing a live editor: end the old one first so AppKit never holds two
+        // field editors and the abandoned relay cannot post a late outcome.
+        end_tab_rename(handle);
+        let frame = {
+            let tabs = handle.tabs.borrow();
+            let Some(chip) = tabs.iter().find(|t| t.tab_id() == tab) else {
+                return false;
+            };
+            chip.editor_frame()
+        };
+        let target = TabRenameTarget::build(
+            mtm,
+            handle.proxy.clone(),
+            handle.window,
+            session,
+            crate::session_timeline::MetaField::Title.cap(),
+        );
+        // SAFETY: `textFieldWithString:` is the documented non-raising factory; the
+        // rest are plain setters on the fresh field, all on the main thread. The
+        // delegate is installed with a raw `setDelegate:` because AppKit resolves
+        // delegate callbacks by `respondsToSelector:` and the typed setter would
+        // demand a formal `NSTextFieldDelegate` conformance for two optional
+        // methods, one of which is not surfaced at this binding feature set.
+        let field = unsafe {
+            let field = NSTextField::textFieldWithString(&NSString::from_str(seed), mtm);
+            field.setFrame(frame);
+            field.setEditable(true);
+            field.setSelectable(true);
+            field.setBezeled(true);
+            field.setDrawsBackground(true);
+            field.setUsesSingleLineMode(true);
+            field.setAlignment(NSTextAlignment::Left);
+            // Match the chip's own label metrics so the text does not jump size
+            // between editing and committed states.
+            field.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+            if !placeholder.is_empty() {
+                field.setPlaceholderString(Some(&NSString::from_str(placeholder)));
+            }
+            let target_obj: &AnyObject = &target;
+            let _: () = msg_send![&*field, setDelegate: target_obj];
+            handle.container.addSubview_positioned_relativeTo(
+                &field,
+                objc2_app_kit::NSWindowOrderingMode::NSWindowAbove,
+                None,
+            );
+            field
+        };
+        // Key focus: AppKit installs the window's shared field editor with this
+        // field as its owner. The FIELD's window is resolved from the container,
+        // never assumed to be winit's — in native fullscreen the toolbar lives in
+        // a separate auxiliary window.
+        let focused = handle.container.window().is_some_and(|w| {
+            let responder: &objc2_app_kit::NSResponder = &field;
+            w.makeFirstResponder(Some(responder))
+        });
+        if !focused {
+            // SAFETY: main-thread teardown of the field we just added.
+            unsafe { field.removeFromSuperview() };
+            return false;
+        }
+        // SAFETY: `selectText:` is a main-thread NSTextField method; selecting all
+        // makes the first keystroke replace the old pin, as a rename should.
+        unsafe { field.selectText(None) };
+        *handle.rename.borrow_mut() = Some(RenameEditor { field, target, tab });
+        true
+    }
+
+    /// Remove the inline rename editor and hand key focus back to the terminal.
+    /// Idempotent. Latches the relay's `done` flag FIRST, so the end-of-editing
+    /// AppKit fires while we dismantle the field cannot post a second outcome.
+    pub fn end_tab_rename(handle: &ToolbarHandle) {
+        let Some(editor) = handle.rename.borrow_mut().take() else {
+            return;
+        };
+        editor.target.ivars().done.set(true);
+        // Restore first responder BEFORE removing the field: removing the current
+        // first responder leaves the window with none, and keys then go nowhere.
+        if let Some(window) = handle.container.window() {
+            let responder: &objc2_app_kit::NSResponder = &handle.content_view;
+            window.makeFirstResponder(Some(responder));
+        }
+        // SAFETY: main-thread teardown; `setDelegate: nil` drops AppKit's weak
+        // reference before the relay's last strong reference goes away here.
+        unsafe {
+            let nil: *mut AnyObject = std::ptr::null_mut();
+            let _: () = msg_send![&*editor.field, setDelegate: nil];
+            editor.field.removeFromSuperview();
+        }
+    }
+
+    /// The live rename field's current text, or `None` when no editor is open.
+    /// The field's `stringValue` is the ONE home of the in-progress text, so this
+    /// is how a command that must run "outside" an open editor (⌘W, ⌘T, a split)
+    /// keeps what the user typed instead of discarding it.
+    pub fn rename_editor_text(handle: &ToolbarHandle) -> Option<String> {
+        let rename = handle.rename.borrow();
+        let editor = rename.as_ref()?;
+        // SAFETY: plain main-thread value getter on the live field.
+        Some(unsafe { editor.field.stringValue() }.to_string())
+    }
+
+    /// Hand one editing command to the live rename field's field editor. macOS
+    /// resolves a menu key equivalent BEFORE the first responder sees the key, so
+    /// without this ⌘V would paste into the PTY behind an open editor.
+    pub fn rename_editor_edit(
+        handle: &ToolbarHandle,
+        action: crate::platform::RenameEditorEdit,
+    ) -> bool {
+        use crate::platform::RenameEditorEdit;
+        let rename = handle.rename.borrow();
+        let Some(editor) = rename.as_ref() else {
+            return false;
+        };
+        // SAFETY: `currentEditor` is a plain main-thread getter; the returned NSText
+        // implements the standard editing actions, each taking a `sender`.
+        unsafe {
+            let Some(text) = editor.field.currentEditor() else {
+                return false;
+            };
+            let sender: *mut AnyObject = std::ptr::null_mut();
+            match action {
+                RenameEditorEdit::Copy => {
+                    let _: () = msg_send![&*text, copy: sender];
+                }
+                RenameEditorEdit::Paste => {
+                    let _: () = msg_send![&*text, paste: sender];
+                }
+                RenameEditorEdit::SelectAll => {
+                    let _: () = msg_send![&*text, selectAll: sender];
+                }
+            }
+        }
+        true
+    }
+
+    /// Keep a live rename editor glued to its tab across a strip refresh.
+    ///
+    /// Called at the END of every [`set_window_tabs`] path, because ALL of them
+    /// move or destroy chips: the empty path and the rebuild path drain every
+    /// chip, and even the in-place diff path re-stamps identities after a
+    /// reorder. `ids` is the refreshed tab order.
+    ///
+    /// * the edited tab is GONE ⇒ tear the editor down and post a CANCEL. Never a
+    ///   commit: the user was naming something that no longer exists.
+    /// * the edited tab is PRESENT ⇒ re-frame the field over its (possibly moved)
+    ///   chip and re-raise it, because the rebuild path appends the fresh chips
+    ///   ON TOP — an editor left underneath would still hold key focus while
+    ///   being invisible.
+    ///
+    /// The field is never removed on the present path, so the in-progress text,
+    /// the selection, any IME composition, and first responder are all untouched
+    /// by a refresh.
+    fn sync_rename_overlay(handle: &ToolbarHandle, ids: &[TabId]) {
+        // Resolve everything under one short borrow, so the teardown branch below
+        // is free to take `handle.rename` mutably.
+        let outcome = {
+            let rename = handle.rename.borrow();
+            let Some(editor) = rename.as_ref() else {
+                return;
+            };
+            let tabs = handle.tabs.borrow();
+            ids.iter()
+                .position(|id| *id == editor.tab)
+                .and_then(|i| tabs.get(i))
+                .map(|chip| chip.editor_frame())
+                .ok_or(editor.target.ivars().session)
+        };
+        let frame = match outcome {
+            Ok(frame) => frame,
+            Err(session) => {
+                let window = handle.window;
+                end_tab_rename(handle);
+                let _ = handle
+                    .proxy
+                    .send_event(Wake::CancelSessionRename { window, session });
+                return;
+            }
+        };
+        let rename = handle.rename.borrow();
+        let Some(editor) = rename.as_ref() else {
+            return;
+        };
+        // SAFETY: main-thread geometry setter + re-insert of a view already in this
+        // container; `addSubview:positioned:relativeTo:` moves it to the top of the
+        // subview order without disturbing first responder.
+        unsafe {
+            editor.field.setFrame(frame);
+            handle.container.addSubview_positioned_relativeTo(
+                &editor.field,
+                objc2_app_kit::NSWindowOrderingMode::NSWindowAbove,
+                None,
+            );
+        }
+    }
 }

@@ -1669,20 +1669,9 @@ impl App {
         // REFUSAL short-circuits the attempt right here, before anything parks.
         // Never an authorization either way — the child re-runs the complete
         // gate under the apply lock at swap time.
-        let preverified = apply_attempt.as_ref().and_then(|attempt| {
-            let cached = self
-                .handoff_preverified
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            cached
-                .as_ref()
-                .filter(|entry| {
-                    entry.build == attempt.target_build()
-                        && entry.commit == attempt.target_commit()
-                        && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
-                })
-                .map(|entry| entry.passed)
-        });
+        let preverified = apply_attempt
+            .as_ref()
+            .and_then(|attempt| self.cached_handoff_preverification(attempt));
         if preverified == Some(false) {
             return Err(crate::UpdateHandoffStartError::failed(
                 "the staged update failed verification; the terminal was left untouched",
@@ -2407,61 +2396,9 @@ impl App {
         // Every non-ready completion is emitted only AFTER the worker killed and
         // reaped the child. It is now safe to restore parent readers and reduce the
         // exact ticket using disk facts that were also collected off the UI thread.
-        // (Unused fields keep underscore-prefixed bindings so their drops still
-        // run at the end of this call, as with the old entry destructure.)
-        let crate::UpdateHandoffCompletion {
-            attempt_id: _attempt_id,
-            nonce,
-            child_pid: _child_pid,
-            outcome,
-            commit_fd: _commit_fd,
-            reject: _reject,
-            reconcile,
-            detail,
-            input_drain_spins: _input_drain_spins,
-        } = completion;
-        let Some(pending) = self.pending_update_handoff.take() else {
+        let Some(teardown) = self.reduce_returned_handoff_completion(completion) else {
             return;
         };
-        // Activity classification for the bounded automatic retry budget: the
-        // worker's typed `ActivityRevoked` outcome, or a main-thread rejection
-        // this attempt recorded as activity-shaped. Only automatic mode owns a
-        // timer budget; a manual attempt's failure surfaces to the user as
-        // before. Genuine failures (ChildDied/TimedOut/AdoptionMismatch/
-        // PreparationFailed/plain Rejected without the flag) stay manual-only.
-        let activity_revoked = (outcome == crate::UpdateHandoffOutcome::ActivityRevoked
-            || pending.revoked_by_activity)
-            && pending.mode.is_automatic();
-        let teardown = match (pending.mode, pending.teardown) {
-            // Construction records this eagerly; keep a fail-safe derivation from
-            // the typed mode so a future constructor cannot strand an authorized
-            // clean quit merely by omitting the replay marker.
-            (
-                crate::native_updater_service::ApplyMode::CleanQuit,
-                crate::DeferredHandoffTeardown::None,
-            ) => crate::DeferredHandoffTeardown::CleanQuitReady,
-            (_, teardown) => teardown,
-        };
-        self.rollback_overlap(nonce.as_deref(), &pending.live);
-        let surfaced = match (pending.apply_attempt, reconcile) {
-            (Some(attempt), Some(facts)) => self.finish_async_native_update_handoff(
-                attempt,
-                facts,
-                format!("overlap handoff failed safely: {detail}"),
-                activity_revoked,
-            ),
-            (None, _) => Some(crate::native_app::UpdateOutcome::Failed {
-                message: format!("debug overlap handoff failed safely: {detail}"),
-            }),
-            (Some(attempt), None) => Some(self.abort_reaped_native_apply_before_reconcile(
-                &attempt,
-                format!("overlap handoff failed safely: {detail}"),
-                activity_revoked,
-            )),
-        };
-        if let Some(surfaced) = surfaced {
-            self.surface_update_apply_outcome("automatic handoff", surfaced, false);
-        }
         // The child process group is reaped and overlap rollback has run. Only now
         // may the event-loop lane replay destructive intent. A whole-app request
         // dominates individual closes; AppKit generation ownership is preserved.
@@ -2546,6 +2483,131 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The cached pre-park verification verdict for THIS exact artifact, or `None`
+    /// when there is no fresh entry bound to its build and commit.
+    ///
+    /// `Some(false)` is the only answer with authority: it short-circuits
+    /// [`Self::start_unix_update_handoff`] before a single reader parks. Split out
+    /// of that function so the verdict a fixture seeds can be read back the way
+    /// production reads it — a test that parks nothing (every headless one, since
+    /// `native_update_admission` refuses the seamless lane without an event-loop
+    /// proxy) cannot otherwise tell a healthy candidate from one production would
+    /// decline outright, which is how a whole retry-policy suite came to be written
+    /// against a `passed: false` fixture.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn cached_handoff_preverification(
+        &self,
+        attempt: &crate::native_updater_service::ApplyAttemptTicket,
+    ) -> Option<bool> {
+        let cached = self
+            .handoff_preverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cached
+            .as_ref()
+            .filter(|entry| {
+                entry.build == attempt.target_build()
+                    && entry.commit == attempt.target_commit()
+                    && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
+            })
+            .map(|entry| entry.passed)
+    }
+
+    /// Reduce one RETURNED (non-ready) handoff completion: resume the parked
+    /// readers, reduce the exact apply ticket against the lane its mode
+    /// authorized, surface the verdict, and hand back the structural teardown the
+    /// caller must replay. `None` means there was no matching pending attempt to
+    /// reduce and nothing may be replayed.
+    ///
+    /// SPLIT OUT OF [`Self::finish_update_handoff`] SO IT CAN BE PROVEN. Every
+    /// line here is event-loop-free — the `&ActiveEventLoop` the caller holds is
+    /// needed only by the teardown replay below it — and this is the only place
+    /// the attempt's `ApplyMode` still exists, which makes it the only place the
+    /// automatic/person-initiated split can be gotten right (see
+    /// [`crate::app_native::HandoffFailureLane`]).
+    #[cfg(unix)]
+    fn reduce_returned_handoff_completion(
+        &mut self,
+        completion: crate::UpdateHandoffCompletion,
+    ) -> Option<crate::DeferredHandoffTeardown> {
+        // (Unused fields keep underscore-prefixed bindings so their drops still
+        // run at the end of this call, as with the old entry destructure.)
+        let crate::UpdateHandoffCompletion {
+            attempt_id: _attempt_id,
+            nonce,
+            child_pid: _child_pid,
+            outcome,
+            commit_fd: _commit_fd,
+            reject: _reject,
+            reconcile,
+            detail,
+            input_drain_spins: _input_drain_spins,
+        } = completion;
+        let pending = self.pending_update_handoff.take()?;
+        // Lane classification for the bounded automatic retry budgets, from the two
+        // typed facts this reduction still holds: the mode the apply was authorized
+        // under, and the worker's outcome (plus the main thread's own
+        // activity-shaped rejection flag, the other half of the activity
+        // observation).
+        //
+        // THE MODE IS CARRIED, NOT DROPPED. It used to reach only this line and
+        // then vanish, so a failure a PERSON asked for was charged to the
+        // automatic budget — converging the background lane on human retries and
+        // silencing the pill for the human who asked.
+        //
+        // AND NEITHER IS THE OUTCOME, WHICH IS THE SAME BUG ONE LEVEL DOWN. The
+        // outcome used to be collapsed into a bare `activity_revoked` bool here,
+        // so `TimedOut` (a missed deadline on a busy machine) and
+        // `AdoptionMismatch` (two images that cannot agree on a proof) arrived at
+        // the budget indistinguishable and were charged the same nine attempts
+        // across fourteen hours. `classify` now sees the kind and
+        // `PhysicalFailureShape` decides what it costs.
+        let lane = crate::app_native::HandoffFailureLane::classify(
+            pending.mode,
+            outcome,
+            pending.revoked_by_activity,
+        );
+        let teardown = match (pending.mode, pending.teardown) {
+            // Construction records this eagerly; keep a fail-safe derivation from
+            // the typed mode so a future constructor cannot strand an authorized
+            // clean quit merely by omitting the replay marker.
+            (
+                crate::native_updater_service::ApplyMode::CleanQuit,
+                crate::DeferredHandoffTeardown::None,
+            ) => crate::DeferredHandoffTeardown::CleanQuitReady,
+            (_, teardown) => teardown,
+        };
+        self.rollback_overlap(nonce.as_deref(), &pending.live);
+        let surfaced = match (pending.apply_attempt, reconcile) {
+            (Some(attempt), Some(facts)) => self.finish_async_native_update_handoff(
+                attempt,
+                facts,
+                format!("overlap handoff failed safely: {detail}"),
+                lane,
+            ),
+            (None, _) => Some(crate::native_app::UpdateOutcome::Failed {
+                message: format!("debug overlap handoff failed safely: {detail}"),
+            }),
+            (Some(attempt), None) => Some(self.abort_reaped_native_apply_before_reconcile(
+                &attempt,
+                format!("overlap handoff failed safely: {detail}"),
+                lane,
+            )),
+        };
+        if let Some(surfaced) = surfaced {
+            // The source names the lane the attempt actually rode, so the log can
+            // no longer report a person's Version-menu apply as background work.
+            let source = if pending.mode.is_automatic() {
+                "automatic handoff"
+            } else {
+                "manual handoff"
+            };
+            self.surface_update_apply_outcome(source, surfaced, false);
+        }
+        Some(teardown)
     }
 
     #[cfg(not(unix))]
@@ -3634,5 +3696,352 @@ mod handoff_process_group_tests {
             "a session leader must both REFUSE the repeat setpgid and still lead \
              its own process group"
         );
+    }
+}
+
+/// The returned-completion reducer's ONE remaining piece of attempt identity: the
+/// [`crate::native_updater_service::ApplyMode`] the apply was authorized under.
+#[cfg(all(test, unix))]
+mod returned_handoff_completion_lane_tests {
+    use crate::App;
+    use crate::native_updater_service::{
+        ApplyAttemptTicket, ApplyMode, CheckCompletion, CheckStart, DurableUpdateStatus,
+    };
+
+    const TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Stage one strictly-newer build through the REAL check reducer, so the
+    /// artifact the completion reduces below is the one production would hold.
+    fn stage_one_build(app: &mut App) -> u64 {
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let build = current_build + 1;
+        let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
+            panic!("a fresh service must start exactly one check");
+        };
+        assert_eq!(
+            app.native_updater_service.finish_check(
+                ticket,
+                DurableUpdateStatus {
+                    enabled: true,
+                    current_build,
+                    staged_build: Some(build),
+                    staged_version: Some(format!("1.0.{build}")),
+                    staged_commit: Some(TEST_COMMIT.to_string()),
+                    staged_dmg_sha256: Some("ab".repeat(32)),
+                    changelog: None,
+                    outcome: "staged".to_string(),
+                    failing_checks: 0,
+                },
+            ),
+            CheckCompletion::Reduced,
+            "PRECONDITION: the check must reduce, or nothing is staged"
+        );
+        build
+    }
+
+    /// Drive ONE returned handoff for `mode` end to end through the production
+    /// reducer: an authorized attempt is pending, the worker reports `outcome`
+    /// against the artifact `digest` names, and the reducer decides what that
+    /// costs.
+    ///
+    /// Everything here is what a real attempt leaves behind, not a hand-built
+    /// verdict: the ticket is the reducer's own current apply, the pending record
+    /// carries the mode the apply was authorized under, and the completion has
+    /// `reconcile: None` exactly as every construction site in this crate emits.
+    ///
+    /// The OUTCOME is a parameter because it is now load-bearing twice over — it
+    /// carries the activity classification AND the physical shape — so a fixture
+    /// that pinned it to one kind could only ever exercise one of the budgets.
+    fn reduce_one_returned_failure(
+        app: &mut App,
+        mode: ApplyMode,
+        build: u64,
+        digest: &str,
+        outcome: crate::UpdateHandoffOutcome,
+    ) {
+        let ticket = ApplyAttemptTicket::for_test(build, TEST_COMMIT, digest);
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
+        app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            attempt_id: 1,
+            nonce: None,
+            live: Vec::new(),
+            adoption: Vec::new(),
+            child_pid: None,
+            mode,
+            apply_attempt: Some(ticket),
+            target_build: build,
+            target_commit: TEST_COMMIT.to_string(),
+            layout: crate::restore::RestoreManifest::new(Vec::new()),
+            layout_digest: [0; 32],
+            screen_digest: [0; 32],
+            activity_epoch: app.update_handoff_activity_epoch,
+            cancel,
+            arbiter: crate::HandoffAttemptArbiter::new(),
+            teardown: crate::DeferredHandoffTeardown::None,
+            commit_drain_started: None,
+            revoked_by_activity: false,
+        });
+        let teardown = app
+            .reduce_returned_handoff_completion(crate::UpdateHandoffCompletion {
+                attempt_id: 1,
+                nonce: None,
+                child_pid: None,
+                outcome,
+                commit_fd: None,
+                reject: None,
+                reconcile: None,
+                detail: format!("handoff proof ended {outcome:?}"),
+                input_drain_spins: 0,
+            })
+            .expect("a matching pending attempt is always reduced");
+        assert_eq!(
+            teardown,
+            crate::DeferredHandoffTeardown::None,
+            "PRECONDITION: this fixture requests no structural teardown, so the \
+             replay branch cannot be what changed the state asserted on"
+        );
+    }
+
+    /// THE FINDING: the completion path took `pending.mode`, used it for the
+    /// activity classification, and then dropped it — so a physical failure a
+    /// PERSON asked for (Version menu, palette, `aterm-ctl update apply`, an
+    /// install-on-clean-quit gesture) was charged to the AUTOMATIC lane's
+    /// converging budget and latched automatic apply off on their behalf.
+    ///
+    /// The two lanes are driven here against the SAME artifact in the SAME `App`,
+    /// with identical worker reports, and the contrast is the assertion. A test
+    /// that only drove one of them would pass with the mode dropped.
+    #[test]
+    fn a_person_s_returned_handoff_never_spends_the_automatic_lane_s_budget() {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        assert!(
+            app.arm_native_auto_apply(build, &"ab".repeat(32)),
+            "PRECONDITION: the background lane is armed for these exact bytes, \
+             which is the state a person's click has to leave alone"
+        );
+
+        // A PERSON'S FAILURE: nothing is charged. Not the physical budget, not the
+        // manual-only latch, and not the live automatic intent — the background
+        // lane is still going to try this artifact at its own next window.
+        reduce_one_returned_failure(
+            &mut app,
+            ApplyMode::Immediate,
+            build,
+            &"ab".repeat(32),
+            crate::UpdateHandoffOutcome::TimedOut,
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            None,
+            "a person-initiated handoff failure must not open (or advance) the \
+             automatic artifact's converging physical budget"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "a person's failure must not latch automatic apply off — a manual \
+             retry that converges the background lane is the finding"
+        );
+        assert!(
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build),
+            "and it must not retire the live automatic intent either"
+        );
+
+        // THE SAME FAILURE, AUTHORIZED IN THE BACKGROUND: charged in full. This is
+        // the discriminator — flip the classification to ignore the mode and the
+        // block above starts producing exactly this state.
+        reduce_one_returned_failure(
+            &mut app,
+            ApplyMode::AutomaticPastGrace,
+            build,
+            &"ab".repeat(32),
+            crate::UpdateHandoffOutcome::TimedOut,
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(1),
+            "the automatic lane's own failure is what the budget is for"
+        );
+        let latched = app
+            .auto_apply_manual_only
+            .expect("an automatic physical failure latches manual-only")
+            .retry_at
+            .expect("with a deadline, on its first failure")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            latched > std::time::Duration::from_secs(500)
+                && latched <= std::time::Duration::from_secs(600),
+            "and on the physical schedule's first rung (~600s), got {latched:?}"
+        );
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "an automatic physical failure retires the intent it was spent on"
+        );
+    }
+
+    /// The activity classification must ALSO stay pointed at the background lane:
+    /// a person's attempt does not arm the revocation watcher at all, so an
+    /// activity-shaped rejection recorded against one can only be noise — and it
+    /// must not mint an `arm_activity_revoked_overlap_retry` cycle that re-arms
+    /// automatic apply on a schedule nobody asked for.
+    #[test]
+    fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let ticket = ApplyAttemptTicket::for_test(build, TEST_COMMIT, &"ab".repeat(32));
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
+        app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
+            attempt_id: 2,
+            nonce: None,
+            live: Vec::new(),
+            adoption: Vec::new(),
+            child_pid: None,
+            mode: ApplyMode::Immediate,
+            apply_attempt: Some(ticket),
+            target_build: build,
+            target_commit: TEST_COMMIT.to_string(),
+            layout: crate::restore::RestoreManifest::new(Vec::new()),
+            layout_digest: [0; 32],
+            screen_digest: [0; 32],
+            activity_epoch: app.update_handoff_activity_epoch,
+            cancel,
+            arbiter: crate::HandoffAttemptArbiter::new(),
+            teardown: crate::DeferredHandoffTeardown::None,
+            commit_drain_started: None,
+            revoked_by_activity: true,
+        });
+        let _ = app.reduce_returned_handoff_completion(crate::UpdateHandoffCompletion {
+            attempt_id: 2,
+            nonce: None,
+            child_pid: None,
+            outcome: crate::UpdateHandoffOutcome::ActivityRevoked,
+            commit_fd: None,
+            reject: None,
+            reconcile: None,
+            detail: "activity revoked handoff during physical preparation".to_string(),
+            input_drain_spins: 0,
+        });
+        assert!(
+            app.auto_overlap_retry.is_none(),
+            "a person's revoked attempt must not consume — or create — the \
+             automatic artifact's activity-revoked retry budget"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "nor may it latch the background lane off"
+        );
+    }
+
+    /// THE TYPED KIND MUST REACH THE BUDGET, NOT JUST THE LOG LINE.
+    ///
+    /// `UpdateHandoffOutcome` distinguishes four physical failures and the
+    /// completion path collapsed all of them into one bool on its way to the
+    /// schedule, so the budget could not tell "the machine missed a 15 s deadline"
+    /// from "these two images cannot agree on an adoption proof" and charged both
+    /// the nine-attempt, fourteen-hour transient schedule.
+    ///
+    /// Driven through `reduce_returned_handoff_completion` — the reduction that
+    /// owns the classification — with two artifacts in one `App` so each has its
+    /// own budget and the only difference between the two arcs is the worker's
+    /// verdict.
+    #[test]
+    fn a_structural_worker_outcome_reaches_a_different_schedule_from_a_transient_one() {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let deadline = |app: &App| {
+            app.auto_apply_manual_only
+                .expect("an automatic physical failure always latches manual-only")
+                .retry_at
+        };
+
+        // AdoptionMismatch, twice: a confirmation and then the end of the lane for
+        // those bytes. `retry_at: None` is what `arm` reads as `SuppressManualOnly`
+        // until a strictly newer build ships.
+        for _ in 0..2 {
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"ab".repeat(32),
+                crate::UpdateHandoffOutcome::AdoptionMismatch,
+            );
+        }
+        assert_eq!(
+            deadline(&app),
+            None,
+            "two proofs that these two images disagree is not a busy afternoon; \
+             the lane must be finished with the artifact, not scheduling a third \
+             park/spawn/paint round trip"
+        );
+
+        // TimedOut, twice, same `App` and same build — different bytes, so a
+        // different budget. Still scheduled, and on the SECOND rung, which is what
+        // proves the two arcs really did diverge rather than one of them silently
+        // inheriting the other's counter.
+        for _ in 0..2 {
+            reduce_one_returned_failure(
+                &mut app,
+                ApplyMode::AutomaticPastGrace,
+                build,
+                &"cd".repeat(32),
+                crate::UpdateHandoffOutcome::TimedOut,
+            );
+        }
+        let transient = deadline(&app)
+            .expect("a transient failure two attempts in is still coming back")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            transient > std::time::Duration::from_secs(1700)
+                && transient <= std::time::Duration::from_secs(1800),
+            "the transient lane must be on its second rung (~1800s), got {transient:?}"
+        );
+    }
+
+    /// The classification itself, stated as a table so a future outcome variant
+    /// has to be placed deliberately rather than falling into whichever arm the
+    /// compiler allows. Two axes, and both used to be lossy: WHO asked (the mode)
+    /// and WHAT happened (the worker's typed outcome).
+    #[test]
+    fn every_handoff_outcome_lands_in_the_lane_its_evidence_earns() {
+        use crate::UpdateHandoffOutcome as Outcome;
+        use crate::app_native::{HandoffFailureLane as Lane, PhysicalFailureShape as Shape};
+
+        for (outcome, expected) in [
+            (Outcome::AdoptionMismatch, Lane::Physical(Shape::Structural)),
+            (Outcome::PreparationFailed, Lane::Physical(Shape::Structural)),
+            (Outcome::ChildDied, Lane::Physical(Shape::Structural)),
+            (Outcome::TimedOut, Lane::Physical(Shape::Transient)),
+            (Outcome::Rejected, Lane::Physical(Shape::Transient)),
+            (Outcome::ActivityRevoked, Lane::ActivityRevoked),
+            // Unreachable as a FAILURE (the commit path handles it), and it fails
+            // closed to the forgiving shape rather than converging an artifact on
+            // a state nobody understands.
+            (Outcome::ProofReady, Lane::Physical(Shape::Transient)),
+        ] {
+            assert_eq!(
+                Lane::classify(ApplyMode::AutomaticPastGrace, outcome, false),
+                expected,
+                "{outcome:?} in the background lane"
+            );
+            // A PERSON'S APPLY CHARGES NOTHING, whatever the worker reported: the
+            // shape decides how much an AUTOMATIC failure costs, never whether a
+            // human's click may converge the background lane.
+            assert_eq!(
+                Lane::classify(ApplyMode::Immediate, outcome, false),
+                Lane::Manual,
+                "{outcome:?} from a person"
+            );
+            // The main thread's own activity-shaped rejection is the other half of
+            // the activity observation and dominates the physical shape: a lossless
+            // rollback the terminal caused is not evidence about the artifact.
+            assert_eq!(
+                Lane::classify(ApplyMode::AutomaticPastGrace, outcome, true),
+                Lane::ActivityRevoked,
+                "{outcome:?} with a main-thread activity revocation"
+            );
+        }
     }
 }

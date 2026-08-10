@@ -25,9 +25,10 @@ use aterm_render::{
 };
 
 use crate::effect_util::{
-    STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT,
-    STAR_GLINT_COV, STAR_WAIST, dust_r, fire_ramp, lerp_rgb, push_fx_rect as push_rect,
-    push_twinkle_star, star_accent, star_arm, twinkle_env, twinkle_peak, twinkle_rgb, water_ramp,
+    STAR_ARM, STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT,
+    STAR_GLINT_COV, STAR_STACK_ADD, STAR_WAIST, dust_r, fire_ramp, lerp_rgb,
+    push_dust_mote, push_fx_rect as push_rect, push_twinkle_star, star_accent, star_arm,
+    star_arm_px, twinkle_env, twinkle_peak, twinkle_rgb, water_ramp,
 };
 use crate::trail_sweep::{line_cells_tail, row_sweep_cells, wrap_fold_cells};
 use crate::typing_momentum::TypingMomentum;
@@ -297,6 +298,17 @@ pub const SPARKLE_DEFAULT_COLOR: u32 = 0x00FF_D9A0;
 /// tail/coma/debris palette re-derives from it (the ramps lerp off the config
 /// hues, never this constant).
 pub const COMET_DEFAULT_COLOR: u32 = 0x009E_D6FF;
+
+/// The Comet debris GLINT's coverage, as a fraction of the grain's own — the
+/// diffraction spike is a highlight ON a grain of ice, so it is drawn dimmer
+/// than the grain that throws it.
+///
+/// It is a named constant because TWO sites must agree on it: the dealt grain
+/// that still draws the 4-point glint, and the UNDEALT grain that no longer
+/// does and is paid the glint's light instead (see the Comet arm of
+/// `emit_particles`). Split across two literals they would drift, and the drift
+/// would land as a brightness step between two grains of the same tail.
+const COMET_GLINT_COV: f32 = 0.5;
 
 /// The six iconic rainbow band colours, top → bottom (`0x00RRGGBB`). Fixed
 /// (not a rolling hue) so a horizontal sweep reads as the classic stacked stripes.
@@ -574,7 +586,7 @@ const RAINBOW_EDGE_OUT: f32 = 0.30;
 /// Sub-linear exponent on the tail taper's smoothstep: `smoothstep^γ` with
 /// γ < 1 LIFTS the mid-taper (the light lingers, "melts out") while keeping
 /// the exact-zero endpoint (0^γ = 0) and strict monotonicity. Spelled inside
-/// [`rainbow_ribbon_profile`] itself so every consumer (dark body, light-theme
+/// `rainbow_ribbon_profile` itself so every consumer (dark body, light-theme
 /// rails, crossfade ghosts replaying the profile) melts identically.
 const RAINBOW_TAIL_MELT_GAMMA: f32 = 0.6;
 /// Modest luminance renormalisation for the feathered profile: the two edge
@@ -624,7 +636,8 @@ fn rainbow_edge_envelope(u: f32, life: f32) -> f32 {
     smoothstep01(u / birth) * melt
 }
 
-/// [`rainbow_ribbon_profile`] for a caller that has ALREADY evaluated the
+/// The ribbon's per-cell brightness law (`rainbow_ribbon_profile`) for a
+/// caller that has ALREADY evaluated the
 /// spark's [`rainbow_edge_envelope`] — the ribbon body and its starfield share
 /// one spark's feather (see `emit_rainbow`), and the envelope is the priciest
 /// term in the law. Identical arithmetic in identical order to the wrapper
@@ -646,6 +659,14 @@ fn rainbow_ribbon_profile_edged(u: f32, edge: f32) -> f32 {
 /// peaking at [`RAINBOW_CREST_POS`] — pinned by
 /// `rainbow_ribbon_profile_peaks_in_the_mid_tail` and
 /// `rainbow_ribbon_profile_feathers_both_ends_to_zero`.
+///
+/// THE PROOFS' ENTRY POINT, and only theirs. Every shipping caller already holds
+/// the spark's `rainbow_edge_envelope` (it is the priciest term in the law and
+/// the body shares one evaluation with its starfield), so production calls
+/// `rainbow_ribbon_profile_edged` directly; this wrapper exists so the tests can
+/// state the law in the terms it is written in — `(u, life)` — rather than
+/// re-deriving the envelope at every assertion.
+#[cfg(test)]
 #[inline]
 fn rainbow_ribbon_profile(u: f32, life: f32) -> f32 {
     rainbow_ribbon_profile_edged(u, rainbow_edge_envelope(u, life))
@@ -967,7 +988,7 @@ pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
 ///
 /// Quantized rather than continuous, deliberately: the six stacked stripes ARE
 /// this style's identity, a discrete band is what makes red and violet
-/// nameable on a thin underline, and [`is_fresh_ink_veil`] needs the pop's
+/// nameable on a thin underline, and `is_fresh_ink_veil` needs the pop's
 /// colour to come from a finite set to stay independently assertable.
 #[inline]
 pub(crate) fn rainbow_band_of(sweep: f32) -> u32 {
@@ -1012,6 +1033,22 @@ const RAINBOW_LIGHT_RAIL_ALPHA_CAP: f32 = 236.0;
 /// cell sits AT the ceiling and only a dimmed/low-intensity one falls below it
 /// — the band is meant to be ink, and the ceiling is meant to bind.
 const RAINBOW_LIGHT_RAIL_PEAK: f32 = 255.0;
+/// THE LIGHT SKY TWINKLE'S COVERAGE BUDGET — the ceiling on the `cov` any one
+/// sparkle in the light ribbon's sky may ASK FOR, before the twinkle envelope,
+/// the momentum spine and the host's intensity scale it down.
+///
+/// The ribbon BODY is under ink, and a bright bed destroys contrast against an
+/// antialiased glyph, so every body sample is held to [`RAINBOW_OCCUPIED_COV_CAP`]
+/// (5.37:1 worst-band contrast). The light arm's marks live OUTSIDE the glyph
+/// band — the rail in the leading below the row, the twinkles in the sky above
+/// it — so they keep their own separate, looser budget.
+///
+/// IT IS A COVERAGE, NOT AN ALPHA. What reaches the screen is this coverage
+/// priced through the stardust law: a round grain is drawn at
+/// [`stacked_ink_alpha`] of it, which is strictly ABOVE this number over the
+/// whole range the emitter can reach. `rainbow_light_sky_mote_is_priced_as_a_plus`
+/// leans on exactly that gap.
+const RAINBOW_LIGHT_SKY_COV_CAP: f32 = 120.0;
 /// How flat a RAIL-RIDING streak is drawn, as a fraction of its own length
 /// radius. Sized so the streak's thickness lands on the rail's own
 /// (`RAINBOW_LIGHT_RAIL_RY` of a cell): the meteor then reads as the underline
@@ -1760,7 +1797,7 @@ const FRESH_INK_LIGHT_VEIL: u32 = 0x0026_2E36;
 /// desaturation three reviews reported.
 ///
 /// Held BELOW 1 on purpose: at exactly 1 the pop's colour becomes bit-identical
-/// to the rail's, and [`is_fresh_ink_veil`] — the predicate that keeps a light
+/// to the rail's, and `is_fresh_ink_veil` — the predicate that keeps a light
 /// pop independently assertable from every other veil in the frame — stops
 /// discriminating. A tenth of the slate is what carries that identity.
 const FRESH_INK_LIGHT_TINT: f32 = 0.90;
@@ -1801,6 +1838,12 @@ const FRESH_INK_LIGHT_FLASH_RY: f32 = 0.13;
 /// RAINBOW_LIGHT_RAIL_RY` is the tightest a rail ever comes; this stays under
 /// it, and the ribbon's own rails have honoured the same clearance since they
 /// shipped.
+///
+/// THE CLAIM, NOT A KNOB. No emitter reads it — the pop's bars are placed from
+/// the rail's own `DY`/`RY` — so it exists to give the clearance a name and a
+/// number that the proof can hold the emitted geometry against, and it lives
+/// with that proof.
+#[cfg(test)]
 const FRESH_INK_LIGHT_GLYPH_HALF: f32 = 0.34;
 // ---- THE FRESH-INK GLYPH TINT ----------------------------------------------
 //
@@ -2020,6 +2063,13 @@ fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f32) -> Opti
     Some(cand(lo_k))
 }
 
+/// ONE MEMOIZED FRESH-INK GLYPH PALETTE: the `(theme_fg, theme_bg)` key it was
+/// derived from, paired with the six band inks — or with `None`, which is a
+/// memoized REFUSAL (a theme that gets no tint at all; see
+/// [`fresh_ink_glyph_palette`]). Named because the nesting is three deep at the
+/// field that holds it and reads as noise inline.
+type GlyphPaletteMemo = ((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>);
+
 /// The six band inks for one theme, or `None` when this theme gets no tint.
 ///
 /// ALL SIX OR NONE, deliberately. A per-band suppression would draw a rainbow
@@ -2169,7 +2219,7 @@ fn fresh_ink_scale(u: f32) -> f32 {
 /// bands by `fresh_ink_light_veil_centre_is_capped_for_legibility`.
 ///
 /// `band` is always one of the six [`RAINBOW_BANDS`] anchors, never a point on
-/// the continuous gradient — see [`is_fresh_ink_veil`] for why that matters.
+/// the continuous gradient — see `is_fresh_ink_veil` for why that matters.
 #[inline]
 fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
     let ink = lerp_rgb(
@@ -2192,6 +2242,12 @@ fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
 /// colour. (Quantizing also reads better: six iconic stripes walking under a
 /// typed word is the rainbow, where a continuous blend across three letters is
 /// a smear.)
+///
+/// A PROOF INSTRUMENT, so it lives with the proofs: nothing on the emit path
+/// asks the question — the pop knows what it drew — and the only caller is
+/// `fresh_ink_light_theme_pops_with_a_darken_veil`, which needs to pick the
+/// pop's veils out of a frame full of other source-over marks.
+#[cfg(test)]
 #[inline]
 fn is_fresh_ink_veil(color: u32) -> bool {
     RAINBOW_BANDS
@@ -2255,6 +2311,19 @@ struct Spark {
 struct InkPop {
     row: u16,
     col: u16,
+    /// THE SHAPE SEED — which silhouette this pop's sky sparkle takes, dealt
+    /// once at BIRTH through [`star_accent`] and then held for the pop's whole
+    /// life.
+    ///
+    /// It must be per-SPAWN, not per-CELL. Dealing from `(row, col)` alone is
+    /// stable in the wrong dimension: a prompt sits at the same columns every
+    /// time, so the accent columns would be the SAME columns forever and
+    /// retyping one would draw a plus every single time — a fixed cross in the
+    /// leading rather than an occasional grace note. Mixing the live hue phase
+    /// in at birth re-deals on every keystroke (the phase advances one step per
+    /// laid cell) while staying frozen for the pop, so the mark never changes
+    /// shape mid-fade.
+    seed: u32,
     /// The eased momentum spine (`rainbow.disp`) at birth: full momentum = the
     /// brightest pop (frozen at birth so a pop never re-prices mid-fade).
     mom: f32,
@@ -2573,11 +2642,45 @@ impl RainbowState {
     }
 }
 
-/// A scattered burst star's ARM LENGTH as a fraction of a cell height — about a
-/// third of a cell, so a landing star reads a touch larger than the typing
-/// starfield's twinkles without becoming a different object (the burst draws
-/// [`push_twinkle_star`], the one star shape).
-const RAINBOW_STAR_R_FRAC: f32 = 0.30;
+/// A scattered burst star's ARM LENGTH as a fraction of a cell height, so a
+/// landing star reads a touch larger than the typing starfield's twinkles
+/// without becoming a different object (the burst draws [`push_twinkle_star`],
+/// the one star shape).
+///
+/// THINNED from a bare 0.30 onto the FAMILY LADDER (owner, 2026-08-09: "I dont
+/// want fat '+'"). 0.30 of a cell is `STAR_ARM * 2.14` — off the ladder
+/// entirely, past even [`STAR_ARM_HERO`] — and a plus's mass follows its arm
+/// LENGTH, so at a retina cell each landing star rasterized 2 px thick on a
+/// 4 px nucleus. A landing throws a whole fan of them at once, which is
+/// precisely the "cloud of small crosses at glyph size" hazard, at the largest
+/// size in the module.
+///
+/// THE SHAPE IS NOT TOUCHED, deliberately. These stay 4-point stars: the owner
+/// asked for this burst specifically ("The landing should be a starburst of
+/// color"), and its light arm's own note records that drawing them ROUND is a
+/// defect already found and fixed ("this used to be a round blob, which is why
+/// a white-ground landing read as pastel confetti while dark read as a
+/// starburst"). Only the HEFT changes — at the ladder's hero grain a landing
+/// star is still ~1.9x the starfield twinkle it garnishes, and every one of
+/// them rasterizes back to the 1 px hairline.
+const RAINBOW_STAR_R_FRAC: f32 = STAR_ARM * STAR_ARM_HERO;
+
+/// The landing burst star's INTEGER arm half-length (px), for a cell height and
+/// the star's own size-bounce `scale` — ONE expression, read by the emitter and
+/// by `every_plus_this_module_draws_stays_a_hairline` alike.
+///
+/// It exists because the audit and the emitter had DRIFTED while looking
+/// identical. The test recovered a ratio (`RAINBOW_STAR_R_FRAC / STAR_ARM`) and
+/// measured it through `star_arm(ch, ratio) as i32`; the emitter rounded
+/// (`r_i.round() as i32`). Both spellings agree at most cell heights, and at a
+/// 40 px cell they do not: 7.84 px of arm truncates to 7 (a 1 px bar) and rounds
+/// to 8 (a 2 px bar on a 3 px nucleus). So the test certified a hairline for a
+/// population that was drawing a fat cross — the exact failure the test exists
+/// to catch, hidden by a second spelling of "the arm". The conversion is now the
+/// family's own [`star_arm_px`], and there is one place to change it.
+fn rainbow_burst_star_arm(cell_h: f32, scale: f32) -> i32 {
+    star_arm_px(RAINBOW_STAR_R_FRAC * cell_h * scale)
+}
 
 // ---- THE ERASE POOF's ENERGY -----------------------------------------------
 //
@@ -2632,8 +2735,22 @@ const ERASE_HERO_SCALE_MIN: f32 = 0.80;
 const ERASE_HERO_SCALE_SPAN: f32 = 0.09;
 /// Size multiplier the hero grain is drawn at, from a single character to a
 /// killed line.
-const ERASE_HERO_ARM_MIN: f32 = 2.0;
-const ERASE_HERO_ARM_MAX: f32 = 3.2;
+///
+/// THINNED 2.0/3.2 → the family's own ladder (owner, 2026-08-09: "I dont want
+/// fat '+'"). Both rasterizers take a plus's arm MASS from its arm LENGTH —
+/// the additive bar is `round(2·arm·STAR_WAIST)` px thick on a
+/// `round(2·arm·STAR_CORE)` px nucleus, the source-over one `arm·STAR_WAIST`
+/// — so an arm ratio is a HEFT dial, not just a size dial. At 2.0..3.2 the
+/// hero was the ONLY mark this module draws whose arm ran past the family's
+/// 1 px hairline: at a retina cell (`ch` 32-40 px) it rasterized 2-3 px thick
+/// on a 3-5 px block, which is a typographic `+` rather than a sparkle —
+/// exactly the shape [`STAR_WAIST`]'s own doc calls "a fat cross", reached by
+/// a different road. At `STAR_ARM_STD`..[`STAR_ARM_HERO`] the hero is still
+/// visibly the poof's biggest mark and still grows with what vanished, while
+/// every size in the band rounds back to the 1 px hairline on a 1-2 px
+/// nucleus. Pinned by `every_plus_this_module_draws_stays_a_hairline`.
+const ERASE_HERO_ARM_MIN: f32 = STAR_ARM_STD;
+const ERASE_HERO_ARM_MAX: f32 = STAR_ARM_HERO;
 /// The ROUND-SPARK band, at the bottom of the GLITTER sentinel range: the
 /// poof's BODY grains spawn at [`ERASE_ROUND_SCALE`], and `emit_particles`
 /// reads anything under [`ERASE_ROUND_SCALE_MAX`] as "draw ROUND" — the
@@ -2644,8 +2761,18 @@ const ERASE_HERO_ARM_MAX: f32 = 3.2;
 /// reads as literal '+' characters typed into the buffer, and a terminal must
 /// never appear to emit glyphs it didn't. The poof keeps exactly ONE plus —
 /// the hero band above — so the accent survives while the body goes back to
-/// sparks. The middle of the glitter band (the trail's own star and the
-/// terminus melt-out, both 0.7) still draws the plus twinkle, unchanged.
+/// sparks.
+///
+/// STALE CLAIM RETIRED: this doc used to end "the middle of the glitter band
+/// (the trail's own star and the terminus melt-out, both 0.7) still draws the
+/// plus twinkle, unchanged". It does not, and has not since THE STARDUST LAW
+/// ([`star_accent`]): the 0.7 band now falls through this sentinel to the
+/// population deal in `emit_particles`, which draws round [`dust_r`] stardust
+/// unless the grain's stored seed is dealt the
+/// 1-in-[`crate::effect_util::STAR_ACCENT_DEN`]
+/// accent. The `< ERASE_ROUND_SCALE_MAX` sentinel is now the narrower
+/// statement it reads as — "this grain is poof BODY, round unconditionally"
+/// — and the hero band is the only thing that still buys a plus outright.
 const ERASE_ROUND_SCALE: f32 = 0.5;
 const ERASE_ROUND_SCALE_MAX: f32 = 0.6;
 
@@ -3065,6 +3192,30 @@ pub struct CursorGlow {
     /// paired move (one press = one snap, so a spinner can never surf one
     /// stale hint).
     return_hint: Option<Instant>,
+    /// A fresh COMPOSER-NEWLINE hint ([`Self::note_newline_break`] — an
+    /// alt-screen Shift+Enter, the chord agent composers bind to "insert a line
+    /// break without submitting").
+    ///
+    /// THE ONE SIGNAL THE GEOMETRY CANNOT CARRY. The TUI-relocation retirement
+    /// (see [`Self::retire_abandoned_light`]) retires the previous row's ribbon
+    /// on a typing-classified row change that no fold, gesture or scroll
+    /// explains, because such a change means a repaint MOVED the input line and
+    /// the light above is decorating cells that no longer hold what laid it. A
+    /// composer newline produces the identical observed move — one row down,
+    /// back to the box's left inset — and is the exact opposite case: the user
+    /// authored that line break, and the row it leaves still holds the text they
+    /// just typed. Nothing in `(pr, pc) → (cr, cc)` separates the two, which is
+    /// why this was carried as a known residual until the host started arming
+    /// the distinction.
+    ///
+    /// Shift+Enter arms the TYPED hint (the host needs the move to re-anchor
+    /// rather than meteor), so it cannot be told from a glyph echo by hint shape
+    /// either. PEEKED, never consumed, by the retirement: one press can span
+    /// several observed frames of a repainting composer, and consuming it on the
+    /// first would strand the rest. Expires after [`Self::RETURN_HINT_FRESH`] —
+    /// the same quarter-second an Enter's license lives for, because it is the
+    /// same key's gesture.
+    newline_hint: Option<Instant>,
     /// A fresh REFLOW hint ([`Self::note_reflow`] — the host committed a grid
     /// GEOMETRY change: an interactive window resize, a font-zoom re-grid, a
     /// scale-factor change): the license for the un-hinted rainbow kitty jump
@@ -3133,6 +3284,25 @@ pub struct CursorGlow {
     /// keep every hinted one-row jump's owner-mandated drama. Main screen is
     /// blink-blind (the conjunct is vacuous there).
     blink_hint: Option<Instant>,
+    /// THE SCROLL SIGNAL: the host reported a scroll ([`Self::note_scroll`])
+    /// since the last observed MOVE, and `classify_move` has not consumed it
+    /// yet.
+    ///
+    /// It exists for the TUI-relocation retirement, which asks "did the caret
+    /// change rows without the screen moving under it?". A scroll answers that
+    /// question the other way: `note_scroll` translates the anchors AND the
+    /// light together, so the caret's terminal row rises relative to the
+    /// translated anchor and the very next move looks like a one-row
+    /// relocation — while the ribbon is in fact still exactly over the text
+    /// that earned it. Retiring there would snuff a perfectly placed trail
+    /// every time a shell scrolls at the bottom of the screen, which is most
+    /// of the time.
+    ///
+    /// Consumed on the next observed move (`classify_move`), so a scroll with
+    /// no move behind it can at worst decline ONE later retirement — the
+    /// conservative direction, and the same fail-closed discipline the rest of
+    /// this module's witnesses take.
+    scroll_seen: bool,
     /// Per-frame ALT-SCREEN context ([`Self::note_context`], stamped by the
     /// host beside the row probe each frame). Gates the re-anchor's blink
     /// requirement: `false` (main screen / unwired host) keeps the shipped
@@ -3154,7 +3324,7 @@ pub struct CursorGlow {
     /// `Some((key, None))` is a memoized REFUSAL — a theme with no usable side
     /// costs one evaluation too, and re-deciding it every frame would be the
     /// same waste.
-    glyph_palette: Option<((u32, u32), Option<[u32; RAINBOW_BANDS.len()]>)>,
+    glyph_palette: Option<GlyphPaletteMemo>,
     /// ERASE MOMENTUM — the mirror of the canonical typing metric, for the
     /// gesture going the other way (owner, 2026-08-06: bring the delete poof
     /// back "with a similar momentum as forward typing").
@@ -3405,6 +3575,9 @@ struct MoveCtx<'a> {
     re_anchor: bool,
     wrap: bool,
     rainbow_coalesce: bool,
+    /// A scroll was reported between this move and the previous one — the
+    /// screen moved under the light. See [`CursorGlow::scroll_seen`].
+    scrolled: bool,
     /// `raw_dist` with wrap / re-anchor / coalesced-echo moves collapsed to 1.
     dist: f32,
     typing: bool,
@@ -3842,10 +4015,44 @@ impl CursorGlow {
     /// never punch a hole in it — one less than the four-letter ribbon
     /// guarantee, so a legitimate short fold is never cut.
     const RAINBOW_REANCHOR_KEEP: u16 = 3;
+    /// THE FOLD'S LANDING COLUMN (cells): the rightmost column a one-row-down
+    /// move may land on and still be exempted from the TUI-relocation
+    /// retirement as a genuine typewriter FOLD.
+    ///
+    /// A fold lands where a wrapped line STARTS. On a bare terminal that is
+    /// column 0, which the SHAPE classifier (`shape_wrap`) already spells for
+    /// itself; inside a TUI it is the box's LEFT INSET — a border, a padding
+    /// cell, a prompt marker — which is why the Ink wrap lands right of column
+    /// 1 and needed the hint-shaped `re_anchor` classifier at all. Eight
+    /// columns is a generous allowance for that inset (`│ > ` and then some)
+    /// and is still nowhere near an arbitrary relocation, which keeps the
+    /// caret's own column: the reported (3,20) → (4,10) repaint is a
+    /// relocation by ten cells of column, and calling it a fold is what
+    /// stranded its fragment.
+    ///
+    /// THE SAME ALLOWANCE READ FROM THE RIGHT is the fold's LAUNCH bound (see
+    /// `fold` in [`Self::retire_abandoned_light`]), and it is the half that makes
+    /// this a shape test rather than a threshold. A landing column alone is weak
+    /// evidence: `(3,20) → (4,8)` lands inside the inset allowance and is still a
+    /// plain reflow, so the bare column test kept stranding it. A fold is the
+    /// move a line makes when it RAN OUT OF ROOM, so the launch has to be at the
+    /// row's right extremity — within this same inset of the last column,
+    /// because a TUI box's right border and padding cost exactly what its left
+    /// ones do. Bare terminals never rely on it (`shape_wrap` spells its own
+    /// `pc + 2 >= cols`); it is the Ink-style inset wrap that needs the pair.
+    const RAINBOW_FOLD_LANDING_MAX: u16 = 8;
     /// …and the stranded light is retired on the FIRE/PHASER off-line timescale
     /// (their `SNUFF`): a visible gutter-out in a beat, never a hard pop, and
     /// far shorter than [`Self::RAINBOW_ABANDON_FADE`] — an abandoned band is still
     /// over its own text, this one is over cells the repaint just rewrote.
+    ///
+    /// THE RE-ANCHOR ARM'S ALONE. Its OFF-ROW sibling (added for the stranded
+    /// fragment) retires through [`Spark::fade_at`] instead, because that arm
+    /// hits sparks at arbitrary ages and a `life` clamp makes `env = f(age /
+    /// life)` step at the clamp — see the reasoning on `fade_at` itself. This
+    /// arm keeps the clamp only because it is the shipped behaviour of a
+    /// narrower case (the landing row, immediately after the caret rewrote it),
+    /// and re-timing it is not this fix's business.
     const RAINBOW_REANCHOR_SNUFF: f32 = 0.18;
     // ---- RAINBOW EASED MOMENTUM SPINE (`rainbow.disp`) ------------------------------
     /// Ribbon-momentum ATTACK ease (seconds to ~63% of a rise): a single key
@@ -4345,6 +4552,21 @@ impl CursorGlow {
         self.return_hint = Some(now);
     }
 
+    /// A COMPOSER NEWLINE landed — an alt-screen Shift+Enter, which agent
+    /// composers bind to "insert a line break without submitting" (see
+    /// [`Self::newline_hint`]).
+    ///
+    /// The host arms this on the SAME arm that arms the typed hint for that
+    /// chord, and only there: a main-screen Shift+Enter IS Enter and keeps its
+    /// meteor, a plain Enter takes [`Self::note_return`], and a modified chord
+    /// that is not a composer newline arms nothing. Never gates bytes; never
+    /// classifies as typing on its own — it only tells the ribbon's relocation
+    /// retirement that the row change it is about to see was AUTHORED, so the
+    /// line above still holds the text its trail decorates.
+    pub fn note_newline_break(&mut self, now: Instant) {
+        self.newline_hint = Some(now);
+    }
+
     /// The host committed a grid GEOMETRY change (a settled window resize, a
     /// font-zoom re-grid, a scale-factor change) — arm the REFLOW license (see
     /// [`Self::reflow_hint`]). Never gates bytes; never classifies as typing.
@@ -4592,6 +4814,10 @@ impl CursorGlow {
         if rows == 0 {
             return;
         }
+        // THE SCROLL SIGNAL (see [`Self::scroll_seen`]): the screen moved under
+        // the light, so the next observed move's row change is the scroll's, not
+        // a repaint's, and the TUI-relocation retirement must decline it.
+        self.scroll_seen = true;
         if let Some((r, c)) = self.last {
             self.last = Some((r.saturating_sub(rows), c));
         }
@@ -5038,6 +5264,7 @@ impl CursorGlow {
         self.blink_hint = None;
         self.reflow_hint = None;
         self.return_hint = None;
+        self.newline_hint = None;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
         self.last_poof = None;
@@ -6139,6 +6366,12 @@ impl CursorGlow {
         self.rainbow.ink_pops.push(InkPop {
             row,
             col,
+            // The cell avalanche the starfield uses, RE-DEALT per keystroke by
+            // the live hue phase (see the field doc): same cell, later key,
+            // different silhouette.
+            seed: (u32::from(row).wrapping_mul(73_856_093))
+                ^ (u32::from(col).wrapping_mul(19_349_663))
+                ^ self.hue.to_bits(),
             mom: self.rainbow.disp,
             born: now,
         });
@@ -6508,6 +6741,10 @@ impl CursorGlow {
             re_anchor,
             wrap,
             rainbow_coalesce,
+            // Consumed here, once per observed move: the classifier is the one
+            // place that reads it, and leaving it armed would let one scroll
+            // veto every later relocation.
+            scrolled: std::mem::take(&mut self.scroll_seen),
             dist,
             typing,
             fire,
@@ -6646,20 +6883,24 @@ impl CursorGlow {
     }
 
     /// A real jump slams the flare and forgets the rainbow kitty tail memory; the
-    /// abandoned ribbon and a backward TUI re-anchor's stranded ribbon are
-    /// retro-clamped so stale light never parks over cells the typing left.
+    /// abandoned ribbon, a backward TUI re-anchor's stranded ribbon, and a TUI
+    /// repaint's OFF-ROW stranded ribbon are retro-clamped so stale light never
+    /// parks over cells the typing left.
     fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
+            pr,
             pc,
             cr,
             cc,
             now,
             cfg,
+            geom,
             typing,
             fire,
             re_anchor,
             shape_wrap,
             navigation,
+            scrolled,
             ..
         } = mv;
         // A real jump slams the FLARE to full: Fire ignites white-hot at the leap
@@ -6738,9 +6979,12 @@ impl CursorGlow {
         // byte-identical — while the deletion arm, which has no rebuild, keeps a
         // sane anchor instead of an empty one.
         //
-        // KNOWN LIMIT: only the LANDING row is cleaned. A box that grew strands
-        // light on the row the caret is on, which is this one; light on the
-        // box's earlier rows was already snuffed by the growth that stranded it.
+        // SCOPE: this arm cleans only the LANDING row. The case it owns alone is
+        // the box-growth re-anchor (`dr == 0`), where light on the box's earlier
+        // rows was already snuffed by the growth that stranded it. A re-anchor
+        // that DID change row is picked up by the OFF-ROW arm below — the
+        // general statement — which is what reaches the BACKSPACE WRAP-BACK this
+        // arm's `cc < pc` deliberately cannot (a wrap-back lands to the RIGHT).
         // (No particle clamp here, unlike the Fire/Phaser snuff this borrows
         // from: the rainbow kitty typing path pushes no particles at spawn.)
         if matches!(cfg.style, GlowStyle::RainbowKitty) && re_anchor && !shape_wrap && cc < pc {
@@ -6754,6 +6998,229 @@ impl CursorGlow {
                 .ink_pops
                 .retain(|p| p.row != cr || p.col.abs_diff(cc) <= Self::RAINBOW_REANCHOR_KEEP);
             self.rainbow.tail = [Some((cr, cc)), None, None];
+        }
+        // TUI REPAINT RELOCATION — THE STRANDED FRAGMENT (owner, with
+        // screenshots: a one-cell rainbow ribbon fragment stranded one text row
+        // ABOVE the prompt, straddling a rule, detached from the live trail).
+        //
+        // THE OFF-ROW ARM the re-anchor arm above is a special case of. The host
+        // is a TUI that repaints and RELOCATES its whole input line by a row.
+        // Ribbon sparks are absolute `(row, col)` grid geometry and NOTHING
+        // translates them: `note_scroll` never runs (the alt screen's scrollback
+        // does not grow, so the host has nothing to report), and the observed
+        // move is chebyshev-1 — so it classified as plain TYPING and reached NO
+        // retirement arm at all. The `!typing` abandon clamp above is skipped,
+        // and the re-anchor arm needs `raw_dist > 2.0`. FIRE and PHASER snuff
+        // every off-row spark on ANY row change (`dr_abs >= 1`, see the
+        // Fire/Phaser SNUFF in the spawn path); RAINBOW KITTY had no off-row
+        // rule whatsoever, which is the whole defect.
+        //
+        // Same reasoning as the re-anchor arm and the same conservatism: we do
+        // NOT translate the ribbon a row, because the engine cannot OBSERVE that
+        // the screen shifted — translating would be a guess about someone else's
+        // glyph positions. Retiring is provably safe; moving is not.
+        //
+        // THE EXEMPTIONS, each for a row change whose PREVIOUS row still holds
+        // the glyphs the ribbon decorates:
+        //   * `!shape_wrap` — a genuine typewriter line-FOLD. The band FOLLOWS
+        //     the typing through the fold (the phaser's `phaser_wrap_follow`
+        //     carries the identical exemption for the identical reason);
+        //     snuffing here would break the trail at every wrap.
+        //   * `!re_anchor` — the Ink inset wrap, which is also a fold: its
+        //     launch row keeps the text it wrapped, and its own arm above
+        //     already owns the landing row.
+        //   * `!navigation` — a hinted Up/Down/PageUp scrub is a deliberate
+        //     gesture over text that is still there, not a repaint. Rainbow
+        //     kitty keeps its ribbon over typed letters on a scrub exactly as
+        //     it shipped; only an UNGESTURED row change is a relocation.
+        //   * `typing` — a real JUMP already takes the `!typing` arm above,
+        //     whose slower `RAINBOW_ABANDON_FADE` is deliberate ("an abandoned
+        //     band is still over its own text").
+        //
+        // What survives those exemptions is exactly a chebyshev-1 row change:
+        // `typing` means `dist <= 1.0`, and the two collapses that could forge a
+        // small `dist` out of a big move (`rainbow_coalesce`, `echo_run`) both
+        // require `cr == pr`, so with the wrap collapses excluded the raw move
+        // itself is chebyshev-1. A fold cannot hide in there — a fold's column
+        // delta spans the terminal width.
+        //
+        // THE TAIL REBASE is the other half, and without it this is COSMETIC:
+        // `rainbow.tail` still holds the PRE-relocation cells, and the
+        // four-letter re-lay in the spawn path reads it to carry the ribbon
+        // across a fold. It would find the just-clamped sparks still alive and
+        // EXTEND them in place, re-birthing the dead row for the next two
+        // keystrokes — the fragment would come back brighter than it left. Keep
+        // only the entries that are still on the caret's row; if none are (the
+        // ordinary case — the whole memory was on the row that moved), anchor at
+        // the head, which is byte-identical to what the typing path's own
+        // rebuild produces after a clear, and leaves the deletion arm (which has
+        // no rebuild) with a sane anchor instead of an empty one.
+        // THE FOLD, precisely: a row change is a fold only if it steps DOWN
+        // exactly one row AND one of the two fold classifiers claimed it. Both
+        // conjuncts are load-bearing. Dropping the direction test would exempt
+        // the BACKSPACE WRAP-BACK — a `re_anchor` that joins the caret UP to the
+        // previous visual line, whose vacated row BELOW was consumed by the join
+        // and whose ribbon is therefore stranded exactly like a relocation's
+        // (the arm above cannot reach it: its `cc < pc` narrows to backward
+        // relocations, and a wrap-back lands to the RIGHT). Dropping the
+        // classifier test would exempt every downward relocation, which is the
+        // reported bug.
+        // …AND A FOLD LANDS AT THE LEFT. `shape_wrap` says so itself (`cc <= 1`,
+        // or 1..=3 for a coalesced echo); `re_anchor` does not — it is a
+        // HINT-shaped classifier (a typed/backspace hint, one row, `raw_dist >
+        // 2`) with no opinion about where the caret came down, and it was
+        // carrying the whole fold exemption on its own. So a repaint that moved
+        // the input line one row down AND shifted its column — (3,20) → (4,10),
+        // the shape a TUI produces when its box reflows — matched `re_anchor`,
+        // was called a fold, and kept its stranded fragment. The re-anchor arm
+        // above does not reach it either: that one cleans the LANDING row only.
+        //
+        // A REAL fold lands where a wrapped line starts: column 0 on a bare
+        // terminal, or a TUI box's LEFT INSET — a border, a padding cell and a
+        // prompt marker ("│ > "), which is why the Ink case lands right of
+        // column 1 at all. [`Self::RAINBOW_FOLD_LANDING_MAX`] is a generous
+        // allowance for that inset and nothing more; past it the caret kept a
+        // column of its own, which is a relocation, not a wrap.
+        //
+        // …AND A LANDING COLUMN ALONE IS NOT THE SHAPE. That bound was fitted to
+        // the one relocation that had been reported — `(3,20) → (4,10)` — and it
+        // recognises nothing but that one's column: `(3,20) → (4,8)` is the same
+        // reflow one cell further left, lands inside the inset allowance, and was
+        // still exempted, still stranding its fragment. The classifier was
+        // overfit to its fixture, which used destination column 10 and only 10.
+        //
+        // A FOLD IS THE MOVE A LINE MAKES WHEN IT RAN OUT OF ROOM, so the
+        // EVIDENCE is the pair, not the landing: the caret has to have been at
+        // the row's RIGHT EXTREMITY (within the same inset allowance of the last
+        // column — a box's right border and padding cost what its left ones do)
+        // and to have come DOWN AND BACK to the line start. A repaint that
+        // reflows a box moves the caret from wherever it was; it does not need
+        // the previous row to have been full, and `(3,20)` in a 40-column
+        // terminal plainly was not. `cc < pc` states the "back" explicitly so a
+        // narrow terminal, where both bounds can hold at once, cannot call a
+        // sideways step a wrap.
+        let fold_launch_at_margin =
+            (pc as usize) + 1 + Self::RAINBOW_FOLD_LANDING_MAX as usize >= geom.cols;
+        let fold = cr == pr.saturating_add(1)
+            && (shape_wrap
+                || (re_anchor
+                    && cc <= Self::RAINBOW_FOLD_LANDING_MAX
+                    && cc < pc
+                    && fold_launch_at_margin));
+        // THE SCREEN DID NOT MOVE UNDER THE LIGHT. This arm's whole premise is
+        // that the caret changed rows while the glyphs stayed put — so the one
+        // thing that must veto it is the host reporting a SCROLL
+        // ([`Self::scroll_seen`]). `note_scroll` translates the anchors and the
+        // ribbon together, which makes the very next move look like a one-row
+        // relocation while the light is in fact still exactly over the text that
+        // earned it; retiring there would snuff a correctly-placed trail every
+        // time a shell scrolls at the bottom of the screen.
+        //
+        // THIS REPLACED THE REPAINT-BLINK WITNESS, and the replacement is the
+        // fix. The arm used to demand the DECTCEM-hide-inside-DEC-2026 bracket a
+        // full-redraw TUI wraps each keystroke's repaint in
+        // ([`Self::note_repaint_blink`]; Claude Code brackets every one) and
+        // called that fail-closed. But the defect is not "Claude Code strands a
+        // fragment", it is "a repaint strands a fragment", and most TUIs redraw
+        // without that particular cursor-hide choreography — vim's own status
+        // repaint, a pager, an Ink app on a terminal that reports no bracket, an
+        // ssh session where the sequence is coalesced away. Every one of those
+        // kept the reported bug, and no test noticed because the fixture always
+        // armed a blink. The general statement — a TYPING-classified caret row
+        // change, no fold, no gesture, and no scroll to explain it — is the one
+        // that describes the light being stranded, and it is still conservative:
+        // the exemptions below are what keep an ordinary caret step, an Enter, a
+        // composer's Shift+Enter and a deliberate scrub out of it.
+        let no_scroll_signal = !scrolled;
+        // ENTER IS A GESTURE, NOT A REPAINT. A bare Return from column 0 or 1 is
+        // a chebyshev-1 row change that would otherwise match this arm exactly,
+        // and the line it leaves still holds the command you just typed. Peeked,
+        // never consumed — the un-hinted jump arm owns the return license.
+        //
+        let returned = self
+            .return_hint
+            .is_some_and(|t| {
+                now.saturating_duration_since(t).as_secs_f32() <= Self::RETURN_HINT_FRESH
+            });
+        // A COMPOSER NEWLINE IS A GESTURE TOO — and it was the residual this arm
+        // shipped with, knowingly retiring light that had every right to be there.
+        //
+        // An agent composer binds Shift+Enter to "insert a line break without
+        // submitting". That is a REAL user-authored break: the row it leaves
+        // holds the words the user just typed, and the ribbon over them is the
+        // trail of typing them. But the host arms the TYPED hint on that chord
+        // (the box repaints, so the move must re-anchor rather than meteor), and
+        // the observed move — one row down, back to the box's left inset — is
+        // pixel-for-pixel the reflow relocation this arm exists to catch. The
+        // classifier above cannot separate them: `(3,20) → (4,4)` is a composer
+        // newline off a full line and a reflowed repaint off a half-full one, and
+        // the geometry is identical. Only the KEY knows.
+        //
+        // So the host says which ([`Self::note_newline_break`]). PEEKED, never
+        // consumed: a composer repaints over several observed frames and the
+        // first one must not spend the license the rest need. It is not folded
+        // into `fold` because it is not a fold — a fold's previous row ran out of
+        // room, this one was ENDED — and the two want different evidence.
+        let newline_break = self.newline_hint.is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::RETURN_HINT_FRESH
+        });
+        if matches!(cfg.style, GlowStyle::RainbowKitty)
+            && typing
+            && cr != pr
+            && !fold
+            && !navigation
+            && !returned
+            && !newline_break
+            && no_scroll_signal
+        {
+            // RETIRED WITH `fade_at`, NOT WITH A LIFE CLAMP. This module already
+            // wrote down why (see [`Spark::fade_at`]): `env` rides `age / life`,
+            // so shrinking `life` makes a spark's coverage JUMP at the instant of
+            // the clamp — it would BRIGHTEN or step the very fragment being
+            // retired, in front of the owner who reported it. `fade_at` is a
+            // separate multiplier that starts at exactly 1.0 when stamped and
+            // eases to zero over [`Self::RAINBOW_RETRACT_FADE`], so the stranded
+            // light leaves from the brightness it actually had. `get_or_insert`
+            // so a cell the exit swoosh already selected keeps its own stamp and
+            // cannot restart its fade.
+            //
+            // SCOPED TO `s.typing`, like the re-anchor arm this generalizes and
+            // unlike the Fire/Phaser snuff it borrows from. A jump's sparks are
+            // already retro-clamped to `RAINBOW_ABANDON_FADE` by the `!typing`
+            // arm above at the moment the jump happened, so they are leaving on
+            // their own schedule; re-stamping them here would change a shipped
+            // fade for a symptom nobody reported. The stranded fragment is
+            // ribbon light, and ribbon light is `typing` light.
+            // (No particle clamp, for the same reason as the arm above: the
+            // rainbow kitty typing path pushes no particles at spawn.)
+            for s in self.sparks.iter_mut() {
+                if s.typing && s.row != cr {
+                    s.fade_at.get_or_insert(now);
+                }
+            }
+            // The fresh-ink pops go with them: a pop marks the glyph a keystroke
+            // just laid, and the repaint moved that glyph off this row.
+            self.rainbow.ink_pops.retain(|p| p.row == cr);
+            // THE TAIL REBASE — HEAD FIRST, always. Keeping only the surviving
+            // same-row entries is not enough: whichever one landed in slot 0
+            // would become the ribbon's HEAD, and `rainbow_exit_swoosh` reads
+            // `tail[0]` as exactly that — so on the DELETION path, which runs no
+            // later rebuild, the swoosh would drain toward a cell the caret is
+            // not on. Anchoring at the caret and keeping the same-row history
+            // behind it is correct on every path, and on the typing path it is
+            // what that path's own rebuild would produce anyway.
+            let mut rebased = [Some((cr, cc)), None, None];
+            let mut slot = 1;
+            for cell in self.rainbow.tail.into_iter().flatten() {
+                if slot >= rebased.len() {
+                    break;
+                }
+                if cell.0 == cr && cell != (cr, cc) {
+                    rebased[slot] = Some(cell);
+                    slot += 1;
+                }
+            }
+            self.rainbow.tail = rebased;
         }
     }
 
@@ -11470,6 +11937,33 @@ impl CursorGlow {
                     }
                 }
             }
+            // THE FAN IS A POPULATION, AND THE LAW SAYS SO IN ITS OWN WORDS
+            // (owner, 2026-08-09: "many fewer of those cross sparkles").
+            //
+            // The stardust law exempts "singular gestures" from the deal and
+            // named this burst as one — but it also says, in the same
+            // paragraph, that "SINGULAR GESTURE IS A COUNT, NOT A NAME", which
+            // is exactly how the recruited gold and the glide head lost their
+            // exemptions. A landing scatters up to
+            // [`Self::RAINBOW_BURST_STARS`] = 11 full crosses in one fan, plus
+            // up to two more white/gold ones below: thirteen pluses arriving
+            // together is not one mark, it is the single densest cloud of
+            // crosses the module ever draws, and it lands on the deliberate
+            // gesture the owner is watching most closely.
+            //
+            // So the gesture keeps ONE cross — the count the exemption was
+            // always claiming — and the rest of the fan is round stardust at
+            // the same colour, count and light. Which ray carries it rides the
+            // burst's own stored seed, so it is fixed for the burst's whole
+            // life (a per-frame roll would flicker the silhouette as the fan
+            // scatters) and different landings crown a different ray.
+            //
+            // COUNT AND BRIGHTNESS ARE UNTOUCHED: every ray still lights a mark,
+            // at the same `cov`, in the same band hue, at the same place on the
+            // fan — the round ones through the family's compensated mote
+            // ([`push_dust_mote`] on dark, the stacked-alpha disc on light), so
+            // "an even bigger brighter landing" survives the shape change.
+            let hero_ray = (b.seed.abs().fract() * n as f32) as usize % n;
             for i in 0..n {
                 if out.len() >= Self::MAX_QUADS {
                     return;
@@ -11531,43 +12025,82 @@ impl CursorGlow {
                 if cov < 1.0 {
                     continue;
                 }
+                let crossed = i == hero_ray;
                 if !cfg.dark_theme {
                     // LIGHT ARM: additive light does nothing on white, so each
                     // star inverts to a DARKENED SATURATED source-over mark
                     // (contrast increase — the shared light-ink recipe), the
                     // centre over-alpha capped for legibility so it never
-                    // buries text. It draws the SAME 4-point plus the dark arm
-                    // does (`push_twinkle_over`): this used to be a round blob,
-                    // which is why a white-ground landing read as pastel
-                    // confetti while dark read as a starburst.
+                    // buries text. It draws the SAME shape the dark arm does —
+                    // the crowned ray's 4-point plus (`push_twinkle_over`), the
+                    // rest of the fan's round stardust — because a landing that
+                    // reads as a starburst on black and as pastel confetti on
+                    // white is the split this family spent a round removing.
                     // BIGGER on white. The additive star gets its presence
                     // from full-coverage pixels; the ink star has to buy the
                     // same presence with area, or a landing reads as "a handful
                     // of tiny sparkles" with "almost no luminance".
-                    self.push_twinkle_over_text_first(
-                        halos,
-                        geom,
-                        cx_i,
-                        cy_i,
-                        r_i * STAR_ARM_INK,
-                        hue,
-                        false,
-                        (cov * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
-                    );
+                    let a = (cov * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8;
+                    if crossed {
+                        self.push_twinkle_over_text_first(
+                            halos,
+                            geom,
+                            cx_i,
+                            cy_i,
+                            r_i * STAR_ARM_INK,
+                            hue,
+                            false,
+                            a,
+                        );
+                    } else {
+                        self.push_dust_mote_over_text_first(
+                            halos,
+                            geom,
+                            cx_i,
+                            cy_i,
+                            // The mote's radius off the family's stardust law,
+                            // carrying the star's own size bounce and the ink
+                            // tax the plus beside it pays.
+                            dust_r(chf, (i as f32 + 0.5) / n as f32) * scale * STAR_ARM_INK,
+                            hue,
+                            a,
+                        );
+                    }
                     continue;
                 }
                 // DARK ARM: THE SHARED TWINKLE, in this star's rainbow band hue.
                 // Same shape as the typing starfield and the glide sparkles —
                 // only the colour differs — so the landing reads as the rainbow kitty
                 // starfield flaring, not as a second star species arriving.
-                if !push_twinkle_star(
+                if crossed {
+                    if !push_twinkle_star(
+                        out,
+                        geom,
+                        cx_i.round() as i32,
+                        cy_i.round() as i32,
+                        // THE FAMILY'S OWN CONVERSION (see [`rainbow_burst_star_arm`]).
+                        // This was `(r_i.round() as i32).max(1)` — the one site in the
+                        // kit that ROUNDED an arm, which at a 40 px cell drew the fan
+                        // 2 px thick on a 3 px nucleus while the hairline audit,
+                        // truncating its own recomputed ratio, certified 1 px.
+                        rainbow_burst_star_arm(chf, scale),
+                        cov as u8,
+                        false,
+                        hue,
+                        Self::MAX_QUADS,
+                    ) {
+                        return;
+                    }
+                } else if !push_dust_mote(
                     out,
                     geom,
                     cx_i.round() as i32,
                     cy_i.round() as i32,
-                    (r_i.round() as i32).max(1),
+                    // The same dust the ribbon's starfield lays, at this star's
+                    // own size bounce: a ray's mote and its crowned neighbour
+                    // are the two silhouettes of one family, at one size.
+                    ((dust_r(chf, (i as f32 + 0.5) / n as f32) * 1.4 * scale) as i32).max(2),
                     cov as u8,
-                    false,
                     hue,
                     Self::MAX_QUADS,
                 ) {
@@ -11629,32 +12162,70 @@ impl CursorGlow {
                     // Every third sparkle is GOLD — the same accent ratio the
                     // starfield's gold gate produces at full spine.
                     let sgold = i % 3 == 0;
+                    // …AND THE SILHOUETTE IS DEALT, like every other population
+                    // in the kit (owner, 2026-08-09: "many fewer of those cross
+                    // sparkles"). These are LITERALLY the starfield's plus, and
+                    // the starfield's plus is 1-in-[`STAR_ACCENT_DEN`] — a
+                    // landing that crowns one ray with a cross and then throws
+                    // two more unconditional ones beside it has not become
+                    // rarer, only thinner. Seeded off the burst plus the index,
+                    // so the two sparkles take CONSECUTIVE residues and can
+                    // never both be crosses, and so the shape is frozen for the
+                    // burst's life like the fan's crown above.
+                    let sparkle_seed = (b.seed.abs().fract() * 4096.0) as u32 + i as u32;
+                    let scrossed = star_accent(sparkle_seed);
                     if !cfg.dark_theme {
                         // LIGHT: the same plus in ink. White/gold is invisible
                         // on white, so the light sparkle takes the GOLD half of
                         // the palette as its hue seed and lets the shared
                         // darken carry it — a warm ink fleck, distinct from the
                         // colour stars' band hues beside it.
-                        self.push_twinkle_over_text_first(
-                            halos,
-                            geom,
-                            sx as f32,
-                            sy as f32,
-                            arm_f * STAR_ARM_INK,
-                            twinkle_rgb(true),
-                            sgold,
-                            (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8,
-                        );
+                        let a = (f32::from(scov) * LIGHT_INK_GAIN).min(LIGHT_INK_ALPHA_CAP) as u8;
+                        if scrossed {
+                            self.push_twinkle_over_text_first(
+                                halos,
+                                geom,
+                                sx as f32,
+                                sy as f32,
+                                arm_f * STAR_ARM_INK,
+                                twinkle_rgb(true),
+                                sgold,
+                                a,
+                            );
+                        } else {
+                            self.push_dust_mote_over_text_first(
+                                halos,
+                                geom,
+                                sx as f32,
+                                sy as f32,
+                                dust_r(chf, (i as f32 + 0.5) / ns as f32) * STAR_ARM_INK,
+                                twinkle_rgb(true),
+                                a,
+                            );
+                        }
                         continue;
                     }
-                    if !push_twinkle_star(
+                    if scrossed {
+                        if !push_twinkle_star(
+                            out,
+                            geom,
+                            sx,
+                            sy,
+                            arm,
+                            scov,
+                            sgold,
+                            twinkle_rgb(sgold),
+                            Self::MAX_QUADS,
+                        ) {
+                            return;
+                        }
+                    } else if !push_dust_mote(
                         out,
                         geom,
                         sx,
                         sy,
-                        arm,
+                        ((dust_r(chf, (i as f32 + 0.5) / ns as f32) * 1.4) as i32).max(2),
                         scov,
-                        sgold,
                         twinkle_rgb(sgold),
                         Self::MAX_QUADS,
                     ) {
@@ -11748,7 +12319,7 @@ impl CursorGlow {
             // cyclic permutation of the ribbon's canonicalized order, and a hard
             // seam where the wrap landed. `k` runs red at the tail to violet at
             // the head for every star.
-            for k in 0..bands {
+            for (k, &hue) in RAINBOW_BANDS.iter().enumerate() {
                 if out.len() >= Self::MAX_QUADS {
                     return;
                 }
@@ -11756,7 +12327,6 @@ impl CursorGlow {
                 let f1 = (k + 1) as f32 / bands as f32;
                 let p0 = (tx + (hx - tx) * f0, ty + (hy - ty) * f0);
                 let p1 = (tx + (hx - tx) * f1, ty + (hy - ty) * f1);
-                let hue = RAINBOW_BANDS[k];
                 let c0 = (head_cov * (0.2 + 0.8 * f0)) as u8;
                 let c1 = (head_cov * (0.2 + 0.8 * f1)) as u8;
                 if c1 == 0 {
@@ -11800,28 +12370,71 @@ impl CursorGlow {
                     return;
                 }
             }
-            // WHITE-HOT twinkle HEAD (the star at the leading tip) — a small
-            // 4-point plus pulsing over the star's life.
+            // WHITE-HOT HEAD (the mark at the leading tip), pulsing over the
+            // star's life.
+            //
+            // THE STARDUST LAW, applied to the last population plus on the DARK
+            // theme that had never been dealt into it (owner, 2026-08-09: "many
+            // fewer of those cross sparkles"). This head drew a 4-point plus
+            // 1-in-1, at the family DEFAULT arm — the longest routine arm in the
+            // dark trail — and a fast glide is not one gesture: the classifier
+            // fires a star per qualifying frame up to [`Self::GLIDE_STAR_CAP`],
+            // so a single fast sweep of the cursor lays a ROW of full-size
+            // crosses across the screen. That is population light by count even
+            // though each streak reads as one object, which is exactly the
+            // distinction the law draws — and it is why the audit that exempted
+            // "shooting-star heads" as singular gestures was wrong about THIS
+            // one. (The `emit_particles` shooting star keeps its exemption: that
+            // family spawns one tip per shower, not one per frame of motion.)
+            //
+            // Dealt from the star's OWN stored birth seed — the same `g.seed`
+            // that already sets its twinkle phase — so the shape is fixed for
+            // the streak's whole life and cannot flicker between frames as the
+            // head retracts.
             if out.len() >= Self::MAX_QUADS {
                 return;
             }
             let twinkle = twinkle_env(age, g.seed * std::f32::consts::TAU);
             let hcov = (head_cov * twinkle).clamp(0.0, 255.0) as u8;
             if hcov > 0 {
-                let arm = (star_arm(chf, STAR_ARM_STD) as i32).max(1);
                 let (ix, iy) = (hx as i32, hy as i32);
-                if !push_twinkle_star(
-                    out,
-                    geom,
-                    ix,
-                    iy,
-                    arm,
-                    hcov,
-                    false,
-                    0x00FF_FFFF,
-                    Self::MAX_QUADS,
-                ) {
-                    return;
+                if !star_accent((g.seed * 4096.0) as u32) {
+                    // THE BODY — one round white-hot mote. A shooting star's tip
+                    // is a POINT of light; the plus was never what made it read
+                    // as a head (the chained rainbow tail underneath it is), so
+                    // the round mark loses nothing but the cross. Sized by the
+                    // family's stardust radius off the same seed, so no two
+                    // heads in a sweep match.
+                    //
+                    // WHITE-HOT MEANS WHITE-HOT, and one halo at `hcov` is not:
+                    // the plus this replaced stacked two arms and a nucleus on
+                    // its centre pixel, so a single radial mote at the same
+                    // coverage reads as a soft dot where a shooting star's tip
+                    // should be the hottest thing on screen. [`push_dust_halo`]
+                    // is that argument, hoisted — this site wrote the skirt+core
+                    // pair out by hand and the next three emitters to lose a plus
+                    // shipped the 1x version instead, which is exactly the class
+                    // a shared helper closes.
+                    let r = dust_r(chf, g.seed.fract().abs());
+                    push_dust_halo(halos, geom, hx, hy, r, 0x00FF_FFFF, hcov);
+                } else {
+                    // THE ACCENT — the 4-point star, at the STARFIELD GRAIN
+                    // rather than the family default: even the dealt head is a
+                    // grace note over the dust, not the boldest mark on screen.
+                    let arm = star_arm_px(star_arm(chf, STAR_ARM_FINE));
+                    if !push_twinkle_star(
+                        out,
+                        geom,
+                        ix,
+                        iy,
+                        arm,
+                        hcov,
+                        false,
+                        0x00FF_FFFF,
+                        Self::MAX_QUADS,
+                    ) {
+                        return;
+                    }
                 }
             }
         }
@@ -12050,12 +12663,6 @@ impl CursorGlow {
         halos: &mut Vec<RainHalo>,
     ) {
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
-        // The body is UNDER ink, but a bright additive background still destroys
-        // contrast against an antialiased glyph: the single structural clamp
-        // holds every body sample to [`RAINBOW_OCCUPIED_COV_CAP`] (5.37:1
-        // worst-band contrast). Light-theme rails live OUTSIDE the glyph band,
-        // so they keep their own separate 120 budget.
-        const RAINBOW_LIGHT_RAIL_COV_CAP: f32 = 120.0;
         // Opacity in the high byte, peak always FULL: constant radii.
         let (scx, scy) = geom.cell_center(s.row, s.col);
         // ONE RAIL, UNDER THE LINE — an UNDERLINE, which is what the owner
@@ -12145,7 +12752,7 @@ impl CursorGlow {
         {
             let twinkle = twinkle_env(age, (sh >> 3) as f32);
             let mom = rainbow_star_momentum(self.rainbow.disp);
-            let scov = (RAINBOW_LIGHT_RAIL_COV_CAP * retract * twinkle * mom * cfg.intensity)
+            let scov = (RAINBOW_LIGHT_SKY_COV_CAP * retract * twinkle * mom * cfg.intensity)
                 .min(LIGHT_INK_ALPHA_CAP);
             if scov >= 1.0 {
                 // A saturated sparkle hue (rolls per cell so the sky isn't
@@ -12168,9 +12775,14 @@ impl CursorGlow {
                         scov as u8,
                     );
                 } else {
-                    // The BODY: one round darkened mote — stardust in ink.
+                    // The BODY: one round darkened mote — stardust in ink, at
+                    // the alpha that reproduces the plus's STACKED centre
+                    // ([`stacked_ink_alpha`]). The accent beside it is three
+                    // coincident source-over lays; clamping this disc to the
+                    // single-lay cap made the ribbon's sky read as pale dots
+                    // around the odd crisp cross on white.
                     let dot = (InkRole::OverText.ink(hue) & 0x00FF_FFFF)
-                        | ((scov as u32).clamp(1, InkRole::OverText.alpha_cap() as u32) << 24);
+                        | (stacked_ink_alpha(scov as u8, InkRole::OverText) << 24);
                     let r = dust_r(chf, ((sh >> 17) & 0xFF) as f32 / 255.0) * STAR_ARM_INK;
                     push_halo_over(halos, geom, scx + jx, scy - chf * 1.1, r, r, dot, 255);
                 }
@@ -12562,7 +13174,7 @@ impl CursorGlow {
                     // this star (momentum only grows the arm toward it), so the
                     // drift span provably keeps the whole plus inside the
                     // landing row's band.
-                    let a_max = (star_arm(ch as f32, STAR_ARM_STD) as i32).max(1);
+                    let a_max = star_arm_px(star_arm(ch as f32, STAR_ARM_STD));
                     let span = (ch * 3 / 4 - a_max).max(1) as u32;
                     let drift = ((h >> 9) % span) as i32;
                     if sky {
@@ -12575,11 +13187,31 @@ impl CursorGlow {
                 };
                 // THE STARDUST LAW: the field's BODY is round dust — a tiny
                 // seed-sized point riding the same env/twinkle/momentum
-                // brightness — and the 4-point star is dealt to the recruited
-                // GOLD plus 1-in-8 of the hash. The plus stopped being the
+                // brightness — and the 4-point star is the dealt
+                // 1-in-[`STAR_ACCENT_DEN`] accent. The plus stopped being the
                 // population (owner, 2026-08-08: "cute small stardust ...
                 // fewer of the '+'").
-                if gold || star_accent(h >> 5) {
+                //
+                // THE GOLD EXEMPTION IS GONE, and it is the reason the DEFAULT
+                // THEME never got the thinning (owner, 2026-08-09: "many fewer
+                // of those cross sparkles" — a SECOND report, after the deal
+                // was already shipping). This read `gold || star_accent(..)`,
+                // on the family's rule that heroes stand outside the deal. But
+                // a hero is a SINGULAR GESTURE, and the recruited gold is not
+                // one: measured over a 60x200 field at full spine it is 6.3 %
+                // of every starred cell — the same order as the entire accent
+                // budget. So the dark starfield's plus share was 18.1 %, of
+                // which the deal governed only two thirds, and halving
+                // `STAR_ACCENT_DEN` alone would have moved it to 12.4 % with
+                // gold left as the majority of the crosses on screen. Dealing
+                // gold with everything else takes it to 6.5 %.
+                //
+                // GOLD KEEPS ITS IDENTITY — it is a COLOUR (and, when the deal
+                // also lands, the diagonal glint), not a silhouette. An
+                // undealt gold cell is a WARM stardust mote, which is the
+                // "occasional gold star among the white ones" the recruitment
+                // doc above promises, in the shape the owner asked for.
+                if star_accent(h >> 5) {
                     // Arm half-length breathes with the same envelope, between
                     // two NAMED ratios of the family's arm scale: the
                     // starfield grain at rest, the family default at full
@@ -12587,11 +13219,10 @@ impl CursorGlow {
                     // classic four-point sparkle — kept dim so text stays
                     // legible. Shared with the glide LANDING via
                     // `push_twinkle_star`.
-                    let a = (star_arm(
+                    let a = star_arm_px(star_arm(
                         ch as f32,
                         STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * mom,
-                    ) as i32)
-                        .max(1);
+                    ));
                     if !push_twinkle_star(
                         out,
                         geom,
@@ -12611,15 +13242,34 @@ impl CursorGlow {
                     }
                     let d = ((dust_r(ch as f32, ((h >> 17) & 0xFF) as f32 / 255.0) * 1.4) as i32)
                         .max(2);
-                    push_rect(
+                    // …in THIS cell's own half of the palette. A gold cell that
+                    // the deal passed over is a WARM mote, not a white one: the
+                    // recruitment above promises "an occasional GOLD star among
+                    // the white ones", and that promise is about the field's
+                    // colour, which must not evaporate just because the cell
+                    // drew the body silhouette instead of the accent one.
+                    //
+                    // …AT THE PLUS'S OWN COMPOSITED LIGHT. This was ONE flat rect
+                    // at `star_cov` — the same number the plus's arms are handed,
+                    // which reads as parity primitive-for-primitive and is a
+                    // 2.35x cut where it counts, because the plus stacks two arms
+                    // and a nucleus on its centre pixel
+                    // ([`crate::effect_util::STAR_STACK_ADD`]) and a
+                    // single rect stacks nothing. The owner asked for fewer
+                    // crosses and MORE light; [`push_dust_mote`] pays the
+                    // difference back as a hot core inside the skirt.
+                    if !push_dust_mote(
                         out,
                         geom,
-                        sx - d / 2,
-                        sy - d / 2,
+                        sx,
+                        sy,
                         d,
-                        d,
-                        premul_rgb(twinkle_rgb(false), star_cov),
-                    );
+                        star_cov,
+                        twinkle_rgb(gold),
+                        Self::MAX_QUADS,
+                    ) {
+                        return false;
+                    }
                 }
             }
         }
@@ -12864,6 +13514,55 @@ impl CursorGlow {
         push_twinkle_over(halos, geom, cx, cy, arm, rgb, gold, cov);
     }
 
+    /// THE ROUND STARDUST MOTE IN INK — [`push_twinkle_over`]'s body twin, under
+    /// the same text-first probe as [`Self::push_twinkle_over_text_first`].
+    ///
+    /// AND AT THE PLUS'S OWN COMPOSITED LIGHT, which is the whole reason this is
+    /// a helper and not a `push_halo_over` call at the call site. The light star
+    /// lays THREE coincident source-over marks (two arms and the nucleus), so its
+    /// centre composites to `1-(1-a)^3`; one disc at the same `a` reaches only
+    /// `a`, and swapping the shape at equal alpha is a silent 60/255 cut exactly
+    /// where the mark is loudest. Solve for the alpha that reproduces the stack,
+    /// and take the CEILING from the same place: `alpha_cap` bounds ONE lay, and
+    /// `push_twinkle_over` clamps each of its three lays to it independently, so
+    /// the plus's realized centre was `1-(1-cap)^3` — matching it can regress no
+    /// legibility budget, because it is what the plus already put on the screen.
+    /// (The identical argument, in the identical arithmetic, is written out at
+    /// the fresh-ink mote and pinned by
+    /// `the_fresh_ink_mote_keeps_the_plus_s_brightness`.)
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the mote's parameters plus the geometry the text-first probe needs — \
+                  deliberately the same list as its plus twin \
+                  [`Self::push_twinkle_over_text_first`] minus the arm/gold pair, so the \
+                  two sides of the stardust deal read as one call at every emitter"
+    )]
+    fn push_dust_mote_over_text_first(
+        &self,
+        halos: &mut Vec<RainHalo>,
+        geom: Geom,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        rgb: u32,
+        cov: u8,
+    ) {
+        if cov == 0 || r < 0.5 {
+            return;
+        }
+        let col = ((cx - f32::from(geom.origin_x)) / (geom.cw as f32).max(1.0)).floor();
+        let row = ((cy - f32::from(geom.origin_y)) / (geom.ch as f32).max(1.0)).floor();
+        if col >= 0.0
+            && (0..geom.cols as i32).contains(&(col as i32))
+            && self.probed_cell_glyph(row as i32, col as u16, geom.rows) == Some(true)
+        {
+            return;
+        }
+        const ROLE: InkRole = InkRole::OverText;
+        let dot = (ROLE.ink(rgb) & 0x00FF_FFFF) | (stacked_ink_alpha(cov, ROLE) << 24);
+        push_halo_over(halos, geom, cx, cy, r.max(1.0), r.max(1.0), dot, 255);
+    }
+
     fn emit_fresh_ink_glyphs(&self, now: Instant, cfg: &GlowConfig, charred: &mut Vec<CharFg>) {
         if !matches!(cfg.style, GlowStyle::RainbowKitty)
             || cfg.dark_theme
@@ -12975,19 +13674,15 @@ impl CursorGlow {
         // THE CARET POCKET's anchor — the same head the ribbon body clears
         // against, so the two layers dim over one shared span.
         let head_cell = self.last.or(self.last_visible.map(|(c, _)| c));
-        // THE NEWEST POP IS EXEMPT FROM THE POCKET (owner, 2026-08-06: "I still
-        // want to see an effect per character I type"). The pocket answers an
-        // EARLIER owner report ("too bright right where I was typing"), and both
-        // are satisfied at once by scoping it: what was too bright was the STACK
-        // of several fresh pops piled under the hand during a fast run, not the
-        // single character you just committed. Exempting exactly the newest pop
-        // gives every keystroke one unmistakable flash of its own while the pops
-        // behind it stay pocketed, so the stack never rebuilds.
-        //
-        // Ties (a coalesced multi-cell echo stamps one `born`) all read as
-        // newest, which is correct: that batch IS one keystroke's worth of
-        // freshly typed cells, and it is bounded by RAINBOW_TYPED_SWEEP_MAX.
-        let newest = self.rainbow.ink_pops.iter().map(|p| p.born).max();
+        // THE NEWEST POP IS THE ONE THE OWNER IS LOOKING AT (2026-08-06: "I still
+        // want to see an effect per character I type"), and it is the EMPHASIS
+        // RAMP below that delivers that now — full weight on the cell just typed,
+        // easing down a short word behind. This used to be spelled as an exemption
+        // from the caret POCKET and carried a `born`-max scan to find the newest
+        // pop; the ramp replaced the pocket and reads the head cell instead, so
+        // that scan became a value nobody consumed. Removed rather than left
+        // computed: `-D warnings` is the push gate, and a dead binding beside
+        // live prose is also how a reader is told the pocket is still here.
         for p in &self.rainbow.ink_pops {
             if (p.row as usize) >= geom.rows || (p.col as usize) >= geom.cols {
                 continue;
@@ -13093,7 +13788,9 @@ impl CursorGlow {
                 // white-ground review read as a soft stain rather than as an
                 // event: the bar is a wide radial falloff, so it can be strong
                 // without ever being CRISP. A star can. One twinkle — the same
-                // 4-point plus the trail scatters, in the same band hue — sits
+                // mark the trail scatters, in the same band hue (round stardust
+                // by default, the 4-point plus when the cell is dealt the
+                // family's accent — see the shape split at the emit) — sits
                 // in the sky above the fresh glyph, gated by the emphasis ramp
                 // so it belongs to the newest letters and fades out within a
                 // couple of cells rather than trailing a row of them.
@@ -13137,16 +13834,117 @@ impl CursorGlow {
                         .min(LIGHT_INK_ALPHA_CAP);
                     if scov >= 1.0 {
                         let dy = chf * FRESH_INK_SPARK_DY * if sky_up { -1.0 } else { 1.0 };
-                        push_twinkle_over(
-                            halos,
-                            geom,
-                            cx,
-                            cy + dy,
-                            star_arm(chf, STAR_ARM_STD * STAR_ARM_INK) * scale,
-                            band,
-                            false,
-                            scov as u8,
-                        );
+                        // THE STARDUST LAW, applied to the last mark that had
+                        // never been dealt into it (owner, 2026-08-09: "many
+                        // fewer of those cross sparkles").
+                        //
+                        // Every other star in this module is population light
+                        // and takes the family's 1-in-`STAR_ACCENT_DEN` deal;
+                        // this one drew a 4-point plus for EVERY freshly typed
+                        // character — the highest-frequency plus left in the
+                        // trail, and, at `STAR_ARM_STD * STAR_ARM_INK`, the
+                        // longest-armed routine mark of the whole kit. On a
+                        // light theme a fast run therefore walked a cross along
+                        // the sky band one glyph behind the caret, which is
+                        // precisely "a cloud of small crosses at glyph size"
+                        // arriving one at a time.
+                        //
+                        // Dealt from the CELL, not from a per-frame draw: the
+                        // pop is re-emitted every frame of its life, so a
+                        // per-frame roll would flicker between shapes mid-pop.
+                        // The same `(row, col)` avalanche the starfield uses,
+                        // so the two sky marks above one cell agree on what
+                        // that cell is.
+                        //
+                        // COUNT AND BRIGHTNESS ARE UNCHANGED — the owner asked
+                        // for more brightness, not fewer sparkles. Every pop
+                        // that lit a plus still lights a mark, at the same
+                        // `scov`, in the same band hue, in the same sky cell;
+                        // only the SILHOUETTE changes, to the round stardust
+                        // mote the owner named as the look they like. The
+                        // emphasis this mark exists to deliver survives: a
+                        // small hard-centred mote in the leading is still the
+                        // CRISP event the rail's wide falloff cannot be.
+                        // Read from the pop's own BIRTH seed (see
+                        // [`InkPop::seed`]) so the deal is per-KEYSTROKE and
+                        // frozen for the mark's life — a cell that happens to
+                        // be an accent column must not be an accent column
+                        // forever.
+                        let seed = p.seed;
+                        if star_accent(seed >> 5) {
+                            // THE ACCENT — "a few of the '+' are nice". Pulled
+                            // back from the family DEFAULT arm to the STARFIELD
+                            // GRAIN so even the surviving plus is a grace note
+                            // over the dust rather than the biggest mark in the
+                            // leading. It keeps the ink tax, which is what a
+                            // source-over star needs to register on white at
+                            // all.
+                            push_twinkle_over(
+                                halos,
+                                geom,
+                                cx,
+                                cy + dy,
+                                star_arm(chf, STAR_ARM_FINE * STAR_ARM_INK) * scale,
+                                band,
+                                false,
+                                scov as u8,
+                            );
+                        } else {
+                            // THE BODY — one round stardust mote, in ink. The
+                            // ink tax applies to a disc exactly as it does to a
+                            // star (area buys presence on white), and the
+                            // OverText role + its alpha cap are the same
+                            // legibility bounds `push_twinkle_over` would have
+                            // applied internally — this mark sits in the sky
+                            // band but is placed by cell, so it takes the
+                            // conservative role like every other flung grain.
+                            // Seeded from the SAME birth seed as the deal, so no
+                            // two motes along a typed run match — the family's
+                            // stardust never repeats a size — and so a mark
+                            // keeps one size for the pop's whole life.
+                            let r = (dust_r(chf, ((seed >> 17) & 0xFF) as f32 / 255.0)
+                                * STAR_ARM_INK
+                                * scale)
+                                .max(1.0);
+                            // BRIGHTNESS IS NOT CUT. `push_twinkle_over` lays
+                            // THREE coincident source-over marks (two arms and
+                            // the nucleus), so the plus's centre composited to
+                            // `1-(1-a)^3` while one disc at the same alpha
+                            // reaches only `a` — swapping the shape at equal
+                            // alpha would have quietly dimmed the mark the owner
+                            // asked to make BRIGHTER. Solve for the alpha that
+                            // reproduces the stacked centre.
+                            let a1 = f32::from(scov as u8) / 255.0;
+                            let stacked = 1.0 - (1.0 - a1).powi(3);
+                            // …AND THE CEILING HAS TO BE THE STACKED ONE TOO,
+                            // or the compensation is arithmetic that never
+                            // reaches the screen. `alpha_cap` bounds ONE mark;
+                            // `push_twinkle_over` clamps each of its three lays
+                            // to it INDEPENDENTLY, so the plus's realized centre
+                            // was `1-(1-cap)^3` — 250/255 at the OverText cap of
+                            // 190 — and the plus's own `scov` is already
+                            // `.min(LIGHT_INK_ALPHA_CAP)`, i.e. exactly that cap.
+                            // Clamping the disc to 190 therefore threw the
+                            // compensation away over the whole range that
+                            // matters: it survives only below `scov` 93 (where
+                            // `1-(1-a)^3 < 190/255`), and every pop that is
+                            // ACTUALLY emphatic — a fresh keystroke at full
+                            // envelope — sits above that. So the mark the owner
+                            // asked to brighten got dimmer by up to 60/255
+                            // precisely when it was meant to be loudest.
+                            //
+                            // The bound below is the same legibility budget,
+                            // stated at the layer it was always enforced at: the
+                            // PIXEL. It is what the plus already put on screen,
+                            // so matching it can regress nothing — and it is
+                            // still a hard ceiling, not 255. Pinned by
+                            // `the_fresh_ink_mote_keeps_the_plus_s_brightness`.
+                            let cap1 = InkRole::OverText.alpha_cap() / 255.0;
+                            let ceiling = (1.0 - (1.0 - cap1).powi(3)) * 255.0;
+                            let a = (stacked * 255.0).clamp(1.0, ceiling) as u32;
+                            let dot = (InkRole::OverText.ink(band) & 0x00FF_FFFF) | (a << 24);
+                            push_halo_over(halos, geom, cx, cy + dy, r, r, dot, 255);
+                        }
                     }
                 }
                 // The BIRTH bar: the wider, dimmer twin of the dark arm's birth
@@ -14257,13 +15055,19 @@ impl CursorGlow {
                         };
                         // THE STARDUST LAW: deep space is DUST with the odd
                         // star — the wake's body is round motes; a dealt
-                        // 1-in-8 keeps the 4-point twinkle, FINE.
+                        // 1-in-8 keeps the 4-point twinkle, FINE. The grain is
+                        // priced at the plus's COMPOSITED centre
+                        // ([`push_dust_halo`]): the star below it stacks three
+                        // additive lays, so one halo at the same `scov` would
+                        // make the wake's body 2.35x darker than the accent it
+                        // stands in for — a wake of dim smudges around the odd
+                        // bright cross, which is a split, not a family.
                         if !star_accent((p.hue * 4096.0) as u32) {
                             let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
-                            push_halo(halos, geom, x, y, r, r, premul_rgb(tint, scov));
+                            push_dust_halo(halos, geom, x, y, r, tint, scov);
                             continue;
                         }
-                        let arm = (star_arm(geom.ch as f32, STAR_ARM_FINE) as i32).max(1);
+                        let arm = star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE));
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -14308,15 +15112,27 @@ impl CursorGlow {
                         d,
                         premul_rgb(particle_color(), gcov),
                     );
-                    // THE STARDUST LAW: only a dealt 1-in-8 grain throws the
-                    // 4-point glint at its twinkle peak — the rest of the
-                    // tail shimmers as the dust it is (the peak still brights
-                    // the grain via `gcov`'s twinkle term). Accent glints
-                    // stay FINE.
-                    if twinkle_peak(twinkle) && star_accent((p.hue * 4096.0) as u32) {
-                        if out.len() >= Self::MAX_QUADS {
-                            return;
-                        }
+                    // Off-peak the grain is just the grain: no glint fired here
+                    // before the deal and none is owed now.
+                    if !twinkle_peak(twinkle) {
+                        continue;
+                    }
+                    // THE GLINT'S OWN COVERAGE, once, so the cross below and the
+                    // compensation beside it cannot disagree about how bright a
+                    // glint is.
+                    let glint_cov = (f32::from(gcov) * COMET_GLINT_COV) as u8;
+                    if out.len() >= Self::MAX_QUADS {
+                        return;
+                    }
+                    // THE STARDUST LAW: only a dealt 1-in-16 grain throws the
+                    // 4-point glint at its twinkle peak — the rest of the tail
+                    // shimmers as the dust it is. The glint IS one of the crosses
+                    // the owner asked to thin out (2026-08-09, "many fewer of
+                    // those cross sparkles"): `twinkle_peak` opens for ~26% of
+                    // every grain's cycle, so before the deal a hot tail was
+                    // throwing a plus off a quarter of its debris at any instant
+                    // — one of the largest cross populations in the module.
+                    if star_accent((p.hue * 4096.0) as u32) {
                         // THE ONE STAR — this glint used to be two hand-rolled
                         // `push_rect` bars, the eleventh star mark in the audit
                         // and the only one that could never grow a nucleus.
@@ -14325,15 +15141,42 @@ impl CursorGlow {
                             geom,
                             ix,
                             iy,
-                            (star_arm(geom.ch as f32, STAR_ARM_FINE) as i32).max(1),
-                            gcov / 2,
+                            star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE)),
+                            glint_cov,
                             false,
                             0x00FF_FFFF,
                             Self::MAX_QUADS,
                         ) {
                             return;
                         }
+                        continue;
                     }
+                    // …AND THE UNDEALT GRAIN IS PAID THE GLINT'S LIGHT.
+                    //
+                    // Comet is the one arm of the rarity change where NO shape
+                    // swap happened: everywhere else a plus became a round mote
+                    // and the mote was re-priced at the plus's composited centre
+                    // ([`crate::effect_util::STAR_STACK_ADD`],
+                    // [`stacked_ink_alpha`]). Here the body was already a flat
+                    // square and stayed one, so 15-in-16 grains simply LOST the
+                    // glint's extra light at their peak — the exact
+                    // "fewer crosses became dimmer" defect the owner ruled out.
+                    //
+                    // [`push_twinkle_star`] lays three coincident additive marks
+                    // at the crossing, so the glint used to put
+                    // `STAR_STACK_ADD · glint_cov` of WHITE on the grain's centre
+                    // pixel. Pay exactly that, as the one primitive the family
+                    // already uses for "the light a plus put in the middle": a
+                    // hot core over the skirt, sized like [`push_dust_mote`]'s so
+                    // the grain keeps its own edge and only its middle lights up.
+                    // White, because the glint was white — a diffraction spike
+                    // off ice reads as the highlight, not as more of the grain.
+                    let c = ((d + 1) / 2).max(1);
+                    let core = premul_rgb(
+                        0x00FF_FFFF,
+                        (f32::from(glint_cov) * STAR_STACK_ADD).min(255.0) as u8,
+                    );
+                    push_rect(out, geom, ix - c / 2, iy - c / 2, c, c, core);
                     continue;
                 }
                 // Rainbow kitty "star power": render each particle as a twinkling 4-point star
@@ -14388,13 +15231,23 @@ impl CursorGlow {
                             cov,
                         );
                         // A small twinkle head — the sparkle at the comet's tip.
+                        // Its own doc calls it "the Beam stardust plus", and
+                        // Beam's dealt accent is the STARFIELD GRAIN; at the
+                        // family DEFAULT this head was a third longer-armed than
+                        // every other star in the trail while being the one that
+                        // flies fastest across the eye. Pulled onto the grain
+                        // ratio so the shooting star's tip is a delicate sparkle
+                        // and not the boldest cross on screen (owner,
+                        // 2026-08-09: "I dont want fat '+'"). It stays 1-in-1 —
+                        // a shooting star is a singular gesture with exactly one
+                        // tip, not population light for the accent deal to thin.
                         let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                         let hcov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
                         if hcov > 0 {
                             if out.len() >= Self::MAX_QUADS {
                                 return;
                             }
-                            let arm = (star_arm(geom.ch as f32, STAR_ARM_STD) as i32).max(1);
+                            let arm = star_arm_px(star_arm(geom.ch as f32, STAR_ARM_FINE));
                             let (ix, iy) = (x as i32, y as i32);
                             if !push_twinkle_star(
                                 out,
@@ -14504,10 +15357,16 @@ impl CursorGlow {
                             // carries the crisp accent.
                             let r = (geom.ch as f32 * (0.10 + 0.05 * p.hue)).max(1.5);
                             // OVER-TEXT role: a poof grain lands wherever the
-                            // deleted span was, glyphs included.
+                            // deleted span was, glyphs included — and at the
+                            // alpha that reproduces the plus's STACKED centre
+                            // ([`stacked_ink_alpha`]), because the hero cross
+                            // this body was split away from lays three coincident
+                            // source-over marks. At the single-lay cap the
+                            // white-ground kill was one crisp plus surrounded by
+                            // dots that were up to 60/255 fainter than the mark
+                            // they replaced.
                             let dot = (InkRole::OverText.ink(sat) & 0x00FF_FFFF)
-                                | (u32::from(a).clamp(1, InkRole::OverText.alpha_cap() as u32)
-                                    << 24);
+                                | (stacked_ink_alpha(a, InkRole::OverText) << 24);
                             push_halo_over(halos, geom, x, y, r, r, dot, 255);
                             continue;
                         }
@@ -14554,13 +15413,24 @@ impl CursorGlow {
                             // already in `scov` (the twinkle sine), so the
                             // spark still glints — it just stopped
                             // spelling '+'.
+                            //
+                            // …AND AT THE PLUS'S COMPOSITED LIGHT
+                            // ([`push_dust_halo`]). Both arms that reach here
+                            // stand in for a cross: the momentum shower's grain
+                            // lost its plus to the accent deal, and the poof's
+                            // body lost its plus to [`ERASE_ROUND_SCALE_MAX`] at
+                            // the earlier rebalance. The hero plus a cell away
+                            // stacks three additive lays, so one halo at the same
+                            // `scov` put the round debris 2.35x under it and the
+                            // poof read as "a row of pale dots" beside one bright
+                            // cross.
                             let r = if round {
                                 // The poof's round body keeps its shipped size.
                                 (geom.ch as f32 * (0.09 + 0.06 * p.hue)).max(1.5)
                             } else {
                                 dust_r(geom.ch as f32, p.hue)
                             } * (0.6 + 0.4 * fade);
-                            push_halo(halos, geom, x, y, r, r, premul_rgb(tint, scov));
+                            push_dust_halo(halos, geom, x, y, r, tint, scov);
                             continue;
                         }
                         // The ACCENT (or the poof's hero): momentum still
@@ -14573,7 +15443,7 @@ impl CursorGlow {
                         } else {
                             STAR_ARM_FINE
                         };
-                        let arm = (star_arm(geom.ch as f32, ratio) as i32).max(1);
+                        let arm = star_arm_px(star_arm(geom.ch as f32, ratio));
                         let (ix, iy) = (x as i32, y as i32);
                         if !push_twinkle_star(
                             out,
@@ -14671,22 +15541,29 @@ impl CursorGlow {
                     let seed = (p.hue * 4096.0) as u32;
                     let (ix, iy) = (x as i32, y as i32);
                     match seed % 8 {
-                        1..=3 => {
-                            // THE STARDUST LAW: the pour's former star lion's
-                            // share (buckets 1-3) is round celestial dust now
-                            // — the 4-point star kept exactly ONE bucket (0,
-                            // 1-in-8) below. Brightness keeps the same
-                            // twinkle; the dust still glints, it just stopped
-                            // spelling '+'.
-                            let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
-                            let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
-                            if scov > 0 {
-                                let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
-                                push_halo(halos, geom, x, y, r, r, premul_rgb(particle_color(), scov));
-                            }
-                            continue;
-                        }
-                        0 => {
+                        // THE FAMILY'S DENOMINATOR REACHES SPARKLE (owner,
+                        // 2026-08-09: "many fewer of those cross sparkles").
+                        //
+                        // This style deals its own grammar out of an eight-way
+                        // bucket — dust, star, glitter, moon, mini-comet — so
+                        // when [`STAR_ACCENT_DEN`] went 8 → 16 for the whole
+                        // kit, the ONE population that spelled its share by
+                        // hand kept the exact 1-in-8 the owner had just
+                        // rejected. Picking `GlowStyle::Sparkle` therefore
+                        // still bought a plus every eighth grain of the pour,
+                        // which is the complaint, in a whole cursor style, with
+                        // a golden test blessing it as a known residual.
+                        //
+                        // The buckets stay — the moon and the mini-comet are
+                        // this style's grammar and are nobody else's business —
+                        // and only the STAR bucket is re-dealt: it keeps the
+                        // plus when the family's own [`star_accent`] picks the
+                        // grain and joins the dust otherwise. `seed % 16 == 0`
+                        // is a strict subset of `seed % 8 == 0`, so the pour's
+                        // plus share is exactly 1-in-16 and the half of bucket 0
+                        // that loses the cross lands on the dust arm below —
+                        // count and brightness unchanged, silhouette dealt.
+                        0 if star_accent(seed) => {
                             // Four-point star, twinkling on its own seeded phase.
                             let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
                             let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
@@ -14696,11 +15573,10 @@ impl CursorGlow {
                                 // default — the hero span retired with the
                                 // stardust law: one dealt accent per eight
                                 // grains, never a fat plus in the pour.
-                                let arm = (star_arm(
+                                let arm = star_arm_px(star_arm(
                                     geom.ch as f32,
                                     STAR_ARM_FINE + (STAR_ARM_STD - STAR_ARM_FINE) * p.hue,
-                                ) as i32)
-                                    .max(1);
+                                ));
                                 // Arms via the shared star; the glint stays local —
                                 // Sparkle's is WHITE and fires only at the twinkle
                                 // peak, unlike the helper's gold glint.
@@ -14733,6 +15609,32 @@ impl CursorGlow {
                                         push_rect(out, geom, ix + gx, iy + gy, 1, 1, glint);
                                     }
                                 }
+                            }
+                            continue;
+                        }
+                        0..=3 => {
+                            // THE STARDUST LAW: the pour's former star lion's
+                            // share (buckets 1-3) is round celestial dust — and
+                            // so is the half of bucket 0 the family's deal
+                            // passed over. Brightness keeps the same twinkle;
+                            // the dust still glints, it just stopped spelling
+                            // '+'.
+                            //
+                            // AT THE PLUS'S OWN COMPOSITED LIGHT
+                            // ([`push_dust_halo`]). This arm is where bucket 0's
+                            // re-deal LANDS, so it is the exact seam where a
+                            // rarity fix could — and did — become a brightness
+                            // cut: the grain above it stacks three additive lays
+                            // on its centre, this one used to lay ONE halo at the
+                            // same `scov`, so converting a plus to a grain dimmed
+                            // that sparkle 2.35x in the middle. That is the
+                            // brightness loss the owner rejected, arriving at a
+                            // new emitter by the back door of a rarity change.
+                            let twinkle = twinkle_env(age, p.hue * std::f32::consts::TAU);
+                            let scov = ((cov as f32) * twinkle).clamp(0.0, 255.0) as u8;
+                            if scov > 0 {
+                                let r = dust_r(geom.ch as f32, p.hue) * (0.6 + 0.4 * fade);
+                                push_dust_halo(halos, geom, x, y, r, particle_color(), scov);
                             }
                             continue;
                         }
@@ -15047,6 +15949,35 @@ fn push_rainbow_streak_over(
     }
 }
 
+/// THE ROUND GRAIN'S ALPHA IN INK — the source-over half of the stardust law's
+/// brightness statement, in one place so no light-theme emitter can re-derive it
+/// wrong.
+///
+/// [`push_twinkle_over`] lays THREE coincident source-over marks (two arms and
+/// the nucleus), so the plus's centre composites to `1-(1-a)^3` while one disc at
+/// the same `a` reaches only `a`. Swapping the shape at equal alpha is therefore
+/// a silent cut of up to ~60/255, exactly where the mark is loudest — the mark
+/// the owner asked to make BRIGHTER. Solve for the alpha that reproduces the
+/// stacked centre.
+///
+/// AND TAKE THE CEILING FROM THE SAME PLACE, or the compensation is arithmetic
+/// that never reaches the screen: [`InkRole::alpha_cap`] bounds ONE lay, and
+/// `push_twinkle_over` clamps each of its three lays to it INDEPENDENTLY, so the
+/// plus's realized centre was `1-(1-cap)^3` (250/255 at the over-text cap of
+/// 190). Clamping the disc to the single-lay cap instead would throw the
+/// compensation away over the whole range that matters — it survives only below
+/// `cov` 93 — while still being a hard ceiling, not 255. Matching what the plus
+/// already put on screen can regress no legibility budget.
+///
+/// Pinned by `the_fresh_ink_mote_keeps_the_plus_s_brightness` and
+/// `every_round_grain_composites_to_the_plus_it_replaced`.
+fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
+    let a1 = f32::from(cov.min(role.alpha_cap() as u8)) / 255.0;
+    let cap1 = role.alpha_cap() / 255.0;
+    let ceiling = (1.0 - (1.0 - cap1).powi(3)) * 255.0;
+    ((1.0 - (1.0 - a1).powi(3)) * 255.0).clamp(1.0, ceiling) as u32
+}
+
 /// THE LIGHT-THEME STAR — [`push_twinkle_star`]'s source-over twin.
 ///
 /// Additive light is invisible on paper-white, so every light arm of the
@@ -15069,6 +16000,14 @@ fn push_rainbow_streak_over(
 /// falloff ellipses instead of hard additive rects. They used to be private
 /// `LIGHT_STAR_*` constants the additive star had never heard of, so a sparkle
 /// changed shape when the theme changed.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the light star's parameter set IS `push_twinkle_star`'s, minus the \
+              quad budget it does not spend — output + geometry + centre + arm + \
+              colour + the gold accent + coverage. Grouping them into a struct \
+              here and not there would break the deliberate symmetry between the \
+              two halves of one silhouette"
+)]
 fn push_twinkle_over(
     halos: &mut Vec<RainHalo>,
     geom: Geom,
@@ -15258,6 +16197,48 @@ fn push_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, rx: f32, ry:
         });
         yy = band_end;
     }
+}
+
+/// THE ONE ROUND STARDUST GRAIN ON DARK GROUND — a radial mote drawn at the
+/// COMPOSITED LIGHT of the four-point plus it stands in for.
+///
+/// The stardust law swapped a population's silhouette, not its brightness, and
+/// on the additive arm those are not the same statement.
+/// [`push_twinkle_star`] lays THREE coincident marks on the crossing — the
+/// horizontal arm at `cov`, the vertical arm at `cov`, the nucleus at
+/// [`crate::effect_util::STAR_CORE_ADD`] — so the pixel the eye reads at a plus's centre
+/// carries [`crate::effect_util::STAR_STACK_ADD`] (2.35x) of the coverage its
+/// emitter asked for. One `push_halo` at that same `cov` peaks at `cov`: parity
+/// primitive-for-primitive, 2.35x darker in the middle. The owner asked for
+/// fewer crosses AND more light (2026-08-09, "many fewer of those cross
+/// sparkles", after 2026-08-08's "cute small stardust"), so every dealt grain
+/// that LOST its plus has to be priced against what that plus put on screen.
+///
+/// Two halos, exactly as [`crate::effect_util::push_dust_mote`] does it on the
+/// additive rect: the emitter's own SKIRT at `cov`, and a small HOT CORE at
+/// [`STAR_CORE`] of the radius carrying the rest of the stack. Paying the
+/// difference into a core rather than into the whole disc keeps the mark's TOTAL
+/// light where the plus had it — brightening the skirt to 2.35x would make the
+/// round grain 2.35x the light of the cross it replaced, which is a different
+/// wrong answer — and it keeps the mote's soft edge, which a flat 2.35x disc
+/// would blow out into a blob.
+///
+/// This is the helper the shooting-star head wrote out by hand first; every
+/// other additive stardust site now calls it, so the law has ONE spelling and a
+/// new emitter cannot quietly ship the 1x version again.
+fn push_dust_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, r: f32, rgb: u32, cov: u8) {
+    if cov == 0 {
+        return;
+    }
+    push_halo(out, geom, cx, cy, r, r, premul_rgb(rgb, cov));
+    // Floored at 1 px so the smallest grain still has a lit centre — the same
+    // floor `push_dust_mote`'s `ceil(d/2).max(1)` core carries.
+    let core = (r * STAR_CORE).max(1.0);
+    // Clamped at the byte, and the clamp is never a shortfall: above `cov` 188
+    // the skirt plus a 255 core already saturates the channel, which is what the
+    // plus's own 2.35x does anywhere above `cov` 109.
+    let hot = (f32::from(cov) * (crate::effect_util::STAR_STACK_ADD - 1.0)).min(255.0) as u8;
+    push_halo(out, geom, cx, cy, core, core, premul_rgb(rgb, hot));
 }
 
 /// Two-octave integer value-noise for the rainbow ribbon's iridescence, returned
@@ -17721,8 +18702,26 @@ mod tests {
             "the light delete sheds a saturated source-over sparkle (contrast-increasing on white)"
         );
         // Legibility: every saturated sparkle veil carries a bounded per-pixel
-        // centre cap in its high byte (bounded by LIGHT_INK_ALPHA_CAP), so it greys the surround
-        // without ever burying the ink (`aterm_render::halo_over_cap`).
+        // centre cap in its high byte, so it greys the surround without ever
+        // burying the ink (`aterm_render::halo_over_cap`).
+        //
+        // THE BOUND IS THE PIXEL'S, NOT THE PRIMITIVE'S — this assertion used to
+        // read [`LIGHT_INK_ALPHA_CAP`] straight off a single lay, which is the
+        // wrong quantity and made the round poof grain look compliant while it
+        // was 60/255 DIMMER than the hero plus standing next to it. `alpha_cap`
+        // bounds ONE lay, and the plus is THREE coincident lays each clamped to
+        // it independently, so what the plus actually put on the page was
+        // `1-(1-cap)^3` — 250/255. The round body has to reach the same pixel
+        // ([`stacked_ink_alpha`]) or the shape swap is a brightness cut, and the
+        // ceiling it is held to is that realized centre: still a hard bound,
+        // still short of 255, and by construction no looser than what this arm
+        // has been rendering all along.
+        let stacked_ceiling = stacked_ink_alpha(255, InkRole::OverText);
+        assert!(
+            stacked_ceiling < 255 && stacked_ceiling > LIGHT_INK_ALPHA_CAP as u32,
+            "fixture: the stacked ceiling ({stacked_ceiling}) must be a real \
+             bound that is nonetheless above the single-lay cap"
+        );
         assert!(
             glow.halos()
                 .iter()
@@ -17737,9 +18736,39 @@ mod tests {
                 })
                 .all(|h| {
                     let cap = (h.color >> 24) & 0xff;
-                    (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&cap)
+                    (1..=stacked_ceiling).contains(&cap)
                 }),
             "the light delete sparkle is capped for legibility"
+        );
+        // …AND THE POOF'S ROUND BODY IS AS BRIGHT AS THE HERO CROSS BESIDE IT.
+        // Same argument, same site class as the ribbon rail's sky mote: the body
+        // is one `push_halo_over` disc where the hero is three coincident
+        // `push_twinkle_over` lays, so at equal alpha the debris rendered up to
+        // 60/255 fainter than the mark it was split away from — the white-ground
+        // "row of pale dots" reading. Drawn at [`stacked_ink_alpha`] now, which
+        // is exactly the claim that some round grain carries an alpha ABOVE the
+        // single-lay cap; below it, the compensation was never applied.
+        let bodies: Vec<u32> = glow
+            .halos()
+            .iter()
+            .filter(|h| {
+                let (r, gg, b) = (
+                    (h.color >> 16) & 0xff,
+                    (h.color >> 8) & 0xff,
+                    h.color & 0xff,
+                );
+                let (mx, mn) = (r.max(gg).max(b), r.min(gg).min(b));
+                h.mode == HaloMode::Over && h.rx == h.ry && mx - mn > 30 && mx < 200
+            })
+            .map(|h| (h.color >> 24) & 0xff)
+            .collect();
+        assert!(!bodies.is_empty(), "vacuous: the poof shed no round body");
+        assert!(
+            bodies
+                .iter()
+                .any(|&a| a > InkRole::OverText.alpha_cap() as u32),
+            "every round poof grain is drawn at or under the SINGLE-lay cap \
+             ({bodies:?}) — the stacked-centre compensation never reached the poof"
         );
     }
 
@@ -23154,6 +24183,528 @@ mod tests {
         );
     }
 
+    /// The SHAPE of the row change [`relocation_probe`] drives — the ONE
+    /// variable separating the stray-fragment regression from its controls.
+    ///
+    /// The first three are all the SAME defect wearing different clothes, and
+    /// only the first was ever covered: the fixture used to relocate at the same
+    /// column with a blink always armed, which is exactly the narrow shape the
+    /// retirement's first predicate recognised.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Reloc {
+        /// The reported TUI repaint: the input line moves one row down and the
+        /// caret keeps its column.
+        SameColumn,
+        /// …the same repaint with the box REFLOWED, so the caret's column moved
+        /// too: (3,20) -> (4,`lc`). Classified `re_anchor`, which used to be
+        /// enough on its own to call the move a typewriter fold and exempt it.
+        ///
+        /// PARAMETERIZED BY THE LANDING COLUMN, because the first fix was
+        /// OVERFIT to the one column its fixture used. It exempted any hinted
+        /// one-row-down move landing at column <= 8, so `(3,20) -> (4,8)` —
+        /// the same reflow two cells further left — kept stranding its
+        /// fragment, and the test could not see it because it only ever asked
+        /// for column 10.
+        ColumnShift(u16),
+        /// CONTROL: a TUI box's own typewriter fold — the Ink inset wrap. The
+        /// line ran out of room at the box's RIGHT inset and continued at its
+        /// LEFT one, so it lands at column 4, which `shape_wrap` (column <= 1,
+        /// or <= 3 for a coalesced echo) does not recognise. Only the
+        /// hint-shaped `re_anchor` classifier reaches it, so this is the case
+        /// the fold exemption exists for — and the one a bare "landed left"
+        /// rule cannot tell from the reflows above.
+        InsetFold,
+        /// CONTROL: an agent composer's Shift+Enter — a user-authored line
+        /// break. Geometrically indistinguishable from the reflows (one row
+        /// down, back to the box's left inset, typed hint armed because the box
+        /// repaints), and the exact OPPOSITE case: the row it leaves holds the
+        /// words the user just typed, so its ribbon is over its own text.
+        /// `true` arms the host's composer-newline signal; `false` is the same
+        /// keystroke with the host silent, which is the shape that used to be
+        /// carried as a known residual.
+        ComposerNewline(bool),
+        /// …the same repaint from a TUI that redraws WITHOUT the
+        /// DECTCEM-hide-inside-sync bracket. Most of them.
+        NoBlink,
+        /// CONTROL: a genuine typewriter FOLD — type off the right edge, land at
+        /// column 0. Its previous row still holds the glyphs the ribbon
+        /// decorates, so the retirement must decline it.
+        Fold,
+        /// CONTROL: not a repaint at all — the screen SCROLLED, and
+        /// `note_scroll` translated the ribbon with the text it decorates.
+        Scroll,
+    }
+
+    /// Drive the rainbow ribbon across a ONE-ROW RELOCATION and report what is
+    /// still lit afterwards: `(vacated-row typing sparks, landing-row typing
+    /// sparks, vacated-row ink pops, vacated-row sparks RETIREMENT-STAMPED at
+    /// the move)` — the last read at the move instant, before any settling, so
+    /// "retired" can never be confused with "expired".
+    ///
+    /// Shared by the stray-fragment regression and its FOLD control so both
+    /// halves are provably the same experiment with one variable changed — the
+    /// SHAPE of the row change. Everything else (four typed keys, the same
+    /// inter-key cadence, two follow-up keys after the move, the same settle
+    /// time) is identical by construction.
+    ///
+    /// `shape` selects the move — see [`Reloc`].
+    fn relocation_probe(shape: Reloc) -> (usize, usize, usize, usize) {
+        let g = geom(); // rows:6 cols:40
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // A full-redraw TUI lives on the alt screen (Claude Code's Ink prompt).
+        glow.note_context(true);
+        // The prompt row and the four typed columns. The fold has to launch from
+        // the right edge for the wrap SHAPE detector to fire, and the
+        // column-shifted relocation has to launch far enough right that its
+        // landing column is a genuine RELOCATION rather than a box inset — so
+        // the runs differ in start column, and the ribbon they lay is the same
+        // four cells either way.
+        let row = 3u16;
+        let c0 = match shape {
+            Reloc::Fold => 35u16,
+            // The INSET fold launches from the box's RIGHT inset — the row DID
+            // run out of room, which is the evidence a fold now has to show.
+            Reloc::InsetFold => 31,
+            // …and the reflow does NOT: a caret at column 20 of a 40-column
+            // terminal had half the row still in front of it, which is exactly
+            // what separates a repaint from a wrap.
+            Reloc::ColumnShift(_) => 16,
+            _ => 10,
+        };
+        glow.tick(Some((row, c0)), t0, &c, g, &mut out);
+        for k in 1..=4u16 {
+            glow.note_typed(at(20 * u64::from(k)));
+            glow.tick(Some((row, c0 + k)), at(20 * u64::from(k)), &c, g, &mut out);
+        }
+        let laid = glow
+            .sparks
+            .iter()
+            .filter(|s| s.typing && s.row == row)
+            .count();
+        // NON-VACUOUS: the experiment is meaningless unless the ribbon really
+        // was laid on the row that is about to be vacated.
+        assert!(
+            laid >= 3,
+            "precondition: four typed keys must light the prompt row (got {laid} sparks)"
+        );
+
+        // THE REPAINT BLINK. Armed on every arm that HAS one — including the
+        // fold, because a full-redraw TUI brackets EVERY keystroke's redraw,
+        // including the one that merely wrapped a glyph, and arming it there is
+        // what makes the fold a real CONTROL. `NoBlink` is the arm that omits
+        // it: a TUI that repaints without the DECTCEM-hide-inside-sync
+        // choreography, which is most of them.
+        if shape != Reloc::NoBlink {
+            glow.note_repaint_blink(at(99));
+        }
+        // THE ROW CHANGE, and the row the ribbon is sitting on when it happens
+        // (the SCROLL arm is the one where those differ: `note_scroll`
+        // TRANSLATES the light, so the ribbon rides up with the text it
+        // decorates and the caret's terminal row is the one that stays put).
+        let (ribbon_row, land, lc) = match shape {
+            Reloc::Fold => {
+                // Typewriter fold: the fifth glyph does not fit, so the terminal
+                // wraps it to column 0 of the next row. Row 3 still holds the
+                // four glyphs the ribbon decorates.
+                glow.note_typed(at(100));
+                (row, row + 1, 0)
+            }
+            // TUI REPAINT RELOCATION: the host redraws and moves its whole input
+            // line down one row. No keystroke, no scroll (scrollback did not
+            // grow, so `note_scroll` never runs), and the caret keeps its
+            // column — chebyshev 1, which classifies as plain TYPING.
+            Reloc::SameColumn | Reloc::NoBlink => (row, row + 1, c0 + 4),
+            // …the same repaint with the box REFLOWED: (3,20) -> (4,10). The
+            // typed hint pairs with a one-row move of ten columns, which is the
+            // `re_anchor` signature — and `re_anchor` used to be accepted as a
+            // FOLD on its own, which is precisely why this shape kept its
+            // stranded fragment.
+            Reloc::ColumnShift(lc) => {
+                glow.note_typed(at(100));
+                (row, row + 1, lc)
+            }
+            // The Ink inset fold: off the box's right inset (column 35) and back
+            // to its left one (column 4). Same hint, same blink, same one-row
+            // step as the reflows — only the LAUNCH differs.
+            Reloc::InsetFold => {
+                glow.note_typed(at(100));
+                (row, row + 1, 4)
+            }
+            // Shift+Enter in a composer: the host arms the typed hint (the box
+            // repaints, so the move must re-anchor rather than meteor) and — when
+            // `armed` — the composer-newline signal beside it. The caret leaves
+            // column 14 with half the row unused, so no fold evidence exists and
+            // the geometry is a reflow's exactly.
+            Reloc::ComposerNewline(armed) => {
+                glow.note_typed(at(100));
+                if armed {
+                    glow.note_newline_break(at(100));
+                }
+                (row, row + 1, 4)
+            }
+            // NOT A REPAINT: the screen scrolled. `note_scroll` translates the
+            // anchors AND the light, so the ribbon is still exactly over its own
+            // text one row up — and the very next move looks like a one-row
+            // relocation. Retiring here would snuff a correctly placed trail.
+            Reloc::Scroll => {
+                glow.note_scroll(1);
+                glow.note_typed(at(100));
+                (row - 1, row, c0 + 5)
+            }
+        };
+        glow.tick(Some((land, lc)), at(100), &c, g, &mut out);
+        if shape != Reloc::Fold {
+            // CLASSIFICATION WITNESS. A jump slams the flare to 1.0 in
+            // `retire_abandoned_light` (`!typing`, and no nav hint is armed
+            // here), and would ALSO clear the tail by another path — which
+            // would make the tail-rebase half of the fix untestable. A cold
+            // flare is the proof that this move took the TYPING path.
+            assert!(
+                glow.flare < 0.05,
+                "precondition: {shape:?} must classify as typing, not a jump (flare {})",
+                glow.flare
+            );
+            assert!(
+                glow.rainbow.jumps.is_empty(),
+                "precondition: a typing-classified relocation throws no ZOOM streak"
+            );
+        }
+        // THE RETIREMENT STAMP, read at the instant it would have been made —
+        // before any settling can confound "retired" with "expired". A retired
+        // spark carries `fade_at`; a spark merely living out its life does not.
+        // This is what makes the FOLD control immune to timing: it can assert
+        // ZERO stamps on its previous row, which no lifetime accident can fake.
+        let stamped = glow
+            .sparks
+            .iter()
+            .filter(|s| s.typing && s.row == ribbon_row && s.fade_at.is_some())
+            .count();
+
+        // Two more keys on the NEW row, and the SECOND one is deliberately
+        // late. These drive the four-letter re-lay, which reads `rainbow.tail`
+        // — the tail-rebase ablation target.
+        //
+        // THE TIMING IS THE TEST, and it is pinned from BOTH sides.
+        //
+        // The re-lay has two paths: it EXTENDS a cell whose spark is still
+        // alive, and it MINTS a fresh spark for one whose spark is gone.
+        // Extending cannot resurrect a retired cell — the stamp rides the spark
+        // and the extension does not clear it — so a follow-up key fired while
+        // the stranded light is still fading proves nothing about the tail.
+        // Only the MINT path can put brand-new full-life light back on the dead
+        // row, and reaching it needs a key LATE enough that the retirement has
+        // already been reaped: t = 100 ms + [`RAINBOW_RETRACT_FADE`] = 230 ms.
+        //
+        // …and EARLY enough that the stale cells are still IN the tail. The
+        // memory is three slots deep and the typing path pushes the new head in
+        // on every key, so the pre-relocation cells are rolled out after exactly
+        // two more keystrokes — which is the same "next two keystrokes" window
+        // the bug report describes. A first follow-up key at 300 ms sits inside
+        // both bounds; putting it any later would make this test silently
+        // vacuous by testing a tail that had already flushed itself.
+        for (k, ms) in [(1u16, 300u64), (2, 340)] {
+            glow.note_typed(at(ms));
+            glow.tick(Some((land, lc + k)), at(ms), &c, g, &mut out);
+        }
+        // Settle past the retirement's own fade-out ([`RAINBOW_RETRACT_FADE`],
+        // 0.13 s, stamped at t=100 ms — a stamped spark is reaped once its fade
+        // has actually finished) AND past the late follow-up key that could have
+        // re-minted the dead row, but far short of a ribbon's own life, so the
+        // landing row is still unambiguously lit.
+        glow.tick(Some((land, lc + 2)), at(600), &c, g, &mut out);
+        (
+            glow.sparks
+                .iter()
+                .filter(|s| s.typing && s.row == ribbon_row)
+                .count(),
+            glow.sparks
+                .iter()
+                .filter(|s| s.typing && s.row == land)
+                .count(),
+            glow.rainbow
+                .ink_pops
+                .iter()
+                .filter(|p| p.row == ribbon_row)
+                .count(),
+            stamped,
+        )
+    }
+
+    /// THE STRANDED RAINBOW FRAGMENT (owner, with screenshots: "a one-cell
+    /// rainbow ribbon fragment sits stranded one text row ABOVE the prompt,
+    /// straddling a rule, detached from the live trail").
+    ///
+    /// The host is a TUI that repaints and RELOCATES its input line. Ribbon
+    /// sparks are addressed by absolute `(row, col)`, and nothing translated
+    /// them: FIRE and PHASER snuff every off-row spark on any row change, but
+    /// RAINBOW KITTY had no off-row rule at all. The relocation emits no scroll
+    /// (scrollback does not grow, so `note_scroll` never runs) and it is
+    /// chebyshev-1, so it classified as plain TYPING and reached NO retirement
+    /// arm: the `!typing` abandon clamp was skipped, and the re-anchor arm needs
+    /// `raw_dist > 2.0` and only ever cleaned the LANDING row.
+    ///
+    /// Both halves of the fix are load-bearing and this asserts both:
+    ///   * the OFF-ROW SNUFF retires the vacated row's light, and
+    ///   * the TAIL REBASE stops the four-letter re-lay re-minting it on the
+    ///     next two keystrokes (ablate the rebase and this test fails on the
+    ///     re-born sparks alone, which is why the two follow-up keys are here).
+    ///
+    /// The landing row is checked LIT at the same instant, so "the vacated row
+    /// is dark" can only mean retirement — never a global wipe.
+    #[test]
+    fn a_tui_relocation_retires_the_ribbon_it_stranded() {
+        let (vacated, landing, pops, stamped) = relocation_probe(Reloc::SameColumn);
+        assert_eq!(
+            vacated, 0,
+            "the relocated-away row must hold no ribbon light: {vacated} sparks stranded"
+        );
+        assert_eq!(
+            pops, 0,
+            "…nor any fresh-ink pops over cells the repaint rewrote"
+        );
+        assert!(
+            landing > 0,
+            "the LANDING row must still be lit — emptiness above is retirement, not a wipe"
+        );
+        // …and the emptiness came from the RETIREMENT specifically: the vacated
+        // row's sparks carried the stamp at the move instant. Without this a
+        // future change that merely shortened ribbon life everywhere would
+        // satisfy the count above while fixing nothing.
+        assert!(
+            stamped >= 3,
+            "the vacated row must be RETIRED at the move, not left to expire \
+             ({stamped} sparks stamped)"
+        );
+    }
+
+    /// …and the CONTROL that keeps the retirement honest: a genuine typewriter
+    /// line-FOLD is exempt. Its previous row still holds the four glyphs the
+    /// ribbon decorates, so snuffing there would break the trail at every wrap
+    /// — the exact defect `phaser_wrap_follow` exists to avoid for the phaser.
+    ///
+    /// Same probe, same cadence, same settle time; the only variable is the
+    /// SHAPE of the row change.
+    #[test]
+    fn a_typewriter_fold_keeps_its_previous_row_ribbon() {
+        let (vacated, landing, _, stamped) = relocation_probe(Reloc::Fold);
+        assert!(
+            vacated >= 3,
+            "a wrap FOLLOWS the typing through the fold: the pre-fold row keeps \
+             its ribbon (got {vacated} sparks)"
+        );
+        assert!(
+            landing > 0,
+            "…and the new row is lit too — the fold continues one ribbon"
+        );
+        // THE TIMING-PROOF HALF. `vacated >= 3` could in principle be satisfied
+        // by a fade that had simply not finished yet; a STAMP cannot. Zero
+        // stamps is the direct statement that the retirement arm declined this
+        // move — which is the exemption itself, asserted rather than inferred.
+        assert_eq!(
+            stamped, 0,
+            "a fold must not RETIRE its previous row — {stamped} sparks were stamped"
+        );
+    }
+
+    /// THE SAME DEFECT, WITH THE BOX REFLOWED — the shape the first fix could
+    /// not see.
+    ///
+    /// A TUI that repaints its input line does not always put the caret back in
+    /// the same column: reflow the box (a resize, a wrapped token, a mode line
+    /// appearing) and the prompt lands at (4,10) having left (3,20). That pairs a
+    /// fresh typed hint with a one-row move of ten columns, which is exactly the
+    /// `re_anchor` signature — and `re_anchor` alone used to be accepted as proof
+    /// of a typewriter FOLD, so the arm skipped the move and the old row kept its
+    /// fragment. (The re-anchor arm above cannot cover it either: that one cleans
+    /// the LANDING row.)
+    ///
+    /// A fold lands where a wrapped line starts, at or near column 0
+    /// ([`CursorGlow::RAINBOW_FOLD_LANDING_MAX`]); a relocation lands wherever
+    /// the box put it. That is the distinction the exemption now draws, and this
+    /// is the case that made the difference visible.
+    #[test]
+    fn a_column_shifted_relocation_retires_its_ribbon_too() {
+        let (vacated, landing, pops, stamped) = relocation_probe(Reloc::ColumnShift(10));
+        assert_eq!(
+            vacated, 0,
+            "a reflowed repaint strands its old row just as squarely: \
+             {vacated} sparks left behind"
+        );
+        assert_eq!(pops, 0, "…and its fresh-ink pops with them");
+        assert!(landing > 0, "the LANDING row must still be lit");
+        assert!(
+            stamped >= 3,
+            "the vacated row must be RETIRED at the move ({stamped} stamped)"
+        );
+    }
+
+    /// …AT EVERY LANDING COLUMN, which is the half the first fix got wrong.
+    ///
+    /// The fold exemption was rewritten as "a hinted one-row-down move landing at
+    /// column <= [`CursorGlow::RAINBOW_FOLD_LANDING_MAX`] is a fold", and the
+    /// fixture that blessed it asked for landing column 10 — one cell outside the
+    /// bound. So the predicate was never exercised on the side that mattered:
+    /// `(3,20) -> (4,8)` is the SAME reflow, lands inside the allowance, and kept
+    /// stranding its fragment exactly as reported. A classifier fitted to a
+    /// single fixture column is not a classifier.
+    ///
+    /// This walks the WHOLE range a typing-classified reflow can land on — 0
+    /// through 17, columns <= 8 emphatically included — from a launch column that
+    /// had half the row still in front of it. Every one of them is a relocation
+    /// and every one must retire. (Above 17 the move stops classifying as typing
+    /// at all: chebyshev 2 is a jump, which the `!typing` abandon arm owns and
+    /// which the probe's own flare precondition would catch.)
+    #[test]
+    fn the_reflow_retirement_holds_at_every_landing_column() {
+        for lc in 0..=17u16 {
+            let (vacated, landing, pops, stamped) = relocation_probe(Reloc::ColumnShift(lc));
+            assert_eq!(
+                vacated, 0,
+                "a reflow landing at column {lc} stranded {vacated} sparks — the \
+                 fold exemption is still reading the landing column alone"
+            );
+            assert_eq!(pops, 0, "…and its fresh-ink pops with it (column {lc})");
+            assert!(landing > 0, "the LANDING row must still be lit (column {lc})");
+            assert!(
+                stamped >= 3,
+                "column {lc}: the vacated row must be RETIRED at the move \
+                 ({stamped} stamped)"
+            );
+        }
+    }
+
+    /// A COMPOSER'S SHIFT+ENTER IS NOT A REPAINT — the legitimate trail the
+    /// widened predicate was knowingly retiring.
+    ///
+    /// Agent composers bind Shift+Enter to "insert a line break without
+    /// submitting". The user authored that break; the row it leaves still holds
+    /// the words they just typed, and the ribbon over them is the trail of typing
+    /// them. But the host arms the TYPED hint on that chord (the composer
+    /// repaints its box, so the move has to re-anchor rather than meteor), and
+    /// the observed move is one row down and back to the box's left inset —
+    /// pixel-for-pixel a reflow relocation. The retirement therefore snuffed it,
+    /// and the module wrote that down as an accepted residual.
+    ///
+    /// GEOMETRY CANNOT SEPARATE THEM, and this test is the proof: BOTH arms drive
+    /// the identical move, the identical hint, the identical cadence. The only
+    /// difference is whether the host said which key it was
+    /// ([`CursorGlow::note_newline_break`]) — so the unarmed arm is also the
+    /// standing statement that the host signal is load-bearing, not decorative.
+    #[test]
+    fn a_composer_newline_keeps_the_ribbon_it_authored() {
+        let (vacated, landing, _, stamped) = relocation_probe(Reloc::ComposerNewline(true));
+        assert!(
+            vacated >= 3,
+            "a user-authored line break leaves its own text behind: the previous \
+             row keeps its ribbon (got {vacated} sparks)"
+        );
+        assert!(landing > 0, "…and the new line is lit too");
+        assert_eq!(
+            stamped, 0,
+            "a composer newline must not RETIRE the row it wrote — {stamped} \
+             sparks were stamped"
+        );
+        // THE SIGNAL IS THE WHOLE DIFFERENCE. Same move, same typed hint, same
+        // blink, same cadence — with the host silent it is indistinguishable from
+        // a reflow and is retired, which is both the residual this closes and the
+        // proof that the exemption is not passing everything through.
+        let (unarmed, _, _, stamped_unarmed) = relocation_probe(Reloc::ComposerNewline(false));
+        assert_eq!(
+            unarmed, 0,
+            "without the host signal this move IS a reflow and must still retire \
+             ({unarmed} sparks survived) — otherwise the exemption is vacuous"
+        );
+        assert!(
+            stamped_unarmed >= 3,
+            "…retired at the move ({stamped_unarmed} stamped)"
+        );
+    }
+
+    /// …AND THE CONTROL THAT STOPS THAT FROM BEING A BLANKET RETIREMENT: a TUI
+    /// box's OWN typewriter fold, which lands at the box's left inset and so
+    /// looks exactly like the reflows above.
+    ///
+    /// This is the case the exemption exists for and the one `shape_wrap` cannot
+    /// reach — it lands at column 4, past `shape_wrap`'s column bound — so
+    /// without the hint-shaped arm the ribbon would break at every wrap inside an
+    /// Ink prompt. The ONE thing that separates it from
+    /// `the_reflow_retirement_holds_at_every_landing_column` is the LAUNCH: this
+    /// line ran out of room at the box's right inset (column 35 of 40), while
+    /// those reflows left from column 20 with half the row unused. That is the
+    /// evidence the classifier now reads, and this pair is what proves it reads
+    /// the evidence rather than the destination.
+    #[test]
+    fn a_tui_inset_fold_keeps_its_previous_row_ribbon() {
+        let (vacated, landing, _, stamped) = relocation_probe(Reloc::InsetFold);
+        assert!(
+            vacated >= 3,
+            "an inset wrap FOLLOWS the typing through the fold: the pre-fold row \
+             keeps its ribbon (got {vacated} sparks)"
+        );
+        assert!(landing > 0, "…and the new row is lit too");
+        assert_eq!(
+            stamped, 0,
+            "a fold must not RETIRE its previous row — {stamped} sparks were stamped"
+        );
+    }
+
+    /// THE SAME DEFECT, IN AN APP THAT DOES NOT BLINK — the reason the predicate
+    /// stopped asking for a repaint witness.
+    ///
+    /// The retirement used to demand the DECTCEM-hide-inside-sync bracket that
+    /// Claude Code wraps every redraw in, and called that fail-closed. But the
+    /// bug is "a repaint strands light", not "Claude Code strands light": a TUI
+    /// that redraws without that choreography — a pager, a status line, an Ink
+    /// app over a link that coalesces the sequence away — reproduced the owner's
+    /// screenshot exactly and was excluded by construction. The old fixture
+    /// armed a blink on every arm, so nothing noticed.
+    #[test]
+    fn a_repaint_without_a_blink_bracket_still_retires_its_ribbon() {
+        let (vacated, landing, pops, stamped) = relocation_probe(Reloc::NoBlink);
+        assert_eq!(
+            vacated, 0,
+            "a TUI that never brackets its redraw strands the same fragment: \
+             {vacated} sparks left behind"
+        );
+        assert_eq!(pops, 0, "…and its fresh-ink pops with them");
+        assert!(landing > 0, "the LANDING row must still be lit");
+        assert!(
+            stamped >= 3,
+            "the vacated row must be RETIRED at the move ({stamped} stamped)"
+        );
+    }
+
+    /// …and the CONTROL that the widened predicate needs most: a SCROLL is not a
+    /// relocation.
+    ///
+    /// Dropping the repaint witness costs this arm its only proof that someone
+    /// else redrew the screen, so the one event that must still veto it is the
+    /// host reporting a scroll. `note_scroll` translates the anchors AND the
+    /// ribbon together, which makes the very next move look like a one-row
+    /// relocation while the light is in fact still exactly over the text that
+    /// earned it — and that is not a corner case, it is what happens every time
+    /// a shell scrolls at the bottom of the screen. Retiring there would snuff a
+    /// correctly placed trail on most keystrokes of a full terminal.
+    #[test]
+    fn a_scroll_is_not_a_relocation_and_keeps_its_translated_ribbon() {
+        let (vacated, landing, _, stamped) = relocation_probe(Reloc::Scroll);
+        assert!(
+            vacated >= 3,
+            "the ribbon rode the scroll and is still over its own text: \
+             {vacated} sparks survived"
+        );
+        assert!(landing > 0, "…and the caret's row is lit too");
+        assert_eq!(
+            stamped, 0,
+            "a scroll must not RETIRE the light it just translated — \
+             {stamped} sparks were stamped"
+        );
+    }
+
     /// THE RIBBON'S SHAPE IS SPATIAL, NOT TEMPORAL — the guard for the "the
     /// rainbow trail isn't smooth enough" report (owner, 2026-08-04).
     ///
@@ -24577,8 +26128,11 @@ mod tests {
         // colours depended on the seed while every other small mark starts red.
         for i in 0..6 {
             let born = Instant::now();
-            let mut glow = CursorGlow::default();
-            glow.reduced_motion = true; // one static rest frame: no scatter phase
+            // one static rest frame: no scatter phase
+            let mut glow = CursorGlow {
+                reduced_motion: true,
+                ..CursorGlow::default()
+            };
             glow.rainbow.bursts.push(Starburst {
                 cx: 160.0,
                 cy: 40.0,
@@ -25434,12 +26988,30 @@ mod tests {
             }),
             "the veils are DARKENED SATURATED rainbow (contrast-increasing on white)"
         );
+        // CAPPED FOR LEGIBILITY — at the ceiling the mark ITSELF reaches on the
+        // pixel, which is the layer this budget was always enforced at.
+        //
+        // `LIGHT_INK_ALPHA_CAP` bounds ONE source-over lay, and the fan's crowned
+        // ray still obeys it lay by lay. The fan's round motes are the SINGLE lay
+        // that replaced a three-lay plus, and a plus composited its three
+        // independently-capped lays to `1-(1-cap)^3` — so pricing the disc at
+        // that stacked figure hands the screen exactly what the cross already put
+        // there, and pricing it at 190 instead would be the silent dimming of the
+        // very mark the owner asked to keep bright (the identical argument, with
+        // the identical arithmetic, at `the_fresh_ink_mote_keeps_the_plus_s_brightness`).
+        let stacked_cap = (1.0 - (1.0 - LIGHT_INK_ALPHA_CAP / 255.0).powi(3)) * 255.0;
         assert!(
             lh.iter().all(|h| {
                 let cap = (h.color >> 24) & 0xff;
-                (1..=(LIGHT_INK_ALPHA_CAP as u32)).contains(&cap)
+                (1..=(stacked_cap as u32)).contains(&cap)
             }),
             "each veil is capped for legibility"
+        );
+        // …and that ceiling is a real bound, not a formality: it is well short of
+        // opaque, so a landing star can never bury a letterform.
+        assert!(
+            stacked_cap < 252.0,
+            "the stacked ceiling {stacked_cap} has stopped bounding anything"
         );
 
         // DARK control: solid additive star fill, never a source-over veil.
@@ -25808,6 +27380,392 @@ mod tests {
         );
     }
 
+    /// NO FAT '+' (owner, 2026-08-09: "I dont want fat '+' … I really like the
+    /// current sparkles in the cursor trail in 0.14").
+    ///
+    /// A plus's HEFT is not a free parameter at the call site — both
+    /// rasterizers derive it from the arm LENGTH the emitter picks: the
+    /// additive star's bars are `star_waist_px(arm)` px thick on a
+    /// `star_core_px(arm)` px nucleus, and the source-over twin's are
+    /// `arm·STAR_WAIST` / `arm·STAR_CORE`. The family sizes those so every
+    /// ORDINARY arm rounds to the 1 px hairline that IS the stardust read
+    /// (see [`STAR_WAIST`]'s own doc), which means an emitter that reaches
+    /// past the named ladder is the only way a fat cross can come back — and
+    /// [`ERASE_HERO_ARM_MAX`] at 3.2 was exactly that: at a retina cell it
+    /// rasterized 2-3 px thick on a 3-5 px block.
+    ///
+    /// This walks the arm each of THIS module's plus populations actually hands
+    /// the star kit and pins its rasterized heft. Non-vacuous by construction:
+    /// every case asserts the arm is long enough to HAVE a thickness
+    /// (`arm >= 2`), so a population accidentally collapsed to nothing cannot
+    /// pass by drawing no star at all.
+    ///
+    /// EACH CASE MEASURES THE PRODUCTION EXPRESSION, not a re-derivation of it.
+    /// That distinction is the whole reason this test was a FALSE PASS for the
+    /// landing burst: the emitter converted its arm with `.round()` while this
+    /// census recovered a ratio and converted with `as i32`, so at a 40 px cell
+    /// the census measured a 7 px arm (1 px bar) for a population that was
+    /// drawing an 8 px one (2 px bar on a 3 px nucleus). A test that recomputes
+    /// what production computes is only ever testing its own arithmetic — so
+    /// the burst case now calls [`rainbow_burst_star_arm`], the emitter's own
+    /// function, and the rest call the family's own [`star_arm_px`].
+    #[test]
+    fn every_plus_this_module_draws_stays_a_hairline() {
+        use crate::effect_util::{star_core_px, star_waist_px};
+        // The erase poof's HERO — the module's biggest plus — at both ends of
+        // its weight band, alongside the family ratios this file passes.
+        let hero_min = STAR_ARM_STD * erase_hero_arm(ERASE_HERO_SCALE_MIN);
+        let hero_max = STAR_ARM_STD * erase_hero_arm(ERASE_HERO_SCALE_MIN + ERASE_HERO_SCALE_SPAN);
+        // `cell height -> the integer arm that population hands `push_twinkle_star``.
+        let arms: [(&str, &dyn Fn(f32) -> i32); 5] = [
+            ("poof hero, one character", &|ch| {
+                star_arm_px(star_arm(ch, hero_min))
+            }),
+            ("poof hero, killed line", &|ch| {
+                star_arm_px(star_arm(ch, hero_max))
+            }),
+            ("starfield grain", &|ch| {
+                star_arm_px(star_arm(ch, STAR_ARM_FINE))
+            }),
+            ("family default", &|ch| {
+                star_arm_px(star_arm(ch, STAR_ARM_STD))
+            }),
+            // The JUMP/GLIDE LANDING burst star. It is a whole FAN of crosses
+            // thrown at once, so it is the one path where an off-ladder arm
+            // reads as a cloud rather than as a mark — and it is the one that
+            // was measured through a second spelling of "the arm" and passed
+            // while drawing 2 px bars. Straight through the emitter's own
+            // function now, at the size-bounce PEAK (`scale == 1.0`, which is
+            // where `pop * die` sits for most of a landing's life and is
+            // exactly what reduced motion draws), so the census measures the
+            // heaviest frame the population ever reaches.
+            ("landing burst star", &|ch| rainbow_burst_star_arm(ch, 1.0)),
+        ];
+        // THE SHIPPING BAND: 24-40 px cells — roughly 12-20 pt at 2x, which is
+        // where aterm actually runs. Here the bar is absolute: every mark is
+        // the 1 px hairline on a nucleus of at most 2 px. (The 16 px test
+        // `geom()` is a low-DPI stand-in and is the EASY case — every ratio
+        // floors to 1 px there whatever it is, which is exactly how a fat cross
+        // survived a suite that only ever used it.)
+        for ch in [24.0_f32, 28.0, 32.0, 36.0, 40.0] {
+            for (name, arm_of) in arms {
+                let arm = arm_of(ch);
+                assert!(
+                    arm >= 2,
+                    "{name} at ch {ch} drew no arm to measure (arm {arm}) — \
+                     the bounds below would be vacuous"
+                );
+                assert_eq!(
+                    star_waist_px(arm),
+                    1,
+                    "{name} at ch {ch}: arm {arm} rasterizes {} px thick — a fat '+', \
+                     not a sparkle",
+                    star_waist_px(arm)
+                );
+                assert!(
+                    star_core_px(arm) <= 2,
+                    "{name} at ch {ch}: a {} px nucleus on a hairline arm is a block, \
+                     not a star centre",
+                    star_core_px(arm)
+                );
+            }
+            // …and the LIGHT twin of the hero, which pays the INK TAX on top of
+            // its ratio — the one path that can multiply past the ladder
+            // without the ladder noticing. (`hero_max` already carries the
+            // `STAR_ARM_STD` the call site multiplies in; only the tax is left.)
+            let light_arm = star_arm(ch, hero_max * STAR_ARM_INK);
+            assert!(
+                light_arm >= 2.0,
+                "the light hero at ch {ch} drew no arm to measure ({light_arm})"
+            );
+            assert!(
+                (light_arm * STAR_WAIST).max(1.0) <= 1.35,
+                "the light poof hero at ch {ch} is {} px at the waist — ink buys \
+                 presence with AREA, never with a fat cross",
+                (light_arm * STAR_WAIST).max(1.0)
+            );
+            // …and its NUCLEUS, which the waist bound does not imply: the core
+            // is a SEPARATE fraction of the same arm ([`STAR_CORE`] 0.16 against
+            // the waist's 0.10), so a mark can be hairline-armed and still carry
+            // a block at the crossing — which is half of what "fat '+'" names.
+            assert!(
+                (light_arm * STAR_CORE).max(1.0) <= 2.0,
+                "the light poof hero at ch {ch} carries a {} px nucleus — a \
+                 hairline arm through a block is still a fat cross",
+                (light_arm * STAR_CORE).max(1.0)
+            );
+        }
+        // BEYOND THE SHIPPING BAND an absolute pixel bar is the wrong test:
+        // every waist here is a FRACTION of its arm, so at a big enough cell
+        // any ratio in the family eventually rounds past 1 px — the ladder says
+        // so itself ([`STAR_WAIST`]: "only the big hero grains actually
+        // fatten"). The bar that survives at every scale is the LADDER bound:
+        // nothing this module draws may be heavier than the family's own
+        // heaviest named grain. That is exactly what 3.2 broke — it put the
+        // poof hero 2.3x past [`STAR_ARM_HERO`], which is how a hero grain
+        // became a bar-and-block instead of a big sparkle.
+        assert!(
+            hero_max <= STAR_ARM_HERO,
+            "the poof hero ({hero_max}) reaches past the family's heaviest named \
+             grain ({STAR_ARM_HERO}) — off the ladder is where fat crosses live"
+        );
+        for ch in [48.0_f32, 64.0, 80.0, 120.0] {
+            let hero_arm = star_arm_px(star_arm(ch, hero_max));
+            let ladder_arm = star_arm_px(star_arm(ch, STAR_ARM_HERO));
+            assert!(
+                ladder_arm >= 2,
+                "the ladder's own hero grain drew no arm at ch {ch} — vacuous bound"
+            );
+            // The LANDING BURST is declared to BE the ladder's hero grain
+            // ([`RAINBOW_STAR_R_FRAC`] = `STAR_ARM * STAR_ARM_HERO`), so at
+            // every cell height it must rasterize to exactly that arm — not to
+            // "one more pixel than that", which is all a second rounding rule
+            // ever cost and all it took to double the bar. Asserted as EQUALITY
+            // rather than as a bound, because the two are the same expression by
+            // construction and the only way they can differ is a conversion
+            // drifting apart again.
+            assert_eq!(
+                rainbow_burst_star_arm(ch, 1.0),
+                ladder_arm,
+                "at ch {ch} the landing burst draws a {} px arm against the family \
+                 hero grain's {ladder_arm} px — the two spellings drifted again",
+                rainbow_burst_star_arm(ch, 1.0)
+            );
+            assert!(
+                star_waist_px(hero_arm) <= star_waist_px(ladder_arm)
+                    && star_core_px(hero_arm) <= star_core_px(ladder_arm),
+                "at ch {ch} the poof hero rasterizes {}px/{}px against the family \
+                 hero grain's {}px/{}px",
+                star_waist_px(hero_arm),
+                star_core_px(hero_arm),
+                star_waist_px(ladder_arm),
+                star_core_px(ladder_arm)
+            );
+        }
+    }
+
+    /// THE FRESH-INK SPARK JOINS THE STARDUST LAW (owner, 2026-08-09: "many
+    /// fewer of those cross sparkles").
+    ///
+    /// It was the last 1-in-1 plus in the trail: a 4-point cross in the sky
+    /// above EVERY freshly typed character, at the longest arm ratio of the
+    /// whole kit (`STAR_ARM_STD * STAR_ARM_INK`). On a light theme a run of
+    /// typing therefore walked a cross along the leading, one glyph at a time —
+    /// the "cloud of small crosses at glyph size" hazard, delivered serially.
+    ///
+    /// Two halves, both asserted:
+    ///   * the SHAPE MIX — most cells now light the round stardust mote, the
+    ///     plus survives as the family's dealt accent; and
+    ///   * NOTHING WAS CUT — every cell that lit a mark before lights one now.
+    ///     The owner asked for fewer CROSSES and MORE brightness, so a fix that
+    ///     thinned the population would be the wrong fix passing the wrong test.
+    #[test]
+    fn the_fresh_ink_spark_is_stardust_with_a_dealt_plus() {
+        let g = geom();
+        // LIGHT theme — this mark is the light arm's answer to fresh-ink
+        // emphasis and does not exist on dark.
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.dark_theme = false;
+        let born = Instant::now();
+        let now = born + Duration::from_millis(40);
+        let chf = g.ch as f32;
+
+        // Park the emphasis head on ANOTHER row so every pop weighs the full
+        // 1.0 (the `_ => 1.0` arm) and each cell is judged on its own deal
+        // rather than on its distance from one caret.
+        let mut glow = CursorGlow {
+            last: Some((0, 0)),
+            ..CursorGlow::default()
+        };
+        glow.rainbow.disp = 1.0;
+        // FIVE ROWS of typing, not one. The deal is 1-in-[`STAR_ACCENT_DEN`],
+        // and at a denominator of 16 a single 40-cell row expects two or three
+        // pluses — close enough to zero that hash lumpiness alone could make
+        // "the accent survived" pass or fail by luck. 200 cells puts the
+        // expectation at ~12 and makes both bounds below statements about the
+        // LAW rather than about one row's draw.
+        let rows = 1..6u16;
+        let cells = usize::from(rows.end - rows.start) * g.cols;
+        let mut plus = 0usize;
+        let mut dust = 0usize;
+        for row in rows {
+            for col in 0..g.cols as u16 {
+                glow.rainbow.ink_pops.clear();
+                // Born through the ENGINE's own birth path, not hand-built: the
+                // shape deal is seeded there, and a hand-built pop would let a
+                // regression in the seeding sail past this census. The hue
+                // advances one step per typed cell, exactly as the ribbon
+                // advances it, so consecutive columns are dealt independently
+                // the way real typing deals them.
+                glow.hue = (glow.hue + 0.11).fract();
+                glow.born_ink_pop(row, col, born);
+                let mut halos = Vec::new();
+                glow.emit_fresh_ink(now, &c, g, &mut halos);
+                // The spark is the only mark in the SKY band: it is placed a
+                // full FRESH_INK_SPARK_DY cell off the glyph centre, while the
+                // rail bar and the birth bar both sit in the leading right
+                // under it. Select by that centre, so this census can never be
+                // fooled by the pop's own bars.
+                let cy = g.origin_y as f32 + (f32::from(row) + 0.5) * chf;
+                let sky = cy - chf * FRESH_INK_SPARK_DY;
+                let marks: Vec<_> = halos
+                    .iter()
+                    .filter(|h| (f32::from(h.cy) - sky).abs() <= 1.0)
+                    .collect();
+                match marks.len() {
+                    // `push_twinkle_over` lays arms + arms + nucleus.
+                    3 => plus += 1,
+                    // …the stardust mote is one disc.
+                    1 => dust += 1,
+                    0 => {}
+                    n => panic!("r{row} c{col}: {n} sky marks — neither a plus nor a mote"),
+                }
+            }
+        }
+        // NON-VACUOUS: the census only means something if the sparks fired at
+        // all. Every cell of every row must have lit exactly one mark.
+        assert_eq!(
+            plus + dust,
+            cells,
+            "every fresh pop must still light one sky mark ({plus} plus + {dust} dust \
+             over {cells} cells) — this fix changes SHAPE, never count"
+        );
+        // …and the plus is now the accent, not the population. The family deals
+        // 1-in-[`STAR_ACCENT_DEN`] = 6.25 %; a hash is not a perfect partition,
+        // so bound it on both sides — the point is that the plus is a small
+        // minority and has not vanished ("a few of the '+' are nice").
+        assert!(
+            plus >= 1,
+            "the accent must SURVIVE — the owner likes a few of the '+'"
+        );
+        // THE BOUND MOVED WITH THE LAW: 8 → 16 (owner, 2026-08-09: "many fewer
+        // of those cross sparkles"). At 1-in-8 this read `plus * 3 <= dust`,
+        // which the 1-in-16 mix satisfies with a factor of two to spare — i.e.
+        // it would have passed the thinning without noticing it happened, and
+        // would keep passing if the denominator were put back. `plus * 9 <=
+        // dust` is 10 % of the population, a bar 1-in-8 (12.5 %) provably fails
+        // and 1-in-16 (6.25 %) clears with margin for hash lumpiness.
+        assert!(
+            plus * 9 <= dust,
+            "the plus must be a SMALL accent, not the body: {plus} plus vs {dust} dust \
+             ({:.1} %)",
+            100.0 * plus as f32 / cells as f32
+        );
+    }
+
+    /// THE COMPENSATION HAS TO REACH THE SCREEN (the fresh-ink mote's
+    /// "BRIGHTNESS IS NOT CUT" claim, verified rather than asserted in prose).
+    ///
+    /// Swapping the plus for a mote is a SHAPE change and must not be a
+    /// brightness cut — the same owner report asked for MORE emphasis on freshly
+    /// typed characters. `push_twinkle_over` lays THREE coincident source-over
+    /// marks, so the plus's centre composited to `1-(1-a)^3`; one disc at the
+    /// same alpha reaches only `a`. The emitter solves for the alpha that
+    /// reproduces the stack — and then has to be allowed to USE it: bounding the
+    /// disc by `InkRole::OverText.alpha_cap()` (190) threw the whole
+    /// compensation away for every `scov` above 93, which is exactly the range a
+    /// freshly typed character at full envelope lives in.
+    ///
+    /// THE TWO POPS DIFFER IN ONE BIT. `scov` is computed from the cell and the
+    /// clock alone — it never reads [`InkPop::seed`] — so two pops at the SAME
+    /// `(row, col, born, mom)` whose seeds fall on opposite sides of the deal
+    /// are the same mark at the same brightness in two silhouettes. That makes
+    /// the comparison exact instead of statistical. (Hand-built here for that
+    /// reason; the ENGINE's seeding is what
+    /// `the_fresh_ink_spark_is_stardust_with_a_dealt_plus` covers.)
+    #[test]
+    fn the_fresh_ink_mote_keeps_the_plus_s_brightness() {
+        let g = geom();
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.dark_theme = false;
+        // Full intensity: the compensation is a HIGH-alpha phenomenon (it is
+        // arithmetically inert below `scov` 93), so a dim sample would make this
+        // test vacuous. The precondition below proves we actually got there.
+        c.intensity = 1.0;
+        let born = Instant::now();
+        let now = born + Duration::from_millis(40);
+        let (row, col) = (3u16, 12u16);
+
+        // seed 0 → `star_accent(0 >> 5)` is true → the dealt PLUS.
+        // seed 32 → `star_accent(32 >> 5) == star_accent(1)` is false → the MOTE.
+        let sky_marks = |seed: u32| -> Vec<RainHalo> {
+            let glow = CursorGlow {
+                last: Some((0, 0)), // emphasis head off-row → every pop weighs 1.0
+                rainbow: RainbowState {
+                    disp: 1.0,
+                    ink_pops: vec![InkPop {
+                        row,
+                        col,
+                        seed,
+                        mom: 1.0,
+                        born,
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut halos = Vec::new();
+            glow.emit_fresh_ink(now, &c, g, &mut halos);
+            let cy = g.origin_y as f32 + (f32::from(row) + 0.5) * g.ch as f32;
+            let sky = cy - g.ch as f32 * FRESH_INK_SPARK_DY;
+            halos
+                .into_iter()
+                .filter(|h| (f32::from(h.cy) - sky).abs() <= 1.0)
+                .collect()
+        };
+        let alpha = |h: &RainHalo| (h.color >> 24) & 0xff;
+
+        let plus = sky_marks(0);
+        let mote = sky_marks(32);
+        // NON-VACUOUS, part 1: the two seeds really did deal opposite shapes.
+        assert_eq!(plus.len(), 3, "seed 0 must deal the plus (arms + nucleus)");
+        assert_eq!(mote.len(), 1, "seed 32 must deal the round mote");
+        // …and they really are the same mark at the same brightness underneath:
+        // all three of the plus's lays carry ONE alpha, which is the `scov` both
+        // shapes were priced from.
+        let cap = alpha(&plus[0]);
+        assert!(
+            plus.iter().all(|h| alpha(h) == cap),
+            "the plus's three lays must share one alpha to compare against"
+        );
+        // NON-VACUOUS, part 2: the sample is IN the range where the old ceiling
+        // bit. `1-(1-a)^3 > 190/255` needs `a > 93`; below that the clamp was
+        // never reached and this test would prove nothing.
+        assert!(
+            cap > 93,
+            "vacuous sample: at alpha {cap} the stacked centre never reached the \
+             old ceiling, so no compensation was being clamped away"
+        );
+
+        // THE CLAIM: the mote's single lay reproduces the plus's COMPOSITED
+        // centre, to within the 1/255 the byte can express.
+        let stacked = 1.0 - (1.0 - f32::from(cap as u8) / 255.0).powi(3);
+        let want = stacked * 255.0;
+        let got = alpha(&mote[0]) as f32;
+        assert!(
+            (got - want).abs() <= 1.5,
+            "the mote lands at alpha {got} where the plus's centre composited to \
+             {want} — the shape swap dimmed the mark"
+        );
+        // …and the DIRECT statement of the bug: the compensation now survives.
+        // Clamped to `alpha_cap` this was exactly 190 and the mote was up to
+        // 60/255 darker than the plus it replaced.
+        assert!(
+            got > LIGHT_INK_ALPHA_CAP,
+            "the compensation is being clamped away again: alpha {got} sits at or \
+             under the single-mark ceiling {LIGHT_INK_ALPHA_CAP}"
+        );
+        // …but it is still BOUNDED, and by the plus's own realized ceiling —
+        // `1-(1-190/255)^3`, not 255. A mark that may composite over a
+        // letterform never gets a free pass to opaque.
+        let ceiling = (1.0 - (1.0 - LIGHT_INK_ALPHA_CAP / 255.0).powi(3)) * 255.0;
+        assert!(
+            got <= ceiling + 0.5,
+            "alpha {got} passed the stacked ceiling {ceiling} the plus itself \
+             could reach — that is a new legibility cost, not parity"
+        );
+    }
+
     /// TASK 5 P1 — the SHOOTING-STAR shower (the `cov_scale > 1.25` rainbow kitty comet)
     /// is LIGHT-MODE FORKED: DARK draws the additive `comet_beam` + twinkle head
     /// (GlowQuads); LIGHT inverts it to a DARKENED SATURATED rainbow source-over
@@ -25903,6 +27861,117 @@ mod tests {
         assert!(
             twinkle,
             "the light ribbon twinkles (a compact saturated source-over dot in the sky)"
+        );
+        // NOT COVERED HERE, deliberately: the sky's ROUND body mote's ALPHA (it
+        // is priced at [`stacked_ink_alpha`], not at the single lay it asks for)
+        // cannot be witnessed through a whole tick. Every candidate filter
+        // (round, saturated, a row above the caret, under the arm's own coverage
+        // ceiling) also admits marks from the crown and the fresh-ink pop, so an
+        // assertion written here would pass with the site reverted. That law is
+        // pinned instead by `rainbow_light_sky_mote_is_priced_as_a_plus`, which
+        // drives THIS emitter directly and sees nothing else.
+    }
+
+    /// THE SKY MOTE'S PRICE, at the emitter that draws it (owner, 2026-08-09:
+    /// "many fewer of those cross sparkles" — and no dimmer for it).
+    ///
+    /// The light ribbon's sky twinkle deals 15-in-16 of its sparkles to a ROUND
+    /// mote instead of the 4-point plus. [`push_twinkle_over`] lays THREE
+    /// coincident source-over marks, so a plus's centre composites to
+    /// `1−(1−a)³` while one disc at the same `a` reaches only `a`: drawing the
+    /// mote at the coverage it asks for is a silent cut of up to ~60/255 exactly
+    /// where the mark is loudest. [`stacked_ink_alpha`] is the compensation and
+    /// this pins that the CALL SITE actually applies it.
+    ///
+    /// ISOLATION IS THE WHOLE POINT. Driven through a tick, this emitter's dot
+    /// is indistinguishable from the crown's and the fresh-ink pop's marks —
+    /// round, saturated, above the caret, under the same ceiling — so every
+    /// filter tried there passed with the site reverted (see the note in
+    /// `rainbow_light_ribbon_twinkles`). Calling `emit_rainbow_rails_light`
+    /// directly leaves exactly two halos on the table: the rail below the row
+    /// and the sky mote above it. Nothing else can satisfy the assertion.
+    ///
+    /// THE BRACKET IS THE MUTATION PROOF, and it is built from named constants
+    /// rather than from a copy of the emitter's arithmetic. The coverage this
+    /// emitter can ask for is `RAINBOW_LIGHT_SKY_COV_CAP · twinkle · mom ·
+    /// intensity`; pinned at full momentum and full intensity, that is the
+    /// closed interval `[CAP · TWINKLE_FLOOR, CAP]`. The mote's alpha must be
+    /// the stacked price of a coverage in that band — which lies ENTIRELY ABOVE
+    /// the band itself, so a site that emitted the raw coverage (the revert)
+    /// lands under the lower bound and fails.
+    #[test]
+    fn rainbow_light_sky_mote_is_priced_as_a_plus() {
+        use crate::effect_util::TWINKLE_FLOOR;
+        let g = geom();
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.dark_theme = false;
+        // Pin the two scalars that are not this law's business, so the coverage
+        // band below is exactly the twinkle envelope's own range.
+        c.intensity = 1.0;
+        let mut glow = CursorGlow::default();
+        glow.rainbow.disp = 1.0; // full spine ⇒ `rainbow_star_momentum` == 1
+        // (row 2, col 6) is dealt into the 1-in-6 starfield gate AND onto the
+        // BODY side of `star_accent` — a round mote, not a plus. Row 2 also puts
+        // the sky mark (1.1 cells above the row) inside the effects box, so
+        // nothing is clipped away.
+        let s = Spark {
+            row: 2,
+            col: 6,
+            born_cov: 200,
+            pos: 0.5,
+            life: 4.0,
+            typing: true,
+            hue: 0.0,
+            born: Instant::now(),
+            fade_at: None,
+        };
+        let mut halos = Vec::new();
+        // `retract` = 1 (not retracting), `cov_f` above the caller's visibility
+        // floor, mid-life so the rail's edge envelope is fully open.
+        glow.emit_rainbow_rails_light(&s, 0.30, 0.5, 1.0, 60.0, &c, g, &mut halos);
+        // NON-VACUOUS, and the isolation claim stated as an assertion: this
+        // emitter drew its rail AND its sky mote and nothing else at all.
+        assert_eq!(
+            halos.len(),
+            2,
+            "the light arm of one swept cell is exactly a rail and a sky twinkle"
+        );
+        let (scx, scy) = g.cell_center(s.row, s.col);
+        let mote = halos
+            .iter()
+            .find(|h| f32::from(h.cy) < scy)
+            .expect("the sky mote sits ABOVE the row; the rail sits below it");
+        assert!(
+            mote.mode == HaloMode::Over && mote.rx == mote.ry,
+            "the dealt body is a ROUND source-over grain: {}x{}",
+            mote.rx,
+            mote.ry
+        );
+        assert!(
+            (f32::from(mote.cx) - scx).abs() <= g.cw as f32,
+            "the mote stays within its own cell's column"
+        );
+        let a = (mote.color >> 24) & 0xff;
+        // The stacked price of the DIMMEST and BRIGHTEST coverage the emitter
+        // can reach here. `stacked_ink_alpha` is monotone, so this brackets the
+        // mote exactly — no slack, no epsilon.
+        let lo = stacked_ink_alpha(
+            (RAINBOW_LIGHT_SKY_COV_CAP * TWINKLE_FLOOR) as u8,
+            InkRole::OverText,
+        );
+        let hi = stacked_ink_alpha(RAINBOW_LIGHT_SKY_COV_CAP as u8, InkRole::OverText);
+        assert!(
+            (lo..=hi).contains(&a),
+            "the sky mote must be drawn at the plus's STACKED centre: got {a}, \
+             expected {lo}..={hi}"
+        );
+        // …and that bracket is only a proof because it sits clear of the raw
+        // coverage band. If this ever stops holding, the assertion above has
+        // gone vacuous and a reverted call site would slip through it.
+        assert!(
+            lo > RAINBOW_LIGHT_SKY_COV_CAP as u32,
+            "the stacked price must exceed EVERY single-lay coverage this \
+             emitter can ask for ({lo} vs {RAINBOW_LIGHT_SKY_COV_CAP})"
         );
     }
 
@@ -26132,53 +28201,1193 @@ mod tests {
         );
     }
 
-    /// THE STARDUST LAW's population census (owner, 2026-08-08: "cute small
-    /// stardust ... fewer of the '+' like sparkles"; the check the 2026-08-06
-    /// rebalance lacked, which is how the star-kit unification silently made
-    /// every trail mark a plus). Across a full-spine ribbon the 4-point stars
-    /// — counted by their silhouette: the one wide hairline bar each star
-    /// pushes — must stay under the promised ≤15% of the emitted population;
-    /// the body is round dust (small near-square points and radial motes).
-    /// Any future star-kit refactor that routes the population back through
-    /// the plus fails HERE, not in the owner's eyes.
+    /// THE STARDUST LAW's population census ON THE DEFAULT THEME (owner,
+    /// 2026-08-08: "cute small stardust ... fewer of the '+' like sparkles";
+    /// then again 2026-08-09: "many fewer of those cross sparkles"). This is
+    /// the DARK ribbon starfield — the mark a typist on the shipped theme
+    /// actually watches, several per keystroke, for the whole session.
+    ///
+    /// THE SECOND REPORT IS WHY THIS TEST WAS REWRITTEN. Its first form ran a
+    /// 40-cell ribbon on the 16 px test `geom()` and counted "a wide hairline
+    /// bar" as `w >= 4` against "a near-square point" as `w == q.h && w <= 6`.
+    /// At `ch` 16 a starfield arm is 1-2 px, so the bar it was looking for is
+    /// 3-5 px wide — half the pluses fell out of the numerator — while the
+    /// 1x1 nucleus and the four 1x1 gold GLINTS all landed in the denominator
+    /// as "dust". It therefore scored ~11 % for a field that was really 20.8 %
+    /// plus, and its ≤15 % bar passed comfortably through both the defect and
+    /// the owner's complaint about it.
+    ///
+    /// SO: a 24-row field at a SHIPPING cell height (32 px), where the two
+    /// silhouettes are unambiguous — an arm is 7-9 px wide and exactly 1 px
+    /// tall, a mote is a 3-5 px square, and the 1x1 nucleus/glint fragments
+    /// match neither — and 600 swept cells instead of 40, so the share is a
+    /// measurement rather than a coin toss.
+    ///
+    /// MEASURED: 20.8 % plus before this round (`STAR_ACCENT_DEN` 8 with the
+    /// recruited GOLD exempt from the deal), 6.7 % after (denominator 16, gold
+    /// dealt like everything else) — over an identical 178-mark population.
+    ///
+    /// THE BRIGHTNESS HALF MEASURES PIXELS, NOT PRIMITIVES — and that is the
+    /// second rewrite this test has needed. It used to compare the brightest
+    /// QUEUED QUAD of each silhouette, which is a quantity nobody looks at: a
+    /// plus lays two full-coverage arms and a nucleus on ONE pixel, so its
+    /// composited centre carries [`crate::effect_util::STAR_STACK_ADD`] (2.35x) of
+    /// the coverage its
+    /// arms report, while a one-lay mote at the same coverage reports parity and
+    /// renders 2.35x darker. The old assertion passed at every step of that cut.
+    /// So the marks are RASTERIZED here — additively, saturating at the byte, the
+    /// way the renderer composites them — and the light compared is the light on
+    /// screen.
+    ///
+    /// ONE CELL PER EMISSION, 600 of them, which is what makes both halves exact:
+    /// each `out` then holds exactly one mark, so a cell can be classified by its
+    /// own silhouette and rasterized in isolation (no neighbour's arm bleeding
+    /// into its peak), and the quad budget cannot truncate the census.
     #[test]
     fn stardust_is_the_body_the_plus_is_the_accent() {
+        // A SHIPPING cell (32 px ≈ 16 pt at 2x), so the silhouettes separate.
+        let g = Geom {
+            cw: 8,
+            ch: 32,
+            rows: 30,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 960,
+            head: 0,
+        };
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let born = Instant::now();
+        // One swept cell's sky marks. Full spine (`disp` 1.0): momentum recruits
+        // extra star cells (and used to recruit the GOLD ones, every one of which
+        // was an unconditional plus) and the arm breathing peaks — the
+        // plus-heaviest the field ever gets.
+        let emit_cell = |row: u16, col: u16| -> Vec<GlowQuad> {
+            let mut glow = CursorGlow::default();
+            glow.sparks.clear();
+            glow.sparks.push(Spark {
+                row,
+                col,
+                born_cov: 255,
+                pos: 0.9,
+                life: 1.0,
+                typing: true,
+                hue: 0.0,
+                born,
+                fade_at: None,
+            });
+            glow.rainbow.disp = 1.0;
+            glow.rainbow.phase = 0.0;
+            let mut out = Vec::new();
+            glow.emit_rainbow(
+                born + Duration::from_millis(500),
+                &c,
+                g,
+                &mut Vec::new(),
+                &mut out,
+                &mut Vec::new(),
+            );
+            out
+        };
+        // THE RENDERER'S OWN ARITHMETIC: additive light, per channel, saturating
+        // at the byte. Returns `(peak pixel channel, total light over the mark)`
+        // — the centre the eye reads, and the mark's whole contribution.
+        let raster = |qs: &[GlowQuad]| -> (u32, u64) {
+            let mut px: std::collections::HashMap<(u32, u32), [u32; 3]> =
+                std::collections::HashMap::new();
+            for q in qs {
+                let lay = [
+                    (q.color >> 16) & 0xff,
+                    (q.color >> 8) & 0xff,
+                    q.color & 0xff,
+                ];
+                for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
+                    for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
+                        let e = px.entry((xx, yy)).or_insert([0; 3]);
+                        for ch in 0..3 {
+                            e[ch] = (e[ch] + lay[ch]).min(255);
+                        }
+                    }
+                }
+            }
+            let peak = px
+                .values()
+                .map(|c| c[0].max(c[1]).max(c[2]))
+                .max()
+                .unwrap_or(0);
+            let total: u64 = px.values().map(|c| u64::from(c[0] + c[1] + c[2])).sum();
+            (peak, total)
+        };
+        // THE COVERAGE THE EMITTER ASKED FOR, read off the mark's own widest lay:
+        // a plus's ARM (7-9 px of hairline, against a 1 px nucleus) and a mote's
+        // SKIRT (9-25 px, against a ≤9 px core) are each their silhouette's
+        // largest quad by area, and both carry `star_cov` verbatim. It is the
+        // only per-mark normalizer the two shapes share, and it is what lets the
+        // composited light below be compared MARK FOR MARK instead of as two
+        // population averages — which matters here: the shape deal reads
+        // `h >> 5` while the twinkle phase reads `h >> 3`, so the dealt crosses
+        // are NOT a fair sample of the field's coverage distribution (measured:
+        // their mean coverage runs ~12 % hot), and a raw mean-vs-mean bar would
+        // have to swallow that bias to pass.
+        let requested = |qs: &[GlowQuad]| -> u32 {
+            qs.iter()
+                .max_by_key(|q| u32::from(q.w) * u32::from(q.h))
+                .map(|q| ((q.color >> 16) & 0xff).max((q.color >> 8) & 0xff).max(q.color & 0xff))
+                .unwrap_or(0)
+        };
+        // A plus is the only silhouette with an ARM: `2·arm+1` (7 or 9) px wide
+        // and exactly 1 px tall at this cell height. A mote's skirt is a 3-5 px
+        // square and its hot core smaller still, so neither can forge one.
+        let (mut plus, mut dust) = (Vec::new(), Vec::new());
+        for row in 1..16u16 {
+            for col in 0..g.cols as u16 {
+                let marks = emit_cell(row, col);
+                if marks.is_empty() {
+                    continue;
+                }
+                let (peak, total) = raster(&marks);
+                let lit = (peak, total, requested(&marks));
+                if marks.iter().any(|q| q.h == 1 && q.w >= 7) {
+                    plus.push(lit);
+                } else {
+                    dust.push(lit);
+                }
+            }
+        }
+        let (np, nd) = (plus.len(), dust.len());
+        let pop = np + nd;
+        // NON-VACUOUS: a real population, or every bound below is free.
+        assert!(
+            pop > 100,
+            "the full-spine field must emit a real population, got {pop}"
+        );
+        assert!(nd > 0, "the body must be dust, not plus");
+        assert!(
+            np >= 1,
+            "the accent must SURVIVE — the owner likes a few of the '+'"
+        );
+        // THE SHARE. 10 % is chosen to sit BETWEEN the two shipping states:
+        // 20.8 % (before) fails it and 6.7 % (after) clears it with margin, so
+        // this bar actually discriminates the fix. The old ≤15 % bar did not —
+        // 20.8 % would have failed it too if the filter had been able to see
+        // the pluses, which is the deeper reason it passed.
+        assert!(
+            np * 10 <= pop,
+            "the plus is the ACCENT: {np} crosses in a population of {pop} \
+             ({:.1} %) — the dark starfield went back to texture",
+            100.0 * np as f32 / pop as f32
+        );
+        // …AND NOTHING WAS CUT, measured on the COMPOSITED PIXELS.
+        //
+        // THE CENTRE, mark for mark. This is what "the sparkles got dimmer"
+        // actually means: a plus stacks two arms and a nucleus on one pixel, so
+        // its composited centre is [`crate::effect_util::STAR_STACK_ADD`] times the
+        // coverage it asked
+        // for, and a mote has to reach the same. Asserted over EVERY mark of both
+        // populations — the plus half proves the constant really describes the
+        // cross (so the bar cannot be met by weakening the reference), the dust
+        // half is the fix. The 2/255 slack is the byte rounding in `premul_rgb`
+        // and the `as u8` truncation of the core's share, nothing else.
+        let stacked =
+            |req: u32| (crate::effect_util::STAR_STACK_ADD * req as f32).min(255.0);
+        for (name, pop) in [("cross", &plus), ("mote", &dust)] {
+            for &(peak, _, req) in pop.iter() {
+                assert!(
+                    f64::from(peak) + 2.0 >= f64::from(stacked(req)),
+                    "a {name} asked for {req} of coverage and composited to {peak} \
+                     where the family's stack is {:.0} — the mark is under-lit",
+                    stacked(req)
+                );
+            }
+        }
+        // THE WHOLE MARK, not only its centre: a mote that matched the peak on
+        // one pixel and shed the rest of the plus's mass would still read as a
+        // thinner field. Normalized by each mark's own requested coverage for the
+        // reason given above, so this compares SHAPES rather than two unequal
+        // draws from the twinkle.
+        let light_per_cov = |pop: &[(u32, u64, u32)]| -> f64 {
+            pop.iter()
+                .map(|&(_, total, req)| total as f64 / f64::from(req.max(1)))
+                .sum::<f64>()
+                / pop.len() as f64
+        };
+        let (pt, dt) = (light_per_cov(&plus), light_per_cov(&dust));
+        assert!(pt > 0.0, "vacuous: the cross population emitted no light");
+        assert!(
+            dt >= pt,
+            "a mote lays {dt:.1} of composited light per unit of coverage against \
+             the plus's {pt:.1} — the field lost light in the swap"
+        );
+    }
+
+    /// THE JUMP LANDING JOINS THE DEAL (owner, 2026-08-09: "many fewer of those
+    /// cross sparkles").
+    ///
+    /// A landing fan was exempt as a "singular gesture" — and at
+    /// [`CursorGlow::RAINBOW_BURST_STARS`] it throws ELEVEN full 4-point crosses
+    /// at once, plus up to two more white/gold ones beside them. Thirteen pluses
+    /// arriving together is the densest cloud of crosses the module draws, on the
+    /// deliberate gesture the owner is most likely to be looking straight at; the
+    /// law's own words are that "a singular gesture is a COUNT, not a NAME".
+    ///
+    /// So the gesture keeps ONE cross and the rest of the fan is round stardust.
+    /// Three halves, all asserted: the COUNT is unchanged (every ray still lights
+    /// exactly one mark — checked by rasterizing the fan and counting connected
+    /// components of lit pixels, which no shape can fake), the CROSS is down to
+    /// one, and the LIGHT THEME draws the same mix rather than forking into a
+    /// different grammar.
+    ///
+    /// (The round mote's composited-brightness parity is `push_dust_mote`'s own
+    /// law and is pinned mark-for-mark by
+    /// `stardust_is_the_body_the_plus_is_the_accent`; this test is about the
+    /// deal.)
+    #[test]
+    fn the_jump_landing_fan_keeps_exactly_one_cross() {
+        // A SHIPPING cell (32 px): the fan's arm is 13 px wide and 1 px tall,
+        // the motes are 3-5 px squares, and nothing else is in the stream.
+        let g = Geom {
+            cw: 8,
+            ch: 32,
+            rows: 30,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 960,
+            head: 0,
+        };
+        let born = Instant::now();
+        // u ≈ 0.49 — chosen deliberately: past the impact FLASH
+        // ([`RAINBOW_LAND_FLASH_SPAN`] of a 0.72 s life ends at 0.30 s), which is
+        // a mark of the landing and not of the fan, and short of the death
+        // shrink at u 0.6, so every star is at full size. The fan is then the
+        // only thing in either stream.
+        let mid = born + Duration::from_millis(350);
+        let n = CursorGlow::RAINBOW_BURST_STARS;
+        let burst = |seed: f32, stars: u8, sparkles: u8| Starburst {
+            cx: 160.0,
+            cy: 480.0,
+            born,
+            life: CursorGlow::RAINBOW_BURST_LIFE,
+            reach: 2.0 * g.ch as f32,
+            seed,
+            stars,
+            sparkles,
+        };
+        let emit = |dark: bool, b: Starburst| -> (Vec<GlowQuad>, Vec<RainHalo>) {
+            let mut c = cfg(GlowStyle::RainbowKitty, true);
+            c.dark_theme = dark;
+            let mut glow = CursorGlow::default();
+            glow.rainbow.bursts.push(b);
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_rainbow_starburst(mid, &c, g, &mut out, &mut halos);
+            (out, halos)
+        };
+        // HOW MANY MARKS ARE ON SCREEN — counted as CONNECTED COMPONENTS of lit
+        // pixels, not as quads. A quad count cannot answer this: `push_fx_rect`
+        // splits every mark at the cell-row boundary, a plus is three lays and a
+        // mote is two, so only the rasterized picture says how many separate
+        // marks the fan actually put down. The rays scatter a full `reach`
+        // apart, so no two marks can touch.
+        let marks = |qs: &[GlowQuad]| -> usize {
+            let mut px: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+            for q in qs {
+                for yy in i32::from(q.y)..i32::from(q.y) + i32::from(q.h) {
+                    for xx in i32::from(q.x)..i32::from(q.x) + i32::from(q.w) {
+                        px.insert((xx, yy));
+                    }
+                }
+            }
+            let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+            let mut count = 0usize;
+            for &p in &px {
+                if seen.contains(&p) {
+                    continue;
+                }
+                seen.insert(p);
+                let mut stack = vec![p];
+                let mut size = 1usize;
+                while let Some((x, y)) = stack.pop() {
+                    for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let q2 = (x + dx, y + dy);
+                        if px.contains(&q2) && seen.insert(q2) {
+                            size += 1;
+                            stack.push(q2);
+                        }
+                    }
+                }
+                // A MARK, not a speck: the gold star's four diffraction GLINTS
+                // are 1x1 dots thrown clear of their own arms, and they are a
+                // decoration ON a mark rather than marks of their own. Every
+                // real mark here is at least an arm (7 px) or a skirt (9 px).
+                if size > 1 {
+                    count += 1;
+                }
+            }
+            count
+        };
+        // A 4-point star's horizontal ARM: 13 px wide, exactly 1 px tall. A
+        // mote's widest lay is 5 px.
+        let crosses = |qs: &[GlowQuad]| qs.iter().filter(|q| q.h == 1 && q.w >= 7).count();
+
+        // DARK: the full fan, no sparkles, so the stream is the fan alone.
+        let (out, _) = emit(true, burst(0.3, n as u8, 0));
+        assert_eq!(
+            marks(&out),
+            n,
+            "every ray must still light exactly one mark — the deal changes \
+             SHAPE, never count"
+        );
+        assert_eq!(
+            crosses(&out),
+            1,
+            "the landing keeps ONE cross, not {n} of them"
+        );
+        // …and the crown MOVES with the burst, so a landing is not always
+        // crowned on the same ray (which would read as a fixed spoke).
+        let mut crowned = std::collections::HashSet::new();
+        for k in 0..n {
+            let seed = (k as f32 + 0.1) / n as f32;
+            let (o, _) = emit(true, burst(seed, n as u8, 0));
+            assert_eq!(crosses(&o), 1, "seed {seed}: exactly one cross");
+            // Which ray it is, by the arm's own x — the fan is an even ring, so
+            // distinct rays land at distinct x.
+            let x = o
+                .iter()
+                .find(|q| q.h == 1 && q.w >= 7)
+                .map(|q| q.x)
+                .unwrap_or(0);
+            crowned.insert(x);
+        }
+        assert!(
+            crowned.len() >= 3,
+            "the crowned ray must ride the burst seed — {} distinct rays over \
+             {n} landings",
+            crowned.len()
+        );
+
+        // LIGHT: the same mix, in ink. Marks are counted by DISTINCT CENTRES
+        // (a plus lays three coincident halos and every lay row-splits, so
+        // counting halos would count neither), and a cross is the only mark with
+        // an ELONGATED lay — its arms are `arm x waist`, while a mote is a disc.
+        let (lo, lh) = emit(false, burst(0.3, n as u8, 0));
+        assert!(lo.is_empty(), "the light arm emits no additive light");
+        let centres: std::collections::HashSet<(u16, u16)> =
+            lh.iter().map(|h| (h.cx, h.cy)).collect();
+        let cross_centres: std::collections::HashSet<(u16, u16)> = lh
+            .iter()
+            .filter(|h| h.rx != h.ry)
+            .map(|h| (h.cx, h.cy))
+            .collect();
+        assert_eq!(
+            centres.len(),
+            n,
+            "every ray lights one mark on white too ({} centres)",
+            centres.len()
+        );
+        assert_eq!(
+            cross_centres.len(),
+            1,
+            "the light landing keeps ONE cross as well ({} found)",
+            cross_centres.len()
+        );
+
+        // THE LANDING SPARKLES take the family's own deal. Driven with a
+        // single-ray fan (which is always the crowned one), so the fan
+        // contributes exactly one cross and everything above it is the
+        // sparkles' doing.
+        //
+        // Seed 0.3 → `(0.3 · 4096) = 1228`, and 1228 ≡ 12 (mod 16): neither
+        // sparkle is dealt, so the landing shows the fan's cross alone. Seed
+        // 16/4096 → 16 ≡ 0: the FIRST sparkle is dealt and the second (17) is
+        // not, which is the consecutive-residue property that stops a landing
+        // from ever throwing two.
+        let (undealt, _) = emit(true, burst(0.3, 1, 2));
+        assert_eq!(
+            crosses(&undealt),
+            1,
+            "an undealt pair of sparkles adds no cross to the landing"
+        );
+        assert_eq!(
+            marks(&undealt),
+            3,
+            "…but they are still THERE, as round dust (one fan mark + two)"
+        );
+        let (dealt, _) = emit(true, burst(16.0 / 4096.0, 1, 2));
+        assert_eq!(
+            crosses(&dealt),
+            2,
+            "a DEALT sparkle keeps its cross — the accent still exists"
+        );
+        assert_eq!(marks(&dealt), 3, "…and the count is the same either way");
+    }
+
+    /// THE SPARKLE POUR JOINS THE DEAL — the residual a golden test had blessed
+    /// (owner, 2026-08-09: "many fewer of those cross sparkles").
+    ///
+    /// `GlowStyle::Sparkle` deals its grain shapes from an eight-way `seed % 8`
+    /// bucket of its own, so when the family halved [`STAR_ACCENT_DEN`] this one
+    /// population never heard about it: bucket 0 was the star, unconditionally,
+    /// which is the exact 1-in-8 the owner had just rejected — for anyone whose
+    /// cursor style is Sparkle, on every keystroke, in every pour. The previous
+    /// round SAW this (its golden test says so in prose) and recorded it as a
+    /// known residual rather than fixing it, which left the complaint live in a
+    /// whole cursor style.
+    ///
+    /// Two halves, as always — the DEAL is exact and the COUNT is unchanged:
+    ///   * the star bucket now asks [`star_accent`], and because `seed % 16 == 0`
+    ///     is a strict subset of `seed % 8 == 0` the share is exactly 1-in-16;
+    ///   * every grain that lit a mark before lights one now, in the same
+    ///     stream-agnostic sense (a quad or a halo) — the swap is a silhouette,
+    ///     never a cull.
+    #[test]
+    fn the_sparkle_pour_deals_its_plus_at_the_family_rate() {
+        // A SHIPPING cell (32 px), so a star's arm (7-9 px wide, 1 px tall) can
+        // be told from the moon's limbs (3 px) and the glitter square.
+        let g = Geom {
+            cw: 8,
+            ch: 32,
+            rows: 30,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 960,
+            head: 0,
+        };
+        let c = cfg(GlowStyle::Sparkle, true);
+        let born = Instant::now();
+        // ONE grain per emission, at rest (no velocity), so nothing else in the
+        // pour can leave a wide hairline in the stream: the mini-comet's dash is
+        // velocity-aligned and degenerates to nothing at zero speed, and the
+        // moon's limbs are 3 px at this cell height.
+        let emit = |hue: f32| -> (Vec<GlowQuad>, Vec<RainHalo>) {
+            let mut glow = CursorGlow::default();
+            glow.particles.push(Particle {
+                x0: 80.0,
+                y0: 160.0,
+                vx: 0.0,
+                vy: 0.0,
+                gy: 0.0,
+                life: 1.0,
+                hue,
+                cov_scale: 1.0,
+                born,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_particles(
+                born + Duration::from_millis(120),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
+            (out, halos)
+        };
+        // A 4-point star's HORIZONTAL ARM — 7-9 px wide and exactly 1 px tall at
+        // this cell height — is the only mark of its shape in the pour: the
+        // moon's limbs are 3 px, the glitter grain is a 5 px square, and the
+        // mini-comet's dash is velocity-aligned and draws nothing at rest. (The
+        // vertical arm is NOT usable as a second witness: `push_fx_rect` splits
+        // every mark at the cell-row boundary, so a 7 px vertical hairline
+        // arrives as two shorter quads whenever it straddles one.)
+        let is_plus = |out: &[GlowQuad]| out.iter().any(|q| q.h == 1 && q.w >= 7);
+
+        // THE DEAL, EXACTLY — over the bucket that owns the star. `hue = k/512`
+        // lands `seed` on 8k, i.e. every member of bucket 0 in order, so this is
+        // the whole star bucket rather than a sample of it.
+        let (mut dealt, mut passed) = (0usize, 0usize);
+        for k in 0..512u32 {
+            let hue = k as f32 / 512.0;
+            let seed = (hue * 4096.0) as u32;
+            assert_eq!(seed % 8, 0, "fixture: hue {hue} must land in the star bucket");
+            let (out, halos) = emit(hue);
+            let plus = is_plus(&out);
+            assert_eq!(
+                plus,
+                star_accent(seed),
+                "seed {seed} drew {} where the family's deal says {}",
+                if plus { "a plus" } else { "dust" },
+                if star_accent(seed) { "a plus" } else { "dust" }
+            );
+            // …and NOTHING WAS CULLED: the grain the deal passed over still
+            // lights its mark, as the round dust it became.
+            assert!(
+                plus || !halos.is_empty(),
+                "seed {seed} lit nothing at all — the deal changes SHAPE, not count"
+            );
+            if plus {
+                dealt += 1;
+            } else {
+                passed += 1;
+            }
+        }
+        assert_eq!(
+            dealt * 2,
+            passed + dealt,
+            "exactly half the star bucket keeps the cross ({dealt} dealt, {passed} passed)"
+        );
+
+        // THE POUR'S OWN SHARE, over a uniform hue sweep — the whole grammar
+        // (dust, star, glitter, moon, mini-comet), the way a real pour arrives.
+        // 400 samples put ~25 crosses on the board at 1-in-16 and ~50 at 1-in-8,
+        // so the 10 % bar between them discriminates the law rather than
+        // recording it.
+        let n = 400u32;
+        let (mut plus, mut lit, mut want) = (0usize, 0usize, 0usize);
+        for i in 0..n {
+            let hue = (i as f32 + 0.5) / n as f32;
+            let (out, halos) = emit(hue);
+            // The MINI-COMET bucket is excluded from the count claim and only
+            // from that: its mark is a velocity-aligned dash, and this fixture
+            // holds every grain at rest so the dash cannot forge a wide hairline
+            // in the classifier above. A grain with no length draws nothing here
+            // for fixture reasons, which is not a statement about the pour.
+            if (hue * 4096.0) as u32 % 8 != 7 {
+                want += 1;
+                if !out.is_empty() || !halos.is_empty() {
+                    lit += 1;
+                }
+            }
+            if is_plus(&out) {
+                plus += 1;
+            }
+        }
+        assert_eq!(
+            lit, want,
+            "every grain of the pour must still light a mark ({lit} of {want})"
+        );
+        assert!(plus >= 1, "the accent must SURVIVE in the pour");
+        assert!(
+            plus * 10 <= lit,
+            "the pour's plus share is {:.1} % ({plus} of {lit}) — Sparkle is \
+             still running its own 1-in-8",
+            100.0 * plus as f32 / lit as f32
+        );
+    }
+
+    /// Composite ONE additive cursor-effect frame the way the renderer actually
+    /// does, and return the light at `(px, py)`.
+    ///
+    /// Flat [`GlowQuad`]s go through `add_sat` (the renderer's
+    /// `draw_flat_add`); [`RainHalo`]s go through the SHARED integer falloff
+    /// (`halo_row_ny` / `halo_weight`, `draw_radial_add`), which is the same
+    /// arithmetic the GPU shader mirrors under the halo-parity contract. Nothing
+    /// here is a model of the renderer — every function called is the renderer's
+    /// own, so a mark's measured light is the light it puts on the screen.
+    ///
+    /// This exists because per-PRIMITIVE maxima are the wrong quantity: a plus
+    /// stacks two arms and a nucleus on one pixel while a mote used to be one
+    /// flat lay, so two marks with identical primitive maxima differed 2.35x
+    /// where the eye actually looks.
+    fn composited_light_at(quads: &[GlowQuad], halos: &[RainHalo], px: i32, py: i32) -> u32 {
+        let mut dst = 0u32;
+        for q in quads {
+            let (x0, y0) = (i32::from(q.x), i32::from(q.y));
+            if (x0..x0 + i32::from(q.w)).contains(&px) && (y0..y0 + i32::from(q.h)).contains(&py) {
+                dst = aterm_render::add_sat(dst, q.color);
+            }
+        }
+        for h in halos {
+            assert_eq!(
+                h.mode,
+                HaloMode::Add,
+                "this compositor is the ADDITIVE (dark-ground) one"
+            );
+            // `push_halo` splits one disc into a band per cell row; only the band
+            // that owns this pixel's row may contribute, or the disc would be
+            // added once per band it was split into.
+            let (x0, y0) = (i32::from(h.x), i32::from(h.y));
+            if !((x0..x0 + i32::from(h.w)).contains(&px)
+                && (y0..y0 + i32::from(h.h)).contains(&py))
+            {
+                continue;
+            }
+            let (rx2, ry2) = (
+                i32::from(h.rx) * i32::from(h.rx),
+                i32::from(h.ry) * i32::from(h.ry),
+            );
+            if rx2 == 0 || ry2 == 0 {
+                continue;
+            }
+            let ny = aterm_render::halo_row_ny(py - i32::from(h.cy), ry2);
+            if ny >= 256 {
+                continue;
+            }
+            let wt = aterm_render::halo_weight(px - i32::from(h.cx), ny, rx2);
+            if wt == 0 {
+                continue;
+            }
+            dst = aterm_render::add_sat(dst, premul_rgb(h.color, wt.min(255) as u8));
+        }
+        ((dst >> 16) & 0xff).max((dst >> 8) & 0xff).max(dst & 0xff)
+    }
+
+    /// HOW DARK ONE PIXEL GOT, source-over the renderer's way, onto PAPER WHITE
+    /// — [`composited_light_at`]'s twin for the ink (light-theme) arm.
+    ///
+    /// A veil's per-pixel alpha is its falloff weight clamped by the ceiling in
+    /// its own high byte, so the centre (weight 255) composites at exactly that
+    /// ceiling. DARKNESS is the signal here: an ink mark's whole job is to
+    /// subtract light, so the mark's weight is how far the pixel fell from white.
+    fn ink_on_white(halos: &[RainHalo], px: i32, py: i32) -> u32 {
+        let mut dst = 0x00FF_FFFFu32;
+        for h in halos {
+            let (x0, y0) = (i32::from(h.x), i32::from(h.y));
+            if !((x0..x0 + i32::from(h.w)).contains(&px)
+                && (y0..y0 + i32::from(h.h)).contains(&py))
+            {
+                continue;
+            }
+            let (rx2, ry2) = (
+                i32::from(h.rx) * i32::from(h.rx),
+                i32::from(h.ry) * i32::from(h.ry),
+            );
+            if rx2 == 0 || ry2 == 0 {
+                continue;
+            }
+            let ny = aterm_render::halo_row_ny(py - i32::from(h.cy), ry2);
+            if ny >= 256 {
+                continue;
+            }
+            let wt = aterm_render::halo_weight(px - i32::from(h.cx), ny, rx2);
+            if wt == 0 {
+                continue;
+            }
+            let cap = ((h.color >> 24) & 0xff) as u8;
+            let cap = if cap == 0 { 255 } else { cap };
+            dst = aterm_render::over_rgb(dst, h.color, (wt.min(255) as u8).min(cap));
+        }
+        255 - (((dst >> 16) & 0xff).max((dst >> 8) & 0xff).max(dst & 0xff))
+    }
+
+    /// EVERY GRAIN THAT LOST ITS PLUS STILL DELIVERS THE PLUS'S LIGHT — stated
+    /// on the COMPOSITED PIXEL, across every additive population the stardust law
+    /// touched.
+    ///
+    /// This is the defect the rarity fix RECREATED. Halving the accent rate is a
+    /// change of SILHOUETTE; the owner asked for fewer crosses AND more light
+    /// (2026-08-09, "many fewer of those cross sparkles"). But
+    /// [`push_twinkle_star`] lays THREE coincident additive marks on the crossing
+    /// (two arms and the nucleus), so a plus's centre carries
+    /// [`crate::effect_util::STAR_STACK_ADD`] · cov, while the round grain that
+    /// replaced it was ONE halo at the same cov. Converting a plus to a grain
+    /// therefore DIMMED that sparkle 2.35x in the middle — at the Sparkle pour,
+    /// at the Beam wake, and at the rainbow shower, all three of which the
+    /// previous round's tests passed because they counted marks and compared
+    /// per-primitive maxima instead of rasterizing.
+    ///
+    /// The claim is made SELF-REFERENTIALLY, per grain: whatever coverage a mark
+    /// ASKED for (its arm, or its skirt), its centre must composite to the
+    /// family's stack of it. That removes every cross-grain confound — the two
+    /// silhouettes are dealt off different seeds, so their twinkle phase, size
+    /// bounce and tint all differ slightly — while still being exactly the
+    /// statement the owner perceives.
+    #[test]
+    fn every_converted_grain_composites_to_the_plus_it_replaced() {
+        let g = Geom {
+            cw: 8,
+            ch: 32,
+            rows: 30,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 960,
+            head: 0,
+        };
+        let born = Instant::now();
+        // THE GRAIN'S CENTRE, in window px: the fixture holds every particle at
+        // rest at this point, so the pixel the law is stated on is known rather
+        // than searched for (a searched peak could land on a diffraction glint,
+        // which is a decoration ON a mark, not the mark).
+        let (cx, cy) = (80i32, 160i32);
+        // LATE IN THE GRAIN'S LIFE, deliberately. `cov` is `230 · fade`, so a
+        // fresh grain sits near 200 and BOTH silhouettes saturate the byte at
+        // 2.35x — a saturated pair reports parity for any law at all, including
+        // the broken one. At 880 ms of a 1 s life `cov` is ~27 and the whole
+        // stack fits inside the channel, so the measurement can actually fail.
+        let emit = |style: GlowStyle, hue: f32| -> (Vec<GlowQuad>, Vec<RainHalo>) {
+            let c = cfg(style, true);
+            let mut glow = CursorGlow::default();
+            // The rainbow shower's coverage rides the EASED MOMENTUM SPINE; at
+            // the default cold spine it emits nothing at all and the arm would be
+            // silently unmeasured.
+            glow.rainbow.disp = 1.0;
+            glow.particles.push(Particle {
+                x0: cx as f32,
+                y0: cy as f32,
+                vx: 0.0,
+                vy: 0.0,
+                gy: 0.0,
+                life: 1.0,
+                hue,
+                cov_scale: 1.0,
+                born,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_particles(
+                born + Duration::from_millis(880),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
+            (out, halos)
+        };
+        let chan = |c: u32| ((c >> 16) & 0xff).max((c >> 8) & 0xff).max(c & 0xff);
+        for style in [GlowStyle::Sparkle, GlowStyle::Beam, GlowStyle::RainbowKitty] {
+            let (mut plus_n, mut dust_n) = (0usize, 0usize);
+            // `hue = s / 4096` reproduces the emitters' own `seed` exactly (a
+            // power-of-two denominator is exact in f32), and the two strides walk
+            // BOTH sides of the deal: `s % 16 == 0` keeps the cross, `s % 16 == 8`
+            // is the grain that lost one. Sparkle deals shapes out of a `seed % 8`
+            // bucket of its own, so both strides stay inside its STAR bucket —
+            // its glitter square, moon and mini-comet are different marks with
+            // different laws and are not this test's business.
+            for s in (0..4096u32).step_by(8) {
+                let hue = s as f32 / 4096.0;
+                let (out, halos) = emit(style, hue);
+                let centre = composited_light_at(&out, &halos, cx, cy);
+                // THE ARM identifies a plus: 1 px tall and at least 7 px wide, the
+                // only mark of that shape any of these three arms draws. Its own
+                // coverage is what the emitter asked for; the nucleus beside it
+                // carries only `STAR_CORE_ADD` of that, and the diffraction glints
+                // are 1x1 dots thrown clear of the centre.
+                let arm = out
+                    .iter()
+                    .filter(|q| q.h == 1 && q.w >= 7)
+                    .map(|q| chan(q.color))
+                    .max();
+                let req = if let Some(a) = arm {
+                    plus_n += 1;
+                    a
+                } else if !halos.is_empty() {
+                    dust_n += 1;
+                    // THE SKIRT is the coverage a round grain asked for, and it
+                    // is the DIMMER of the two coincident lays by construction —
+                    // the hot core carries the rest of the stack on top of it.
+                    // (Not "the widest": at a small cell both radii floor to
+                    // 1 px, so radius does not separate them and reading the
+                    // widest silently measured the CORE.) Deduplicated first: one
+                    // disc arrives as a band per cell row, and counting bands
+                    // would count a lay twice.
+                    let mut seen: Vec<(u16, u16, u16, u16, u32)> = Vec::new();
+                    let mut lays: Vec<u32> = Vec::new();
+                    for h in &halos {
+                        let key = (h.cx, h.cy, h.rx, h.ry, h.color);
+                        if !seen.contains(&key) {
+                            seen.push(key);
+                            lays.push(chan(h.color));
+                        }
+                    }
+                    lays.iter().copied().min().unwrap_or(0)
+                } else {
+                    continue;
+                };
+                let want = (crate::effect_util::STAR_STACK_ADD * req as f32).min(255.0);
+                // Slack of 2/255 for `premul_rgb`'s byte rounding and the `as u8`
+                // truncation of the core's share — never for a missing lay, which
+                // costs 1.35x.
+                assert!(
+                    f64::from(centre) + 2.0 >= f64::from(want),
+                    "{style:?} seed {s}: a grain asked for {req} of coverage and \
+                     composited to {centre} at its own centre, where the family's \
+                     stack is {want:.0} — the shape swap became a brightness cut"
+                );
+            }
+            // NON-VACUOUS PER STYLE: both silhouettes really were exercised, so
+            // "no failure" cannot mean "the dust arm was never reached".
+            assert!(
+                plus_n > 0 && dust_n > 0,
+                "{style:?}: the sweep must measure BOTH silhouettes \
+                 ({plus_n} crosses, {dust_n} grains)"
+            );
+            // …and the deal really is the family's 1-in-16, on this same sweep:
+            // the strides alternate dealt/passed inside the star bucket, so a
+            // population that quietly kept a private rate would show here.
+            assert_eq!(
+                plus_n, dust_n,
+                "{style:?}: the sweep walks both sides of the deal evenly \
+                 ({plus_n} vs {dust_n})"
+            );
+        }
+    }
+
+    /// …AND COMET, THE ONE ARM WHERE NOTHING WAS SWAPPED (owner, 2026-08-09:
+    /// "many fewer of those cross sparkles" — and no dimmer for it).
+    ///
+    /// Comet is absent from the sweep above for a structural reason: its grain
+    /// body is a flat SQUARE that was never a plus, so the rarity deal converted
+    /// no silhouette and there is no "grain that replaced a cross" to price.
+    /// What the deal DID take away is the diffraction glint — a real
+    /// [`push_twinkle_star`], and one of the module's largest cross populations,
+    /// since `twinkle_peak` opens for about a quarter of every grain's cycle.
+    /// Gating it 1-in-16 with no compensation therefore left 15-in-16 grains
+    /// simply DARKER at their peak, which is the half of the owner's ask that
+    /// was not negotiable.
+    ///
+    /// The statement is made on PAIRS, `s` and `s + 8`, which straddle the deal
+    /// (`s % 16 == 0` keeps the cross, `s % 16 == 8` lost it) while differing by
+    /// one part in 512 of hue — so grain size, tint and twinkle phase are
+    /// effectively held constant and the ONLY difference between the two
+    /// measurements is the deal itself.
+    #[test]
+    fn comet_grains_that_lost_the_glint_keep_its_light() {
+        let g = Geom {
+            cw: 8,
+            ch: 32,
+            rows: 30,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 960,
+            head: 0,
+        };
+        let born = Instant::now();
+        // MID-ROW, not on a row boundary: `push_fx_rect` splits a quad that
+        // straddles one into a band per row, and a split body would be measured
+        // as two half-height rects rather than as the square it is.
+        let (cx, cy) = (80i32, 176i32);
+        // LATE IN THE GRAIN'S LIFE, for the same reason the sweep above is: a
+        // fresh grain's stack saturates the byte and a saturated pair reports
+        // parity for any law at all, including the broken one.
+        const AGE_MS: u64 = 880;
+        let age = AGE_MS as f32 / 1000.0;
+        let mut c = cfg(GlowStyle::Comet, true);
+        // WHITE, so a mark's max channel IS the coverage it was drawn at and the
+        // compositor reads light rather than the default palette's green.
+        c.color = 0x00FF_FFFF;
+        let emit = |hue: f32| -> Vec<GlowQuad> {
+            let mut glow = CursorGlow::default();
+            glow.particles.push(Particle {
+                x0: cx as f32,
+                y0: cy as f32,
+                vx: 0.0,
+                vy: 0.0,
+                gy: 0.0,
+                life: 1.0,
+                hue,
+                cov_scale: 1.0,
+                born,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_particles(born + Duration::from_millis(AGE_MS), &c, g, &mut out, &mut halos);
+            assert!(halos.is_empty(), "comet debris draws quads, never halos");
+            out
+        };
+        let mut pairs = 0usize;
+        for s in (0..4096u32).step_by(16) {
+            // `hue = s / 4096` reproduces the emitter's own seed exactly (a
+            // power-of-two denominator is exact in f32).
+            let (h_cross, h_grain) = (s as f32 / 4096.0, (s + 8) as f32 / 4096.0);
+            // Only the PEAK is this law's business: off-peak no glint ever fired,
+            // so there is nothing owed. Asked of the shared helpers, not of a
+            // copy of the emitter's arithmetic.
+            if !twinkle_peak(twinkle_env(age, h_cross * std::f32::consts::TAU))
+                || !twinkle_peak(twinkle_env(age, h_grain * std::f32::consts::TAU))
+            {
+                continue;
+            }
+            // A grain small enough to be a single pixel cannot carry a skirt and
+            // a core as distinct marks; the sweep stays on grains with real size.
+            if ((g.ch as f32 * (0.07 + 0.09 * h_cross)) as i32) < 3 {
+                continue;
+            }
+            let (cross, grain) = (emit(h_cross), emit(h_grain));
+            let (lit_cross, lit_grain) = (
+                composited_light_at(&cross, &[], cx, cy),
+                composited_light_at(&grain, &[], cx, cy),
+            );
+            // NON-VACUOUS: the dealt grain's glint really does add light on top
+            // of the body, so there is something for the undealt grain to match.
+            // The body alone is the widest quad's coverage.
+            let body = cross
+                .iter()
+                .filter(|q| q.w == q.h && q.w >= 3)
+                .map(|q| ((q.color >> 16) & 0xff).max((q.color >> 8) & 0xff).max(q.color & 0xff))
+                .max()
+                .expect("the dealt grain drew its square body");
+            assert!(
+                lit_cross > body,
+                "seed {s}: the glint must actually brighten the grain it fires \
+                 off ({lit_cross} vs a bare body of {body})"
+            );
+            // THE LAW, stated BOTH WAYS: the deal changes the SILHOUETTE and
+            // nothing else, so the grain that lost the cross is neither dimmer
+            // than the one that kept it (the defect) nor brighter (which would
+            // make the rarity a visible flicker between neighbouring grains).
+            // Slack of 2/255 for `premul_rgb`'s byte rounding, the `as u8`
+            // truncations either side, and the one part in 512 of hue between
+            // the pair — never for a missing lay, which costs the whole of
+            // `STAR_STACK_ADD · glint_cov`.
+            assert!(
+                lit_grain.abs_diff(lit_cross) <= 2,
+                "seed {s}: the grain that lost the cross composites to \
+                 {lit_grain} where the one that kept it reaches {lit_cross} — \
+                 the deal moved the light, not just the shape"
+            );
+            pairs += 1;
+        }
+        assert!(
+            pairs > 8,
+            "the sweep must actually straddle the deal at the twinkle peak, \
+             got {pairs} pairs"
+        );
+    }
+
+    /// …AND THE SAME STATEMENT IN INK, on the light ground, where the stack is
+    /// source-over rather than additive.
+    ///
+    /// [`push_twinkle_over`] lays three coincident source-over marks, so a light
+    /// plus's centre reaches `1-(1-a)^3` while one disc at the same `a` reaches
+    /// `a` — a silent cut of up to ~60/255 exactly where the mark is loudest.
+    /// [`stacked_ink_alpha`] is the solve, and this pins it against the star it
+    /// stands in for by compositing BOTH marks onto white with the renderer's own
+    /// `over_rgb`.
+    ///
+    /// Two light emitters call it beyond the fresh-ink pop that first derived it
+    /// — the ribbon rail's sky mote and the erase poof's round body — and both
+    /// were clamping to the SINGLE-lay `alpha_cap`, which threw the compensation
+    /// away over the whole range that matters.
+    #[test]
+    fn the_ink_grain_composites_to_the_light_plus_it_replaced() {
+        let g = geom();
+        let hue = RAINBOW_BANDS[0];
+        let (cx, cy) = (60.0f32, 60.0f32);
+        // Across the WHOLE coverage range, including above the single-lay cap
+        // (190) where the old clamp silently discarded the compensation.
+        for cov in [24u8, 60, 93, 128, 190, 255] {
+            let mut star = Vec::new();
+            push_twinkle_over(&mut star, g, cx, cy, 6.0, hue, false, cov);
+            let mut mote = Vec::new();
+            let dot = (InkRole::OverText.ink(hue) & 0x00FF_FFFF)
+                | (stacked_ink_alpha(cov, InkRole::OverText) << 24);
+            push_halo_over(&mut mote, g, cx, cy, 4.0, 4.0, dot, 255);
+            let (sp, mp) = (
+                ink_on_white(&star, cx as i32, cy as i32),
+                ink_on_white(&mote, cx as i32, cy as i32),
+            );
+            // NON-VACUOUS: the plus really does stack in ink, so there is
+            // something for the disc to match. One lay at `cov` could not reach
+            // this on its own.
+            assert!(
+                sp > 0,
+                "cov {cov}: the reference plus put no ink on the page"
+            );
+            assert!(
+                mp + 2 >= sp,
+                "cov {cov}: the round grain darkens the page by {mp} where the \
+                 plus it replaced darkens it by {sp} — the ink mark got dimmer"
+            );
+        }
+        // …and the compensation is REAL rather than a no-op: below the cap it
+        // must actually raise the alpha the disc is drawn at.
+        assert!(
+            stacked_ink_alpha(60, InkRole::OverText) > 60,
+            "the stacked solve must exceed the single-lay alpha it replaces"
+        );
+        // …and it is still a CEILING, not 255: the plus's own realized centre
+        // (`1-(1-cap)^3`) bounds it, so no legibility budget moved.
+        let cap = InkRole::OverText.alpha_cap() / 255.0;
+        let ceiling = ((1.0 - (1.0 - cap).powi(3)) * 255.0) as u32;
+        assert_eq!(stacked_ink_alpha(255, InkRole::OverText), ceiling);
+        assert!(ceiling < 255, "the ceiling must still bound the mark");
+    }
+
+    /// …AND THE HELPER THE INK EMITTERS ACTUALLY CALL APPLIES IT.
+    ///
+    /// The law above is stated at [`stacked_ink_alpha`], which is one arithmetic
+    /// step away from the screen: a call site that reverted to the single-lay cap
+    /// would leave that proof green. Two light populations — the sparkle burst's
+    /// undealt fleck and the fresh-ink pop's sky grain — reach the page through
+    /// [`CursorGlow::push_dust_mote_over_text_first`] and NOTHING pinned it, which
+    /// a mutation of that one line confirmed: reverting it broke no test in this
+    /// module.
+    ///
+    /// So the statement is made where the emitters make it — helper against
+    /// helper, the mote against the plus it stands in for
+    /// ([`CursorGlow::push_twinkle_over_text_first`]), on the composited pixel.
+    #[test]
+    fn the_ink_dust_helper_prices_its_mote_like_the_plus_it_stands_in_for() {
+        let g = geom();
+        let hue = RAINBOW_BANDS[2];
+        // A DEFAULT glow: no row probe has run, so `probed_cell_glyph` answers
+        // UNPROBED and both helpers' text-first gate lets the mark through —
+        // the gate is not what is under test here.
+        let glow = CursorGlow::default();
+        let (cx, cy) = (60.0f32, 60.0f32);
+        // Across the whole coverage range, including above the single-lay cap
+        // (190) where a clamp to `alpha_cap` silently discards the compensation.
+        for cov in [24u8, 60, 93, 128, 190, 255] {
+            let mut star = Vec::new();
+            glow.push_twinkle_over_text_first(&mut star, g, cx, cy, 6.0, hue, false, cov);
+            let mut mote = Vec::new();
+            glow.push_dust_mote_over_text_first(&mut mote, g, cx, cy, 4.0, hue, cov);
+            let (sp, mp) = (
+                ink_on_white(&star, cx as i32, cy as i32),
+                ink_on_white(&mote, cx as i32, cy as i32),
+            );
+            // NON-VACUOUS: the reference plus really did put ink on the page, so
+            // there is something for the mote to match.
+            assert!(sp > 0, "cov {cov}: the reference plus drew nothing");
+            assert!(
+                mp + 2 >= sp,
+                "cov {cov}: the ink dust helper darkens the page by {mp} where \
+                 the plus it stands in for darkens it by {sp} — the shape swap \
+                 is a brightness cut at the call site"
+            );
+        }
+    }
+
+    /// THE FAST-GLIDE SHOOTING STAR'S HEAD JOINS THE DEAL (owner, 2026-08-09:
+    /// "many fewer of those cross sparkles").
+    ///
+    /// It was a 1-in-1 plus at the family DEFAULT arm — the longest routine arm
+    /// in the dark trail — and it was exempt on the grounds that a shooting star
+    /// is one gesture with one tip. It is not: the classifier fires a star per
+    /// qualifying frame up to `GLIDE_STAR_CAP`, so one fast sweep of the cursor
+    /// laid a ROW of full-size crosses across the screen. That is population by
+    /// count, whatever it is by narrative.
+    ///
+    /// Two halves, as always: the SHAPE MIX moved, and the COUNT did not.
+    #[test]
+    fn the_glide_shooting_star_head_is_dealt_like_the_rest() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let born = Instant::now();
-        let mut glow = CursorGlow::default();
-        rainbow_uniform_ribbon(&mut glow, born, 255, 0..40);
-        // Full spine: momentum recruits extra star cells and the arm
-        // breathing peaks — the plus-heaviest the field gets.
-        glow.rainbow.disp = 1.0;
-        glow.rainbow.phase = 0.0;
-        let (mut under, mut out) = (Vec::new(), Vec::new());
-        glow.emit_rainbow(
-            born + Duration::from_millis(500),
-            &c,
-            g,
-            &mut under,
-            &mut out,
-            &mut Vec::new(),
-        );
-        // A star's signature is its horizontal arm bar: one wide hairline
-        // quad per star (w at least 4 and at least triple its height). Dust
-        // rects are near-square points.
-        let stars = out
-            .iter()
-            .filter(|q| q.w >= 4 && u32::from(q.w) >= 3 * u32::from(q.h.max(1)))
-            .count();
-        let dust = out
-            .iter()
-            .filter(|q| q.w == q.h && q.w <= 6)
-            .count();
-        let pop = stars + dust;
-        assert!(pop > 8, "the full-spine field must emit a real population, got {pop}");
-        assert!(dust > 0, "the body must be dust, not plus");
+        // The head is the only ACHROMATIC mark a glide star draws — the tail is
+        // six saturated rainbow band segments — so `r == g == b` separates the
+        // head from its own streak without any geometry guesswork. A dealt plus
+        // lands in the additive QUAD stream; the body mote is a radial HALO.
+        let achromatic = |c: u32| {
+            let (r, gg, b) = ((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+            r == gg && gg == b && r > 0
+        };
+        let (mut plus, mut mote) = (0usize, 0usize);
+        let (mut plus_peak, mut mote_peak) = (0u32, 0u32);
+        // `(composited centre, the coverage that mark asked for)` per head — the
+        // pair the brightness law below is stated in.
+        let mut heads: Vec<(u32, u32)> = Vec::new();
+        let mut seen_lay: std::collections::HashSet<(u16, u16, u16, u16, u32)> =
+            std::collections::HashSet::new();
+        for i in 0..200u32 {
+            let mut glow = CursorGlow::default();
+            glow.glide.stars.push(GlideStar {
+                x0: 40.0,
+                y0: 40.0,
+                x1: 100.0,
+                y1: 40.0,
+                born,
+                life: 0.32,
+                vel: 120.0,
+                // The engine seeds this from `frand()`, i.e. uniform on 0..1;
+                // this walks that range so the census reads the whole deal
+                // rather than one lucky draw.
+                seed: i as f32 / 200.0,
+            });
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_rainbow_glide_stars(born + Duration::from_millis(40), &c, g, &mut out, &mut halos);
+            let head_q = out.iter().filter(|q| achromatic(q.color)).count();
+            let head_h = halos.iter().filter(|h| achromatic(h.color)).count();
+            // EXACTLY ONE HEAD PER STAR, one shape or the other — the count
+            // half of the contract, asserted per star rather than in aggregate
+            // so a star that drew BOTH (or neither) cannot average away.
+            assert!(
+                (head_q > 0) ^ (head_h > 0),
+                "seed {i}: a glide star must light exactly one head \
+                 ({head_q} quad marks, {head_h} halo marks)"
+            );
+            let chan = |c: u32| (c >> 16) & 0xff;
+            if head_q > 0 {
+                plus += 1;
+                // THE CENTRE, COMPOSITED. The head's two arms cross on one pixel
+                // and the nucleus lands on it too, so the light there is the SUM
+                // of three lays — measured by rasterizing the achromatic quads
+                // additively, rather than by reading the brightest single quad,
+                // which is what the old form of this assertion did.
+                let mut px: std::collections::HashMap<(u32, u32), u32> =
+                    std::collections::HashMap::new();
+                for q in out.iter().filter(|q| achromatic(q.color)) {
+                    for yy in u32::from(q.y)..u32::from(q.y) + u32::from(q.h) {
+                        for xx in u32::from(q.x)..u32::from(q.x) + u32::from(q.w) {
+                            *px.entry((xx, yy)).or_insert(0) += chan(q.color);
+                        }
+                    }
+                }
+                let centre = px.values().copied().max().unwrap_or(0).min(255);
+                let req = out
+                    .iter()
+                    .filter(|q| achromatic(q.color))
+                    .map(|q| chan(q.color))
+                    .max()
+                    .unwrap_or(0);
+                heads.push((centre, req));
+                plus_peak = plus_peak.max(centre);
+            } else {
+                mote += 1;
+                // …and the round head's centre is the sum of ITS coincident lays:
+                // the skirt and the hot core, both radial halos centred on the
+                // same pixel. Deduplicated first — `push_halo` splits one halo
+                // into a band per cell row, and counting those bands twice would
+                // invent light that is not there.
+                let mut lays: Vec<u32> = Vec::new();
+                for h in halos.iter().filter(|h| achromatic(h.color)) {
+                    let key = (h.cx, h.cy, h.rx, h.ry, h.color);
+                    if seen_lay.insert(key) {
+                        lays.push(chan(h.color));
+                    }
+                }
+                seen_lay.clear();
+                let centre = lays.iter().sum::<u32>().min(255);
+                // The SKIRT is the coverage the emitter asked for, and it is by
+                // construction the DIMMER of the two coincident lays — the hot
+                // core carries the rest of the stack on top of it.
+                let req = lays.iter().copied().min().unwrap_or(0);
+                heads.push((centre, req));
+                mote_peak = mote_peak.max(centre);
+            }
+        }
+        assert_eq!(plus + mote, 200, "every glide star still lights a head");
         assert!(
-            (stars as f32) <= (pop as f32) * 0.15 + 1.0,
-            "the plus is the accent: {stars} stars in a population of {pop} \
-             breaks the <=15% share the stardust law promises"
+            plus >= 1,
+            "the accent must SURVIVE — a shooting star may still tip a cross"
+        );
+        // 1-in-16 measured 16 pluses here. `plus * 9 <= mote` clears that
+        // (144 <= 184) and is failed by the 1-in-8 the rest of the kit ran at
+        // before this round (25 * 9 = 225 > 175), so the bound discriminates
+        // the law rather than merely recording it.
+        assert!(
+            plus * 9 <= mote,
+            "the glide head must be a dealt ACCENT: {plus} crosses vs {mote} motes"
+        );
+        // …AND THE MOTE IS NOT A DIMMER MARK — measured at the pixel, mark for
+        // mark, which is the correction this assertion needed.
+        //
+        // It used to compare the brightest QUEUED PRIMITIVE of each silhouette:
+        // a plus's arm carries `hcov` and a one-lay mote carries `hcov`, so
+        // "parity" was reported for a head that rendered 2.35x darker in the
+        // middle — the plus stacks two arms and a nucleus on its centre pixel and
+        // the mote stacked nothing. Both shapes now have to reach the family's
+        // composited centre ([`crate::effect_util::STAR_STACK_ADD`]) from the
+        // coverage they were handed, and BOTH populations are checked, so the bar
+        // cannot be met by weakening the reference. (Slack of 2/255 for the byte
+        // rounding in `premul_rgb` and the `as u8` truncation of the core share.)
+        assert!(!heads.is_empty(), "vacuous: no heads were measured");
+        for &(centre, req) in &heads {
+            let want = (crate::effect_util::STAR_STACK_ADD * req as f32).min(255.0);
+            assert!(
+                f64::from(centre) + 2.0 >= f64::from(want),
+                "a glide head asked for {req} of coverage and composited to \
+                 {centre} where the family's stack is {want:.0} — under-lit"
+            );
+        }
+        assert!(
+            mote_peak >= plus_peak && plus_peak > 0,
+            "the round head tops out at {mote_peak} against the cross's \
+             {plus_peak} — the shape swap became a brightness cut"
         );
     }
 
@@ -26670,22 +29879,73 @@ mod tests {
         // clearance/taper/star-shower are provably inert, and displaced stars
         // take the in-cell fallback because their landing rows are UNKNOWN.
         //
-        // RECAPTURED at the STARDUST LAW (owner, 2026-08-08: dust is the body,
-        // the plus a dealt 1-in-8 accent): the same four star-kit indices as
-        // the unification — 2 (RainbowKitty), 3 (Sparkle), 6 (Beam), 8
-        // (Comet) — moved and ONLY those. Lumen, Phaser, Fire, Laser and
-        // Water are byte-identical, i.e. the change reached the star kit and
-        // nothing else, again.
+        // RECAPTURED at the STARDUST LAW's SECOND thinning (owner, 2026-08-09:
+        // "many fewer of those cross sparkles" — [`STAR_ACCENT_DEN`] 8 → 16).
+        // THREE indices moved then: 2 (RainbowKitty), 6 (Beam), 8 (Comet) — the
+        // dealt star populations. Lumen, Phaser, Fire, Laser and Water were
+        // byte-identical, i.e. the change reached the star kit and nothing else.
+        //
+        // RECAPTURED AGAIN when the two populations that had escaped that
+        // thinning were brought under it, and the round body was repriced at the
+        // plus's own composited light. TWO indices moved:
+        //
+        //   * 2 (RainbowKitty) — the dark starfield's mote now lays a HOT CORE
+        //     inside its skirt (`push_dust_mote`), because one flat rect at the
+        //     arms' coverage renders 2.35x darker than the crossing it replaced;
+        //     and the jump-LANDING fan, thirteen full crosses at its widest,
+        //     keeps exactly one.
+        //   * 3 (Sparkle) — the KNOWN RESIDUAL from the last capture is gone.
+        //     Sparkle dealt its own shape from an eight-way `seed % 8` bucket, so
+        //     the family's denominator never reached it and picking that style
+        //     still bought the 1-in-8 the owner had just rejected. Its buckets
+        //     (moon, mini-comet, glitter) are untouched; only the STAR bucket now
+        //     asks [`star_accent`], which makes its plus share 1-in-16 like
+        //     everything else.
+        //
+        // RECAPTURED AGAIN when the repricing was carried to the RADIAL half of
+        // the kit — the previous capture's own note ("Beam and Comet did NOT move,
+        // and that is the control: their motes are radial halos") was the tell,
+        // and it was reasoning backwards. It read the two styles' stillness as
+        // evidence the change had been scoped correctly, when what it actually
+        // recorded was that the halo emitters had NOT been repriced and were
+        // still laying one flat disc at the arms' coverage — 2.35x under the
+        // crossing they replaced. TWO indices moved:
+        //
+        //   * 3 (Sparkle) — the pour's converted grain now lays a HOT CORE inside
+        //     its skirt ([`push_dust_halo`]). This is the seam where the last
+        //     round's RARITY fix became a BRIGHTNESS cut: bucket 0's re-deal sends
+        //     half its grains down the dust arm, and that arm was one halo at the
+        //     same `scov` the plus's three stacked lays were handed.
+        //   * 6 (Beam) — the wake's body, the same law at the same coverage.
+        //
+        // RECAPTURED AGAIN for COMET (8), and the previous capture's note about
+        // it was the last place this defect was hiding. That note called Comet
+        // "the control", on the grounds that its grain is a flat square that was
+        // never a plus so no shape swap reached it. True, and beside the point:
+        // what the rarity deal took from Comet was the twinkle-peak GLINT, which
+        // is itself a `push_twinkle_star` — three coincident additive lays on the
+        // crossing — so 15-in-16 grains lost `STAR_STACK_ADD · glint_cov` of
+        // light at their peak and got NOTHING back, because there was no
+        // converted mote to reprice. Being outside the shape swap made Comet the
+        // one arm where the cut was total rather than the one arm that was
+        // exempt. The undealt grain is now paid the glint's light as a hot core
+        // over its own skirt (`comet_grains_that_lost_the_glint_keep_its_light`),
+        // and the frame moved accordingly.
+        //
+        // RainbowKitty (2) did not move — its shower's coverage rides the
+        // momentum spine, which this script deliberately leaves at zero (no
+        // `note_typed`), so its repriced arm is inert here by construction rather
+        // than unchanged.
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
-            4009512679956847361,
-            16738082778528137437,
+            13259144446454873362,
+            11795279380596197491,
             15099317426123974543,
             8477863368341368663,
-            17563734566908079188,
+            9248424784827790764,
             18198127167938565682,
-            5200910487073069437,
+            2481095491064481384,
         ];
         let styles = [
             GlowStyle::Lumen,
@@ -29002,11 +32262,6 @@ halo = "add"
         );
     }
 
-    /// REDUCED-MOTION ARM: with the host's reduced seam set, the pop is a
-    /// brightness STEP-FADE only — no birth flash, no scale animation (the
-    /// halo footprint is frozen at base size while the full-motion twin's
-    /// spring visibly swells it).
-    #[test]
     /// THE POP IS LIGHT OR IT IS NOTHING (owner, 2026-08-04: the trail "isn't
     /// smooth", against a screenshot whose last few typed characters lay under a
     /// dirty grey-olive wash).
@@ -29068,6 +32323,17 @@ halo = "add"
         }
     }
 
+    /// REDUCED-MOTION ARM: with the host's reduced seam set, the pop is a
+    /// brightness STEP-FADE only — no birth flash, no scale animation (the
+    /// halo footprint is frozen at base size while the full-motion twin's
+    /// spring visibly swells it).
+    ///
+    /// The prose above used to sit on a `#[test]` with NO FUNCTION under it,
+    /// several hundred lines up: the attribute stacked onto the NEXT test, so
+    /// `fresh_ink_pop_is_light_or_nothing` was registered TWICE and ran twice
+    /// while this arm's doc floated free of the arm it describes. Reattached
+    /// 2026-08-09; found by review, not by the suite, because running one test
+    /// twice fails nothing.
     #[test]
     fn fresh_ink_reduced_motion_is_a_step_fade_without_scale() {
         let g = geom();

@@ -26,6 +26,35 @@ use crate::{App, FONT_ZOOM_STEP, Wake, WindowId, keybinding, keymap, menu, pane,
 /// re-arms it, so this is a tail after the LAST key, not a per-key budget.
 const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How far AHEAD of its event-loop arrival a key enqueued on the per-session
+/// ordering FIFO stamps the word engine's typed-edit witness — the projected
+/// moment it reaches the wire.
+///
+/// The witness is a freshness budget spent waiting for the key's own ECHO, so
+/// its clock has to start at the terminal, not at the event loop. On the inline
+/// path those coincide; behind a draining paste they do not, and an
+/// arrival-stamped witness expires in the queue (see the arm site). The host
+/// cannot ask the future writer thread when its turn will come, so it grants
+/// the queued key a bounded head start instead, and the engine's own echo
+/// budget runs from there.
+///
+/// WHY A GENEROUS-BUT-BOUNDED GRACE IS SAFE HERE. The witness this extends is
+/// single-use (`TypedEdit::spent` — one keystroke, at most one re-arm),
+/// pane-scoped, and caret-reach-scoped, and this grace is granted ONLY to a key
+/// that really was typed and really is still queued — never to a redraw. So the
+/// worst case is that one genuine keystroke stays licensed a little longer than
+/// its bytes deserved, in a session that is mid-paste; the discrimination the
+/// witness exists for (a repaint may not mint one, another pane's key may not
+/// spend it here) is untouched. It stays FINITE for the same reason the base
+/// budget is: a key whose echo never comes must eventually stop licensing
+/// anything.
+///
+/// Sized as two of the engine's own 750 ms echo budgets — a paste that has not
+/// cleared the FIFO in a second and a half is not one the typist is still
+/// watching echo. The engine then measures its own budget from there, so a
+/// queued keystroke stays licensed for at most ~2.25 s after the keypress.
+const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::from_millis(1_500);
+
 /// A predictor mutation needs a paint when it either removes pixels that were
 /// already on glass or creates/extends a visible overlay. Keeping this decision
 /// in one pure seam prevents conservative flush paths from accidentally keying
@@ -418,6 +447,42 @@ pub(crate) mod paste_order {
         } else {
             (crate::input::seam_egress(term, sink, ev, mode), true)
         }
+    }
+
+    /// TEST-ONLY: hold this sink's FIFO occupied so the key path takes the
+    /// ORDERED branch of [`ordered_or_inline`] — i.e. reproduce "a key typed
+    /// while a paste is still draining" without having to wedge a real PTY.
+    ///
+    /// It claims exactly what a real in-flight job claims (one slot on the
+    /// session's `pending` counter and one on `ACTIVE`) through the SAME
+    /// `writer_for` registry the paste path uses, so `is_ordering` answers for
+    /// the real reason and the key that follows is enqueued by the real
+    /// `enqueue`. The pin is per-MASTER, so a test must hold a sink with its own
+    /// fd (`app_observing_pty`) or it will steer other tests' sessions too, and
+    /// the guard releases the slots on drop.
+    #[cfg(test)]
+    pub(crate) struct OrderingPin {
+        pending: Arc<AtomicUsize>,
+    }
+
+    #[cfg(test)]
+    impl Drop for OrderingPin {
+        fn drop(&mut self) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pin_ordering_for_test(sink: &Arc<SinkWriter>) -> OrderingPin {
+        let master = sink.master();
+        let (_tx, pending) = {
+            let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
+            writer_for(&mut reg, master, sink).expect("egress-order writer thread")
+        };
+        pending.fetch_add(1, Ordering::AcqRel);
+        ACTIVE.fetch_add(1, Ordering::AcqRel);
+        OrderingPin { pending }
     }
 }
 
@@ -1119,27 +1184,73 @@ impl App {
         } else {
             None
         };
+        // THE CAT THE CAMEO WEARS. A first-ever sighting is a genuine
+        // discovery, so the toy that appears IS the cat that was just
+        // unlocked; otherwise it wears the identity already resolved above
+        // (the collected companion, or this session's own kitty). Either way
+        // the COMPANION's identity is untouched here — the host's per-frame
+        // `companion_precedence` sync owns that, and it already promotes a
+        // fresh discovery on the very next frame.
+        let cameo_look = discovered.unwrap_or(look);
+        // WHERE THE TOY APPEARS: the caret cell the completing keystroke left
+        // behind. Read here, latched by the engine, and never re-read — the
+        // cameo belongs to the place the word was typed, not to the caret,
+        // which walks on with the next keystroke.
+        //
+        // Read from `session` — the pane the keystroke actually went to — not
+        // from the window's front mirror: in a split those are the same pane
+        // today, but the anchor CELL and the pane it is scoped to must agree by
+        // construction, not by coincidence.
+        //
+        // THE ECHO HAS NOT LANDED YET, and that is fine. This runs on the input
+        // path, so the completing keystroke has been written to the PTY but the
+        // shell's echo of it has not been parsed back into the grid — the
+        // cursor read here is up to a few cells behind where it will settle.
+        // Neither consumer cares at that resolution: the toy is drawn AHEAD of
+        // the anchor cell (a cell either way is invisible), and the veto tests
+        // `caret_on_span`, which spans the whole token plus one — the very
+        // token the detector just completed. Waiting for the echo would mean
+        // deferring the summon to the next rescan, which is a frame of latency
+        // on the one effect whose whole point is answering the keystroke.
+        //
+        // Scrolled-back views have no live input caret (the same rule the word
+        // scanner uses), so the anchor falls back to the terminal's cursor cell
+        // as reported; a scrolled-back user is not typing anyway.
+        let anchor = self.pool.get(session).map(|st| {
+            let t = term_lock(&st.term);
+            let c = t.cursor();
+            (c.row, c.col)
+        });
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // TWO REASONS, TWO PRESENTATIONS — the companion identity may only
-            // change for a reason.
+            // OWNER RULING, 2026-08-09: "When I type 'kitty' I do not want that
+            // to make the CURSOR kitty appear. I want THE kitty to appear."
             //
-            // * A first-ever sighting is a genuine discovery — a real reason to
-            //   swap. Present that exact unlocked identity, like the render
-            //   drain would.
-            // * Merely typing the word is NOT a reason. `on_collect` replaces
-            //   `look` outright (the two-path rule's path 2), so routing a
-            //   typed `kitty` through it would re-skin the companion out from
-            //   under the session. `on_summon` gives the identical
-            //   appearance/hold WITHOUT touching the identity, so the session's
-            //   own kitty is the one that shows up.
-            match discovered {
-                Some(unlocked) => ws.cursor_cat.on_collect(now, unlocked),
-                None => ws.cursor_cat.on_summon(now, 1),
+            // This used to route the typed word into the cursor companion's
+            // bounded hello (`on_collect` for a discovery, `on_summon`
+            // otherwise) — which answered the keystroke by waking the animal
+            // that already lives on the cursor. It now summons the standalone
+            // CAMEO ([`aterm_effects::kitty_cameo`]): a free-floating sprite
+            // anchored where the word was typed, drawn bigger than the escort
+            // so it reads as the toy, and it NEVER wakes the companion.
+            //
+            // The ledger tier above is unchanged and still runs first: a cameo
+            // is a VIEW, so it writes no collectible row of its own, and the
+            // `record` cooldown governs the row, never the appearance.
+            if let Some(cell) = anchor {
+                // Pane-scoped: `session` is the `bind_pane` key the composed
+                // renderer uses, so the anchor cell can only veto inside the
+                // pane it belongs to. An unsplit window binds no pane and the
+                // scope check is a no-op there.
+                ws.word_decos
+                    .summon_cameo(now, cell, cameo_look, Some(session));
             }
             // A no-echo prompt (password read) repaints nothing on its own —
-            // one explicit wake lets the hello's first frame present (full
-            // motion then owns the cadence; reduced motion arms its single
-            // erase deadline via `static_deadline`).
+            // one explicit wake lets the cameo's first frame present (full
+            // motion then owns the cadence through
+            // `WordDecorations::is_active_in`; reduced motion arms its single
+            // erase deadline via `cameo_static_deadline_in`). Both of those are
+            // scoped to the toy's owning session being VISIBLE, so the lane it
+            // takes here is released the moment the user switches away.
             if let Some(w) = ws.os_window.as_ref() {
                 w.request_redraw();
             }
@@ -1708,6 +1819,13 @@ impl App {
                         if !navigation_key && !kill_key {
                             ws.typing_cadence.on_keystroke(input_now);
                         }
+                        // THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ARMED
+                        // AFTER THE EGRESS, NOT HERE — see the arm below the
+                        // `ordered_or_inline` dispatch. Its 750 ms freshness
+                        // budget is measured against the moment the key reaches
+                        // the TERMINAL, and this point is merely the moment it
+                        // reached the event loop; between the two sits the
+                        // per-session ordering FIFO.
                         // Feed the EMBERFORGE quench: a Backspace key-hint douses
                         // the fire engine (heat + coal cool, the quench meter
                         // escalates) and classifies the paired echo move as a
@@ -1753,6 +1871,19 @@ impl App {
                         // screen; in a plain (main-screen) shell Shift+Enter IS Enter
                         // and keeps its meteor.
                         let shift_enter_insert = enter_like && !typed_enter && is_alt;
+                        // A COMPOSER NEWLINE IS AUTHORED, NOT A REPAINT. The
+                        // ribbon's TUI-relocation retirement treats a caret row
+                        // change with no scroll signal as a repaint that moved
+                        // the prompt, and retires the light on the vacated row —
+                        // correct for a redraw, wrong here, because the row above
+                        // still holds the glyphs this trail decorates and the
+                        // user put the caret on a new line deliberately. The
+                        // engine already accepts and consumes this signal; without
+                        // it a Shift+Enter in the composer eats its own previous
+                        // row's ribbon.
+                        if shift_enter_insert {
+                            ws.cursor_glow.note_newline_break(input_now);
+                        }
                         if typed_forward == Some(true) && (!enter_like || shift_enter_insert) {
                             ws.cursor_glow.note_typed(input_now);
                             ws.cursor_trail.note_typed(input_now);
@@ -2053,6 +2184,61 @@ impl App {
                 // arming and every `request_redraw` above stay where they are — those
                 // must precede the write to buy perceived latency.
                 if let Some(input_now) = input_now {
+                    // THE WORD ENGINE'S "A HUMAN TYPED" WITNESS.
+                    //
+                    // OWNER RULING, 2026-08-09 ("when the screen draws, new
+                    // kitties appear; I want them to just appear once per kitty
+                    // word"). The engine used to infer typing from CARET
+                    // POSITION alone, and a caret on a word proves nothing: a
+                    // shell or TUI parks it at (or one past) the line it just
+                    // drew, so after enough repaints a redraw satisfied the test
+                    // and re-armed a spent cat. This is the causal signal the
+                    // engine could not otherwise see — it exists only on the
+                    // INPUT path, so PTY output can never mint one.
+                    //
+                    // EDITS ONLY. `typed_forward` is `Some` exactly for the keys
+                    // that change line CONTENT — a printable glyph or committed
+                    // IME run (`Some(true)`) and a backspace (`Some(false)`) —
+                    // and `kill_key` adds the span erases (Ctrl-U/W/K, Alt-D,
+                    // forward Delete). Navigation (arrows, Home/End) is
+                    // deliberately excluded: walking the caret over a finished
+                    // kitty is not a retype of it, and admitting it would hand
+                    // the redraw loop its witness back through the other door.
+                    //
+                    // PANE-SCOPED with `session` — the pane this key actually
+                    // went to, which is the `bind_pane` key the engine scans
+                    // under — so a key typed in one pane can never license a
+                    // re-arm in the pane next door.
+                    //
+                    // ARMED AFTER THE EGRESS, AND STAMPED AGAINST THE WIRE.
+                    // The witness is a 750 ms freshness budget spent waiting for
+                    // THIS key's ECHO, so its clock has to start when the key
+                    // reaches the terminal. Stamping it at event-loop arrival —
+                    // which is where this arm used to live, hundreds of lines
+                    // above the dispatch — is the same instant only on the
+                    // INLINE path. A key submitted while a paste drains is
+                    // enqueued on the per-session ordering FIFO
+                    // (`ordered_or_inline`) and written LATER on the egress
+                    // thread, so an arrival-time stamp burns its whole budget in
+                    // the queue and the echo lands on an EXPIRED witness: the
+                    // once-per-word rule then refuses a genuine retype, a false
+                    // negative inside the very mechanism that exists to stop
+                    // false positives.
+                    if typed_forward.is_some() || kill_key {
+                        // `wrote_inline` is the honest discriminator the seam
+                        // already computes for the latency histogram: true means
+                        // the PTY write RETURNED above, so `input_now` is the
+                        // wire moment (microseconds earlier); false means the
+                        // event is still sitting on the FIFO.
+                        let wire_at = if wrote_inline {
+                            input_now
+                        } else {
+                            input_now + ORDERED_EGRESS_WITNESS_GRACE
+                        };
+                        if let Some(ws) = self.windows.get_mut(&wid) {
+                            ws.word_decos.note_typed_edit(wire_at, Some(session));
+                        }
+                    }
                     // TYPED-"kitty" CAMEO (the terminal twin of the Settings
                     // §L.4 cameo): feed this classified PRESS to the
                     // per-window detector. PRINTED characters — bare
@@ -5529,6 +5715,11 @@ impl App {
             }
             Action::OpenPalette => self.toggle_palette(),
             Action::ToggleViMode => self.toggle_vi_mode(wid),
+            // Opens the inline pin editor over the ACTIVE tab of the window the
+            // chord landed in — the keyboard face of the double-click.
+            Action::RenameSession => {
+                self.begin_active_session_rename(wid);
+            }
         }
     }
 
@@ -5754,6 +5945,56 @@ impl App {
             .then_some(wid)
     }
 
+    /// Keep a menu command from running THROUGH an open inline rename editor.
+    /// Returns whether the action was fully handled here.
+    ///
+    /// This exists because AppKit resolves a menu item's KEY EQUIVALENT before
+    /// the first responder ever sees the key. With the strip's text field
+    /// focused, ⌘V would otherwise paste into the PTY behind it, ⌘A would select
+    /// the terminal buffer, and ⌘W would close the very tab being renamed.
+    ///
+    /// * Editing commands are handed to the field editor (the responder that
+    ///   should have received them).
+    /// * Everything else COMMITS the edit first — the same "clicking away keeps
+    ///   what you typed" rule the editor already follows — so the command runs
+    ///   against a settled world instead of silently discarding the text. The
+    ///   text comes from the field, because the field owns it.
+    /// * `RenameSession` itself is exempt: re-issuing it while editing the same
+    ///   session must stay idempotent, not close-and-reopen the editor.
+    pub(crate) fn divert_menu_action_around_rename(&mut self, action: menu::MenuAction) -> bool {
+        use crate::platform::{AppRt, RenameEditorEdit};
+        use menu::MenuAction;
+        let Some(window) = self.front_rename_edit() else {
+            return false;
+        };
+        if matches!(action, MenuAction::RenameSession) {
+            return false;
+        }
+        let editing = match action {
+            MenuAction::Copy => Some(RenameEditorEdit::Copy),
+            MenuAction::Paste => Some(RenameEditorEdit::Paste),
+            MenuAction::SelectAll => Some(RenameEditorEdit::SelectAll),
+            _ => None,
+        };
+        if let Some(edit) = editing {
+            return self
+                ._toolbars
+                .get(&window)
+                .is_some_and(|handle| self.apprt.rename_editor_edit(handle, edit));
+        }
+        let text = self
+            ._toolbars
+            .get(&window)
+            .and_then(|handle| self.apprt.rename_editor_text(handle));
+        match (self.rename_edit_session(window), text) {
+            (Some(session), Some(text)) => self.commit_session_rename(window, session, &text),
+            // No native field behind the state (headless, or a platform without
+            // an editor): end it without inventing text to write.
+            _ => self.end_session_rename_editor(window),
+        }
+        false
+    }
+
     /// Dispatch a macOS menu-bar click into the EXISTING `App` command method the
     /// matching keybinding already uses — the menu adds an entry point, never a
     /// parallel implementation. Anything the user could do from the menu, they can
@@ -5764,6 +6005,9 @@ impl App {
     /// ever constructs the variant), so it stays warning-clean on every target.
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
         use menu::MenuAction;
+        if self.divert_menu_action_around_rename(action) {
+            return;
+        }
         match action {
             // App menu --------------------------------------------------------
             // About and Software Update are routes inside the process-singleton
@@ -5856,7 +6100,7 @@ impl App {
             // `Wake::TabMenuAction` instead, which carries the exact clicked
             // tab's STABLE id into the same per-tab dispatcher; here the
             // subject is resolved NOW, so the active tab's id is that capture.
-            MenuAction::CopySessionId | MenuAction::CopyCwd => {
+            MenuAction::CopySessionId | MenuAction::CopyCwd | MenuAction::RenameSession => {
                 if let Some(window) = self.frontmost_window
                     && let Some(tab) = self
                         .windows
@@ -5993,6 +6237,11 @@ impl App {
                 if let Some(cwd) = self.tab_session_cwd(window, index) {
                     let _ = crate::control::pbcopy(&cwd);
                 }
+            }
+            // Open the inline pin editor over THIS tab (which need not be the
+            // active one), editing its FOCUSED pane's session.
+            MenuAction::RenameSession => {
+                self.begin_session_rename(window, tab);
             }
             MenuAction::CloseTab => {
                 // Byte-same as the `Wake::CloseTab` handler: close the tab as a
@@ -9920,35 +10169,245 @@ mod typed_kitty_summon_tests {
         assert_eq!(on_spec[&"ordinary_armed"], 1);
         assert_eq!(on_spec[&"ordinary_visible"], 1);
 
-        // Typed summons intentionally use the independent bounded hello. They
-        // stay visible even with reduced animation and the trail owner off.
+        // TYPED SUMMONS ARE NOT THE COMPANION AT ALL (owner, 2026-08-09). They
+        // present the standalone CAMEO, which carries the same independence the
+        // bounded hello used to: it stays visible with the trail owner off and
+        // with reduced animation, because its emitters take no trail-style gate
+        // — and now it additionally leaves the companion untouched, which the
+        // hello could not claim.
         let session = off_app.front_terminal(wid).unwrap().session;
         let hello_at = Instant::now();
         off_app.summon_typed_kitty(wid, session, hello_at, true);
-        let hello = off_app
-            .windows
-            .get_mut(&wid)
-            .unwrap()
-            .cursor_cat
-            .static_frame(hello_at);
-        assert!(hello.collection_hello && hello.alpha > 0);
-        assert!(crate::app_render::cursor_cat_presentation_enabled(
-            false,
-            false,
-            crate::cursor_glow::GlowStyle::RainbowKitty,
-            hello.collection_hello,
-        ));
+        let cameo_visible = off_app.windows[&wid]
+            .word_decos
+            .cameo_frame(hello_at)
+            .is_some_and(|f| f.alpha > 0);
+        assert!(cameo_visible, "the toy shows with the trail master OFF");
+        assert!(
+            !off_app.windows[&wid].cursor_cat.is_active(),
+            "and the trail's own companion stayed asleep"
+        );
         assert!(model.fire("Collect", &mut off_spec));
         assert_eq!(off_spec[&"trail_master"], 0);
-        assert_eq!(off_spec[&"visible"], i64::from(hello.alpha > 0));
+        assert_eq!(off_spec[&"visible"], i64::from(cameo_visible));
         assert!(model.check_invariant("HelloIndependentOfTrailMaster", &off_spec));
     }
 
-    /// Typing `kitty` summons the cameo through the cursor companion's hello
-    /// and logs EXACTLY one episode as the type it visually is (`head_peek`,
-    /// ordinary magic) — and the consumed completion's tail adds nothing.
+    /// THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ACTUALLY WIRED.
+    ///
+    /// Owner, 2026-08-09 ("when the screen draws, new kitties appear; I want
+    /// them to just appear once per kitty word"). The engine now refuses to
+    /// re-arm a spent cat on caret position alone and demands a committed EDIT
+    /// keystroke — a signal that exists ONLY on this input path. If the seam
+    /// below were dropped, nothing would fail to compile and no error would be
+    /// logged; every genuine retype would just quietly stop replaying its cat.
+    /// So the wiring itself is the thing under test.
+    ///
+    /// Both directions are pinned, because "edits only" is half the contract: a
+    /// printable key arms the witness, and a NAVIGATION key — which moves the
+    /// caret over words without editing anything — must not.
     #[test]
-    fn typing_kitty_summons_the_cameo_and_logs_one_episode() {
+    fn a_committed_edit_key_arms_the_word_engine_typing_witness() {
+        use aterm_types::keyboard::Key;
+
+        let now = std::time::Instant::now();
+
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        assert!(
+            !app.windows[&wid].word_decos.typed_edit_witness(now),
+            "PRECONDITION: a window nobody has typed in carries no witness"
+        );
+        type_word(&mut app, wid, "k");
+        assert!(
+            app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(std::time::Instant::now()),
+            "a committed printable key is what the re-arm may trust"
+        );
+
+        // NAVIGATION ONLY, on a fresh window so the arm above cannot leak in.
+        let mut nav = App::headless_for_test();
+        nav.recompute_sparkle();
+        for _ in 0..4 {
+            nav.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Named(aterm_types::keyboard::NamedKey::ArrowLeft),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        assert!(
+            !nav.windows[&wid]
+                .word_decos
+                .typed_edit_witness(std::time::Instant::now()),
+            "walking the caret over a finished kitty is not a retype of it"
+        );
+    }
+
+    /// An app whose session sink writes to a pipe THIS TEST OWNS. A private fd
+    /// is load-bearing here and not merely tidy: the ordering FIFO is a
+    /// process-global registry keyed by the PTY master, and every plain
+    /// `headless_for_test` shares master `-1`, so pinning that key would steer
+    /// concurrently running tests' keystrokes onto the deferred writer.
+    #[cfg(unix)]
+    fn app_with_private_pty() -> (
+        App,
+        std::sync::Arc<aterm_session::sink::SinkWriter>,
+        [i32; 2],
+    ) {
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let sink = Arc::new(SinkWriter::new(pipe[1]));
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        app.recompute_sparkle();
+        (app, sink, pipe)
+    }
+
+    /// THE WITNESS CLOCK STARTS AT THE WIRE, NOT AT THE EVENT LOOP.
+    ///
+    /// The once-per-word rule (owner, 2026-08-09) lets a genuine RETYPE replay
+    /// its cat by demanding a committed edit keystroke within the engine's
+    /// short echo budget. That budget is spent waiting for the key's own echo,
+    /// so it has to start when the key reaches the TERMINAL — and a key
+    /// submitted while a paste drains does not go straight there. It is
+    /// enqueued on the per-session ordering FIFO (the submission-order fix) and
+    /// written later on the egress thread, so a witness stamped at event-loop
+    /// arrival burns its whole budget in the queue and is already EXPIRED when
+    /// the echo finally lands. The user retypes `kitty`, the engine sees the
+    /// word reappear with no live witness, and refuses to replay it: a false
+    /// negative inside the mechanism built to stop false positives.
+    ///
+    /// The pre-existing wiring test only ever drove the INLINE path, so it
+    /// could not see this. This one drives the ORDERED branch of
+    /// `ordered_or_inline` through the real `App::input`, and pins BOTH
+    /// directions: the queued key still authorizes its own echo well past the
+    /// bare budget, while the scope tests it is supposed to enforce are
+    /// untouched — a key that went to ANOTHER pane still authorizes nothing
+    /// here, and the extended witness is still finite.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_queued_behind_a_paste_still_witnesses_its_own_echo() {
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let master = sink.master();
+        let session = app.front_terminal(wid).unwrap().session;
+
+        // CONTROL — THE INLINE PATH IS UNCHANGED. Nothing is in flight, so this
+        // key's write RETURNS inside `App::input`; its stamp is that instant and
+        // its witness dies on the engine's bare budget. Asserted first so the
+        // queued case below cannot pass by the witness simply never expiring.
+        assert!(
+            !super::paste_order::is_ordering(master),
+            "PRECONDITION: a fresh session has no paste draining"
+        );
+        let inline_at = Instant::now();
+        type_word(&mut app, wid, "k");
+        assert!(
+            app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(inline_at + Duration::from_millis(300)),
+            "an inline key witnesses the echo that follows it"
+        );
+        assert!(
+            !app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(inline_at + Duration::from_millis(1_100)),
+            "and is granted no head start it did not spend in a queue"
+        );
+
+        // THE QUEUED PATH. One occupied FIFO slot is exactly what a draining
+        // paste presents to the key path, so this key takes the ordered branch
+        // and its bytes leave on the writer thread, not here.
+        let pin = super::paste_order::pin_ordering_for_test(&sink);
+        assert!(
+            super::paste_order::is_ordering(master),
+            "PRECONDITION: the key path must see this session as ordering"
+        );
+        let queued_at = Instant::now();
+        type_word(&mut app, wid, "k");
+        assert!(
+            app.windows[&wid].word_decos.typed_edit_witness(queued_at),
+            "a queued key witnesses immediately — the FIFO may drain at once"
+        );
+        assert!(
+            app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(queued_at + Duration::from_millis(1_400)),
+            "and must still witness the echo that only arrives after the queue \
+             drains — the arrival-stamped witness expired here"
+        );
+        // STILL FINITE: a key whose echo never comes eventually stops
+        // licensing anything, exactly as the bare budget does.
+        assert!(
+            !app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(queued_at + Duration::from_millis(2_400)),
+            "the queue's head start is a bounded grace, not an open licence"
+        );
+
+        // NEGATIVE CONTROL — THE GRACE EXTENDS THE CLOCK, NEVER THE SCOPE. With
+        // the engine scanning a DIFFERENT pane, a queued edit in this one is an
+        // unrelated edit and must witness nothing, at any point in the grace.
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .word_decos
+            .bind_pane(session.wrapping_add(0xBEEF), (0, 0));
+        let elsewhere_at = Instant::now();
+        type_word(&mut app, wid, "k");
+        assert!(
+            !app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(elsewhere_at),
+            "another pane's key may not license a re-arm on this scan"
+        );
+        assert!(
+            !app.windows[&wid]
+                .word_decos
+                .typed_edit_witness(elsewhere_at + Duration::from_millis(1_400)),
+            "and the queue grace must not smuggle it in later either"
+        );
+
+        // Release the pin and let the writer thread finish the jobs it took, so
+        // the pipe is closed with nothing still writing into it.
+        drop(pin);
+        for _ in 0..400 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !super::paste_order::is_ordering(master),
+            "the ordered egress must drain once the pin is released"
+        );
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    /// Typing `kitty` summons THE STANDALONE CAMEO — never the cursor
+    /// companion (owner, 2026-08-09) — and logs EXACTLY one episode as the type
+    /// it visually is (`head_peek`, ordinary magic); the consumed completion's
+    /// tail adds nothing.
+    #[test]
+    fn typing_kitty_summons_the_cameo_and_never_the_companion() {
         let mut app = App::headless_for_test();
         app.recompute_sparkle();
         assert!(
@@ -9956,20 +10415,25 @@ mod typed_kitty_summon_tests {
             "the default config resolves sparkle words ON"
         );
         let wid = WindowId(0);
+        let now = std::time::Instant::now();
         assert!(!app.windows[&wid].cursor_cat.is_active());
+        assert!(
+            !app.windows[&wid].word_decos.cameo_live(now, None),
+            "precondition: nothing is on glass before the word is typed"
+        );
 
         type_word(&mut app, wid, "kitty");
         assert!(
-            app.windows[&wid].cursor_cat.is_active(),
-            "the typed word summons the companion hello"
+            app.windows[&wid].word_decos.cameo_live(now, None),
+            "the typed word summons THE kitty"
         );
         assert!(
-            app.windows[&wid]
-                .cursor_cat
-                .static_deadline(std::time::Instant::now())
-                .is_some(),
-            "the reduced-motion erase wake is armed (the hello is a real \
-             collection-style presentation, not a nyan-only flight)"
+            !app.windows[&wid].cursor_cat.is_active(),
+            "and it must NOT wake the CURSOR kitty"
+        );
+        assert!(
+            app.windows[&wid].cursor_cat.static_deadline(now).is_none(),
+            "the companion owns no erase wake either — it was never presented"
         );
         assert_eq!(
             app.kitty_log.log().sightings,
@@ -10130,8 +10594,14 @@ mod typed_kitty_summon_tests {
         let wid = WindowId(0);
         type_word(&mut app, wid, "kitty");
         assert!(
-            !app.windows[&wid].cursor_cat.is_active(),
+            !app.windows[&wid]
+                .word_decos
+                .cameo_live(std::time::Instant::now(), None),
             "feline off: no cameo may arm"
+        );
+        assert!(
+            !app.windows[&wid].cursor_cat.is_active(),
+            "feline off: and certainly no companion either"
         );
         assert_eq!(
             app.kitty_log.log().sightings,
@@ -10152,7 +10622,7 @@ mod typed_kitty_summon_tests {
         let now = std::time::Instant::now();
         app.summon_typed_kitty(wid, session, now, true);
         assert_eq!(app.kitty_log.log().sightings, 1);
-        assert!(app.windows[&wid].cursor_cat.is_active());
+        assert!(app.windows[&wid].word_decos.cameo_live(now, None));
         // Bypassing the detector's cooldown on purpose: this seam proves the
         // ident sequence, not the rate limit (the detector owns that proof).
         app.summon_typed_kitty(wid, session, now, true);
@@ -10178,8 +10648,12 @@ mod typed_kitty_summon_tests {
         app.summon_typed_kitty(wid, session, now, false);
 
         assert!(
-            app.windows[&wid].cursor_cat.is_active(),
+            app.windows[&wid].word_decos.cameo_live(now, None),
             "the cat must come when called, cooldown or not"
+        );
+        assert!(
+            !app.windows[&wid].cursor_cat.is_active(),
+            "and the cooldown tier still never routes through the companion"
         );
         assert_eq!(
             app.kitty_log.log().sightings,

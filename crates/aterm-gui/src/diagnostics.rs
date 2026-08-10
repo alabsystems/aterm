@@ -1130,6 +1130,23 @@ pub(crate) fn config_backend_capability_warnings(
                 crate::prefs::EDIT_TRAIL_SOUND_VOLUME,
                 config.trail_sound_volume.is_some(),
             ),
+            // The rest of the Sound menu's SYNTH voices. They ride the same
+            // macOS-only `trail_audio` output as the two keys above, and the
+            // Sound menu made them reachable from Settings, so a portable
+            // `aterm.toml` must get the same honest warning for all of them.
+            (
+                crate::prefs::EDIT_TRAIL_SOUND_STYLE,
+                config.trail_sound_style.is_some(),
+            ),
+            (crate::prefs::EDIT_TONE_MELODY, config.tone_melody.is_some()),
+            (
+                crate::prefs::EDIT_TRAIL_SOUND_BED,
+                config.trail_sound_bed.is_some(),
+            ),
+            (
+                crate::prefs::EDIT_TRAIL_SOUND_RIFF,
+                config.trail_sound_riff.is_some(),
+            ),
         ] {
             if authored {
                 warnings.push(ConfigSemanticWarning {
@@ -1153,6 +1170,17 @@ pub(crate) fn config_backend_capability_warnings(
             warnings.push(ConfigSemanticWarning {
                 key: "allow_notifications",
                 message: "allow_notifications is parsed and preserved but has no effect on this platform because desktop-notification delivery is currently implemented only on macOS and Windows"
+                    .to_string(),
+            });
+        }
+        // The audible BEL is the macOS/Windows pair, not the macOS-only synth:
+        // `NSBeep` and `MessageBeep` both exist, and nothing else does — so this
+        // key belongs in the Unsupported block with its platform twins above,
+        // NOT in the macOS-only trail-audio block.
+        if config.bell_sound.is_some() {
+            warnings.push(ConfigSemanticWarning {
+                key: crate::prefs::EDIT_BELL_SOUND,
+                message: "bell_sound is parsed and preserved but has nothing to suppress on this platform because the audible terminal bell is implemented only with the macOS and Windows system alert sound"
                     .to_string(),
             });
         }

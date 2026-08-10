@@ -142,6 +142,12 @@ pub enum Action {
     /// cursor for motion + selection over the screen and scrollback, no chord bound by
     /// default — bind it in `[keybindings]` (e.g. `ctrl+shift+space = "toggle_vi_mode"`).
     ToggleViMode,
+    /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
+    /// keyboard face of Window ▸ Rename Session… and of double-clicking a tab.
+    /// It renames the SESSION (`meta set title`), not the tab: a tab can hold
+    /// several split sessions. No chord by default — bind it in `[keybindings]`
+    /// (e.g. `ctrl+shift+r = "rename_session"`).
+    RenameSession,
 }
 
 /// Every bindable action NAME, in a stable order — the canonical discoverable
@@ -184,6 +190,7 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "toggle_serious_mode",
     "open_palette",
     "toggle_vi_mode",
+    "rename_session",
 ];
 
 /// Built-in Cmd-* shortcuts hardcoded in `App::on_key` + its helpers, as
@@ -303,6 +310,7 @@ impl Action {
             "toggle_serious_mode" => Action::ToggleSeriousMode,
             "open_palette" => Action::OpenPalette,
             "toggle_vi_mode" => Action::ToggleViMode,
+            "rename_session" => Action::RenameSession,
             _ => return None,
         })
     }

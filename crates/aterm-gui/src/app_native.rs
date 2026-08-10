@@ -369,11 +369,336 @@ const MAX_ACTIVITY_REVOKED_CYCLES: u8 = 8;
 /// staged update sitting there applying only on the next relaunch. That is the
 /// exact symptom this whole feature exists to remove.
 ///
-/// Two retries, spaced in tens of minutes, is the compromise: a slow moment gets
-/// another chance at a calmer one, while a STRUCTURAL failure (two builds whose
-/// adoption proof genuinely cannot agree) still converges to manual-only quickly
-/// and stops costing round trips.
+/// Two retries, spaced in tens of minutes, is the compromise WITHIN one epoch: a
+/// slow moment gets another chance at a calmer one. Convergence for a STRUCTURAL
+/// failure is NOT this constant's job — three failures inside forty minutes cannot
+/// tell a broken pair of builds from a busy afternoon, which is why the lane it
+/// ends is bounded by [`MAX_PHYSICAL_FAILURE_EPOCHS`] instead, after the whole
+/// schedule has been replayed in three separate epochs spread across ~14 hours.
+///
+/// …AND WHY THIS SCHEDULE IS NOT THE ONLY ONE. A failure that says so in its own
+/// right — two builds whose adoption proof genuinely cannot agree — never enters
+/// this schedule at all now: it is charged
+/// [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`] and converges without ever reaching an
+/// epoch boundary. Everything above is the argument for the TRANSIENT member of
+/// the set, and it was being spent on all four.
 const MAX_PHYSICAL_FAILURE_CYCLES: u8 = 2;
+
+/// Physical failures counted in ONE epoch: the initial failure plus its
+/// [`MAX_PHYSICAL_FAILURE_CYCLES`] retries.
+const PHYSICAL_FAILURES_PER_EPOCH: u8 = MAX_PHYSICAL_FAILURE_CYCLES + 1;
+
+/// How many whole epochs an artifact gets before automatic apply gives up on
+/// those exact bytes.
+///
+/// THE FINDING THIS CONSTANT EXISTS FOR: without it, a spent epoch stood down for
+/// six hours, the stand-down outlasted the replenish window BY DESIGN, and so the
+/// cycle counter reset and the artifact got a full fresh budget — forever. The
+/// measured cost was ~10 park/spawn/paint round trips and ~10 "Update delayed"
+/// pills a day, on a machine where nothing was ever going to change, while the
+/// prose one screen up claimed the lane "converges to manual-only quickly". The
+/// code and the claim disagreed and the claim was the nicer of the two.
+///
+/// Owner instruction: a transient BLOCK deserves a cooldown; a STRUCTURAL failure
+/// does not deserve unbounded retries — bound it so it genuinely converges, keep
+/// the transient lane retrying quietly, and do not notify a user on a schedule
+/// for a failure that is not going to fix itself.
+///
+/// Three epochs is where "the machine was having a bad afternoon" stops being a
+/// credible explanation. The full schedule is 9 failures spread over roughly
+/// 14 hours (40 min of epoch + 6 h stand-down, three times over), so the last
+/// epoch necessarily samples the machine on a different side of a night's idle
+/// time from the first. An artifact that cannot hand off in any of them is
+/// evidence about the BYTES, and the honest answer is the one the user can act
+/// on: stop spending round trips, latch manual-only, and say so once.
+const MAX_PHYSICAL_FAILURE_EPOCHS: u8 = 3;
+
+/// Total physical failures an artifact may cost before automatic apply converges.
+/// Nine, and after the ninth [`App::spend_physical_failure_budget`] answers
+/// `retry_at: None` — the deadline-less latch that `arm` reads as
+/// `SuppressManualOnly` until a strictly newer build ships or the app relaunches.
+const PHYSICAL_FAILURE_LIFETIME_ATTEMPTS: u8 =
+    PHYSICAL_FAILURES_PER_EPOCH * MAX_PHYSICAL_FAILURE_EPOCHS;
+
+/// Total physical failures a STRUCTURALLY-shaped artifact may cost before
+/// automatic apply converges on those exact bytes.
+///
+/// THE FINDING THIS CONSTANT EXISTS FOR: the worker's four returned failure kinds
+/// were classified precisely and then charged identically. They are not the same
+/// event, and every word of the schedule above is an argument about ONE of them.
+/// [`MAX_PHYSICAL_FAILURE_CYCLES`] is sized for `TimedOut` — a 15 s deadline
+/// missed on a cold page cache, an accident of the machine's afternoon — and its
+/// generosity (nine round trips, three independent epochs, ~14 hours) is bought
+/// entirely by the claim that the next sample genuinely might succeed.
+///
+/// Nothing in that argument survives contact with an `AdoptionMismatch`: the
+/// parent and its candidate disagreed about the adopted PTY set, which is a
+/// property of the two IMAGES. Six hours of stand-down does not change a build's
+/// proof format, and a quiet terminal does not change a bundle that fails
+/// `codesign`. Charging a structural failure the transient schedule spends eight
+/// further park/spawn/paint round trips, and most of a day of the automatic
+/// lane's attention, re-learning what the first failure already said.
+///
+/// TWO, NOT ONE, and the second attempt is a genuine confirmation rather than
+/// politeness: the class is not perfectly separable at this seam. A
+/// `PreparationFailed` is usually the staged bundle failing pre-park verification
+/// (structural, certain to recur), but it is also what a screen-carry digest
+/// losing a race with a resize reports. One retry, ten minutes out, separates
+/// those at a cost of one round trip. A third would be spending round trips to
+/// re-confirm a verdict already confirmed.
+const STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS: u8 = 2;
+
+const _: () = assert!(
+    STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS < PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+    "the structural lane exists to converge SOONER than the transient one; at \
+     parity the classification is decoration"
+);
+
+const _: () = assert!(
+    STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS <= PHYSICAL_FAILURES_PER_EPOCH,
+    "a structural failure must be finished inside its FIRST epoch. It may never \
+     reach the stand-down, whose whole premise — that six hours make the machine \
+     an independent sample — is a statement about the machine, and a structural \
+     failure is not about the machine"
+);
+
+/// Idle gap after which an artifact's PHYSICAL-failure counter starts over.
+///
+/// DELIBERATELY NOT [`crate::ACTIVITY_RETRY_BUDGET_REPLENISH`], which this lane
+/// used to borrow. That window is 30 minutes and the second physical retry waits
+/// exactly 30 minutes, so the third failure ALWAYS landed at or past the
+/// replenish threshold and reset `cycles` to zero. The budget therefore never
+/// reached [`MAX_PHYSICAL_FAILURE_CYCLES`]: a structurally broken pair of builds
+/// alternated 10-minute and 30-minute park/spawn/paint round trips forever. A
+/// budget whose cap cannot be reached is not a budget.
+///
+/// IT MUST NOW OUTLAST A WHOLE EPOCH, WHICH IS THE OPPOSITE OF WHAT IT USED TO DO,
+/// and the inversion is the fix. The previous window (4 h) was deliberately
+/// SHORTER than the 6 h stand-down so that "the next epoch starts from a full
+/// budget" — which is exactly how the counter forgave itself on the very cadence
+/// it prescribed and made the lane unbounded. Epochs can only be counted by a
+/// counter that survives the gap between them, so the window has to clear the
+/// longest gap the schedule itself can produce: one stand-down
+/// ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`], 6 h) plus the in-epoch spacing
+/// (600 s + 1800 s). Twelve hours clears that with room for a late failure that
+/// waited behind other updater work.
+///
+/// The forgiveness property the window was borrowed for is intact and now means
+/// something sharper: half a day with no physical failure at all for these exact
+/// bytes — which, once the lane has converged, only a person's deliberate Version
+/// menu retry can produce — starts the schedule over.
+const PHYSICAL_RETRY_BUDGET_REPLENISH: std::time::Duration =
+    std::time::Duration::from_secs(12 * 60 * 60);
+
+/// How long automatic apply stands down after an artifact spends one epoch's
+/// PHYSICAL retry budget.
+///
+/// A spent EPOCH is not proof that the artifact is broken — it is proof that
+/// three handoffs inside forty minutes did not land, and the commonest cause
+/// (`TimedOut`: the 15 s handoff deadline missed on a cold page cache or a cold
+/// `codesign`) is a fact about the machine's afternoon, not about the bytes. So a
+/// spent epoch is a LONG WAIT and nothing more; only a spent
+/// [`MAX_PHYSICAL_FAILURE_EPOCHS`] is permitted to end the lane.
+///
+/// Six hours is what makes the epochs independent samples: it is long enough that
+/// the page cache, `codesign`'s state, and the machine's load are unrelated to
+/// what they were, and short enough that three of them fit inside a day, so a
+/// user whose machine had one bad morning still gets the update that evening
+/// rather than the following week. The worst case an artifact that can NEVER hand
+/// off can cost is now finite and stated: 9 round trips over ~14 h, then silence.
+const PHYSICAL_FAILURE_EPOCH_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+const _: () = assert!(
+    PHYSICAL_RETRY_BUDGET_REPLENISH.as_secs()
+        > PHYSICAL_FAILURE_EPOCH_COOLDOWN.as_secs() + 600 + 1800,
+    "the replenish window must outlast a whole epoch — one stand-down plus the \
+     in-epoch spacing — or the counter forgives itself between epochs, the epoch \
+     cap is unreachable, and a structurally broken artifact retries forever"
+);
+
+/// What [`App::spend_physical_failure_budget`] says about the attempt that just
+/// came back.
+///
+/// The three cases are kept apart rather than flattened into
+/// `(Instant, bool exhausted)` because they mean three different things to a user
+/// and the old pair could only say two of them: a mid-epoch retry is invisible, a
+/// stand-down is a long quiet wait, and convergence is the only state where
+/// reaching for the Version menu beats waiting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalFailureSchedule {
+    /// Another automatic attempt, inside the current epoch.
+    Retry(std::time::Instant),
+    /// This epoch is spent; the next one begins after a long stand-down.
+    StandDown(std::time::Instant),
+    /// [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] spent across
+    /// [`MAX_PHYSICAL_FAILURE_EPOCHS`] independent epochs. Automatic apply is done
+    /// with these exact bytes; a strictly newer build, a relaunch, or the Version
+    /// menu is what moves next.
+    Converged,
+}
+
+impl PhysicalFailureSchedule {
+    /// The deadline to stamp on [`crate::AutoApplyManualOnly`]. `None` is the
+    /// latch `lapse_expired_auto_apply_manual_only` will never release — minted
+    /// ONLY on convergence, never for a single unlucky handoff.
+    #[must_use]
+    fn retry_at(self) -> Option<std::time::Instant> {
+        match self {
+            Self::Retry(at) | Self::StandDown(at) => Some(at),
+            Self::Converged => None,
+        }
+    }
+}
+
+/// How long the automatic lane waits between attempts once an artifact's cheap
+/// PREFLIGHT-BLOCK budget is spent.
+///
+/// The same number as [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`] on purpose — both
+/// answer the same question ("how long before it is worth disturbing a machine
+/// that told us it was busy") — but a distinct name, because this one is a RETRY
+/// SPACING on a retained intent, not the lapse deadline of a latch. They are free
+/// to diverge; sharing a `const` would make that look like a bug.
+const PREFLIGHT_BLOCK_COOLDOWN: std::time::Duration = crate::ACTIVITY_MANUAL_ONLY_LAPSE;
+
+/// WHICH LANE'S BUDGET A RETURNED HANDOFF FAILURE MAY SPEND, carried from the
+/// [`crate::native_updater_service::ApplyMode`] the attempt was authorized under.
+///
+/// THE FINDING THIS TYPE EXISTS FOR: the completion path took `pending.mode`,
+/// used it for the activity classification, and then DROPPED it — so every
+/// returned failure, including one a person asked for from the Version menu or
+/// `aterm-ctl update apply`, was charged to the AUTOMATIC lane. Two consequences,
+/// both user-visible and both the wrong way round:
+///   * a person's retry pushed the automatic artifact toward
+///     [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`], so clicking Install three times on a
+///     bad afternoon could converge the background lane to manual-only — the exact
+///     "staged, applies on relaunch" state the seamless lane exists to delete;
+///   * it also stamped `auto_apply_physical_retry` MICROSECONDS before surfacing,
+///     which is precisely the freshness window
+///     [`App::physical_failure_deserves_a_pill`] uses to recognise the automatic
+///     lane's own quiet retries — so the person who just asked for the update got
+///     silence.
+///
+/// A person's failure therefore charges NOTHING: no budget, no manual-only latch,
+/// no retirement of a live automatic intent. It is surfaced (loudly, by the
+/// caller) and that is all. The two automatic causes keep their existing separate
+/// clocks.
+/// WHAT A RETURNED PHYSICAL FAILURE IS EVIDENCE ABOUT: the machine's MOMENT, or
+/// the two IMAGES. Carried from the worker's typed [`crate::UpdateHandoffOutcome`]
+/// and never from its message string, exactly like the activity classification
+/// beside it.
+///
+/// The distinction is not cosmetic — it decides how many park/spawn/paint round
+/// trips an artifact may cost and how long the automatic lane keeps promising the
+/// user it "retries on its own". See [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhysicalFailureShape {
+    /// The attempt lost a race the next one may win. Rides the full
+    /// [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] schedule.
+    Transient,
+    /// The candidate could not become this process's successor, for a reason that
+    /// belongs to the bytes rather than to the afternoon. Converges after
+    /// [`STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS`].
+    Structural,
+}
+
+impl PhysicalFailureShape {
+    /// Classify one worker outcome.
+    ///
+    /// STRUCTURAL, and why each one earns it:
+    ///   * `AdoptionMismatch` — the child proved a PTY set the parent does not
+    ///     recognise. Every instance this tree has recorded was a cross-version
+    ///     disagreement about what the proof covers (a re-serialized manifest, a
+    ///     screen digest taken over different bytes, a key count off by one);
+    ///     none of them cared how busy the machine was;
+    ///   * `PreparationFailed` — raised entirely BEFORE the spawn, and its
+    ///     dominant producer is the staged candidate failing pre-park
+    ///     verification. A bundle that fails `codesign` fails it again in six
+    ///     hours;
+    ///   * `ChildDied` — the candidate exited before writing its readiness proof.
+    ///     That is the successor image refusing to boot as a successor (a
+    ///     malformed inherited handoff, a prearm refusal), which is the strongest
+    ///     statement about the new bytes available at this seam.
+    ///
+    /// TRANSIENT is the rest, and deliberately includes the two that are facts
+    /// about a moment: `TimedOut` (a 15 s deadline covering a cold boot, a
+    /// blocking `flock`, a bundle swap, a second exec and a full repaint — 4.5 s
+    /// measured, until the page cache is cold) and a non-activity-shaped
+    /// `Rejected` (a commit-time re-check of state that moves on its own).
+    /// `ProofReady` cannot reach a failure lane at all; it fails closed to the
+    /// forgiving shape rather than converging an artifact on a state nobody
+    /// understands.
+    #[must_use]
+    fn of_outcome(outcome: crate::UpdateHandoffOutcome) -> Self {
+        match outcome {
+            crate::UpdateHandoffOutcome::AdoptionMismatch
+            | crate::UpdateHandoffOutcome::PreparationFailed
+            | crate::UpdateHandoffOutcome::ChildDied => Self::Structural,
+            crate::UpdateHandoffOutcome::TimedOut
+            | crate::UpdateHandoffOutcome::Rejected
+            | crate::UpdateHandoffOutcome::ActivityRevoked
+            | crate::UpdateHandoffOutcome::ProofReady => Self::Transient,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandoffFailureLane {
+    /// AUTOMATIC, and the lossless rollback was caused by user/terminal activity:
+    /// spends [`AutomaticRetryKind::ActivityRevoked`] budget.
+    ActivityRevoked,
+    /// AUTOMATIC, and the failure is evidence about the artifact or the machine:
+    /// spends the converging physical budget, on the schedule its
+    /// [`PhysicalFailureShape`] earns.
+    Physical(PhysicalFailureShape),
+    /// A PERSON asked for this apply (the Version menu, the palette, a control
+    /// request, or an install-on-clean-quit gesture). Charges nothing.
+    Manual,
+}
+
+impl HandoffFailureLane {
+    /// Classify one returned completion from the two typed facts it carries: the
+    /// mode the apply was authorized under, and the worker's `outcome`.
+    ///
+    /// `revoked_by_activity` is the MAIN THREAD's half of the activity
+    /// observation (an activity-shaped rejection it recorded against this
+    /// attempt); the worker's half is the `ActivityRevoked` outcome, and either
+    /// one is enough. Both are meaningful only for a background attempt — a
+    /// person's apply deliberately does not arm the revocation watcher at all.
+    ///
+    /// THE OUTCOME IS NOW READ RATHER THAN DISCARDED. It used to reach this
+    /// decision as a single `activity_revoked: bool` and stop there, so all four
+    /// physical kinds were charged one schedule — the one written for the
+    /// transient member of the set. See [`PhysicalFailureShape`].
+    ///
+    /// `CleanQuit` counts as person-initiated: it exists only because a human just
+    /// quit the app, nothing re-attempts it on a timer, and the process is on its
+    /// way out — so spending a budget that dies with it could only ever damage the
+    /// NEXT session's automatic lane through the durable side effects the latch
+    /// drives.
+    #[must_use]
+    pub(crate) fn classify(
+        mode: crate::native_updater_service::ApplyMode,
+        outcome: crate::UpdateHandoffOutcome,
+        revoked_by_activity: bool,
+    ) -> Self {
+        if !mode.is_automatic() {
+            return Self::Manual;
+        }
+        if revoked_by_activity || outcome == crate::UpdateHandoffOutcome::ActivityRevoked {
+            Self::ActivityRevoked
+        } else {
+            Self::Physical(PhysicalFailureShape::of_outcome(outcome))
+        }
+    }
+
+    /// Whether this failure is allowed to touch the automatic lane's scheduling
+    /// state at all (its budgets, its latch, its live intent).
+    #[must_use]
+    fn charges_the_automatic_lane(self) -> bool {
+        !matches!(self, Self::Manual)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AutomaticRetryKind {
@@ -392,6 +717,11 @@ enum AutomaticRetryKind {
 /// activity-revoked overlap returns, and — on a deliberately short budget and long
 /// leash — for physical handoff failures, most of which are a missed deadline
 /// rather than a broken pair of builds (see [`MAX_PHYSICAL_FAILURE_CYCLES`]).
+///
+/// For [`AutomaticRetryKind::PhysicalFailure`] the `cycles` argument is the index
+/// WITHIN the current epoch, not the artifact's lifetime failure count: `None`
+/// here means "this epoch is spent", and whether that ends the epoch or the whole
+/// lane is [`App::spend_physical_failure_budget`]'s decision.
 #[must_use]
 fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::time::Duration> {
     let budget = match kind {
@@ -423,7 +753,8 @@ fn automatic_retry_delay(cycles: u8, kind: AutomaticRetryKind) -> Option<std::ti
         // missed deadline — so wait long enough that the machine is plausibly in a
         // different state (page cache warm, codesign warm, load down) rather than
         // re-running the same losing race immediately. The budget above stops this
-        // after two.
+        // after two retries per epoch; [`MAX_PHYSICAL_FAILURE_EPOCHS`] stops the
+        // epochs.
         (AutomaticRetryKind::PhysicalFailure, 0) => 600,
         (AutomaticRetryKind::PhysicalFailure, _) => 1800,
     };
@@ -4184,9 +4515,16 @@ impl App {
 
     /// Retain automatic apply intent for one exact (or superseding) staged build.
     /// Returns true only when this call armed a new intent.
-    /// Let an ACTIVITY-shaped manual-only latch lapse once its deadline passes,
-    /// restoring both automatic apply and a fresh retry budget for that
-    /// artifact. Genuine-failure latches carry no deadline and never lapse.
+    /// Let a manual-only latch lapse once its deadline passes, restoring
+    /// automatic apply and the ACTIVITY retry budget for that artifact.
+    ///
+    /// EVERY latch this process installs now carries a deadline: an activity one
+    /// after [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`], a physical one at the end of
+    /// its epoch ([`PHYSICAL_FAILURE_EPOCH_COOLDOWN`]). A `retry_at: None` latch
+    /// survives only as the fail-safe for a policy/outcome mismatch that no code
+    /// path is supposed to reach; it never lapses, which is the correct answer for
+    /// a state nobody understands.
+    ///
     /// Returns true when a latch was actually released.
     pub(crate) fn lapse_expired_auto_apply_manual_only(&mut self) -> bool {
         let now = std::time::Instant::now();
@@ -4503,19 +4841,114 @@ impl App {
                 );
             }
             (AttemptDisposition::Retry, UpdateOutcome::Blocked { reasons }) => {
-                if let Some(delay) =
-                    automatic_retry_delay(intent.attempts, AutomaticRetryKind::PreflightBlocked)
-                {
-                    intent.retry_at = std::time::Instant::now() + delay;
-                    self.auto_apply_intent = Some(intent);
-                } else {
-                    self.auto_apply_intent = None;
-                    self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-                        build: intent.build,
-                        dmg_sha256: intent.dmg_sha256,
-                        retry_at: None,
-                    });
-                }
+                // A PREFLIGHT BLOCK IS A FACT ABOUT THIS MOMENT, NEVER EVIDENCE
+                // AGAINST THE ARTIFACT — so a spent budget must slow the lane
+                // down, not end it, AND must not become a recurring intrusion.
+                //
+                // History, because both halves were learned the hard way.
+                //
+                // (1) The original shape retired the intent and installed
+                // `AutoApplyManualOnly { retry_at: None }`. `arm` then answers
+                // `SuppressManualOnly` for that exact (build, artifact) FOREVER,
+                // and `lapse_expired_auto_apply_manual_only` only releases
+                // latches whose `retry_at` is `Some`. The budget above is three
+                // attempts spaced 5 s / 15 s — roughly twenty seconds of being
+                // ready-to-park — and every blocker `apply_native_update` can
+                // report here is the user's own live state, so twenty busy
+                // seconds permanently disabled automatic apply and printed
+                // "Update paused — manual retry". That is the field report.
+                //
+                // (2) The obvious repair — give that latch a lapse deadline —
+                // trades a permanent intrusion for a RECURRING one, which is
+                // worse than it sounds. A lapse re-arms a FRESH intent at
+                // `attempts: 0`, so every cooldown replays the whole budget:
+                // three more attempts, each of which re-enters
+                // `prepare_all_native_shutdown`. Calling those "three cheap
+                // probes" was wrong on two independent counts, and BOTH are
+                // fixed here rather than one:
+                //   * the RATE (fixed by retaining the intent, below): a
+                //     monotone `attempts` means one probe per cooldown, not
+                //     three, and one status pill ever rather than one per
+                //     exhaustion;
+                //   * the COST OF A PROBE (fixed at its source in
+                //     `apply_native_update`): a probe used to be a focus hijack.
+                //     A native reducer answering `CloseReadiness::Blocked` made
+                //     `surface_native_close_recovery` switch the active tab, move
+                //     focus, re-front the window and replace the window overlay
+                //     with a Close Recovery palette (`app_tabs.rs` →
+                //     `app_palette.rs`). The automatic lane now probes with
+                //     `ClosePreflightVisibility::Quiet`, so the verdict is
+                //     unchanged and the screen is untouched. Rate alone was not
+                //     enough: even ONE unrequested palette over a user's work is
+                //     the intrusion, and it would still have recurred every
+                //     cooldown for as long as the blocker lived.
+                //
+                // SO THE INTENT IS RETAINED INSTEAD OF LATCHED, and `attempts`
+                // keeps counting for the life of that intent. Three consequences,
+                // all of them the point:
+                //   * the retry RATE past the budget is one attempt per
+                //     `PREFLIGHT_BLOCK_COOLDOWN`, not three — the fast 5 s/15 s
+                //     probes belong to the first twenty seconds only;
+                //   * a monotone `attempts` is a per-(build, artifact) counter
+                //     that no lapse can reset, so the status pill can fire on the
+                //     FIRST exhaustion and never again for these bytes. `arm`
+                //     answers `Keep` for a duplicate stage wake of the same
+                //     artifact, so a wake cannot mint fresh budget either; only a
+                //     genuinely different artifact re-arms at zero;
+                //   * nothing is ever permanent: a user who fixes the blocker
+                //     gets the update on the next cooldown without having to
+                //     learn that a menu exists.
+                //
+                // THE COOLDOWN IS ONLY SAFE BECAUSE EVERY `Blocked` THAT CAN
+                // REACH IT IS TRANSIENT. Audited producer by producer:
+                //   * close-preflight blockers (unsaved Settings text, dirty
+                //     or mid-checkpoint documents, a restore still landing) —
+                //     the user's own live state. Most clear themselves; a
+                //     FAILED checkpoint (`DocumentPhase::Blocked`) waits for
+                //     an explicit retry, so it keeps costing ONE probe per
+                //     cooldown until the user acts. That is the correct trade;
+                //   * `NotStaged`/`NotDeferred` — ordering, a stage may
+                //     publish on the next reduce;
+                //   * a native-close REDUCER ERROR is NOT one of them any
+                //     more: `apply_native_update` now reports it as
+                //     `Failed`, so it takes the strict arm below;
+                //   * `Disabled` and "missing sealed source provenance" are
+                //     unreachable from THIS lane by construction — a disabled
+                //     ledger clears `snapshot.staged` (so `poll` never
+                //     attempts) and `staged_from_status` refuses to import a
+                //     stage without a 40-hex commit (so provenance is always
+                //     present on a reducer-imported artifact).
+                // Genuine hard failures arrive as `UpdateOutcome::Failed` and
+                // keep their strict, converging budget untouched.
+                //
+                // The retained intent cannot spin: `poll` answers
+                // `Wait(Deadline)` without rescheduling until `retry_at`, and
+                // `about_to_wait` folds that instant into winit's `WaitUntil`
+                // (`fold_auto_apply_deadline`), so an IDLE terminal wakes exactly
+                // once per cooldown. It also cannot outlive its artifact — a
+                // superseded, retired or consumed stage clears the intent through
+                // `arm`/`poll`/`reconcile_returned_native_apply_with_facts`.
+                let cooling_down = match automatic_retry_delay(
+                    intent.attempts,
+                    AutomaticRetryKind::PreflightBlocked,
+                ) {
+                    Some(delay) => {
+                        intent.retry_at = std::time::Instant::now() + delay;
+                        false
+                    }
+                    None => {
+                        intent.retry_at = std::time::Instant::now() + PREFLIGHT_BLOCK_COOLDOWN;
+                        true
+                    }
+                };
+                // Exactly the attempt that spent the last of the budget. Counting
+                // from a monotone `attempts` (rather than from "is there a latch")
+                // is what makes this fire ONCE per artifact instead of once per
+                // cooldown: `attempts` is only reset by `arm` setting a new
+                // intent, which requires different bytes or a newer build.
+                let first_exhaustion =
+                    cooling_down && intent.attempts == MAX_AUTOMATIC_UPDATE_CYCLES;
+                self.auto_apply_intent = Some(intent);
                 if announce && intent.attempts == 1 {
                     self.surface_update_apply_outcome(
                         "automatic",
@@ -4525,78 +4958,110 @@ impl App {
                         false,
                     );
                 }
-                if self.auto_apply_intent.is_some() {
+                if !cooling_down {
                     aterm_log::info!(
                         "update auto-apply remains pending for build {}; bounded retry armed",
                         intent.build
                     );
                 } else {
                     let message = format!(
-                        "{} · automatic retries reached their safe cap; use the Update menu",
-                        reasons.join(" · ")
+                        "{} · automatic retries reached their safe cap; the automatic lane \
+                         now re-probes once every {}s until it lands, and the Version menu \
+                         can try immediately (it runs the same safety preflight, so the same \
+                         blockers still apply)",
+                        reasons.join(" · "),
+                        PREFLIGHT_BLOCK_COOLDOWN.as_secs()
                     );
+                    // The LOG says it every cooldown; the UI says it once. A log
+                    // line is pull, a pill is push.
                     aterm_log::warn!("{message}");
-                    self.surface_nonmodal_update_status("↑ Update paused — manual retry");
+                    if first_exhaustion {
+                        // THE OLD PILL WAS A LIE ABOUT A STATE THAT NO LONGER
+                        // EXISTS. "Update paused — manual retry" told the user the
+                        // automatic lane had given up and that clicking was now
+                        // the only way out; neither half is true. Say the two
+                        // things a user can act on: it comes back by itself, and
+                        // there is a control that does it right now.
+                        self.surface_nonmodal_update_status(
+                            "↑ Update waiting — retries on its own, or use the Version menu",
+                        );
+                    }
                 }
             }
             (AttemptDisposition::ManualOnly, UpdateOutcome::Failed { message }) => {
                 // A returned physical handoff can park/read/checkpoint sessions, so it
-                // is retried rarely and only twice — but it IS retried. `retry_at:
-                // None` here used to be a permanent latch (`arm` answers
-                // `SuppressManualOnly` forever, and `lapse_expired_auto_apply_manual_only`
-                // only clears latches that carry a deadline), which meant a single
-                // missed 15 s handoff deadline disabled automatic in-session apply for
-                // that build outright.
+                // is retried rarely and only twice per epoch — but it IS retried, and
+                // an epoch always ends. `retry_at: None` here used to be minted for a
+                // SINGLE missed 15 s handoff deadline, which disabled automatic
+                // in-session apply for that build outright; it is now reachable only
+                // from `PhysicalFailureSchedule::Converged`, i.e. nine failures across
+                // three independent epochs, which is the state where the automatic lane
+                // genuinely has nothing left to try.
                 self.auto_apply_intent = None;
-                // The cycle count must live OUTSIDE the latch: the latch is cleared
-                // when it lapses, so counting inside it would reset the budget on
-                // every lapse and turn "two tries" into an unbounded loop.
-                // `intent.attempts` is equally unusable — a lapse arms a fresh
-                // intent at 0. Keyed by (build, dmg) with the same replenish window
-                // as the activity budget, so a different artifact starts clean and a
-                // long quiet stretch forgives an old failure.
-                let now = std::time::Instant::now();
-                let cycles = self
-                    .auto_apply_physical_retry
-                    .filter(|retry| {
-                        retry.build == intent.build
-                            && retry.dmg_sha256 == intent.dmg_sha256
-                            && now.duration_since(retry.last_attempt)
-                                < crate::ACTIVITY_RETRY_BUDGET_REPLENISH
-                    })
-                    .map_or(0, |retry| retry.cycles);
-                self.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
-                    build: intent.build,
-                    dmg_sha256: intent.dmg_sha256,
-                    cycles: cycles.saturating_add(1),
-                    last_attempt: now,
-                });
-                let retry_at = automatic_retry_delay(cycles, AutomaticRetryKind::PhysicalFailure)
-                    .map(|delay| now + delay);
+                // TRANSIENT, BECAUSE THIS LANE HAS NO TYPED OUTCOME TO READ. These
+                // are SUBMISSION-time failures — the admission classifier refusing
+                // ("Update kept N sessions running…"), a cold-lane `exec` that
+                // returned, a reducer that went stale — and no worker verdict
+                // exists yet, because no candidate has been spawned. The only
+                // remaining discriminator is `message`, and deriving a convergence
+                // schedule from a display string is exactly the string matching the
+                // typed classification beside this replaced. The generous schedule
+                // is also the right default for the set: every producer here is a
+                // fact about this process's current state, which is what changes.
+                let schedule = self.spend_physical_failure_budget(
+                    intent.build,
+                    intent.dmg_sha256,
+                    PhysicalFailureShape::Transient,
+                );
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: intent.build,
                     dmg_sha256: intent.dmg_sha256,
-                    retry_at,
+                    retry_at: schedule.retry_at(),
                 });
-                if let Some(at) = retry_at {
-                    aterm_log::info!(
+                let wait_secs = |at: std::time::Instant| {
+                    at.saturating_duration_since(std::time::Instant::now()).as_secs()
+                };
+                match schedule {
+                    PhysicalFailureSchedule::Retry(at) => aterm_log::info!(
                         "update auto-apply: physical handoff failure on build {} \
                          (attempt {}); automatic apply is latched off until the retry \
                          window in ~{}s, then eligible again",
                         intent.build,
                         intent.attempts,
-                        at.saturating_duration_since(std::time::Instant::now())
-                            .as_secs()
-                    );
-                } else {
-                    aterm_log::warn!(
+                        wait_secs(at)
+                    ),
+                    PhysicalFailureSchedule::StandDown(at) => aterm_log::warn!(
                         "update auto-apply: physical handoff failure on build {} \
-                         exhausted its retry budget; manual apply only",
-                        intent.build
-                    );
+                         (attempt {}) exhausted this epoch's retry budget; standing down \
+                         for ~{}s, then a fresh epoch",
+                        intent.build,
+                        intent.attempts,
+                        wait_secs(at)
+                    ),
+                    PhysicalFailureSchedule::Converged => aterm_log::warn!(
+                        "update auto-apply: physical handoff failure on build {} \
+                         (attempt {}) spent all {} attempts across {} epochs; automatic \
+                         apply for this artifact is done — the Version menu remains",
+                        intent.build,
+                        intent.attempts,
+                        PHYSICAL_FAILURE_LIFETIME_ATTEMPTS,
+                        MAX_PHYSICAL_FAILURE_EPOCHS
+                    ),
                 }
                 self.surface_update_apply_outcome(
-                    "automatic · manual retry required",
+                    // The label used to say "manual retry required" even when
+                    // `retry_at` had just scheduled another automatic attempt —
+                    // it described the exhausted case for all of them. The label
+                    // now names which of the three schedules answered, and the
+                    // PILL (which is the part a user sees) is chosen by
+                    // `physical_failure_deserves_a_pill` from the same budget.
+                    match schedule {
+                        PhysicalFailureSchedule::Retry(_) => "automatic · retrying later",
+                        PhysicalFailureSchedule::StandDown(_) => {
+                            "automatic · standing down, then retrying"
+                        }
+                        PhysicalFailureSchedule::Converged => "automatic · out of retries",
+                    },
                     UpdateOutcome::Failed { message },
                     false,
                 );
@@ -4742,8 +5207,42 @@ impl App {
                 self.publish_native_update_state();
                 match disposition {
                     DurableStageDisposition::InstalledNeedsRelaunch { build } => {
+                        // A RETIRED BUILD MUST NOT KEEP ITS LATCH. The manual-only
+                        // latch is a promise about ONE artifact: do not spend
+                        // automatic apply on these bytes yet. Once those bytes are
+                        // the installed bundle there is nothing left for the
+                        // promise to refuse, and the whole class of bug this file
+                        // has been repairing is a latch that outlived its reason.
+                        // Harmless today only because `arm` independently refuses a
+                        // build that is no longer newer — which is a second
+                        // mechanism agreeing with this one, not a licence to keep
+                        // state that says something false about the world.
+                        //
+                        // A latch naming a STRICTLY NEWER build is about a
+                        // different artifact and survives, for exactly the reason
+                        // the sibling `Retired` arm in
+                        // `reconcile_returned_native_apply_with_facts` keeps its
+                        // own: a newer attempt may already have completed out of
+                        // order, and retiring old authority must not hand it back
+                        // an automatic lane it just latched off.
+                        if self
+                            .auto_apply_manual_only
+                            .is_some_and(|manual| manual.build <= build)
+                        {
+                            self.auto_apply_manual_only = None;
+                        }
+                        // NOT "by another aterm process" ANY MORE, which is the
+                        // likelier half of the truth and the one this line was
+                        // written for. The other producer is THIS process: an
+                        // overlap child swaps the bundle and re-execs BEFORE it can
+                        // write a readiness proof, so a handoff rejected after
+                        // ProofReady leaves the new bundle installed by our own
+                        // candidate — and `send_warranted_handoff_failure` posts
+                        // the disk facts that land here moments later. Name the
+                        // state and the remedy, and do not attribute the installer
+                        // to a process this reducer cannot identify.
                         let message = format!(
-                            "Build {build} was installed by another aterm process; relaunch once to activate it"
+                            "Build {build} is already installed on disk; relaunch once to activate it"
                         );
                         aterm_log::warn!("update sync: {message}");
                     }
@@ -4860,8 +5359,45 @@ impl App {
                 };
             }
         };
+        // A native-close REDUCER ERROR is not "not now". `Ok(false)` means a
+        // native app declined — the user's own live state, self-correcting. `Err`
+        // means the close reducer itself broke (an unknown window, unhandled
+        // effects): an invariant failure that no amount of waiting repairs. Both
+        // used to flatten into the same `Blocked`, which was harmless only while
+        // a `Blocked` latch was permanent anyway. Now that the automatic lane
+        // gives a `Blocked` latch a cooldown and comes back, that flattening
+        // would put a genuine hard failure into an endless retry loop — so keep
+        // the distinction TYPED all the way to the outcome instead of asking a
+        // later arm to guess it back out of a reason string.
+        let mut shutdown_error = None;
+        // A BACKGROUND PROBE MUST NOT TAKE OVER THE SCREEN. Under
+        // `ClosePreflightVisibility::Interactive` a reducer that answers `Blocked`
+        // makes `surface_native_close_recovery` switch the active tab, move
+        // keyboard focus, re-front the window and replace the window overlay with
+        // a Close Recovery palette. The automatic lane re-probes this call on a
+        // `PREFLIGHT_BLOCK_COOLDOWN` schedule for as long as the blocker lives, so
+        // Interactive here turned "an update is waiting" into a recurring focus
+        // hijack aimed at a user whose only mistake was leaving a Settings draft
+        // open. Owner instruction: a busy user must not have their tabs switched,
+        // their focus stolen, or a recovery panel reopened on a schedule.
+        //
+        // Quiet changes NOTHING about the verdict: the same reducers run, an
+        // `Ok(false)` still becomes `Blocked` and an `Err` still becomes the
+        // strict `Failed` lane below. The person-initiated lanes — the Version
+        // menu (`Immediate`) and `CleanQuit`, both of which happen because someone
+        // asked — keep the recovery surface, and the exhaustion pill points at
+        // exactly that menu, so the visible way to act is one deliberate click
+        // away instead of arriving unannounced.
+        let visibility = if mode.is_automatic() {
+            crate::app_tabs::ClosePreflightVisibility::Quiet
+        } else {
+            crate::app_tabs::ClosePreflightVisibility::Interactive
+        };
         let (readiness, safety_token) =
-            match self.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch) {
+            match self.prepare_all_native_shutdown(
+                crate::native_app::CloseScope::Relaunch,
+                visibility,
+            ) {
                 Ok(true) => self.native_update_close_preflight(),
                 Ok(false) => (
                     ClosePreflight::Blocked(vec![
@@ -4869,7 +5405,10 @@ impl App {
                     ]),
                     None,
                 ),
-                Err(message) => (ClosePreflight::Blocked(vec![message]), None),
+                Err(message) => {
+                    shutdown_error = Some(message.clone());
+                    (ClosePreflight::Blocked(vec![message]), None)
+                }
             };
         match self
             .native_updater_service
@@ -4908,6 +5447,14 @@ impl App {
             }
             ApplyDecision::Blocked(reasons) => {
                 self.publish_native_update_state();
+                // The service preflight ticket HAD to be consumed above — an
+                // abandoned `pending_preflight` makes every later
+                // `begin_apply_preflight` answer `Joined` for the rest of the
+                // process — so the error takes the long way round and is
+                // reported here rather than by an early return.
+                if let Some(message) = shutdown_error {
+                    return UpdateOutcome::Failed { message };
+                }
                 UpdateOutcome::Blocked { reasons }
             }
             ApplyDecision::Ignored => UpdateOutcome::Failed {
@@ -4921,19 +5468,182 @@ impl App {
     /// stage may be re-armed, a consumed/swapped stage becomes InstalledNeedsRelaunch,
     /// and a changed stage retires the old generation before importing the new one.
     ///
-    /// `activity_revoked` is the completion path's TYPED classification (never a
-    /// string match): true only when an AUTOMATIC attempt was revoked by user or
-    /// terminal activity and rolled back losslessly. A re-armed stage then spends
-    /// bounded [`AutomaticRetryKind::ActivityRevoked`] budget instead of latching
-    /// manual-only.
+    /// `lane` is the completion path's TYPED classification (never a string
+    /// match), derived from the [`crate::native_updater_service::ApplyMode`] the
+    /// attempt was authorized under plus the worker's activity verdict. An
+    /// activity-revoked AUTOMATIC attempt spends bounded
+    /// [`AutomaticRetryKind::ActivityRevoked`] budget instead of latching
+    /// manual-only; a person's attempt spends nothing at all (see
+    /// [`HandoffFailureLane`]).
     pub(crate) fn finish_async_native_update_handoff(
         &mut self,
         attempt: crate::native_updater_service::ApplyAttemptTicket,
         facts: NativeUpdateReconcileFacts,
         message: String,
-        activity_revoked: bool,
+        lane: HandoffFailureLane,
     ) -> Option<UpdateOutcome> {
-        self.reconcile_returned_native_apply_with_facts(attempt, facts, message, activity_revoked)
+        self.reconcile_returned_native_apply_with_facts(attempt, facts, message, lane)
+    }
+
+    /// Spend one PHYSICAL-failure attempt for this exact artifact and say what
+    /// happens next.
+    ///
+    /// THE ONE PLACE THE PHYSICAL BUDGET IS KEPT. It used to exist only in the
+    /// synchronous `(ManualOnly, Failed)` arm, which sees submission-time
+    /// failures — while the failures the budget is NAMED for (the four worker
+    /// outcomes `PhysicalFailureShape` classifies) return
+    /// asynchronously through `abort_reaped_native_apply_before_reconcile` and
+    /// `reconcile_returned_native_apply_with_facts`, which stamped a
+    /// deadline-less latch and consulted no budget at all. Two lanes, one
+    /// user-visible symptom, and the budgeted one was the lane that almost never
+    /// fires. Both now come here.
+    ///
+    /// THE COUNTER IS A LIFETIME COUNT, NOT AN IN-EPOCH ONE, and that is the
+    /// change this function exists to carry. It lives on
+    /// `auto_apply_physical_retry` rather than inside the latch, because the latch
+    /// is destroyed when it lapses and `AutoApplyIntent::attempts` resets when a
+    /// fresh intent is armed — only a counter that outlives both can converge. The
+    /// epoch and the position within it are DERIVED from it
+    /// ([`PHYSICAL_FAILURES_PER_EPOCH`]), so the epoch count survives the
+    /// stand-down between epochs; previously the stand-down deliberately outlasted
+    /// [`PHYSICAL_RETRY_BUDGET_REPLENISH`], the counter reset on every lapse, and
+    /// "converges to manual-only" was true of the doc comment only.
+    ///
+    /// Three answers, one per lane the caller has to drive:
+    ///   * mid-epoch — retry in 600 s, then 1800 s;
+    ///   * epoch spent — stand down [`PHYSICAL_FAILURE_EPOCH_COOLDOWN`] and start
+    ///     the next epoch with the full in-epoch schedule;
+    ///   * [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] spent — `retry_at: None`, the
+    ///     latch `arm` reads as `SuppressManualOnly` for these exact bytes until a
+    ///     strictly newer build ships or the app relaunches. Nine failures across
+    ///     three independent epochs and ~14 hours is evidence about the artifact,
+    ///     not about the machine's afternoon, and the user is told once (see
+    ///     [`App::physical_failure_deserves_a_pill`]) instead of every 40 minutes
+    ///     forever.
+    ///
+    /// Keyed by (build, dmg) so a different artifact starts clean, and gated by
+    /// [`PHYSICAL_RETRY_BUDGET_REPLENISH`] so half a day with no physical failure
+    /// at all for these bytes starts the whole schedule over.
+    ///
+    /// `shape` chooses WHICH of the two answers above this failure has earned. The
+    /// counter itself is shared and shape-blind on purpose — it counts physical
+    /// failures for these exact bytes, which is a fact neither lane disputes — so
+    /// evidence carries across the classification in the direction that matters: a
+    /// structural failure arriving on an artifact that has already burned its
+    /// transient budget converges immediately rather than buying a fresh pair of
+    /// attempts.
+    fn spend_physical_failure_budget(
+        &mut self,
+        build: u64,
+        dmg_sha256: [u8; 32],
+        shape: PhysicalFailureShape,
+    ) -> PhysicalFailureSchedule {
+        let now = std::time::Instant::now();
+        let spent = self
+            .auto_apply_physical_retry
+            .filter(|retry| {
+                retry.build == build
+                    && retry.dmg_sha256 == dmg_sha256
+                    && now.duration_since(retry.last_attempt) < PHYSICAL_RETRY_BUDGET_REPLENISH
+            })
+            .map_or(0, |retry| retry.cycles);
+        self.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+            build,
+            dmg_sha256,
+            cycles: spent.saturating_add(1),
+            last_attempt: now,
+        });
+        // `spent` is the number of physical failures these bytes had BEFORE this
+        // one, so it is also this failure's 0-based lifetime index. Saturating
+        // arithmetic keeps a `u8` that somehow ran away pinned at Converged rather
+        // than wrapping back into a fresh budget.
+        if spent >= PHYSICAL_FAILURE_LIFETIME_ATTEMPTS.saturating_sub(1) {
+            return PhysicalFailureSchedule::Converged;
+        }
+        if shape == PhysicalFailureShape::Structural {
+            // ONE CONFIRMING RETRY, THEN THE LANE IS DONE WITH THESE BYTES. The
+            // epoch machinery below is deliberately skipped rather than
+            // parameterized: an epoch is a re-sample of the MACHINE, and there is
+            // nothing about the machine left to re-sample once the candidate has
+            // told us twice that it cannot become this process's successor.
+            if spent >= STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS.saturating_sub(1) {
+                return PhysicalFailureSchedule::Converged;
+            }
+            // The same first rung as the transient schedule: the difference
+            // between the lanes is how many rungs there are, not how far apart the
+            // first two sit. Fail-closed if that rung is ever legislated away —
+            // converging is the safe answer for a structural failure with no
+            // schedule to ride.
+            return automatic_retry_delay(0, AutomaticRetryKind::PhysicalFailure)
+                .map_or(PhysicalFailureSchedule::Converged, |delay| {
+                    PhysicalFailureSchedule::Retry(now + delay)
+                });
+        }
+        let within_epoch = spent % PHYSICAL_FAILURES_PER_EPOCH;
+        match automatic_retry_delay(within_epoch, AutomaticRetryKind::PhysicalFailure) {
+            Some(delay) => PhysicalFailureSchedule::Retry(now + delay),
+            // This epoch is spent but the lane is not. Stand down long enough that
+            // the next epoch is an independent sample of the machine, and — unlike
+            // the previous design — short enough that the counter carrying the
+            // epoch tally survives it (the compile-time assert on
+            // [`PHYSICAL_RETRY_BUDGET_REPLENISH`] is what guarantees that).
+            None => PhysicalFailureSchedule::StandDown(now + PHYSICAL_FAILURE_EPOCH_COOLDOWN),
+        }
+    }
+
+    /// Whether a physical apply failure for `staged_build` is one of the two the
+    /// user is told about, or one of the ones that pass in silence.
+    ///
+    /// Owner instruction: do not notify a user on a schedule for a failure that is
+    /// not going to fix itself. The physical lane can cost nine failures before it
+    /// converges, and painting "↑ Update delayed — retries on its own" on each of
+    /// them is a pill every ~40 minutes for most of a day, describing a state the
+    /// user cannot do anything about — the lane is already coming back by itself.
+    ///
+    /// So the same shape the preflight-block lane already proved: THE LOG SAYS IT
+    /// EVERY TIME, THE UI SAYS IT TWICE.
+    ///   * the FIRST physical failure for these bytes — something visibly did not
+    ///     happen, and one pill is how the user learns the lane exists;
+    ///   * convergence — which does not come through here at all, because a
+    ///     converged artifact has `retry_at: None` and takes
+    ///     `surface_update_apply_outcome`'s "see Version menu" branch, the one
+    ///     that names a control the user can actually press.
+    /// Everything between the two is quiet.
+    ///
+    /// Answering `true` for an artifact with no physical record is deliberate:
+    /// activity-revoked latches and the fail-safe policy-mismatch arm keep their
+    /// existing single pill, since neither spends this budget.
+    ///
+    /// THE FRESHNESS TERM IS NOT DECORATION — it is what keeps the suppression
+    /// pointed at the automatic lane. Only the lanes that spend the budget
+    /// (`finish_native_auto_apply_attempt` and the automatic completions) call
+    /// [`Self::spend_physical_failure_budget`] IMMEDIATELY before surfacing, so
+    /// for them the record is microseconds old. A PERSON's failure — the Version
+    /// menu, the palette, or an `aterm-ctl update apply` control request — spends
+    /// nothing, so it inherits a mid-budget record that is at least one retry
+    /// interval old and speaks: a person who just asked for something is exactly
+    /// who should be told it did not happen. The physical schedule's own minimum
+    /// spacing is 600 s, so any window far below that separates the two without a
+    /// new plumbing parameter.
+    ///
+    /// THAT SENTENCE WAS FALSE UNTIL THE COMPLETION PATH CARRIED ITS `ApplyMode`.
+    /// A person's RETURNED handoff (not the submission-time failures this prose was
+    /// written against) went through the same reduction as a background one, spent
+    /// the budget microseconds before surfacing, and was therefore silenced by the
+    /// very rule written to protect it. [`HandoffFailureLane`] is what makes the
+    /// premise true; the residual is a genuine coincidence window — a person whose
+    /// apply fails within `JUST_SPENT` of an automatic failure for the same bytes
+    /// still inherits a fresh record — which the automatic schedule's 600 s minimum
+    /// spacing makes rare and which no observation available here can separate.
+    pub(crate) fn physical_failure_deserves_a_pill(&self, staged_build: u64) -> bool {
+        /// How recently the physical budget must have been spent for this failure
+        /// to be the one that spent it. Three orders of magnitude under the 600 s
+        /// minimum retry spacing, so no real retry can be mistaken for "just now".
+        const JUST_SPENT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        self.auto_apply_physical_retry
+            .filter(|retry| retry.build == staged_build && retry.last_attempt.elapsed() < JUST_SPENT)
+            .is_none_or(|retry| retry.cycles <= 1)
     }
 
     /// Consume one activity-revoked overlap retry cycle for this exact artifact
@@ -5008,12 +5718,22 @@ impl App {
         &mut self,
         attempt: &crate::native_updater_service::ApplyAttemptTicket,
         message: String,
-        activity_revoked: bool,
+        lane: HandoffFailureLane,
     ) -> UpdateOutcome {
         if self
             .native_updater_service
             .abort_apply(attempt, message.clone())
         {
+            // A PERSON'S FAILURE IS NOT THE BACKGROUND LANE'S BUSINESS. The apply
+            // authority above is reduced either way (the artifact remains staged
+            // and the UI leaves Applying), but nothing below this line may run:
+            // spending the automatic budget here converged the background lane on
+            // a human's retries, and the freshly-stamped record silenced the pill
+            // for the very person who asked. See [`HandoffFailureLane`].
+            if !lane.charges_the_automatic_lane() {
+                self.publish_native_update_state();
+                return UpdateOutcome::Failed { message };
+            }
             // MIRRORS the `Rearmed` policy in
             // `reconcile_returned_native_apply_with_facts`. That policy was
             // unreachable: it is gated behind a completion carrying worker
@@ -5024,7 +5744,7 @@ impl App {
             // expire. One revoked overlap therefore retired automatic apply for
             // the process lifetime, and the whole `MAX_ACTIVITY_REVOKED_CYCLES`
             // schedule never ran once in production.
-            if activity_revoked
+            if lane == HandoffFailureLane::ActivityRevoked
                 && let Some(delay) = self.arm_activity_revoked_overlap_retry(attempt)
             {
                 self.publish_native_update_state();
@@ -5037,12 +5757,11 @@ impl App {
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                     build: attempt.target_build(),
                     dmg_sha256,
-                    // RECOVERABLE when the cause was activity: the artifact is
-                    // fine, the terminal was just busy, so the latch lapses
-                    // instead of retiring automatic apply until a relaunch.
-                    // Only a genuine failure keeps the deadline-less latch.
-                    retry_at: activity_revoked
-                        .then(|| std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE),
+                    retry_at: self.physical_completion_retry_at(
+                        attempt.target_build(),
+                        dmg_sha256,
+                        lane,
+                    ),
                 });
             }
             self.auto_apply_intent = None;
@@ -5051,12 +5770,66 @@ impl App {
         UpdateOutcome::Failed { message }
     }
 
+    /// When automatic apply may try this artifact again after a RETURNED handoff
+    /// that is not getting an activity-revoked re-arm.
+    ///
+    /// THIS IS THE LANE THE FINDING WAS ABOUT. All four physical outcomes come
+    /// back here, and this
+    /// used to answer `retry_at: None` for every one of them — a latch `arm`
+    /// honours as `SuppressManualOnly` forever and
+    /// `lapse_expired_auto_apply_manual_only` cannot release. So the commonest
+    /// physical failure there is (a 15 s handoff deadline missed on a cold page
+    /// cache) retired automatic in-session apply for that build until a strictly
+    /// newer one shipped: the exact "staged, only applies on relaunch" symptom the
+    /// seamless lane exists to delete, reachable from ONE unlucky moment.
+    ///
+    /// Two causes, two clocks, and only one of them may ever answer "never":
+    ///   * ACTIVITY exhausted its own (large, exponential) budget — the artifact
+    ///     is fine and the terminal was merely busy, so the short
+    ///     [`crate::ACTIVITY_MANUAL_ONLY_LAPSE`] applies and the answer is always
+    ///     a deadline;
+    ///   * a PHYSICAL failure — expensive to repeat, so it spends the shared
+    ///     budget: a retry inside the epoch, a stand-down between epochs, and
+    ///     `None` once [`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] are gone. That last
+    ///     case is the deliberate difference from the previous design, which could
+    ///     only ever answer with a deadline and therefore retried a structurally
+    ///     broken artifact for the life of the process.
+    ///
+    /// Only the two AUTOMATIC lanes reach here — a person's failure returns
+    /// before the latch is stamped at all, because neither clock is about them.
+    fn physical_completion_retry_at(
+        &mut self,
+        build: u64,
+        dmg_sha256: [u8; 32],
+        lane: HandoffFailureLane,
+    ) -> Option<std::time::Instant> {
+        debug_assert!(
+            lane.charges_the_automatic_lane(),
+            "a person-initiated failure must never reach the automatic schedule"
+        );
+        match lane {
+            HandoffFailureLane::ActivityRevoked => {
+                Some(std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE)
+            }
+            HandoffFailureLane::Physical(shape) => self
+                .spend_physical_failure_budget(build, dmg_sha256, shape)
+                .retry_at(),
+            // UNREACHABLE — both callers return before the latch is stamped for a
+            // person's failure, and the debug assert above says so. If a future
+            // caller forgets, charging nothing is the half that matters (a human's
+            // retries must never converge the background lane), and `None` is this
+            // file's standing answer for a state nobody understands: a latch that
+            // never lapses, rather than a schedule invented for it here.
+            HandoffFailureLane::Manual => None,
+        }
+    }
+
     fn reconcile_returned_native_apply_with_facts(
         &mut self,
         attempt: crate::native_updater_service::ApplyAttemptTicket,
         facts: NativeUpdateReconcileFacts,
         message: String,
-        activity_revoked: bool,
+        lane: HandoffFailureLane,
     ) -> Option<UpdateOutcome> {
         let durable_enabled = facts
             .durable
@@ -5087,12 +5860,22 @@ impl App {
         );
         match disposition {
             ReturnedApplyDisposition::Rearmed => {
+                // A PERSON'S FAILURE CHARGES NOTHING, exactly as in the sibling
+                // reaped-abort lane: the stage is re-armed on disk, the facts are
+                // reduced, and the automatic lane's budgets, latch and live intent
+                // are left precisely as they were. See [`HandoffFailureLane`].
+                if !lane.charges_the_automatic_lane() {
+                    self.publish_native_update_state();
+                    let _ = self.reconcile_native_update_facts(facts);
+                    self.finish_deferred_native_update_reconcile();
+                    return Some(UpdateOutcome::Failed { message });
+                }
                 // ACTIVITY-REVOKED + budget remaining: the exact stage was
                 // re-armed on disk and the rollback was lossless, so schedule
                 // one bounded quiet-window re-attempt instead of latching
-                // manual-only. Exhausted budget (or a genuine failure, where
-                // `activity_revoked` is false) takes the sticky manual latch.
-                if activity_revoked
+                // manual-only. Exhausted budget (or a genuine failure, where the
+                // lane is `Physical`) takes the sticky manual latch.
+                if lane == HandoffFailureLane::ActivityRevoked
                     && let Some(delay) = self.arm_activity_revoked_overlap_retry(&attempt)
                 {
                     self.publish_native_update_state();
@@ -5105,14 +5888,16 @@ impl App {
                     return Some(UpdateOutcome::Deferred { reason: message });
                 }
                 if let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256()) {
-                    // RECOVERABLE when the cause was activity: the artifact is
-                    // fine, the terminal was just busy, so the latch lapses
-                    // instead of retiring automatic apply until a relaunch.
+                    // Same two clocks as the sibling reaped-abort lane, through
+                    // the same helper — see `physical_completion_retry_at`.
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
                         build: attempt.target_build(),
                         dmg_sha256,
-                        retry_at: activity_revoked
-                            .then(|| std::time::Instant::now() + crate::ACTIVITY_MANUAL_ONLY_LAPSE),
+                        retry_at: self.physical_completion_retry_at(
+                            attempt.target_build(),
+                            dmg_sha256,
+                            lane,
+                        ),
                     });
                 }
                 self.auto_apply_intent = None;
@@ -5266,7 +6051,12 @@ impl App {
     /// This keeps `ATERM_DEBUG_SEAMLESS_REEXEC` useful without granting it a bypass
     /// around dirty documents, checkpoint work, or restore/adoption state.
     pub(crate) fn apply_debug_seamless_update(&mut self) -> UpdateOutcome {
-        match self.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch) {
+        // A QA seam is driven by a person at a keyboard, so a blocker is the
+        // answer to something they just did: surface the recovery commands.
+        match self.prepare_all_native_shutdown(
+            crate::native_app::CloseScope::Relaunch,
+            crate::app_tabs::ClosePreflightVisibility::Interactive,
+        ) {
             Ok(true) => {}
             Ok(false) => {
                 return UpdateOutcome::Blocked {
@@ -7204,16 +7994,17 @@ mod tests {
             Some(std::time::Duration::from_secs(1800)),
             "the second waits half an hour"
         );
-        // ...and then it really does stop, so a structurally-incompatible pair of
-        // builds converges to manual-only instead of costing a park/spawn/paint
-        // round trip forever.
+        // ...and then this schedule really does stop. `None` here ends an EPOCH,
+        // not the lane: `spend_physical_failure_budget` turns it into a long
+        // stand-down, and only `MAX_PHYSICAL_FAILURE_EPOCHS` of them converge to
+        // manual-only (see `the_physical_failure_budget_converges_under_its_own_schedule`).
         assert_eq!(
             automatic_retry_delay(
                 MAX_PHYSICAL_FAILURE_CYCLES,
                 AutomaticRetryKind::PhysicalFailure
             ),
             None,
-            "the budget is spent"
+            "the epoch's budget is spent"
         );
         assert_eq!(
             automatic_retry_delay(u8::MAX, AutomaticRetryKind::PhysicalFailure),
@@ -7404,6 +8195,276 @@ mod tests {
         };
     }
 
+    /// A BUDGET WHOSE OWN SCHEDULE RESETS IT IS NOT A BUDGET.
+    ///
+    /// The physical lane's cycle counter is only retained while the gap since the
+    /// last attempt is shorter than its replenish window. It used to borrow the
+    /// ACTIVITY window (30 min) — and its own second retry waits exactly 30 min,
+    /// so a failure that arrived on the schedule the budget itself armed always
+    /// landed at or past the threshold, reset `cycles` to zero, and handed out
+    /// the schedule again. A structurally broken pair of builds alternated
+    /// 10-minute and 30-minute park/spawn/paint round trips forever — roughly 48
+    /// of them a day — and the stand-down that ends them was unreachable through
+    /// the timed lane.
+    ///
+    /// …AND THE FIX FOR THAT MADE THE LANE UNBOUNDED, WHICH IS THIS TEST'S REAL
+    /// SUBJECT. Widening the window to 4 h made the in-epoch cap reachable, and a
+    /// spent cap ended an EPOCH: stand down 6 h, then start over. But the
+    /// stand-down was deliberately LONGER than the replenish window, so the
+    /// counter reset during it and every epoch began with a full budget — forever.
+    /// Measured cost: three park/spawn/paint round trips per ~6.7 h, about ten a
+    /// day, each with an "Update delayed" pill, on an artifact that was never
+    /// going to hand off — while the constant's own prose claimed it "converges to
+    /// manual-only quickly". This walks the real chronology and pins the number of
+    /// round trips at a FINITE one.
+    ///
+    /// SCOPE OF THE CLAIM, stated honestly: the counter is still REPLENISHING by
+    /// design, so a gap longer than [`PHYSICAL_RETRY_BUDGET_REPLENISH`] (12 h with
+    /// no physical failure at all for these exact bytes) still forgives the
+    /// artifact and starts the schedule over. What must never happen — and is what
+    /// the last block rules out — is the schedule producing such a gap ITSELF.
+    #[test]
+    fn the_physical_failure_budget_converges_under_its_own_schedule() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let dmg = [0xab_u8; 32];
+
+        // THE REAL METHOD, in order. Consecutive calls here are microseconds
+        // apart, which models production faithfully precisely because of the last
+        // block below: the longest gap the schedule can produce (one stand-down)
+        // is well inside the replenish window, so no real chronology resets the
+        // counter either.
+        let mut verdicts = Vec::new();
+        for _ in 0..64 {
+            let verdict =
+                app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient);
+            verdicts.push(verdict);
+            if verdict == PhysicalFailureSchedule::Converged {
+                break;
+            }
+        }
+        let now = std::time::Instant::now();
+        let shape = verdicts
+            .iter()
+            .map(|verdict| match verdict {
+                PhysicalFailureSchedule::Retry(at) => {
+                    let secs = at.saturating_duration_since(now).as_secs();
+                    // Real `Instant`s, so name the SCHEDULE each delay came from
+                    // rather than asserting to the second.
+                    if secs >= 1000 { "retry-1800" } else { "retry-600" }
+                }
+                PhysicalFailureSchedule::StandDown(_) => "stand-down",
+                PhysicalFailureSchedule::Converged => "converged",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                "retry-600",
+                "retry-1800",
+                "stand-down",
+                "retry-600",
+                "retry-1800",
+                "stand-down",
+                "retry-600",
+                "retry-1800",
+                "converged",
+            ],
+            "three whole epochs, then the lane is done — no fourth epoch, ever"
+        );
+        assert_eq!(
+            verdicts.len(),
+            usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS),
+            "the artifact costs exactly {PHYSICAL_FAILURE_LIFETIME_ATTEMPTS} \
+             park/spawn/paint round trips in total"
+        );
+        // …and it STAYS converged. A duplicate or reordered completion must not
+        // mint a fourth epoch out of the saturating counter.
+        for extra in 0..4 {
+            assert_eq!(
+                app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+                PhysicalFailureSchedule::Converged,
+                "late completion {extra} must not resurrect the lane"
+            );
+        }
+        // A DIFFERENT artifact is a different question and starts clean.
+        assert!(matches!(
+            app.spend_physical_failure_budget(
+                build,
+                [0xcd_u8; 32],
+                PhysicalFailureShape::Transient
+            ),
+            PhysicalFailureSchedule::Retry(_)
+        ));
+
+        // THE CHRONOLOGY THE VERDICTS PRESCRIBE, as wall time. Two numbers a
+        // future tweak has to look at: how long the whole lane lasts, and the
+        // longest gap it contains.
+        let epoch = 600 + 1800 + PHYSICAL_FAILURE_EPOCH_COOLDOWN.as_secs();
+        let lifetime = u64::from(MAX_PHYSICAL_FAILURE_EPOCHS) * epoch
+            - PHYSICAL_FAILURE_EPOCH_COOLDOWN.as_secs();
+        assert!(
+            (12 * 60 * 60..=24 * 60 * 60).contains(&lifetime),
+            "the lane must span most of a day — long enough that its last epoch \
+             samples a genuinely different machine, short enough that a user whose \
+             morning was bad still gets the update that evening ({lifetime}s)"
+        );
+        // THE PROPERTY THAT MAKES THE EPOCH TALLY REAL, and the one the previous
+        // design had backwards: the counter must outlive the longest gap the
+        // schedule itself produces, or the epochs cannot be counted and the cap is
+        // unreachable. Decided at compile time so a future tweak to either number
+        // has to face it.
+        const {
+            assert!(
+                PHYSICAL_RETRY_BUDGET_REPLENISH.as_secs()
+                    > PHYSICAL_FAILURE_EPOCH_COOLDOWN.as_secs(),
+                "the replenish window must outlast the stand-down between epochs, \
+                 or the counter forgives itself between them and the lane never \
+                 converges"
+            )
+        };
+    }
+
+    /// Name the SCHEDULE a latch deadline came from rather than asserting to the
+    /// second: these are real `Instant`s, and the rungs (600 s, 1800 s, a 6 h
+    /// stand-down, or no deadline at all) are orders of magnitude apart.
+    fn latch_rung(retry_at: Option<std::time::Instant>) -> &'static str {
+        match retry_at.map(|at| at.saturating_duration_since(std::time::Instant::now())) {
+            None => "no-retry",
+            Some(wait) if wait <= std::time::Duration::from_secs(600) => "retry-600",
+            Some(wait) if wait <= std::time::Duration::from_secs(1800) => "retry-1800",
+            Some(_) => "stand-down",
+        }
+    }
+
+    /// A TRANSIENT AND A STRUCTURAL FAILURE ARE NOT THE SAME EVENT, AND THE BUDGET
+    /// USED TO CHARGE THEM ALIKE.
+    ///
+    /// The worker classifies its four physical outcomes precisely and the
+    /// completion path then flattened them into one lane, so `AdoptionMismatch` —
+    /// a parent and a candidate that cannot agree on an adoption proof, which is a
+    /// property of the two IMAGES — rode the schedule written for a missed 15 s
+    /// deadline: nine park/spawn/paint round trips across ~14 hours, eight of them
+    /// re-learning what the first one had already established, and a promise on
+    /// screen that the update "retries on its own" for most of a day.
+    ///
+    /// Both lanes are driven here through the REAL completion path
+    /// (`abort_reaped_native_apply_before_reconcile`, which every returned overlap
+    /// failure takes) in the SAME `App`, and the CONTRAST is the assertion: either
+    /// half alone passes with the shape discarded.
+    #[test]
+    fn a_structural_handoff_failure_converges_where_a_transient_one_keeps_its_epochs() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let structural = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+        assert!(
+            app.arm_native_auto_apply(build, &"ab".repeat(32)),
+            "PRECONDITION: automatic apply is enabled and armable for these bytes, \
+             so the `arm` REFUSAL asserted after convergence is the latch talking \
+             and not a disabled lane"
+        );
+
+        // THE STRUCTURAL LANE: one confirming retry — because this seam cannot
+        // separate a candidate that fails `codesign` from a screen-carry digest
+        // that lost a race with a resize — and then the lane is done with these
+        // bytes.
+        let mut structural_rungs = Vec::new();
+        for _ in 0..3 {
+            structural.make_current_apply_for_test(&mut app.native_updater_service);
+            app.abort_reaped_native_apply_before_reconcile(
+                &structural,
+                "overlap handoff failed safely: handoff proof ended AdoptionMismatch".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+            );
+            structural_rungs.push(latch_rung(
+                app.auto_apply_manual_only
+                    .expect("a returned physical failure always latches manual-only")
+                    .retry_at,
+            ));
+        }
+        assert_eq!(
+            structural_rungs,
+            vec!["retry-600", "no-retry", "no-retry"],
+            "a structural failure gets ONE confirmation and then converges; a \
+             stand-down here would mean the lane is still re-sampling the machine \
+             over a disagreement between two builds"
+        );
+        // AND CONVERGED MEANS CONVERGED, at the gate that decides whether the lane
+        // ever attempts again: a deadline-less latch is what `arm` reads as
+        // `SuppressManualOnly` until a strictly newer build ships or the app
+        // relaunches — which is also why no LATER transient failure can hand these
+        // bytes a fresh schedule. The automatic lane will not attempt them again,
+        // and a person's attempt charges nothing.
+        assert!(
+            !app.arm_native_auto_apply(build, &"ab".repeat(32)),
+            "the converged artifact must not re-arm automatic apply"
+        );
+        assert!(app.auto_apply_intent.is_none());
+
+        // THE TRANSIENT LANE, SAME `App`, DIFFERENT BYTES: three failures in and it
+        // is still going, on the schedule whose generosity is bought by the claim
+        // that the machine's next moment may differ — which is true of `TimedOut`
+        // and is exactly what a structural failure cannot claim.
+        let transient = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"cd".repeat(32),
+        );
+        let mut transient_rungs = Vec::new();
+        for _ in 0..3 {
+            transient.make_current_apply_for_test(&mut app.native_updater_service);
+            app.abort_reaped_native_apply_before_reconcile(
+                &transient,
+                "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            );
+            transient_rungs.push(latch_rung(
+                app.auto_apply_manual_only
+                    .expect("a returned physical failure always latches manual-only")
+                    .retry_at,
+            ));
+        }
+        assert_eq!(
+            transient_rungs,
+            vec!["retry-600", "retry-1800", "stand-down"],
+            "the transient lane must keep its full epoch schedule — collapsing it \
+             onto the structural budget would strand a staged build on one cold \
+             page cache, which is the regression the epochs exist for"
+        );
+    }
+
+    /// The shared counter is deliberately shape-BLIND: it counts physical failures
+    /// for these exact bytes, which neither lane disputes. So evidence carries
+    /// across the classification in the direction that matters — an artifact that
+    /// has already cost the lane round trips does not buy a fresh pair of them by
+    /// failing in a new way.
+    #[test]
+    fn a_structural_failure_inherits_the_round_trips_the_artifact_already_cost() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let dmg = [0xab_u8; 32];
+
+        assert!(matches!(
+            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+            PhysicalFailureSchedule::Retry(_)
+        ));
+        assert!(matches!(
+            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Transient),
+            PhysicalFailureSchedule::Retry(_)
+        ));
+        assert_eq!(
+            app.spend_physical_failure_budget(build, dmg, PhysicalFailureShape::Structural),
+            PhysicalFailureSchedule::Converged,
+            "two round trips are already spent on these bytes and the structural \
+             budget is {STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS}; a `Retry` here would \
+             mean the structural verdict RESET the artifact's history"
+        );
+    }
+
     /// The physical-failure budget must survive a latch LAPSE, or "two tries" is
     /// an unbounded ten-minute loop.
     ///
@@ -7477,7 +8538,7 @@ mod tests {
             app.abort_reaped_native_apply_before_reconcile(
                 &ticket,
                 "overlap handoff failed safely: handoff proof ended ActivityRevoked".to_string(),
-                true,
+                HandoffFailureLane::ActivityRevoked,
             );
             assert!(
                 app.auto_apply_intent.is_some()
@@ -7508,11 +8569,14 @@ mod tests {
         );
     }
 
-    /// The counterpart: a GENUINE failure (not activity) keeps the sticky,
-    /// deadline-less latch. Automatic apply should stop retrying an artifact
-    /// that is actually broken.
+    /// The counterpart: a GENUINE failure (not activity) is latched manual-only
+    /// and takes the STRICT budget rather than the activity one — but it is still
+    /// scheduled to come back, because "the handoff did not land" is not the same
+    /// claim as "these bytes are broken". That holds for BOTH physical shapes: the
+    /// structural one converges after its confirmation, not on the failure that
+    /// first revealed it, so the first rung is the same ten minutes either way.
     #[test]
-    fn a_genuine_failure_completion_keeps_the_sticky_manual_only_latch() {
+    fn a_genuine_failure_completion_latches_manual_only_on_the_strict_budget() {
         let mut app = App::headless_for_test();
         let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
             78,
@@ -7524,15 +8588,27 @@ mod tests {
         app.abort_reaped_native_apply_before_reconcile(
             &ticket,
             "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
-            false,
+            HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
         );
 
         let manual = app
             .auto_apply_manual_only
             .expect("a genuine failure latches manual-only");
-        assert_eq!(
-            manual.retry_at, None,
-            "a genuine failure must NOT arm a lapse deadline"
+        let wait = manual
+            .retry_at
+            .expect(
+                "the FIRST physical failure must always schedule a comeback; \
+                 `retry_at: None` belongs to convergence, nine failures away",
+            )
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > std::time::Duration::from_secs(500),
+            "a genuine failure waits its own SLOW schedule, never the activity \
+             lane's fast one, got {wait:?}"
+        );
+        assert!(
+            app.auto_overlap_retry.is_none(),
+            "a genuine failure must not touch the ACTIVITY budget"
         );
         assert!(
             app.auto_apply_intent.is_none(),
@@ -7601,17 +8677,26 @@ mod tests {
         );
     }
 
-    /// Seamless seam 5 (recoverable degradation). A latch set because the
-    /// TERMINAL WAS BUSY must LAPSE; a latch set because the artifact or the
-    /// physical handoff genuinely failed must not. Before this, three unlucky
-    /// moments retired automatic apply until the next relaunch — which is
-    /// precisely the "staged, applies on next launch" state seen in the field.
+    /// Seamless seam 5 (recoverable degradation). A latch with a deadline must
+    /// LAPSE, restoring both automatic apply and the artifact's activity budget;
+    /// a deadline-less one must not.
+    ///
+    /// The deadline-less case has exactly two producers now, and neither is "one
+    /// unlucky moment": the policy/outcome mismatch fail-safe, which no path is
+    /// supposed to reach, and physical-lane CONVERGENCE
+    /// ([`PHYSICAL_FAILURE_LIFETIME_ATTEMPTS`] failures across
+    /// [`MAX_PHYSICAL_FAILURE_EPOCHS`] epochs and ~14 hours). Every other cause — a
+    /// busy terminal, any single physical handoff failure — carries a deadline,
+    /// because three unlucky moments used to retire automatic apply until the next
+    /// relaunch, which is precisely the "staged, applies on next launch" state seen
+    /// in the field. The mechanism is asserted here regardless of who mints it: the
+    /// lapse reads `retry_at` and nothing else.
     #[test]
-    fn an_activity_shaped_manual_only_latch_lapses_but_a_genuine_one_does_not() {
+    fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
         let mut app = App::headless_for_test();
         let build = app.native_updater_service.snapshot().current_build + 1;
 
-        // GENUINE failure: no deadline, never lapses, budget untouched.
+        // FAIL-SAFE latch: no deadline, never lapses, budget untouched.
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build,
             dmg_sha256: [0xab; 32],
@@ -7650,6 +8735,1220 @@ mod tests {
         );
         // …and automatic apply is armable again for the same artifact.
         assert!(app.arm_native_auto_apply(build, &"ab".repeat(32)));
+    }
+
+    const PREFLIGHT_TEST_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// Drive the REAL check reducer to a Staged phase for `build`, exactly as a
+    /// completed updater worker does, so the automatic intent under test is the
+    /// one production arms — not a hand-built struct.
+    ///
+    /// The pre-park verification verdict is pre-seeded so `arm_native_auto_apply`
+    /// short-circuits its worker thread: these tests are about retry policy, not
+    /// about running `codesign` from a unit test.
+    ///
+    /// AND THE SEEDED VERDICT IS `passed: true`, WHICH IS NOT COSMETIC. A cached
+    /// REFUSAL is a short-circuit: `start_unix_update_handoff` turns it into
+    /// "the staged update failed verification; the terminal was left untouched"
+    /// before a single reader parks. Every retry-policy test built on a
+    /// `passed: false` fixture was therefore describing an artifact production
+    /// declines outright, while claiming to describe the schedule that carries a
+    /// HEALTHY artifact to the physical gate. The two are only indistinguishable
+    /// because a headless `App` is blocked one gate earlier
+    /// (`native_update_admission` has no seamless lane without a proxy), which is
+    /// precisely why the premise has to be stated in the fixture rather than
+    /// inferred from a green suite.
+    fn stage_one_build_for_test(app: &mut App, build: u64) {
+        *app.handoff_preverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::HandoffPreverification {
+                build,
+                commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                at: std::time::Instant::now(),
+                passed: true,
+            });
+        let current_build = app.native_updater_service.snapshot().current_build;
+        assert!(
+            build > current_build,
+            "the staged build must supersede the running one or nothing is armable"
+        );
+        let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
+            panic!("a fresh service must start exactly one check");
+        };
+        // The REDUCER is driven for real, and so is `arm_native_auto_apply`
+        // below; only the presentation fan-out that
+        // `App::finish_native_update_check` wraps around them is skipped
+        // (window repaints, tab-strip rebuilds, palette refresh). None of that
+        // is the retry policy under test, and everything the policy reads —
+        // phase, staged identity, generation — comes out of the same reducer
+        // either way.
+        assert_eq!(
+            app.native_updater_service.finish_check(
+                ticket,
+                DurableUpdateStatus {
+                    enabled: true,
+                    current_build,
+                    staged_build: Some(build),
+                    staged_version: Some(format!("1.0.{build}")),
+                    staged_commit: Some(PREFLIGHT_TEST_COMMIT.to_string()),
+                    staged_dmg_sha256: Some("ab".repeat(32)),
+                    changelog: None,
+                    outcome: "staged".to_string(),
+                    failing_checks: 0,
+                },
+            ),
+            CheckCompletion::Reduced,
+            "PRECONDITION: the check must actually reduce, or nothing is staged"
+        );
+        let staged = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .clone()
+            .expect("PRECONDITION: the reduced check staged the build");
+        assert_eq!(staged.build, build);
+        assert!(
+            app.arm_native_auto_apply(staged.build, &staged.dmg_sha256),
+            "PRECONDITION: a strictly newer staged build arms automatic intent"
+        );
+    }
+
+    /// A RETIRED BUILD MUST NOT KEEP ITS LATCH — AND A LATCH ABOUT A DIFFERENT
+    /// ARTIFACT MUST SURVIVE THE RETIREMENT.
+    ///
+    /// `reconcile_native_update_facts` cleared `auto_apply_intent` for a stage it
+    /// had just retired as INSTALLED and left `auto_apply_manual_only` standing for
+    /// the same bytes. Nothing observable went wrong, because the latch is keyed by
+    /// (build, dmg) and `arm` independently refuses a build that is no longer newer
+    /// — but that is a second mechanism agreeing, not a reason to keep state
+    /// asserting something false about the world, and "a latch that outlived its
+    /// reason" is the shape of every bug this lane has had.
+    ///
+    /// The NEWER case is asserted in the same breath because it is what stops the
+    /// repair from becoming its own bug: completions can land out of order, and a
+    /// latch minted for a newer artifact must not be handed back an automatic lane
+    /// it just latched off — the same rule the sibling `Retired` arm in
+    /// `reconcile_returned_native_apply_with_facts` already follows.
+    #[test]
+    fn retiring_an_installed_build_clears_its_own_latch_and_no_one_else_s() {
+        for latched_ahead in [0_u64, 1] {
+            let mut app = App::headless_for_test();
+            let build = app.native_updater_service.snapshot().current_build + 1;
+            stage_one_build_for_test(&mut app, build);
+            app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                build: build + latched_ahead,
+                dmg_sha256: [0xab; 32],
+                retry_at: None,
+            });
+
+            // The survivor state a swapped-but-uncommitted handoff leaves behind:
+            // the canonical bundle carries this build and its receipt names this
+            // exact artifact, so the reducer retires the stage as installed.
+            app.finish_native_update_reconcile(
+                NativeUpdateReconcilePurpose::Startup,
+                reconcile_facts_with_installed(
+                    11,
+                    11,
+                    Some(DurableUpdateStatus {
+                        enabled: true,
+                        current_build: app.native_updater_service.snapshot().current_build,
+                        staged_build: Some(build),
+                        staged_version: Some(format!("1.0.{build}")),
+                        staged_commit: Some(PREFLIGHT_TEST_COMMIT.to_string()),
+                        staged_dmg_sha256: Some("ab".repeat(32)),
+                        changelog: None,
+                        outcome: "staged".to_string(),
+                        failing_checks: 0,
+                    }),
+                    Some(InstalledUpdate {
+                        build,
+                        commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                        receipt_build: Some(build),
+                        receipt_dmg_sha256: Some("ab".repeat(32)),
+                    }),
+                ),
+            );
+
+            assert!(
+                app.native_updater_service.snapshot().staged.is_none(),
+                "PRECONDITION: the receipt must actually retire the stage, or this \
+                 reconcile never reached the disposition under test"
+            );
+            assert_eq!(
+                app.auto_apply_manual_only.is_none(),
+                latched_ahead == 0,
+                "a latch for build {} against an installed build {build} must {}",
+                build + latched_ahead,
+                if latched_ahead == 0 {
+                    "be cleared with the artifact it was about"
+                } else {
+                    "survive: it is about a newer artifact this reconcile said \
+                     nothing about"
+                }
+            );
+        }
+    }
+
+    /// Put the app in the exact state the field report describes: one Settings
+    /// view holding an unsaved draft, parked in a BACKGROUND tab while the user
+    /// works in the terminal tab. Returns the settings instance/view.
+    ///
+    /// THIS BLOCKER IS CHOSEN OVER `pending_restore` ON PURPOSE, and the choice is
+    /// the whole point of the test that uses it. Both stop an update relaunch, but
+    /// they are discovered in different places:
+    ///   * `pending_restore` is found by `native_update_close_preflight`, a pure
+    ///     counting function with NO user interface whatsoever;
+    ///   * an unsaved Settings draft is found EARLIER, by
+    ///     `prepare_all_native_shutdown` → `CloseReadiness::Blocked` →
+    ///     `surface_native_close_recovery`, which switches the active tab, moves
+    ///     keyboard focus, re-fronts the window and replaces the window overlay
+    ///     with a Close Recovery palette.
+    /// A test written against `pending_restore` therefore cannot observe a single
+    /// one of those disturbances even when they are happening on every probe —
+    /// which is exactly how the recurring focus hijack survived two reviews.
+    fn park_a_settings_draft_in_a_background_tab(
+        app: &mut App,
+    ) -> (crate::tab_model::AppInstanceId, crate::tab_model::ViewId) {
+        let wid = WindowId(0);
+        assert!(
+            app.open_settings_tab(crate::native_settings::SettingsRoute::Home),
+            "PRECONDITION: the Settings tab opens"
+        );
+        let (instance, view) = app
+            .active_native_view(wid)
+            .expect("PRECONDITION: the new Settings tab is the active native view");
+        for event in [
+            crate::native_app::AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new(format!(
+                "settings/control/{}",
+                crate::prefs::EDIT_FONT_FAMILY
+            )))),
+            crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::SelectAll),
+            crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::Commit(
+                "Update Probe Mono".to_string(),
+            )),
+        ] {
+            app.dispatch_native_view_event(wid, view, event)
+                .expect("PRECONDITION: the Settings draft edit dispatches");
+        }
+        // The reducer's own verdict, read directly. `closable == false` is what
+        // `prepare_close` turns into `CloseReadiness::Blocked { recovery }`, so
+        // this is the precondition that the probe below really does reach the
+        // recovery-surfacing branch rather than some UI-less blocker.
+        assert!(
+            !app.native_runtime
+                .presentation(instance, view)
+                .expect("PRECONDITION: the Settings view still presents")
+                .closable,
+            "PRECONDITION: the draft makes the Settings view refuse a close, which is \
+             the only verdict that surfaces Close Recovery"
+        );
+        // Back to the terminal tab: the user is working somewhere else. Every
+        // later assertion that this stayed true is an assertion that no probe
+        // dragged them into Settings.
+        app.switch_tab_in(wid, 0);
+        assert!(
+            app.active_native_view(wid).is_none(),
+            "PRECONDITION: the user is on the terminal tab, not on Settings"
+        );
+        (instance, view)
+    }
+
+    /// Clear the draft through the app's own recovery command, the way a real
+    /// user would: walk over to the Settings tab, discard, walk back. The trip
+    /// back matters — every later "nothing moved" assertion is only meaningful if
+    /// the user really is somewhere else again.
+    fn discard_settings_drafts(app: &mut App, view: crate::tab_model::ViewId) {
+        let wid = WindowId(0);
+        app.switch_tab_in(wid, 1);
+        assert!(
+            app.active_native_view(wid)
+                .is_some_and(|(_, active)| active == view),
+            "the Settings tab is where the draft lives"
+        );
+        for _ in 0..2 {
+            app.dispatch_native_view_event(
+                WindowId(0),
+                view,
+                crate::native_app::AppEvent::Action(crate::native_app::ActionInvocation {
+                    id: crate::native_ui::ActionId::new("settings/drafts/discard-all"),
+                    value: None,
+                }),
+            )
+            .expect("the discard-all recovery command dispatches");
+        }
+        assert!(
+            app.native_runtime
+                .presentation(
+                    app.active_native_view(wid).expect("still on Settings").0,
+                    view
+                )
+                .expect("the Settings view still presents")
+                .closable,
+            "the discard really cleared the blocker — otherwise the 'way back' \
+             below would be testing the blocked path all over again"
+        );
+        app.switch_tab_in(wid, 0);
+        assert!(
+            app.active_native_view(wid).is_none(),
+            "the user went back to their terminal tab"
+        );
+    }
+
+    /// Nothing on screen moved. Called after every automatic probe.
+    fn assert_no_probe_disturbance(app: &App, wid: WindowId, active_tab: crate::tab_model::TabId) {
+        assert!(
+            app.windows[&wid].palette().is_none(),
+            "a background update probe must never open a palette over the user's work"
+        );
+        assert!(
+            app.windows[&wid].overlay.is_none(),
+            "a background update probe must never install a window overlay"
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.active_id(),
+            Some(active_tab),
+            "a background update probe must never switch the active tab"
+        );
+        assert!(
+            app.active_native_view(wid).is_none(),
+            "a background update probe must never move focus onto the blocking \
+             native view"
+        );
+        assert_eq!(
+            app.frontmost_window,
+            Some(wid),
+            "a background update probe must never change the frontmost window"
+        );
+    }
+
+    /// Make the retained intent eligible RIGHT NOW and past its idle-preference
+    /// deadline, so the attempt takes the `AutomaticPastGrace` lane. Whether the
+    /// machine running the suite happens to be quiet is then irrelevant.
+    fn force_auto_apply_attempt_now(app: &mut App) {
+        let mut intent = app
+            .auto_apply_intent
+            .expect("an automatic intent must be armed to force an attempt");
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        intent.retry_at = past;
+        intent.apply_by = past;
+        app.auto_apply_intent = Some(intent);
+    }
+
+    /// Drive the automatic lane through one whole preflight-block budget against
+    /// whatever blocker the caller has already installed.
+    fn spend_one_preflight_block_budget(app: &mut App) {
+        for attempt in 1..=u32::from(MAX_AUTOMATIC_UPDATE_CYCLES) {
+            force_auto_apply_attempt_now(app);
+            app.try_pending_native_auto_apply(false);
+            // PRECONDITION, not decoration: a `Wait` would leave `attempts`
+            // untouched, so this is what proves the preflight really RAN and
+            // really came back `Blocked` rather than the poll short-circuiting.
+            assert_eq!(
+                app.auto_apply_intent.map(|intent| intent.attempts),
+                Some(u8::try_from(attempt).expect("small")),
+                "attempt {attempt} must have consumed exactly one retry budget cycle"
+            );
+        }
+    }
+
+    /// THE "UPDATE PAUSED" REGRESSION, AND THE RECURRING NAG IT WAS ALMOST TRADED
+    /// FOR. A close-preflight BLOCK is a fact about the moment, not about the
+    /// artifact — so exhausting its bounded budget must neither retire automatic
+    /// apply for the life of the process NOR turn into a scheduled disturbance.
+    ///
+    /// The budget is three attempts spaced 5 s / 15 s: about twenty seconds of
+    /// being ready to park. Two failure modes bracket this test.
+    ///   * PERMANENCE (the original bug): twenty busy seconds installed a
+    ///     `retry_at: None` latch, `arm` then answered `SuppressManualOnly` for
+    ///     that exact (build, artifact) forever, and only a newer build or a
+    ///     relaunch escaped. The user was told "Update paused — manual retry"
+    ///     permanently for having been busy.
+    ///   * RECURRENCE (the first attempt at a fix): giving that latch a lapse
+    ///     deadline re-armed a FRESH intent at `attempts: 0` every cooldown, so
+    ///     the whole budget replayed — three more `prepare_all_native_shutdown`
+    ///     passes, each of which can hijack focus into a Close Recovery palette,
+    ///     plus a new status pill — every two hours, forever.
+    ///
+    /// So this walks TWO full cooldown rounds of the REAL lane
+    /// (`try_pending_native_auto_apply` → `apply_native_update` →
+    /// `prepare_all_native_shutdown` → the service's own preflight reducer) and
+    /// pins the shape that is neither: one attempt per cooldown, one pill ever,
+    /// NOTHING on screen ever, and a way back the moment the blocker clears.
+    ///
+    /// THE BLOCKER IS A REAL RECOVERY-UI BLOCKER. An earlier version of this test
+    /// used `pending_restore`, which is discovered by the UI-less counting pass in
+    /// `native_update_close_preflight` and therefore cannot disturb anything even
+    /// in principle — so the test passed while every probe was switching the
+    /// user's tab and throwing a Close Recovery palette over their work. An
+    /// unsaved Settings draft is discovered by `prepare_all_native_shutdown`,
+    /// which is the code that does the disturbing.
+    #[test]
+    fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_schedule() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(
+            crate::app_config::update_auto_apply(&app.config)
+                && std::env::var_os("ATERM_DEBUG_RELAUNCH_NUDGE").is_none(),
+            "PRECONDITION: the automatic lane must be enabled or every poll below \
+             answers Clear and this test proves nothing"
+        );
+        let (_, settings) = park_a_settings_draft_in_a_background_tab(&mut app);
+        let working_tab = app.windows[&wid]
+            .tab_set
+            .active_id()
+            .expect("PRECONDITION: the user is on a tab");
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        assert!(
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build),
+            "PRECONDITION: the staged build armed automatic intent"
+        );
+
+        app.notice = None;
+        spend_one_preflight_block_budget(&mut app);
+        // THE FIRST BUDGET IS ALREADY THREE PROBES. Even before the cooldown
+        // schedule is reached, none of them may have taken the screen.
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // NOT PERMANENT: the intent is retained on a long cooldown, and it is a
+        // real deadline in the future that `about_to_wait` folds into winit's
+        // `WaitUntil` (`fold_auto_apply_deadline`), so it fires on a fully IDLE
+        // terminal instead of waiting for an event that never comes.
+        let cooling = app
+            .auto_apply_intent
+            .expect("a spent preflight budget must NOT retire the automatic lane");
+        assert_eq!(cooling.build, build);
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "a transient block must not install a manual-only latch at all — that \
+             latch is what `arm` reads as SuppressManualOnly"
+        );
+        let cooldown = cooling
+            .retry_at
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            cooldown > PREFLIGHT_BLOCK_COOLDOWN / 2 && cooldown <= PREFLIGHT_BLOCK_COOLDOWN,
+            "the retry must be spaced by the cooldown, not by the 5s/15s probe \
+             cadence (got {cooldown:?})"
+        );
+
+        // The ONE pill. Its wording has to survive too: the old text asserted the
+        // automatic lane had given up, which is now false.
+        let pill = app
+            .notice
+            .as_ref()
+            .map(crate::notice::TransientNotice::text)
+            .expect("the first exhaustion tells the user once");
+        assert!(
+            pill.contains("retries on its own"),
+            "the pill must say the lane comes back by itself, got {pill:?}"
+        );
+
+        // SECOND ROUND. Each further attempt costs exactly ONE probe (not three)
+        // and must add nothing to the screen.
+        for round in 0..4 {
+            app.notice = None;
+            force_auto_apply_attempt_now(&mut app);
+            app.try_pending_native_auto_apply(false);
+            let again = app
+                .auto_apply_intent
+                .expect("the lane keeps trying while the blocker persists");
+            assert_eq!(
+                again.attempts,
+                MAX_AUTOMATIC_UPDATE_CYCLES + 1 + u8::try_from(round).expect("small"),
+                "round {round}: a cooldown probe must consume exactly one attempt, \
+                 and `attempts` must keep counting — resetting it is what would \
+                 re-arm the whole budget and re-fire the pill"
+            );
+            assert!(
+                again
+                    .retry_at
+                    .saturating_duration_since(std::time::Instant::now())
+                    > PREFLIGHT_BLOCK_COOLDOWN / 2,
+                "round {round}: still spaced by the cooldown"
+            );
+            assert!(
+                app.notice.is_none(),
+                "round {round}: THE NAG. The user was already told once; telling \
+                 them again on a two-hour schedule is the regression this test exists \
+                 for (got {:?})",
+                app.notice.as_ref().map(crate::notice::TransientNotice::text)
+            );
+            // THE OTHER HALF OF THE NAG, and the half no `notice` assertion can
+            // ever see: the pill is one-shot, but the tab switch / focus theft /
+            // recovery palette were not. This is the assertion the finding is
+            // about.
+            assert_no_probe_disturbance(&app, wid, working_tab);
+        }
+
+        // AND THE WAY BACK: the moment the blocker clears, the next cooldown probe
+        // must leave the Blocked lane and be handed to physical replacement — not
+        // merely bump a counter while the update sits there staged forever.
+        //
+        // THE SCOPE OF WHAT THIS BLOCK PROVES, because the previous version of it
+        // claimed more. It shows the AUTHORIZATION, by two witnesses that a
+        // `Blocked` outcome cannot fake:
+        //   * the pill. `Blocked` paints "Update waiting"; only
+        //     `UpdateOutcome::Failed` reaches the "Update delayed" arm, and the
+        //     close preflight cannot produce `Failed` for a declining reducer (it
+        //     produces `Blocked`; only a reducer ERROR is `Failed`, and there is
+        //     none here — the reducer answered cleanly for four rounds above);
+        //   * the SCHEDULING SHAPE. `Blocked` retains the intent and installs no
+        //     latch; the physical lane does the exact opposite. This is the pair
+        //     the sibling test `a_genuine_failure_takes_the_physical_budget_…`
+        //     pins as mutually exclusive.
+        // It does NOT show the update landing — in this process the physical lane
+        // cannot land (headless: no event-loop proxy, so
+        // `native_update_admission::classify` never reaches `Apply(Seamless)`).
+        // `a_busy_user_eventually_gets_the_update` carries the arc the rest of the
+        // way and ends on the INSTALLED artifact; this test's subject is the
+        // cooldown, the nag and the screen.
+        assert!(
+            app.pool.iter().count() > 0,
+            "PRECONDITION AND A SAFETY RAIL: this app must own at least one live \
+             session. With an empty pool `native_update_admission::classify` admits \
+             the COLD lane, and the authorized apply below would `exec()` the test \
+             binary instead of returning"
+        );
+        discard_settings_drafts(&mut app, settings);
+        app.notice = None;
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+
+        let landed = app
+            .notice
+            .as_ref()
+            .map(crate::notice::TransientNotice::text)
+            .expect("the attempt past the preflight reports its physical outcome");
+        assert_eq!(
+            landed, "↑ Update delayed — retries on its own",
+            "the cleared blocker must let the attempt reach PHYSICAL replacement. \
+             A close-preflight refusal would have painted the Blocked pill \
+             (\"Update waiting …\") or, inside its cooldown, nothing at all"
+        );
+        assert!(
+            app.auto_apply_intent.is_none()
+                && app
+                    .auto_apply_manual_only
+                    .is_some_and(|latch| latch.build == build && latch.retry_at.is_some()),
+            "reaching the physical lane retires the transient cooldown intent and \
+             hands the artifact to the strict physical-failure budget; still being \
+             refused by the close preflight would have kept a live intent and no \
+             latch"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+    }
+
+    /// THE OTHER HALF OF THE FIX, stated as an outcome rather than as a pill: with
+    /// the SAME Settings draft in place, a background probe and a person's click
+    /// get the same VERDICT and completely different SCREENS.
+    ///
+    /// Deleting the recovery surface outright would satisfy every "nothing moved"
+    /// assertion in the lane test above, so this pins that the surface is intact
+    /// where it belongs — on the lane a person actually asked for, which is also
+    /// the lane the exhaustion pill sends them to ("or use the Version menu").
+    #[test]
+    fn an_automatic_probe_is_silent_while_a_person_s_apply_still_surfaces_recovery() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let (_, settings) = park_a_settings_draft_in_a_background_tab(&mut app);
+        let working_tab = app.windows[&wid]
+            .tab_set
+            .active_id()
+            .expect("PRECONDITION: the user is on a tab");
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+
+        // BACKGROUND: the verdict is real and it is `Blocked` by the native-app
+        // barrier (not by the UI-less `native_update_close_preflight` counters —
+        // that string is different, and getting it would mean the reducer barrier
+        // never ran).
+        let UpdateOutcome::Blocked { reasons } =
+            app.apply_native_update(ApplyMode::AutomaticPastGrace)
+        else {
+            panic!("an unsaved Settings draft blocks an update relaunch");
+        };
+        assert_eq!(
+            reasons,
+            vec!["Review or discard unsaved native-app work before relaunching".to_string()],
+            "the block came from the native close barrier — the one that surfaces \
+             recovery — and not from a later, UI-less blocker"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // A PERSON: same state, same verdict, but now the blocking leaf is focused
+        // and its reducer-supplied recovery commands are on screen.
+        let UpdateOutcome::Blocked { reasons: manual } =
+            app.apply_native_update(ApplyMode::Immediate)
+        else {
+            panic!("the same draft blocks a manual apply");
+        };
+        assert_eq!(manual, reasons, "identical verdict, by construction");
+        assert_eq!(
+            app.active_native_view(wid).map(|(_, view)| view),
+            Some(settings),
+            "a person's apply focuses the leaf that refused"
+        );
+        let lines = app.windows[&wid]
+            .palette()
+            .expect("a person's apply opens Close Recovery")
+            .controls_lines();
+        for action in ["settings/drafts/review", "settings/drafts/discard-all"] {
+            assert!(
+                lines.iter().any(|line| {
+                    line.contains("target=native") && line.contains(&format!("action={action}"))
+                }),
+                "recovery exposes {action}: {lines:?}"
+            );
+        }
+    }
+
+    /// THE OUTCOME THE WHOLE FIX IS FOR, END TO END: a user who was merely BUSY
+    /// eventually GETS THE UPDATE — and the update is INSTALLED at the end of it.
+    ///
+    /// Two earlier versions of this test each stopped one step short:
+    ///   * the first proved the cleared blocker let the attempt reach the physical
+    ///     ADMISSION gate and then asserted the gate's REFUSAL. A refusal is not an
+    ///     update: every assertion in it was equally satisfied by a world where the
+    ///     lane reaches the last gate forever and the build is never applied;
+    ///   * the second reached an installed VERDICT, but by handing worker-collected
+    ///     disk facts straight to `finish_async_native_update_handoff`. That arm is
+    ///     gated on `UpdateHandoffCompletion::reconcile` being `Some`, and every
+    ///     construction site in this crate sets it to `None` — so it proved that a
+    ///     RECEIPT REDUCES, down a path no worker has ever taken, and it never
+    ///     re-attempted the apply the cooldown exists to re-arm.
+    ///
+    /// SO THIS DRIVES THE REAL SEQUENCE, in production's own order, and the only
+    /// substituted step is marked at the call site:
+    ///   1. the blocked probes spend the cheap preflight budget (act one);
+    ///   2. the blocker clears, an AUTHORIZED attempt reaches physical replacement
+    ///      and books a physical failure with a comeback (act two);
+    ///   3. the comeback deadline lapses and the lane RE-ATTEMPTS FOR REAL, through
+    ///      the same three calls `about_to_wait` makes — lapse, re-arm, poll — and
+    ///      the second failure lands on the SECOND rung of the physical schedule,
+    ///      which is what makes it a fresh attempt rather than a replay (act three);
+    ///   4. the third attempt's child gets far enough to swap the bundle before it
+    ///      dies, and the two events a real worker emits are replayed in order: the
+    ///      handoff completion (`reconcile: None`, like every real one) and then the
+    ///      separately-collected disk facts (act four).
+    ///
+    /// WHAT A UNIT TEST CANNOT DO, STATED PLAINLY, so the substitution is not
+    /// mistaken for the thing itself:
+    ///   * `apply_staged_update_now` cannot run. The seamless lane needs a live
+    ///     winit event-loop proxy and spawns a real successor process; the cold lane
+    ///     calls `Command::exec`. Either would fork or destroy the test binary, and
+    ///     a headless `App` (`proxy: None`, `headless: true`) cannot reach
+    ///     `Apply(Seamless)` in `native_update_admission::classify` at all. Acts two
+    ///     and three therefore fail AT that gate — which is exactly the physical
+    ///     failure the retry schedule is written for — and act four consumes the
+    ///     one-shot apply authority with an empty closure in its place. The full
+    ///     park → spawn → adopt → repaint path is covered by the QA seam
+    ///     (`ATERM_DEBUG_SEAMLESS_REEXEC`) against a real binary, not by this suite;
+    ///   * the INSTALLED facts are supplied rather than read. `installed_update_facts`
+    ///     runs `verify_bundle_policy` (a real `codesign --deep` against a real
+    ///     signed bundle) plus PlistBuddy, so no unit test can produce a true
+    ///     reading. What is NOT faked is the judgement, and it is worth being exact
+    ///     about how much of it the receipt carries: `reconcile_durable_stage` will
+    ///     only say `InstalledNeedsRelaunch` when the receipt re-proves the
+    ///     in-memory stage's build, commit AND DMG digest, and that is what retires
+    ///     the stage here — but a receipt that failed to prove them would still
+    ///     retire it (as `Retired`) and the durable outcome would still name the
+    ///     installed build, because the bundle and the ledger agree on the number.
+    ///     So the assertion that discriminates is the CONSUMED STAGE, not the
+    ///     string; both are produced by production code on production's own
+    ///     reconcile wake.
+    ///
+    /// WHAT IS THEREFORE PINNED: the strongest APPLIED state a surviving process can
+    /// observe — the stage is CONSUMED and the durable outcome names the installed
+    /// build — reached only after a re-armed automatic apply really attempted again.
+    #[test]
+    fn a_busy_user_eventually_gets_the_update() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let (_, settings) = park_a_settings_draft_in_a_background_tab(&mut app);
+        let working_tab = app.windows[&wid]
+            .tab_set
+            .active_id()
+            .expect("PRECONDITION: the user is on a tab");
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        assert!(
+            app.pool.iter().count() > 0,
+            "PRECONDITION AND A SAFETY RAIL: with an empty session pool the \
+             admission classifier admits the destructive COLD lane and the \
+             authorized apply below would `exec()` the test binary"
+        );
+        // PRECONDITION, READ BACK THE WAY PRODUCTION READS IT: the staged candidate
+        // is one `start_unix_update_handoff` would carry to the physical gate. A
+        // cached REFUSAL is a short-circuit before anything parks, so a fixture
+        // carrying one would make every act below a story about an artifact
+        // production declines outright — and a headless `App`, blocked one gate
+        // earlier, cannot tell the difference from its outcomes alone.
+        #[cfg(unix)]
+        assert_eq!(
+            app.cached_handoff_preverification(
+                &crate::native_updater_service::ApplyAttemptTicket::for_test(
+                    build,
+                    PREFLIGHT_TEST_COMMIT,
+                    &"ab".repeat(32),
+                )
+            ),
+            Some(true),
+            "the fixture must model a candidate that PASSED pre-park verification"
+        );
+
+        // ACT ONE — BUSY. The user's unsaved Settings draft blocks every probe
+        // until the cheap budget is spent and the lane drops to its cooldown.
+        // Surviving this at all is the first half of the fix: the old code retired
+        // automatic apply permanently right here.
+        spend_one_preflight_block_budget(&mut app);
+        assert!(
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build),
+            "a spent preflight budget must retain the intent, not retire the lane"
+        );
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "a transient block must not install the latch `arm` reads as \
+             SuppressManualOnly"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // ACT TWO — THE USER STOPS BEING BUSY, and the next cooldown probe is
+        // AUTHORIZED: it leaves the close-preflight lane entirely and is handed to
+        // physical replacement. In this process that replacement cannot land (see
+        // the doc comment), so the lane books it as a physical failure and
+        // schedules its own comeback — which is what act three arrives on.
+        discard_settings_drafts(&mut app, settings);
+        app.notice = None;
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        assert_eq!(
+            app.notice
+                .as_ref()
+                .map(crate::notice::TransientNotice::text)
+                .as_deref(),
+            Some("↑ Update delayed — retries on its own"),
+            "a cleared blocker must take the attempt past the close preflight; a \
+             refusal there paints the Blocked pill or nothing at all"
+        );
+        // WHICH GATE REFUSED IS PART OF THE PREMISE, not decoration. The fixture's
+        // candidate carries a PASSED pre-park verification, so a real attempt is
+        // carried all the way to physical replacement; a `passed: false` fixture
+        // would be short-circuited by `start_unix_update_handoff` before anything
+        // parked, and every act below it would be describing an artifact production
+        // refuses outright. The refusal recorded here must therefore be the
+        // admission gate this process genuinely cannot pass — never the verification
+        // one, which would mean the whole arc was measured on a doomed candidate.
+        let refusal = app
+            .native_updater_service
+            .snapshot()
+            .error
+            .clone()
+            .expect("a returned physical failure records why it stopped");
+        // Both `native_update_admission` refusals open this way ("…could not be
+        // prepared" for the seamless lane a headless `App` cannot offer, "…could not
+        // be proven safe" for the cold lane's foreground probe). Which of the two
+        // answers is an accident of the test process's PTY state and is not the
+        // claim; that the attempt got as far as that gate is.
+        assert!(
+            refusal.starts_with("Update kept"),
+            "the attempt must reach the physical admission gate, got {refusal:?}"
+        );
+        assert!(
+            !refusal.contains("failed verification"),
+            "the staged candidate must be one production would carry to the gate, \
+             not one the pre-park verification cache already refused: {refusal:?}"
+        );
+        let comeback = app
+            .auto_apply_manual_only
+            .expect("the physical lane latches with its own schedule")
+            .retry_at
+            .expect("and that latch always carries a deadline on its first failure");
+        assert!(
+            comeback > std::time::Instant::now(),
+            "the lane is scheduled to come back, not finished"
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(1),
+            "exactly one physical failure has been booked against these bytes"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // ACT THREE — THE COMEBACK IS REAL, NOT A PROMISE ON A STRUCT. Only the
+        // clock is forced: the deadline is moved into the past and then production's
+        // own `about_to_wait` sequence runs verbatim (lapse the latch, re-arm from
+        // the reducer's stage, poll). Nothing here hand-builds an intent.
+        let mut latch = app
+            .auto_apply_manual_only
+            .expect("act two latched the comeback");
+        latch.retry_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        app.auto_apply_manual_only = Some(latch);
+        assert!(
+            app.lapse_expired_auto_apply_manual_only(),
+            "an ACTIVITY-or-physical latch with a passed deadline must lapse; this \
+             is the release that the old `retry_at: None` made impossible"
+        );
+        app.rearm_native_auto_apply_after_lapse();
+        assert!(
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build),
+            "the lapse must re-arm automatic apply for the same staged artifact"
+        );
+        app.notice = None;
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        // THE DISCRIMINATOR: a SECOND failure was booked, and the new deadline is the
+        // second rung of the physical schedule (1800 s), not the first (600 s). A
+        // test that only re-read the latch would pass just as well if the lane had
+        // never re-attempted at all.
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(2),
+            "the re-armed lane must actually ATTEMPT again — a second physical \
+             failure is the receipt for a second park/spawn round trip"
+        );
+        let second = app
+            .auto_apply_manual_only
+            .expect("the second failure latches again")
+            .retry_at
+            .expect("and it is still inside its budget, so it still has a deadline")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            second > std::time::Duration::from_secs(1700)
+                && second <= std::time::Duration::from_secs(1800),
+            "the comeback must advance to the SECOND physical rung (~1800s), got \
+             {second:?} — the first rung again would mean the budget was replayed"
+        );
+        assert_no_probe_disturbance(&app, wid, working_tab);
+
+        // ACT FOUR — THE ATTEMPT THAT LANDS.
+        //
+        // The comeback re-authorizes through exactly this reducer path, which is
+        // the only producer of an `ApplyAttemptTicket`: `begin_apply_preflight`
+        // binds the artifact generation, and `finish_apply_preflight` mints the
+        // one-shot command ONLY for `ClosePreflight::Ready`. So holding this
+        // ticket is itself proof that the close preflight said yes.
+        let ApplyPreflightStart::Inspect(preflight) = app
+            .native_updater_service
+            .begin_apply_preflight(ApplyMode::AutomaticPastGrace)
+        else {
+            panic!("the re-armed stage must admit a fresh apply preflight");
+        };
+        let ApplyDecision::Execute(command) = app
+            .native_updater_service
+            .finish_apply_preflight(preflight, ClosePreflight::Ready)
+        else {
+            panic!("a ready close preflight must authorize the replacement");
+        };
+        let attempt = command.attempt();
+        assert_eq!(attempt.target_build(), build);
+        // THE ONE STEP A UNIT TEST MAY NOT RUN. In production this closure is
+        // `apply_staged_update_now`, which parks every reader and either `exec`s or
+        // spawns the successor. Consuming the one-shot authority without it is the
+        // whole of the substitution; everything after this line is the real
+        // completion path with the real ticket.
+        command.execute(|| ());
+
+        // EVENT ONE: the handoff completion. This child swapped the bundle and then
+        // failed to commit, so the parent survives — and the parent learns nothing
+        // about the swap here, because a real completion carries `reconcile: None`.
+        // This call IS the `(Some(attempt), None)` arm of
+        // `reduce_returned_handoff_completion`; the mode-to-lane classification that
+        // wraps it is proven in `app_update_handoff.rs`.
+        app.notice = None;
+        let returned = app.abort_reaped_native_apply_before_reconcile(
+            &attempt,
+            "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+        );
+        assert!(
+            matches!(returned, UpdateOutcome::Failed { .. }),
+            "the parent's view of a non-committed handoff is a failure, whatever \
+             the child managed to do to the bundle first, got {returned:?}"
+        );
+        app.surface_update_apply_outcome("automatic handoff", returned, false);
+        assert!(
+            app.auto_apply_manual_only
+                .is_some_and(|manual| manual.build == build),
+            "PRECONDITION FOR THE LATCH ASSERTION BELOW: the returned failure \
+             latched THESE bytes manual-only, which is correct — at this instant \
+             the parent has no idea the child got as far as swapping the bundle"
+        );
+
+        // EVENT TWO: the disk facts the worker collected right after it published
+        // that completion (`send_warranted_handoff_failure` posts them as a separate
+        // `NativeUpdateReconcileFinished` wake, which is why the completion above
+        // could not carry them). The canonical bundle now carries this build and its
+        // INSTALLED RECEIPT names this exact artifact — build, commit AND digest,
+        // all three re-proved against the in-memory stage before the reducer will
+        // call anything installed.
+        let facts = reconcile_facts_with_installed(
+            9,
+            9,
+            Some(DurableUpdateStatus {
+                enabled: true,
+                current_build: app.native_updater_service.snapshot().current_build,
+                staged_build: Some(build),
+                staged_version: Some(format!("1.0.{build}")),
+                staged_commit: Some(PREFLIGHT_TEST_COMMIT.to_string()),
+                staged_dmg_sha256: Some("ab".repeat(32)),
+                changelog: None,
+                outcome: "staged".to_string(),
+                failing_checks: 0,
+            }),
+            Some(InstalledUpdate {
+                build,
+                commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                receipt_build: Some(build),
+                receipt_dmg_sha256: Some("ab".repeat(32)),
+            }),
+        );
+        app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Startup, facts);
+
+        // THE ASSERTION THE OLD TESTS DID NOT MAKE, ON THE PATH A WORKER TAKES: the
+        // update is INSTALLED. The stage is consumed (a retained one would keep
+        // painting an update arrow for bytes already on disk) and the durable
+        // outcome — the same string `aterm-ctl update status` prints — names the
+        // installed build.
+        assert!(
+            app.native_updater_service.snapshot().staged.is_none(),
+            "the swap consumed the stage; a surviving stage means the receipt was \
+             not believed and the lane would re-attempt installed bytes forever"
+        );
+        let outcome = app.native_updater_service.snapshot().outcome.clone();
+        assert!(
+            outcome.contains(&format!("build {build} is installed")),
+            "the durable outcome names the installed build, got {outcome:?}"
+        );
+        assert!(
+            outcome.contains("relaunch"),
+            "…and says the one thing left to do about it, got {outcome:?}"
+        );
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "an installed artifact must not leave an intent re-probing"
+        );
+        // …AND NOT A LATCH EITHER. A manual-only latch is a promise about ONE
+        // artifact — do not spend automatic apply on these bytes — and the reducer
+        // has just retired those exact bytes as INSTALLED. Nothing is left for the
+        // promise to refuse, so keeping it is state that says something false about
+        // the world; `arm` refusing a no-longer-newer build is a second mechanism
+        // agreeing, not a reason to leave the first one lying.
+        assert!(
+            app.auto_apply_manual_only.is_none(),
+            "the retired-as-installed build must not keep its manual-only latch"
+        );
+        {
+            use crate::native_update_auto_intent::{AttemptDisposition, AttemptResult, finish};
+            assert_eq!(
+                finish(AttemptResult::InstalledNeedsRelaunch),
+                AttemptDisposition::Complete,
+                "and the lane's own policy calls that outcome COMPLETE, not a retry"
+            );
+        }
+        assert_no_probe_disturbance(&app, wid, working_tab);
+    }
+
+    /// The counterpart the fix must NOT loosen: `UpdateOutcome::Failed` is the
+    /// evidence-against-the-artifact channel and takes the strict, converging
+    /// PHYSICAL budget — never the cheap preflight cooldown — on the very same
+    /// artifact, in the very same `App`.
+    ///
+    /// The contrast is the assertion. A `Blocked` attempt leaves a live intent
+    /// re-probing in ~2 h; a `Failed` one retires the intent, latches manual-only,
+    /// and schedules its comeback off the physical schedule (10 min, then 30 min,
+    /// then a stand-down epoch). Confusing the two in either direction is a bug:
+    /// one way spams park/spawn round trips, the other never applies.
+    #[test]
+    fn a_genuine_failure_takes_the_physical_budget_while_a_preflight_block_only_cools_down() {
+        // The pure policy split the two lanes ride on, asserted directly so a
+        // future reclassification cannot silently swap them.
+        use crate::native_update_auto_intent::{AttemptDisposition, AttemptResult, finish};
+        assert_eq!(finish(AttemptResult::Blocked), AttemptDisposition::Retry);
+        assert_eq!(
+            finish(AttemptResult::Failed),
+            AttemptDisposition::ManualOnly
+        );
+
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        app.pending_restore = Some(crate::restore::RestoreManifest::new(Vec::new()));
+        spend_one_preflight_block_budget(&mut app);
+        assert!(
+            app.auto_apply_intent.is_some() && app.auto_apply_manual_only.is_none(),
+            "PRECONDITION: the transient lane keeps a live intent and no latch"
+        );
+
+        // Same artifact, same process — but this time the physical handoff
+        // genuinely failed (the child died), arriving asynchronously through the
+        // completion lane every real overlap failure takes.
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        app.abort_reaped_native_apply_before_reconcile(
+            &ticket,
+            "overlap handoff failed safely: handoff proof ended ChildDied".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Structural),
+        );
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "a genuine failure retires the intent; it does not inherit the \
+             preflight lane's live re-probe"
+        );
+        let genuine = app
+            .auto_apply_manual_only
+            .expect("a genuine failure latches manual-only");
+        let wait = genuine
+            .retry_at
+            .expect(
+                "even a genuine failure gets a comeback on its first attempt; \
+                 `None` here would be the one-unlucky-moment permanence",
+            )
+            .saturating_duration_since(std::time::Instant::now());
+        // The FIRST physical cycle: ten minutes, i.e. the physical schedule and
+        // not the two-hour preflight cooldown. Getting the cheap lane's number
+        // here would mean the classification collapsed.
+        assert!(
+            wait > std::time::Duration::from_secs(500)
+                && wait <= std::time::Duration::from_secs(600),
+            "a physical failure must wait its own first cycle (~600s), got {wait:?}"
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(1),
+            "the ASYNC completion lane must spend the shared physical budget — it \
+             used to consult no budget at all and stamp `retry_at: None`"
+        );
+    }
+
+    /// EVERY PHYSICAL LANE SHARES ONE BUDGET, THE BUDGET RUNS OUT, AND THE USER IS
+    /// TOLD TWICE — NOT NINE TIMES AND NOT FOREVER.
+    ///
+    /// Three independent things are pinned here because each of them shipped
+    /// broken in a different round:
+    ///   * the failures the budget is NAMED for return through
+    ///     `abort_reaped_native_apply_before_reconcile`, which once consulted no
+    ///     budget and stamped a deadline-less latch. One missed 15 s handoff
+    ///     deadline — the commonest physical failure there is, and an
+    ///     environmental one — disabled automatic apply for that build outright;
+    ///   * the repair for that made the lane UNBOUNDED: a spent epoch stood down
+    ///     6 h, the stand-down outlasted the 4 h replenish window by design, the
+    ///     counter reset, and the artifact got a fresh full budget every epoch
+    ///     forever (~10 round trips a day) while the constant's prose claimed it
+    ///     converged. The whole lifetime is walked here so "converges" is a fact
+    ///     about the code and not about a comment;
+    ///   * and the user-visible half: every one of those failures painted
+    ///     "Update delayed — retries on its own". That is a notification on a
+    ///     SCHEDULE for a condition the user cannot act on. Owner instruction: the
+    ///     transient lane retries quietly. Exactly two pills, and the second one
+    ///     names a control.
+    ///
+    /// The pill is surfaced here the way the production caller does it
+    /// (`app_update_handoff.rs`: `surface_update_apply_outcome("automatic handoff",
+    /// surfaced, false)`), because the completion lane returns the outcome and the
+    /// event-loop caller paints it.
+    #[test]
+    fn the_async_physical_lane_converges_and_stops_nagging() {
+        let mut app = App::headless_for_test();
+        // Relative to the running build: `arm` answers `Clear` for anything not
+        // strictly newer, which would make the two `arm_native_auto_apply`
+        // assertions at the end pass for the wrong reason.
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+
+        // THE WHOLE LIFETIME, driven through the REAL completion lane, one entry
+        // per failure: what the latch said, and what the user saw.
+        let mut latched = Vec::new();
+        let mut pills = Vec::new();
+        for _ in 0..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) {
+            ticket.make_current_apply_for_test(&mut app.native_updater_service);
+            app.notice = None;
+            let outcome = app.abort_reaped_native_apply_before_reconcile(
+                &ticket,
+                "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            );
+            app.surface_update_apply_outcome("automatic handoff", outcome, false);
+            latched.push(
+                app.auto_apply_manual_only
+                    .expect("a returned physical failure always latches manual-only")
+                    .retry_at
+                    .map(|at| at.saturating_duration_since(std::time::Instant::now())),
+            );
+            pills.push(
+                app.notice
+                    .as_ref()
+                    .map(crate::notice::TransientNotice::text),
+            );
+        }
+
+        // 600 s, 1800 s, stand-down — three times over, and the last stand-down is
+        // replaced by `None`. Names the SCHEDULE each deadline came from rather
+        // than asserting to the second, because these are real `Instant`s.
+        let schedule = latched
+            .iter()
+            .map(|wait| match wait {
+                None => "no-retry",
+                Some(wait) if *wait <= std::time::Duration::from_secs(600) => "retry-600",
+                Some(wait) if *wait <= std::time::Duration::from_secs(1800) => "retry-1800",
+                Some(_) => "stand-down",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schedule,
+            vec![
+                "retry-600",
+                "retry-1800",
+                "stand-down",
+                "retry-600",
+                "retry-1800",
+                "stand-down",
+                "retry-600",
+                "retry-1800",
+                "no-retry",
+            ],
+            "the async lane must ride the shared physical schedule and then STOP; \
+             a fourth epoch here is the unbounded-retry regression"
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS),
+            "each returned failure spends exactly one attempt"
+        );
+
+        // THE NAG, counted. One pill at the start so the user knows the lane
+        // exists, one at the end naming the control, and silence in between.
+        assert_eq!(
+            pills.iter().filter(|pill| pill.is_some()).count(),
+            2,
+            "nine failures may cost at most two pills, got {pills:?}"
+        );
+        assert_eq!(
+            pills.first().and_then(Clone::clone).as_deref(),
+            Some("↑ Update delayed — retries on its own"),
+            "the first failure tells the user the lane is handling it"
+        );
+        assert!(
+            pills[1..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) - 1]
+                .iter()
+                .all(Option::is_none),
+            "every failure between the first and the last must pass in silence — \
+             the user has nothing to do and the lane is already coming back, \
+             got {pills:?}"
+        );
+        assert_eq!(
+            pills.last().and_then(Clone::clone).as_deref(),
+            Some("↑ Update paused — see Version menu"),
+            "the ONE actionable moment — the lane is out of retries — must name a \
+             control, not repeat 'retries on its own'"
+        );
+
+        // AND CONVERGED MEANS CONVERGED. `arm` refuses the artifact, and the latch
+        // carries no deadline for `lapse_expired_auto_apply_manual_only` to find.
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        assert!(
+            app.auto_apply_manual_only
+                .is_some_and(|manual| manual.retry_at.is_none()),
+            "the converged latch stays"
+        );
+        assert!(
+            !app.arm_native_auto_apply(build, &"ab".repeat(32)),
+            "a duplicate stage wake for the SAME artifact must not restart the lane"
+        );
+        // …but a strictly newer build is a different artifact and is not punished
+        // for this one's history.
+        assert!(
+            app.arm_native_auto_apply(build + 1, &"cd".repeat(32)),
+            "convergence is per-artifact; a newer build still arms automatically"
+        );
+    }
+
+    /// A NATIVE-CLOSE REDUCER `Err` IS NOT "NOT NOW".
+    ///
+    /// `prepare_all_native_shutdown` answers `Ok(false)` when a native app
+    /// deliberately retained its view — the user's own live state, self-correcting
+    /// — and `Err` when the close reducer itself broke (an unknown instance,
+    /// unhandled effects). Both used to flatten into `UpdateOutcome::Blocked`,
+    /// which was harmless only while a `Blocked` latch was permanent anyway. Now
+    /// that `Blocked` keeps a live intent re-probing every cooldown forever, that
+    /// flattening would put a genuine invariant failure into an endless retry
+    /// loop, so the distinction is kept TYPED all the way to the outcome.
+    ///
+    /// Driven through the real lane with a real broken reducer: a Settings view
+    /// whose instance has been removed from the runtime under it, which is exactly
+    /// the `RuntimeError::UnknownInstance` shape `prepare_close` reports.
+    #[test]
+    fn a_broken_close_reducer_is_a_failure_not_a_block() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(
+            app.open_settings_tab(crate::native_settings::SettingsRoute::Home),
+            "PRECONDITION: a native view must exist for a close reducer to break"
+        );
+        let (instance, _view) = app
+            .active_native_view(wid)
+            .expect("PRECONDITION: the Settings tab is the active native view");
+
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        // An ordinary transient blocker, held constant across BOTH phases below,
+        // so the only variable is whether the close reducer works. It also keeps
+        // the preflight from ever answering Ready, which in a unit test would mean
+        // a real park/spawn/exec.
+        app.pending_restore = Some(crate::restore::RestoreManifest::new(Vec::new()));
+
+        // PRECONDITION / ANTI-VACUITY: with the runtime intact this same apply is
+        // NOT a failure, so anything the assertions below catch is the reducer
+        // error and not the fixture.
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        assert!(
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.attempts >= 1),
+            "PRECONDITION: an intact runtime leaves the attempt on the cheap \
+             Blocked lane with a live intent"
+        );
+        assert!(
+            app.auto_apply_physical_retry.is_none(),
+            "PRECONDITION: an ordinary block spends no physical budget"
+        );
+
+        // Break it: the view is still in the tab tree, its app instance is gone.
+        assert!(
+            app.native_runtime.remove_instance(instance).is_some(),
+            "PRECONDITION: the instance existed to be removed"
+        );
+
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+
+        assert!(
+            app.auto_apply_intent.is_none(),
+            "a broken close reducer must NOT be treated as a transient block — a \
+             live intent would re-probe it every cooldown for the life of the process"
+        );
+        let latched = app
+            .auto_apply_manual_only
+            .expect("a reducer error takes the strict Failed lane and latches manual-only");
+        assert_eq!(latched.build, build);
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(1),
+            "and it spends the strict, converging budget rather than the cheap \
+             preflight cooldown"
+        );
     }
 
     /// The retry budget REPLENISHES after a long idle gap: a busy hour must not

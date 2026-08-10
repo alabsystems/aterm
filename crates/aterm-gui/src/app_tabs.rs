@@ -16,6 +16,38 @@ use crate::{
     App, TabAction, TabIndex, WindowId, WindowState, pane, session_store, tab_bar, term_lock,
 };
 
+/// Whether a native close preflight is allowed to take over the screen when a
+/// reducer answers [`crate::native_app::CloseReadiness::Blocked`].
+///
+/// THIS EXISTS BECAUSE A BLOCKED CLOSE HAS TWO VERY DIFFERENT AUDIENCES, and
+/// until now both got the same, maximally intrusive treatment.
+/// `surface_native_close_recovery` switches the active tab, moves keyboard focus,
+/// re-fronts the window and REPLACES `window.overlay` with a Close Recovery
+/// palette (destroying whatever overlay the user had open). For a person who just
+/// pressed Cmd-W or Quit that is exactly right: they asked a question and the
+/// blocker is the answer, shown where they are already looking.
+///
+/// For BACKGROUND POLICY it is a focus hijack. The automatic update lane re-probes
+/// `prepare_all_native_shutdown` on a schedule for as long as a blocker persists
+/// (`app_native.rs`, `PREFLIGHT_BLOCK_COOLDOWN`), so an Interactive probe there
+/// meant a user with one unsaved Settings draft had their tab switched, their
+/// focus stolen and a palette thrown over their work every couple of hours,
+/// forever, for an update that is merely WAITING. Owner instruction: "a user who
+/// is simply busy must not have their tabs switched, their focus stolen, or a
+/// recovery panel reopened on a schedule."
+///
+/// The safety answer is identical under both — `Quiet` runs the same reducer and
+/// returns the same `Ok(false)`/`Err` — so nothing downstream becomes more
+/// permissive. Only the screen is left alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClosePreflightVisibility {
+    /// A person asked for this close: surface the reducer's recovery commands on
+    /// the blocking leaf.
+    Interactive,
+    /// Background policy asked: report the verdict, disturb nothing.
+    Quiet,
+}
+
 /// Decide whether a background tab's new title epoch changes visible tab chrome.
 ///
 /// The epoch remains the cheapest gate for ordinary PTY output. Once it changes,
@@ -2408,6 +2440,61 @@ impl App {
         (titles, metadata)
     }
 
+    /// Repaint everything a session's USER metadata feeds, after a change has
+    /// ALREADY been stored and recorded. Shared by the control socket's
+    /// `Wake::MetaChanged` arm and the in-process GUI rename commit, so the two
+    /// can never drift on what a pin change invalidates.
+    ///
+    /// The user title is the TOP tab-label rung, so every window labeling a tab
+    /// with this session re-reads its strip: the native (macOS) toolbar push,
+    /// plus a redraw when either the in-grid strip changed OR this is the
+    /// focused session (its metadata also feeds the native OS title even when
+    /// `tab_strip_rows = 0`, and `apply_title` runs on the redraw path including
+    /// its nothing-changed early-out). This is the exact refresh pair the
+    /// epoch-gated title/cwd drift path runs, minus the epoch gate (a pin change
+    /// is rare and every caller already gates on an ACTUAL change).
+    ///
+    /// ORDERING: the `meta-change` timeline record must already have landed —
+    /// [`crate::session_timeline::apply_meta_value`] takes it under the meta
+    /// guard, before this runs. Refreshing first would let `composed_session_chrome`
+    /// re-cache stale tooltip/context-menu text under an unmoved `high_id` key,
+    /// which for a quiet session with a pinned label never expires.
+    pub(crate) fn refresh_meta_dependent_chrome(&mut self, session: u64) {
+        let label_windows: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| {
+                ws.tab_set.tabs().iter().any(|tab| {
+                    self.view_store
+                        .get(tab.focus)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        == Some(session)
+                })
+            })
+            .map(|(wid, _)| *wid)
+            .collect();
+        for wid in label_windows {
+            let focused = self.focused_session_id(wid) == Some(session);
+            // Same snapshot the strip was just pushed — see
+            // `refresh_window_tabs`; recomputing it here doubled the
+            // per-tab meta-lock + term-try-lock + compose round trips.
+            let (titles, metadata) = self.refresh_window_tabs(wid);
+            let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
+            let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
+            let strip_changed = self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.last_present.as_ref().is_none_or(|k| k.tab_strip != fp));
+            let needs_redraw = crate::metadata_change_needs_redraw(focused, strip_changed);
+            if needs_redraw
+                && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+            {
+                w.request_redraw();
+            }
+        }
+    }
+
     /// RETIRED AFFORDANCE (update-flow UX rework): the titlebar "Update" capsule is gone
     /// — the update affordance moved to the VERSION menu (one-click apply, see
     /// [`crate::menu::update_version_menu`] / `App::refresh_version_menu`) — so nothing
@@ -2626,8 +2713,9 @@ impl App {
 
     /// Run one native reducer's close transaction without mutating topology.
     /// `Ok(false)` means the app deliberately retained its view (Blocked or
-    /// Pending); a Blocked verdict has already made its recovery capabilities
-    /// visible through [`Self::surface_native_close_recovery`].
+    /// Pending); a Blocked verdict under
+    /// [`ClosePreflightVisibility::Interactive`] has also made its recovery
+    /// capabilities visible through [`Self::surface_native_close_recovery`].
     fn prepare_native_leaf_close(
         &mut self,
         wid: WindowId,
@@ -2635,6 +2723,7 @@ impl App {
         view: crate::tab_model::ViewId,
         native: crate::tab_model::NativeViewRef,
         scope: crate::native_app::CloseScope,
+        visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
         let (readiness, effects) = self
             .native_runtime
@@ -2651,7 +2740,16 @@ impl App {
             crate::native_app::CloseReadiness::Ready => Ok(true),
             crate::native_app::CloseReadiness::Pending { .. } => Ok(false),
             crate::native_app::CloseReadiness::Blocked { recovery } => {
-                self.surface_native_close_recovery(wid, tab, view, native, recovery)?;
+                // THE VERDICT IS THE SAME EITHER WAY; ONLY THE SCREEN DIFFERS.
+                // A Quiet probe still runs the reducer and still reports
+                // `Ok(false)`, so no caller gets a weaker safety answer — it
+                // simply declines to answer a question nobody asked by taking
+                // the user's tab, focus, window and overlay. See
+                // [`ClosePreflightVisibility`] for why that distinction is
+                // load-bearing rather than cosmetic.
+                if visibility == ClosePreflightVisibility::Interactive {
+                    self.surface_native_close_recovery(wid, tab, view, native, recovery)?;
+                }
                 Ok(false)
             }
         }
@@ -2663,6 +2761,22 @@ impl App {
         &mut self,
         wid: WindowId,
         scope: crate::native_app::CloseScope,
+    ) -> Result<bool, String> {
+        // Every caller of THIS entry point is a person closing a window (Cmd-W,
+        // the close button, a control-socket close on the user's behalf), so the
+        // recovery surface is the answer to their request. Only the process-wide
+        // barrier below is reachable from background policy, so only it takes a
+        // visibility argument.
+        self.prepare_window_native_shutdown_with(wid, scope, ClosePreflightVisibility::Interactive)
+    }
+
+    /// [`Self::prepare_window_native_shutdown`] with an explicit disruption
+    /// policy, so the process-wide barrier can forward a background caller's.
+    fn prepare_window_native_shutdown_with(
+        &mut self,
+        wid: WindowId,
+        scope: crate::native_app::CloseScope,
+        visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
         let leaves = self
             .windows
@@ -2683,7 +2797,7 @@ impl App {
             })
             .collect::<Vec<_>>();
         for (tab, view, native) in leaves {
-            if !self.prepare_native_leaf_close(wid, tab, view, native, scope)? {
+            if !self.prepare_native_leaf_close(wid, tab, view, native, scope, visibility)? {
                 return Ok(false);
             }
         }
@@ -2691,16 +2805,22 @@ impl App {
     }
 
     /// Process-wide counterpart of [`Self::prepare_window_native_shutdown`].
-    /// The first blocker is focused and surfaced; every window/view remains
-    /// live. Quit and update-relaunch feed their distinct semantic scope into
-    /// this same reducer-owned barrier.
+    /// Every window/view remains live; under
+    /// [`ClosePreflightVisibility::Interactive`] the first blocker is also focused
+    /// and surfaced. Quit and update-relaunch feed their distinct semantic scope
+    /// into this same reducer-owned barrier.
+    ///
+    /// `visibility` is explicit at this seam and nowhere else because this is the
+    /// ONLY close barrier background policy can reach: the automatic update lane
+    /// re-probes it on a cooldown and must stay invisible while doing so.
     pub(crate) fn prepare_all_native_shutdown(
         &mut self,
         scope: crate::native_app::CloseScope,
+        visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
         let windows = self.windows.keys().copied().collect::<Vec<_>>();
         for wid in windows {
-            if !self.prepare_window_native_shutdown(wid, scope)? {
+            if !self.prepare_window_native_shutdown_with(wid, scope, visibility)? {
                 return Ok(false);
             }
         }
@@ -2708,7 +2828,12 @@ impl App {
     }
 
     pub(crate) fn prepare_quit_native_shutdown(&mut self) -> Result<bool, String> {
-        self.prepare_all_native_shutdown(crate::native_app::CloseScope::AppQuit)
+        // Quit is always a person's request — including the deferred-update quit
+        // path, which only runs once the user has chosen to quit.
+        self.prepare_all_native_shutdown(
+            crate::native_app::CloseScope::AppQuit,
+            ClosePreflightVisibility::Interactive,
+        )
     }
 
     /// Close one focused leaf of a heterogeneous tab as a host transaction.
@@ -2747,6 +2872,7 @@ impl App {
                 view,
                 native,
                 crate::native_app::CloseScope::View,
+                ClosePreflightVisibility::Interactive,
             )? {
                 return Err("native view close is not ready".to_string());
             }
@@ -2829,6 +2955,7 @@ impl App {
                 *view,
                 native,
                 crate::native_app::CloseScope::Tab,
+                ClosePreflightVisibility::Interactive,
             )? {
                 return Err("one or more native leaves are not ready to close".to_string());
             }
@@ -3858,6 +3985,74 @@ mod mixed_tab_tests {
         assert!(app.structural_invariants_ok());
     }
 
+    /// The barrier answers the SAME question two ways: a person gets the recovery
+    /// surface, background policy gets only the verdict.
+    ///
+    /// This is the seam the automatic update lane rides (`app_native.rs`
+    /// re-probes it on a `PREFLIGHT_BLOCK_COOLDOWN` schedule), so the Quiet arm
+    /// must be provably identical in verdict and provably invisible on screen.
+    /// Asserting only "Quiet opens no palette" would pass for a barrier that had
+    /// stopped checking anything at all, so the `Ok(false)` and the reducer's
+    /// retained state are asserted alongside it.
+    #[test]
+    fn a_quiet_shutdown_probe_reports_the_same_block_without_taking_the_screen() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (instance, settings) = app.active_native_view(wid).unwrap();
+        enter_settings_draft(&mut app, wid, settings);
+        // The user walks away to the terminal tab. Everything below asserts they
+        // are still there afterwards.
+        app.switch_tab_in(wid, 0);
+        let working_tab = app.windows[&wid].tab_set.active_id().unwrap();
+        assert!(app.active_native_view(wid).is_none());
+
+        for round in 0..3 {
+            assert!(
+                !app.prepare_all_native_shutdown(
+                    crate::native_app::CloseScope::Relaunch,
+                    ClosePreflightVisibility::Quiet
+                )
+                .unwrap(),
+                "round {round}: a quiet probe still refuses the shutdown"
+            );
+            assert!(
+                app.windows[&wid].overlay.is_none(),
+                "round {round}: a quiet probe opened an overlay over the user's work"
+            );
+            assert_eq!(
+                app.windows[&wid].tab_set.active_id(),
+                Some(working_tab),
+                "round {round}: a quiet probe switched the active tab"
+            );
+            assert!(
+                app.active_native_view(wid).is_none(),
+                "round {round}: a quiet probe moved focus onto the blocking view"
+            );
+            // The reducer really ran and really still holds the draft — a barrier
+            // that had been short-circuited would also be silent.
+            assert!(
+                !app.native_runtime
+                    .presentation(instance, settings)
+                    .unwrap()
+                    .closable,
+                "round {round}: the draft is still what refused"
+            );
+        }
+
+        // Same state, Interactive: now the screen moves.
+        assert!(
+            !app.prepare_all_native_shutdown(
+                crate::native_app::CloseScope::Relaunch,
+                ClosePreflightVisibility::Interactive
+            )
+            .unwrap()
+        );
+        assert_eq!(app.active_native_view(wid), Some((instance, settings)));
+        assert_exact_settings_close_recovery(&app, wid);
+        assert!(app.structural_invariants_ok());
+    }
+
     #[test]
     fn window_native_shutdown_barrier_retains_all_topology_until_explicit_discard() {
         let mut app = App::headless_for_test();
@@ -3878,8 +4073,11 @@ mod mixed_tab_tests {
         assert_eq!(app.windows[&wid].tab_set.len(), tabs);
         assert_exact_settings_close_recovery(&app, wid);
         assert!(
-            !app.prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch)
-                .unwrap()
+            !app.prepare_all_native_shutdown(
+                crate::native_app::CloseScope::Relaunch,
+                ClosePreflightVisibility::Interactive
+            )
+            .unwrap()
         );
         assert_eq!(app.windows[&wid].tab_set.len(), tabs);
         assert_exact_settings_close_recovery(&app, wid);

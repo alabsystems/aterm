@@ -268,11 +268,16 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             owner: "ParkedPane",
             decl: "persist: FxHashMap<u64, Episode>,",
             kind: ReplicaKind::Shard,
-            justification: "Episodes are grid-shaped, so an unbound pane parks its own \
-                map and `bind_pane` mem::swaps it in. This is a SHARD, not a separate \
-                scope: the burst mutex derived from these maps is still window-wide \
-                (supernova.rs `MAX_ACTIVE_SUPERNOVAE`), so the mutex's own scan must \
-                cover the parked maps too — hence the required `aggregator`.",
+            justification: "Episodes are grid-shaped, so a grid the engine is not \
+                currently scanning parks its own map and a swap brings it back. TWO \
+                seams do that swap, both keyed by SESSION id: `bind_pane` for a \
+                composed host's panes, and `set_scan_session` for an unsplit host's \
+                TABS (added 2026-08-09 — one window's tabs shared one map, so the same \
+                word at the same cell in two tabs was one episode). This is a SHARD, \
+                not a separate scope: the burst mutex derived from these maps is still \
+                window-wide (supernova.rs `MAX_ACTIVE_SUPERNOVAE`), so the mutex's own \
+                scan must cover every parked map — hence the required `aggregator`, \
+                which reads `self.parked` and therefore already covers the tabs.",
         }],
         aggregator: Some(Aggregator {
             symbol: "super_prepass",
@@ -288,6 +293,67 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             make it 2 x 900 = 1800, or 3 x 392 + 900 = 2076 mixed — and the const-assert \
             derivation in supernova.rs is falsified SILENTLY, because that assert is over \
             CONSTANTS and can never observe a second instance.",
+    },
+    ScopeClaim {
+        id: "typed-kitty-cameo",
+        machine: None,
+        unmodelled_because: "The cameo is a presentation lifetime (rise/dwell/fade) with no \
+            safety invariant a ty machine would carry: nothing it does can freeze, deadlock \
+            or lose data. What CAN go wrong is purely a cardinality claim — two toys on one \
+            window — which is exactly what this census checks, so a model here would restate \
+            the chain rather than add to it.",
+        scope: Scope::Window,
+        root: "WindowState",
+        chain: &[
+            Link {
+                file: "crates/aterm-gui/src/lib.rs",
+                owner: "WindowState",
+                decl: "word_decos: crate::word_decorations::WordDecorations,",
+            },
+            Link {
+                file: "crates/aterm-effects/src/word_decorations.rs",
+                owner: "WordDecorations",
+                decl: "cameo: crate::kitty_cameo::KittyCameo,",
+            },
+        ],
+        closed_tokens: &["WordDecorations"],
+        replicas: &[
+            Replica {
+                file: "crates/aterm-effects/src/pipeline.rs",
+                owner: "EffectsPipeline",
+                decl: "decos: WordDecorations,",
+                kind: ReplicaKind::SeparateScope,
+                justification: "The wasm/web pipeline is a DIFFERENT PROCESS with its own \
+                    browser surface, so its cameo is that window's one cameo. It shares no \
+                    glass with a native WindowState, which is what makes it a second SCOPE \
+                    rather than a second toy inside one.",
+            },
+            Replica {
+                file: "crates/aterm-gui/src/settings_preview.rs",
+                owner: "kitty_layer",
+                decl: "WordDecorations::default()",
+                kind: ReplicaKind::SeparateScope,
+                justification: "An offscreen still, dropped after one bake. Nothing types \
+                    into it, so `summon_cameo` is never reached and it holds no cameo at \
+                    all — it cannot put a second toy on any window's glass.",
+            },
+        ],
+        // Both replicas are separate SCOPES, not shards: neither parks state
+        // that a window-wide sweep would have to re-aggregate. OB-15 forbids a
+        // dead aggregator, so there is none.
+        aggregator: None,
+        covers_prose_in: &[
+            "crates/aterm-effects/src/kitty_cameo.rs",
+            "crates/aterm-effects/src/word_decorations.rs",
+        ],
+        rationale: "The cameo is the answer to \"typing kitty must summon THE kitty\", and \
+            the reason it is ONE per window is the same reason the ambient cat has a \
+            one-cat-per-caret veto: two toys for two keystrokes is the pile-up that veto \
+            exists to prevent. A second typed word REPLACES the live cameo rather than \
+            stacking. That is enforced by the field being a single `KittyCameo` rather than \
+            a collection — a shape no assertion inside `kitty_cameo.rs` can observe, because \
+            the type cannot see how many of itself exist. Per-PANE cameos would satisfy \
+            every in-module invariant while the window showed one toy per pane.",
     },
 ];
 

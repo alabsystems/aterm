@@ -1969,6 +1969,18 @@ impl App {
         // that was discovered after the preceding capture had already resolved
         // its frame and was therefore paused unseen below.
         ws.cursor_cat.set_collection_presentable(now, true);
+        // A CAPTURE IS A RENDERER, so it declares its session exactly like the
+        // unsplit glass path does (`app_render::redraw_window`). This arm binds
+        // no pane — `input_scratch` holds the FRONT terminal's whole grid — and
+        // an unbound engine used to treat that as "every session matches",
+        // which is a claim about geometry masquerading as one about identity.
+        // Without this, capturing tab B ticked the engine with tab A's cameo
+        // still holding the one-cat-per-caret veto (so tab B's own ambient cat
+        // at that cell went missing from its image) and with tab A's edit
+        // keystroke still a live re-arm witness. Declared BEFORE the
+        // suspension fork below for the same reason the glass path declares
+        // above its own: identity does not depend on whether this frame draws.
+        ws.word_decos.set_scan_session(Some(front_terminal.session));
         // Explicit captures have no animation timer. A focused/full-motion
         // window samples its live lifecycle; reduced or windowless captures
         // show a collection as one full-opacity still, never a synthetic idle
@@ -2271,6 +2283,43 @@ impl App {
                     &mut ws.free_scratch,
                 );
             }
+        }
+        // THE TYPED-KITTY CAMEO — the third emitter of the same free-sprite
+        // channel, and the third place it has to be wired or the capture lies.
+        // Ungated by `kitty_alpha`/`cur` like the two render paths: the cameo
+        // is not the companion and has its own anchor. Without this a
+        // screenshot taken while the toy is on glass would show the terminal
+        // without it, which is exactly the class of silent capture divergence
+        // the free-sprite copy below exists to prevent.
+        //
+        // SCOPED TO THE CAPTURED SESSION (skeptic's second-round finding,
+        // 2026-08-09). This arm passed the wildcard `None` to every cameo query
+        // — and `None` means "any cameo may draw here"
+        // ([`aterm_effects::kitty_cameo::KittyCameo::frame_in_pane`]). Glass
+        // rendering was fixed to name its front session
+        // (`app_render::present_typed_cameo`), but a capture is a renderer too:
+        // `WordDecorations` is per WINDOW and a tab switch retires nothing, so
+        // typing `kitty` in tab A and then capturing tab B put tab A's toy, at
+        // tab A's caret cell, into tab B's image. `input_scratch` here holds the
+        // FRONT terminal's grid, so the front session is the one and only
+        // session this arm may present.
+        let capture_pane = Some(front_terminal.session);
+        if ws.word_decos.cameo_live(now, capture_pane)
+            && let Some(footprint) =
+                ws.word_decos
+                    .kitty_cameo_footprint(effect_geom, now, capture_pane)
+        {
+            let colors = crate::app_render::cursor_cat_color_key(
+                &ws.input_scratch.cells,
+                effect_geom,
+                footprint,
+                ws.input_scratch.default_bg,
+                ws.input_scratch.cursor_color,
+                glow_cfg.accent,
+            );
+            let _ =
+                ws.word_decos
+                    .kitty_cameo(effect_geom, now, capture_pane, colors, &mut ws.free_scratch);
         }
         drop(term);
         ws.input_scratch
@@ -2917,9 +2966,9 @@ impl App {
         let Some(ws) = windows.get_mut(&front) else {
             return;
         };
-        // Headless semantic-renderer pixels. `backend.render_input` returns an
-        // owned Frame on both backends; no surface exists, so this branch does
-        // not claim swapchain byte identity.
+        // Headless semantic-renderer pixels. `backend.render_input_for_destination`
+        // returns an owned Frame on both backends; no surface exists, so this
+        // branch does not claim swapchain byte identity.
         // P3 settings card → raw bytes + device-px rect for the GPU tray quad (same
         // builder application-present uses). The GPU arm bakes it into the offscreen so
         // app-present and capture share composition; the CPU arm ignores it here
@@ -8943,6 +8992,258 @@ mod encode_worker_tests {
         assert_eq!(app.kitty_log.log().sightings, 1);
     }
 
+    /// THE TYPED-KITTY CAMEO REACHES THE SINGLE-PANE COMPOSITION TOO.
+    ///
+    /// `splice_word_decorations` is the headless single-pane emitter — the
+    /// third place the toy has to be wired (the other two are `redraw_window`'s
+    /// arm and `compose_typed_cameo`). INTROSPECTION IS SACRED: a capture taken
+    /// while the toy is on glass must show it, or a screenshot silently
+    /// disagrees with the screen.
+    ///
+    /// Identified by height: the cameo exceeds the `2·cell_h` atlas slot that
+    /// bounds every word-cat and the cursor escort. The pre-summon assertion
+    /// proves the discriminator bites — the frame already carries an ambient
+    /// cat and it does not qualify.
+    #[test]
+    fn headless_capture_carries_the_typed_kitty_cameo() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let t0 = Instant::now();
+        app.recompute_sparkle();
+        {
+            let terminal = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            let ws = app.windows.get_mut(&wid).expect("window 0");
+            ws.pending_deco_birth = Some(t0);
+            let mut term = crate::term_lock(&terminal);
+            term.process(b"\r\n\r\n\r\nhello kitty friend");
+            term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
+        }
+        app.splice_word_decorations(wid, t0);
+        let cell_h = app.win_cell_size(wid).1 as i32;
+        assert!(cell_h > 0, "PRECONDITION: the fixture has real cell metrics");
+        let cameo_sized = |app: &App| {
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .any(|s| i32::from(s.h) > 2 * cell_h)
+        };
+        assert!(
+            !app.windows[&wid].input_scratch.free_sprites.is_empty(),
+            "PRECONDITION: the capture already carries an ambient cat"
+        );
+        assert!(
+            !cameo_sized(&app),
+            "PRECONDITION: and no ambient sprite is cameo-sized, so the height \
+             test below is a real discriminator"
+        );
+
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(c),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        let at = Instant::now();
+        assert!(
+            app.windows[&wid].word_decos.cameo_live(at, None),
+            "PRECONDITION: typing the word summoned a cameo at all"
+        );
+        app.splice_word_decorations(wid, at);
+        assert!(
+            cameo_sized(&app),
+            "a capture must carry the typed-kitty cameo the glass is showing"
+        );
+    }
+
+    /// A CAPTURE IS A RENDERER, AND IT MUST HONOUR THE SAME TAB SCOPE.
+    ///
+    /// SKEPTIC'S SECOND-ROUND FINDING, 2026-08-09: glass rendering was fixed to
+    /// name its front session (`app_render::present_typed_cameo`), but this arm
+    /// still handed the WILDCARD `None` to every cameo query — and `None` means
+    /// "any cameo may draw here". `WordDecorations` is per WINDOW and a tab
+    /// switch retires nothing, so `aterm-ctl image` of tab B returned an image
+    /// containing tab A's toy, drawn at tab A's caret cell over tab B's text.
+    ///
+    /// NON-VACUITY: tab B carries its own feline word, so its capture is proven
+    /// to have run and drawn cats — just none of them cameo-sized. And tab A's
+    /// capture, taken again afterwards inside the toy's life, still has it: this
+    /// is a scope, not a deletion.
+    #[test]
+    fn a_capture_of_another_tab_omits_the_first_tabs_cameo() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let t0 = Instant::now();
+        app.recompute_sparkle();
+        let session_a = app.front_terminal(wid).expect("front terminal").session;
+        let write = |app: &App, session: u64, bytes: &[u8]| {
+            let term = app.pool.get(session).expect("pane session").term.clone();
+            crate::term_lock(&term).process(bytes);
+        };
+        write(&app, session_a, b"\r\n\r\n\r\nhello kitty friend");
+        {
+            let ws = app.windows.get_mut(&wid).expect("window 0");
+            ws.pending_deco_birth = Some(t0);
+        }
+        app.splice_word_decorations(wid, t0);
+        let (cell_w, cell_h) = {
+            let (w, h) = app.win_cell_size(wid);
+            (w as i32, h as i32)
+        };
+        assert!(
+            cell_h > 0 && cell_w > 0,
+            "PRECONDITION: the fixture has real cell metrics"
+        );
+        let cameo_sized = |app: &App| {
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .any(|s| i32::from(s.h) > 2 * cell_h)
+        };
+        let any_cat = |app: &App| !app.windows[&wid].input_scratch.free_sprites.is_empty();
+        // A CAT AT A NAMED COLUMN, because "some cat is present" measures the
+        // wrong quantity here. The engine is per WINDOW and the two tabs are
+        // two different terminals, so their damage epochs are independent
+        // counters that can read equal — and when they do, the capture skips
+        // its rescan and re-emits the PREVIOUS tab's word list over the new
+        // tab's text. `any_cat` cannot tell that leaked cat from tab B's own;
+        // its column can. A peeking cat's dest rect starts at its word's first
+        // cell, so one cell of tolerance is generous.
+        let cat_at_col = |app: &App, col: u16| {
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .any(|s| (s.x - i32::from(col) * cell_w).abs() <= cell_w)
+        };
+        assert!(
+            any_cat(&app) && !cameo_sized(&app),
+            "PRECONDITION: tab A's capture draws ambient cats and none is \
+             cameo-sized, so the height test is a real discriminator"
+        );
+        // Where tab A's ambient cat stands: `kitty` begins at column 6 of
+        // "hello kitty friend". Pinned as a PRECONDITION so the negative it
+        // anchors further down — "tab A's cat is NOT in tab B's image" — cannot
+        // pass merely because the column test never matches anything.
+        let first_word_col: u16 = 6;
+        assert!(
+            cat_at_col(&app, first_word_col),
+            "PRECONDITION: tab A's own cat really stands at its own word"
+        );
+
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(c),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        let at = t0 + Duration::from_millis(16);
+        app.splice_word_decorations(wid, at);
+        assert!(
+            cameo_sized(&app),
+            "PRECONDITION: the summoning tab's capture really carries the toy"
+        );
+
+        // A SECOND TAB, made front exactly as ⌘T does, with a feline word of
+        // its own so its capture cannot be silent for an unrelated reason.
+        let session_b = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(session_b));
+        assert_eq!(
+            app.front_terminal(wid).expect("front terminal").session,
+            session_b,
+            "PRECONDITION: the new tab is the one on glass now"
+        );
+        // THE SAME CELL, DELIBERATELY. An earlier version of this test put tab
+        // B's word at a DIFFERENT ROW, which made it blind to half of what it
+        // claims to cover: the cameo does not only DRAW, it also holds the
+        // one-cat-per-caret VETO over the word at its anchor, and that veto was
+        // still wildcard-scoped on the unsplit path (skeptic's third round,
+        // 2026-08-09). A tab-A toy therefore silenced the ambient cat at the
+        // same cell in tab B — a leak the old fixture stepped around rather
+        // than caught, because a suppression is invisible unless something is
+        // standing where it lands. So tab B's feline word is planted to START
+        // ON TAB A'S ANCHOR CELL: if the veto still crossed tabs it would eat
+        // this cat, and the capture would come back empty.
+        //
+        // The word is read out of the live cameo rather than hard-coded, so the
+        // fixture cannot drift away from the cell it is aiming at.
+        let anchor = app.windows[&wid]
+            .word_decos
+            .cameo_frame(at)
+            .expect("PRECONDITION: the toy is still on glass")
+            .anchor;
+        write(
+            &app,
+            session_b,
+            format!("\x1b[{};{}Hkitty waits", anchor.0 + 1, anchor.1 + 1).as_bytes(),
+        );
+        {
+            let ws = app.windows.get_mut(&wid).expect("window 0");
+            ws.pending_deco_birth = Some(at);
+        }
+        assert_eq!(
+            app.windows[&wid]
+                .word_decos
+                .cameo_pane(at)
+                .expect("PRECONDITION: a tab switch retires no cameo"),
+            Some(session_a),
+            "PRECONDITION: and it still names the tab it was typed in"
+        );
+        app.splice_word_decorations(wid, at + Duration::from_millis(16));
+        assert!(
+            cat_at_col(&app, anchor.1),
+            "tab B's OWN cat, at the very cell tab A's toy is anchored to, must \
+             be the cat in this image: a cameo in another tab is not on this \
+             glass and vetoes nothing here"
+        );
+        assert!(
+            !cat_at_col(&app, first_word_col),
+            "and tab A's word list must not have survived the switch — this \
+             capture is of tab B's grid, where that column is blank"
+        );
+        assert!(
+            !cameo_sized(&app),
+            "a capture of another tab must not contain tab A's toy"
+        );
+
+        // Back to tab A, still inside the toy's ~5 s life: a SCOPE, not a
+        // deletion.
+        app.switch_tab_in(wid, 0);
+        assert_eq!(
+            app.front_terminal(wid).expect("front terminal").session,
+            session_a,
+            "PRECONDITION: tab A is front again"
+        );
+        app.splice_word_decorations(wid, at + Duration::from_millis(32));
+        assert!(
+            cameo_sized(&app),
+            "and tab A's own capture still carries it"
+        );
+    }
+
     /// Capture is silent, but it must not discard the cursor companion's
     /// visual curse reaction while draining the shared cue queue.
     #[test]
@@ -8961,6 +9262,11 @@ mod encode_worker_tests {
                 .on_collect(t0, aterm_effects::kitty_registry::KittyLook::default());
             ws.cursor_cat.set_collection_presentable(t0, false);
             ws.pending_deco_birth = Some(t0);
+            // The curse is TYPED, and the engine's typed witness is now the
+            // caret's completion position AND a committed key (a passive output
+            // line parks the caret one past a curse just as readily). Without
+            // this the fixture stages OUTPUT, which correctly never winces.
+            ws.word_decos.note_typed_edit(t0, None);
             let mut term = crate::term_lock(&terminal);
             term.process(b"fuck");
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);

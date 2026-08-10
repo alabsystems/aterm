@@ -53,6 +53,19 @@ pub(crate) struct ToolbarTabsModel<'a> {
     pub(crate) active: usize,
 }
 
+/// One editing command a menu key equivalent must hand to the inline rename
+/// field instead of to the terminal while an editor is open (see
+/// [`AppRt::rename_editor_edit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RenameEditorEdit {
+    /// ⌘C — copy the field's selection.
+    Copy,
+    /// ⌘V — paste into the field.
+    Paste,
+    /// ⌘A — select the field's whole value.
+    SelectAll,
+}
+
 /// The native application-runtime seam. Every method is a platform OS-integration
 /// operation aterm performs; the macOS impl runs the real objc2 calls, the Linux
 /// impl is a graceful no-op. Implementors are zero-sized.
@@ -251,6 +264,61 @@ pub(crate) trait AppRt {
     /// Retired native-toolbar update seam. Current implementations are no-ops because
     /// update state and its action live in the version menu. See `toolbar.rs`.
     fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool);
+
+    /// Open the INLINE SESSION-RENAME editor over the strip's `tab` chip, seeded
+    /// with `seed` (the current pin — EMPTY when unpinned) and placeheld with
+    /// `placeholder` (the label the ladder falls back to, so an empty field
+    /// visibly means "use that"). Returns whether an editor is actually on
+    /// screen; `App` refuses to hold edit state that nothing is presenting.
+    ///
+    /// The editor is owned by the strip HANDLE, not by a tab chip: chips are
+    /// destroyed and rebuilt whenever the tab count or the container width
+    /// changes, which ordinary background events (a background session exiting,
+    /// any window resize) cause mid-edit. `tab` is the STABLE id, used only to
+    /// re-find the chip and reposition the editor over it — or, when it is gone,
+    /// to cancel. Default: `false` (no inline editor on this platform yet).
+    fn begin_tab_rename(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        tab: crate::tab_model::TabId,
+        session: u64,
+        seed: &str,
+        placeholder: &str,
+    ) -> bool {
+        let _ = (handle, tab, session, seed, placeholder);
+        false
+    }
+
+    /// Remove the inline rename editor and hand first responder back to the
+    /// terminal view. Idempotent (no editor ⇒ no-op) and side-effect free with
+    /// respect to metadata: `App` writes the pin itself, after this returns.
+    fn end_tab_rename(&self, handle: &toolbar::ToolbarHandle) {
+        let _ = handle;
+    }
+
+    /// The live rename editor's current text, or `None` when none is open. The
+    /// native field owns the in-progress text, so a command that must run
+    /// OUTSIDE an open editor reads it here and commits before proceeding —
+    /// otherwise closing a tab with ⌘W mid-rename would silently discard it.
+    /// Default: `None`.
+    fn rename_editor_text(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {
+        let _ = handle;
+        None
+    }
+
+    /// Forward one editing command to the live rename field's field editor
+    /// instead of to the terminal. macOS resolves a menu key equivalent BEFORE
+    /// the first responder sees the key, so without this ⌘V would paste into the
+    /// PTY behind an open editor. Returns whether the field editor took it.
+    /// Default: `false` (no editor to forward to).
+    fn rename_editor_edit(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        action: RenameEditorEdit,
+    ) -> bool {
+        let _ = (handle, action);
+        false
+    }
 
     /// Read native title chrome as one introspection line (titles, selection,
     /// independent status, and full tooltips), or `None` only for an empty tab set.
@@ -717,6 +785,33 @@ impl AppRt for AppRtMacOS {
 
     fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool) {
         toolbar::set_update_available(handle, available);
+    }
+
+    fn begin_tab_rename(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        tab: crate::tab_model::TabId,
+        session: u64,
+        seed: &str,
+        placeholder: &str,
+    ) -> bool {
+        toolbar::begin_tab_rename(handle, tab, session, seed, placeholder)
+    }
+
+    fn end_tab_rename(&self, handle: &toolbar::ToolbarHandle) {
+        toolbar::end_tab_rename(handle);
+    }
+
+    fn rename_editor_text(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {
+        toolbar::rename_editor_text(handle)
+    }
+
+    fn rename_editor_edit(
+        &self,
+        handle: &toolbar::ToolbarHandle,
+        action: RenameEditorEdit,
+    ) -> bool {
+        toolbar::rename_editor_edit(handle, action)
     }
 
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String> {

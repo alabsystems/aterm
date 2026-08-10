@@ -275,11 +275,54 @@ pub(crate) const STAR_ARM_HERO: f32 = 1.4;
 /// paid taxes of 1.06, 1.71, 1.86 and 1.0 — i.e. none at all.)
 pub(crate) const STAR_ARM_INK: f32 = 1.55;
 
+/// THE LADDER'S SHAPE, held where a violation cannot ship. Nine call sites used
+/// to pass arm ratios spanning 6x with no shared constant; these four rungs
+/// replaced them, and the point of a ladder is that it stays ordered and stays
+/// short. All four terms are constants, so this is a build-time fact rather than
+/// something a test run could have skipped. (What the tests still owe is the
+/// part no constant can state: that [`star_arm`] realizes each rung — see
+/// `the_star_arm_ladder_is_ordered_and_derived`.)
+const _: () = {
+    assert!(
+        STAR_ARM_FINE < STAR_ARM_STD && STAR_ARM_STD < STAR_ARM_HERO,
+        "the star arm ladder must stay ordered fine < std < hero"
+    );
+    // Before the erase HERO band's own documented `erase_hero_arm` multiplier.
+    assert!(
+        STAR_ARM_HERO / STAR_ARM_FINE <= 2.0,
+        "the family's own star sizes must stay inside 2x end to end"
+    );
+    assert!(
+        STAR_ARM_INK > 1.0,
+        "a source-over star must out-size its additive twin"
+    );
+};
+
 /// A star's arm half-length in px: the cell height, [`STAR_ARM`], and ONE of the
 /// named ratios. The only way an emitter is allowed to pick a star's size.
 #[inline]
 pub(crate) fn star_arm(cell_h: f32, ratio: f32) -> f32 {
     cell_h * STAR_ARM * ratio
+}
+
+/// THE ONE FLOAT→INTEGER ARM CONVERSION for the additive star: TRUNCATE, then
+/// floor at the 1 px arm [`push_twinkle_star`] needs to draw anything at all.
+///
+/// It has to be one rule, because a plus's MASS is derived from its integer arm
+/// and NOT from the float behind it: [`star_waist_px`] and [`star_core_px`]
+/// round `2·arm·ratio`, so one extra pixel of arm is what flips a 1 px hairline
+/// to a 2 px bar. Every integer-arm site in the kit spelled this
+/// `(star_arm(..) as i32).max(1)` — truncation, which is what the ladder's
+/// "every ordinary arm rounds to the hairline" claim was measured against —
+/// except ONE, which spelled it
+/// `(r.round() as i32).max(1)`: the jump-landing burst star. At a 40 px cell
+/// that lone rounding turned the family's own hero grain (7.84 px of arm) into
+/// an 8 px arm, i.e. a 2 px bar on a 3 px nucleus — a fat cross, thrown a whole
+/// fan at a time, reached without ever leaving the ladder. Truncating there
+/// costs the star less than a pixel of reach and puts it back on the hairline.
+#[inline]
+pub(crate) fn star_arm_px(arm: f32) -> i32 {
+    (arm as i32).max(1)
 }
 
 /// THE STARDUST LAW (owner, 2026-08-08: "make sure that the cursor sparkles
@@ -294,17 +337,53 @@ pub(crate) fn star_arm(cell_h: f32, ratio: f32) -> f32 {
 /// mote), and the 4-point star is an ACCENT dealt to at most one particle in
 /// [`STAR_ACCENT_DEN`] — decided from the particle's ALREADY-STORED seed so
 /// no RNG stream shifts and a grain never changes shape mid-flight. Heroes
-/// (the erase poof's one plus, landing stars, shooting-star heads, the
-/// starfield's recruited gold) sit OUTSIDE the deal: they are singular
+/// (the erase poof's one plus, the jump-landing starburst, the momentum
+/// shower's one shooting-star tip) sit OUTSIDE the deal: they are singular
 /// gestures, not population.
-pub(crate) const STAR_ACCENT_DEN: u32 = 8;
+///
+/// "SINGULAR GESTURE" IS A COUNT, NOT A NAME. Two marks were exempted on the
+/// strength of reading like one object and were in fact subpopulations, which
+/// is why the DEFAULT THEME never felt the first thinning:
+///   * the ribbon starfield's recruited GOLD — 6.3 % of every starred cell
+///     measured over a 60x200 field at full spine, i.e. the same order as the
+///     whole accent budget. Gold is a COLOUR now; the silhouette is dealt.
+///   * the fast-glide shooting star's HEAD — one tip per streak, but the
+///     classifier fires a streak per qualifying frame, so one fast sweep of
+///     the cursor laid a row of full-size crosses. Dealt.
+///
+/// Both are `cursor_glow`'s; both were 1-in-1 before 2026-08-09.
+///
+/// 8 → 16 (owner, 2026-08-09: "many fewer of those cross sparkles"). This is
+/// the SECOND report against this law, and the first one is the reason the
+/// number had to move rather than the call sites: 1-in-8 was already shipping
+/// everywhere when the owner looked again and still counted too many crosses.
+/// A deal of 1-in-8 puts a plus in roughly every eighth grain of a field whose
+/// grains arrive several per keystroke, so on a busy ribbon a cross is never
+/// more than a cell or two away — "most of them are round" and "I keep seeing
+/// crosses" are both true at 12.5 %, which is precisely the complaint. Halving
+/// the share to 6.25 % puts the nearest plus a short word away instead, which
+/// is what makes it read as punctuation on the dust rather than as texture in
+/// it, while keeping it comfortably above zero ("a few of the '+' are nice").
+///
+/// The DEFAULT THEME is what this number is aimed at. The 2026-08-09 round
+/// before this one thinned arm LENGTHS across both themes but changed the
+/// plus:round RATIO at exactly one site — the LIGHT theme's fresh-ink spark —
+/// so on dark, where the owner actually types, the mix was untouched. This
+/// constant is the only lever that reaches every dealt population on both
+/// grounds at once: the dark ribbon starfield, the light ribbon starfield, the
+/// Beam/Comet/Sparkle wakes, the erase poof on both grounds, and the fresh-ink
+/// spark. Measured per theme by `cursor_glow`'s
+/// `stardust_is_the_body_the_plus_is_the_accent` (dark) and
+/// `the_fresh_ink_spark_is_stardust_with_a_dealt_plus` (light).
+pub(crate) const STAR_ACCENT_DEN: u32 = 16;
 
 /// Deal a stored particle seed into the accent (true → the 4-point star) or
-/// the stardust body (false → a round mote). 1-in-8 = 12.5%, under the ≤15%
-/// share the sparkle rebalance promised.
+/// the stardust body (false → a round mote). 1-in-16 = 6.25 %, half the share
+/// the first pass of the sparkle rebalance left and well under the ≤15 % it
+/// promised.
 #[inline]
 pub(crate) fn star_accent(seed: u32) -> bool {
-    seed % STAR_ACCENT_DEN == 0
+    seed.is_multiple_of(STAR_ACCENT_DEN)
 }
 
 /// Stardust mote radius, px: seeded so no two motes match, floored so the
@@ -313,6 +392,82 @@ pub(crate) fn star_accent(seed: u32) -> bool {
 #[inline]
 pub(crate) fn dust_r(cell_h: f32, seed01: f32) -> f32 {
     (cell_h * (0.07 + 0.05 * seed01)).max(1.3)
+}
+
+/// THE PLUS'S COMPOSITED CENTRE, as a multiple of the coverage its emitter
+/// asked for. [`push_twinkle_star`] is THREE coincident additive lays at the
+/// crossing — the horizontal arm at `cov`, the vertical arm at `cov`, and the
+/// nucleus at [`STAR_CORE_ADD`] of it — so the PIXEL the eye actually reads at
+/// the centre of a plus carries `2.35 · cov` of light, not `cov`.
+///
+/// This number exists because the stardust law's shape swap was, on the
+/// additive arm, a BRIGHTNESS CUT nobody could see in the quad stream: the
+/// round body was one lay at the same `cov` the plus's arms were handed, which
+/// looks like parity primitive-for-primitive and lands 2.35x darker in the
+/// middle. The owner asked for fewer crosses AND more light (2026-08-09, "many
+/// fewer of those cross sparkles", after 2026-08-08's "cute small stardust"),
+/// so a mote has to be priced against what the plus PUT ON SCREEN. The light
+/// arm already does exactly this with `1-(1-a)^3` (the fresh-ink mote's
+/// source-over stack); this is the additive half of the same statement.
+pub(crate) const STAR_STACK_ADD: f32 = 2.0 + STAR_CORE_ADD;
+
+/// THE ONE STARDUST MOTE (additive) — the round BODY of every dealt population
+/// on dark ground, drawn so its composited centre matches the plus it replaced.
+///
+/// Two lays, for the same reason the star has three: a `d x d` SKIRT at the
+/// emitter's own `cov`, and a HOT CORE over it carrying the rest of
+/// [`STAR_STACK_ADD`]. A single flat rect at `2.35 · cov` would match the peak
+/// too, but a 3-5 px square of blown white is a blob, not dust — the skirt keeps
+/// the mote's soft edge while the core gives it the bright middle a sparkle
+/// needs. The core is `ceil(d/2)`, so the mote's mass rides its own seeded size
+/// and the smallest grain still gets a lit centre.
+///
+/// The core's coverage is CLAMPED at the byte, and that clamp is never a
+/// shortfall: it only binds above `cov` 188, and there the skirt plus a 255 core
+/// already saturates the channel — which is exactly what the plus's own
+/// `2.35 · cov` does anywhere above `cov` 109. Either side of the clamp the mote
+/// reaches `min(255, STAR_STACK_ADD · cov)`, i.e. the plus's rendered centre.
+///
+/// Window-absolute: draws through [`push_fx_rect`]. Returns `false` when the
+/// quad budget ran out, checked between pushes exactly like [`push_twinkle_star`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the mote's parameter set is [`push_twinkle_star`]'s with the arm/gold pair \
+              replaced by one size — output + geometry + centre + size + coverage + \
+              colour + budget. The two sides of the stardust deal are chosen between at \
+              every call site, so they must read as the same call"
+)]
+pub(crate) fn push_dust_mote(
+    out: &mut Vec<GlowQuad>,
+    geom: Geom,
+    cx: i32,
+    cy: i32,
+    d: i32,
+    cov: u8,
+    color: u32,
+    max_quads: usize,
+) -> bool {
+    if cov == 0 || d < 1 {
+        return true;
+    }
+    push_fx_rect(
+        out,
+        geom,
+        cx - d / 2,
+        cy - d / 2,
+        d,
+        d,
+        premul_rgb(color, cov),
+    );
+    if out.len() >= max_quads {
+        return false;
+    }
+    // The HOT CORE completes the plus's stack: skirt (1.0) + core (1.35) =
+    // [`STAR_STACK_ADD`] at the centre pixel.
+    let c = ((d + 1) / 2).max(1);
+    let core = premul_rgb(color, (f32::from(cov) * (STAR_STACK_ADD - 1.0)).min(255.0) as u8);
+    push_fx_rect(out, geom, cx - c / 2, cy - c / 2, c, c, core);
+    true
 }
 
 /// THE ONE PULSE LAW — angular frequency (rad/s) of every twinkling star.
@@ -340,9 +495,26 @@ pub(crate) const TWINKLE_DEPTH: f32 = 0.45;
 pub(crate) const TWINKLE_GLINT_FRAC: f32 = 0.92;
 
 /// The family's FLASH rate in Hz — `ω/π`, because the rectified envelope peaks
-/// twice per sine cycle. Pinned under the WCAG 2.3.1 general-flash bound by
-/// `twinkle_law_stays_under_the_photosensitivity_bound`.
+/// twice per sine cycle. Held under the WCAG 2.3.1 general-flash bound by
+/// [`TWINKLE_FLASH_BOUND_HZ`] below, and MEASURED against the envelope the
+/// emitters actually run by `twinkle_law_stays_under_the_photosensitivity_bound`.
 pub(crate) const TWINKLE_FLASH_HZ: f32 = TWINKLE_OMEGA / std::f32::consts::PI;
+
+/// WCAG 2.3.1's general-flash threshold, in Hz. Three flashes in any one second
+/// is the failing condition, so 3.2 is the bound this crate certifies against
+/// with the margin the guideline's own examples use.
+pub(crate) const TWINKLE_FLASH_BOUND_HZ: f32 = 3.2;
+
+/// A PHOTOSENSITIVITY BOUND IS NOT A TEST CASE. Both terms are constants, so
+/// the check belongs where a violation cannot ship at all: retune
+/// [`TWINKLE_OMEGA`] past the bound and this crate stops building, rather than
+/// failing a test somebody could have skipped. (The test beside it still earns
+/// its keep — it MEASURES the rate off the real envelope, which catches a
+/// rectification change that leaves both constants untouched.)
+const _: () = assert!(
+    TWINKLE_FLASH_HZ <= TWINKLE_FLASH_BOUND_HZ,
+    "the unified twinkle flashes over the WCAG 2.3.1 general-flash bound"
+);
 
 /// THE ONE TWINKLE. A star's brightness multiplier at `age_s` seconds of life,
 /// on its own `phase` (radians — seed it per star so a field blinks out of step).
@@ -494,10 +666,11 @@ mod tests {
     /// The raw-`sin` sites were being measured against the wrong number.
     #[test]
     fn twinkle_law_stays_under_the_photosensitivity_bound() {
-        assert!(
-            TWINKLE_FLASH_HZ <= 3.2,
-            "the unified twinkle flashes at {TWINKLE_FLASH_HZ} Hz — over the 3.2 Hz bound"
-        );
+        // The DECLARED rate is bounded at build time (`TWINKLE_FLASH_BOUND_HZ`),
+        // where a violation cannot ship. What is left for a test is the part a
+        // constant cannot state: that the declaration matches the envelope the
+        // emitters actually run.
+        //
         // MEASURED, not merely declared: count the envelope's bright peaks over
         // ten seconds and check the rate against the constant. A future retune
         // that drops the rectification would halve this and be caught.
@@ -558,22 +731,93 @@ mod tests {
         );
     }
 
+    /// THE ACCENT IS 1-IN-[`STAR_ACCENT_DEN`], measured over a uniform seed
+    /// sweep rather than read off the constant — the deal is the one number the
+    /// owner has now reported on twice ("fewer of the '+'", then "many fewer of
+    /// those cross sparkles"), so its rate is worth a measurement.
+    ///
+    /// Also pins the DIRECTION of the 2026-08-09 change: whatever the
+    /// denominator becomes, the plus must stay a small minority AND must not
+    /// vanish ("a few of the '+' are nice").
+    #[test]
+    fn the_stardust_accent_is_a_small_dealt_minority() {
+        let n = 16_000u32;
+        let hits = (0..n).filter(|s| star_accent(*s)).count();
+        let share = hits as f32 / n as f32;
+        // Exact over a contiguous sweep: `seed % DEN == 0` partitions perfectly.
+        assert!(
+            (share - 1.0 / STAR_ACCENT_DEN as f32).abs() < 1e-6,
+            "the deal measured {share}, not 1-in-{STAR_ACCENT_DEN}"
+        );
+        assert!(
+            hits > 0,
+            "the accent must SURVIVE — it is the family's grace note"
+        );
+        assert!(
+            share <= 0.07,
+            "the plus is back to texture at {:.1} % of the population",
+            share * 100.0
+        );
+    }
+
+    /// THE ONE ARM CONVERSION, and the pixel it is worth.
+    ///
+    /// [`star_arm_px`] truncates. That is not a stylistic choice: the family's
+    /// claim that "every ordinary arm rounds to the 1 px hairline" was only ever
+    /// measured against truncation, and the one emitter that ROUNDED instead
+    /// (`cursor_glow`'s jump-landing burst) drew a 2 px bar on a 3 px nucleus at
+    /// a 40 px cell while the audit certified it a hairline. So this pins BOTH
+    /// halves: the rule, and the fact that the rule is load-bearing — at every
+    /// shipping cell height the family's heaviest named grain is a hairline
+    /// under truncation, and somewhere in that band it provably is NOT under
+    /// rounding.
+    #[test]
+    fn the_one_arm_conversion_truncates_and_floors() {
+        assert_eq!(
+            star_arm_px(7.84),
+            7,
+            "the conversion must truncate, not round"
+        );
+        assert_eq!(star_arm_px(7.0), 7);
+        // …and floors, so a tiny grain still draws a mark rather than nothing.
+        assert_eq!(star_arm_px(0.2), 1);
+        assert_eq!(star_arm_px(0.0), 1);
+        let mut rounding_would_fatten = 0;
+        for ch in [24.0_f32, 28.0, 32.0, 36.0, 40.0] {
+            let f = star_arm(ch, STAR_ARM_HERO);
+            let arm = star_arm_px(f);
+            assert!(arm >= 2, "vacuous: no arm to measure at ch {ch}");
+            assert_eq!(
+                star_waist_px(arm),
+                1,
+                "the family's heaviest named grain is {} px thick at ch {ch}",
+                star_waist_px(arm)
+            );
+            if star_waist_px((f.round() as i32).max(1)) > 1 {
+                rounding_would_fatten += 1;
+            }
+        }
+        // NON-VACUOUS: if rounding and truncating agreed everywhere in the
+        // shipping band, this whole rule would be cosmetic and the burst star's
+        // second spelling would have been harmless. It is not.
+        assert!(
+            rounding_would_fatten > 0,
+            "no shipping cell height distinguishes truncation from rounding — \
+             this rule would be pinning nothing"
+        );
+    }
+
     /// ONE ARM FAMILY. Nine call sites used to pass arm ratios spanning 6x with
     /// no shared constant; the sizes are a ladder now, and this pins its shape:
     /// ordered, derived from the one scale, and (before the erase HERO band's
     /// own documented multiplier) inside 2x end to end.
     #[test]
     fn the_star_arm_ladder_is_ordered_and_derived() {
-        assert!(STAR_ARM_FINE < STAR_ARM_STD && STAR_ARM_STD < STAR_ARM_HERO);
-        assert!(
-            STAR_ARM_HERO / STAR_ARM_FINE <= 2.0,
-            "the family's own sizes span {}x",
-            STAR_ARM_HERO / STAR_ARM_FINE
-        );
-        assert!(
-            STAR_ARM_INK > 1.0,
-            "a source-over star must out-size its additive twin"
-        );
+        // The ladder's ORDER and SPAN are relations between constants and are
+        // held at build time (see the `const _` block beside the ratios), where
+        // a violation cannot ship. What only a test can state is that
+        // `star_arm` — the function every emitter actually calls — really does
+        // realize each rung as `cell · STAR_ARM · ratio`.
         for r in [STAR_ARM_FINE, STAR_ARM_STD, STAR_ARM_HERO, STAR_ARM_INK] {
             assert!((star_arm(16.0, r) - 16.0 * STAR_ARM * r).abs() < 1e-6);
         }
@@ -607,13 +851,18 @@ mod tests {
             .iter()
             .find(|q| span(q) == (sx - arm, sx + arm + 1))
             .expect("a horizontal arm of 2*arm+1");
+        // The arm's full SPAN — `arm` px either side of the crossing plus the
+        // centre pixel. Named rather than spelled inline: it is the quantity
+        // being measured, and `>= 2 * arm + 1` reads to a linter as an
+        // off-by-one dressed up as a bound.
+        let full_span = 2 * arm + 1;
         assert!(
             out.iter()
                 .filter(|q| span(q) == (sx - (t - 1) / 2, sx - (t - 1) / 2 + t))
                 .map(|q| i32::from(q.h))
                 .sum::<i32>()
-                >= 2 * arm + 1,
-            "the vertical arm is not 2*arm+1 tall at the shared waist"
+                >= full_span,
+            "the vertical arm is not {full_span} px tall at the shared waist"
         );
         assert_eq!(
             i32::from(horiz.h),
@@ -658,6 +907,84 @@ mod tests {
             plain
                 .iter()
                 .all(|q| !(q.w == 1 && q.h == 1 && q.color == dim))
+        );
+    }
+
+    /// THE BODY IS AS BRIGHT AS THE ACCENT IT REPLACED — the additive half of
+    /// the stardust law, stated on the COMPOSITED PIXEL.
+    ///
+    /// The star lays two arms and a nucleus on its centre, so a plus renders
+    /// [`STAR_STACK_ADD`] times the coverage its emitter asked for; the mote that
+    /// replaced it used to be one flat rect at that same coverage, i.e. 2.35x
+    /// darker in the middle for a shape swap that was supposed to change nothing
+    /// but the silhouette. Both marks are rasterized here — additively,
+    /// saturating at the byte, the way the renderer composites them — and their
+    /// centres compared.
+    #[test]
+    fn the_dust_mote_composites_to_the_plus_s_own_centre() {
+        let g = geom();
+        let (cx, cy) = (100i32, 40i32);
+        let cov = 90u8;
+        // Additive rasterization of a small quad batch: `(peak, lit pixels)`.
+        let raster = |qs: &[GlowQuad]| -> (u32, usize) {
+            let mut px: std::collections::HashMap<(u16, u16), u32> =
+                std::collections::HashMap::new();
+            for q in qs {
+                for yy in q.y..q.y + q.h {
+                    for xx in q.x..q.x + q.w {
+                        *px.entry((xx, yy)).or_insert(0) += (q.color >> 16) & 0xff;
+                    }
+                }
+            }
+            (
+                px.values().copied().map(|v| v.min(255)).max().unwrap_or(0),
+                px.len(),
+            )
+        };
+        let mut star = Vec::new();
+        assert!(push_twinkle_star(
+            &mut star,
+            g,
+            cx,
+            cy,
+            4,
+            cov,
+            false,
+            0x00FF_FFFF,
+            4096
+        ));
+        let mut mote = Vec::new();
+        assert!(push_dust_mote(&mut mote, g, cx, cy, 5, cov, 0x00FF_FFFF, 4096));
+        let (star_peak, star_px) = raster(&star);
+        let (mote_peak, mote_px) = raster(&mote);
+        // NON-VACUOUS: the plus really does stack, so there is something to match.
+        assert!(
+            star_peak >= 2 * u32::from(cov),
+            "the reference is not stacking: a plus centre of {star_peak} at cov {cov}"
+        );
+        assert!(
+            mote_peak >= star_peak,
+            "the mote's centre composites to {mote_peak} against the plus's \
+             {star_peak} — the round body is the dimmer mark"
+        );
+        // …and it did NOT buy that with FOOTPRINT: the hot core lands inside the
+        // skirt, so the mote lights exactly the `d x d` it always did and the
+        // extra light is in the middle rather than at the edges. (A mote is a
+        // filled grain and a plus is two hairlines, so their pixel counts were
+        // never equal, which is why this is stated against the mote's own
+        // silhouette — and the plus's own count is printed beside it so a
+        // failure says which silhouette moved.)
+        assert_eq!(
+            mote_px, 25,
+            "the compensation grew the mote's footprint past its own 5x5 skirt \
+             (the plus beside it lights {star_px} px — a different silhouette, \
+             never a shared budget)"
+        );
+        // BUDGET: the helper checks between its two lays, exactly like the star.
+        let mut tight = Vec::new();
+        assert!(
+            !push_dust_mote(&mut tight, g, cx, cy, 5, cov, 0x00FF_FFFF, 1),
+            "a mote that ran out of budget must report it"
         );
     }
 }

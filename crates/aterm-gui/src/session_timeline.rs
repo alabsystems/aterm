@@ -211,6 +211,176 @@ impl SessionMeta {
     }
 }
 
+/// The three USER-metadata fields as a CLOSED type. Everything past the wire
+/// PARSE boundary carries this instead of a `&str` name, which removes two
+/// hazards by construction: the unknown-field case stops being reachable, and
+/// the `meta-change` record no longer has to re-map a borrowed name onto a
+/// `'static` token before printing it into a payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetaField {
+    /// `title` — the operator's display title, TOP rung of the label chain.
+    Title,
+    /// `description` — free-text purpose/notes an agent leaves behind.
+    Description,
+    /// `icon` — an emoji / short token for the strip.
+    Icon,
+}
+
+impl MetaField {
+    /// Parse a wire field token, or `None` for an unknown name — the ONE door
+    /// from the string vocabulary into the typed one.
+    #[must_use]
+    pub(crate) fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "title" => Self::Title,
+            "description" => Self::Description,
+            "icon" => Self::Icon,
+            _ => return None,
+        })
+    }
+
+    /// The stable token [`SessionMeta::set`]/[`SessionMeta::get`] key on and the
+    /// `meta-change` payload prints. Safe to print verbatim: a closed
+    /// vocabulary, never free text (only the VALUE is user-supplied).
+    #[must_use]
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Description => "description",
+            Self::Icon => "icon",
+        }
+    }
+
+    /// This field's byte cap — applied to the TRIMMED value, measured in bytes.
+    #[must_use]
+    pub(crate) const fn cap(self) -> usize {
+        match self {
+            Self::Title => META_TITLE_MAX,
+            Self::Description => META_DESCRIPTION_MAX,
+            Self::Icon => META_ICON_MAX,
+        }
+    }
+}
+
+/// What a metadata write INTENDS. `Clear` is first-class rather than a `Set("")`
+/// spelling: both end with a stored `None`, but they record DIFFERENT timeline
+/// payloads (`value=-` is the documented cleared marker; `value=` is not), so an
+/// `events` consumer must be able to tell them apart. Typing the intent stops
+/// `Set("")` from silently masquerading as a clear at the mutation boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetaEdit<'a> {
+    /// Store this value, after the full validation ladder.
+    Set(&'a str),
+    /// Unset the field — labels fall back down the chain.
+    Clear,
+}
+
+/// Why a metadata write was REFUSED. Every variant is user-visible: the control
+/// arm renders it as its existing `ERR` line, a GUI caller as an inline
+/// rejection. Refusal is deliberate — a value is never silently truncated or
+/// stripped, because the caller must know its label did not land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MetaWriteError {
+    /// The value was empty (or whitespace-only). `Set` cannot clear.
+    Empty,
+    /// Control, bidi, or invisible formatting characters were present.
+    ForbiddenFormatting,
+    /// Over the field's byte cap (which is carried so the caller can name it).
+    TooLong {
+        /// The exceeded [`MetaField::cap`].
+        cap: usize,
+    },
+}
+
+/// PURE validation: the whole `meta set` ladder minus the store — trim, empty
+/// rejection, forbidden-formatting rejection, byte cap, then canonicalization to
+/// the STORED representation. No locks and no ctx, so any caller can run it
+/// before it owns anything.
+///
+/// `Ok(None)` is produced ONLY by [`MetaEdit::Clear`]: a `Set` that survives the
+/// ladder always has a canonical value, because rejection already removed every
+/// input that could sanitize away to nothing.
+pub(crate) fn validated_meta_value(
+    field: MetaField,
+    edit: MetaEdit<'_>,
+) -> Result<Option<String>, MetaWriteError> {
+    let MetaEdit::Set(value) = edit else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(MetaWriteError::Empty);
+    }
+    if metadata_has_forbidden_formatting(value) {
+        return Err(MetaWriteError::ForbiddenFormatting);
+    }
+    let cap = field.cap();
+    if value.len() > cap {
+        return Err(MetaWriteError::TooLong { cap });
+    }
+    Ok(Some(
+        sanitize_metadata_value(field.wire_name(), value)
+            .expect("non-empty validated metadata has a canonical value"),
+    ))
+}
+
+/// Apply one already-validated metadata mutation and — on an ACTUAL change —
+/// record the `meta-change` timeline event (`field=<f> value=<pct|->`). Returns
+/// whether the stored value moved, which is the caller's gate for the wake +
+/// subscriber fan-out (see the `meta` dispatch arm and the GUI rename commit).
+///
+/// ATOMICITY: the timeline record happens WHILE the meta guard is still held —
+/// the one sanctioned meta→timeline nesting (documented on `SessionCtx`). The
+/// control socket runs concurrent worker threads, so two authorized `meta set`s
+/// racing on one session must not interleave between the store and the record:
+/// dropping the meta guard first lets the pair invert (store A,B — record B,A),
+/// leaving every `subscribe … events` watcher and the `timeline` verb with a
+/// LAST event that names the LOSING value while the stored meta, the bare
+/// `meta` readout, and the tab label all show the winner. Holding the guard
+/// across the record makes event-stream order match store order by
+/// construction. Deadlock-free: no other site takes these two nested, and
+/// timeline is a leaf everywhere (nothing locks meta under timeline).
+///
+/// GUARDS ARE RELEASED ON RETURN, and that is load-bearing rather than tidy: a
+/// SAME-THREAD GUI caller refreshes the tab chrome immediately after this
+/// returns, and that refresh re-takes `ctx.meta` once per tab inside
+/// `App::tab_titles`. `std::sync::Mutex` is not reentrant, so a refresh run
+/// from inside the mutation would self-deadlock the event loop.
+pub(crate) fn apply_meta_value(
+    ctx: &crate::SessionCtx,
+    field: MetaField,
+    value: Option<String>,
+) -> bool {
+    let payload_value = value
+        .as_deref()
+        .map_or_else(|| "-".to_string(), crate::control::pct_encode);
+    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let changed = meta.set(field.wire_name(), value).unwrap_or(false);
+    if changed {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(
+                "meta-change",
+                format!("field={} value={payload_value}", field.wire_name()),
+            );
+    }
+    drop(meta);
+    changed
+}
+
+/// Validate THEN apply — the entry point a NON-wire caller uses so it cannot
+/// skip a rung. The wire handler splits the two only because it must render
+/// each refusal as its own byte-exact `ERR` line.
+pub(crate) fn write_session_meta(
+    ctx: &crate::SessionCtx,
+    field: MetaField,
+    edit: MetaEdit<'_>,
+) -> Result<bool, MetaWriteError> {
+    let value = validated_meta_value(field, edit)?;
+    Ok(apply_meta_value(ctx, field, value))
+}
+
 /// One recorded lifecycle event. `kind` is a closed vocabulary (`spawned`,
 /// `state-change`, `title-change`, `cwd-change`, `meta-change`); `payload` is a
 /// short space-separated `k=v` token string whose free-text values are ALREADY
@@ -517,5 +687,136 @@ mod tests {
         assert_eq!(SessionMeta::cap("description"), Some(META_DESCRIPTION_MAX));
         assert_eq!(SessionMeta::cap("icon"), Some(META_ICON_MAX));
         assert_eq!(SessionMeta::cap("colour"), None);
+    }
+}
+
+/// Proofs for the TYPED metadata write API — the one path both the control
+/// socket (`meta set`/`meta unset`) and the GUI rename affordance take.
+#[cfg(test)]
+mod write_api_tests {
+    use super::{MetaEdit, MetaField, MetaWriteError, apply_meta_value, validated_meta_value};
+
+    /// The validation ladder refuses rather than repairs: an empty `Set` is a
+    /// refusal (never a clear), forbidden formatting and an over-cap value are
+    /// refusals (never a strip or a truncation), and a legal value comes back
+    /// canonicalized. `Clear` is the ONLY way to reach `Ok(None)`.
+    #[test]
+    fn the_ladder_refuses_rather_than_repairs() {
+        use MetaField::{Icon, Title};
+        assert_eq!(
+            validated_meta_value(Title, MetaEdit::Set("   ")),
+            Err(MetaWriteError::Empty),
+            "an empty Set is a refusal, not a clear"
+        );
+        assert_eq!(
+            validated_meta_value(Title, MetaEdit::Set("build\u{202e}agent")),
+            Err(MetaWriteError::ForbiddenFormatting)
+        );
+        let over = "x".repeat(super::META_TITLE_MAX + 1);
+        assert_eq!(
+            validated_meta_value(Title, MetaEdit::Set(&over)),
+            Err(MetaWriteError::TooLong {
+                cap: super::META_TITLE_MAX
+            }),
+            "over-cap is refused, never truncated"
+        );
+        assert_eq!(
+            validated_meta_value(Title, MetaEdit::Set("  build agent  ")),
+            Ok(Some("build agent".to_string())),
+            "interior whitespace survives; the edges are trimmed"
+        );
+        assert_eq!(validated_meta_value(Title, MetaEdit::Clear), Ok(None));
+        assert_eq!(validated_meta_value(Icon, MetaEdit::Clear), Ok(None));
+        assert_eq!(Icon.cap(), super::META_ICON_MAX);
+        assert_eq!(MetaField::parse("colour"), None);
+    }
+
+    /// A CLEAR records the documented cleared marker (`value=-`), which is what
+    /// distinguishes it from the unrepresentable `Set("")` — both would store
+    /// `None`, but only one of them says so in the event stream.
+    #[test]
+    fn a_clear_records_the_cleared_marker_and_only_on_a_real_change() {
+        let ctx = crate::stub_session(0).ctx.clone();
+        assert!(apply_meta_value(
+            &ctx,
+            MetaField::Title,
+            Some("agent".into())
+        ));
+        assert!(
+            !apply_meta_value(&ctx, MetaField::Title, Some("agent".into())),
+            "a no-op re-set reports unchanged so the caller stays silent"
+        );
+        assert!(apply_meta_value(&ctx, MetaField::Title, None));
+        assert!(
+            !apply_meta_value(&ctx, MetaField::Title, None),
+            "clearing an unset field is a no-op"
+        );
+        let tl = ctx.timeline.lock().unwrap();
+        let payloads: Vec<&str> = tl
+            .since(None)
+            .filter(|e| e.kind == "meta-change")
+            .map(|e| e.payload.as_str())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec!["field=title value=agent", "field=title value=-"],
+            "exactly one record per REAL change, and a clear is `-`"
+        );
+    }
+}
+
+/// Concurrency proof for [`apply_meta_value`]: the meta store and the timeline
+/// record are ATOMIC with respect to racing `meta set`s (the record is taken
+/// while the meta guard is held), so the event stream can never invert against
+/// the finally-stored value. The control socket runs a pool of worker threads;
+/// before the fix, two writers could interleave store(A) store(B) record(B)
+/// record(A) — every `subscribe … events` watcher and the `timeline` verb then
+/// ended on an event naming A while the store, the bare `meta` readout, and
+/// the tab label all showed B.
+#[cfg(test)]
+mod meta_atomicity_tests {
+    use super::{MetaField, apply_meta_value};
+
+    /// Hammer one session's title from several threads, then require the LAST
+    /// recorded `meta-change` event to name exactly the value the store ended
+    /// on. Deterministically true with the guard-held record; reliably flaky
+    /// without it (the race window was the whole guard-drop → record gap).
+    #[test]
+    fn racing_meta_sets_keep_the_last_event_matching_final_state() {
+        let ctx = crate::stub_session(0).ctx.clone();
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    for j in 0..50 {
+                        apply_meta_value(&ctx, MetaField::Title, Some(format!("t{i}-{j}")));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let final_title = ctx
+            .meta
+            .lock()
+            .unwrap()
+            .get("title")
+            .expect("some writer won")
+            .to_string();
+        let tl = ctx.timeline.lock().unwrap();
+        let last = tl
+            .since(None)
+            .filter(|e| e.kind == "meta-change")
+            .last()
+            .expect("changes were recorded");
+        assert_eq!(
+            last.payload,
+            format!(
+                "field=title value={}",
+                crate::control::pct_encode(&final_title)
+            ),
+            "the final meta-change event names the finally-stored value"
+        );
     }
 }

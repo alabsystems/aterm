@@ -170,10 +170,16 @@ const HELP_TAIL: &str = concat!(
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_trail, cursor_trail_style\n",
     "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
-    "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius),\n",
-    "              trail_sounds, trail_sound_volume (the styles' sound palettes),\n",
-    "              trail_sound_bed (the ambient background texture; default off),\n",
-    "              trail_sound_style (auto | mechanical — the typing-sound palette).\n",
+    "              cursor_trail_ms/_length/_ring, cursor_trail_bloom (+_strength/_radius).\n",
+    // Sound is its own help block because it is its own Settings box now (the
+    // owner's Sound menu); listing it under Cursor is what made the volume dial
+    // hard to find in the first place.
+    "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
+    "              voice), trail_sound_style (auto | mechanical), tone_melody,\n",
+    "              trail_sound_bed (the ambient texture; default off),\n",
+    "              trail_sound_riff (the sing-along song — the loudest voice),\n",
+    "              bell_sound (the audible BEL beep; macOS/Windows),\n",
+    "              sparkle_words.profanity.bonk[_detonation] (the curse bonk).\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
     "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
@@ -273,10 +279,14 @@ const STARTER_CONFIG: &str = "\
 # cursor_trail_wake_ms = 300           # rainbow-kitty TYPING WAKE: ms of recent travel the
 #                                      # plume under your words shows (0 = off, max 1500)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
+# --- sound (Settings > Cursor & Motion > Sound) -------------------------------
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
-# trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell)
-# trail_sound_bed = false          # the continuous ambient BED texture behind the notes (default OFF; true re-enables the per-style drone)
+# trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
 # trail_sound_style = \"auto\"     # typing-sound palette: auto = follow the trail style; mechanical = keyboard click + thock (aliases: mech, thock)
+# tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
+# trail_sound_bed = false          # the continuous ambient BED texture behind the notes (default OFF; true re-enables the per-style drone)
+# trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)
+# bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep); false keeps the visual flash and window attention (default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
 # cursor_trail_bloom_strength = 0.85   # 0.0..=3.0 (halo intensity)
 # cursor_trail_bloom_radius = 2.2      # 0.5..=8.0 (half-res blur texels)
@@ -348,6 +358,8 @@ const STARTER_CONFIG: &str = "\
 # anim_ms = 2500                   # how long a word sparkles after appearing (350..=10000)
 # jitter = 2                       # sub-cell sparkle jitter in px (0..=6)
 # intensity = 0.85                 # opacity 0.0..=1.0
+# bonk = true                      # the curse BONK sound effect on a TYPED curse (default ON; scaled by trail_sound_volume — Settings shows it in the Sound box)
+# bonk_detonation = false          # also bonk when an on-screen curse's supernova ignites (default OFF; typed provenance only unless opted in)
 # extra_words = [\"frak\"]           # extra words to treat as profanity
 # ignore_words = [\"fluff\"]         # never decorate these as profanity
 # [sparkle_words.feline]

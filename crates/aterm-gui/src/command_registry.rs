@@ -173,6 +173,13 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::Zoom => spec("window.maximize", S::Window, A::LocalUi, C::Any),
         M::NextTab => spec("tab.next", S::Window, A::LocalUi, C::Any),
         M::PrevTab => spec("tab.previous", S::Window, A::LocalUi, C::Any),
+        // Same identity as the keybinding face (K::RenameSession below): one
+        // command, two faces, converging on the inline pin editor. Scoped to
+        // the Tab because the gesture names a tab and the editor is tab chrome;
+        // the WRITE it eventually performs targets that tab's FOCUSED session.
+        // `LocalUi` (not `ConfigMutate`) for the same reason the control layer
+        // classifies `meta set` as `WriteInput`: nothing durable on disk moves.
+        M::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
     }
 }
@@ -224,6 +231,7 @@ pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpe
         ),
         K::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
         K::ToggleViMode => spec("terminal.vi.toggle", S::View, A::LocalUi, C::Terminal),
+        K::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
     }
 }
 

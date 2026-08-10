@@ -3105,8 +3105,26 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · macOS CoreText only; parsed and preserved but inert on other platforms"
         }
         crate::prefs::EDIT_MOTION => crate::prefs::motion_auto_help(),
-        crate::prefs::EDIT_TRAIL_SOUNDS | crate::prefs::EDIT_TRAIL_SOUND_VOLUME => {
+        // Every SYNTH voice shares the one macOS-only output path, so they share
+        // one platform caveat. Grown with the Sound menu: these keys are now
+        // reachable from Settings, so Manual must state the same limit the panel
+        // discloses rather than only doing so for the master and the volume.
+        crate::prefs::EDIT_TRAIL_SOUNDS
+        | crate::prefs::EDIT_TRAIL_SOUND_VOLUME
+        | crate::prefs::EDIT_TONE_MELODY
+        | crate::prefs::EDIT_TRAIL_SOUND_BED => {
             " · audio playback is macOS-only; parsed and preserved but inert on other platforms"
+        }
+        crate::prefs::EDIT_TRAIL_SOUND_RIFF => {
+            " · quiets only the held-key sing-along song; its ribbon, star shower and dancing cat keep running · subordinate to trail_sounds and trail_sound_volume · audio playback is macOS-only"
+        }
+        // The BEL is the one sound trail_sound_volume does NOT reach — say so
+        // where a Manual author is looking for the level control.
+        crate::prefs::EDIT_BELL_SOUND => {
+            " · the OS alert sound (macOS NSBeep / Windows MessageBeep), so trail_sound_volume does not scale it · false keeps the visual bell flash and the urgent-window request · other platforms emit no beep"
+        }
+        crate::prefs::EDIT_SPARKLE_BONK | crate::prefs::EDIT_SPARKLE_BONK_DETONATION => {
+            " · scaled by trail_sound_volume and silent with the window unfocused, reduced motion, or the sparkle-words master off · audio playback is macOS-only"
         }
         crate::prefs::EDIT_CURSOR_TRAIL_BLOOM
         | crate::prefs::EDIT_CURSOR_TRAIL_BLOOM_STRENGTH

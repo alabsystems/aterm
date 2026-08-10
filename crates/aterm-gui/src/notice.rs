@@ -146,7 +146,12 @@ impl TransientNotice {
     }
 
     /// The pill caption.
-    fn text(&self) -> String {
+    ///
+    /// `pub(crate)` so update-lane tests can pin the exact user-facing string a
+    /// scheduling state produces — the wording IS the contract there ("it comes
+    /// back by itself" vs "go press something"), and asserting on it is the only
+    /// way a predicate that silently flips has to fail.
+    pub(crate) fn text(&self) -> String {
         match &self.kind {
             // A staged build can share the running build's display version (the
             // updater orders by build number — see `menu::staged_apply_label`), so
@@ -166,6 +171,40 @@ impl TransientNotice {
     }
 }
 
+/// Horizontal breathing room between the pill's edge and its caption.
+const PAD_X_CELLS: f32 = 0.9;
+
+/// The caption, shortened with a trailing ellipsis until it fits `max_w`.
+///
+/// [`notice_rect`] CAPS the pill at the tray width, but the caption was still
+/// laid out at its NATURAL width and centred inside that cap, so any status
+/// longer than the window overflowed symmetrically and lost characters off BOTH
+/// ends — the accent marker glyph first, then the action at the end. On a narrow
+/// window "↑ Update waiting — retries on its own, or use the Version menu"
+/// painted as a fragment from the middle. A status the user can read the start
+/// of beats a wider one they cannot: eliding from the tail keeps the marker and
+/// the state, which are what the pill exists to say.
+fn caption_fitted(text: &str, max_w: f32, px: f32) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    if text_w(text, px) <= max_w {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let mut candidate: String = chars.iter().collect();
+        candidate.push('\u{2026}');
+        if text_w(&candidate, px) <= max_w {
+            return candidate;
+        }
+    }
+    // Even one ellipsis overflows: the pill is narrower than a glyph. Painting
+    // nothing is the only honest option left, and the panel still shows.
+    String::new()
+}
+
 /// The pill rect `(x, y, w, h)` in tray px — where [`notice_tray`] draws it and where a
 /// click on an `UpdateReady` notice is tested.
 pub(crate) fn notice_rect(n: &TransientNotice, g: &SettingsGeom) -> (f32, f32, f32, f32) {
@@ -173,7 +212,7 @@ pub(crate) fn notice_rect(n: &TransientNotice, g: &SettingsGeom) -> (f32, f32, f
     let tray_w = g.cols as f32 * cw;
     let size = (px * 0.82).max(11.0);
     let tw = text_w(&n.text(), size);
-    let pad_x = 0.9 * cw;
+    let pad_x = PAD_X_CELLS * cw;
     let pill_w = (tw + 2.0 * pad_x).min(tray_w - 2.0 * cw);
     let pill_h = size + 0.7 * ch;
     // Top-centre, a little below the first row so it clears the toolbar/tab strip.
@@ -237,9 +276,12 @@ pub(crate) fn notice_tray(
         color: rgba(accent, sa(0xC0)),
     });
     // Caption: the leading glyph takes the accent/cursor colour, the words stay primary.
-    let cap = n.text();
     // Caption step (px*0.82 snaps to the 0.8 Caption factor), floored at 11px.
     let size = TypeStep::Caption.px_clamped(px, 11.0, f32::INFINITY);
+    // Elide to the pill's INNER width. `notice_rect` already clamped the pill to
+    // the tray, so without this the text is centred at its natural width and
+    // bleeds out of both ends on a narrow window.
+    let cap = caption_fitted(&n.text(), w - 2.0 * PAD_X_CELLS * g.cw, size.get());
     let tx = x + (w - text_w(&cap, size.get())) * 0.5;
     let base = row_baseline(y, h, size.get());
     // Split the leading marker glyph so it can be accent-coloured.
@@ -344,5 +386,77 @@ mod tests {
         let (x, _, w, _) = notice_rect(&n, &g);
         let tray_w = g.cols as f32 * g.cw;
         assert!(x >= 0.0 && x + w <= tray_w, "pill fits within the tray");
+    }
+
+    /// A LONG STATUS MUST STILL BE READABLE ON A NARROW WINDOW.
+    ///
+    /// The pill is clamped to the tray, but the caption used to be centred at
+    /// its natural width inside that clamp, so it bled out of BOTH ends and the
+    /// user lost the accent marker and the trailing advice. The automatic-update
+    /// statuses are the longest captions this widget carries, so they are what
+    /// this asserts with.
+    #[test]
+    fn a_long_status_caption_is_elided_into_the_pill_instead_of_bleeding_out() {
+        let now = t0();
+        let long = "\u{2191} Update waiting \u{2014} retries on its own, or use the Version menu";
+        // 20 columns is the narrow end this widget has to survive.
+        let narrow = SettingsGeom {
+            cols: 20,
+            ..geom()
+        };
+        let size = crate::type_scale::TypeStep::Caption
+            .px_clamped(narrow.font_px, 11.0, f32::INFINITY);
+        // PRECONDITION: without elision this caption genuinely does NOT fit, so a
+        // pass below is about the fix and not about a caption that was short.
+        let inner =
+            (narrow.cols as f32 * narrow.cw) - 2.0 * narrow.cw - 2.0 * PAD_X_CELLS * narrow.cw;
+        assert!(
+            text_w(long, size.get()) > inner,
+            "the fixture caption must overflow a 20-column tray or this proves nothing"
+        );
+
+        let n = TransientNotice::update_status(long, now);
+        let (x, _, w, _) = notice_rect(&n, &narrow);
+        let t = notice_tray(&n, &narrow, Theme::default(), [0, 255, 0], now);
+        let painted = t
+            .prims
+            .iter()
+            .filter_map(|p| match p {
+                DrawPrim::Text { s, x, .. } => Some((s.clone(), *x)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!painted.is_empty(), "the caption is still painted");
+        let leftmost = painted
+            .iter()
+            .map(|(_, tx)| *tx)
+            .fold(f32::INFINITY, f32::min);
+        let total_w = painted
+            .iter()
+            .map(|(s, _)| text_w(s, size.get()))
+            .sum::<f32>();
+        assert!(
+            leftmost >= x,
+            "the caption starts inside the pill ({leftmost} < {x})"
+        );
+        assert!(
+            leftmost + total_w <= x + w + 0.5,
+            "the caption ends inside the pill"
+        );
+        // The marker the accent colour is applied to must survive the elision —
+        // it is the first thing dropped when the text bleeds off the left.
+        assert!(
+            painted.iter().any(|(s, _)| s.contains('\u{2191}')),
+            "the leading marker glyph is still painted"
+        );
+    }
+
+    #[test]
+    fn caption_fitting_is_a_no_op_when_the_text_already_fits() {
+        let short = "\u{2191} Ready";
+        assert_eq!(caption_fitted(short, 10_000.0, 12.0), short);
+        // Degenerate widths never panic and never return junk.
+        assert_eq!(caption_fitted(short, 0.0, 12.0), "");
+        assert_eq!(caption_fitted(short, -5.0, 12.0), "");
     }
 }

@@ -7735,10 +7735,17 @@ mod tests {
             // "Trail effect", the serious-mode master policy gets its own box,
             // colour identity + the sprite get "Trail color", the GPU light
             // knobs "Light & GPU", and M2 stream fade closes.
+            //
+            // "Sound" opens right after "Trail effect" (owner ask: "add the
+            // volume and SFX menu to settings" — ONE coherent box holding the
+            // master volume slider and every SFX toggle, instead of sound rows
+            // scattered through the trail box and, for the bonk, a different
+            // pane entirely).
             [
                 "Cursor",
                 "Effect policy",
                 "Trail effect",
+                "Sound",
                 "Motion",
                 "Trail color",
                 "Light & GPU",
@@ -7815,9 +7822,18 @@ mod tests {
         assert_eq!(&controls[..head.len()], head);
         // The decorative nested tables close the pane: every sparkle-words leaf
         // then every matrix-rain leaf, in NESTED_LEAVES (registry) order.
+        //
+        // The section filter is not decoration: the two BONK leaves are
+        // `sparkle_words.` keys that now route to the Sound menu on the Cursor
+        // pane, so a prefix-only expectation would demand them back here. Asking
+        // `section_of` keeps this test honest against the router rather than
+        // hard-coding which leaves left.
         let expected_tail: Vec<&str> = prefs::NESTED_LEAVES
             .iter()
-            .filter(|l| l.key.starts_with("sparkle_words."))
+            .filter(|l| {
+                l.key.starts_with("sparkle_words.")
+                    && prefs::section_of(l.key) == prefs::Section::Appearance
+            })
             .chain(
                 prefs::NESTED_LEAVES
                     .iter()
@@ -7840,6 +7856,116 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, GroupRow::Footnote(n) if n.contains("theme's color")))
         );
+    }
+
+    /// THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
+    ///
+    /// Non-vacuous by construction: it asserts its own precondition — that the
+    /// registry actually still holds every audible key — before asserting they
+    /// paint as ONE consecutive run under ONE "Sound" caption. If a future key
+    /// is dropped from the registry the first block fails loudly instead of the
+    /// grouping check passing over a shorter list.
+    #[test]
+    fn every_audible_key_paints_in_one_sound_box() {
+        use std::collections::BTreeSet;
+        let s = SettingsState::from_config(&cfg());
+
+        // Precondition: each Sound-menu key is a real, reachable registry row.
+        for key in prefs::SOUND_MENU_KEYS {
+            assert!(
+                s.fields.iter().any(|f| &f.key == key),
+                "{key} left the registry; the Sound menu would silently shrink"
+            );
+        }
+        assert!(
+            prefs::SOUND_MENU_KEYS.len() >= 9,
+            "the Sound menu lost members: {:?}",
+            prefs::SOUND_MENU_KEYS
+        );
+
+        let rows = category_layout(&s.fields, prefs::Section::Cursor, usize::MAX);
+        // Walk the painted rows and collect the keys under the Sound caption,
+        // exactly as the pane draws them.
+        let mut caption: Option<&str> = None;
+        let mut in_sound: Vec<&str> = Vec::new();
+        let mut sound_captions = 0usize;
+        let mut elsewhere: Vec<&str> = Vec::new();
+        for row in &rows {
+            match row {
+                GroupRow::Caption(c) => {
+                    caption = Some(c);
+                    if *c == "Sound" {
+                        sound_captions += 1;
+                    }
+                }
+                GroupRow::Control(i) => {
+                    let key = s.fields[*i].key;
+                    if caption == Some("Sound") {
+                        in_sound.push(key);
+                    } else if prefs::SOUND_MENU_KEYS.contains(&key) {
+                        elsewhere.push(key);
+                    }
+                }
+                GroupRow::Footnote(_) | GroupRow::Gap => {}
+            }
+        }
+        assert_eq!(sound_captions, 1, "the Sound box must not be split in two");
+        assert!(
+            elsewhere.is_empty(),
+            "audible keys still scattered outside the Sound box: {elsewhere:?}"
+        );
+
+        // THE CENSUS IS SPELLED OUT, NOT DERIVED. Deriving it from
+        // `SOUND_MENU_KEYS` (filtered through the very `section_of` under test)
+        // would let a misrouted key vanish from both sides of the comparison and
+        // pass. These are the nine audible keys by name; the box holds exactly
+        // them, in this exact painted order.
+        assert_eq!(
+            in_sound,
+            [
+                // The master switch opens the box and the slider it scales
+                // follows it — the owner's "master volume slider plus the SFX
+                // toggles", in that order.
+                "trail_sounds",
+                "trail_sound_volume",
+                // …then one row per voice, coarse to fine.
+                "tone_melody",
+                "trail_sound_bed",
+                "trail_sound_style",
+                "trail_sound_riff",
+                "bell_sound",
+                // The `[sparkle_words]` leaves land last: nested leaves are
+                // registered after the top-level rows and keep build order.
+                "sparkle_words.profanity.bonk",
+                "sparkle_words.profanity.bonk_detonation",
+            ],
+            "the Sound box holds exactly the nine audible keys, in painted order"
+        );
+        // A duplicate would survive the set-shaped checks above, so compare
+        // lengths against the deduplicated view explicitly.
+        assert_eq!(
+            in_sound.len(),
+            in_sound.iter().copied().collect::<BTreeSet<_>>().len(),
+            "a key is painted into the Sound box twice: {in_sound:?}"
+        );
+        // …and the spelled-out census must agree with the routing list, or one
+        // of the two is stale.
+        assert_eq!(
+            in_sound.iter().copied().collect::<BTreeSet<_>>(),
+            prefs::SOUND_MENU_KEYS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            "SOUND_MENU_KEYS and the painted Sound box disagree"
+        );
+
+        // The box carries consequence copy: where the master lives (it is a Top
+        // Setting on the native surface, not a row here) and the one thing
+        // Volume does not reach.
+        let note = prefs::group_footnote("Sound").expect("the Sound box needs consequence copy");
+        assert!(note.contains("Music effects"), "{note}");
+        assert!(note.contains("Volume"), "{note}");
+        assert!(note.contains("bell"), "{note}");
     }
 
     /// The two-pane keyboard model's pure state (design §6): sidebar ↑↓ clamp over the

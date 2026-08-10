@@ -240,8 +240,57 @@ impl App {
                 if open_details {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
-                } else if self.native_updater_service.snapshot().staged.is_some() {
-                    self.surface_nonmodal_update_status("↑ Update paused — manual retry");
+                } else if let Some(staged_build) = self
+                    .native_updater_service
+                    .snapshot()
+                    .staged
+                    .as_ref()
+                    .map(|staged| staged.build)
+                {
+                    // "Update paused — manual retry" named a mechanism, not an
+                    // action: there is no "retry" control anywhere in the UI, so a
+                    // user who read it had nothing to click. Worse, it was flatly
+                    // wrong half the time — a physical handoff failure inside its
+                    // budget schedules another automatic attempt, and this arm
+                    // claimed the automatic lane had given up.
+                    //
+                    // WHICH ANSWER IS TRUE IS A QUESTION ABOUT SCHEDULING STATE,
+                    // so ask every carrier of it rather than one. There are two —
+                    // a live `auto_apply_intent` (this failure did not consume it;
+                    // a control-request apply, for one, leaves it armed) and a
+                    // manual-only latch carrying a lapse deadline — and either
+                    // means a wake is already folded into the event loop. Both
+                    // must name THIS staged artifact, because a leftover for a
+                    // superseded build schedules nothing for the one on screen,
+                    // and automatic apply must actually be enabled or the lapse
+                    // would re-arm into a poll that answers `Clear`.
+                    let retry_scheduled = crate::app_config::update_auto_apply(&self.config)
+                        && (self
+                            .auto_apply_intent
+                            .is_some_and(|intent| intent.build == staged_build)
+                            || self.auto_apply_manual_only.is_some_and(|manual| {
+                                manual.build == staged_build && manual.retry_at.is_some()
+                            }));
+                    if retry_scheduled {
+                        // …AND A SCHEDULED RETRY IS NOT AUTOMATICALLY WORTH A PILL.
+                        // The physical lane may spend nine attempts before it gives
+                        // up, so painting this on every one of them is a pill every
+                        // ~40 minutes for most of a day — describing a state whose
+                        // only honest advice is "wait", which the user is already
+                        // doing. Owner instruction: do not notify on a schedule for
+                        // a failure that is not going to fix itself. So the first
+                        // failure for an artifact speaks and the rest are quiet;
+                        // the log line above still records every one, and the
+                        // moment the lane genuinely runs out the `else` below fires
+                        // once with a control the user can press.
+                        if self.physical_failure_deserves_a_pill(staged_build) {
+                            self.surface_nonmodal_update_status(
+                                "↑ Update delayed — retries on its own",
+                            );
+                        }
+                    } else {
+                        self.surface_nonmodal_update_status("↑ Update paused — see Version menu");
+                    }
                 } else {
                     // A retired/consumed artifact is not "still ready". Keep the
                     // status honest while the native Settings reducer carries detail.
@@ -500,6 +549,248 @@ mod tests {
                 if state.route == crate::native_settings::SettingsRoute::SoftwareUpdate
         ));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stage one strictly-newer build through the REAL check reducer, so the
+    /// snapshot the pill predicate reads is the one production reads.
+    fn stage_one_build(app: &mut App) -> u64 {
+        let current_build = app.native_updater_service.snapshot().current_build;
+        let build = current_build + 1;
+        let CheckStart::Start(ticket) = app.native_updater_service.request_check() else {
+            panic!("a fresh service must start exactly one check");
+        };
+        assert_eq!(
+            app.native_updater_service.finish_check(
+                ticket,
+                crate::native_updater_service::DurableUpdateStatus {
+                    enabled: true,
+                    current_build,
+                    staged_build: Some(build),
+                    staged_version: Some(format!("1.0.{build}")),
+                    staged_commit: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+                    staged_dmg_sha256: Some("ab".repeat(32)),
+                    changelog: None,
+                    outcome: "staged".to_string(),
+                    failing_checks: 0,
+                },
+            ),
+            crate::native_updater_service::CheckCompletion::Reduced,
+            "PRECONDITION: the check must reduce, or nothing is staged and the \
+             predicate under test is never reached"
+        );
+        build
+    }
+
+    /// THE PILL MUST NOT ASSERT THE PESSIMISTIC ANSWER WHEN A RETRY IS ALREADY
+    /// SCHEDULED.
+    ///
+    /// "Update paused — manual retry" named a mechanism, not an action (there is
+    /// no "retry" control in the UI), and it was flatly wrong half the time: a
+    /// physical handoff failure inside its budget schedules another automatic
+    /// attempt, and this arm claimed the lane had given up. Which answer is true
+    /// is a question about SCHEDULING STATE, so every carrier of it is consulted —
+    /// a live intent, or a latch with a deadline — and each must name THIS staged
+    /// artifact.
+    ///
+    /// The user-facing strings are the assertion, because they are the contract.
+    #[test]
+    fn the_failure_pill_says_retrying_only_when_a_retry_is_actually_scheduled() {
+        let mut app = App::headless_for_test();
+        assert!(
+            crate::app_config::update_auto_apply(&app.config),
+            "PRECONDITION: the predicate requires the automatic lane enabled, and \
+             the shipped default is ON"
+        );
+        let build = stage_one_build(&mut app);
+        let failed = || UpdateOutcome::Failed {
+            message: "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+        };
+        let pill = |app: &App| {
+            app.notice
+                .as_ref()
+                .map(crate::notice::TransientNotice::text)
+                .expect("this case must paint a pill; silence is checked directly")
+        };
+
+        // NOTHING SCHEDULED: no intent, no latch. The honest answer is that the
+        // user has to reach for the control.
+        app.auto_apply_intent = None;
+        app.auto_apply_manual_only = None;
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update paused — see Version menu");
+
+        // A LIVE INTENT for this artifact: a wake is already folded into the event
+        // loop, so telling the user to act would be false.
+        app.auto_apply_intent = Some(crate::AutoApplyIntent {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
+            attempts: 0,
+            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update delayed — retries on its own");
+
+        // A LEFTOVER intent for a SUPERSEDED build schedules nothing for the
+        // artifact on screen, so it must not borrow the optimistic answer.
+        app.auto_apply_intent = Some(crate::AutoApplyIntent {
+            build: build + 7,
+            dmg_sha256: [0xab; 32],
+            retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
+            attempts: 0,
+            apply_by: std::time::Instant::now() + std::time::Duration::from_secs(600),
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update paused — see Version menu");
+
+        // A LATCH WITH A DEADLINE is the other carrier: the lane is standing down
+        // but `about_to_wait` will lapse it, so it does come back on its own.
+        app.auto_apply_intent = None;
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update delayed — retries on its own");
+
+        // A DEADLINE-LESS latch (the policy-mismatch fail-safe) genuinely does not
+        // come back by itself. This is the case the old wording described, and the
+        // only one it was ever right about.
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: None,
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update paused — see Version menu");
+
+        // …AND A SCHEDULED RETRY IS STILL NOT AUTOMATICALLY A PILL. The physical
+        // lane can spend nine attempts before it gives up; repeating "retries on
+        // its own" on each of them is a notification every ~40 minutes for most of
+        // a day, about a state whose only advice is "wait". The first failure for
+        // an artifact speaks; the rest are silent. (Convergence is not silent — it
+        // clears `retry_at`, which is the deadline-less case two blocks up.)
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+        });
+        for (cycles, expected) in [
+            (1_u8, Some("↑ Update delayed — retries on its own")),
+            (2, None),
+            (5, None),
+            (8, None),
+        ] {
+            app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+                build,
+                dmg_sha256: [0xab; 32],
+                cycles,
+                last_attempt: std::time::Instant::now(),
+            });
+            app.notice = None;
+            app.surface_update_apply_outcome("automatic handoff", failed(), false);
+            assert_eq!(
+                app.notice
+                    .as_ref()
+                    .map(crate::notice::TransientNotice::text)
+                    .as_deref(),
+                expected,
+                "physical failure {cycles} for this artifact"
+            );
+        }
+        // A record for a DIFFERENT artifact says nothing about this one, so the
+        // suppression must not leak across builds.
+        app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+            build: build + 7,
+            dmg_sha256: [0xab; 32],
+            cycles: 8,
+            last_attempt: std::time::Instant::now(),
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic handoff", failed(), false);
+        assert_eq!(pill(&app), "↑ Update delayed — retries on its own");
+
+        // AND A PERSON IS NEVER SILENCED BY THE AUTOMATIC LANE'S BUDGET.
+        //
+        // THIS BLOCK USED TO REST ON A FALSE PREMISE AND PASS ANYWAY. It asserted
+        // that a person's lane "spends nothing", and then proved it by HAND-SETTING
+        // a record 600 s old and calling the surfacing function directly — a fixture
+        // that is stale by construction, so the pill was guaranteed whether or not a
+        // person's failure charged the budget. It did charge it: the returned-handoff
+        // completion dropped the attempt's `ApplyMode`, so a Version-menu apply that
+        // failed physically spent `auto_apply_physical_retry` MICROSECONDS before
+        // surfacing — landing inside the freshness window this predicate uses to
+        // recognise the automatic lane's own quiet retries, and silencing the one
+        // person who had just asked for the update.
+        //
+        // So the premise is now DRIVEN: a real person-initiated returned handoff,
+        // through the same call the completion path's `(Some(attempt), None)` arm
+        // makes, followed by the real surfacing. The inherited record is mid-budget
+        // and 600 s old — the physical schedule's own MINIMUM spacing, so it is the
+        // freshest record the automatic lane can leave behind between attempts — and
+        // both assertions below fail if the person's failure re-stamps it.
+        let manual_ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            "0123456789abcdef0123456789abcdef01234567",
+            &"ab".repeat(32),
+        );
+        manual_ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        app.auto_apply_physical_retry = Some(crate::AutoOverlapRetry {
+            build,
+            dmg_sha256: [0xab; 32],
+            cycles: 5,
+            last_attempt: std::time::Instant::now() - std::time::Duration::from_secs(600),
+        });
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+        });
+        app.notice = None;
+        let person = app.abort_reaped_native_apply_before_reconcile(
+            &manual_ticket,
+            "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            crate::app_native::HandoffFailureLane::Manual,
+        );
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(5),
+            "a person's failure must not spend the automatic lane's budget — that \
+             is how three clicks on a bad afternoon converged the background lane"
+        );
+        app.surface_update_apply_outcome("manual handoff", person, false);
+        assert_eq!(
+            pill(&app),
+            "↑ Update delayed — retries on its own",
+            "whoever just asked for the update is exactly who must be told it did \
+             not happen; the automatic lane's mid-budget silence is not theirs"
+        );
+        app.auto_apply_physical_retry = None;
+
+        // TURNING THE LANE OFF makes every scheduling carrier moot: a lapse would
+        // only re-arm into a poll that answers `Clear`.
+        app.config.update = Some(crate::app_config::UpdateConfig {
+            auto_apply: Some(false),
+            ..app.config.update.clone().unwrap_or_default()
+        });
+        assert!(
+            !crate::app_config::update_auto_apply(&app.config),
+            "PRECONDITION: the opt-out actually took"
+        );
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            build,
+            dmg_sha256: [0xab; 32],
+            retry_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+        });
+        app.notice = None;
+        app.surface_update_apply_outcome("automatic", failed(), false);
+        assert_eq!(pill(&app), "↑ Update paused — see Version menu");
     }
 
     #[test]

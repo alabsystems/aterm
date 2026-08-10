@@ -901,6 +901,60 @@ fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<
     (raw_focused && configured && volume > 0.0).then_some(volume)
 }
 
+/// Resolve SING-ALONG RIFF audio policy: the trail-sound law verbatim
+/// ([`trail_sound_gain`]) AND the riff's own switch.
+///
+/// `trail_sound_riff` (owner ask, Sound menu audit; default ON) exists because
+/// the held-key riff is the LOUDEST voice the engine emits and until now the
+/// only ways to quiet it were the master `trail_sounds` (which also kills the
+/// keystroke palette the owner wants to keep) or `trail_sound_volume` (which
+/// turns the keystrokes down with it). It is a SOUND gate only — the
+/// celebration's ribbon saturation, star shower, dancing cat and singing face
+/// are a MOTION contract and keep running, which is why this resolves a GAIN
+/// rather than suppressing the celebration.
+///
+/// ONE author for that law across BOTH riff seams (the single-pane present and
+/// the split-pane compose) — the same reason `trail_sound_gain` and
+/// `bonk_sound_gain` are functions: a split pane must never sing a song a
+/// single pane suppresses.
+fn sing_riff_gain(raw_focused: bool, trail_sounds: bool, riff: bool, volume: f32) -> Option<f32> {
+    trail_sound_gain(raw_focused, trail_sounds && riff, volume)
+}
+
+#[cfg(test)]
+mod sing_riff_gain_tests {
+    use super::sing_riff_gain;
+
+    /// The riff's own switch is INDEPENDENT of the trail-sound master: with the
+    /// master on, the window focused and the volume up — the shipped default
+    /// posture, asserted here as this test's own precondition so the `None`
+    /// cases below cannot pass vacuously — flipping `trail_sound_riff` off is
+    /// the single change that silences the song.
+    #[test]
+    fn the_riff_switch_alone_silences_the_song_under_shipped_defaults() {
+        assert_eq!(
+            sing_riff_gain(true, true, true, 0.4),
+            Some(0.4),
+            "precondition: the shipped default posture must actually sing",
+        );
+        assert_eq!(
+            sing_riff_gain(true, true, false, 0.4),
+            None,
+            "trail_sound_riff = false must silence the riff on its own",
+        );
+    }
+
+    /// Every OTHER term of the trail-sound law still applies to the riff, so
+    /// the new switch cannot be read as a bypass. Each case flips exactly one
+    /// term away from the singing precondition above.
+    #[test]
+    fn the_riff_stays_subordinate_to_focus_master_and_volume() {
+        assert_eq!(sing_riff_gain(false, true, true, 0.4), None, "raw focus");
+        assert_eq!(sing_riff_gain(true, false, true, 0.4), None, "trail_sounds");
+        assert_eq!(sing_riff_gain(true, true, true, 0.0), None, "volume");
+    }
+}
+
 /// The per-event trail-audio POLICY the host resolves once per drain and
 /// stamps on every emitted [`SoundEvent`] — the knobs ride together so the
 /// synth stays policy-free.
@@ -959,19 +1013,44 @@ fn drain_trail_sound_cues(
     emitted
 }
 
-/// Resolve curse-BONK policy — the profanity `bonk` knob, RAW window focus
-/// (the trail-sound law verbatim: a background recording may animate, it must
-/// never make the Mac speak), the motion policy (a Reduced window pushes no
-/// events, matching the glow engine's intensity-0 silence), and the shared
-/// `trail_sound_volume`. Per-class/master sparkle gates need no re-check: the
-/// engine records cues only for words it is actually decorating.
+/// Resolve curse-BONK policy — the MASTER music switch (`trail_sounds`), the
+/// profanity `bonk` knob, RAW window focus (the trail-sound law verbatim: a
+/// background recording may animate, it must never make the Mac speak), the
+/// motion policy (a Reduced window pushes no events, matching the glow
+/// engine's intensity-0 silence), and the shared `trail_sound_volume`.
+/// Per-class/master SPARKLE gates need no re-check: the engine records cues
+/// only for words it is actually decorating.
+///
+/// THE MASTER TERM IS THE FIX FOR A LIE THE UI WAS TELLING. The Sound box's
+/// consequence copy (`prefs::group_footnote`, "Sound") promises that *"Music
+/// effects in Top Settings is the master switch for the synth voices"*, and
+/// the bonk IS a synth voice — it is pushed into the same
+/// [`crate::trail_audio::TrailAudio`] host, as a
+/// [`aterm_effects::trail_sound::WordGesture::Bonk`], and it is already scaled
+/// by the same `trail_sound_volume`. Until this parameter existed the function
+/// took no `trail_sounds` input at all and both render paths passed only the
+/// profanity toggle, so muting Music effects and typing profanity still bonked
+/// — the one voice that escaped the switch the menu names. The honest law is
+/// the one the UI already promises: the master gates EVERY synth voice, and
+/// the terminal bell (an OS alert sound emitted from `lib.rs::on_bell`, which
+/// reads neither key) remains the single stated exception.
+///
+/// Delegating the focus/master/volume terms to [`trail_sound_gain`] keeps that
+/// law authored ONCE — the same reason [`sing_riff_gain`] delegates — so the
+/// bonk cannot drift away from the riff and the keystroke palette again.
 fn bonk_sound_gain(
     raw_focused: bool,
+    trail_sounds: bool,
     enabled: bool,
     reduced_motion: bool,
     volume: f32,
 ) -> Option<f32> {
-    (raw_focused && enabled && !reduced_motion && volume > 0.0).then_some(volume)
+    // The bonk's ONE extra term over the shared law: a Reduced-motion window
+    // renders no wince, so it must not clash either.
+    if reduced_motion {
+        return None;
+    }
+    trail_sound_gain(raw_focused, trail_sounds && enabled, volume)
 }
 
 /// Drain every curse-BONK cue the word-decoration tick recorded and emit the
@@ -1062,20 +1141,57 @@ mod curse_bonk_drain_tests {
 
     use super::{bonk_sound_gain, drain_curse_bonk_cues};
 
-    /// The policy resolver: raw focus, the bonk knob, the reduced-motion
-    /// demotion, and the shared volume each silence independently; the
-    /// survivor passes the volume through as the event gain.
+    /// The policy resolver: the MASTER music switch, raw focus, the bonk knob,
+    /// the reduced-motion demotion, and the shared volume each silence
+    /// independently; the survivor passes the volume through as the event
+    /// gain. Every `None` case below flips exactly ONE term away from the
+    /// audible precondition, so none of them can pass vacuously.
     #[test]
-    fn bonk_gain_policy_gates_focus_knob_motion_and_volume() {
-        assert_eq!(bonk_sound_gain(true, true, false, 0.4), Some(0.4));
-        assert_eq!(bonk_sound_gain(false, true, false, 0.4), None, "raw focus");
-        assert_eq!(bonk_sound_gain(true, false, false, 0.4), None, "bonk knob");
+    fn bonk_gain_policy_gates_master_focus_knob_motion_and_volume() {
         assert_eq!(
-            bonk_sound_gain(true, true, true, 0.4),
+            bonk_sound_gain(true, true, true, false, 0.4),
+            Some(0.4),
+            "precondition: the shipped posture must actually bonk",
+        );
+        assert_eq!(
+            bonk_sound_gain(false, true, true, false, 0.4),
+            None,
+            "raw focus"
+        );
+        assert_eq!(
+            bonk_sound_gain(true, true, false, false, 0.4),
+            None,
+            "bonk knob"
+        );
+        assert_eq!(
+            bonk_sound_gain(true, true, true, true, 0.4),
             None,
             "reduced motion"
         );
-        assert_eq!(bonk_sound_gain(true, true, false, 0.0), None, "zero volume");
+        assert_eq!(
+            bonk_sound_gain(true, true, true, false, 0.0),
+            None,
+            "zero volume"
+        );
+    }
+
+    /// THE MENU'S OWN PROMISE, as a law rather than as prose: *"Music effects
+    /// in Top Settings is the master switch for the synth voices"*
+    /// (`prefs::group_footnote`, "Sound"). Turning Music effects OFF while the
+    /// Curse bonk knob stays ON — the exact posture a user who wants silence
+    /// leaves the app in — must resolve to silence.
+    ///
+    /// This is the case the shipped code got wrong: `bonk_sound_gain` had no
+    /// master input at all, so the bonk was audible with Music effects off.
+    /// Asserted with the knob deliberately left ON so it cannot pass because
+    /// something ELSE muted the voice.
+    #[test]
+    fn music_effects_off_silences_the_bonk_even_with_the_knob_on() {
+        assert_eq!(
+            bonk_sound_gain(true, false, true, false, 0.4),
+            None,
+            "Music effects off must silence the bonk with the knob still on",
+        );
     }
 
     /// The RESIZE QUIET law: a window inside [`crate::RESIZE_SOUND_QUIET`] of
@@ -1133,6 +1249,10 @@ mod curse_bonk_drain_tests {
         let typed_curse = |wd: &mut WordDecorations, now: Instant| {
             let mut term = Terminal::new(4, 32);
             term.process(b"fuck");
+            // TYPED means a committed key, not just a caret parked one past the
+            // token — a scrolling build log leaves the caret there too, and this
+            // seam makes a SOUND. The engine's typed witness now demands both.
+            wd.note_typed_edit(now, None);
             wd.rescan(&term, 4, 32, &lex, &cfg, 1, now);
             tick(wd, now);
         };
@@ -1192,6 +1312,80 @@ mod curse_bonk_drain_tests {
             |_| panic!("the muted frame's cue must not backlog into the unmute"),
         );
         assert_eq!(drained, super::CurseDrain::default());
+    }
+
+    /// THE MENU'S PROMISE, END TO END over a real typed curse: with the Curse
+    /// bonk knob ON, the window focused, full motion and the volume up — the
+    /// shipped default posture, asserted first so the negative below cannot
+    /// pass vacuously — flipping ONLY `trail_sounds` (the "Music effects" Top
+    /// Setting) must take the sound off while leaving the on-screen wince
+    /// exactly where it was.
+    ///
+    /// Deliberately routed through the REAL [`bonk_sound_gain`] and the REAL
+    /// [`drain_curse_bonk_cues`] rather than through a hand-picked `None`
+    /// gain: the defect this pins was a MISSING ARGUMENT, and a test that
+    /// hands the drain its own answer cannot see one.
+    #[test]
+    fn music_effects_off_drops_a_real_typed_curse_but_keeps_the_wince() {
+        let cfg = crate::app_config::Config::default()
+            .sparkle_deco_config()
+            .expect("defaults enable sparkle words");
+        let lex = Lexicon::with_languages(&["en"]);
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 4,
+            cols: 32,
+        };
+        let t0 = Instant::now();
+        let style = crate::cursor_glow::GlowStyle::RainbowKitty;
+        let typed_curse = |now: Instant| {
+            let mut wd = WordDecorations::default();
+            let mut term = Terminal::new(4, 32);
+            term.process(b"fuck");
+            wd.note_typed_edit(now, None);
+            wd.rescan(&term, 4, 32, &lex, &cfg, 1, now);
+            let (mut o, mut i, mut f, mut n) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            wd.tick(
+                now, &cfg, geom, None, None, true, &mut o, &mut i, &mut f, &mut n,
+            );
+            wd
+        };
+        // The whole policy vector, with only the master differing between the
+        // two runs: focused, knob on, full motion, audible volume.
+        let drain_with_master = |master: bool, emit: &mut dyn FnMut(_)| {
+            let mut wd = typed_curse(t0);
+            drain_curse_bonk_cues(
+                &mut wd,
+                style,
+                SoundVoice::Style,
+                geom.cols,
+                bonk_sound_gain(true, master, true, false, 0.4),
+                false,
+                emit,
+            )
+        };
+
+        let mut heard = Vec::new();
+        let audible = drain_with_master(true, &mut |ev| heard.push(ev));
+        assert_eq!(
+            audible.emitted, 1,
+            "PRECONDITION: with Music effects ON this posture really bonks",
+        );
+        assert_eq!(heard.len(), 1);
+        assert_eq!(heard[0].kind, SoundGesture::Words(WordGesture::Bonk));
+
+        let muted = drain_with_master(false, &mut |_| {
+            panic!("Music effects OFF must not push a single bonk event")
+        });
+        assert_eq!(
+            muted.emitted, 0,
+            "the master switch the Sound menu names must reach the bonk",
+        );
+        assert_eq!(
+            muted.wince_hits, audible.wince_hits,
+            "and it is a SOUND gate only: the on-screen wince is unchanged",
+        );
     }
 }
 
@@ -1263,6 +1457,239 @@ enum SuccessfulPresentRoute {
 pub(crate) struct HostVisualState {
     pub(crate) invert: bool,
     pub(crate) overlay: Option<OverlayGlow>,
+}
+
+/// THE TYPED-KITTY CAMEO on a SINGLE-PANE present — the unsplit twin of
+/// [`App::compose_typed_cameo`], and the reason this is a named function rather
+/// than four lines inline: the pane scope it resolves is the whole point, and
+/// it has to be reachable by a test.
+///
+/// `front_session` is the session whose grid this frame is drawing. The cameo
+/// is emitted ONLY for it.
+///
+/// THE BUG THIS EXISTS TO CLOSE (skeptic's finding, 2026-08-09): the summon
+/// tags every cameo with the session the keystroke landed in
+/// (`App::summon_typed_kitty` passes `Some(session)`), but this renderer used
+/// to pass `None` — and `None` is a WILDCARD in
+/// [`aterm_effects::kitty_cameo::KittyCameo::frame_in_pane`], meaning "any
+/// cameo may draw here". `WordDecorations` is per-WINDOW, not per-tab, and a
+/// tab switch retires nothing, so typing `kitty` in tab A and immediately
+/// selecting tab B teleported the five-second toy onto tab B's grid at tab A's
+/// caret cell. Naming the front session turns the wildcard into an identity
+/// check, so the toy stays in the tab it was summoned in and reappears there
+/// (still bounded by its own clock) if the user switches back inside its life.
+///
+/// The composed path never had this bug — it resolves the pane from the
+/// cameo's OWN tag and draws nothing when that pane is absent from the active
+/// tab's layout — which is exactly the law this brings the unsplit path to.
+///
+/// Returns the frame-fingerprint contribution (0 when nothing was drawn), so a
+/// cameo-free frame stays byte-identical.
+fn present_typed_cameo(
+    ws: &mut WindowState,
+    geom: aterm_effects::word_decorations::EffectGeom,
+    now: Instant,
+    front_session: u64,
+    default_bg: u32,
+    cursor_color: u32,
+    accent: u32,
+) -> u64 {
+    // The scope, authored once and in ONE place: this renderer draws exactly
+    // one session's grid, so it may only present that session's toy.
+    let pane = Some(front_session);
+    let Some(footprint) = ws.word_decos.kitty_cameo_footprint(geom, now, pane) else {
+        return 0;
+    };
+    let colors = cursor_cat_color_key(
+        &ws.input_scratch.cells,
+        geom,
+        footprint,
+        default_bg,
+        cursor_color,
+        accent,
+    );
+    ws.word_decos
+        .kitty_cameo(geom, now, pane, colors, &mut ws.free_scratch)
+        .map_or(0, |f| f.rotate_left(11))
+}
+
+#[cfg(test)]
+mod typed_cameo_scope_tests {
+    //! A TYPED CAMEO BELONGS TO THE SESSION IT WAS SUMMONED IN.
+    //!
+    //! `WordDecorations` — and with it the one live cameo — is per WINDOW, not
+    //! per tab, and a tab switch retires nothing. The only thing keeping one
+    //! tab's toy off another tab's glass is the pane scope the renderer names.
+
+    use std::time::Instant;
+
+    use super::present_typed_cameo;
+    use crate::{App, WindowId};
+
+    fn geom() -> aterm_effects::word_decorations::EffectGeom {
+        aterm_effects::word_decorations::EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    /// Emit for `session` and report how many free sprites landed.
+    fn present_for(app: &mut App, wid: WindowId, session: u64, now: Instant) -> (u64, usize) {
+        let ws = app.windows.get_mut(&wid).expect("window");
+        ws.free_scratch.clear();
+        let fp = present_typed_cameo(
+            ws,
+            geom(),
+            now,
+            session,
+            0x0000_0000,
+            0x00ff_ffff,
+            0x00ff_00ff,
+        );
+        (fp, ws.free_scratch.len())
+    }
+
+    /// THE OWNER-VISIBLE REPRO (skeptic's finding, 2026-08-09): type `kitty` in
+    /// tab A, immediately select tab B, and the five-second toy teleported onto
+    /// tab B at tab A's caret cell.
+    ///
+    /// Both halves are asserted from the SAME live cameo, one frame apart, so
+    /// the silence for tab B cannot come from the toy having expired, failed to
+    /// bake, or never been summoned — the tab A precondition rules each of
+    /// those out immediately before.
+    #[test]
+    fn a_cameo_summoned_in_one_tab_is_never_presented_for_another() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.recompute_sparkle();
+        let now = Instant::now();
+        let session_a = app.front_terminal(wid).expect("front terminal").session;
+        // The REAL input path, so the pane tag under test is the one the
+        // shipping summon actually stamps.
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                crate::input::InputEvent::Key {
+                    key: aterm_types::keyboard::Key::Character(c),
+                    mods: aterm_types::keyboard::Modifiers::empty(),
+                    base_layout: None,
+                    event_type: aterm_types::keyboard::KeyEventType::Press,
+                },
+                crate::input::Source::Human,
+            );
+        }
+
+        let (fp_a, sprites_a) = present_for(&mut app, wid, session_a, now);
+        assert!(
+            sprites_a > 0 && fp_a != 0,
+            "PRECONDITION: the summoning tab really presents the toy \
+             (sprites={sprites_a}, fp={fp_a})",
+        );
+
+        // A SECOND TAB, with its own session, made front exactly as ⌘T does.
+        let session_b = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(session_b));
+        assert_ne!(session_a, session_b);
+        assert_eq!(
+            app.front_terminal(wid).expect("front terminal").session,
+            session_b,
+            "PRECONDITION: the new tab is the one on glass now",
+        );
+        assert!(
+            app.windows[&wid]
+                .word_decos
+                .cameo_pane(now)
+                .expect("PRECONDITION: the cameo is still live — a tab switch retires nothing")
+                == Some(session_a),
+            "PRECONDITION: and it still names the tab it was typed in",
+        );
+
+        let (fp_b, sprites_b) = present_for(&mut app, wid, session_b, now);
+        assert_eq!(
+            sprites_b, 0,
+            "the toy must not follow the user into another terminal tab",
+        );
+        assert_eq!(fp_b, 0, "and it must contribute nothing to that tab's frame");
+
+        // …and switching BACK inside its life still finds it, so this is a
+        // scope, not a silent deletion.
+        let (fp_back, sprites_back) = present_for(&mut app, wid, session_a, now);
+        assert!(
+            sprites_back > 0 && fp_back != 0,
+            "the toy is scoped to its tab, not destroyed",
+        );
+    }
+
+    /// AND A TOY NOBODY CAN SEE MUST NOT HOLD THE WINDOW AT 60 fps.
+    ///
+    /// SKEPTIC'S SECOND-ROUND FINDING, 2026-08-09: the emitters were scoped but
+    /// the SCHEDULER was not. `WordDecorations::is_active` answered the
+    /// window-wide question "is a cameo animating", so a toy typed in tab A
+    /// kept `cursor_fx_active` true — and with it the whole terminal-effects
+    /// frame lane — for its full ~5.04 s while the user worked in tab B, where
+    /// both renderers correctly draw nothing. Real cost, zero pixels.
+    ///
+    /// The cameo is summoned through the ENGINE seam rather than the keyboard
+    /// deliberately: `drain_serious_effects` first parks every other latch this
+    /// predicate reads, and typing would recharge the glow and the trail, so
+    /// the lane's verdict would no longer be about the toy. (The input path's
+    /// own wiring is pinned by the test above.)
+    #[test]
+    fn a_cameo_in_a_hidden_tab_does_not_hold_the_effect_frame_lane() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.recompute_sparkle();
+        let now = Instant::now();
+        let session_a = app.front_terminal(wid).expect("front terminal").session;
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.focused = true;
+            ws.drain_serious_effects();
+            assert!(
+                !ws.cursor_fx_active(now, false),
+                "PRECONDITION: with every latch parked the lane is idle, so the \
+                 verdicts below are about the cameo and nothing else"
+            );
+            ws.word_decos.summon_cameo(
+                now,
+                (2, 3),
+                aterm_effects::kitty_registry::KittyLook::for_session(session_a),
+                Some(session_a),
+            );
+            assert!(
+                ws.cursor_fx_active(now, false),
+                "PRECONDITION: in its own tab the toy alone arms the lane"
+            );
+        }
+
+        let session_b = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(session_b));
+        assert_eq!(
+            app.front_terminal(wid).expect("front terminal").session,
+            session_b,
+            "PRECONDITION: the new tab is the one on glass now"
+        );
+        assert!(
+            app.windows[&wid]
+                .word_decos
+                .cameo_pane(now)
+                .is_some_and(|p| p == Some(session_a)),
+            "PRECONDITION: a tab switch retires nothing — the toy is still live \
+             and still names tab A"
+        );
+        assert!(
+            !app.windows[&wid].cursor_fx_active(now, false),
+            "a cameo no renderer will draw must not keep the window presenting"
+        );
+
+        app.switch_tab_in(wid, 0);
+        assert!(
+            app.windows[&wid].cursor_fx_active(now, false),
+            "…and coming back inside its life re-arms it: a scope, not a deletion"
+        );
+    }
 }
 
 fn acknowledge_successful_present(
@@ -11630,9 +12057,10 @@ impl App {
         // Settings receives its projection through the native app service.
         let kitty_log_on = self.kitty_log_enabled();
         // Curse-BONK policy, read before the `ws` borrow like the Kitty Log
-        // recorder gate (§F4.7): the profanity bonk knobs, the shared trail
-        // volume, and the active trail style (it keys the bonk's clash
-        // register to the melody actually playing).
+        // recorder gate (§F4.7): the MASTER music switch, the profanity bonk
+        // knobs, the shared trail volume, and the active trail style (it keys
+        // the bonk's clash register to the melody actually playing).
+        let bonk_master = self.config.trail_sounds_or_default();
         let bonk_enabled = self.curse_bonk_enabled();
         let bonk_detonations = self.curse_bonk_detonation_enabled();
         let bonk_volume = self.config.trail_sound_volume();
@@ -11669,6 +12097,24 @@ impl App {
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
+            // THE UNSPLIT WINDOW NAMES ITS SESSION. This renderer drives the
+            // whole window as ONE grid, so it never calls `bind_pane` — and the
+            // engine read that missing binding as "matches every session",
+            // which is only ever true of the GEOMETRY. `WordDecorations` is per
+            // WINDOW and a tab switch retires nothing, so the wildcard let TAB
+            // A's typed cameo veto the identically-placed ambient cat in TAB B,
+            // and TAB A's edit keystroke license a plain repaint of TAB B to
+            // re-arm a cat that was already spent there (skeptic's third round,
+            // 2026-08-09).
+            //
+            // DECLARED HERE, not beside the tick: the declaration also
+            // invalidates the live scan when the session actually changes, and
+            // `needs_rescan` is consulted under LOCK A a few dozen lines below.
+            // Announcing the switch after that read would leave the first frame
+            // of a newly-front tab decorated with the PREVIOUS tab's word list.
+            // Unconditional (above every suspend/sync fork) because it is a
+            // statement about identity, not about whether this frame draws.
+            ws.word_decos.set_scan_session(Some(front_terminal.session));
             // M2 stream fade: identity of the front terminal's engine
             // allocation. A tab switch / session migration changes this Arc,
             // which must re-baseline the age map (a
@@ -12175,18 +12621,29 @@ impl App {
                 // bar while ARMED (wind-down schedules none — the synth's
                 // sing-duck release is the audio crossfade). Sound policy is
                 // the trail-sound law (RAW focus × `trail_sounds` ×
-                // volume): muted/unfocused ⇒ visuals only. Deliberately NOT
+                // volume) AND the riff's OWN gate: muted/unfocused ⇒ visuals
+                // only. Deliberately NOT
                 // reduced-motion-gated — reduced motion is a MOTION
                 // contract, so the static celebration keeps its song when
                 // sound is on (unlike the bonk, whose gain models the
                 // glow's intensity-0 silence).
+                //
+                // `trail_sound_riff` ([`sing_riff_gain`]) is a SOUND-ONLY gate
+                // and it is deliberately applied HERE, after `ws.sing_riff_bar`
+                // has already been latched above, not around the whole bar
+                // block: the celebration's ribbon saturation, star shower and
+                // dancing cat are a MOTION contract the owner did not ask to
+                // cancel, and the bar latch must keep advancing while the song
+                // is quiet so that turning the riff back on mid-celebration
+                // resumes on the CURRENT bar instead of replaying a stale one.
                 if let Some(bar) = ws.kitty_sing.bar(frame_started)
                     && ws.sing_riff_bar != Some(bar)
                 {
                     ws.sing_riff_bar = Some(bar);
-                    if let Some(gain) = trail_sound_gain(
+                    if let Some(gain) = sing_riff_gain(
                         ws.focused,
                         self.config.trail_sounds_or_default(),
+                        self.config.trail_sound_riff_or_default(),
                         self.config.trail_sound_volume(),
                     ) {
                         // The HELD CHARACTER picks the song — its bijective
@@ -12626,6 +13083,11 @@ impl App {
                     // detonation kind (typed provenance stays typed-only).
                     let bonk_gain = bonk_sound_gain(
                         ws.focused,
+                        // THE MASTER MUSIC SWITCH. The bonk is a synth voice
+                        // and the Sound menu promises Music effects silences
+                        // every one of them; before this term it was the one
+                        // voice that ignored it (see `bonk_sound_gain`).
+                        bonk_master,
                         bonk_enabled
                             // Resize repaint storms drain silently
                             // (RESIZE_SOUND_QUIET) — a re-scanned curse on a
@@ -12783,6 +13245,28 @@ impl App {
                             }
                         }
                     }
+                    // THE TYPED-KITTY CAMEO (owner, 2026-08-09: "I want THE
+                    // kitty to appear"). Emitted UNCONDITIONALLY of every
+                    // companion gate above it — no `kitty_alpha`, no
+                    // `flying_kitty_admitted`, no pet mode: it is not the
+                    // companion, it answers a keystroke rather than a trail
+                    // style, and it must show for every trail style exactly as
+                    // the summon it replaced did. `kitty_cameo` no-ops when
+                    // nothing is live, so a cameo-free frame stays
+                    // byte-identical.
+                    //
+                    // THE TWIN OF THIS CALL IS `compose_typed_cameo`. The two
+                    // render paths are separate emitters; wiring only one would
+                    // leave the toy invisible in the other layout.
+                    fp ^= present_typed_cameo(
+                        ws,
+                        effect_geom,
+                        frame_started,
+                        front_session,
+                        default_bg_u32,
+                        cursor_color_u32,
+                        glow_cfg.accent,
+                    );
                     fp
                 }
             } else {
@@ -14790,6 +15274,7 @@ impl App {
         // Knobs first: every one is an `&self` method, so they must resolve
         // before the `self.windows` borrow below.
         let kitty_log_on = self.kitty_log_enabled();
+        let bonk_master = self.config.trail_sounds_or_default();
         let bonk_enabled = self.curse_bonk_enabled();
         let bonk_detonations = self.curse_bonk_detonation_enabled();
         let bonk_volume = self.config.trail_sound_volume();
@@ -15005,6 +15490,10 @@ impl App {
             }
             let bonk_gain = bonk_sound_gain(
                 ws.focused,
+                // The master music switch, exactly as the single-pane present
+                // reads it: a split pane must never bonk a word a single pane
+                // would have muted.
+                bonk_master,
                 bonk_enabled && !ws.resize_sound_quiet(std::time::Instant::now()),
                 tick_cfg.reduced_motion,
                 bonk_volume,
@@ -15034,7 +15523,150 @@ impl App {
         // ≤ MAX_INK_CELLS per pane, so this sort is free.
         ws.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
         fp ^= self.compose_cursor_companion(wid, ctx, focus_place);
+        fp ^= self.compose_typed_cameo(wid, ctx, focus_place);
         fp
+    }
+
+    /// THE TYPED-KITTY CAMEO on a composed frame — the split twin of the cameo
+    /// arm in `redraw_window`.
+    ///
+    /// Its own function, called BESIDE `compose_cursor_companion` rather than
+    /// inside it, because that function is a chain of early returns owned by
+    /// the companion's gates (pet mode, `kitty_alpha == 0`, a missing focus
+    /// cursor) and the cameo is subject to NONE of them: it answers a
+    /// keystroke, not a trail style. Folding it in there would silently
+    /// suppress the toy in exactly the configurations most likely to be in use.
+    ///
+    /// THE TOY RIDES THE PANE IT WAS TYPED IN — not the focused one.
+    ///
+    /// SKEPTIC'S FINDING, 2026-08-09: this used to emit at `ctx.focus` while
+    /// the engine's one-cat-per-caret VETO
+    /// (`WordDecorations::tick` → `KittyCameo::veto_cell`) is scoped to
+    /// `bind_pane`, i.e. to the pane the word was typed in. Two different
+    /// scopes for one toy: move focus to the other half of a split and the
+    /// veto kept silencing the ambient cat in pane A while nothing at all was
+    /// drawn there. Both sides now ask the SAME question — "does this cameo
+    /// belong to the pane in question?" — which also gives `Cameo::pane` a
+    /// job it is actually read for (it selects the geometry below) rather than
+    /// leaving it a scope check that only ever answered yes.
+    ///
+    /// Emission happens at that pane's geometry and then goes through the one
+    /// `translate_free_into_pane` helper, so a cameo near a divider is cropped
+    /// at it rather than drawn over the neighbour.
+    fn compose_typed_cameo(
+        &mut self,
+        wid: WindowId,
+        ctx: &ComposeDecoCtx<'_>,
+        focus_place: Option<PanePlace>,
+    ) -> u64 {
+        // The sparkle master owns every cat: with it off the engine was
+        // hard-reset above (which retires any live cameo), so there is nothing
+        // to draw and nothing to check.
+        if self.sparkle.is_none() {
+            return 0;
+        }
+        // WHICH PANE OWNS THE TOY. `None` (outer) means no cameo is on glass at
+        // all; `None` (inner) is a cameo summoned by a host that binds no pane,
+        // which has no divider to respect and falls back to the focused place.
+        let Some(cameo_pane) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.word_decos.cameo_pane(ctx.now))
+        else {
+            return 0;
+        };
+        // THE OWNING PANE, resolved ONCE: its place (where the toy draws) and
+        // its terminal (whose text the toy is tinted against) must come from
+        // the SAME leaf, or the sample describes a grid the sprite is not on.
+        let owner = match cameo_pane {
+            Some(session) => ctx.panes.iter().find(|(r, _)| r.session == session),
+            // A cameo summoned by a host that binds no pane has no divider to
+            // respect; it falls back to the focused place, so the focused
+            // pane's terminal is also the right palette source.
+            None => ctx.panes.iter().find(|(r, _)| r.session == ctx.focus),
+        };
+        let place = match cameo_pane {
+            Some(_) => owner.map(|(r, _)| PanePlace {
+                row_off: r.row_off,
+                col_off: r.col_off,
+                rows: r.rows,
+                cols: r.cols,
+                win_rows: ctx.win_rows,
+                win_cols: ctx.win_cols,
+                cell_w: ctx.cell_w,
+                cell_h: ctx.cell_h,
+            }),
+            None => focus_place,
+        };
+        // A cameo whose pane has left the layout draws nothing. `retain_panes`
+        // retires that pane's episodes at the top of this compose, so the toy
+        // is the only thing that could still name it.
+        let Some(place) = place else {
+            return 0;
+        };
+        let owner_term = owner.map(|(_, term)| term.clone());
+        let default_bg = self.theme.bg;
+        let accent = ctx.accent;
+        let cursor_color = ctx.cursor_color;
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        let geom = crate::word_decorations::EffectGeom {
+            cell_w: ctx.cell_w as u16,
+            cell_h: ctx.cell_h as u16,
+            rows: place.rows,
+            cols: place.cols,
+        };
+        let Some(footprint) = ws
+            .word_decos
+            .kitty_cameo_footprint(geom, ctx.now, cameo_pane)
+        else {
+            return 0;
+        };
+        // THE PALETTE COMES FROM THE TOY'S OWN PANE, ONCE.
+        //
+        // SKEPTIC'S FINDING, 2026-08-09: this used to sample `deco_pane_cells`
+        // as it stood — "whichever pane extracted last this frame", which the
+        // pane loop only refills for panes that RESCANNED. A split cameo was
+        // therefore tinted against a sibling pane's text (wrong contrast, and a
+        // wrong background BAND flips the pale-underlay treatment outright), or
+        // against a stale grid, and the palette is part of the BAKE KEY — so a
+        // buffer that flipped owner between frames also churned the cat atlas
+        // for the toy's whole life.
+        //
+        // Same two-part shape the PET companion beside this already uses: latch
+        // the palette for the episode, and pay for one extraction to get that
+        // one sample right. `cameo_wants_colors` is true for exactly one frame
+        // per cameo, so the ~300 frames that follow take no lock at all.
+        let colors = if ws.word_decos.cameo_wants_colors() {
+            if let Some(term) = owner_term.as_ref() {
+                let mut t = term_lock(term);
+                t.cell_frame_into(
+                    &mut ws.deco_pane_cells,
+                    usize::from(place.rows),
+                    usize::from(place.cols),
+                );
+            }
+            cursor_cat_color_key(
+                &ws.deco_pane_cells.cells,
+                geom,
+                footprint,
+                default_bg,
+                cursor_color,
+                accent,
+            )
+        } else {
+            // Already latched: `kitty_cameo` ignores what we hand it, so hand it
+            // nothing rather than sampling a grid we would then discard.
+            aterm_effects::cat_baker::CatColorKey::default()
+        };
+        ws.pane_free.clear();
+        let fp = ws
+            .word_decos
+            .kitty_cameo(geom, ctx.now, cameo_pane, colors, &mut ws.pane_free);
+        translate_free_into_pane(&mut ws.pane_free, place);
+        ws.free_scratch.extend_from_slice(&ws.pane_free);
+        fp.map_or(0, |f| f.rotate_left(11))
     }
 
     /// The CURSOR COMPANION on a composed frame: ONE per window, riding the
@@ -15969,6 +16601,14 @@ impl App {
         let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();
         let sound_volume = self.config.trail_sound_volume();
+        // THE RIFF'S OWN GATE (`trail_sound_riff`, owner ask: the sing-along is
+        // TIER 5, the loudest voice, and had no switch but the master and the
+        // master volume). Hoisted above the `ws` borrow with the other config
+        // reads, and kept SEPARATE from `sound_on` — that is the trail-sound
+        // master and must keep its meaning for every other voice on this path.
+        // The two terms are combined by [`sing_riff_gain`], the one author of
+        // this law, so a split never sings a song a single pane suppresses.
+        let riff_key = self.config.trail_sound_riff_or_default();
         // The PET companion, resolved on the SAME terms as the single-pane path
         // (a pure config read, hoisted above the `ws` borrow) — and drawable
         // under the same presentation gate the flying kitty takes here.
@@ -16017,7 +16657,11 @@ impl App {
                         && ws.sing_riff_bar != Some(bar)
                     {
                         ws.sing_riff_bar = Some(bar);
-                        riff = trail_sound_gain(ws.focused, sound_on, sound_volume)
+                        // `riff_key` reaches the policy AFTER the bar latch
+                        // above, exactly like the single-pane seam: quieting
+                        // the song must not stall the bar grid, or re-enabling
+                        // it mid-celebration would replay a stale bar.
+                        riff = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
                             .map(|gain| (bar, gain, ws.kitty_sing.signature()));
                     }
                 } else {
@@ -20510,6 +21154,342 @@ mod split_sparkle_tests {
         );
     }
 
+    /// THE TYPED-KITTY CAMEO ON THE COMPOSED PATH (owner ask, 2026-08-09).
+    ///
+    /// The two render paths are SEPARATE emitters, so wiring only
+    /// `redraw_window` would leave the toy invisible in a split — the exact
+    /// class of bug the owner's "sparkle effects are NOT SINGLE PANE ONLY"
+    /// ruling created this module for.
+    ///
+    /// The toy is identified by SIZE: it is drawn taller than the `2·cell_h`
+    /// atlas slot, which is a height neither a word-cat nor the cursor escort
+    /// can reach. The pre-summon assertion proves the discriminator is real —
+    /// the split frame is already full of ordinary cats, and none of them
+    /// qualify.
+    #[test]
+    fn split_compose_emits_the_typed_kitty_cameo() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let t0 = Instant::now();
+        let (mut app, wid, _) = split_app(t0);
+        compose(&mut app, wid, t0);
+        let t1 = t0 + Duration::from_millis(600);
+        compose(&mut app, wid, t1);
+        let cell_h = app.win_cell_size(wid).1 as i32;
+        let taller_than_a_slot = |app: &App, wid: WindowId| -> bool {
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .any(|s| i32::from(s.h) > 2 * cell_h)
+        };
+        assert!(
+            !app.windows[&wid].input_scratch.free_sprites.is_empty(),
+            "PRECONDITION: the split frame already draws ambient cats"
+        );
+        assert!(
+            !taller_than_a_slot(&app, wid),
+            "PRECONDITION: and NONE of them is cameo-sized, so the size test \
+             below is a real discriminator"
+        );
+
+        // Type the word for real — the detector only ever sees committed keys.
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(c),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        assert!(
+            app.windows[&wid].word_decos.cameo_live(Instant::now(), None),
+            "PRECONDITION: typing the word summoned a cameo at all"
+        );
+        compose(&mut app, wid, t1 + Duration::from_millis(16));
+        assert!(
+            taller_than_a_slot(&app, wid),
+            "a split frame must emit the typed-kitty cameo ({})",
+            channels(&app, wid, t1)
+        );
+    }
+
+    /// A SPLIT CAMEO WEARS ITS OWN PANE'S COLOURS.
+    ///
+    /// SKEPTIC'S SECOND-ROUND FINDING, 2026-08-09: the composed emitter sampled
+    /// `deco_pane_cells` as it stood — one scratch buffer the pane loop refills
+    /// only for panes that RESCANNED, so it holds "whichever pane extracted
+    /// last", which on a quiet frame is a pane the toy is not even in. The
+    /// palette is part of the cat's BAKE KEY (`CatColorKey`), so a foreign
+    /// sample does not merely shade the cat slightly wrong: the background BAND
+    /// selects between the pale-underlay and dark-keyline treatments, so a cat
+    /// popped onto a dark pane can be baked for a light one and lose its
+    /// outline entirely.
+    ///
+    /// THE FIXTURE MAKES THE WRONG ANSWER THE AVAILABLE ONE. The LEFT pane is
+    /// flooded with a white background (band 3) and is the only pane that
+    /// rescans; the cameo is summoned in the FOCUSED RIGHT pane, which is dark
+    /// (band 0) and does not rescan at all on the frame that draws the toy. The
+    /// precondition below asserts the shared buffer really is holding the white
+    /// grid at that moment, so a passing verdict cannot come from the two panes
+    /// happening to agree.
+    #[test]
+    fn a_split_cameo_samples_its_own_panes_palette() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let t0 = Instant::now();
+        let (mut app, wid, sid) = split_app(t0);
+        compose(&mut app, wid, t0);
+        let t1 = t0 + Duration::from_millis(600);
+        compose(&mut app, wid, t1);
+
+        // Flood the LEFT (unfocused) pane with a white background. DECAWM off
+        // so the fill cannot wrap past the pane's real width and scroll.
+        {
+            let term = app.pool.get(0).expect("left pane session").term.clone();
+            let mut t = term_lock(&term);
+            t.process(b"\x1b[?7l\x1b[48;2;255;255;255m");
+            // 39 columns is inside any plausible half of an 80-column window,
+            // so the fill cannot wrap and scroll a default-background row in
+            // under it.
+            for row in 1..=24u16 {
+                t.process(format!("\x1b[{row};1H").as_bytes());
+                t.process(&b" ".repeat(39));
+            }
+        }
+        let t2 = t1 + Duration::from_millis(16);
+        compose(&mut app, wid, t2);
+        // PRECONDITION: the shared scratch now holds the LEFT pane's WHITE grid
+        // over the region the cameo's footprint samples (it is anchored at the
+        // right pane's caret, near the top-left of that pane). The wrong answer
+        // is loaded, present, and a different luminance band.
+        {
+            let cells = &app.windows[&wid].deco_pane_cells.cells;
+            assert!(
+                cells.len() > 4 && cells[0].len() > 12,
+                "PRECONDITION: the shared scratch holds a real grid"
+            );
+            assert!(
+                cells[..5]
+                    .iter()
+                    .all(|row| row[..13].iter().all(|c| c.bg == [255, 255, 255])),
+                "PRECONDITION: it is the LEFT pane's white grid — got {:?}",
+                cells[0][..13].iter().map(|c| c.bg).collect::<Vec<_>>()
+            );
+        }
+
+        // Summon in the FOCUSED (right) pane. Nothing writes to any terminal
+        // here, so no pane's damage epoch advances and the next compose
+        // re-extracts nothing on its own.
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(c),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        let t3 = t2 + Duration::from_millis(16);
+        assert_eq!(
+            app.windows[&wid].word_decos.cameo_pane(t3),
+            Some(Some(sid)),
+            "PRECONDITION: the toy belongs to the focused RIGHT pane"
+        );
+        compose(&mut app, wid, t3);
+        let colors = app.windows[&wid]
+            .word_decos
+            .cameo_colors()
+            .expect("the composed frame latched the cameo's palette");
+        assert_eq!(
+            colors.background, 0,
+            "the toy must be tinted against its OWN dark pane, not the white \
+             grid the shared scratch was holding ({})",
+            channels(&app, wid, t3)
+        );
+
+        // And the latch holds: a later frame cannot re-tint a toy that is
+        // already on glass, however the shared buffer moves under it.
+        compose(&mut app, wid, t3 + Duration::from_millis(16));
+        assert_eq!(
+            app.windows[&wid].word_decos.cameo_colors(),
+            Some(colors),
+            "one palette per toy, for its whole life"
+        );
+    }
+
+    /// THE MUSIC MASTER REACHES THE COMPOSED BONK CALL SITE.
+    ///
+    /// [`super::bonk_sound_gain`]'s own unit tests pin the LAW; this pins that
+    /// the split-pane render path actually feeds it the `trail_sounds` knob
+    /// rather than a hardcoded `true`. It drives the real composed frame with a
+    /// LIVE-but-capturing audio host and reads what the synth was handed.
+    #[test]
+    fn a_composed_frame_stops_bonking_when_music_effects_is_off() {
+        use aterm_effects::trail_sound::{SoundGesture, WordGesture};
+
+        let bonks = |app: &mut App| -> usize {
+            app.trail_audio
+                .take_captured_for_test()
+                .iter()
+                .filter(|ev| matches!(ev.kind, SoundGesture::Words(WordGesture::Bonk)))
+                .count()
+        };
+        // One run of the whole fixture, differing ONLY in the Music-effects
+        // Top Setting, so the delta below cannot come from anything else.
+        let curse_in_a_split = |music: bool| -> usize {
+            let t0 = Instant::now();
+            let (mut app, wid, sid) = split_app(t0);
+            app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+            app.config.trail_sounds = Some(music);
+            // This scan is what leaves the engine's `last_caret` on the row the
+            // curse is about to be written to — the PLACE half of the typed
+            // witness (`WordDecorations::typed_edit_reached`) is measured
+            // against it, so the curse must be appended at the caret rather
+            // than on a fresh line.
+            compose(&mut app, wid, t0);
+            let term = app.pool.get(sid).expect("pane session").term.clone();
+            term_lock(&term).process(b"fuck");
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                // The TYPED witness the bonk demands: a committed key, not just
+                // a caret parked past the token (a scrolling build log leaves
+                // it there too, and this seam makes a sound).
+                ws.word_decos
+                    .note_typed_edit(t0 + Duration::from_millis(600), Some(sid));
+                // A window inside `RESIZE_SOUND_QUIET` of a reflow drains
+                // silently; the fixture's establishing compose is a reflow.
+                ws.last_resize_at = None;
+            }
+            let mut app = app;
+            compose(&mut app, wid, t0 + Duration::from_millis(600));
+            bonks(&mut app)
+        };
+
+        assert_eq!(
+            curse_in_a_split(true),
+            1,
+            "PRECONDITION: with Music effects ON this fixture really bonks — \
+             without it the assertion below would pass for any reason at all",
+        );
+        assert_eq!(
+            curse_in_a_split(false),
+            0,
+            "Music effects Off must reach the composed bonk call site",
+        );
+    }
+
+    /// EMISSION AND VETO MUST NAME THE SAME PANE (skeptic's finding,
+    /// 2026-08-09).
+    ///
+    /// The toy's one-cat-per-caret VETO is scoped by `bind_pane` — the pane the
+    /// word was typed in — while the composed emitter used to draw at whatever
+    /// pane had FOCUS. Move focus in a split and the two scopes disagreed: the
+    /// veto kept silencing the ambient cat in the pane the toy belonged to
+    /// while the toy itself was drawn nowhere at all.
+    ///
+    /// The probe: type in the focused (RIGHT) pane, then move focus to the LEFT
+    /// pane and compose again. The toy must still be on glass, and still on the
+    /// RIGHT — the pane whose veto is holding its word.
+    #[test]
+    fn a_typed_cameo_keeps_its_own_pane_when_focus_moves() {
+        use crate::input::{InputEvent, Source};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let t0 = Instant::now();
+        let (mut app, wid, sid) = split_app(t0);
+        compose(&mut app, wid, t0);
+        let t1 = t0 + Duration::from_millis(600);
+        compose(&mut app, wid, t1);
+        let (cw, cell_h) = app.win_cell_size(wid);
+        let cell_h = cell_h as i32;
+        // Every cameo sprite's x. Height is the discriminator: nothing else on
+        // glass can exceed the `2·cell_h` atlas slot.
+        let cameo_xs = |app: &App| -> Vec<i32> {
+            app.windows[&wid]
+                .input_scratch
+                .free_sprites
+                .iter()
+                .filter(|s| i32::from(s.h) > 2 * cell_h)
+                .map(|s| s.x)
+                .collect()
+        };
+        assert_eq!(
+            app.active_tree(wid).map(crate::pane::PaneTree::focus),
+            Some(sid),
+            "PRECONDITION: the fresh split focuses the NEW (right) pane, so the \
+             keystrokes below land there"
+        );
+        for c in "kitty".chars() {
+            app.input(
+                wid,
+                InputEvent::Key {
+                    key: Key::Character(c),
+                    mods: Modifiers::empty(),
+                    base_layout: None,
+                    event_type: KeyEventType::Press,
+                },
+                Source::Human,
+            );
+        }
+        assert_eq!(
+            app.windows[&wid]
+                .word_decos
+                .cameo_pane(Instant::now())
+                .expect("PRECONDITION: typing the word summoned a cameo"),
+            Some(sid),
+            "PRECONDITION: and the composed host binds panes, so the toy is \
+             scoped to the pane it was typed in"
+        );
+        compose(&mut app, wid, t1 + Duration::from_millis(16));
+        // The right pane starts at col 41 (col 40 is the divider).
+        let right_x0 = (41 * cw) as i32;
+        let focused = cameo_xs(&app);
+        assert!(
+            !focused.is_empty() && focused.iter().all(|&x| x >= right_x0),
+            "PRECONDITION: while its own pane has focus the toy draws there: \
+             {focused:?} (right pane starts at x={right_x0})"
+        );
+
+        // FOCUS MOVES to the left pane. Nothing about the toy changed.
+        let moved = app
+            .active_tree_mut(wid)
+            .is_some_and(|tree| tree.set_focus(0));
+        assert!(moved, "PRECONDITION: focus really moves to the left pane");
+        let active = app.windows[&wid].tabs.active;
+        assert!(app.sync_tab_model_from_layout(wid, active));
+        app.sync_window(wid);
+        assert_eq!(
+            app.active_tree(wid).map(crate::pane::PaneTree::focus),
+            Some(0),
+            "PRECONDITION: and the compose pass will see the LEFT pane focused"
+        );
+
+        compose(&mut app, wid, t1 + Duration::from_millis(32));
+        let unfocused = cameo_xs(&app);
+        assert!(
+            !unfocused.is_empty(),
+            "the toy must stay on glass in the pane that summoned it — its veto \
+             is still silencing that pane's ambient cat ({})",
+            channels(&app, wid, t1)
+        );
+        assert!(
+            unfocused.iter().all(|&x| x >= right_x0),
+            "and it must stay on the RIGHT: emission follows the summoning \
+             pane, never the focus. got {unfocused:?} (right pane starts at \
+             x={right_x0})"
+        );
+    }
+
     /// T2 — the merged ink stream must satisfy `ink_row_slice`'s contract:
     /// non-empty (so this is not vacuous) and strictly increasing by
     /// `(row, col)`, which a pane-major concatenation of a vertical split is not.
@@ -21461,10 +22441,10 @@ mod tone_melody_seam_tests {
     use aterm_effects::trail_sound::{SoundEvent, SoundGesture};
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
-    use super::{CursorFxInputs, CursorStyle};
+    use super::CursorFxInputs;
     use crate::input::{InputEvent, Source};
     use crate::trail_audio::TrailAudio;
-    use crate::{App, Theme, WindowId};
+    use crate::{App, WindowId};
 
     fn key(character: char) -> InputEvent {
         InputEvent::Key {

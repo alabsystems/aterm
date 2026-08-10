@@ -1222,10 +1222,13 @@ pub struct TrailSynth {
     /// apart — and nothing bound a typed note to the chord under it, so the
     /// typing was simply ducked out of the way rather than made to agree.
     ///
-    /// Latched from every `RiffBar` and released with the sing duck, so it is
-    /// exactly as live as the song is: while the cat sings, what you type is IN
-    /// THE SAME KEY and reads as counterpoint; the moment the song ends the
-    /// typing is back on the neutral lattice, note for note as before.
+    /// Latched by [`TrailSynth::latch_song_key`] from EVERY riff-bar variant —
+    /// the canonical `RiffBarSig` and the deprecated `RiffBar` shim alike, both
+    /// through the same `celebration_root(sig)` the riff itself transposes by —
+    /// and released with the sing duck, so it is exactly as live as the song is:
+    /// while the cat sings, what you type is IN THE SAME KEY and reads as
+    /// counterpoint; the moment the song ends the typing is back on the neutral
+    /// lattice, note for note as before.
     song_key: i8,
     /// Seconds of full sing-duck hold remaining (block-rate countdown).
     sing_hold: f32,
@@ -1492,19 +1495,20 @@ impl TrailSynth {
             }
             SoundGesture::Words(WordGesture::Bonk) => self.design_bonk(ev, duck),
             SoundGesture::Celebration(CelebrationGesture::RiffBarSig { bar, sig }) => {
+                self.latch_song_key(sig);
                 self.design_celebration(ev, bar, sig);
             }
             #[allow(deprecated)]
             SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key }) => {
-                // Latch the song's key so the typing that continues underneath
-                // the riff walks the SAME lattice (see `song_key`).
-                self.song_key = key;
                 // COMPAT (delete with the pending GUI patch): the unpatched
                 // host still speaks the 5-class key. Delegate through a
                 // synthetic signature whose derived root IS that key, so the
                 // legacy path keeps its old transpose while the design stays
-                // a pure function of ONE payload.
-                self.design_celebration(ev, bar, legacy_key_signature(key));
+                // a pure function of ONE payload — INCLUDING the key latch,
+                // which now runs off that one payload for both variants.
+                let sig = legacy_key_signature(key);
+                self.latch_song_key(sig);
+                self.design_celebration(ev, bar, sig);
             }
         }
     }
@@ -1967,6 +1971,31 @@ impl TrailSynth {
         self.duck = 1.0;
     }
 
+    /// Latch [`Self::song_key`] — the pentatonic root the typed melody borrows
+    /// while the cat sings — from the bar's ONE payload, the signature.
+    ///
+    /// SEPARATE from [`Self::design_celebration`] because the key outlives the
+    /// bar: `design_celebration` schedules THIS bar's voices and returns, while
+    /// the latch stands until the sing duck hands back (`song_key = 0` in
+    /// `render`). Reading it out of `celebration_root` rather than storing an
+    /// independent "key" field is what makes the two layers provably agree —
+    /// the typed note and the riff are transposed by the same integer, derived
+    /// from the same `sig`, so they cannot drift apart.
+    ///
+    /// THE DEFECT THIS CLOSES: the latch used to live in the DEPRECATED
+    /// `RiffBar { key }` arm only. The canonical `RiffBarSig` arm — the one the
+    /// pending GUI patch switches every host to — scheduled the riff and never
+    /// touched `song_key`, so on the payload the design is moving TO, the typed
+    /// melody silently kept walking the neutral lattice under a transposed
+    /// song: exactly the "two lattices that only happened to be a near-just
+    /// fourth apart" the feature was written to end. Both arms now latch, off
+    /// the same signature.
+    fn latch_song_key(&mut self, sig: u32) {
+        // -2..=2 by construction (`celebration_root` is `sig % 5 - 2`), so the
+        // i8 narrowing is total.
+        self.song_key = celebration_root(sig) as i8;
+    }
+
     /// One BAR of the SING-ALONG sing-along riff — one bar of the eight-bar
     /// [`CELEBRATION_PHRASE`] form (see that constant's "not the Nyan Cat
     /// melody" note). Up to eight SWUNG eighth-note pulse-wave voices scheduled
@@ -2020,6 +2049,9 @@ impl TrailSynth {
     /// PENTA, transpose ×1.0) — every pinned neutral-path celebration proof is
     /// byte-untouched. The bonk alone keeps the raw `penta` (its clash is
     /// anchored to the untransposed lattice by design).
+    ///
+    /// Callers must latch the key with [`Self::latch_song_key`] first — see
+    /// that method for why the two are separate.
     fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
         let idx = usize::from(bar) % CELEBRATION_PHRASE_BARS;
@@ -5018,10 +5050,22 @@ mod tests {
         let neutral = hz_of(&plain);
         assert!(neutral > 0.0, "the typed note speaks");
 
-        // The same note, with the song live in a transposed key.
+        // The same note, with the song live in a transposed key. Built through
+        // the CANONICAL constructor — the payload every host speaks once the
+        // pending GUI patch lands — because the latch used to exist only on the
+        // deprecated `RiffBar { key }` arm, and a fixture that reaches for the
+        // shim would have gone on passing while the shipping path was mute.
+        // `sig = 4` is a root of +2 (`4 % 5 - 2`), the same key the legacy
+        // fixture used, so the transposition under test is unchanged.
+        const SIG_IN_KEY_TWO: u32 = 4;
+        assert_eq!(
+            celebration_root(SIG_IN_KEY_TWO),
+            2,
+            "fixture precondition: this signature's song IS in key +2"
+        );
         let mut singing = TrailSynth::new(48_000.0, 7);
         singing.push(SoundEvent {
-            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 0, key: 2 }),
+            kind: SoundGesture::Celebration(CelebrationGesture::riff_bar(0, SIG_IN_KEY_TWO)),
             ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
         });
         assert_eq!(singing.song_key, 2, "the riff latches its key");
@@ -5545,8 +5589,12 @@ mod tests {
     fn cross_key_difference() {
         let intervals = |sig: u32| -> Vec<i32> {
             let mut degs = Vec::new();
-            for idx in 0..CELEBRATION_PHRASE_BARS {
-                if CELEBRATION_VERSE[idx] {
+            // `CELEBRATION_VERSE` is `[bool; CELEBRATION_PHRASE_BARS]`, indexed
+            // by the same bar ordinal the walk uses — so iterating IT *is* the
+            // per-bar loop, and the bar count can never drift out of step with
+            // the flag table the way a separate `0..N` range could.
+            for (idx, &is_verse) in CELEBRATION_VERSE.iter().enumerate() {
+                if is_verse {
                     degs.extend(
                         celebration_bar_degrees(sig, idx)
                             .into_iter()

@@ -1129,8 +1129,7 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
                 libc::close(rd);
                 libc::close(wr);
             }
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "exec-status fifo is not the private close-on-exec object we created",
             ));
         }
@@ -1320,7 +1319,7 @@ fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
             libc::FD_SET(fd, &mut set);
             let mut tv = libc::timeval {
                 tv_sec: slice.as_secs() as libc::time_t,
-                tv_usec: libc::suseconds_t::from(slice.subsec_micros() as u32 as i32),
+                tv_usec: libc::suseconds_t::from(slice.subsec_micros() as i32),
             };
             libc::select(
                 fd + 1,

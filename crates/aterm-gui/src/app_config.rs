@@ -144,6 +144,38 @@ pub(crate) struct Config {
     /// melody to today's neutral constitution and stops the classifier from
     /// ever running.
     pub(crate) tone_melody: Option<bool>,
+    /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
+    /// ship enabled; this is an opt-OUT).
+    ///
+    /// The held-key celebration's song (`aterm_effects::kitty_sing` →
+    /// `Celebration(RiffBar)`) is TIER 5, the loudest thing the engine emits.
+    /// Before this key the only ways to quiet it were the master `trail_sounds`
+    /// switch — which kills every sound, keystrokes included — or
+    /// `trail_sound_volume`, which turns the keystrokes down with it. `false`
+    /// schedules no riff bar while leaving every other voice at its configured
+    /// level.
+    ///
+    /// SOUND ONLY: the sing-along's visuals (ribbon saturation, star shower,
+    /// the dancing cat and its singing face) are deliberately NOT gated here —
+    /// motion belongs to the motion contract, and the owner asked to quiet the
+    /// song, not to cancel the celebration. Subordinate to the existing law:
+    /// raw window focus × `trail_sounds` × `trail_sound_volume` still apply
+    /// first, so this can only ever take sound away.
+    pub(crate) trail_sound_riff: Option<bool>,
+    /// AUDIBLE TERMINAL BELL (`bell_sound`, default ON — opt-OUT like every
+    /// other user-facing feature here).
+    ///
+    /// BEL (0x07) rings the user's configured system alert sound: `NSBeep` on
+    /// macOS, `MessageBeep` on Windows. It is NOT a synth voice, so
+    /// `trail_sound_volume` and `trail_sounds` do not reach it — before this key
+    /// it was the one sound in the product with no configuration at all. `false`
+    /// suppresses the beep only; the visual bell flash and the urgent-window /
+    /// Dock-bounce attention request stay, because those are how a muted
+    /// terminal still surfaces background activity.
+    ///
+    /// Parsed and preserved everywhere; INERT off macOS/Windows, which have no
+    /// beep call to gate (see `crate::diagnostics` capability warnings).
+    pub(crate) bell_sound: Option<bool>,
     /// Trail colour, `#RRGGBB`. Defaults to the (themed) cursor colour, so the
     /// trail matches the cursor unless overridden here.
     pub(crate) cursor_trail_color: Option<String>,
@@ -2355,6 +2387,25 @@ impl Config {
     /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
         self.trail_sound_bed.unwrap_or(false)
+    }
+
+    /// Sing-along RIFF on/off (`trail_sound_riff`, default ON — a shipped
+    /// feature, so this is an opt-OUT). The riff's own switch: the celebration's
+    /// VISUALS keep running when it is off, and every existing sound gate
+    /// (raw focus × `trail_sounds` × `trail_sound_volume`) still applies first,
+    /// so this can only ever remove sound. See the field docs for why the
+    /// loudest voice in the engine needed a switch of its own.
+    pub(crate) fn trail_sound_riff_or_default(&self) -> bool {
+        self.trail_sound_riff.unwrap_or(true)
+    }
+
+    /// Audible terminal bell on/off (`bell_sound`, default ON). Gates ONLY the
+    /// OS alert sound (`NSBeep` / `MessageBeep`) — never the visual bell flash
+    /// or the urgent-window attention request, which are how a muted terminal
+    /// still surfaces background activity. `trail_sound_volume` deliberately
+    /// does not reach this: the beep is an OS sound, not a synth voice.
+    pub(crate) fn bell_sound_or_default(&self) -> bool {
+        self.bell_sound.unwrap_or(true)
     }
 
     /// The parsed `trail_sound_style` voice (default `"auto"` → follow the

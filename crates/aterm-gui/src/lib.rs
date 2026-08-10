@@ -59,6 +59,7 @@ mod app_native;
 #[cfg(feature = "a11y-accesskit")]
 mod app_native_accessibility;
 mod app_palette;
+mod app_rename;
 mod app_render;
 mod app_search;
 mod app_settings;
@@ -1998,6 +1999,36 @@ enum Wake {
         tab: tab_model::TabId,
         action: menu::MenuAction,
     },
+    /// A tab chip was DOUBLE-CLICKED (macOS strip): open the inline pin editor
+    /// over that tab. Carries the STABLE [`tab_model::TabId`] captured at the
+    /// gesture, for the same reason [`Wake::TabMenuAction`] does — an editor
+    /// lives for seconds, and the chip's live id is re-stamped per POSITION by
+    /// the strip's in-place diff path, so re-reading it later would target
+    /// whichever tab slid into the slot. `user_event` runs
+    /// [`App::begin_session_rename`], which resolves the tab's FOCUSED pane to
+    /// the session that actually owns the pin. macOS-only constructor.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BeginSessionRename {
+        window: WindowId,
+        tab: tab_model::TabId,
+    },
+    /// The inline pin editor ENDED with intent to keep what was typed (Return,
+    /// Tab, or a click away — the Finder convention). `session` is the identity
+    /// captured at begin, re-validated against the live edit state before
+    /// anything is written, so a commit that arrives after the edit was torn
+    /// down (a tab closed mid-edit, a second editor opened) is dropped rather
+    /// than applied to the wrong session. An EMPTY `text` CLEARS the pin.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    CommitSessionRename {
+        window: WindowId,
+        session: u64,
+        text: String,
+    },
+    /// The inline pin editor ended with NO write: Escape, or the strip
+    /// discovering mid-edit that the edited tab is gone. Tears the edit state
+    /// down; never touches metadata.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    CancelSessionRename { window: WindowId, session: u64 },
     /// The control socket's `tab` verb (`new`/`<N>`/`next`/`prev`), driving the
     /// FRONT window's tabs. Unlike [`Wake::SelectTab`] (which knows its window) the
     /// verb targets `self.frontmost_window`, which only the main thread can resolve,
@@ -3276,23 +3307,16 @@ impl Backend {
     /// offscreen REUSE across snapshot/`image` calls — the pixels are identical
     /// regardless. It is SEPARATE from any window's on-glass present `window_gpu`,
     /// so a snapshot never disturbs a window's scissor/dirty-gate caches.
-    #[cfg(test)]
-    fn render_input(
-        &mut self,
-        gpu_scratch: &mut aterm_gpu::WindowGpu,
-        input: &mut RenderInput,
-        // Settings-card overlay. The GPU arm BAKES it into the offscreen so the
-        // readback is WYSIWYG; the CPU arm IGNORES it (the caller still composites
-        // on the CPU after readback, gated on `!is_gpu()`).
-        tray: Option<aterm_gpu::TrayQuad<'_>>,
-    ) -> Frame {
-        self.render_input_for_destination(gpu_scratch, input, tray, None)
-            .expect("test capture readback")
-    }
-
-    /// [`Self::render_input`] with the exact on-glass destination height. GPU
-    /// top-crop parity depends on the row-fit remainder, so window capture must
-    /// configure the readback with the same height the successful present used.
+    ///
+    /// `destination_height` is REQUIRED, not optional: GPU top-crop parity
+    /// depends on the row-fit remainder, so window capture must configure the
+    /// readback with the same height the successful present used. A `#[cfg(test)]`
+    /// `render_input` convenience wrapper used to pass `None` here and `.expect()`
+    /// the readback; it had no callers on either the `Backend` or the lazy-backend
+    /// impl, and it was a trap for the one that came along — `None` silently opts
+    /// out of exactly the parity this signature exists to enforce, and the
+    /// `expect` turns a refused readback into a panic instead of the `Err` every
+    /// live call site handles. Removed rather than `#[allow]`ed for that reason.
     fn render_input_for_destination(
         &mut self,
         gpu_scratch: &mut aterm_gpu::WindowGpu,
@@ -3613,16 +3637,6 @@ impl BackendSlot {
 
     fn unsupported_user_feature_tags(&self) -> Vec<[u8; 4]> {
         self.ready().unsupported_user_feature_tags()
-    }
-
-    #[cfg(test)]
-    fn render_input(
-        &mut self,
-        gpu_scratch: &mut aterm_gpu::WindowGpu,
-        input: &mut RenderInput,
-        tray: Option<aterm_gpu::TrayQuad<'_>>,
-    ) -> Frame {
-        self.ready_mut().render_input(gpu_scratch, input, tray)
     }
 
     fn render_input_for_destination(
@@ -5960,6 +5974,10 @@ struct WindowState {
     /// `last_strip_fp` so moving BETWEEN tabs repaints and moving WITHIN one does
     /// not. Always `None` while the in-grid strip is disabled.
     strip_hover: Option<usize>,
+    /// The live inline SESSION-RENAME edit on this window's tab strip, or `None`
+    /// when nothing is being edited. See [`app_rename::TabRenameEdit`] for why
+    /// it is keyed on a session id and carries the tab id only for positioning.
+    rename_edit: Option<app_rename::TabRenameEdit>,
     /// The painted tab-strip rows from the last build (see `last_strip_fp`). Cloned
     /// into `input_scratch` on a cache hit; rebuilt on a miss.
     cached_strip_rows: Vec<Vec<RenderCell>>,
@@ -6405,7 +6423,15 @@ impl WindowState {
             // same "a correct emitter renders one frame and freezes" rule the
             // word-decoration arm above carries.
             || (animate_cursor_cat && self.cursor_pet.needs_frames())
-            || self.word_decos.is_active(now)
+            // SCOPED, not blanket (skeptic's finding, 2026-08-09): the typed
+            // cameo rides this same arm, `WordDecorations` is per WINDOW, and a
+            // tab switch retires nothing — so a toy summoned in tab A held this
+            // window at 60 fps for its full ~5.04 s life while the user worked
+            // in tab B, where both renderers correctly refuse to draw it. An
+            // animation nobody can see is not a reason to present.
+            || self
+                .word_decos
+                .is_active_in(now, |session| self.shows_session(session))
             || (!self.is_split()
                 && (self.cursor_rainbow.is_active()
                     || self.cursor_droplet.is_active()
@@ -6443,19 +6469,55 @@ impl WindowState {
 
     /// The reduced-motion cat's one-shot erase deadline, gated by the same
     /// canonical terminal-front boundary as the animated effects lane.
+    ///
+    /// TWO CATS SHARE THIS LANE, on deliberately different gates:
+    ///
+    /// * the CURSOR COMPANION's held collection hello — single-pane only,
+    ///   because `redraw_compose` does not tick the companion's fade machine;
+    /// * the TYPED-KITTY CAMEO ([`aterm_effects::kitty_cameo`]) — emitted on
+    ///   BOTH render paths, so it takes NO `is_split()` gate. Under reduced
+    ///   motion the cameo owns no frame cadence (`is_active` answers `false`),
+    ///   so this deadline is the ONLY thing that will ever schedule the frame
+    ///   that erases it; gating it on layout would leave a split-pane toy
+    ///   painted on glass forever.
+    ///
+    /// The earlier of the two wins: whichever cat has to come off glass first
+    /// sets the wake, and the other is still live when that frame runs.
+    ///
+    /// THE CAMEO ALSO IGNORES `animate_cursor_cat`, which is the companion's
+    /// gate and not a motion policy: the cameo's reduced/animated verdict comes
+    /// from the sparkle engine's OWN `DecoConfig::reduced_motion` — the
+    /// `[sparkle_words] reduced_motion` knob and the per-window motion
+    /// demotion — and those move independently. `cameo_static_deadline` already
+    /// answers `None` unless the engine really is rendering the cameo reduced,
+    /// so a second, unrelated gate here could only produce the failure it
+    /// looks like a safeguard against: one static frame painted and never
+    /// erased. Nor is it focus-gated, for the stream-fade precedent — the
+    /// erase frame that takes a toy off glass must present on an unfocused
+    /// window too.
     fn static_cursor_cat_deadline(
         &self,
         now: Instant,
         animate_cursor_cat: bool,
     ) -> Option<Instant> {
-        if self.front_terminal().is_some()
-            && !self.is_split()
-            && self.focused
-            && !animate_cursor_cat
-        {
-            self.cursor_cat.static_deadline(now)
-        } else {
-            None
+        // A window with no front terminal has nothing on glass to erase, so
+        // neither toy can owe a static frame here.
+        self.front_terminal()?;
+        let companion = (!self.is_split() && self.focused && !animate_cursor_cat)
+            .then(|| self.cursor_cat.static_deadline(now))
+            .flatten();
+        // SCOPED for the same reason the frame-cadence arm is, and the
+        // reduced-motion lane is the worse of the two: an unseen cameo never
+        // lands a sprite, so its BAKE-RETRY deadline re-arms every ~16 ms for
+        // the whole hold — a wake train in the mode whose contract is one still
+        // pose and one erase. Hidden means nothing drew it, so nothing has to
+        // erase it; switching back schedules a frame that recomputes this.
+        let cameo = self
+            .word_decos
+            .cameo_static_deadline_in(now, |session| self.shows_session(session));
+        match (companion, cameo) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -6552,6 +6614,32 @@ impl WindowState {
         self.tab_set
             .active()
             .is_some_and(|tab| tab.root.len() > 1 && !tab.zoomed)
+    }
+
+    /// Whether this window is currently DRAWING `session` — the active tab's
+    /// pane leaves, narrowed to the focused pane while that tab is zoomed (a
+    /// zoom composes only that one pane, the same rule
+    /// [`active_tab_displays_session`] applies on the canonical side).
+    ///
+    /// Read off the TERMINAL PROJECTION (`layouts[tabs.active]`) rather than
+    /// the canonical `tab_set`, because only the projection is keyed by SESSION
+    /// — `Tab::root` is a `SplitTree<ViewId>` and knows nothing about session
+    /// ids. Its parked-on-native staleness cannot leak here: every caller gates
+    /// on [`Self::front_terminal`] first, which fails closed on a native front.
+    ///
+    /// The visibility half of the effect-scheduler predicates: engines whose
+    /// state is per WINDOW but whose OUTPUT is per session (the typed-kitty
+    /// cameo) must not arm a wake train for something no renderer will emit.
+    /// A session in another TAB fails here, which is the case that matters —
+    /// nothing retires a cameo on a tab switch.
+    fn shows_session(&self, session: u64) -> bool {
+        self.layouts.get(self.tabs.active).is_some_and(|tree| {
+            if tree.is_zoomed() && tree.len() > 1 {
+                tree.focus() == session
+            } else {
+                tree.contains(session)
+            }
+        })
     }
 
     /// The Settings overlay for this window, if it is the OPEN variant. The accessor shim
@@ -6935,6 +7023,7 @@ impl WindowState {
             tab_segments: Vec::new(),
             last_strip_fp: None,
             strip_hover: None,
+            rename_edit: None,
             cached_strip_rows: Vec::new(),
             strip_row_pool: Vec::new(),
             strip_titles_scratch: Vec::new(),
@@ -10491,14 +10580,29 @@ impl App {
     /// originating tab: attention is requested when the window is unfocused OR the
     /// bell came from a BACKGROUND tab (its flash isn't on the visible screen), so
     /// a background tab's activity still surfaces even on a focused window.
+    ///
+    /// AUDIBLE vs VISIBLE: `bell_sound` (owner ask, Sound menu audit; default
+    /// ON) gates ONLY the beep below. The flash, the phosphor alert and the
+    /// urgent-window request are how a muted terminal still surfaces
+    /// background activity, so they are deliberately outside that gate.
     fn on_bell(&mut self, window: WindowId, session: u64) {
         // The `Wake::Bell` spawn stamp `window` may be STALE (a migrate/detach moved
         // the session's tab to another window), so we do NOT trust it for the flash.
         let _ = window;
         let now = Instant::now();
+        // GATE ORDER IS LOAD-BEARING. `BellRateLimiter::try_fire` MUTATES — it
+        // consumes the one-beep-per-[`BELL_BEEP_INTERVAL`] token on every call
+        // that returns true. Rust's `&&` short-circuits left to right, so both
+        // the serious-mode policy and the user's `bell_sound` switch are tested
+        // BEFORE it: a silenced bell must never burn the limiter's token, or
+        // the first beep after the user re-enables sound (or leaves serious
+        // mode) would be swallowed by a floor a silent bell had already
+        // advanced. Config is read live per bell — no cached copy — so the
+        // switch takes effect on the very next BEL after an edit lands.
         if self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::TerminalSound)
+            && self.config.bell_sound_or_default()
             && self.bell_beep.try_fire(now)
         {
             // The user's configured macOS alert sound. AppKit is already
@@ -13155,48 +13259,12 @@ impl ApplicationHandler<Wake> for App {
                 self.observe_title_drift(session, now);
             }
             // A control connection changed a session's USER metadata (`meta set`/
-            // `meta unset`). The user title is the TOP tab-label rung, so every
-            // window labeling a tab with this session re-reads its strip: the
-            // native (macOS) toolbar push, plus a redraw when either the in-grid
-            // strip changed OR this is the focused session (its metadata also
-            // feeds the native OS title even when `tab_strip_rows=0`). This is
-            // the exact refresh pair the epoch-gated title/cwd drift path above
-            // runs, minus the epoch gate (`meta set` is rare and the poster
-            // already gates on an actual change).
-            Wake::MetaChanged { session } => {
-                let label_windows: Vec<WindowId> = self
-                    .windows
-                    .iter()
-                    .filter(|(_, ws)| {
-                        ws.tab_set.tabs().iter().any(|tab| {
-                            self.view_store
-                                .get(tab.focus)
-                                .copied()
-                                .and_then(tab_model::View::terminal_session)
-                                == Some(session)
-                        })
-                    })
-                    .map(|(wid, _)| *wid)
-                    .collect();
-                for wid in label_windows {
-                    let focused = self.focused_session_id(wid) == Some(session);
-                    // Same snapshot the strip was just pushed — see
-                    // `refresh_window_tabs`; recomputing it here doubled the
-                    // per-tab meta-lock + term-try-lock + compose round trips.
-                    let (titles, metadata) = self.refresh_window_tabs(wid);
-                    let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-                    let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
-                    let strip_changed = self.windows.get(&wid).is_some_and(|ws| {
-                        ws.last_present.as_ref().is_none_or(|k| k.tab_strip != fp)
-                    });
-                    let needs_redraw = metadata_change_needs_redraw(focused, strip_changed);
-                    if needs_redraw
-                        && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
-                    {
-                        w.request_redraw();
-                    }
-                }
-            }
+            // `meta unset`). The refresh body is SHARED with the in-process GUI
+            // rename commit, which calls it directly on the main thread rather
+            // than posting this wake — posting from there would run the whole
+            // refresh twice (two AppKit strip pushes + two redraw requests per
+            // window) for one edit.
+            Wake::MetaChanged { session } => self.refresh_meta_dependent_chrome(session),
             // A session's reader thread confirmed it is live (first loop iteration).
             // Flip its registry handle `Spawning -> Alive` (the async-spawn path).
             // `mark_alive` is monotonic + fail-safe: an unknown id, an already-`Alive`
@@ -13526,6 +13594,26 @@ impl ApplicationHandler<Wake> for App {
                 action,
             } => {
                 self.dispatch_tab_menu_action(el, window, tab, action);
+            }
+            // A tab chip was double-clicked: open the inline pin editor over that
+            // tab's FOCUSED pane's session, resolved from the stable id here.
+            Wake::BeginSessionRename { window, tab } => {
+                self.begin_session_rename(window, tab);
+            }
+            // The editor ended keeping what was typed (Return / Tab / click away).
+            // Empty CLEARS the pin. `commit_session_rename` re-validates the
+            // session against the live edit state before writing anything.
+            Wake::CommitSessionRename {
+                window,
+                session,
+                text,
+            } => {
+                self.commit_session_rename(window, session, &text);
+            }
+            // Escape, or the strip discovering its edited tab is gone: tear the
+            // editor down and write nothing.
+            Wake::CancelSessionRename { window, session } => {
+                self.cancel_session_rename(window, session);
             }
             // The control socket's `tab` verb (new/<N>/next/prev), driving the FRONT
             // window's tabs. Resolve the front window HERE (only the main thread can),
@@ -22031,6 +22119,48 @@ mod tests {
         assert!(
             app.bell_beep.try_fire(std::time::Instant::now()),
             "a serious-mode BEL must not consume the audible rate-limit lane"
+        );
+    }
+
+    /// `bell_sound = false` (owner ask, Sound menu audit) SILENCES the audible
+    /// BEL, and — the subtle half — does so WITHOUT consuming the one-beep-per
+    /// [`BELL_BEEP_INTERVAL`] token, exactly like the serious-mode twin above.
+    /// Get the `&&` order wrong in `on_bell` and a muted terminal quietly
+    /// advances the beep floor, so the first bell after the user turns sound
+    /// back on is swallowed.
+    ///
+    /// NON-VACUOUS: it first asserts its own preconditions — the key ships ON
+    /// (so this really is an opt-OUT), a fresh App's lane really is open, and
+    /// the lane really is CONSUMABLE (one fire flips `try_fire` to false).
+    /// Without that last one, "the token survived" would be a claim about a
+    /// limiter that always says yes rather than about the gate.
+    ///
+    /// The AUDIBLE half is deliberately not driven here: on macOS/Windows a
+    /// permitted `on_bell` calls `NSBeep`/`MessageBeep`, which in a headless
+    /// test means AppKit off the main thread with no `NSApplication` — and a
+    /// test suite that beeps. That the un-muted path reaches the limiter at all
+    /// is pinned structurally by `native_settings`'
+    /// `sound_menu_keys_are_read_at_their_consumers`.
+    #[test]
+    fn a_silenced_bell_never_consumes_the_audible_rate_limit_lane() {
+        let mut app = App::headless_for_test();
+        assert!(
+            app.config.bell_sound_or_default(),
+            "the audible bell ships ON; this switch is the opt-OUT",
+        );
+
+        // The lane is consumable: exactly the property the assertion below
+        // depends on to mean anything.
+        let now = std::time::Instant::now();
+        let mut lane = crate::BellRateLimiter::new(crate::BELL_BEEP_INTERVAL);
+        assert!(lane.try_fire(now), "a fresh lane is open");
+        assert!(!lane.try_fire(now), "one fire consumes the lane's token");
+
+        app.config.bell_sound = Some(false);
+        app.on_bell(WindowId(0), 0);
+        assert!(
+            app.bell_beep.try_fire(std::time::Instant::now()),
+            "a silenced BEL must not consume the audible rate-limit lane",
         );
     }
 

@@ -382,6 +382,15 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         entries.extend(timeline.into_iter().map(TabMenuEntry::Header));
     }
     entries.push(TabMenuEntry::Separator);
+    // FIRST because it is the identity action the headers above are about; the
+    // clipboard pair and the close follow. Gated on `has_session` like the id
+    // copy: the pin is SESSION metadata, so a tab with no session has nothing
+    // to rename (and the write path would no-op silently).
+    entries.push(TabMenuEntry::Action {
+        label: "Rename Session…",
+        action: MenuAction::RenameSession,
+        enabled: input.has_session,
+    });
     entries.push(TabMenuEntry::Action {
         label: "Copy Session ID",
         action: MenuAction::CopySessionId,
@@ -737,7 +746,7 @@ mod tests {
     }
 
     /// The menu model carries the pinned structure: identity headers, sep,
-    /// timeline headers, sep, then the three actions in order — with the
+    /// timeline headers, sep, then the four actions in order — with the
     /// SAME header text the tooltip shows (one composer, two surfaces).
     #[test]
     fn menu_matches_tooltip_headers_and_orders_actions() {
@@ -767,6 +776,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
+                ("Rename Session…", MenuAction::RenameSession, true),
                 ("Copy Session ID", MenuAction::CopySessionId, true),
                 ("Copy CWD", MenuAction::CopyCwd, true),
                 ("Close Tab", MenuAction::CloseTab, true),
@@ -799,6 +809,14 @@ mod tests {
                 .count(),
             1
         );
+        assert!(menu.iter().any(|e| matches!(
+            e,
+            TabMenuEntry::Action {
+                action: MenuAction::RenameSession,
+                enabled: false,
+                ..
+            }
+        )));
         assert!(menu.iter().any(|e| matches!(
             e,
             TabMenuEntry::Action {
@@ -838,7 +856,7 @@ mod tests {
         let line = tab_menu_chrome_line(2, &compose_tab_menu(&input));
         assert_eq!(
             line,
-            r#"tab-menu tab=2 items=["zsh", "cwd: /tmp", "---", "Copy Session ID (disabled)", "Copy CWD", "Close Tab"]"#
+            r#"tab-menu tab=2 items=["zsh", "cwd: /tmp", "---", "Rename Session… (disabled)", "Copy Session ID (disabled)", "Copy CWD", "Close Tab"]"#
         );
     }
 }

@@ -1,20 +1,39 @@
 id = "spec_maneki"
 kind = "special"
-viewbox = [150, 170]
+# Owner, 2026-08-09: "make it bigger with 50% bigger wings so I can see it more
+# clearly". The "wings" are this cat's ONE distinguishing feature — the raised
+# pink-bean paw — so the paw group (outline path 2, coat path 2, all three pink
+# beans) took a uniform 1.5x about the shoulder at (102, 148), the point where
+# the arm meets the body, so the limb grows outward while staying attached.
+#
+# THE VIEWBOX GREW WITH IT. Coordinates normalize as `v / extent` and the
+# codegen CLAMPS to the box, so a 1.5x paw reaching x = 160.5 inside the old
+# [150, 170] frame would have been squashed flat against the right edge instead
+# of drawn. 166 clears the paw's true extent with a small margin; the cat's
+# other geometry is untouched, so only the authored ASPECT changes (0.882 ->
+# 0.976 — a wider sprite for a wider cat, which is exactly what a bigger paw
+# is).
+viewbox = [166, 170]
 anchor = { eye_y = 0.36, center_x = 0.5, word_top = 1.0 }
 
 # Lucky Bean: a smiling beckoning cat with one raised pink-bean paw.
+#
+# LAYER ORDER IS PAINT ORDER. `whisker` used to be last, which put the right-
+# hand whisker tips ON TOP of the pink beans; at the enlarged paw size those
+# hairlines bisect the pad instead of grazing it. Whiskers now paint after the
+# face (`mouth`) and BEFORE the paw group, so the pad reads as a solid shape in
+# front of the face — which is what a raised paw physically is.
 [[layer]]
 role = "outline"
 ref_fill = "#342B35"
 recolor = "fixed"
-paths = ["M 23 64 C 21 50 25 39 34 31 L 31 10 C 31 5 35 3 39 7 L 55 20 C 68 16 82 16 95 21 L 113 8 C 117 5 121 8 120 13 L 117 34 C 125 43 128 54 126 66 C 123 85 109 97 91 101 C 74 105 56 102 42 94 C 31 88 24 78 23 64 Z", "M 40 93 C 27 104 24 133 36 153 C 49 169 94 169 109 151 C 119 136 116 108 101 96 Z", "M 102 104 C 104 92 107 77 119 70 C 130 65 141 72 140 84 C 139 98 126 104 117 109 L 117 140 C 117 149 109 153 101 148 Z", "M 104 137 C 124 128 136 133 136 143 C 136 154 121 160 107 154 Z"]
+paths = ["M 23 64 C 21 50 25 39 34 31 L 31 10 C 31 5 35 3 39 7 L 55 20 C 68 16 82 16 95 21 L 113 8 C 117 5 121 8 120 13 L 117 34 C 125 43 128 54 126 66 C 123 85 109 97 91 101 C 74 105 56 102 42 94 C 31 88 24 78 23 64 Z", "M 40 93 C 27 104 24 133 36 153 C 49 169 94 169 109 151 C 119 136 116 108 101 96 Z", "M 102 82 C 105 64 109.5 41.5 127.5 31 C 144 23.5 160.5 34 159 52 C 157.5 73 138 82 124.5 89.5 L 124.5 136 C 124.5 149.5 112.5 155.5 100.5 148 Z", "M 104 137 C 124 128 136 133 136 143 C 136 154 121 160 107 154 Z"]
 
 [[layer]]
 role = "coat"
 ref_fill = "#D2A77E"
 recolor = "coat"
-paths = ["M 28 63 C 26 51 30 42 39 34 L 36 14 L 55 26 C 68 22 82 22 95 27 L 115 14 L 112 36 C 120 44 123 54 121 65 C 119 81 107 92 90 96 C 74 100 57 97 45 90 C 35 84 29 75 28 63 Z", "M 44 96 C 33 108 32 132 41 148 C 53 161 91 161 104 147 C 113 133 109 110 98 100 Z", "M 107 105 C 109 93 112 81 121 76 C 128 72 136 77 135 85 C 134 95 123 100 113 105 L 113 139 C 113 145 109 148 105 145 Z", "M 108 140 C 124 133 131 137 131 143 C 131 150 120 154 109 150 Z"]
+paths = ["M 28 63 C 26 51 30 42 39 34 L 36 14 L 55 26 C 68 22 82 22 95 27 L 115 14 L 112 36 C 120 44 123 54 121 65 C 119 81 107 92 90 96 C 74 100 57 97 45 90 C 35 84 29 75 28 63 Z", "M 44 96 C 33 108 32 132 41 148 C 53 161 91 161 104 147 C 113 133 109 110 98 100 Z", "M 109.5 83.5 C 112.5 65.5 117 47.5 130.5 40 C 141 34 153 41.5 151.5 53.5 C 150 68.5 133.5 76 118.5 83.5 L 118.5 134.5 C 118.5 143.5 112.5 148 106.5 143.5 Z", "M 108 140 C 124 133 131 137 131 143 C 131 150 120 154 109 150 Z"]
 
 [[layer]]
 role = "pattern"
@@ -59,10 +78,15 @@ recolor = "fixed"
 paths = ["M 69 68 L 73 68 L 73 72 C 77 75 81 73 83 70 C 82 78 76 81 71 76 C 66 81 60 78 59 70 C 61 73 65 75 69 72 Z"]
 
 [[layer]]
+role = "whisker"
+ref_fill = "#342B35"
+recolor = "fixed"
+paths = ["M 47 69 L 12 66 L 12 68 L 47 72 Z", "M 47 74 L 9 78 L 9 81 L 48 77 Z", "M 95 69 L 125 66 L 125 68 L 95 72 Z", "M 95 74 L 126 78 L 126 81 L 94 77 Z"]
+[[layer]]
 role = "pink"
 ref_fill = "#E793A5"
 recolor = "fixed"
-paths = ["M 116 82 C 116 76 120 72 125 72 C 130 72 134 76 134 82 C 134 88 130 92 125 92 C 120 92 116 88 116 82 Z", "M 115 94 C 115 91 117 89 120 89 C 123 89 125 91 125 94 C 125 97 123 99 120 99 C 117 99 115 97 115 94 Z", "M 127 95 C 127 92 129 90 132 90 C 135 90 137 92 137 95 C 137 98 135 100 132 100 C 129 100 127 98 127 95 Z"]
+paths = ["M 123 49 C 123 40 129 34 136.5 34 C 144 34 150 40 150 49 C 150 58 144 64 136.5 64 C 129 64 123 58 123 49 Z", "M 121.5 67 C 121.5 62.5 124.5 59.5 129 59.5 C 133.5 59.5 136.5 62.5 136.5 67 C 136.5 71.5 133.5 74.5 129 74.5 C 124.5 74.5 121.5 71.5 121.5 67 Z", "M 139.5 68.5 C 139.5 64 142.5 61 147 61 C 151.5 61 154.5 64 154.5 68.5 C 154.5 73 151.5 76 147 76 C 142.5 76 139.5 73 139.5 68.5 Z"]
 
 [[layer]]
 role = "accessory"
@@ -75,9 +99,3 @@ role = "detail"
 ref_fill = "#C99C54"
 recolor = "fixed"
 paths = ["M 64 100 C 64 94 68 90 74 90 C 80 90 84 94 84 100 C 84 106 80 111 74 111 C 68 111 64 106 64 100 Z", "M 71 95 L 77 95 L 77 105 L 71 105 Z"]
-
-[[layer]]
-role = "whisker"
-ref_fill = "#342B35"
-recolor = "fixed"
-paths = ["M 47 69 L 12 66 L 12 68 L 47 72 Z", "M 47 74 L 9 78 L 9 81 L 48 77 Z", "M 95 69 L 125 66 L 125 68 L 95 72 Z", "M 95 74 L 126 78 L 126 81 L 94 77 Z"]

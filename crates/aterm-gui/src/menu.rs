@@ -271,6 +271,13 @@ pub enum MenuAction {
     /// `~`-abbreviated — a pasted path must be real) to the clipboard.
     CopyCwd,
     // Window menu
+    /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
+    /// keyboard/menu twin of double-clicking a tab. Named "Rename SESSION", not
+    /// "Rename Tab", because it mutates session metadata (`meta set title`) and
+    /// a tab can hold several split sessions. A bar item (not context-only) so
+    /// it earns a palette row and an `invoke` name; it ALSO appears in the tab
+    /// context menu, exactly as `CloseTab` does.
+    RenameSession,
     /// Minimise the window.
     Minimize,
     /// Zoom (toggle maximised) the window.
@@ -338,6 +345,7 @@ impl MenuAction {
             MenuAction::ToggleSeriousMode => 45,
             MenuAction::FavouriteSessionKitty => 46,
             MenuAction::Packages => 47,
+            MenuAction::RenameSession => 48,
         }
     }
 
@@ -390,6 +398,7 @@ impl MenuAction {
             45 => MenuAction::ToggleSeriousMode,
             46 => MenuAction::FavouriteSessionKitty,
             47 => MenuAction::Packages,
+            48 => MenuAction::RenameSession,
             _ => return None,
         })
     }
@@ -411,6 +420,9 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The favourite promotes the front SESSION's own kitty — a native
             // whole tab has no session, so it has no session kitty to pin.
             | MenuAction::FavouriteSessionKitty
+            // The pin is SESSION metadata; a native whole tab owns no session,
+            // so the item greys rather than opening an editor over nothing.
+            | MenuAction::RenameSession
     )
 }
 
@@ -521,6 +533,11 @@ impl MenuAction {
             // and its `kitty-log.toml` mirror) — never `aterm.toml`, no security
             // knob, no capability escalation. That is why it is not `ConfigWrite`.
             | MenuAction::FavouriteSessionKitty
+            // Opens the inline pin editor. Its eventual write is `meta set title`,
+            // which the control layer's own `escalated_op` already classifies as
+            // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
+            // rewritten), so this matches rather than tunnels under it.
+            | MenuAction::RenameSession
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -571,6 +588,7 @@ impl MenuAction {
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
+            "RenameSession" => Some(MenuAction::RenameSession),
             "OpenPalette" => Some(MenuAction::OpenPalette),
             "Minimize" => Some(MenuAction::Minimize),
             "Zoom" => Some(MenuAction::Zoom),
@@ -868,6 +886,16 @@ const WINDOW_MENU: &[MenuEntry] = &[
         action: MenuAction::PrevTab,
         key: "[",
         mods: MenuMods::CommandShift,
+    },
+    Separator,
+    // No key equivalent by default: every free ⌘ letter near "rename" is either
+    // claimed by the bar or by the shell. The chord is bindable instead
+    // (`rename_session` in `[keybindings]`).
+    Item {
+        label: "Rename Session…",
+        action: MenuAction::RenameSession,
+        key: "",
+        mods: MenuMods::None,
     },
 ];
 
@@ -1688,6 +1716,18 @@ mod macos {
             "[",
             command_shift_mask(),
         );
+        add_separator(mtm, &window);
+        // The bar face of the inline tab-strip rename (the double-click twin).
+        // Unbound: `requires_terminal_tab` greys it on a native whole tab.
+        add_item(
+            mtm,
+            &window,
+            target,
+            "Rename Session…",
+            MenuAction::RenameSession,
+            "",
+            false,
+        );
         window
     }
 
@@ -2072,6 +2112,7 @@ mod tests {
         MenuAction::Zoom,
         MenuAction::NextTab,
         MenuAction::PrevTab,
+        MenuAction::RenameSession,
         MenuAction::ToggleSeriousMode,
         MenuAction::ToggleMatrixRain,
         MenuAction::FavouriteSessionKitty,
@@ -2373,6 +2414,8 @@ mod tests {
                     | MenuAction::ToggleMatrixRain
                     // Same reason: no session ⇒ no session kitty to promote.
                     | MenuAction::FavouriteSessionKitty
+                    // Same reason: the pin is SESSION metadata.
+                    | MenuAction::RenameSession
             );
             assert_eq!(
                 super::requires_terminal_tab(action),

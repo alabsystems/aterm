@@ -69,6 +69,86 @@ pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
 /// `mechanical` swaps every keystroke to the mechanical-keyboard palette
 /// (switch click + case thock) whatever the trail looks like.
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
+/// SING-ALONG RIFF toggle (`Config::trail_sound_riff`, default ON).
+///
+/// Owner ask (Sound menu audit): the held-key sing-along riff is TIER 5 — the
+/// loudest thing the engine emits — and had NO independent switch. The only
+/// ways to quiet it were the master "Music effects" toggle (which kills every
+/// sound, including the keystroke palette the owner wants to keep) or
+/// `trail_sound_volume` (which turns the keystrokes down with it). This key is
+/// the riff's own gate: OFF keeps every other voice at its configured level and
+/// simply schedules no `Celebration(RiffBar)` bar. It is a SOUND gate only —
+/// the sing-along's VISUALS (ribbon saturation, star shower, the dancing cat and
+/// its singing face) are untouched, because they are a motion contract and the
+/// owner asked to quiet the song, not to cancel the celebration.
+///
+/// Named into the `trail_sound_*` family because that is exactly what it gates:
+/// the riff rides the same `trail_audio` synth and is already subordinate to
+/// `trail_sounds` × `trail_sound_volume` × raw window focus.
+pub(crate) const EDIT_TRAIL_SOUND_RIFF: &str = "trail_sound_riff";
+/// AUDIBLE TERMINAL BELL toggle (`Config::bell_sound`, default ON).
+///
+/// Owner ask (Sound menu audit): the BEL (0x07) beep — `NSBeep` on macOS,
+/// `MessageBeep` on Windows — had NO config key at all, and is NOT covered by
+/// `trail_sound_volume` because it is an OS alert sound rather than a synth
+/// voice, so it was the one genuinely unreachable sound in the product. OFF
+/// suppresses only the AUDIBLE beep; the visual bell flash and the
+/// urgent-window/Dock-bounce attention request are unaffected, since those are
+/// how a muted terminal still surfaces activity.
+///
+/// PLATFORM: implemented on macOS and Windows only. Other platforms have no
+/// beep call at all, so the key is parsed and preserved there but inert —
+/// mirrored by [`super::native_settings`]' Advanced gate and by the
+/// [`crate::diagnostics`] capability matrix.
+pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
+/// The curse BONK's two gates, named so the Sound menu, the section router and
+/// the visibility allowlist all spell them once. They are `[sparkle_words]`
+/// leaves in the FILE (that is where the feature's table lives and the spelling
+/// must never change), but they are SFX in the UI.
+pub(crate) const EDIT_SPARKLE_BONK: &str = "sparkle_words.profanity.bonk";
+pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.bonk_detonation";
+
+/// THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
+///
+/// Every config key that changes what aterm SOUNDS like, and nothing else. One
+/// list drives [`section_of`] (they all land in the same pane), [`group_of`]
+/// (they all land in the same "Sound" box), and the native Advanced audit, so a
+/// new audible knob cannot be added to one and forgotten in the others — the
+/// exact drift that left `tone_melody`, `trail_sound_bed` and both bonk keys
+/// reachable only by hand-editing `aterm.toml`.
+///
+/// DELIBERATELY ABSENT — and each exclusion is a JUDGEMENT, recorded here so a
+/// later reader can check the reasoning rather than guess at an omission:
+///
+///   * `serious_mode`. It genuinely IS an audio gate, and not a marginal one:
+///     `SeriousEffect::TerminalSound` is read at all three `app_render` sound
+///     seams (the single-pane cursor-fx tick, the single-pane present and the
+///     split-pane compose) and again at `lib.rs::on_bell`, so with it on every
+///     row in this box is silent. It is still excluded, for two reasons that
+///     are about the CONTROL, not the effect. First, it is a whole-product
+///     policy — it suppresses trails, matrix rain, sparkle words and stream
+///     fade too — so a copy of it inside a Sound box would misdescribe its
+///     blast radius; it keeps its own "Effect policy" home. Second, it is a
+///     Top Effect control with ESCAPE semantics (turning a playful control on
+///     while it is set CLEARS it), and a plain Advanced Bool row cannot express
+///     that; duplicating one key into two controls that disagree is the exact
+///     hazard that also keeps [`EDIT_TRAIL_SOUNDS`] in Top Settings. What the
+///     box owes the user instead is a per-row DISCLOSURE, and every audible row
+///     carries one — pinned by
+///     `native_settings::…::serious_mode_is_disclosed_on_the_sound_rows_it_silences`.
+///   * `matrix_rain.bell_alert` — the BEL's amber hue ramp is a VISUAL bell;
+///     only [`EDIT_BELL_SOUND`] is audible.
+pub(crate) const SOUND_MENU_KEYS: &[&str] = &[
+    EDIT_TRAIL_SOUNDS,
+    EDIT_TRAIL_SOUND_VOLUME,
+    EDIT_TRAIL_SOUND_STYLE,
+    EDIT_TONE_MELODY,
+    EDIT_TRAIL_SOUND_BED,
+    EDIT_TRAIL_SOUND_RIFF,
+    EDIT_BELL_SOUND,
+    EDIT_SPARKLE_BONK,
+    EDIT_SPARKLE_BONK_DETONATION,
+];
 pub(crate) const EDIT_CURSOR_TRAIL_COLOR: &str = "cursor_trail_color";
 pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
 /// The rainbow kitty's user sprite. KEEPS the `nyan` spelling — unlike the
@@ -523,14 +603,19 @@ pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
         label: "Profanity opacity",
         kind: EditKind::Float,
     },
+    // The bonk's two gates keep their `[sparkle_words.profanity]` FILE spelling
+    // (renaming a config key silently orphans every line already authored), but
+    // their LABELS are written for the Sound menu they now appear in — the row
+    // has to say what it sounds like, because "Profanity opacity" is two boxes
+    // and one pane away from it.
     NestedLeaf {
-        key: "sparkle_words.profanity.bonk",
-        label: "Profanity curse bonk (typed)",
+        key: EDIT_SPARKLE_BONK,
+        label: "Curse bonk (typed)",
         kind: EditKind::Bool,
     },
     NestedLeaf {
-        key: "sparkle_words.profanity.bonk_detonation",
-        label: "Profanity bonk on supernova",
+        key: EDIT_SPARKLE_BONK_DETONATION,
+        label: "Curse bonk on supernova",
         kind: EditKind::Bool,
     },
     // [sparkle_words.feline]
@@ -857,6 +942,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_TONE_MELODY,
     EDIT_TRAIL_SOUND_BED,
     EDIT_TRAIL_SOUND_STYLE,
+    // Aural, no pixels — the same rationale as their five siblings above.
+    EDIT_TRAIL_SOUND_RIFF,
+    EDIT_BELL_SOUND,
     EDIT_PALETTE,
     EDIT_CURSOR_TRAIL_PACKS,
     EDIT_FONT_FEATURES,
@@ -1163,6 +1251,8 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TRAIL_SOUNDS
         | EDIT_TONE_MELODY
         | EDIT_TRAIL_SOUND_BED
+        | EDIT_TRAIL_SOUND_RIFF
+        | EDIT_BELL_SOUND
         | EDIT_CURSOR_BLINK
         | EDIT_OPTION_AS_META
         | EDIT_CONFIRM_MULTILINE_PASTE
@@ -1958,6 +2048,17 @@ pub(crate) fn section_of(key: &str) -> Section {
     if key.starts_with("update.") {
         return Section::Terminal;
     }
+    // THE SOUND MENU (owner ask: "add the volume and SFX menu to settings").
+    // Every audible knob in the product answers to ONE pane, so the box below
+    // reads as a menu instead of rows scattered across unrelated sections. The
+    // curse BONK is the exception that proves it: it lives under
+    // `[sparkle_words.profanity]` in the file, but it is an SFX, so it is
+    // routed here BEFORE the decorative-table prefix rule below — otherwise the
+    // single loudest sparkle-words gesture would sit two panes away from the
+    // volume slider that scales it.
+    if SOUND_MENU_KEYS.contains(&key) {
+        return Section::Cursor;
+    }
     if key.starts_with("sparkle_words.") || key.starts_with("matrix_rain.") {
         return Section::Appearance;
     }
@@ -2012,10 +2113,6 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_STYLE
-        | EDIT_TRAIL_SOUNDS
-        | EDIT_TONE_MELODY
-        | EDIT_TRAIL_SOUND_BED
-        | EDIT_TRAIL_SOUND_STYLE
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
@@ -2032,13 +2129,11 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_MOTION
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
-        // The rest of the trail/aurora surface (sound level, packs — the
-        // colour overrides route via the early trail-colour return above) +
-        // the stream-fade motion pair live with the cursor FX.
-        EDIT_TRAIL_SOUND_VOLUME
-        | EDIT_CURSOR_TRAIL_PACKS
-        | EDIT_STREAM_FADE
-        | EDIT_STREAM_FADE_MS => Section::Cursor,
+        // The rest of the trail/aurora surface (packs — the colour overrides
+        // route via the early trail-colour return above) + the stream-fade
+        // motion pair live with the cursor FX. The sound level moved to the
+        // Sound menu with its siblings (see [`SOUND_MENU_KEYS`]).
+        EDIT_CURSOR_TRAIL_PACKS | EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => Section::Cursor,
         // The shell program + argv are terminal-session settings.
         EDIT_SHELL | EDIT_SHELL_ARGS => Section::Terminal,
         EDIT_FONT_PX
@@ -2076,8 +2171,17 @@ pub(crate) fn section_of(key: &str) -> Section {
 /// (fields keep their [`editable_fields`] build order within a group). Callers that
 /// include an ungrouped key place it in a trailing per-section "General" box.
 pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
+    // THE SOUND MENU, before every prefix rule below: the owner asked for ONE
+    // coherent Sound surface — "the master volume slider plus the SFX toggles,
+    // GROUPED so it reads as a menu rather than rows scattered across unrelated
+    // boxes". This box IS that menu. It opens right after "Trail effect" (order
+    // 2) because the keystroke palette is the aural half of the trail, and the
+    // motion/colour/GPU boxes shift down one to make room.
+    if SOUND_MENU_KEYS.contains(&key) {
+        return ("Sound", 2);
+    }
     if matches!(key, EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT) {
-        return ("Trail color", 3);
+        return ("Trail color", 4);
     }
     if COLOR_KEYS.contains(&key) {
         return ("Colors", 1);
@@ -2115,32 +2219,28 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_STYLE
-        | EDIT_TRAIL_SOUNDS
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
         | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_CURSOR_TRAIL_RING => ("Trail effect", 1),
-        EDIT_MOTION | EDIT_LOAD_ADAPTIVE_MOTION => ("Motion", 2),
+        EDIT_MOTION | EDIT_LOAD_ADAPTIVE_MOTION => ("Motion", 3),
         // The extended trail surface rides the same box, after the basics
         // (colour identity and the GPU light knobs get their own boxes below).
-        EDIT_TRAIL_SOUND_VOLUME
-        | EDIT_TONE_MELODY
-        | EDIT_TRAIL_SOUND_BED
-        | EDIT_TRAIL_SOUND_STYLE
-        | EDIT_CURSOR_TRAIL_PACKS => ("Trail effect", 1),
+        // The sound rows left for the "Sound" menu box above.
+        EDIT_CURSOR_TRAIL_PACKS => ("Trail effect", 1),
         // Colour identity: the overrides route via the early COLOR-KEYS return;
         // the custom sprite art rides beside them.
-        EDIT_CURSOR_NYAN_SPRITE => ("Trail color", 3),
+        EDIT_CURSOR_NYAN_SPRITE => ("Trail color", 4),
         EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
         | EDIT_CURSOR_FIRE_SHIMMER
         | EDIT_HDR_GLOW
-        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Light & GPU", 4),
+        | EDIT_CURSOR_GLOW_SDR_BOOST => ("Light & GPU", 5),
         // M2 stream fade is its own motion pair, not part of the trail.
-        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Stream fade", 5),
+        EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => ("Stream fade", 6),
         // Typography splits into four scannable boxes (was one 22-row "Font" wall):
         // which faces / how glyphs join / where lines sit / how stems rasterize.
         EDIT_FONT_FAMILY
@@ -2231,6 +2331,45 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         }
         "Stream fade" => {
             "Fresh live-bottom output fades. It is instant with Reduce Motion, an unfocused window, full-screen apps, scrollback, input, or Serious Mode."
+        }
+        // The Sound box's consequence copy states the ONE fact its rows cannot:
+        // this box holds TWO independent audio paths, not one. Every row except
+        // [`EDIT_BELL_SOUND`] is a SYNTH voice — cue-borne, subordinate to
+        // `trail_sounds` and scaled by `trail_sound_volume` (see
+        // `app_render::{trail_sound_gain, sing_riff_gain, bonk_sound_gain}`).
+        // The bell is the OS alert sound, emitted from `lib.rs::on_bell`, which
+        // reads NEITHER of those keys — so the master switch and the volume
+        // both stop at the box's edge, and a user who mutes Music effects
+        // expecting silence would still be beeped at.
+        //
+        // Earlier copy said only that Volume misses the bell and called Music
+        // effects "the master switch" flatly; that overclaimed the master, which
+        // is why the scope is now spelled out.
+        //
+        // THE CURSE BONK USED TO BE A SECOND, UNDISCLOSED EXCEPTION (skeptic's
+        // finding, 2026-08-09): `app_render::bonk_sound_gain` took no
+        // `trail_sounds` input at all, so muting Music effects and typing
+        // profanity still bonked. Two honest laws were available — name the
+        // bonk here as a second exception, or make the code match the sentence
+        // — and the code was changed, because the bonk is a synth voice by
+        // every other measure (same `TrailAudio` host, same `trail_sound_volume`
+        // scaling, same `SoundVoice` register) and a user who mutes "Music
+        // effects" is asking for silence. The sentence below is therefore now
+        // literally true of every voice, and the bell is the only exception
+        // left. Pinned behaviourally by
+        // `app_render::curse_bonk_drain_tests::music_effects_off_*` — the old
+        // wiring test only grepped source text for accessor names and could
+        // never have seen this.
+        //
+        // Every other caveat (silent with
+        // the trail off, with the window unfocused, under Serious Mode, or on a
+        // platform without audio) already has a per-row disclosure
+        // (`native_settings::settings_effect_note`), and this string is
+        // budgeted: a long footnote can consume a whole 320 pt page at 2× text
+        // and leave no room for a control
+        // (`advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts`).
+        "Sound" => {
+            "Music effects in Top Settings is the master switch for the synth voices; Volume scales them. Neither reaches the terminal bell's system alert sound."
         }
         "Trail color" => {
             "Blank colors follow the active terminal theme; Nyan uses its built-in sprite."
@@ -2533,6 +2672,16 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         }
         EDIT_TONE_MELODY => &["tone", "mood", "melody", "music", "classifier", "sound"],
         EDIT_TRAIL_SOUND_BED => &["bed", "ambient", "drone", "texture", "background", "sound"],
+        // Discovery aliases for the riff: a user hunting it will type what they
+        // HEAR ("song", "loud"), not the internal gesture name.
+        EDIT_TRAIL_SOUND_RIFF => &[
+            "riff", "sing", "song", "celebration", "music", "loud", "sound", "sfx",
+        ],
+        // Likewise the bell: "beep" and "alert" are what the sound is called
+        // outside this codebase.
+        EDIT_BELL_SOUND => &[
+            "bell", "beep", "alert", "bel", "audible", "sound", "sfx", "notification",
+        ],
         EDIT_TRAIL_SOUND_STYLE => &[
             "mechanical",
             "keyboard",
@@ -2798,6 +2947,20 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
         k if k.starts_with("update.") => &["update", "channel", "github", "release"],
+        // The bonk keys are sparkle-words leaves in the file but SFX in the UI:
+        // give them the sound vocabulary too, or the one sparkle gesture a user
+        // searches for by ear ("bonk", "sound") would be findable only under
+        // "sparkle".
+        EDIT_SPARKLE_BONK | EDIT_SPARKLE_BONK_DETONATION => &[
+            "bonk",
+            "curse",
+            "profanity",
+            "swear",
+            "sound",
+            "sfx",
+            "sparkle",
+            "words",
+        ],
         k if k.starts_with("sparkle_words.") => &["sparkle", "words", "decorations", "effects"],
         k if k.starts_with("matrix_rain.") => &["matrix", "rain", "phosphor", "effects"],
         _ => &[],
@@ -3174,6 +3337,20 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
+            // THE MASTER VOLUME, built here rather than 600 rows down with the
+            // leftovers: rows sort by (group order, BUILD order), so the owner's
+            // "master volume slider plus the SFX toggles" only reads as a menu
+            // if the slider follows the master switch it scales.
+            label: "Sound volume",
+            key: EDIT_TRAIL_SOUND_VOLUME,
+            kind: EditKind::Float,
+            seed: cfg.trail_sound_volume.map(|v| format!("{v}")),
+            placeholder: match cfg.trail_sound_volume {
+                Some(v) => format!("{v}"),
+                None => "0.4 (default)".to_string(),
+            },
+        },
+        EditField {
             // Tone melody: the trail sound's melody leans with the inferred
             // mood of the line being typed (a tiny on-device multilingual
             // classifier over TYPED input only — never screen content, never
@@ -3214,6 +3391,31 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .trail_sound_style
                 .clone()
                 .unwrap_or_else(|| format!("{DEFAULT_TRAIL_SOUND_STYLE} (default)")),
+        },
+        EditField {
+            // THE SING-ALONG RIFF's own switch (owner ask). It is TIER 5 — the
+            // loudest thing the engine emits — and until now the only ways to
+            // quiet it were the master switch (kills every sound) or the volume
+            // (turns your keystrokes down with it). Default ON: a shipped
+            // feature, so this is the opt-OUT. Sound only; the celebration's
+            // ribbon, star shower and dancing cat keep running.
+            label: "Sing-along riff",
+            key: EDIT_TRAIL_SOUND_RIFF,
+            kind: EditKind::Bool,
+            seed: Some(cfg.trail_sound_riff_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // THE AUDIBLE BEL (owner ask): the one sound in the product with no
+            // key at all. It is an OS alert sound (NSBeep / MessageBeep), NOT a
+            // synth voice, so `trail_sound_volume` never reached it. Default ON
+            // — turning it off silences only the beep; the visual flash and the
+            // urgent-window request still surface background activity.
+            label: "Terminal bell sound",
+            key: EDIT_BELL_SOUND,
+            kind: EditKind::Bool,
+            seed: Some(cfg.bell_sound_or_default().to_string()),
+            placeholder: String::new(),
         },
         EditField {
             label: "Trail duration",
@@ -3779,16 +3981,9 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 .unwrap_or_else(|| "theme palette — #RRGGBB by index, comma-separated".to_string()),
             seed: palette,
         },
-        EditField {
-            label: "Trail sound volume",
-            key: EDIT_TRAIL_SOUND_VOLUME,
-            kind: EditKind::Float,
-            seed: cfg.trail_sound_volume.map(|v| format!("{v}")),
-            placeholder: match cfg.trail_sound_volume {
-                Some(v) => format!("{v}"),
-                None => "0.4 (default)".to_string(),
-            },
-        },
+        // (The Sound-menu rows — master, volume, palette, melody, bed, riff and
+        // the terminal bell — are built together above, so the box paints in
+        // the order the owner asked to read it.)
         // (The trail colour/accent, kitty sprite, comet-geometry, bloom, shimmer
         // and HDR/SDR glow ROWS live in the core list above — one row per key.)
         EditField {

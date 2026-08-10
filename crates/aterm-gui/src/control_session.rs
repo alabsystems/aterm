@@ -14,6 +14,9 @@ use aterm_session::{EdgeToken, Op, SessionId};
 
 use super::{Scope, json_ok, json_str_field, pct_encode};
 use crate::session_store::Store;
+use crate::session_timeline::{
+    MetaEdit, MetaField, MetaWriteError, apply_meta_value, write_session_meta,
+};
 use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
@@ -1224,53 +1227,52 @@ pub(crate) fn cmd_meta(
                     false,
                 );
             };
-            let Some(cap) = crate::session_timeline::SessionMeta::cap(field) else {
+            let Some(typed) = MetaField::parse(field) else {
                 return (
                     "ERR unknown meta field (title|description|icon)\n".to_string(),
                     false,
                 );
             };
             // The VALUE is the raw remainder after the field token (single-space
-            // grammar like `turn`), trimmed — token iteration would collapse
-            // interior whitespace the caller meant to keep.
+            // grammar like `turn`) — token iteration would collapse interior
+            // whitespace the caller meant to keep. This is WIRE GRAMMAR and stops
+            // here: everything below is the shared policy ladder, which a GUI
+            // caller (already holding a discrete value) enters directly.
             let value = rest
                 .split_once("set")
                 .and_then(|(_, r)| r.trim_start().split_once(char::is_whitespace))
-                .map_or("", |(_, v)| v)
-                .trim();
-            if value.is_empty() {
-                return (
+                .map_or("", |(_, v)| v);
+            match write_session_meta(ctx, typed, MetaEdit::Set(value)) {
+                Ok(changed) => ("OK\n".to_string(), changed),
+                // On the wire `meta set title ""` is a USAGE ERROR, never a
+                // clear: clearing has its own explicit `meta unset` form.
+                Err(MetaWriteError::Empty) => (
                     "ERR usage: meta set <title|description|icon> <text...>\n".to_string(),
                     false,
-                );
-            }
-            if crate::session_timeline::metadata_has_forbidden_formatting(value) {
-                return (
+                ),
+                Err(MetaWriteError::ForbiddenFormatting) => (
                     format!(
                         "ERR {field} must be single-line and contain no control, bidi, or invisible formatting characters\n"
                     ),
                     false,
-                );
+                ),
+                Err(MetaWriteError::TooLong { cap }) => {
+                    (format!("ERR {field} too long (max {cap} bytes)\n"), false)
+                }
             }
-            if value.len() > cap {
-                return (format!("ERR {field} too long (max {cap} bytes)\n"), false);
-            }
-            let value = crate::session_timeline::sanitize_metadata_value(field, value)
-                .expect("non-empty validated metadata has a canonical value");
-            let changed = set_meta_field(ctx, field, Some(value));
-            ("OK\n".to_string(), changed)
         }
         Some("unset") => {
             let Some(field) = toks.next() else {
                 return ("ERR usage: meta unset <field>\n".to_string(), false);
             };
-            if crate::session_timeline::SessionMeta::cap(field).is_none() {
+            let Some(field) = MetaField::parse(field) else {
                 return (
                     "ERR unknown meta field (title|description|icon)\n".to_string(),
                     false,
                 );
-            }
-            let changed = set_meta_field(ctx, field, None);
+            };
+            // A clear has no validation ladder to run, so it applies directly.
+            let changed = apply_meta_value(ctx, field, None);
             ("OK\n".to_string(), changed)
         }
         Some(_) => (
@@ -1313,44 +1315,6 @@ fn meta_status(
         opt(meta.icon.as_deref()),
         opt(cwd.as_deref()),
     )
-}
-
-/// Apply one `meta set`/`unset` mutation and — on an ACTUAL change — record the
-/// `meta-change` timeline event (`field=<f> value=<pct|->`).
-///
-/// ATOMICITY: the timeline record happens WHILE the meta guard is still held —
-/// the one sanctioned meta→timeline nesting (documented on `SessionCtx`). The
-/// control socket runs concurrent worker threads, so two authorized `meta set`s
-/// racing on one session must not interleave between the store and the record:
-/// dropping the meta guard first lets the pair invert (store A,B — record B,A),
-/// leaving every `subscribe … events` watcher and the `timeline` verb with a
-/// LAST event that names the LOSING value while the stored meta, the bare
-/// `meta` readout, and the tab label all show the winner. Holding the guard
-/// across the record makes event-stream order match store order by
-/// construction. Deadlock-free: no other site takes these two nested, and
-/// timeline is a leaf everywhere (nothing locks meta under timeline).
-fn set_meta_field(ctx: &SessionCtx, field: &str, value: Option<String>) -> bool {
-    let payload_value = value.as_deref().map_or_else(|| "-".to_string(), pct_encode);
-    let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-    let changed = meta.set(field, value).unwrap_or(false);
-    if changed {
-        // `field` is a validated table token (title|description|icon) — safe to
-        // print verbatim; only the VALUE is free text and it is pct-encoded.
-        let field: &'static str = match field {
-            "title" => "title",
-            "description" => "description",
-            _ => "icon",
-        };
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record(
-                "meta-change",
-                format!("field={field} value={payload_value}"),
-            );
-    }
-    drop(meta);
-    changed
 }
 
 /// `timeline [<n>] [since=<id>]` -> the session's EVENT TIMELINE, oldest-first,
@@ -1586,60 +1550,4 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
         }
     };
     format!("OK {} {} {}\n", ctx.self_id.as_str(), ctx.nonce.to_hex(), s)
-}
-
-/// Concurrency proof for [`set_meta_field`]: the meta store and the timeline
-/// record are ATOMIC with respect to racing `meta set`s (the record is taken
-/// while the meta guard is held), so the event stream can never invert against
-/// the finally-stored value. The control socket runs a pool of worker threads;
-/// before the fix, two writers could interleave store(A) store(B) record(B)
-/// record(A) — every `subscribe … events` watcher and the `timeline` verb then
-/// ended on an event naming A while the store, the bare `meta` readout, and
-/// the tab label all showed B.
-#[cfg(test)]
-mod meta_atomicity_tests {
-    use super::set_meta_field;
-
-    /// Hammer one session's title from several threads, then require the LAST
-    /// recorded `meta-change` event to name exactly the value the store ended
-    /// on. Deterministically true with the guard-held record; reliably flaky
-    /// without it (the race window was the whole guard-drop → record gap).
-    #[test]
-    fn racing_meta_sets_keep_the_last_event_matching_final_state() {
-        let ctx = crate::stub_session(0).ctx.clone();
-        let threads: Vec<_> = (0..8)
-            .map(|i| {
-                let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    for j in 0..50 {
-                        set_meta_field(&ctx, "title", Some(format!("t{i}-{j}")));
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
-        }
-        let final_title = ctx
-            .meta
-            .lock()
-            .unwrap()
-            .get("title")
-            .expect("some writer won")
-            .to_string();
-        let tl = ctx.timeline.lock().unwrap();
-        let last = tl
-            .since(None)
-            .filter(|e| e.kind == "meta-change")
-            .last()
-            .expect("changes were recorded");
-        assert_eq!(
-            last.payload,
-            format!(
-                "field=title value={}",
-                crate::control::pct_encode(&final_title)
-            ),
-            "the final meta-change event names the finally-stored value"
-        );
-    }
 }

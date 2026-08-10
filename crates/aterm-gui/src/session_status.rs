@@ -274,10 +274,15 @@ impl StatusFsm {
     fn note_activity(&mut self, sample: &ActivitySample, now: Instant) {
         let identity = (sample.alt_screen, sample.content_seq);
         match self.prior {
-            Some((prior_alt, prior_seq)) if prior_alt == sample.alt_screen => {
-                if sample.content_seq != prior_seq {
-                    self.last_movement = Some(now);
-                }
+            // MOVEMENT is only inferable within ONE grid: same screen, and the
+            // content counter actually advanced. Both conditions belong in the
+            // arm's guard — split across a nested `if`, the "same screen but the
+            // counter stood still" case reads like a distinct outcome when it is
+            // the same no-op as the fallthrough below.
+            Some((prior_alt, prior_seq))
+                if prior_alt == sample.alt_screen && sample.content_seq != prior_seq =>
+            {
+                self.last_movement = Some(now);
             }
             // First sample, or an alt-screen transition: adopt the new identity
             // without inferring movement.

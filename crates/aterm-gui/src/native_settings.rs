@@ -2934,6 +2934,16 @@ fn settings_field_is_visible(key: &str, modified_only: bool, global_search: bool
     {
         return false;
     }
+    // THE BONK IS AN SFX, NOT A KEYWORD-TOY INTERNAL (owner ask: deliver ONE
+    // coherent Sound surface). It is the single loudest `[sparkle_words]`
+    // gesture and it is scaled by the same `trail_sound_volume` slider as the
+    // keystrokes, so leaving it behind the blanket keyword-toy rule below would
+    // put the switch two panes away from the dial that governs it. Everything
+    // else under `sparkle_words.` — lexicons, palettes, animation tuning —
+    // stays Manual-only exactly as before.
+    if key == prefs::EDIT_SPARKLE_BONK || key == prefs::EDIT_SPARKLE_BONK_DETONATION {
+        return modified_only || native_advanced_key(key);
+    }
     if key.starts_with("sparkle_words.") {
         return modified_only
             || (global_search && (key == SPARKLE_WORDS_KEY || key == KEYWORD_KITTIES_KEY));
@@ -3050,7 +3060,37 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // both consumed by `trail_audio`, neither reachable from Settings —
         // the same gap as the intensity dial above.
         | prefs::EDIT_TRAIL_SOUND_VOLUME
-        | prefs::EDIT_TRAIL_SOUND_STYLE => Some(Effect::EffectsRuntime),
+        | prefs::EDIT_TRAIL_SOUND_STYLE
+        // THE SOUND MENU (owner ask: "add the volume and SFX menu to
+        // settings"). Each of these was already shipping, already consumed,
+        // and reachable ONLY by hand-editing `aterm.toml` — the exact defect
+        // the intensity dial above was retained to fix, repeated across every
+        // remaining audible knob:
+        //   * `tone_melody`     — `app_render`/`app_input` read
+        //                         `Config::tone_melody_or_default` to pick the
+        //                         synth's scale table;
+        //   * `trail_sound_bed` — `app_render` stamps
+        //                         `Config::trail_sound_bed_or_default` on every
+        //                         emitted event as `SoundEvent::bed`;
+        //   * `trail_sound_riff`— the sing-along's own gate (see below);
+        //   * the two BONK keys — `drain_curse_bonk_cues` reads them per tick;
+        //                         they are `[sparkle_words]` leaves in the file
+        //                         but SFX in the UI, so they belong in this
+        //                         menu rather than two panes away.
+        | prefs::EDIT_TONE_MELODY
+        | prefs::EDIT_TRAIL_SOUND_BED
+        | prefs::EDIT_TRAIL_SOUND_RIFF
+        | prefs::EDIT_SPARKLE_BONK
+        | prefs::EDIT_SPARKLE_BONK_DETONATION => Some(Effect::EffectsRuntime),
+        // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
+        // it is the OS alert sound (`NSBeep` / `MessageBeep`), which is why
+        // `trail_sound_volume` never reached it and why it had no key at all.
+        // Platform-gated exactly like `confirm_multiline_paste`: macOS and
+        // Windows have a beep call to suppress, other platforms have none, so
+        // the row appears only where turning it off does something.
+        prefs::EDIT_BELL_SOUND => {
+            cfg!(any(target_os = "macos", windows)).then_some(Effect::TerminalRuntime)
+        }
         prefs::EDIT_RESTORE_SESSION => Some(Effect::SessionRuntime),
         prefs::EDIT_PACKAGES_ENABLED
         | prefs::EDIT_PACKAGES_AUTO_UPDATE
@@ -10454,6 +10494,28 @@ const TRAIL_TUNING_KEYS: &[&str] = &[
     prefs::EDIT_HDR_GLOW,
     prefs::EDIT_CURSOR_GLOW_SDR_BOOST,
     prefs::EDIT_TRAIL_SOUND_VOLUME,
+    // The melody and the bed are cut from the SAME cloth as the volume already
+    // listed here: both are carried ONLY on events produced by
+    // `CursorGlow::drain_sound_cues`, and the glow "only records cues when it
+    // actually spawned light", so with `cursor_trail = false` there are no cues
+    // and both are genuinely silent. Listing them earns each row the honest
+    // "Inactive · Cursor trail Off" disclosure instead of a switch that looks
+    // live and does nothing.
+    prefs::EDIT_TONE_MELODY,
+    prefs::EDIT_TRAIL_SOUND_BED,
+    // DELIBERATELY ABSENT — each of these is still audible with the trail off,
+    // so claiming otherwise would be a false disclosure, which is worse than
+    // none:
+    //   * `trail_sound_riff` — the sing-along is gated on `glow_cfg.STYLE`, and
+    //     `resolve_cursor_glow` derives `style` from the style STRING
+    //     independently of `enabled` ("invalid/off values carry a harmless
+    //     concrete enum"). With `cursor_trail = false` and the default rainbow
+    //     kitty style the riff still sings. It gets its own Music-effects
+    //     disclosure below instead, which IS one of its real gates.
+    //   * `trail_sound_style` — it voices the curse BONK as well as the trail,
+    //     and the bonk rides the word-decoration tick, not the glow.
+    //   * the BONK keys and the terminal BELL — same reason, and the bell has no
+    //     trail relationship at all.
 ];
 
 fn theme_value_unavailability(state: &SettingsViewState, raw: &str) -> Option<EffectDisclosure> {
@@ -10641,11 +10703,36 @@ fn platform_unavailability(
             "macOS only · No effect here",
             "macOS only; no effect on this platform",
         )),
-        prefs::EDIT_TRAIL_SOUNDS | prefs::EDIT_TRAIL_SOUND_VOLUME if !availability.trail_audio => {
+        // Every SYNTH voice shares one output device, so they share one
+        // unavailability truth. The arm grew with the Sound menu: a user who can
+        // now see "Ambient sound bed" or "Sing-along riff" on a platform with no
+        // audio output deserves the same honest note the master and volume
+        // already carried. The terminal BELL is excluded on purpose — it is an
+        // OS alert sound, not a `trail_audio` voice, so it can still be audible
+        // where `trail_audio` is not.
+        prefs::EDIT_TRAIL_SOUNDS
+        | prefs::EDIT_TRAIL_SOUND_VOLUME
+        | prefs::EDIT_TRAIL_SOUND_STYLE
+        | prefs::EDIT_TONE_MELODY
+        | prefs::EDIT_TRAIL_SOUND_BED
+        | prefs::EDIT_TRAIL_SOUND_RIFF
+        | prefs::EDIT_SPARKLE_BONK
+        | prefs::EDIT_SPARKLE_BONK_DETONATION
+            if !availability.trail_audio =>
+        {
             Some(unavailable(
                 "Cursor-trail audio output is unavailable on this platform. The requested value is saved for a platform with audio support",
                 "Audio unavailable · Saved for portability",
                 "Audio unavailable on this platform; saved for portability",
+            ))
+        }
+        // The audible BEL has no beep call outside macOS/Windows, so the saved
+        // value is preserved but cannot suppress anything there.
+        prefs::EDIT_BELL_SOUND if !availability.macos && !availability.windows => {
+            Some(unavailable(
+                "The audible terminal bell is implemented with the macOS and Windows system alert sound. This platform emits no beep, so the saved value has nothing to suppress",
+                "macOS/Windows only · No beep here",
+                "macOS and Windows only; this platform emits no beep",
             ))
         }
         prefs::EDIT_BACKGROUND_OPACITY if !availability.macos => Some(unavailable(
@@ -10806,6 +10893,58 @@ fn parent_or_motion_inactivity(
         return motion_suppression(state, patch, motion);
     }
 
+    // SERIOUS MODE IS A REAL GATE ON EVERY AUDIBLE ROW, and it is stated FIRST
+    // because it is an OVERRIDE: it suppresses the sound whatever the row's own
+    // family gate says, so a "Cursor trail is Off" note underneath it would
+    // send the user to fix the wrong switch. Same precedence
+    // [`motion_suppression`] uses for every other effect it covers.
+    //
+    // The three synth seams read it directly
+    // (`app_render` resolves gain through
+    // `SeriousEffect::TerminalSound` at the single-pane tick, the single-pane
+    // present and the split-pane compose) and so does `lib.rs::on_bell`, so
+    // every one of these rows really is silent while it is on.
+    //
+    // EXCLUDES the rows that ALREADY carry this note from another branch, so it
+    // is authored once per row rather than raced between two blocks:
+    // `trail_sounds` takes it from the cursor-trail block's
+    // [`motion_suppression`] below, and the two BONK keys take it from the
+    // keyword-toy branch (they are `sparkle_words.*` leaves). Every audible row
+    // ends up disclosing it — pinned by
+    // `serious_mode_is_disclosed_on_the_sound_rows_it_silences`.
+    if matches!(
+        key,
+        prefs::EDIT_TRAIL_SOUND_VOLUME
+            | prefs::EDIT_TRAIL_SOUND_STYLE
+            | prefs::EDIT_TONE_MELODY
+            | prefs::EDIT_TRAIL_SOUND_BED
+            | prefs::EDIT_TRAIL_SOUND_RIFF
+            | prefs::EDIT_BELL_SOUND
+    ) && serious_mode_active(state, patch, motion)
+    {
+        return Some(inactive(
+            "This sound setting is saved but inactive because Serious Mode suppresses nonessential sound",
+            "Inactive · Serious Mode",
+            "Currently inactive: Serious Mode",
+        ));
+    }
+
+    // THE SING-ALONG RIFF's real gate, stated BEFORE the cursor-trail block so
+    // it cannot inherit that block's claim. The riff is NOT trail-gated — it is
+    // gated on the trail STYLE, which `resolve_cursor_glow` derives from the
+    // style string whether or not the trail is enabled — so it still sings with
+    // `cursor_trail = false`. What DOES silence it is the master switch, which
+    // its gain call reads directly.
+    if key == prefs::EDIT_TRAIL_SOUND_RIFF
+        && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
+    {
+        return Some(inactive(
+            "The sing-along riff is saved but inactive while Music effects is Off",
+            "Inactive · Music effects Off",
+            "Currently inactive: Music effects is Off",
+        ));
+    }
+
     // Every one of the five flags below is `false` unless `key` is a cursor-trail
     // key, so gate the whole block on that cheap key-only test: `candidate_trail_resolution`
     // is a field-vector scan plus a `String` plus a walk of the trail-pack catalog,
@@ -10861,11 +11000,20 @@ fn parent_or_motion_inactivity(
                     "Currently inactive: Cursor trail is Off",
                 ));
             }
-            if key == prefs::EDIT_TRAIL_SOUND_VOLUME
-                && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
+            // The master switch subordinates every CUE-BORNE voice, not just
+            // the volume — so with Music effects Off the whole trail-sound part
+            // of the Sound box says so rather than one row of it. (The riff has
+            // its own copy of this above: it reaches here only when it is also
+            // trail-gated, which it is not.)
+            if matches!(
+                key,
+                prefs::EDIT_TRAIL_SOUND_VOLUME
+                    | prefs::EDIT_TONE_MELODY
+                    | prefs::EDIT_TRAIL_SOUND_BED
+            ) && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
             {
                 return Some(inactive(
-                    "Trail sound volume is saved but inactive while Music effects is Off",
+                    "This sound setting is saved but inactive while Music effects is Off",
                     "Inactive · Music effects Off",
                     "Currently inactive: Music effects is Off",
                 ));
@@ -10936,6 +11084,32 @@ fn parent_or_motion_inactivity(
                 "This keyword-toy setting is saved but inactive because Serious Mode hides playful effects",
                 "Inactive · Serious Mode",
                 "Currently inactive: Serious Mode",
+            ));
+        }
+        // THE TWO BONK KEYS ARE SFX, NOT DECORATIONS. They live under
+        // `[sparkle_words.profanity]` in the FILE, but the only thing either
+        // one moves is a synth voice pushed into `TrailAudio`
+        // (`app_render::bonk_sound_gain`) — so they inherit the Music-effects
+        // master exactly as the riff, the volume, the melody and the bed do.
+        // Stated HERE, below the Sparkle-Words master (which stops the cues
+        // being recorded at all, a more fundamental silence) and above the
+        // per-family branches, because it is the gate a user flipping the row
+        // is most likely to be surprised by: the row is in a keyword-toy group
+        // but the switch that silences it is in Top Settings.
+        //
+        // This disclosure only became TRUE with the 2026-08-09 fix that gave
+        // `bonk_sound_gain` its `trail_sounds` term; before it the bonk was the
+        // one synth voice that ignored the master, and claiming this note then
+        // would itself have been the lie.
+        if matches!(
+            key,
+            prefs::EDIT_SPARKLE_BONK | prefs::EDIT_SPARKLE_BONK_DETONATION
+        ) && !candidate_setting_bool(state, patch, prefs::EDIT_TRAIL_SOUNDS, true)
+        {
+            return Some(inactive(
+                "The curse bonk is a synth voice, so it is saved but inactive while Music effects is Off",
+                "Inactive · Music effects Off",
+                "Currently inactive: Music effects is Off",
             ));
         }
         if matches!(
@@ -15139,7 +15313,9 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
         return match route {
             SettingsRoute::Appearance => "Theme, color, contrast, and selection.",
             SettingsRoute::TextFonts => "Fonts, game faces, shaping, and glyphs.",
-            SettingsRoute::CursorMotion => "Cursor form, motion, and visual trails.",
+            // Names SOUND: the Sound menu lives on this page now, and a
+            // subtitle that promises only "visual trails" hides it.
+            SettingsRoute::CursorMotion => "Cursor, motion, trails, and sound.",
             SettingsRoute::WindowTabs => "Padding, chrome, and Smart Titles.",
             SettingsRoute::TabColor => "Any color for your selected tab.",
             SettingsRoute::KeyboardInput => "Keyboard, paste safety, and local echo.",
@@ -15158,7 +15334,9 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
         SettingsRoute::TextFonts => {
             "Typography, game title-screen faces, shaping, fallback, and glyph rendering."
         }
-        SettingsRoute::CursorMotion => "Cursor form, motion policy, and visual trails.",
+        SettingsRoute::CursorMotion => {
+            "Cursor form, motion policy, visual trails, and every sound aterm makes."
+        }
         SettingsRoute::WindowTabs => {
             "Window geometry, title and Description formatting, live Activity, and chrome."
         }
@@ -28190,6 +28368,527 @@ enabled = true
         );
     }
 
+    /// THE SOUND MENU, on the NATIVE surface (owner ask: "add the volume and
+    /// SFX menu to settings"). `settings.rs` pins the in-grid box; this pins the
+    /// native Advanced pane, where the routing actually has to hold: every
+    /// audible key reachable at all is reachable on ONE route under ONE caption,
+    /// and nothing audible is left behind in Manual except where the platform
+    /// has no host for it.
+    ///
+    /// NON-VACUOUS: it asserts its own preconditions — the menu is non-empty and
+    /// every member is a live registry row — and then names the six keys that
+    /// were Manual-only or non-existent before this change, so the test cannot
+    /// pass by surfacing nothing.
+    #[test]
+    fn native_sound_menu_is_one_box_on_one_route() {
+        let fields = prefs::editable_fields(&Config::default());
+        assert!(
+            prefs::SOUND_MENU_KEYS.len() >= 9,
+            "the Sound menu lost members: {:?}",
+            prefs::SOUND_MENU_KEYS
+        );
+        for key in prefs::SOUND_MENU_KEYS {
+            assert!(
+                fields.iter().any(|field| &field.key == key),
+                "{key} left the registry; the Sound menu would silently shrink"
+            );
+        }
+
+        // THE ROUTING CLAIM, SPELLED OUT rather than derived: every audible key
+        // must land on the same pane under the same caption. Naming them here
+        // means a misrouted key fails loudly instead of quietly dropping out of
+        // both sides of a self-derived comparison.
+        for key in [
+            "trail_sounds",
+            "trail_sound_volume",
+            "trail_sound_style",
+            "tone_melody",
+            "trail_sound_bed",
+            "trail_sound_riff",
+            "bell_sound",
+            "sparkle_words.profanity.bonk",
+            "sparkle_words.profanity.bonk_detonation",
+        ] {
+            assert!(
+                prefs::SOUND_MENU_KEYS.contains(&key),
+                "{key} is audible but absent from SOUND_MENU_KEYS"
+            );
+            assert_eq!(prefs::section_of(key), prefs::Section::Cursor, "{key}");
+            assert_eq!(prefs::group_of(key).0, "Sound", "{key}");
+        }
+        // Nothing NON-audible smuggled itself into the routing list.
+        assert_eq!(
+            prefs::SOUND_MENU_KEYS.len(),
+            9,
+            "the Sound menu's membership changed: {:?}",
+            prefs::SOUND_MENU_KEYS
+        );
+
+        let shown: Vec<&str> = prefs::SOUND_MENU_KEYS
+            .iter()
+            .copied()
+            .filter(|key| settings_field_is_visible(key, false, false))
+            .collect();
+
+        // The SEVEN rows the ordinary Advanced pane must paint: the volume
+        // slider, the palette, and the five voice toggles. Four of these shipped
+        // but were reachable only by hand-editing `aterm.toml`; one is new. If
+        // any regresses to Manual the menu is partial again and this fails by
+        // name rather than by a silently shorter list.
+        for required in [
+            prefs::EDIT_TRAIL_SOUND_VOLUME,
+            prefs::EDIT_TRAIL_SOUND_STYLE,
+            prefs::EDIT_TONE_MELODY,
+            prefs::EDIT_TRAIL_SOUND_BED,
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            prefs::EDIT_SPARKLE_BONK,
+            prefs::EDIT_SPARKLE_BONK_DETONATION,
+        ] {
+            assert!(
+                shown.contains(&required),
+                "{required} is not reachable from the native Sound menu"
+            );
+        }
+
+        // The audible BEL appears exactly where a beep call exists to suppress.
+        assert_eq!(
+            shown.contains(&prefs::EDIT_BELL_SOUND),
+            cfg!(any(target_os = "macos", windows)),
+            "the terminal bell row must not promise a beep this platform never makes"
+        );
+
+        // The MASTER switch is deliberately not duplicated into the box: it is a
+        // Top Setting ("Music effects"), and a second copy would let two
+        // controls disagree about one key. It stays findable by search.
+        assert!(
+            !settings_field_is_visible(prefs::EDIT_TRAIL_SOUNDS, false, false),
+            "the master belongs to Top Settings, not a second Advanced row"
+        );
+        assert!(
+            settings_field_is_visible(prefs::EDIT_TRAIL_SOUNDS, false, true),
+            "the master must still answer a global search for sound"
+        );
+        // …but the box must SAY where it went, or a user who opens Sound looking
+        // for the on/off switch finds seven rows and no master.
+        let note = prefs::group_footnote("Sound").expect("the Sound box needs consequence copy");
+        assert!(
+            note.contains("Music effects") && note.contains("Top Settings"),
+            "the Sound box must point at the master switch it does not host: {note}"
+        );
+        // …and it must SCOPE that master, because this box holds two
+        // independent audio paths. `lib.rs::on_bell` reads neither
+        // `trail_sounds` nor `trail_sound_volume`
+        // (`sound_menu_keys_are_read_at_their_consumers` pins that), so copy
+        // calling Music effects "the master switch" flatly promised a user that
+        // muting it would stop the beep. It does not.
+        assert!(
+            note.contains("synth voices") && note.contains("bell"),
+            "the Sound box must scope the master to the synth voices and name \
+             the bell as the exception: {note}"
+        );
+
+        // The bonk keys' escape from the keyword-toy rule is exact: their
+        // sparkle-words siblings stay Manual-only.
+        for sibling in [
+            "sparkle_words.profanity.density",
+            "sparkle_words.profanity.intensity",
+        ] {
+            assert!(
+                !settings_field_is_visible(sibling, false, false),
+                "{sibling} must stay a Manual-only keyword-toy internal"
+            );
+        }
+    }
+
+    /// THE SOUND ROWS DISCLOSE THEIR REAL GATES, AND ONLY THEIR REAL GATES.
+    ///
+    /// A false "Inactive" note is worse than none — it tells a user a control is
+    /// dead while the sound keeps playing. The two families in the Sound box
+    /// have DIFFERENT gates and this pins the difference:
+    ///
+    ///   * the melody and the ambient bed ride `CursorGlow::drain_sound_cues`,
+    ///     so `cursor_trail = false` really does silence them;
+    ///   * the sing-along riff does NOT — it is gated on `glow_cfg.STYLE`, and
+    ///     `resolve_cursor_glow` derives `style` from the style string
+    ///     regardless of `enabled`, so the riff still sings with the trail off.
+    ///     Its honest gate is the master switch.
+    ///
+    /// NON-VACUOUS: each case asserts the note it SHOULD carry as well as the
+    /// note it must not, so a projection that stopped disclosing anything at all
+    /// fails instead of passing the negative half.
+    #[test]
+    fn sound_rows_disclose_their_real_gates_and_no_false_ones() {
+        let availability = audited_availability();
+        let motion = crate::native_app::ViewMotionCx::default();
+
+        // Cue-borne voices: the trail really is their gate.
+        for key in [prefs::EDIT_TONE_MELODY, prefs::EDIT_TRAIL_SOUND_BED] {
+            let effect = projected_effect("cursor_trail = false\n", &[], key, availability, motion);
+            assert!(
+                effect_note_contains(&effect, "Cursor trail is Off"),
+                "{key} must disclose the trail gate it actually has: {effect:?}"
+            );
+            assert!(!effect.has_live_effect, "{key}");
+        }
+
+        // The riff: NOT trail-gated. It must not inherit that claim…
+        let trail_off = projected_effect(
+            "cursor_trail = false\n",
+            &[],
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            availability,
+            motion,
+        );
+        assert!(
+            !effect_note_contains(&trail_off, "Cursor trail is Off"),
+            "the riff still sings with the trail off; claiming otherwise is a lie: {trail_off:?}"
+        );
+
+        // …and it must disclose the master switch, which IS one of its gates.
+        let music_off = projected_effect(
+            "trail_sounds = false\n",
+            &[],
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&music_off, "Music effects is Off"),
+            "the riff must disclose the master switch that does silence it: {music_off:?}"
+        );
+        assert!(!music_off.has_live_effect);
+
+        // The BONK rides the word-decoration tick, not the glow: the trail being
+        // off must not claim it is inactive either.
+        let bonk_trail_off = projected_effect(
+            "cursor_trail = false\n",
+            &[],
+            prefs::EDIT_SPARKLE_BONK,
+            availability,
+            motion,
+        );
+        assert!(
+            !effect_note_contains(&bonk_trail_off, "Cursor trail is Off"),
+            "the bonk fires with the trail off: {bonk_trail_off:?}"
+        );
+        // Its REAL gate, asserted so the negative above cannot pass merely
+        // because the bonk stopped disclosing anything at all.
+        let bonk_master_off = projected_effect(
+            "[sparkle_words]\nenabled = false\n",
+            &[],
+            prefs::EDIT_SPARKLE_BONK,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&bonk_master_off, "Sparkle Words master is Off"),
+            "the bonk must disclose the sparkle master that does silence it: {bonk_master_off:?}"
+        );
+        // …and the MUSIC master, which since 2026-08-09 also silences it
+        // (`app_render::bonk_sound_gain`'s `trail_sounds` term). Both bonk
+        // rows, because both are sound-only leaves: `bonk_detonation` admits a
+        // cue KIND into the same synth and moves nothing on glass.
+        for key in [
+            prefs::EDIT_SPARKLE_BONK,
+            prefs::EDIT_SPARKLE_BONK_DETONATION,
+        ] {
+            let music_off =
+                projected_effect("trail_sounds = false\n", &[], key, availability, motion);
+            assert!(
+                effect_note_contains(&music_off, "Music effects is Off"),
+                "{key} must disclose the Music-effects master that does silence it: {music_off:?}"
+            );
+            assert!(!music_off.has_live_effect, "{key}");
+        }
+
+        // Platform truth: with no audio device the synth voices say so, while
+        // the terminal bell — an OS alert sound, not a synth voice — does not.
+        let silent = SettingsAvailability {
+            trail_audio: false,
+            ..availability
+        };
+        let muted_riff = projected_effect(
+            "",
+            &[],
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            silent,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&muted_riff, "Audio unavailable"),
+            "{muted_riff:?}"
+        );
+        let bell = projected_effect("", &[], prefs::EDIT_BELL_SOUND, silent, motion);
+        assert!(
+            !effect_note_contains(&bell, "Audio unavailable"),
+            "the OS bell does not need the trail-audio device: {bell:?}"
+        );
+    }
+
+    /// SERIOUS MODE IS DISCLOSED ON EVERY AUDIBLE ROW IT ACTUALLY SILENCES —
+    /// and on none that it does not.
+    ///
+    /// The Sound-menu census (`prefs::SOUND_MENU_KEYS`) deliberately keeps
+    /// `serious_mode` OUT of this box: it is a whole-product policy with its own
+    /// "Effect policy" home, and a second control for one key is exactly the
+    /// hazard that keeps the `trail_sounds` master in Top Settings. But it IS a
+    /// real gate — `SeriousEffect::TerminalSound` is read at all three
+    /// `app_render` sound seams and at `lib.rs::on_bell` — so the honest
+    /// surfacing is a per-row note, not a row. Without this every Sound row
+    /// reads "On" under Serious Mode while the machine is silent.
+    ///
+    /// NON-VACUOUS: every case asserts the DEFAULT posture is note-free first,
+    /// so a projection that started shouting "Serious Mode" at everything (or
+    /// that returned the note for reasons unrelated to serious mode) fails.
+    #[test]
+    fn serious_mode_is_disclosed_on_the_sound_rows_it_silences() {
+        let availability = audited_availability();
+        let motion = crate::native_app::ViewMotionCx::default();
+
+        for key in [
+            prefs::EDIT_TRAIL_SOUND_VOLUME,
+            prefs::EDIT_TRAIL_SOUND_STYLE,
+            prefs::EDIT_TONE_MELODY,
+            prefs::EDIT_TRAIL_SOUND_BED,
+            prefs::EDIT_TRAIL_SOUND_RIFF,
+            prefs::EDIT_BELL_SOUND,
+            // The bonks take the same note from the keyword-toy branch; pinning
+            // them here keeps the BOX's promise whole rather than one branch's.
+            prefs::EDIT_SPARKLE_BONK,
+            prefs::EDIT_SPARKLE_BONK_DETONATION,
+        ] {
+            let quiet = projected_effect("", &[], key, availability, motion);
+            assert!(
+                !effect_note_contains(&quiet, "Serious Mode"),
+                "{key} must not claim Serious Mode with Serious Mode off: {quiet:?}"
+            );
+            let serious = projected_effect("serious_mode = true\n", &[], key, availability, motion);
+            assert!(
+                effect_note_contains(&serious, "Serious Mode"),
+                "{key} is silent under Serious Mode and must say so: {serious:?}"
+            );
+            assert!(!serious.has_live_effect, "{key}");
+        }
+
+        // THE MASTER TOO — via the cursor-trail block's `motion_suppression`,
+        // not the sound branch above, which deliberately skips it. Pinned here
+        // anyway so the BOX's promise is whole: if the master ever stopped
+        // disclosing this, the Sound surface would have one row lying while its
+        // eight neighbours told the truth.
+        //
+        // Note the distinction the copy gets right: this describes the CURRENT
+        // STATE (with Serious Mode set, Music effects On is suppressed — true),
+        // not the ACTION (toggling this control ON clears Serious Mode rather
+        // than being suppressed by it —
+        // `top_effect_controls_truthfully_escape_the_serious_mode_override`).
+        let master = projected_effect(
+            "serious_mode = true\n",
+            &[],
+            prefs::EDIT_TRAIL_SOUNDS,
+            availability,
+            motion,
+        );
+        assert!(
+            effect_note_contains(&master, "Serious Mode"),
+            "Music effects On is silent under Serious Mode and must say so: {master:?}"
+        );
+    }
+
+    /// EVERY SOUND-MENU KEY IS READ AT ITS CONSUMER — the pin that stops this
+    /// panel from shipping a switch that does nothing.
+    ///
+    /// A row here is a PROMISE: flip it and the machine sounds different. The
+    /// registry, the schema, the disclosure and the Advanced allowlist can all
+    /// be satisfied by a key nothing reads, so the only thing that makes the
+    /// promise true is an accessor call at the emission site. That is a
+    /// CROSS-FILE property — `app_render.rs` emits the synth voices,
+    /// `lib.rs::on_bell` emits the OS alert sound — so it is pinned here by
+    /// reading those sources, alongside the behavioural tests that prove each
+    /// gate's semantics (`app_render::sing_riff_gain_tests`,
+    /// `lib::…::a_silenced_bell_never_consumes_the_audible_rate_limit_lane`).
+    ///
+    /// This replaces an earlier INVERTED handoff pin that asserted the
+    /// consumers did NOT read the two newest keys. It passed for exactly as
+    /// long as the switches were inert, which is the failure mode this test now
+    /// exists to catch.
+    ///
+    /// NON-VACUOUS: it asserts its own preconditions first — the rows are
+    /// Advanced-visible, the sources are non-empty, and each emission site it
+    /// scans for is still present — so it cannot rot into a pass by matching a
+    /// renamed or emptied file.
+    #[test]
+    fn sound_menu_keys_are_read_at_their_consumers() {
+        let render = include_str!("app_render.rs");
+        let host = include_str!("lib.rs");
+        let input = include_str!("app_input.rs");
+
+        // Precondition: the sources really loaded. An `include_str!` of a
+        // renamed file would not compile, but an emptied one would make every
+        // `contains` below fail loudly rather than pass — assert anyway so the
+        // failure names the cause.
+        assert!(
+            render.len() > 100_000 && host.len() > 100_000 && input.len() > 10_000,
+            "the consumer sources look truncated; the scans below are meaningless"
+        );
+
+        // Precondition: the rows really are on the audited Advanced surface, so
+        // a missing gate would be a visible lie rather than a dormant key.
+        assert!(
+            settings_field_is_visible(prefs::EDIT_TRAIL_SOUND_RIFF, false, false),
+            "the riff row is on the Advanced surface"
+        );
+        assert_eq!(
+            settings_field_is_visible(prefs::EDIT_BELL_SOUND, false, false),
+            cfg!(any(target_os = "macos", windows)),
+            "the bell row is on the Advanced surface exactly where a beep exists"
+        );
+
+        // Precondition: the emission sites these scans are about still exist.
+        assert!(
+            render.contains("fn sing_riff_event("),
+            "the sing-along riff event constructor moved; re-locate its gate"
+        );
+        assert_eq!(
+            render.matches("sing_riff_event(").count(),
+            // The constructor's own definition, plus the two pushes (the
+            // single-pane present and the split-pane compose).
+            3,
+            "the riff is pushed from exactly the two known render paths"
+        );
+        assert!(
+            host.contains("objc2_app_kit::NSBeep()") && host.contains("win32::beep()"),
+            "the audible bel emission sites moved; re-locate their gate"
+        );
+
+        // THE WIRING ITSELF. Each Sound-menu key names the accessor its
+        // consumer must call and the source that must call it.
+        for (key, accessor, consumers) in [
+            (
+                prefs::EDIT_TRAIL_SOUNDS,
+                "trail_sounds_or_default",
+                &[render][..],
+            ),
+            (
+                prefs::EDIT_TRAIL_SOUND_VOLUME,
+                "trail_sound_volume()",
+                &[render][..],
+            ),
+            (
+                prefs::EDIT_TRAIL_SOUND_STYLE,
+                "trail_sound_voice()",
+                &[render][..],
+            ),
+            (
+                prefs::EDIT_TONE_MELODY,
+                "tone_melody_or_default",
+                &[render, input][..],
+            ),
+            (
+                prefs::EDIT_TRAIL_SOUND_BED,
+                "trail_sound_bed_or_default",
+                &[render][..],
+            ),
+            // The two keys the inverted pin used to certify as UNWIRED.
+            (
+                prefs::EDIT_TRAIL_SOUND_RIFF,
+                "trail_sound_riff_or_default",
+                &[render][..],
+            ),
+            (prefs::EDIT_BELL_SOUND, "bell_sound_or_default", &[host][..]),
+            // The two BONK keys are `[sparkle_words]` leaves in the FILE but
+            // SFX in the UI; their accessors are named after the feature, not
+            // the key path.
+            (prefs::EDIT_SPARKLE_BONK, "curse_bonk_enabled()", &[render][..]),
+            (
+                prefs::EDIT_SPARKLE_BONK_DETONATION,
+                "curse_bonk_detonation_enabled()",
+                &[render][..],
+            ),
+        ] {
+            assert!(
+                prefs::SOUND_MENU_KEYS.contains(&key),
+                "{key} is pinned here but is not on the Sound menu"
+            );
+            assert!(
+                consumers.iter().any(|src| src.contains(accessor)),
+                "{key} is a Sound-menu row whose consumer never reads \
+                 `{accessor}` — the switch would do nothing"
+            );
+        }
+
+        // BOTH riff seams, not just one: a split pane must not sing a song a
+        // single pane suppresses. Both go through the one policy author,
+        // identified by the argument only a real render seam can pass — the
+        // window's RAW focus bit. Counting bare `sing_riff_gain(` instead would
+        // also count the function's own definition and its unit tests, which is
+        // a pin on this file's test layout rather than on the wiring.
+        let production_calls = render
+            .match_indices("sing_riff_gain(")
+            .filter(|(at, needle)| render[at + needle.len()..].trim_start().starts_with("ws.focused"))
+            .count();
+        assert_eq!(
+            production_calls, 2,
+            "both riff pushes must resolve gain through the one policy function"
+        );
+
+        // BOTH BONK SEAMS MUST FEED THE MASTER IN. This is a LAYOUT pin and it
+        // is deliberately not the proof: the law lives in
+        // `app_render::curse_bonk_drain_tests::music_effects_off_*` and the
+        // composed call site is pinned behaviourally by
+        // `split_sparkle_tests::a_composed_frame_stops_bonking_when_music_effects_is_off`.
+        // The SINGLE-PANE seam lives inside `redraw_window`, which needs a real
+        // present target and has no headless entry point, so this is what
+        // stands between it and silently regressing to the state the skeptic
+        // found on 2026-08-09 — a bonk that ignored the switch the Sound menu
+        // names as its master. Identified, like the riff pin above, by the
+        // argument only a real render seam passes.
+        let bonk_calls: Vec<&str> = render
+            .match_indices("bonk_sound_gain(")
+            .map(|(at, needle)| &render[at + needle.len()..])
+            .filter(|rest| rest.trim_start().starts_with("ws.focused"))
+            .collect();
+        assert_eq!(
+            bonk_calls.len(),
+            2,
+            "both bonk drains must resolve gain through the one policy function"
+        );
+        for rest in bonk_calls {
+            let head = &rest[..rest.len().min(600)];
+            assert!(
+                head.contains("bonk_master"),
+                "a bonk render seam resolves gain without the Music-effects \
+                 master: {head:?}"
+            );
+        }
+
+        // ORDER IS LOAD-BEARING for the bell: `BellRateLimiter::try_fire`
+        // MUTATES, so the key must be tested BEFORE it or a silenced bell burns
+        // the beep floor's token.
+        let gate = host
+            .find("bell_sound_or_default")
+            .expect("just asserted present");
+        let fire = host
+            .find("self.bell_beep.try_fire(now)")
+            .expect("the audible bell's rate limiter moved; re-locate the gate");
+        assert!(
+            gate < fire,
+            "`bell_sound` must short-circuit BEFORE the rate limiter consumes a token"
+        );
+
+        // THE TWO PATHS ARE INDEPENDENT — the fact the "Sound" footnote states.
+        // The BEL's whole gate chain runs from `fn on_bell(` to the limiter, and
+        // it must not contain the synth master or the synth volume: they are
+        // cue-borne trail-audio keys and the bell is an OS alert sound. If that
+        // ever changes, the footnote (and the bell row's disclosure, which
+        // deliberately carries no "Music effects Off" note) becomes a lie.
+        let on_bell = host.find("fn on_bell(").expect("the BEL handler moved");
+        let chain = &host[on_bell..fire];
+        assert!(
+            !chain.contains("trail_sounds_or_default") && !chain.contains("trail_sound_volume"),
+            "the OS alert sound must stay independent of the synth master and volume"
+        );
+    }
+
     #[test]
     fn visual_forms_hide_inert_and_compatibility_only_effect_controls() {
         for key in [
@@ -28304,14 +29003,42 @@ enabled = true
         // three were reachable ONLY from Manual. The audit found the owner
         // filing bugs — "too bright", "too quiet" — that these exact dials
         // answer. A knob a user cannot find is not restraint; it is a defect.
+        //
+        // THE SOUND MENU (owner ask: "add the volume and SFX menu to settings"):
+        // +5 on every platform, +1 more where the beep exists.
+        //   * `tone_melody`, `trail_sound_bed` — shipped, consumed by
+        //     `app_render`/`app_input` every frame, Manual-only until now;
+        //   * `sparkle_words.profanity.bonk` + `.bonk_detonation` — shipped and
+        //     consumed by `drain_curse_bonk_cues`; they were hidden by the
+        //     blanket keyword-toy rule even though they are SFX, not toy
+        //     internals;
+        //   * `trail_sound_riff` — NEW. The sing-along riff is TIER 5, the
+        //     loudest voice in the engine, and had no switch but the master and
+        //     the master volume;
+        //   * `bell_sound` — NEW, macOS/Windows only. The audible BEL had no key
+        //     at all and is not covered by `trail_sound_volume` (an OS alert
+        //     sound is not a synth voice), so it was the one genuinely
+        //     unreachable sound in the product.
+        //
+        // BOTH NEW KEYS ARE READ AT THEIR CONSUMERS — that is what makes this a
+        // +2 on the surface rather than +2 lies
+        // (`sound_menu_keys_are_read_at_their_consumers`, plus the behavioural
+        // pins `app_render::sing_riff_gain_tests` and
+        // `a_silenced_bell_never_consumes_the_audible_rate_limit_lane`).
+        //
+        // NOT counted, deliberately: `serious_mode`. It is a real gate on every
+        // audible path but a whole-product policy with escape semantics, so it
+        // stays a Top Effect control with its own "Effect policy" box and
+        // reaches this box as a per-row disclosure instead — the reasoning is
+        // recorded in full at `prefs::SOUND_MENU_KEYS`.
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                45
+                51
             } else if cfg!(windows) {
-                43
+                49
             } else {
-                41
+                46
             },
             "the audited Advanced surface changed; new expert keys belong in Manual"
         );
@@ -28342,6 +29069,10 @@ enabled = true
             // two trail-sound keys) surfaced the "Trail effect" caption, which
             // needs its own curated witness like every other group.
             ("Trail effect", prefs::EDIT_CURSOR_TRAIL_INTENSITY),
+            // The Sound menu's curated witness is the master VOLUME slider —
+            // the one control the owner named first, and the only one every
+            // other row in the box is scaled by.
+            ("Sound", prefs::EDIT_TRAIL_SOUND_VOLUME),
         ];
         if cfg!(target_os = "macos") {
             group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
@@ -28377,6 +29108,9 @@ enabled = true
             ("Scrollback", "Searchable lines"),
             ("Text direction & width", "right-to-left"),
             ("Permissions", "request access"),
+            // The Sound box's footnote must name what the VOLUME slider does
+            // and does not reach — the reason the bell needed its own row.
+            ("Sound", "Volume"),
         ] {
             if ordinary_groups.contains(group) {
                 let note = prefs::group_footnote(group)

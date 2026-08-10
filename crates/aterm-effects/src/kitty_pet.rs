@@ -116,6 +116,17 @@ const STRIDE_CELLS: f32 = 1.7;
 /// the stride tops the gallop out at ~7.6 cycles/s, so every frame holds the
 /// glass for at least two ticks.
 const RUN_STRIDE_CELLS: f32 = 3.4;
+/// THE FRAME-RATE LAW ITSELF, held where a violation cannot ship. Both terms
+/// are constants, so the gallop's worst-case cycle rate is decidable at build
+/// time — it does not need a test run to have happened, and a future speed-up
+/// of [`MAX_SPEED`] or a shortening of the stride fails the BUILD rather than
+/// waiting for someone to run the suite. What a test still owes is the part no
+/// constant can state: that the run gait actually USES this stride on glass —
+/// see `the_gallop_cycle_never_exceeds_half_frame_rate`.
+const _: () = assert!(
+    MAX_SPEED / RUN_STRIDE_CELLS <= 30.0,
+    "the gallop cycle must stay at or under half of 60 fps"
+);
 
 // ── the keep-ahead lead ─────────────────────────────────────────────────────
 //
@@ -1831,7 +1842,7 @@ impl PetBrain {
             && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
         {
             self.twitch_t = TWITCH_DUR;
-            self.twitch_up = self.mote_serial % 2 == 0;
+            self.twitch_up = self.mote_serial.is_multiple_of(2);
             self.mote_serial = self.mote_serial.wrapping_add(1);
         }
         // POINTER PLAY (wave 2): the pet's own pointer sensor — velocity EMA
@@ -2873,7 +2884,7 @@ impl PetBrain {
                     let seed = self.mote_serial;
                     self.mote_serial = self.mote_serial.wrapping_add(1);
                     // Alternate ♪ and ♥ deterministically by serial parity.
-                    let kind = if seed % 2 == 0 {
+                    let kind = if seed.is_multiple_of(2) {
                         PetMoteKind::Note
                     } else {
                         PetMoteKind::Heart
@@ -3148,7 +3159,7 @@ impl PetBrain {
             self.mote_serial = self.mote_serial.wrapping_add(1);
             // Note and heart ALTERNATE at every tier — a lone teal speck
             // was the old small-cheer, and it read as a z.
-            let kind = if seed % 2 == 0 {
+            let kind = if seed.is_multiple_of(2) {
                 PetMoteKind::Note
             } else {
                 PetMoteKind::Heart
@@ -3189,7 +3200,14 @@ impl PetBrain {
     fn resolve_motes(&mut self) -> [Option<PetMoteSprite>; PET_MOTES_MAX] {
         let mut out = [None; PET_MOTES_MAX];
         let clock = self.clock;
-        for i in 0..PET_MOTES_MAX {
+        // Walk the OUTPUT slots, carrying the index for the parallel
+        // `self.motes` lane. The two arrays are the same length and the same
+        // slot means the same mote in both, but they cannot be zipped: the body
+        // both frees a slot (`self.motes[i] = None`) and asks `self` a question
+        // (`zee_ink_fade`), so a mutable borrow of `self.motes` across the loop
+        // would not hold. Indexing only the lane that needs it keeps the
+        // out-of-bounds surface to the one array whose bound is the loop.
+        for (i, slot) in out.iter_mut().enumerate() {
             let Some(m) = self.motes[i] else { continue };
             let u = (clock - m.born) / m.life.max(0.01);
             if !(0.0..1.0).contains(&u) {
@@ -3200,7 +3218,7 @@ impl PetBrain {
             let fade_out = ((1.0 - u) / 0.35).clamp(0.0, 1.0);
             let spin = if m.seed % 2 == 0 { 1.0 } else { -1.0 };
             let wobble = (TAU * (u * 0.8 + 0.31 * f32::from(m.seed % 4))).sin();
-            out[i] = Some(match m.kind {
+            *slot = Some(match m.kind {
                 PetMoteKind::Dust => PetMoteSprite {
                     kind: m.kind,
                     // Kicked back along the skid, hugging the floor: a low
@@ -4532,11 +4550,9 @@ mod tests {
     /// be using it.
     #[test]
     fn the_gallop_cycle_never_exceeds_half_frame_rate() {
-        assert!(
-            MAX_SPEED / RUN_STRIDE_CELLS <= 30.0,
-            "the gallop cycle must stay at or under half of 60 fps, got {} Hz",
-            MAX_SPEED / RUN_STRIDE_CELLS
-        );
+        // The constant-vs-constant half of this law is a build-time `const _`
+        // beside `RUN_STRIDE_CELLS`; what is left here is the half only a run
+        // can show — that the gait on glass is the one that stride describes.
         // Drive a sustained chase: one column every three ticks (~20.8
         // cells/s) gallops the pet without ever tripping the pounce gap,
         // then measure cells travelled per stride cycle over the gallop.

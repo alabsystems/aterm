@@ -1355,10 +1355,7 @@ mod tests {
             assert!(w[1] > w[0], "P(Nuke) must climb each level: {nuke_pct:?}");
         }
         for w in flash_pct.windows(2) {
-            assert!(
-                w[1] <= w[0],
-                "P(Flash) must never climb: {flash_pct:?}"
-            );
+            assert!(w[1] <= w[0], "P(Flash) must never climb: {flash_pct:?}");
         }
         assert!(
             (nuke_pct[0] - 5.0).abs() < 1.0,
