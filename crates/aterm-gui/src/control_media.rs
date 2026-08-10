@@ -2116,6 +2116,26 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `status` -> the target session's SUBJECT + classified STATUS record, one
+/// versioned key=value line (RFC: Tab Subject & Status §8).
+///
+/// Read-only, with no sub-form: everything that could change a status is either
+/// the user's own metadata (`meta set`) or durable config (`settings set
+/// tab_status …`), so this verb only ever observes. A main-thread hop like
+/// `tone`/`panes` because the classifier lives in `App` state, which the control
+/// thread cannot reach; that also makes it work headless, which is what lets an
+/// end-to-end test assert on a classification at all.
+pub(crate) fn cmd_session_status(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
+    if !rest.trim().is_empty() {
+        return format!("ERR usage: status (got {:?})\n", rest.trim());
+    }
+    match call_main(proxy, |tx| Wake::ReadSessionStatus { session, reply: tx }) {
+        Ok(Ok(record)) => format!("OK {record}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
 /// `spawn [cwd=<path>]` -> mint ONE new tab session in the frontmost window and
 /// reply `OK <sid>` — birth as a socket primitive. The sid is live in the registry
 /// before the reply is sent, so `@<sid> …` works immediately: an orchestrator

@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "bat"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.57, center_x = 0.5, word_top = 1.0 }
+
+# Bat: dusk purple-grey round head, huge pointed ears, wide friendly eyes, tiny fangs.
+
+[[layer]]
+role = "outline"
+ref_fill = "#2B2333"
+recolor = "fixed"
+paths = ["M 34 84 C 34 60.8 54.6 42 80 42 C 105.4 42 126 60.8 126 84 C 126 107.2 105.4 126 80 126 C 54.6 126 34 107.2 34 84 Z", "M 44 4 C 34 26 30 54 36 78 L 74 60 C 68 34 56 16 44 4 Z", "M 116 4 C 126 26 130 54 124 78 L 86 60 C 92 34 104 16 116 4 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#756A88"
+recolor = "fixed"
+paths = ["M 38 84 C 38 63 57 46 80 46 C 103 46 122 63 122 84 C 122 105 103 122 80 122 C 57 122 38 105 38 84 Z", "M 45 10 C 37 29 34 53 39.5 74 L 69 60 C 63.5 38 54.5 22 45 10 Z", "M 115 10 C 123 29 126 53 120.5 74 L 91 60 C 96.5 38 105.5 22 115 10 Z"]
+
+[[layer]]
+role = "inner_ear"
+ref_fill = "#C79FB6"
+recolor = "fixed"
+paths = ["M 47 20 C 41.5 35 39.5 51 43.5 66 L 62 57 C 57.5 42 52.5 30 47 20 Z", "M 113 20 C 118.5 35 120.5 51 116.5 66 L 98 57 C 102.5 42 107.5 30 113 20 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#CFC6D8"
+recolor = "fixed"
+paths = ["M 54 102 C 54 93.2 65.6 86 80 86 C 94.4 86 106 93.2 106 102 C 106 110.8 94.4 118 80 118 C 65.6 118 54 110.8 54 102 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 52 75 C 52 70 55.6 66 60 66 C 64.4 66 68 70 68 75 C 68 80 64.4 84 60 84 C 55.6 84 52 80 52 75 Z", "M 92 75 C 92 70 95.6 66 100 66 C 104.4 66 108 70 108 75 C 108 80 104.4 84 100 84 C 95.6 84 92 80 92 75 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 60.3 71.5 C 60.3 70.3 61.3 69.3 62.5 69.3 C 63.7 69.3 64.7 70.3 64.7 71.5 C 64.7 72.7 63.7 73.7 62.5 73.7 C 61.3 73.7 60.3 72.7 60.3 71.5 Z", "M 100.3 71.5 C 100.3 70.3 101.3 69.3 102.5 69.3 C 103.7 69.3 104.7 70.3 104.7 71.5 C 104.7 72.7 103.7 73.7 102.5 73.7 C 101.3 73.7 100.3 72.7 100.3 71.5 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#9C5A72"
+recolor = "fixed"
+paths = ["M 80 88 C 84.5 88 87.5 91 86 94.5 C 84 98.5 76 98.5 74 94.5 C 72.5 91 75.5 88 80 88 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#4A3550"
+recolor = "fixed"
+paths = ["M 64 103 C 72 111 88 111 96 103 C 91 114 69 114 64 103 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 67.5 104.5 L 73.5 104.5 L 70.5 112 Z", "M 86.5 104.5 L 92.5 104.5 L 89.5 112 Z"]

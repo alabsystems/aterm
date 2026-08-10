@@ -2150,7 +2150,7 @@ mod tests {
         let fingerprint = |app: &mut App| {
             let titles = app.tab_titles(wid);
             let metadata = app.tab_strip_metadata(wid);
-            app.tab_strip_fingerprint_from_parts(&titles, &metadata, 0)
+            app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
         };
         let before = fingerprint(&mut app);
         feed_session0(&app, b"\x1b]7;file://localhost/aterm-proof/fingerprint\x07");
@@ -2210,7 +2210,7 @@ mod tests {
         let fingerprint = |app: &mut App| {
             let titles = app.tab_titles(wid);
             let metadata = app.tab_strip_metadata(wid);
-            app.tab_strip_fingerprint_from_parts(&titles, &metadata, 0)
+            app.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, 0)
         };
         let before = fingerprint(&mut app);
         app.pool

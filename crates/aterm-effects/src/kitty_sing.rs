@@ -51,7 +51,9 @@
 //! * LOAD-SHED — notes ride the sparkle emission branch, so the shed latch
 //!   sheds them with every other decoration.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path};
 

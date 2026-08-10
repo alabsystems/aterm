@@ -226,7 +226,100 @@ pub(crate) const fn twinkle_rgb(gold: bool) -> u32 {
 ///
 /// At 0.10 the waist rounds to the shipped 1 px hairline for every ordinary
 /// arm and only widens on genuine hero grains, which is what the ladder is for.
+///
+/// THE WAIST IS NOW THE ARM'S *BASE*, NOT ITS PROFILE — see [`STAR_TIP_COV`].
+/// A bar of this thickness held all the way to a square end is a `+`; the arm
+/// starts here and thins to a point.
 pub(crate) const STAR_WAIST: f32 = 0.10;
+
+// ─── THE TAPER ──────────────────────────────────────────────────────────────
+//
+// A SPARKLE COMES TO A POINT (owner, 2026-08-10: the needle star "is better",
+// and the marks the kit was drawing "read as PLUS SIGNS").
+//
+// Both rasterizers used to draw an arm as ONE primitive of constant thickness
+// held to a square end — additive as a rect, source-over as one falloff
+// ellipse — crossed with its twin over a square nucleus. That is the anatomy of
+// a typographic `+`, and no amount of thinning fixes it: a 1 px hairline with
+// hard ends is a thin plus, not a star.
+//
+// THE SHAPE ALREADY EXISTED IN THIS WORKSPACE. `aterm-render`'s `needle_star`
+// (the word decorations' own sparkle) draws each point as a needle whose
+// half-width shrinks to nothing along the arm — `hw = r·hw_frac·(1 − along/r)`
+// — over a small central disc. The cursor kit converges on THAT silhouette.
+//
+// AT TERMINAL SIZE A NEEDLE IS A COVERAGE RAMP. `needle_star` is rasterized
+// from a signed distance at word-decoration size, where an arm is 4-6 px wide
+// at the base and has room to narrow geometrically. A cursor star's arm is
+// `star_arm` ≈ 0.14 · cell_h ≈ 3-8 px LONG, and [`STAR_WAIST`] puts its base at
+// the 1-2 px the family's own anti-fat law allows (`STAR_WAIST`'s doc, three
+// separate owner reports). A needle that narrows from 1.5 px to 0.2 px does not
+// cross a pixel boundary — it just covers less and less of the one row it sits
+// in, and the anti-aliased truth of that is a BRIGHTNESS ramp along the arm.
+// So the taper is drawn as a bright BODY at the crossing and a short run of
+// dimmer, thinner spans running out to each point.
+//
+// This is the same statement on both grounds; only the arithmetic differs. The
+// additive arm ramps its per-span coverage (and, once an arm is thick enough to
+// have room, its span thickness); the source-over arm stacks a shorter BODY lay
+// over a full-length TIP lay, so the ink is heaviest at the crossing and
+// thinnest at the points.
+
+/// THE TAPER — the fraction of an arm's half-length that is drawn at FULL
+/// coverage, as one span through the crossing. Beyond it the arm is the point.
+///
+/// A bit under half. Less and the star loses the solid centre that makes it
+/// read as a mark at all (at `arm` 3-4 the body would be a single pixel); more
+/// and the point is too short a run to ramp over and the arm goes back to
+/// reading as a bar with a slightly soft end. 0.5 was the first capture and it
+/// tapered visibly; 0.42 gives the ramp one more pixel to work in at the sizes
+/// the starfield actually draws, which is what turns "soft-ended cross" into
+/// "needle".
+pub(crate) const STAR_TAPER_BODY: f32 = 0.42;
+
+/// THE TAPER — the coverage AT THE POINT, as a fraction of the coverage the
+/// emitter asked for. The ramp is linear in distance from full at the body's
+/// end to this at the tip.
+///
+/// 0.22, i.e. the point ends at about a fifth of the light its centre carries.
+/// Deep enough that it visibly dissolves rather than stopping (which is the
+/// whole complaint) — at 0.45 a single-span point sampled at its midpoint came
+/// out at 72 %, which is a slightly soft end, not a taper — and shallow enough
+/// that the arm's REACH survives: a star whose tips fade to nothing is just a
+/// shorter star, and arm length is what the size ladder
+/// ([`STAR_ARM_FINE`]..[`STAR_ARM_HERO`]) spends its range on. Captured at 0.30
+/// first, where the point was unmistakably tapered but still legible as a bar
+/// end at the landing's hero size; 0.22 is where the tip stops being an end.
+pub(crate) const STAR_TIP_COV: f32 = 0.22;
+
+/// THE TAPER — the most spans one POINT is rasterized with (per side, per arm).
+///
+/// The point is rasterized one span PER PIXEL of its run, so the ramp is as
+/// smooth as the pixels allow, up to this bound. It is what keeps the taper
+/// cheap: the additive star is a hot path (the ribbon starfield draws one per
+/// starred cell, every frame) and each span costs 4 quads — two arms x two
+/// sides — so an unbounded ramp would price a hero grain at 30-odd quads for
+/// pixels the eye cannot separate anyway. At 3 a star costs at most 15.
+pub(crate) const STAR_TAPER_STEPS: i32 = 3;
+
+/// How many coincident source-over lays `cursor_glow`'s `push_twinkle_over`
+/// stacks at the crossing: a TIP lay and a BODY lay per arm, plus the nucleus.
+pub(crate) const STAR_OVER_LAYS: usize = 5;
+
+/// …and how many the star's centre must still COMPOSITE to. The untapered plus
+/// laid exactly three coincident marks, and `stacked_ink_alpha` prices the round
+/// stardust grain against `1 − (1 − a)³` on that basis; the taper adds lays to
+/// the ARMS, not light to the middle, so the light star solves for a per-lay
+/// alpha that reproduces this stack rather than deepening it.
+pub(crate) const STAR_OVER_CENTRE_LAYS: f32 = 3.0;
+
+/// The taper's coverage multiplier at `u` — the fraction of the way from the
+/// BODY's end to the point. One ramp, shared by both rasterizers so the two
+/// grounds taper at the same rate.
+#[inline]
+pub(crate) fn star_taper_cov(u: f32) -> f32 {
+    1.0 - (1.0 - STAR_TIP_COV) * u.clamp(0.0, 1.0)
+}
 
 /// SILHOUETTE — the NUCLEUS's half-extent as a fraction of the arm's half-length.
 /// A sparkle has a bright centre; on source-over that has to be drawn, and on
@@ -465,7 +558,10 @@ pub(crate) fn push_dust_mote(
     // The HOT CORE completes the plus's stack: skirt (1.0) + core (1.35) =
     // [`STAR_STACK_ADD`] at the centre pixel.
     let c = ((d + 1) / 2).max(1);
-    let core = premul_rgb(color, (f32::from(cov) * (STAR_STACK_ADD - 1.0)).min(255.0) as u8);
+    let core = premul_rgb(
+        color,
+        (f32::from(cov) * (STAR_STACK_ADD - 1.0)).min(255.0) as u8,
+    );
     push_fx_rect(out, geom, cx - c / 2, cy - c / 2, c, c, core);
     true
 }
@@ -552,9 +648,22 @@ pub(crate) fn star_core_px(arm: i32) -> i32 {
     ((2.0 * arm as f32 * STAR_CORE).round() as i32).max(1)
 }
 
-/// THE ONE STAR. A 4-point twinkle: a horizontal and a vertical arm crossing at
-/// `(sx, sy)` on a small NUCLEUS, plus — when `gold` — four dim diagonal glint
-/// dots. This is the only 4-point star shape any emitter draws: the rainbow kitty
+/// The additive star's integer BODY half-length (px) — the full-coverage run of
+/// an arm, from the shared [`STAR_TAPER_BODY`]. Floored at 1 and capped at the
+/// arm, so the smallest grain (`arm == 1`) is all body and no point: there is no
+/// room to ramp over a single pixel, and a 3 px cross is already a dot.
+#[inline]
+pub(crate) fn star_body_px(arm: i32) -> i32 {
+    ((arm as f32 * STAR_TAPER_BODY).round() as i32).clamp(1, arm)
+}
+
+/// THE ONE STAR. A 4-point twinkle: a horizontal and a vertical NEEDLE crossing
+/// at `(sx, sy)` on a small NUCLEUS, plus — when `gold` — four dim diagonal
+/// glint dots. Each needle is a full-coverage BODY through the crossing
+/// ([`STAR_TAPER_BODY`]) running on into POINTS that dim toward
+/// [`STAR_TIP_COV`] and thin with them — see THE TAPER above for why a needle
+/// at terminal size is a coverage ramp rather than a narrowing outline.
+/// This is the only 4-point star shape any emitter draws: the rainbow kitty
 /// typing starfield, glide stars, jump-landing burst and shooting-star heads,
 /// Beam's stardust, the Comet's debris glint and Sparkle's star grains all come
 /// through here, so a star is a star wherever it appears and only its COLOUR and
@@ -594,25 +703,59 @@ pub(crate) fn push_twinkle_star(
         return true;
     }
     let star = premul_rgb(color, cov);
-    // ARMS at the shared waist. An even thickness is biased UP-LEFT by the
-    // integer half so the mark's centre stays on `(sx, sy)`, the pixel every
-    // caller placed it at; at the 1 px floor this is the shipped hairline
-    // verbatim.
+    // THE BODY at the shared waist — the arm's full-coverage run through the
+    // crossing. An even thickness is biased UP-LEFT by the integer half so the
+    // mark's centre stays on `(sx, sy)`, the pixel every caller placed it at;
+    // at the 1 px floor this is the shipped hairline verbatim.
     let t = star_waist_px(arm);
     let half = (t - 1) / 2;
-    push_fx_rect(out, geom, sx - arm, sy - half, 2 * arm + 1, t, star); // horizontal
+    let b = star_body_px(arm);
+    push_fx_rect(out, geom, sx - b, sy - half, 2 * b + 1, t, star); // horizontal
     if out.len() >= max_quads {
         return false;
     }
-    push_fx_rect(out, geom, sx - half, sy - arm, t, 2 * arm + 1, star); // vertical
+    push_fx_rect(out, geom, sx - half, sy - b, t, 2 * b + 1, star); // vertical
     if out.len() >= max_quads {
         return false;
     }
-    // NUCLEUS: the crossing supplies half of it, this completes it.
+    // NUCLEUS: the crossing supplies half of it, this completes it. Drawn
+    // BEFORE the points, so a star truncated by the quad budget loses its
+    // faintest extremities rather than its bright centre.
     let c = star_core_px(arm);
     let ch = (c - 1) / 2;
     let core = premul_rgb(color, (f32::from(cov) * STAR_CORE_ADD) as u8);
     push_fx_rect(out, geom, sx - ch, sy - ch, c, c, core);
+    // THE POINTS. Each arm runs on from the body to the tip in equal spans,
+    // every one dimmer and (once the arm has the thickness to spare) thinner
+    // than the last — the anti-aliased reading of a needle whose half-width
+    // shrinks to nothing. Two spans per step, one per side of the crossing.
+    let run = arm - b;
+    let steps = run.clamp(0, STAR_TAPER_STEPS);
+    for k in 0..steps {
+        let d0 = b + run * k / steps; // last px of the previous span
+        let d1 = b + run * (k + 1) / steps; // last px of this one
+        // The ramp runs over the POINT — full where the body ends, [`STAR_TIP_COV`]
+        // at the tip — sampled at this span's midpoint.
+        let ramp = star_taper_cov(((d0 + d1) as f32 * 0.5 - b as f32) / run as f32);
+        let tip = premul_rgb(color, (f32::from(cov) * ramp) as u8);
+        if tip == 0 {
+            break;
+        }
+        let tt = ((t as f32 * ramp).round() as i32).max(1);
+        let th = (tt - 1) / 2;
+        let len = d1 - d0;
+        // `d0 + 1` runs right/down from the body; `-d1` mirrors it.
+        for off in [d0 + 1, -d1] {
+            if out.len() >= max_quads {
+                return false;
+            }
+            push_fx_rect(out, geom, sx + off, sy - th, len, tt, tip); // horizontal
+            if out.len() >= max_quads {
+                return false;
+            }
+            push_fx_rect(out, geom, sx - th, sy + off, tt, len, tip); // vertical
+        }
+    }
     if gold {
         let d = ((arm as f32 * STAR_GLINT).round() as i32).max(1);
         let dim = premul_rgb(color, (f32::from(cov) * STAR_GLINT_COV) as u8);
@@ -843,31 +986,64 @@ mod tests {
             0x00FF_FFFF,
             4096
         ));
-        // Arms: full span, at the shared waist.
+        // THE BODY: the arm's full-coverage run through the crossing, at the
+        // shared waist and the shared body fraction.
         let t = star_waist_px(arm);
         assert_eq!(t, (2.0 * arm as f32 * STAR_WAIST).round() as i32);
+        let b = star_body_px(arm);
+        assert_eq!(b, (arm as f32 * STAR_TAPER_BODY).round() as i32);
         let span = |q: &GlowQuad| (i32::from(q.x), i32::from(q.x) + i32::from(q.w));
-        let horiz = out
+        let full = premul_rgb(0x00FF_FFFF, cov);
+        let body = out
             .iter()
-            .find(|q| span(q) == (sx - arm, sx + arm + 1))
-            .expect("a horizontal arm of 2*arm+1");
-        // The arm's full SPAN — `arm` px either side of the crossing plus the
-        // centre pixel. Named rather than spelled inline: it is the quantity
-        // being measured, and `>= 2 * arm + 1` reads to a linter as an
-        // off-by-one dressed up as a bound.
-        let full_span = 2 * arm + 1;
-        assert!(
-            out.iter()
-                .filter(|q| span(q) == (sx - (t - 1) / 2, sx - (t - 1) / 2 + t))
-                .map(|q| i32::from(q.h))
-                .sum::<i32>()
-                >= full_span,
-            "the vertical arm is not {full_span} px tall at the shared waist"
-        );
+            .find(|q| span(q) == (sx - b, sx + b + 1) && q.color == full)
+            .expect("a horizontal body of 2*body+1 at full coverage");
         assert_eq!(
-            i32::from(horiz.h),
+            i32::from(body.h),
             t,
-            "the horizontal arm left the shared waist"
+            "the horizontal body left the shared waist"
+        );
+        // …and the arm still REACHES `arm` px either side of it: the taper
+        // dims the point, it does not shorten the star. Measured as the union
+        // of the row's lit columns, so body and points have to be contiguous.
+        let full_span = 2 * arm + 1;
+        let row: Vec<_> = out
+            .iter()
+            .filter(|q| i32::from(q.y) <= sy && sy < i32::from(q.y) + i32::from(q.h))
+            .collect();
+        let lit = |x: i32| row.iter().any(|q| span(q).0 <= x && x < span(q).1);
+        assert!(
+            (sx - arm..=sx + arm).all(lit) && !lit(sx - arm - 1) && !lit(sx + arm + 1),
+            "the tapered arm does not span exactly {full_span} px"
+        );
+        // THE POINTS: every span past the body is dimmer than the body, they
+        // dim MONOTONICALLY outward, and the outermost lands on the shared tip
+        // coverage. (Read off the right-hand point, which the mirror repeats.)
+        let mut point: Vec<_> = row
+            .iter()
+            .filter(|q| span(q).0 > sx + b)
+            .map(|q| (span(q).0, (q.color >> 16) & 0xff))
+            .collect();
+        point.sort_unstable();
+        assert!(!point.is_empty(), "the arm came to a square end");
+        let mut prev = u32::from(cov);
+        for (x, c) in &point {
+            assert!(
+                *c < prev,
+                "the point does not taper: {c} at x+{} under a previous {prev}",
+                x - sx
+            );
+            prev = *c;
+        }
+        // The ramp is sampled at each span's MIDPOINT, so the outermost span
+        // never lands exactly on the tip coverage — but it must sit in the
+        // ramp's bottom half, between the tip and the ramp's own midpoint.
+        let tip = f32::from(cov) * star_taper_cov(1.0);
+        let midway = f32::from(cov) * star_taper_cov(0.5);
+        assert!(
+            (tip..=midway).contains(&(prev as f32)),
+            "the outermost span carries {prev}, outside the ramp's bottom half \
+             ({tip:.0}..={midway:.0}) — the point is not reaching the shared tip"
         );
         // Nucleus, at the shared core extent and its additive share.
         let c = star_core_px(arm);
@@ -954,7 +1130,16 @@ mod tests {
             4096
         ));
         let mut mote = Vec::new();
-        assert!(push_dust_mote(&mut mote, g, cx, cy, 5, cov, 0x00FF_FFFF, 4096));
+        assert!(push_dust_mote(
+            &mut mote,
+            g,
+            cx,
+            cy,
+            5,
+            cov,
+            0x00FF_FFFF,
+            4096
+        ));
         let (star_peak, star_px) = raster(&star);
         let (mote_peak, mote_px) = raster(&mote);
         // NON-VACUOUS: the plus really does stack, so there is something to match.

@@ -19,9 +19,14 @@
 use std::collections::HashSet;
 
 /// English words that legitimately classify — the `en` entries themselves, plus
-/// one obscure dictionary word that is genuinely the Spanish/Portuguese for
-/// "cat" and only ever draws a (harmless) cat sparkle.
-const INTENTIONAL: &[&str] = &["kitten", "kitty", "pussycat", "orca", "gata"];
+/// a few obscure dictionary words that are genuinely another language's word
+/// for the animal and only ever draw a (harmless) animal sparkle: `gata` is the
+/// Spanish/Portuguese she-cat, `chien`/`chiot` the French dog/puppy, `gos` the
+/// Catalan dog.
+const INTENTIONAL: &[&str] = &[
+    "kitten", "kitty", "pussycat", "orca", "gata", "dog", "dogs", "doggy", "doggo", "pooch", "pup",
+    "puppy", "woof", "chien", "chiot", "gos",
+];
 
 #[test]
 fn no_unambiguous_surface_is_an_ordinary_english_word() {

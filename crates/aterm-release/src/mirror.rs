@@ -55,7 +55,6 @@ pub const CHANNEL_KEY: &str = "update_channel";
 
 /// The key inside [`CHANNEL_TABLE`] committing the channel to one
 /// release-signing public key.
-pub const CHANNEL_PUBKEY_KEY: &str = "update_channel_pubkey";
 
 /// `OWNER/REPO` of the public update channel, from `[workspace.metadata.aterm]
 /// update_channel` in the WORKSPACE manifest.
@@ -72,33 +71,6 @@ pub fn update_channel_slug(cargo_toml: &str) -> Result<Option<String>> {
     };
     validate_slug(&raw)?;
     Ok(Some(raw))
-}
-
-/// The COMMITTED signing identity of the public update channel, canonicalized,
-/// from `[workspace.metadata.aterm] update_channel_pubkey`.
-///
-/// `Ok(None)` means the key is absent, which is a legal configuration: signing
-/// stays per-machine opt-in and an unsigned cut is allowed (forks and private
-/// channels). A PRESENT key makes signing tracked channel POLICY, not machine
-/// configuration — every cut for [`CHANNEL_KEY`] must be signed by exactly this
-/// key, so a keyless machine refuses pre-claim instead of publishing unsigned
-/// (v0.16.0 reached the pinned public channel exactly that way). A pin without
-/// its channel, or one that is not a canonical Ed25519 key, is an error rather
-/// than a fall-through: either would silently reopen the unsigned-cut hole the
-/// key exists to close.
-pub fn update_channel_pubkey(cargo_toml: &str) -> Result<Option<String>> {
-    let Some(raw) = table_string(cargo_toml, CHANNEL_TABLE, CHANNEL_PUBKEY_KEY) else {
-        return Ok(None);
-    };
-    if update_channel_slug(cargo_toml)?.is_none() {
-        return Err(Error::new(format!(
-            "{CHANNEL_TABLE} {CHANNEL_PUBKEY_KEY} is set without {CHANNEL_KEY}; the pin \
-             constrains cuts for the public channel, so it cannot stand alone"
-        )));
-    }
-    crate::publish::canonical_update_pubkey(&raw)
-        .map_err(|error| Error::new(format!("{CHANNEL_TABLE} {CHANNEL_PUBKEY_KEY}: {error}")))
-        .map(Some)
 }
 
 /// What the public channel's own source tree says its version is, relative to
@@ -482,39 +454,24 @@ update_channel = \"someone/else\"
         );
     }
 
+    /// REGRESSION: the channel anchor has exactly ONE home.
+    ///
+    /// It used to live in BOTH `[workspace.metadata.aterm] update_channel_pubkey`
+    /// and (after the pins refactor) `aterm_update_core::pins`. Two separately
+    /// edited committed values that nothing compared: editing one and not the other
+    /// yields releases signed by a key no client accepts, silently. The manifest key
+    /// is gone; this test fails if it comes back.
     #[test]
-    fn the_committed_channel_pin_reads_canonically_and_cannot_stand_alone() {
-        // The REAL workspace manifest commits the pin — this is the value every
-        // cut for the public channel must sign under, read by the same parser
-        // the cutter uses.
-        let pin = update_channel_pubkey(REAL_MANIFEST)
-            .expect("workspace manifest parses")
-            .expect("the workspace commits a channel-signing pin");
-        assert_eq!(pin, "cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=");
-
-        // Absent = per-machine opt-in signing, the legal fork configuration.
-        assert_eq!(
-            update_channel_pubkey("[workspace]\nmembers = []\n").unwrap(),
-            None
+    fn the_channel_anchor_lives_only_in_pins() {
+        assert!(
+            !REAL_MANIFEST.contains("update_channel_pubkey"),
+            "the channel anchor must live only in aterm_update_core::pins, \
+             never also in Cargo.toml"
         );
-
-        // A pin without its channel constrains nothing — refused, not ignored.
-        let orphan = "[workspace.metadata.aterm]\n\
-                      update_channel_pubkey = \"cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=\"\n";
-        assert!(update_channel_pubkey(orphan).is_err());
-
-        // A malformed pin must fail closed: falling through to "no pin" would
-        // reopen the unsigned-cut hole under a policy typo.
-        for bad in ["not-base64!", "c3dz", ""] {
-            let doc = format!(
-                "[workspace.metadata.aterm]\nupdate_channel = \"a/b\"\n\
-                 update_channel_pubkey = \"{bad}\"\n"
-            );
-            assert!(
-                update_channel_pubkey(&doc).is_err(),
-                "{bad:?} must be refused, never silently ignored"
-            );
-        }
+        assert!(
+            !aterm_update_core::pins::update_channel_signing_pubkey().is_empty(),
+            "the public channel is pinned in pins.rs"
+        );
     }
 
     #[test]

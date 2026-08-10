@@ -6,9 +6,136 @@
 //! BOTH resolution paths (startup construction and the off-thread catalog).
 
 use aterm_render::{
-    GAME_FONT_MIX_MAX, GAME_FONT_SCHEME, GAME_FONTS, Renderer, Theme, game_font_bytes,
-    game_font_for_family, game_font_mix_for_family, game_mix_face_index,
+    GAME_FONT_MIX_MAX, GAME_FONT_SCHEME, GAME_FONTS, Renderer, Theme, game_face_fit,
+    game_font_bytes, game_font_for_family, game_font_mix_for_family, game_mix_face_index,
 };
+
+/// FONT-GAME-FIT, the invariant the whole fit exists to guarantee: NO glyph a
+/// FITTED game face can draw is wider than the cell it renders into.
+///
+/// Violating it is not a cosmetic problem — an overrunning glyph paints over its
+/// NEIGHBOUR, which is how `minecraft` came out as "m ncraft" in Luckiest Guy
+/// (cell from `M` at 0.79 em, `m` drawn at 0.91 em, the `i` buried in the ink).
+///
+/// Scoped to fitted faces on purpose. An UNFITTED face is one this policy
+/// promises to leave exactly as it found it, and Monocraft — which has been
+/// rendering happily all along — draws `#` a pixel past its advance by design.
+/// Holding it to this invariant would mean changing the one face that was
+/// already right, which is precisely what the fit must not do.
+#[test]
+fn no_fitted_game_glyph_can_overrun_its_cell() {
+    for font in GAME_FONTS {
+        let bytes = game_font_bytes(font.id).expect("registry id resolves");
+        if game_face_fit(bytes).and_then(|fit| fit.cell_advance_em).is_none() {
+            continue;
+        }
+        // Several sizes: the fit is an em fraction, the cell an integer, so the
+        // rounding is only provably safe if it is checked across sizes.
+        for px in [12.0_f32, 14.0, 16.0, 20.0, 28.0] {
+            let mut renderer = Renderer::from_bytes(bytes, px, Theme::default())
+                .unwrap_or_else(|e| panic!("{}: {e}", font.id));
+            let (cell_w, _) = renderer.cell_size();
+            for ch in '!'..='~' {
+                let key = renderer.glyph_key(ch);
+                // Only glyphs the GAME FACE serves. A code point it does not
+                // cover (Hylia Serif has no `|`) falls through the ordinary
+                // fallback cascade by design — that is the "never tofu" promise —
+                // and such a glyph is placed by the fallback pipeline's own
+                // centring, not by the game fit.
+                if !matches!(
+                    key.source,
+                    aterm_render::FaceId::Primary | aterm_render::FaceId::GameMix
+                ) {
+                    continue;
+                }
+                let img = renderer.glyph_image(key);
+                let right = img.xmin() + img.width() as i32;
+                assert!(
+                    right <= cell_w as i32,
+                    "{} at {px}px: {ch:?} ends at {right} past the {cell_w}px cell \
+                     — it would paint over the next character",
+                    font.id
+                );
+                assert!(
+                    img.xmin() >= 0,
+                    "{} at {px}px: {ch:?} starts left of its cell (xmin {})",
+                    font.id,
+                    img.xmin()
+                );
+            }
+        }
+    }
+}
+
+/// The monospaced bundled face takes the IDENTITY fit. Minecraft/Monocraft was
+/// already correct in a fixed grid — the policy must not touch its size, its
+/// cell, or its weight, so the face the user likes cannot regress.
+#[test]
+fn the_monospaced_game_face_is_left_exactly_alone() {
+    let fit = game_face_fit(game_font_bytes("minecraft").unwrap()).expect("bundled face has a fit");
+    assert_eq!(fit.cell_advance_em, None, "no cell override");
+    assert!((fit.px_scale - 1.0).abs() < f32::EPSILON, "no size change");
+    assert!(!fit.embolden, "no weight change");
+
+    // And end to end: the fitted renderer agrees with a raw one, cell for cell.
+    let bytes = game_font_bytes("minecraft").unwrap();
+    for px in [13.0_f32, 16.0, 22.0] {
+        let fitted = Renderer::from_bytes(bytes, px, Theme::default()).unwrap();
+        assert_eq!(
+            fitted.cell_size().0,
+            fitted.cell_geometry(px).0,
+            "monospaced cell width is stable at {px}px"
+        );
+    }
+}
+
+/// A face that is NOT bundled never gets re-fitted: the policy keys off the
+/// registry bytes, so a user's own proportional font keeps the historical
+/// `M`-advance cell and their existing config keeps rendering as it did.
+#[test]
+fn a_non_bundled_face_is_never_fitted() {
+    let dejavu = aterm_render::embedded_font();
+    assert!(
+        game_face_fit(dejavu).is_none(),
+        "the embedded fallback face is not a game font and must not be fitted"
+    );
+}
+
+/// The proportional faces really do take the fit — a guard against the whole
+/// policy silently going inert (e.g. a future asset swap that changes the byte
+/// identity the registry lookup depends on).
+#[test]
+fn proportional_game_faces_are_fitted() {
+    for id in ["roblox", "zelda", "mariokart", "animal-crossing"] {
+        let fit = game_face_fit(game_font_bytes(id).unwrap()).expect("bundled");
+        let em = fit
+            .cell_advance_em
+            .unwrap_or_else(|| panic!("{id} is proportional and must carry a cell override"));
+        // The band's ceiling clears Mario Kart F2, whose advances run past
+        // 1 em by DESIGN (median 1.22 em, `M` at 1.56) — a uniformly wide
+        // face, not a broken measurement. Anything past it is a real bug.
+        assert!(
+            (0.5..=1.6).contains(&em),
+            "{id}: implausible cell advance {em} em"
+        );
+        assert!(fit.px_scale < 1.0, "{id}: a fitted face rasterizes smaller");
+    }
+}
+
+/// The face whose weight NEEDED help carries the flag, and the faces that
+/// rasterize heavy do not. This pins the intent recorded in
+/// `GameFont::embolden` so a future edit has to argue with a test.
+#[test]
+fn weight_boost_is_set_exactly_where_it_is_needed() {
+    let flag = |id: &str| GAME_FONTS.iter().find(|f| f.id == id).unwrap().embolden;
+    assert!(
+        flag("animal-crossing"),
+        "FinkHeavy thins to hairline strokes at body px"
+    );
+    assert!(!flag("minecraft"), "already heavy — dilation would fill it");
+    assert!(!flag("roblox"), "UltraBold — dilation would close its counters");
+    assert!(!flag("mariokart"), "solid lettering — already heavy");
+}
 
 /// Every registry face parses and rasterizes a plain ASCII glyph — a corrupt or
 /// truncated asset (e.g. a failed download committed by mistake) fails here,

@@ -42,6 +42,8 @@ use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
 use aterm_scene::vector::FIXED_ONE;
 use aterm_scene::{mix_rgb, smoothstep};
 
+use crate::animal_baker::{AnimalBakeKey, AnimalBaker};
+use crate::animal_glyphs_gen::{ANIMAL_GLYPHS, AnimalGlyphId, animal_glyph_from_key};
 use crate::cat_baker::{BakeKeyV4, CatBaker, CatColorKey, EyesFrame, PATCH_STRIP};
 use crate::kitty_registry::{
     KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
@@ -137,6 +139,13 @@ const CAT_BOUNCE_MS: u64 = 150;
 /// worse than no cat).
 const CAT_MIN_CELL_H: u16 = 14;
 const CAT_MIN_CELL_W: u16 = 7;
+
+/// §5.2's law applied to the animal roster: the hard cap on SPECIES HEADS per
+/// frame, its own pool so a page of animal words can never starve the felines
+/// out of their MAX_CATS slots (or vice versa). Same row-major deterministic
+/// truncation; an occurrence past the cap draws no graphic — its ink still
+/// plays.
+const MAX_ANIMALS: usize = 8;
 /// v3 §1.2 descend window (easeInOutCubic).
 const CAT_DESCEND_MS: u64 = 320;
 /// v3 §1.2 optional pre-descend anticipation lift (~50% of genomes).
@@ -356,6 +365,26 @@ pub struct KittyCursorFrame {
     pub notes: [Option<crate::kitty_sing::NoteSprite>; crate::kitty_sing::MAX_NOTES],
 }
 
+/// One resolved typed-word DOG cameo emission ([`crate::dog_cameo`]): the
+/// rolled breed/coat, the lifecycle envelope's alpha, and the entry-bounce
+/// offset — the canine sibling of [`KittyCursorFrame`], minus everything that
+/// belongs to a persistent companion (pose engine, sing-along, identity).
+#[derive(Clone, Copy, Debug)]
+pub struct DogCameoFrame {
+    pub geom: EffectGeom,
+    /// The cursor cell `(row, col)` the dog visits.
+    pub cursor: (u16, u16),
+    /// The visit's rolled identity ([`crate::dog_cameo::DogCameo::look`]).
+    pub look: crate::dog_cameo::DogLook,
+    /// Quantized local terminal palette (shared with the cat bakes).
+    pub colors: CatColorKey,
+    /// Entry-bounce offset in cell fractions (`<= 0`: up); `0.0` under
+    /// reduced motion.
+    pub bob: f32,
+    /// The lifecycle envelope's presence, `0..=255`.
+    pub alpha: u8,
+}
+
 /// Geometry-only inputs for resolving the cursor companion before its local
 /// palette is sampled.
 #[derive(Clone, Copy, Debug)]
@@ -384,6 +413,9 @@ pub struct DecoConfig {
     /// when at least one category is on.
     pub profanity: bool,
     pub feline: bool,
+    /// Canine family → the typed-word DOG cameo (the input path). The screen
+    /// scanner's ambient class default is inert, so this gates only the cameo.
+    pub canine: bool,
     /// Orca / cetacean family → the randomized water-droplet "splash".
     pub orca: bool,
     /// Emphasis / hype words (user `extra_words` only; the builtin lexicon
@@ -528,6 +560,44 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
         // steady residual, the §1.2 exception) until the orca redo rides the
         // framework as an `Orcas` collection.
         Class::Orca => WordEffectSpec::default(),
+        // The canine family works BOTH ways: the typed-word summon pops the
+        // dog cameo (the input path), and an on-screen canine word peeks the
+        // animal roster's dog head — the Animal class default with the species
+        // pinned to `dog` at Occurrence resolution.
+        Class::Canine => WordEffectSpec {
+            graphic: Some(GraphicSpec {
+                collection: Collection::Animals,
+                dwell_ms: (2200, 3598),
+            }),
+            ink: Some(InkSpec {
+                colorway: Colorway::SelfGlow {
+                    lift: FELINE_GLOW_LIFT,
+                    amp: FELINE_GLOW_AMP,
+                    window_ms: FELINE_GLOW_MS as u32,
+                },
+                sweep_once: true,
+            }),
+            burst: None,
+        },
+        // The ambient animal roster: the species-keyed peeking sprite (the
+        // species itself rides the Occurrence, not the spec — one class
+        // default covers every animal), with the feline's gentle self-glow so
+        // the word reads as the sprite's caption.
+        Class::Animal => WordEffectSpec {
+            graphic: Some(GraphicSpec {
+                collection: Collection::Animals,
+                dwell_ms: (2200, 3598),
+            }),
+            ink: Some(InkSpec {
+                colorway: Colorway::SelfGlow {
+                    lift: FELINE_GLOW_LIFT,
+                    amp: FELINE_GLOW_AMP,
+                    window_ms: FELINE_GLOW_MS as u32,
+                },
+                sweep_once: true,
+            }),
+            burst: None,
+        },
         Class::Emphasis => WordEffectSpec {
             graphic: None,
             ink: Some(InkSpec {
@@ -559,6 +629,7 @@ impl Default for DecoConfig {
         DecoConfig {
             profanity: true,
             feline: true,
+            canine: true,
             orca: true,
             emphasis: true,
             ink_enabled: true,
@@ -1226,6 +1297,13 @@ struct Occurrence {
     /// class-gate bypass marker; custom TwoTone colors apply RAW (no genome
     /// hue nudge), and the orca class carve-out yields to the spec.
     custom: bool,
+    /// For a [`Class::Animal`] occurrence: the authored species head, resolved
+    /// at rescan from the match's lexicon `species` tag
+    /// ([`animal_glyph_from_key`]). `None` on every other class — and on an
+    /// animal word whose tag has no shipped roster art yet, which draws no
+    /// graphic while keeping its ink (the same graceful fallback as an
+    /// ineligible cat).
+    species: Option<AnimalGlyphId>,
 }
 
 /// Geometry-aware terminal surface used only by the rescan epilogue's
@@ -1909,6 +1987,11 @@ pub struct WordDecorations {
     /// Whether `tick` already ran the baker prologue for this host frame. The
     /// cursor companion shares that budget; it must not reset the two-bake cap.
     cat_baker_ready: bool,
+    /// The ANIMAL roster's exact-size tile cache ([`crate::animal_baker`]):
+    /// species heads for the ambient animal-word decoration, handed to the
+    /// shared atlas through `host_tile` exactly like the pet's. Rides the
+    /// `cat_baker_ready` once-per-frame prologue and the same reload clear.
+    animal_baker: AnimalBaker,
     /// The PET roster's own exact-size tile cache ([`crate::pet_baker`]). Its
     /// tiles reach the screen through the shared atlas's `host_tile` door, so
     /// the pet costs the atlas one slot per resident pose and nothing at all
@@ -1919,6 +2002,14 @@ pub struct WordDecorations {
     /// dropping the sprite (see [`WordDecorations::pet_cursor`]). Cleared with
     /// the atlas, so it can never name a tile that no longer exists.
     pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId)>,
+    /// The DOG roster's own exact-size tile cache ([`crate::dog_baker`]) — the
+    /// typed-word dog cameo's bake path, reaching the screen through the same
+    /// shared-atlas `host_tile` door as the pet.
+    dog_baker: crate::dog_baker::DogBaker,
+    /// The last dog tile that actually resolved: `(ax, ay, look)`. Same
+    /// deferred-bake tolerance as [`Self::pet_last_tile`], same atlas-scoped
+    /// invalidation.
+    dog_last_tile: Option<(u16, u16, crate::dog_cameo::DogLook)>,
     /// A USER-supplied cursor sprite (via `cursor_nyan_sprite`), overriding the
     /// built-in CatBaker cat: the decoded native RGBA `(w, h, rgba)` plus a cache
     /// of the last nearest-resample to the current target size `(tw, th, rgba)`.
@@ -2699,7 +2790,11 @@ impl WordDecorations {
         // The pet's tiles are keyed on the same cell metrics and the same local
         // palette, so they go stale for exactly the reasons the cat's do.
         self.pet_baker.clear();
+        // …and the animal roster's, for the same reasons again.
+        self.animal_baker.clear();
         self.pet_last_tile = None;
+        self.dog_baker.clear();
+        self.dog_last_tile = None;
         // §F4.2: pending sightings die with the state.
         self.sightings.clear();
         self.unlogged.clear();
@@ -3015,6 +3110,24 @@ impl WordDecorations {
 
     /// The geometry half of the cameo, shared by the footprint probe and the
     /// emitter so the palette sample and the drawn rect can never disagree.
+    ///
+    /// OWNER REGRESSION, 2026-08-10: *"AHH! the kitty that appears when I type
+    /// 'Kitty' is huge! go back to the old text kitty!"* — clarified: *"like
+    /// how it appears in the regular text."* 0.19.0 sized the cameo at the
+    /// full 2-cell atlas slot ×2.0 dest scale — a ~4-cell creature STANDING on
+    /// the line, ahead of the caret, over the text. That read as a toy on the
+    /// terminal; the owner wanted the cat that lives IN the terminal.
+    ///
+    /// So the word-kitty now obeys the AMBIENT WORD-CAT'S OWN LAW, the one
+    /// presentation the owner was pointing at: a head at §5.2 scale
+    /// ([`cat_hart`] × the identity's age band, fitted by
+    /// [`authored_cat_size`] — the exact sizing [`cat_geometry_for`] applies),
+    /// its authored centre over the anchor cell, its chin slice tucked behind
+    /// the anchor row so the line's ink occludes it. A kitty typed is a kitty
+    /// that fits the line. What still makes it the CAMEO is everything the
+    /// owner did not complain about: it wears the companion/session identity,
+    /// fires on every completion, holds the one-cat-per-caret veto, and lives
+    /// on its own clockless lifecycle.
     fn cameo_footprint_for(
         &self,
         geom: EffectGeom,
@@ -3023,54 +3136,51 @@ impl WordDecorations {
         if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        // NATURAL SIZE = the full structural slot. `authored_cat_size` clamps to
-        // `2·cell_h` (the baker's slot height), so asking for exactly that is
-        // asking for the crispest tile the atlas can hold; the "bigger than the
-        // escort" reading is then applied to the DEST rect below.
-        let (nat_w, nat_h) = authored_cat_size(
-            frame.look.normalized().variant,
-            2.0 * f32::from(geom.cell_h),
-            geom.cell_h,
-        );
-        let scale = crate::kitty_cameo::CAMEO_DEST_SCALE;
-        let w = ((f32::from(nat_w) * scale).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-        let h = ((f32::from(nat_h) * scale).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-        // i64 THROUGHOUT. Every term here is a `u16` scaled by another `u16`
-        // and then by the 1.5 dest scale, which overruns `i32` at the top of
-        // the valid geometry range; saturating `i32` would silently pin the
-        // sprite to `i32::MAX` instead. i64 holds the whole product space
-        // exactly, and the one narrowing back to the sprite's `i32`/`u16`
-        // fields happens once, at the end, under an explicit clamp.
-        let cw = i64::from(geom.cell_w);
-        let ch = i64::from(geom.cell_h);
-        let grid_w = i64::from(geom.cols) * cw;
-        if grid_w < i64::from(w) {
-            return None; // a grid narrower than the toy shows no toy
+        let look = frame.look.normalized();
+        // THE AMBIENT HEAD LAW, verbatim: base Hart (`1.7·ch`) scaled by the
+        // identity's own age band, fitted to the authored aspect inside the
+        // structural slot. The ambient cat reads its age out of the occurrence
+        // genome; the cameo's identity is its [`KittyLook`], which carries the
+        // same band — so a kitten cameo is small the way a kitten peek is.
+        let desired_h = f32::from(cat_hart(geom.cell_h)) * look.age.scale();
+        let (w, hart) = authored_cat_size(look.variant, desired_h, geom.cell_h);
+        let chin = i32::from(cat_chin(hart));
+        let cw = i32::from(geom.cell_w);
+        let ch = i32::from(geom.cell_h);
+        let grid_w = i32::from(geom.cols) * cw;
+        let grid_h = i32::from(geom.rows) * ch;
+        if grid_w < i32::from(w) {
+            return None; // a grid narrower than the head shows no head
         }
         let (row, col) = frame.anchor;
-        // HORIZONTAL: the toy stands just PAST the anchor cell, in the empty
-        // space ahead of the caret. That side is chosen deliberately — the word
-        // that summoned the cameo is BEHIND the caret, so standing ahead of it
-        // is the one placement that structurally cannot cover the thing you
-        // just typed. Near the right margin it clamps back onto the grid (it
-        // slides over the caret rather than disappearing, exactly as the escort
-        // does): a toy that fell off the edge would read as a rendering bug.
-        let ahead = (i64::from(col) + 1) * cw + cw / 2;
-        let x = ahead.clamp(0, grid_w - i64::from(w));
-        // VERTICAL: centred on the anchor ROW, then clamped so the whole body
-        // is on-grid. A 3-cell toy has no room to stand on the line above on
-        // the top rows, and flipping it below would put it over the NEXT lines
-        // instead — centring plus a clamp keeps one rule for every row.
-        let grid_h = i64::from(geom.rows) * ch;
-        let rest = i64::from(row) * ch + ch / 2 - i64::from(h) / 2;
-        let bob = (f64::from(frame.dy) * ch as f64).round() as i64;
-        let y = (rest + bob).clamp(0, (grid_h - i64::from(h)).max(0));
-        Some(CatFootprint {
-            x: x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            y: y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            w,
-            h,
-        })
+        // HORIZONTAL: the ambient anchor law with a one-cell word — the
+        // authored visual centre lands on the ANCHOR cell's midpoint, then
+        // clamps inward at the viewport edges. The anchor is the caret cell
+        // the completing keystroke left, i.e. the tail of the word just typed
+        // (the echo may lag a cell or two behind the keystroke; at head scale
+        // a cell either way is invisible) — so the head peeks AT its word,
+        // never stands ahead of it in open space.
+        let mid = i32::from(col) * cw + cw / 2;
+        let center = f32::from(GLYPHS[look.variant as usize].center_x) / f32::from(FIXED_ONE);
+        let x = (mid - (center * f32::from(w)).round() as i32)
+            .clamp(0, (grid_w - i32::from(w)).max(0));
+        // VERTICAL: the chin slice tucks behind the anchor row exactly like
+        // the ambient peek — chin at the row's top edge, body in the rows
+        // above. A top row with no room above mirrors DOWN (the ambient
+        // [`PeekDir::Down`] arm): clamping an up-peek would park the head
+        // squarely on the word instead. `dy` (entrance slide + idle bob, in
+        // cells) always moves the head TOWARDS its hidden position behind the
+        // line, whichever side it peeks from, so the entrance reads as the
+        // classic slide-out on both.
+        let body = i32::from(hart) - chin;
+        let dy = (f64::from(frame.dy) * f64::from(ch)).round() as i32;
+        let y_max = (grid_h - i32::from(hart)).max(0);
+        let y = if i32::from(row) * ch < body {
+            ((i32::from(row) + 1) * ch - chin - dy).clamp(0, y_max)
+        } else {
+            (i32::from(row) * ch + chin + dy - i32::from(hart)).clamp(0, y_max)
+        };
+        Some(CatFootprint { x, y, w, h: hart })
     }
 
     /// Emit the typed-kitty cameo as ONE free sprite, or nothing.
@@ -3097,7 +3207,17 @@ impl WordDecorations {
         free: &mut Vec<FreeSprite>,
     ) -> Option<u64> {
         let frame = self.cameo.frame_in_pane(now, pane)?;
-        let footprint = self.cameo_footprint_for(geom, frame)?;
+        let Some(footprint) = self.cameo_footprint_for(geom, frame) else {
+            // A footprint refusal is PERMANENT for this toy — the kitty
+            // sprite source is Disabled, or the pane cannot hold the head —
+            // unlike a bake-budget miss below, which lands next frame. A
+            // cameo that can never present must not spend its 5 s life
+            // holding the scheduler awake and VETOING the ambient word-cat
+            // that could have answered the keystroke (review, 2026-08-10):
+            // the toy dies here, and with it the wake train and the veto.
+            self.cameo.clear();
+            return None;
+        };
         // ONE PALETTE FOR THE WHOLE CAMEO. The host samples the local text
         // colours out of a grid scratch it reuses across panes, so only the
         // FIRST sample is guaranteed to have come from this toy's own pane
@@ -3110,22 +3230,23 @@ impl WordDecorations {
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
-        // The tile bakes at its NATURAL size and the dest rect carries the
-        // enlargement, so the atlas key is stable across the whole animation
-        // (the bob and the fade never rebake).
+        // The tile bakes at its EXACT dest size — NEAREST 1:1 (§5.3), the same
+        // contract as every ambient word-cat — and the footprint's dims never
+        // change over the animation (only x/y ride the slide and the bob), so
+        // the atlas key is stable across the cameo's whole life: the bob and
+        // the fade never rebake.
         let look = frame.look.normalized();
-        let (nat_w, nat_h) =
-            authored_cat_size(look.variant, 2.0 * f32::from(geom.cell_h), geom.cell_h);
         let key = BakeKeyV4 {
             variant: look.variant,
             accessory: look.accessory,
             coat: look.coat,
             iris: look.iris,
             colors,
-            w: nat_w,
-            h: nat_h,
+            w: footprint.w,
+            h: footprint.h,
             // A cameo does not blink: it is on glass for a couple of seconds
             // and one eye frame keeps it to a single atlas slot.
             eyes: EyesFrame::Open,
@@ -3138,14 +3259,17 @@ impl WordDecorations {
             h: footprint.h,
             ax: tile.ax,
             ay: tile.ay,
-            aw: nat_w,
-            ah: nat_h,
+            aw: footprint.w,
+            ah: footprint.h,
             tint: 0x00FF_FFFF,
             alpha: frame.alpha,
             flip_x: false,
-            // OverText: the toy is in front of the terminal, unlike the ambient
-            // word-cats that peek from behind their word.
-            z: FreeZ::OverText,
+            // UnderText, like the ambient word-cats: the word-kitty peeks from
+            // BEHIND the line it answers, so the text's ink occludes its chin
+            // and it reads as part of the line — owner, 2026-08-10: "like how
+            // it appears in the regular text", not a toy standing in front of
+            // the terminal.
+            z: FreeZ::UnderText,
             sampler: FreeSampler::Nearest,
         };
         free.push(sprite);
@@ -3304,6 +3428,7 @@ impl WordDecorations {
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
 
@@ -3526,6 +3651,7 @@ impl WordDecorations {
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
         self.pet_baker.begin_frame(geom.cell_w, geom.cell_h);
@@ -3739,8 +3865,8 @@ impl WordDecorations {
         }
     }
 
-    /// Stable atlas identity for one baked mote tile: kind + rotation bucket
-    /// + exact size. Tint is deliberately absent — tiles bake WHITE and are
+    /// Stable atlas identity for one baked mote tile: kind, rotation bucket and
+    /// exact size. Tint is deliberately absent — tiles bake WHITE and are
     /// colored per sprite, so the whole lane is a handful of atlas slots.
     fn pet_mote_host_id(kind: crate::kitty_pet::PetMoteKind, bucket: u32, side: u16) -> u64 {
         let mut x = Self::PET_MOTE_HOST_SALT
@@ -3863,6 +3989,127 @@ impl WordDecorations {
             }
         }
         tile
+    }
+
+    /// The typed-word DOG's horizontal trail behind the cursor cell's left
+    /// edge, as a fraction of a cell — the mirror of the kitty's
+    /// [`Self::KITTY_LEAD_NUM`] lead. The kitty escorts AHEAD of the caret, so
+    /// the visiting dog pops up BEHIND it: the two cameos can never fight over
+    /// the same pixels, and the dog reads as having trotted up to see what is
+    /// being typed.
+    const DOG_TRAIL_NUM: i32 = 3;
+    const DOG_TRAIL_DEN: i32 = 4;
+
+    /// Emit the typed-word **dog cameo** ([`crate::dog_cameo`]) as one free
+    /// sprite just BEHIND the cursor cell, vertically centred on its row, at
+    /// the envelope's alpha.
+    ///
+    /// The bake path is the pet's two-door pattern: the breed rasterizes into
+    /// the dog roster's own exact-size cache ([`crate::dog_baker::DogBaker`]),
+    /// and those texels enter the shared cat atlas through `host_tile`. A miss
+    /// on either door re-emits the LAST resolved dog tile instead of blinking
+    /// the sprite out (`tick` has first claim on the shared bake budget); the
+    /// fresh breed lands next frame. Near the LEFT margin the dog clamps to
+    /// the grid edge, and when that clamp would slide it over the cursor cell
+    /// it RISES up to half a cell instead of covering the glyph being typed —
+    /// the kitty's boundary-rise law, mirrored.
+    ///
+    /// Call AFTER `tick`, appending into the same `free` buffer it filled.
+    /// Returns a fingerprint fold for the host's early-out, `None` when
+    /// nothing was emitted.
+    pub fn dog_cameo(&mut self, frame: DogCameoFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
+        let DogCameoFrame {
+            geom,
+            cursor: (crow, ccol),
+            look,
+            colors,
+            bob,
+            alpha,
+        } = frame;
+        if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+            return None;
+        }
+        self.cat_baker.set_free_tiles(true);
+        if !self.cat_baker_ready {
+            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.cat_baker_ready = true;
+        }
+        self.dog_baker.begin_frame(geom.cell_w, geom.cell_h);
+
+        // Natural size: the kitty cameo's 1.45-row art height, this breed's
+        // authored aspect, clamped to the host_tile slot (4·ch × 2·ch).
+        let ch = i32::from(geom.cell_h);
+        let cw = i32::from(geom.cell_w);
+        let aspect = crate::dog_baker::DogBaker::aspect(look.breed);
+        let max_w = f32::from(geom.cell_h.saturating_mul(4).max(1));
+        let max_h = f32::from(geom.cell_h.saturating_mul(2).max(1));
+        let desired_h = 1.45 * f32::from(geom.cell_h);
+        let fitted_h = desired_h.max(1.0).min(max_h).min(max_w / aspect);
+        let h = (fitted_h.round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        let w = ((f32::from(h) * aspect).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+
+        let key = crate::dog_baker::DogBakeKey {
+            breed: look.breed,
+            coat: look.coat,
+            colors,
+            w,
+            h,
+        };
+        let resolved = self
+            .dog_baker
+            .tile(&key)
+            .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), w, h, rgba))
+            .map(|t| (t.ax, t.ay, look));
+        if let Some(r) = resolved {
+            self.dog_last_tile = Some(r);
+        }
+        let (ax, ay, _) = resolved.or(self.dog_last_tile)?;
+
+        // Trail just BEHIND the cursor cell (see `DOG_TRAIL_NUM`). Near the
+        // left margin the dog CLAMPS to the grid edge; a clamp that would
+        // slide it back over the cursor cell RISES instead (the kitty's
+        // boundary law, mirrored to the trailing side).
+        let grid_w = i32::from(geom.cols).saturating_mul(cw);
+        let cursor_left = i32::from(ccol).saturating_mul(cw);
+        let trail = cw.saturating_mul(Self::DOG_TRAIL_NUM) / Self::DOG_TRAIL_DEN;
+        let x = cursor_left
+            .saturating_sub(trail)
+            .saturating_sub(i32::from(w))
+            .max(0);
+        if i32::from(w) > grid_w {
+            return None; // the grid is narrower than the dog itself
+        }
+        let rest_top = i32::from(crow) * ch + ch / 2 - i32::from(h) / 2;
+        let intrusion = (x + i32::from(w)) - cursor_left;
+        let rise = if intrusion > 0 {
+            intrusion.min(ch / 2).min(rest_top.max(0))
+        } else {
+            0
+        };
+        let y = rest_top - rise + (bob * ch as f32).round() as i32;
+        let sprite = FreeSprite {
+            x,
+            y,
+            w,
+            h,
+            ax,
+            ay,
+            aw: w,
+            ah: h,
+            tint: 0x00FF_FFFF,
+            alpha,
+            flip_x: false,
+            z: FreeZ::OverText,
+            sampler: FreeSampler::Nearest,
+        };
+        free.push(sprite);
+
+        let mut fp = fold_free(0xCBF2_9CE4_8422_2325, &sprite);
+        fp = fold_u64(fp, self.cat_baker.version());
+        fp = fold_u64(fp, self.dog_baker.version());
+        fp = fold_u64(fp, u64::from(colors.accent));
+        fp = fold_u64(fp, u64::from(colors.background));
+        Some(fp)
     }
 
     /// Install one already-resolved immutable source.  This function performs
@@ -4690,6 +4937,7 @@ impl WordDecorations {
                 match m.class {
                     Class::Profanity if !cfg.profanity => continue,
                     Class::Feline if !cfg.feline => continue,
+                    Class::Canine if !cfg.canine => continue,
                     Class::Orca if !cfg.orca => continue,
                     // Emphasis is the ink-only class (P1): the resolver folds
                     // `ink_enabled || has_custom_specs` into `cfg.emphasis`,
@@ -4873,6 +5121,18 @@ impl WordDecorations {
                 inert,
                 spec,
                 custom,
+                // The species tag resolves through the SAME lexicon instance
+                // that produced the match, so the interned id ↔ key pairing
+                // can never skew across a config reload.
+                species: match m.class {
+                    Class::Animal => m
+                        .species
+                        .and_then(|s| animal_glyph_from_key(lexicon.species_code(s))),
+                    // The agreed cross-branch seam: a canine word IS the
+                    // animal roster's dog — one species, two summon paths.
+                    Class::Canine => animal_glyph_from_key("dog"),
+                    _ => None,
+                },
             });
             if out.len() >= MAX_OCCURRENCES {
                 return false;
@@ -5664,6 +5924,7 @@ impl WordDecorations {
         // historical one-prologue-per-tick behaviour verbatim.
         if !self.cat_baker_ready {
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
             self.cat_baker_ready = true;
         }
         // v3 §1.1/§1.2 episode prepass: arm freezing (Cat vs Paw stored at
@@ -5746,6 +6007,7 @@ impl WordDecorations {
         }
         let mut ctx = CatTick {
             baker: &mut self.cat_baker,
+            animal_baker: &mut self.animal_baker,
             unlogged: &self.unlogged,
             sightings: &mut self.sightings,
             peek_cues: &mut self.peek_cues,
@@ -5779,6 +6041,7 @@ impl WordDecorations {
             }),
         };
         let mut cats = 0usize;
+        let mut animals = 0usize;
 
         for (oi, occ) in self.occ.iter().enumerate() {
             // §6 ink modifiers: the word's own nova (palette anchors, Dip,
@@ -5913,6 +6176,45 @@ impl WordDecorations {
                         || vetoed_by(companion_at)
                         || vetoed_by(cameo_at)
                     {
+                        break 'graphic;
+                    }
+                    // The species collection: same one-shot arm law as the
+                    // feline (frozen arms respected, overflow draws nothing,
+                    // ink survives every fallback), its own MAX_ANIMALS pool,
+                    // no feline_style gate, no paw of any kind.
+                    if occ.spec.graphic.map(|g| g.collection) == Some(Collection::Animals) {
+                        let Some(species) = occ.species else {
+                            break 'graphic; // tag without shipped art: ink only
+                        };
+                        let eligible = animal_eligible(occ, cfg, geom);
+                        // Both operands are already computed (`eligible` above,
+                        // `animals` is a running count), so there is nothing to
+                        // defer and the eager form says so.
+                        let arm = peek.arm.unwrap_or(if !eligible {
+                            KittyShownAs::PawFallbackFloor
+                        } else if animals < MAX_ANIMALS {
+                            KittyShownAs::Cat
+                        } else {
+                            KittyShownAs::PawFallbackOverflow
+                        });
+                        if arm == KittyShownAs::Cat {
+                            animals += 1;
+                            if eligible {
+                                emit_animal(
+                                    &mut ctx,
+                                    occ,
+                                    species,
+                                    cfg,
+                                    geom,
+                                    now,
+                                    frame,
+                                    peek,
+                                    free,
+                                    &mut fp,
+                                    &mut active_until,
+                                );
+                            }
+                        }
                         break 'graphic;
                     }
                     let eligible = cat_eligible(occ, cfg, geom);
@@ -6260,15 +6562,21 @@ impl WordDecorations {
         // counting them here would let up to 10 s of departed history starve
         // every slot right after cat-word-dense output — the typed kitty at
         // the prompt would freeze as an invisible overflow arm forever.
-        let mut cat_slots = self
-            .occ
-            .iter()
-            .filter(|occ| {
-                self.persist.get(&occ.ident).is_some_and(|e| {
+        // Latched, still-live sprite arms, counted into their OWN pools: cats
+        // and animals share the `KittyShownAs::Cat` arm encoding but never a
+        // budget (MAX_CATS vs MAX_ANIMALS — a page of penguins must not evict
+        // the kitties, nor the reverse).
+        let (mut cat_slots, mut animal_slots) =
+            self.occ.iter().fold((0usize, 0usize), |(c, a), occ| {
+                let live = self.persist.get(&occ.ident).is_some_and(|e| {
                     e.shown_as == Some(KittyShownAs::Cat) && !e.peek_done && !e.inert()
-                })
-            })
-            .count();
+                });
+                match occ.spec.graphic.map(|g| g.collection) {
+                    _ if !live => (c, a),
+                    Some(Collection::Animals) => (c, a + 1),
+                    _ => (c + 1, a),
+                }
+            });
         for occ in &self.occ {
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
                 continue;
@@ -6308,7 +6616,12 @@ impl WordDecorations {
                     // clearance pause below all key off the same predicate the
                     // emission loop uses, so "armed Cat" always means "could
                     // draw at decision time".
-                    let drawable = cat_eligible(occ, cfg, geom);
+                    let is_animal = g.collection == Collection::Animals;
+                    let drawable = if is_animal {
+                        animal_eligible(occ, cfg, geom)
+                    } else {
+                        cat_eligible(occ, cfg, geom)
+                    };
                     if matches!(
                         ep.shown_as,
                         None | Some(
@@ -6316,13 +6629,24 @@ impl WordDecorations {
                         )
                     ) {
                         let prior = ep.shown_as;
-                        let arm = if cfg.feline_style != FelineStyle::Cat {
+                        // The animal arm reuses the feline arm encoding
+                        // (`Cat` = "the authored sprite"), with its own slot
+                        // pool and WITHOUT the feline_style gate — the paw
+                        // style is a statement about cats, not about camels.
+                        let arm = if !is_animal && cfg.feline_style != FelineStyle::Cat {
                             KittyShownAs::PawStyle
                         } else if !drawable {
                             // Drawability includes text clearance, not just the
                             // cell floors: a word born under dense output must
                             // not claim a §5.2 slot it will emit nothing from.
                             KittyShownAs::PawFallbackFloor
+                        } else if is_animal {
+                            if animal_slots < MAX_ANIMALS {
+                                animal_slots += 1;
+                                KittyShownAs::Cat
+                            } else {
+                                KittyShownAs::PawFallbackOverflow
+                            }
                         } else if cat_slots < MAX_CATS {
                             cat_slots += 1;
                             KittyShownAs::Cat
@@ -6378,9 +6702,13 @@ impl WordDecorations {
                                 // dwell range). Latched on the episode so the
                                 // scrolled-off sweep below can finish the
                                 // one-shot without the occurrence in scope.
-                                let magical = (cfg.feline_magic
-                                    && cat_magic(ep.genome.magic).is_some())
-                                    || has_accessory(ep.genome.magic);
+                                // Animals decode no magic/accessory — their
+                                // dwell derivation must mirror emit_animal's
+                                // (magical = false) exactly as the feline arm
+                                // mirrors emit_cat's.
+                                let magical = !is_animal
+                                    && ((cfg.feline_magic && cat_magic(ep.genome.magic).is_some())
+                                        || has_accessory(ep.genome.magic));
                                 let total =
                                     peek_total_ms(occ.ident, ep.genome.gkey, magical, g.dwell_ms);
                                 ep.peek_total = total;
@@ -7787,6 +8115,53 @@ fn cat_geometry_for(
     }
 }
 
+/// The animal roster's eligibility gate: [`cat_eligible`] minus the
+/// `feline_style` arm — the paw style is a statement about cats, and there is
+/// no animal paw. Same cell floors, same DEC-line suppression, same
+/// both-sides-walled rejection, same 1-cell-word floor; every ineligible case
+/// draws NO graphic and the word's ink is the graceful fallback.
+fn animal_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
+    let _ = cfg; // parity with cat_eligible's signature; no style gate to read
+    if geom.cell_h < CAT_MIN_CELL_H
+        || geom.cell_w < CAT_MIN_CELL_W
+        || occ.dec_line
+        || !occ.cat_text_clear
+    {
+        return false;
+    }
+    let word_px = (i32::from(occ.end_col) - i32::from(occ.start_col) + 1) * i32::from(geom.cell_w);
+    (word_px as f32) >= 0.8 * f32::from(geom.cell_h)
+}
+
+/// §5.2 geometry for a species head: the cat law with two deletions — no age
+/// scale (every animal is an adult of its own species) and no patch strip in
+/// the width cap (animal tiles are exact-size). Authored aspect from the
+/// species' own viewbox, word-midpoint anchor, viewport clamp.
+fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -> CatGeom {
+    let cw = i32::from(geom.cell_w);
+    let aspect = AnimalBaker::aspect(species);
+    let desired_h = f32::from(cat_hart(geom.cell_h));
+    // `host_tile` admits `w ≤ slot_w (= 4·cell_h)` and `h ≤ 2·cell_h`.
+    let max_w = f32::from(geom.cell_h.saturating_mul(4).max(1));
+    let max_h = f32::from(geom.cell_h.saturating_mul(2).max(1));
+    let fitted_h = desired_h.max(1.0).min(max_h).min(max_w / aspect);
+    let hart = fitted_h.round().clamp(1.0, max_h) as u16;
+    let w = (f32::from(hart) * aspect).round().clamp(1.0, max_w) as u16;
+    let chin = cat_chin(hart);
+    let w_i = i32::from(w);
+    let grid_w = i32::from(geom.cols) * cw;
+    let mid = (i32::from(occ.start_col) * cw + (i32::from(occ.end_col) + 1) * cw) / 2;
+    let center =
+        f32::from(ANIMAL_GLYPHS[species as usize].center_x) / f32::from(FIXED_ONE);
+    let x = (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - w_i).max(0));
+    CatGeom {
+        w,
+        hart,
+        chin,
+        x: x as u16,
+    }
+}
+
 /// §5.6 ease-out-back with an EXACT overshoot amplitude: `f(p) = 1 +
 /// (c+1)(p−1)³ + c(p−1)²`, `c` solved from the closed form
 /// `amp = 4c³ / (27(c+1)²)` by bisection so `max f = 1 + amp` (the genome
@@ -8018,6 +8393,10 @@ fn push_cat_free(
 /// there is no live gaze map / cursor / nova hook any more).
 struct CatTick<'a> {
     baker: &'a mut CatBaker,
+    /// The animal roster's exact-size cache — [`emit_animal`] bakes here, then
+    /// lands the texels in the SHARED atlas through `baker`'s `host_tile`
+    /// door, so cats and animals ride one upload and one bake budget.
+    animal_baker: &'a mut AnimalBaker,
     /// §F4.2: idents whose episode has not yet queued its one sighting (the
     /// pre-loop scratch; ≤ MAX_OCCURRENCES entries, linear scan is bounded).
     unlogged: &'a [u64],
@@ -8431,6 +8810,185 @@ fn emit_cat(
     }
 }
 
+/// The species-head twin of [`emit_cat`]: the SAME one-shot peek — birth-latched
+/// clock, ease-out-back rise, breathing dwell, anticipation + descend, the
+/// text-line-only cut, the companion pixel-yield — with everything the genome
+/// wardrobe owns deleted. No magic, no specials, no accessories, no age scale,
+/// no kitten bounce, no paw fallback, and NO Kitty Log sighting: the log is the
+/// feline collectible surface, and a camel is not a collectible cat. The tile
+/// rides the exact-size [`AnimalBaker`] cache into the shared atlas through the
+/// `host_tile` door (the pet's path), so a deferred bake defers the sprite one
+/// beat exactly like a deferred cat bake.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pure per-occurrence emission over tick-local accumulators, exactly like emit_cat"
+)]
+fn emit_animal(
+    ctx: &mut CatTick,
+    occ: &Occurrence,
+    species: AnimalGlyphId,
+    cfg: &DecoConfig,
+    geom: EffectGeom,
+    now: Instant,
+    frame: u64,
+    peek: PeekView,
+    free: &mut Vec<FreeSprite>,
+    fp: &mut u64,
+    active_until: &mut Option<Instant>,
+) {
+    let g = animal_geometry(occ, geom, species);
+    let ch = i32::from(geom.cell_h);
+    let rest = i32::from(cat_rest_reveal(g.hart));
+    // Entrance overshoot from the same free genome bit window as the cat's —
+    // per-word personality without a bake-key axis. No kitten ×1.3: species
+    // heads have no age.
+    let amp = 0.06 + genome::field(occ.genome.gkey, 15, 2) as f32 * 0.04;
+    // magical = false everywhere below: the prepass's dwell derivation mirrors
+    // this (see episode_prepass).
+    let dwell_range = occ.spec.graphic.map_or((2200, 3598), |g| g.dwell_ms);
+    let dwell = peek_dwell_ms(occ.ident, occ.genome.gkey, false, dwell_range);
+    let antic = anticipation_ms(occ.genome.gkey);
+    let total = peek_total_ms(occ.ident, occ.genome.gkey, false, dwell_range);
+    let dwell_end = CAT_RISE_MS + dwell;
+
+    // Phase resolution — the cat law verbatim (reduced_motion pins the settled
+    // pose; the clock latched at birth; Done emits zero quads forever).
+    let (t, in_rise, in_dwell) = if cfg.reduced_motion {
+        if peek.peek_done || peek.start.is_none() {
+            return;
+        }
+        (CAT_RISE_MS, false, true)
+    } else {
+        let Some(ps) = peek.start else {
+            return;
+        };
+        if now < ps {
+            arm_until(active_until, ps + Duration::from_millis(total));
+            *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
+            return;
+        }
+        let t = now.saturating_duration_since(ps).as_millis() as u64;
+        if peek.peek_done || t >= total {
+            return;
+        }
+        arm_until(active_until, ps + Duration::from_millis(total));
+        (t, t < CAT_RISE_MS, t >= CAT_RISE_MS && t < dwell_end)
+    };
+    let td = t.saturating_sub(CAT_RISE_MS);
+    // The anti-skip frame fold — the dwell breathes, so it folds through the
+    // whole peek exactly like the cat's.
+    if !cfg.reduced_motion {
+        *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
+    }
+    let p = if in_rise {
+        t as f32 / CAT_RISE_MS as f32
+    } else {
+        1.0
+    };
+    let mut antic_lift = 0i32;
+    let reveal = if cfg.reduced_motion || in_dwell {
+        rest
+    } else if in_rise {
+        (ease_out_back(p, amp) * rest as f32).round() as i32
+    } else {
+        let ta = t - dwell_end;
+        if ta < antic {
+            antic_lift = 2;
+            rest
+        } else {
+            let pd = (ta - antic) as f32 / CAT_DESCEND_MS as f32;
+            ((1.0 - ease_in_out_cubic(pd)) * rest as f32).round() as i32
+        }
+    };
+    if reveal <= 0 {
+        return;
+    }
+    // Two doors, one budget (the pet's idiom): bake the species head into its
+    // exact-size cache, then land the texels in the shared atlas. A miss on
+    // either door defers the sprite one short beat — same retry the cat bake
+    // gets. Field-split the ctx so the tile borrow and the atlas door don't
+    // fight over it.
+    let key = AnimalBakeKey {
+        species,
+        colors: occ.cat_colors,
+        w: g.w,
+        h: g.hart,
+    };
+    let host = key.host_id();
+    let CatTick {
+        baker,
+        animal_baker,
+        companion_px,
+        ..
+    } = &mut *ctx;
+    let tile = match animal_baker.tile(&key) {
+        Some(rgba) => baker.host_tile(host, key.w, key.h, rgba),
+        None => None,
+    };
+    let Some(tile) = tile else {
+        arm_until(active_until, now + Duration::from_millis(50));
+        *fp = fold_u64(*fp, frame.wrapping_mul(0x9E37_79B1));
+        return;
+    };
+    // Entrance kinematics + the text-line-only cut: the cat law verbatim
+    // (see emit_cat's §5.6/§5.2 commentary), minus the kitten bounce.
+    let vh = reveal.min(rest);
+    let lift = (reveal - rest)
+        .max(0)
+        .max(antic_lift)
+        .min(2 * ch - (i32::from(g.hart) - i32::from(g.chin)));
+    let row_top = i32::from(occ.row) * ch;
+    let (mut top, mut bottom) = if occ.cat_peek_down {
+        let rest_top = row_top + ch - i32::from(g.chin);
+        let top = rest_top + lift;
+        (top, top + vh)
+    } else {
+        let rest_bottom = row_top + i32::from(g.chin);
+        let bottom = rest_bottom - lift;
+        (bottom - vh, bottom)
+    };
+    let grid_h = i32::from(geom.rows) * ch;
+    if top < 0 {
+        bottom -= top;
+        top = 0;
+    } else if bottom > grid_h {
+        let over = bottom - grid_h;
+        top -= over;
+        bottom -= over;
+    }
+    let src_y0 = if occ.cat_peek_down {
+        i32::from(tile.ay) + (rest - vh).max(0)
+    } else {
+        i32::from(tile.ay)
+    };
+    // Yield to the companion in pixels, exactly like a cat: overlapping the
+    // flying head or the resident pet draws nothing this frame.
+    if companion_px.is_some_and(|box_px| {
+        cat_is_stacked_on(box_px, i32::from(g.x), i32::from(g.w), top, bottom)
+    }) {
+        return;
+    }
+    let pose = if in_dwell && !cfg.reduced_motion {
+        CatIdlePose::breathing(td, occ.genome.gkey, geom.cell_h)
+    } else {
+        CatIdlePose::STILL
+    };
+    push_cat_free(
+        free,
+        i32::from(g.x),
+        i32::from(g.w),
+        top,
+        bottom,
+        i32::from(tile.ax),
+        src_y0,
+        pose,
+        fp,
+    );
+    // Deliberately NO Kitty Log sighting and NO peek cue: the log is the
+    // feline collectible surface (§F4.2), and the pet's word-cat bat answers
+    // cats, not camels.
+}
+
 /// The class base ink pair `(c0, c1)` (§4.2/§4.6), `0x00RRGGBB`. `None` = the
 /// class carries no ink (orca is untouched in v2).
 fn ink_pair(class: Class) -> Option<(u32, u32)> {
@@ -8438,7 +8996,12 @@ fn ink_pair(class: Class) -> Option<(u32, u32)> {
         Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
         Class::Profanity => Some((0x00FF_D447, 0x00FF_7CE5)),
         Class::Feline => Some((0x00F7_A8B8, 0x00FF_D9C2)),
+        // Warm meadow pair — only reachable through a custom TwoTone override
+        // (the class default rides the feline's SelfGlow), kept so the anchor
+        // exists the day a user recolors an animal word.
+        Class::Animal => Some((0x00FF_C98A, 0x00B9_E8A3)),
         Class::Orca => None,
+        Class::Canine => None,
     }
 }
 
@@ -9227,6 +9790,10 @@ fn class_tag(c: Class) -> u64 {
         Class::Feline => 2,
         Class::Orca => 3,
         Class::Emphasis => 4,
+        Class::Canine => 5,
+        // 5 is spoken for: the dog-summon branch's Canine tag (branch
+        // benji-dog-summon) — the seeds must not collide at merge.
+        Class::Animal => 6,
     }
 }
 
@@ -9442,6 +10009,7 @@ mod tests {
         DecoConfig {
             profanity: true,
             feline: true,
+            canine: true,
             orca: true,
             emphasis: true,
             ink_enabled: true,
@@ -9494,6 +10062,7 @@ mod tests {
             // (v1 sparkle batteries), exactly like the rescan would.
             spec: class_default_spec(class, &cfg()),
             custom: false,
+            species: None,
         }
     }
 
@@ -13848,6 +14417,7 @@ mod tests {
             inert: false,
             spec: class_default_spec(Class::Feline, &cfg()),
             custom: false,
+            species: None,
         }
     }
 
@@ -14568,6 +15138,74 @@ mod tests {
             with_companion.len(),
             2,
             "one away cat plus the companion — the intended pair"
+        );
+    }
+
+    /// THE AMBIENT ANIMAL ROSTER, real engine end to end: typed animal words
+    /// (settled — the caret parked elsewhere, so the ambiguous live-caret
+    /// deferral has released them) each peek their OWN species head, cats and
+    /// animals in separate budget pools, no Kitty Log rows for animals.
+    #[test]
+    fn animal_words_peek_their_species_heads() {
+        let lex = lex();
+        let c = cfg();
+        let g = geom20();
+        let t0 = Instant::now();
+        let (rows, cols) = (usize::from(g.rows), usize::from(g.cols));
+        let mut term = Terminal::new(g.rows, g.cols);
+        // Two animal words on well-separated rows, caret on a bare prompt row.
+        term.process(b"\x1b[3;1Hmonkey\x1b[7;1Hcamel\x1b[10;1H");
+        let caret = (9u16, 0u16);
+        let mut snap = aterm_core::render::RenderInput::default();
+        term.cell_frame_into(&mut snap, rows, cols);
+        let bg = snap
+            .cells
+            .iter()
+            .find_map(|line| line.first())
+            .map_or(0, |cell| rgb3_to_u32(cell.bg));
+        let mut wd = WordDecorations::default();
+        wd.rescan_from_cells_with_geom_at_cursor(
+            &snap.cells,
+            &snap.line_sizes,
+            rows,
+            cols,
+            &lex,
+            &c,
+            1,
+            t0,
+            g,
+            bg,
+            Some(caret),
+        );
+        // The rescan resolved each occurrence's species from its lexicon tag.
+        let species: Vec<_> = wd.occ.iter().filter_map(|o| o.species).collect();
+        assert_eq!(
+            species,
+            vec![AnimalGlyphId::Monkey, AnimalGlyphId::Camel],
+            "each word carries its own authored head"
+        );
+        assert!(
+            wd.occ.iter().all(|o| o.class == Class::Animal),
+            "both words classify as animals"
+        );
+        // Tick into the dwell: both heads should be on glass. First frames may
+        // defer on the two-bakes-per-frame budget; the settled frame may not.
+        let mut free = Vec::new();
+        for k in 0..6u64 {
+            let now = t0 + Duration::from_millis(DWELL_QUIET_MS + 16 * k);
+            let (f, _, _) = tick_cat_at(&mut wd, now, &c, g, None, true);
+            free = f;
+        }
+        let ambient: Vec<_> = free
+            .iter()
+            .filter(|s| matches!(s.z, FreeZ::UnderText))
+            .collect();
+        assert_eq!(ambient.len(), 2, "both species heads peek: {ambient:?}");
+        // Animals never join the feline collectible surface.
+        assert_eq!(
+            wd.drain_kitty_sightings().count(),
+            0,
+            "no Kitty Log sighting for a species head"
         );
     }
 
@@ -18038,6 +18676,7 @@ mod tests {
                     inert: false,
                     spec: class_default_spec(Class::Profanity, &cfg_nova()),
                     custom: false,
+                    species: None,
                 }],
                 cols: 20,
                 have_scanned: true,
@@ -18116,6 +18755,7 @@ mod tests {
                 inert: false,
                 spec: class_default_spec(Class::Profanity, &cfg_nova()),
                 custom: false,
+                species: None,
             };
             // All four already granted (bypassing the limiter — this pins the
             // CONCURRENCY cap, not the rate limiter).
@@ -18170,6 +18810,7 @@ mod tests {
                 inert: false,
                 spec: class_default_spec(Class::Profanity, &cfg_nova()),
                 custom: false,
+                species: None,
             };
             let mut wd = WordDecorations {
                 occ: vec![o],
@@ -18776,14 +19417,12 @@ mod tests {
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut wd = WordDecorations::default();
         let mut term = Terminal::new(4, 40);
-        let mut epoch = 1u64;
         for (i, ch) in b"fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
             // KEYSTROKE-REAL: each char is a committed key, which is what the
             // typed witness now requires on top of the caret's position.
             wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
-            wd.rescan(&term, 4, 40, &lexicon, &c, epoch, at(100 * (i as u64 + 1)));
-            epoch += 1;
+            wd.rescan(&term, 4, 40, &lexicon, &c, i as u64 + 1, at(100 * (i as u64 + 1)));
         }
         assert_eq!(wd.combo_births.len(), 2);
         wd.hard_reset();
@@ -18857,14 +19496,12 @@ mod tests {
         let mut wd = WordDecorations::default();
         let mut term = Terminal::new(20, 40);
         term.process(b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n");
-        let mut epoch = 1u64;
         for (i, ch) in b"fuck fuck fuck fuck fuck".iter().enumerate() {
             term.process(&[*ch]);
             // KEYSTROKE-REAL: each char is a committed key, which is what the
             // typed witness now requires on top of the caret's position.
             wd.note_typed_edit(at(60 * (i as u64 + 1)), None);
-            wd.rescan(&term, 20, 40, &lexicon, &c, epoch, at(60 * (i as u64 + 1)));
-            epoch += 1;
+            wd.rescan(&term, 20, 40, &lexicon, &c, i as u64 + 1, at(60 * (i as u64 + 1)));
         }
         let ep5 = &wd.persist[&wd.occ[4].ident];
         assert_eq!(ep5.burst_tier, supernova::SuperTier::Nuke);
@@ -20455,42 +21092,33 @@ mod tests {
 
     // ─────────────────── the typed-kitty cameo (owner ask A) ───────────────────
 
-    /// Owner, 2026-08-09: the typed word must summon a toy that is
-    /// unmistakably NOT the cursor escort.
+    /// OWNER REGRESSION, 2026-08-10: *"AHH! the kitty that appears when I type
+    /// 'Kitty' is huge! go back to the old text kitty!"* — clarified: *"like
+    /// how it appears in the regular text."*
     ///
-    /// The escort is structurally capped at the baker's `2·cell_h` slot
-    /// ([`WordDecorations::COMPANION_CELL_H`] × the age scale, clamped by
-    /// `authored_cat_size`), so "taller than two cells" is a size the escort
-    /// cannot reach at ANY age — which makes it the right claim to pin rather
-    /// than a ratio against one sampled age.
+    /// 0.19.0 drew the typed-word cameo at the full 2-cell atlas slot with a
+    /// further 2.0× dest scale: a ~4-cell creature standing OVER the text,
+    /// ahead of the caret. This pins the restored presentation to the AMBIENT
+    /// WORD-CAT'S OWN LAW — head-scale art, part of the line — so the next
+    /// "make it its own cat" pass cannot silently supersize it again:
+    ///
+    /// * sized by `cat_hart × age.scale()` through `authored_cat_size`,
+    ///   byte-equal to the §5.2 ambient head law, and structurally inside the
+    ///   two-row text band;
+    /// * NEAREST 1:1 (`aw == w`, `ah == h`) — there is no dest enlargement
+    ///   left to turn back up;
+    /// * `UnderText`, chin slice tucked behind the anchor row, so the line's
+    ///   ink occludes it exactly as it does every cat living in regular text;
+    /// * its authored centre over the ANCHOR cell — it peeks AT the word it
+    ///   answers, never stands ahead of it in open space;
+    /// * and a top-row anchor mirrors DOWN like the ambient `PeekDir::Down`
+    ///   arm instead of parking the head on the word.
     #[test]
-    fn the_cameo_draws_bigger_than_the_cursor_escort_can_ever_be() {
+    fn the_word_kitty_is_text_scale_head_art_like_the_ambient_peek() {
         let g = geom20();
         let t0 = Instant::now();
         let look = KittyLook::for_session(3);
         let mut wd = WordDecorations::default();
-
-        // The escort, emitted first purely as the yardstick.
-        let mut escort = Vec::new();
-        wd.kitty_cursor(
-            KittyCursorFrame {
-                geom: g,
-                cursor: (2, 4),
-                look,
-                colors: CatColorKey::default(),
-                bob: 0.0,
-                alpha: 255,
-                pose: crate::kitty_cursor::CatPose::STILL,
-                sing: 0.0,
-                notes: [None; crate::kitty_sing::MAX_NOTES],
-            },
-            &mut escort,
-        );
-        assert_eq!(escort.len(), 1, "PRECONDITION: the escort really drew");
-        assert!(
-            i32::from(escort[0].h) <= 2 * i32::from(g.cell_h),
-            "PRECONDITION: the escort lives inside the 2-cell atlas slot"
-        );
 
         let mut free = Vec::new();
         assert!(
@@ -20500,36 +21128,90 @@ mod tests {
         );
         assert!(free.is_empty(), "and no sprite either — byte-identical off");
 
-        wd.summon_cameo(t0, (2, 4), look, None);
+        let (row, col) = (4u16, 9u16);
+        wd.summon_cameo(t0, (row, col), look, None);
+        // Sample mid-dwell on a whole bob period (`t % CAMEO_BOB_MS == 0`):
+        // the entrance slide is spent and the bob term is exactly zero, so the
+        // REST geometry below is byte-exact rather than tolerance-fuzzed.
+        let rest_at = t0 + Duration::from_millis(2 * crate::kitty_cameo::CAMEO_BOB_MS);
         let fp = wd
-            .kitty_cameo(g, t0, None, CatColorKey::default(), &mut free)
+            .kitty_cameo(g, rest_at, None, CatColorKey::default(), &mut free)
             .expect("a summoned cameo emits");
         assert_ne!(fp, 0, "and folds a fingerprint the host cannot early-out");
-        assert_eq!(free.len(), 1, "exactly ONE sprite: the toy");
-        let toy = free[0];
+        assert_eq!(free.len(), 1, "exactly ONE sprite: the word-kitty");
+        let cat = free[0];
+
+        // THE AMBIENT HEAD LAW, byte for byte: the same size the word-cat
+        // peeking at an on-screen `kitty` of this identity would draw at.
+        let norm = look.normalized();
+        let (law_w, law_h) = authored_cat_size(
+            norm.variant,
+            f32::from(cat_hart(g.cell_h)) * norm.age.scale(),
+            g.cell_h,
+        );
+        assert_eq!(
+            (cat.w, cat.h),
+            (law_w, law_h),
+            "the word-kitty wears the ambient word-cat's own size law"
+        );
         assert!(
-            i32::from(toy.h) > 2 * i32::from(g.cell_h),
-            "the toy must exceed the escort's structural ceiling: {} vs {}",
-            toy.h,
+            i32::from(cat.h) <= 2 * i32::from(g.cell_h),
+            "and stays structurally inside the two-row text band — never pet \
+             scale again: {} vs {}",
+            cat.h,
             2 * g.cell_h
         );
         assert_eq!(
-            toy.z,
-            FreeZ::OverText,
-            "a toy stands in FRONT of the terminal"
+            (cat.aw, cat.ah),
+            (cat.w, cat.h),
+            "NEAREST 1:1 like every text cat — no dest enlargement exists to \
+             be turned back up"
         );
-        // It stands AHEAD of the caret, so it cannot cover the word behind it,
-        // and it is fully on the grid.
-        assert!(
-            toy.x > 4 * i32::from(g.cell_w),
-            "the toy stands past the anchor cell, not over the word behind it"
+        assert_eq!(
+            cat.z,
+            FreeZ::UnderText,
+            "the word-kitty peeks from BEHIND the line, part of the text"
+        );
+        assert_eq!(cat.alpha, 255, "the dwell is fully opaque, like the peek");
+
+        // AT REST the chin slice sits exactly behind the anchor row's top
+        // edge, and the authored centre lands on the anchor cell's midpoint —
+        // the head peeks AT the word just typed, not ahead of the caret.
+        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
+        assert_eq!(
+            cat.y + i32::from(cat.h),
+            i32::from(row) * ch + i32::from(cat_chin(cat.h)),
+            "the chin slice tucks behind the anchor row"
+        );
+        let mid = i32::from(col) * cw + cw / 2;
+        let center = f32::from(GLYPHS[norm.variant as usize].center_x) / f32::from(FIXED_ONE);
+        assert_eq!(
+            cat.x,
+            mid - (center * f32::from(cat.w)).round() as i32,
+            "the authored centre lands on the anchor cell's midpoint"
         );
         assert!(
-            toy.y >= 0
-                && toy.y + i32::from(toy.h)
-                    <= i32::from(g.rows) * i32::from(g.cell_h)
-                && toy.x + i32::from(toy.w) <= i32::from(g.cols) * i32::from(g.cell_w),
-            "and its whole body is on-grid: {toy:?}"
+            cat.y >= 0
+                && cat.y + i32::from(cat.h) <= i32::from(g.rows) * ch
+                && cat.x >= 0
+                && cat.x + i32::from(cat.w) <= i32::from(g.cols) * cw,
+            "and the whole head is on-grid: {cat:?}"
+        );
+
+        // A TOP-ROW anchor has no rows above: the head mirrors DOWN out from
+        // under the line (the ambient `PeekDir::Down` arm) rather than being
+        // clamp-parked on top of the word it came for.
+        wd.summon_cameo(rest_at, (0, col), look, None);
+        let mut below = Vec::new();
+        let rest_down = rest_at + Duration::from_millis(2 * crate::kitty_cameo::CAMEO_BOB_MS);
+        wd.kitty_cameo(g, rest_down, None, CatColorKey::default(), &mut below)
+            .expect("a top-row cameo still emits");
+        let cat = below[0];
+        assert_eq!(
+            cat.y,
+            ch - i32::from(cat_chin(cat.h)),
+            "on row 0 the chin tucks behind the row's BOTTOM edge and the head \
+             slides out below"
         );
     }
 
@@ -21983,5 +22665,62 @@ mod scan_memo_bench {
                 wd.scan_memo.fresh_buffers,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dog_cameo_emission_tests {
+    use super::*;
+
+    /// The dog cameo emits exactly one free sprite BEHIND the cursor once its
+    /// tile lands (retrying the two-door bake across frames like the pet), and
+    /// the sprite never overlaps the cursor cell away from the left margin.
+    #[test]
+    fn dog_cameo_emits_one_trailing_sprite() {
+        let mut wd = WordDecorations::default();
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        };
+        let look = crate::dog_cameo::DogLook {
+            breed: crate::dog_glyphs_gen::DOG_HEADS[0],
+            coat: 9,
+        };
+        let frame = DogCameoFrame {
+            geom,
+            cursor: (5, 40),
+            look,
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            alpha: 255,
+        };
+        let mut free = Vec::new();
+        // The shared bake budget may defer the first frames; a real visit
+        // spans ~190 frames, so retry a handful like the host would.
+        let mut fp = None;
+        for frame_i in 0..8 {
+            // Per-frame prologue the host's `tick` normally performs.
+            wd.cat_baker_ready = false;
+            free.clear();
+            fp = wd.dog_cameo(frame, &mut free);
+            if fp.is_some() {
+                break;
+            }
+            assert!(frame_i < 7, "the dog tile never landed in 8 frames");
+        }
+        assert!(fp.is_some(), "the emission resolves a fingerprint");
+        assert_eq!(free.len(), 1, "exactly one dog sprite");
+        let s = &free[0];
+        assert!(s.alpha == 255);
+        let cursor_left = 40 * 10;
+        assert!(
+            s.x + i32::from(s.w) <= cursor_left,
+            "the dog trails BEHIND the cursor cell (x {} w {} vs cursor left {cursor_left})",
+            s.x,
+            s.w
+        );
+        assert!(s.w > 0 && s.h > 0);
     }
 }

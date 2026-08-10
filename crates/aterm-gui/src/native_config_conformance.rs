@@ -956,6 +956,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     initial.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&initial.assets.trail_packs),
         kitty_sprite: initial.assets.kitty_sprite.clone(),
+        wallpaper: initial.assets.wallpaper.clone(),
         themes: Arc::clone(&initial.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&initial_consumers)),
     });
@@ -984,6 +985,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     patched.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&patched.assets.trail_packs),
         kitty_sprite: patched.assets.kitty_sprite.clone(),
+        wallpaper: patched.assets.wallpaper.clone(),
         themes: Arc::clone(&patched.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&initial_consumers)),
     });
@@ -1044,6 +1046,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
     external.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
         trail_packs: Arc::clone(&external.assets.trail_packs),
         kitty_sprite: external.assets.kitty_sprite.clone(),
+        wallpaper: external.assets.wallpaper.clone(),
         themes: Arc::clone(&external.assets.themes),
         sparkle_spec_consumers: Some(Arc::clone(&external_consumers)),
     });
@@ -1253,6 +1256,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&initial.assets.trail_packs),
             kitty_sprite: external.assets.kitty_sprite.clone(),
+        wallpaper: external.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: external.assets.sparkle_spec_consumers.clone(),
         }),
@@ -1283,6 +1287,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
             kitty_sprite: initial.assets.kitty_sprite.clone(),
+        wallpaper: initial.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: external.assets.sparkle_spec_consumers.clone(),
         }),
@@ -1314,6 +1319,7 @@ fn config_snapshot_catalog_is_atomic_across_patch_external_and_cross_view_delive
         assets: Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&external.assets.trail_packs),
             kitty_sprite: external.assets.kitty_sprite.clone(),
+        wallpaper: external.assets.wallpaper.clone(),
             themes: Arc::clone(&external.assets.themes),
             sparkle_spec_consumers: initial.assets.sparkle_spec_consumers.clone(),
         }),

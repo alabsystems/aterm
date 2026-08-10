@@ -3110,6 +3110,29 @@ impl App {
                     AppEvent::DocumentEditorOpened { document },
                 )?;
             }
+            AppEffect::ChooseWallpaperImage => {
+                // The modal picker runs its own nested loop on the main thread
+                // (the document-open pattern). Only an affirmative selection
+                // writes config — through the SAME versioned lane the control
+                // `settings set` verb uses, so the image is re-decoded and every
+                // Settings view converges on the one admitted verdict.
+                if let Some(path) =
+                    crate::menu::choose_local_file("Choose a wallpaper image", "Set Wallpaper")
+                {
+                    let value = path.to_string_lossy().into_owned();
+                    let (reply, outcome) = std::sync::mpsc::channel();
+                    self.queue_control_settings_field(
+                        crate::prefs::EDIT_WALLPAPER.to_string(),
+                        Some(value),
+                        reply,
+                    );
+                    // The lane replies asynchronously after persistence; only a
+                    // synchronously-known failure is worth surfacing here.
+                    if let Ok(Err(error)) = outcome.try_recv() {
+                        aterm_log::warn!("wallpaper picker: {error}");
+                    }
+                }
+            }
             AppEffect::RequestCloseSelf => {
                 self.close_active_native_tab(wid)?;
             }
@@ -3672,6 +3695,7 @@ impl App {
             prepared.assets = std::sync::Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
                 kitty_sprite: prepared.assets.kitty_sprite.clone(),
+                wallpaper: prepared.assets.wallpaper.clone(),
                 themes: std::sync::Arc::clone(current),
                 sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
             });
@@ -5608,6 +5632,7 @@ impl App {
     ///     converged artifact has `retry_at: None` and takes
     ///     `surface_update_apply_outcome`'s "see Version menu" branch, the one
     ///     that names a control the user can actually press.
+    ///
     /// Everything between the two is quiet.
     ///
     /// Answering `true` for an artifact with no physical record is deliberate:
@@ -6190,7 +6215,11 @@ impl App {
                         indicators: crate::tab_model::TabIndicators {
                             dirty: presentation.indicators.dirty,
                             busy: presentation.indicators.busy,
+                            // A native leaf is the OUT-OF-BAND attention owner;
+                            // it has no session and therefore no classified
+                            // status.
                             attention: presentation.indicators.attention,
+                            status_attention: false,
                         },
                         closable: presentation.closable,
                         tooltip: presentation.tooltip,
@@ -8904,6 +8933,7 @@ mod tests {
     ///     `surface_native_close_recovery`, which switches the active tab, moves
     ///     keyboard focus, re-fronts the window and replaces the window overlay
     ///     with a Close Recovery palette.
+    ///
     /// A test written against `pending_restore` therefore cannot observe a single
     /// one of those disturbances even when they are happening on every probe —
     /// which is exactly how the recurring focus hijack survived two reviews.

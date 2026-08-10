@@ -978,6 +978,21 @@ pub struct Renderer {
     /// in toggle order; the mix's FIRST face is the ordinary primary. Empty =
     /// no mix. See [`Renderer::set_game_mix_faces`] / [`FaceId::GameMix`].
     game_mix: Vec<FallbackFace>,
+    /// FONT-GAME-FIT: how the PRIMARY face is fitted to the grid when it is a
+    /// bundled game face — `None` for every ordinary font, which is what keeps
+    /// the whole policy off the normal path. See [`GameFaceFit`].
+    game_fit: Option<GameFaceFit>,
+    /// The px the host last REQUESTED, before [`GameFaceFit::px_scale`]. Equals
+    /// `px` for every unfitted face; only the size-change guards read it.
+    px_request: f32,
+    /// FONT-GAME-FIT: extra cell px LEARNED by [`Renderer::calibrate_fitted_cell`]
+    /// — how far the real rasterizer's coverage exceeded the metric prediction
+    /// for this face. Kept as a field (rather than applied to `cell_w` alone) so
+    /// the pure geometry read [`Renderer::cell_geometry`], which cannot measure,
+    /// still reports the width the live renderer will actually use. Grows only,
+    /// so repeated calibration at different sizes converges instead of
+    /// oscillating. Always 0 for an unfitted face.
+    fit_cell_pad: usize,
     /// Per-char index into [`Self::fallback_chain`] for the entry that covered the
     /// char, recorded by [`Self::fallback_has`] so the rasterizer (which sees only
     /// a [`GlyphKey`]'s code point) recovers WHICH chain face to draw from — exactly
@@ -1462,6 +1477,23 @@ pub struct WindowCpu {
     pub(crate) scroll_apron_saved: Vec<u32>,
     pub(crate) scroll_apron_rows: Vec<usize>,
     pub(crate) scroll_apron_tmp: Vec<u32>,
+    /// WALLPAPER base-layer conversion cache: the frame's
+    /// [`RenderInput::wallpaper`] RGBA8 texels packed into the framebuffer's
+    /// `0x00RRGGBB` words, rebuilt only when the host publishes a fresh
+    /// wallpaper `Arc` (identity-keyed, like the GPU texture cache), so the
+    /// full-path base fill and the per-band re-establish are straight row
+    /// copies. `None` when no (frame-sized, texel-complete) wallpaper is live.
+    pub(crate) wallpaper_px: Option<WallpaperPx>,
+}
+
+/// One converted wallpaper generation (see [`WindowCpu::wallpaper_px`]).
+#[derive(Default)]
+pub(crate) struct WallpaperPx {
+    /// `Arc::as_ptr` of the source [`RenderInput::wallpaper`] snapshot.
+    key: usize,
+    /// Exactly `width*height` packed `0x00RRGGBB` words (opaque: transmittance
+    /// byte 0 — a wallpaper replaces the background-opacity glass).
+    px: Vec<u32>,
 }
 
 impl WindowCpu {
@@ -1757,10 +1789,18 @@ pub fn embedded_font() -> &'static [u8] {
     include_bytes!("../assets/DejaVuSansMono.ttf")
 }
 
-/// One bundled game-title face: the `game:<id>` virtual-family target. These are
-/// open-licensed LOOKALIKE faces evoking each game's title-screen lettering —
-/// never the games' own proprietary fonts. Each ships with its license text
+/// One bundled game-title face: the `game:<id>` virtual-family target. These
+/// are the REAL faces of each game's title lettering (or the community fan
+/// recreation of it), not open lookalikes. Each ships with its license text
 /// beside it in `assets/game/`.
+///
+/// LICENSING (read before cutting a release): only Monocraft (`minecraft`) is
+/// open-licensed (OFL-1.1). The rest are development-branch assets whose
+/// redistribution is UNRESOLVED — Hylia Serif (`zelda`) and Mario Kart F2
+/// (`mariokart`) are free fan faces without an open grant, while Gill Sans
+/// UltraBold (`roblox`, Monotype) and FinkHeavy (`animal-crossing`, House
+/// Industries) are commercial retail faces. Each LICENSE.txt names the honest
+/// fallback if its face cannot be cleared.
 pub struct GameFont {
     /// The stable selector after the `game:` scheme (config `game_font` value).
     pub id: &'static str,
@@ -1768,6 +1808,16 @@ pub struct GameFont {
     pub game: &'static str,
     /// The actual open font's name + license, for honest attribution in UI.
     pub face: &'static str,
+    /// Render this face with a synthetic WEIGHT BOOST (the `apply_synthetic_style`
+    /// coverage dilation, applied to REGULAR cells). The reason a face wants it
+    /// is legibility rather than taste: its strokes rasterize to a hairline at
+    /// body px, however heavy the design looks at display sizes —
+    /// `animal-crossing`'s FinkHeavy thins to ~1px strokes at 16px without it.
+    ///
+    /// Faces that rasterize heavy (`minecraft`'s pixel face, `roblox`'s
+    /// UltraBold, `mariokart`'s solid lettering) MUST leave this off; dilating
+    /// them fills their counters and turns text to mud.
+    pub embolden: bool,
     bytes: &'static [u8],
 }
 
@@ -1783,32 +1833,60 @@ pub const GAME_FONTS: &[GameFont] = &[
     GameFont {
         id: "roblox",
         game: "Roblox",
-        face: "Luckiest Guy (Astigmatic, Apache-2.0)",
-        bytes: include_bytes!("../assets/game/LuckiestGuy-Regular.ttf"),
+        // Was Luckiest Guy — an open lookalike. This is the REAL face of the
+        // classic Roblox logo, extracted from macOS's bundled collection. A
+        // commercial Monotype face: see `assets/game/GillSans.LICENSE.txt`
+        // before cutting a release.
+        face: "Gill Sans UltraBold (Monotype, macOS system copy — commercial, redistribution unresolved)",
+        // UltraBold is already the heaviest cut of the family; dilation would
+        // close its tight counters (`e`, `a`) and turn body text to mud.
+        embolden: false,
+        bytes: include_bytes!("../assets/game/GillSansUltraBold.ttf"),
     },
     GameFont {
         id: "minecraft",
         game: "Minecraft",
         face: "Monocraft (Idrees Hassan, OFL-1.1)",
+        // The one genuinely MONOSPACED bundled face, and already heavy — it takes
+        // neither the weight boost nor the proportional fit below, so it renders
+        // byte-identically to before this policy existed.
+        embolden: false,
         bytes: include_bytes!("../assets/game/Monocraft.ttf"),
     },
     GameFont {
         id: "zelda",
-        game: "The Legend of Zelda: Breath of the Wild",
-        face: "Cinzel (NDISCOVER, OFL-1.1)",
-        bytes: include_bytes!("../assets/game/Cinzel-var.ttf"),
+        game: "The Legend of Zelda",
+        // NOT an open lookalike — a free FAN face whose author asks to be
+        // contacted before redistribution. See the type's doc comment and
+        // `assets/game/HyliaSerif.LICENSE.txt` before cutting a release.
+        face: "Hylia Serif Beta v0.009 (Omni Jacala, free — redistribution by arrangement)",
+        embolden: false,
+        bytes: include_bytes!("../assets/game/HyliaSerifBeta-Regular.otf"),
     },
     GameFont {
         id: "mariokart",
         game: "Mario Kart",
-        face: "Titan One (Rodrigo Fuenzalida, OFL-1.1)",
-        bytes: include_bytes!("../assets/game/TitanOne-Regular.ttf"),
+        // Was Titan One, then briefly Super Mario 256. This is the community
+        // face of the Mario Kart title lettering — full printable-ASCII
+        // coverage, unlike Super Mario 256 (which lacked & ` { } ~). A free
+        // FAN face, NOT an open lookalike — see
+        // `assets/game/MarioKartF2.LICENSE.txt`.
+        face: "Mario Kart F2 (fan font, free — redistribution unresolved)",
+        embolden: false,
+        bytes: include_bytes!("../assets/game/MarioKartF2.ttf"),
     },
     GameFont {
         id: "animal-crossing",
         game: "Animal Crossing",
-        face: "Chewy (Sideshow, Apache-2.0)",
-        bytes: include_bytes!("../assets/game/Chewy-Regular.ttf"),
+        // Was Chewy — an open lookalike. This is the ACTUAL Animal Crossing
+        // face, licensed by Nintendo from House Industries for the games; a
+        // commercial face — see `assets/game/FinkHeavy.LICENSE.txt` before
+        // cutting a release.
+        face: "FinkHeavy (Ken Barber / House Industries — commercial, redistribution unresolved)",
+        // "Heavy" describes the design, not the raster: at body px its strokes
+        // thin to a hairline (same failure Chewy had) — the boost restores it.
+        embolden: true,
+        bytes: include_bytes!("../assets/game/FinkHeavy.ttf"),
     },
 ];
 
@@ -1865,6 +1943,130 @@ pub fn game_mix_face_index(ch: char, total: usize) -> usize {
         return 0;
     }
     ((ch as u32).wrapping_mul(2_654_435_761) >> 16) as usize % total
+}
+
+/// How a bundled game face is fitted to the fixed terminal grid (FONT-GAME-FIT).
+///
+/// # Why a policy is needed at all
+///
+/// The default cell width is the primary face's `M` advance — sound for a
+/// MONOSPACED face, where every advance is that same number. The bundled game
+/// faces are display faces and wildly PROPORTIONAL: the since-retired Luckiest
+/// Guy (whose measurements motivated this policy) ran `i` at 0.22 em against
+/// `m` at 0.91 em, with `M` itself only 0.79 em. Deriving the cell from `M`
+/// therefore does two visible damages at once:
+///
+/// * every advance ABOVE `M` (`m`, `w`, `W`) overruns its cell and paints over
+///   the next character — "minecraft" renders as "m ncraft", the `i` buried
+///   inside the `m`'s ink;
+/// * every advance BELOW `M` — most of the alphabet — is left-anchored at its
+///   bearing, so all the slack piles up on one side and the letter rhythm reads
+///   as random gaps rather than spacing.
+///
+/// # The fit
+///
+/// * `cell_advance_em` = the WIDEST printable-ASCII advance, so the widest glyph
+///   the face can draw still fits inside one cell: overrun becomes impossible
+///   rather than merely unlikely.
+/// * `px_scale` shrinks the rasterization a notch. A cell cut to the widest
+///   advance instead of `M` would otherwise WIDEN the grid (0.91 em vs 0.79 em
+///   for Luckiest Guy, ~15% fewer columns); the scale lands the new cell back at
+///   roughly the old width, so the collision fix does not cost a column of text.
+/// * the renderer additionally CENTRES each glyph in its cell (see
+///   [`Renderer::game_fit_center_offset`]), splitting the leftover slack evenly
+///   instead of dumping it to the right of every narrow letter.
+///
+/// A MONOSPACED bundled face (Monocraft) needs none of this: its widest advance
+/// IS its `M` advance and its slack is zero. It reports `cell_advance_em: None`
+/// and `px_scale: 1.0`, which routes it down the untouched pre-policy path —
+/// the fit cannot regress the one face that was already correct.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GameFaceFit {
+    /// Cell width as an em fraction, or `None` to keep the ordinary `M`-advance
+    /// derivation (monospaced faces).
+    ///
+    /// This is the widest printable-ASCII EXTENT — the max of the advance and
+    /// the rasterized INK width — not merely the widest advance. Display faces
+    /// routinely draw ink past their own advance (Luckiest Guy's `m` inks about
+    /// a third of a pixel-per-em wider than it advances), so a cell cut to the
+    /// advance alone still lets ink cross into the next cell.
+    pub cell_advance_em: Option<f32>,
+    /// Rasterization px multiplier; `1.0` leaves the requested size alone.
+    pub px_scale: f32,
+    /// Apply the synthetic weight boost — see [`GameFont::embolden`].
+    pub embolden: bool,
+}
+
+/// The identity fit: what a face that needs no fitting reports.
+impl Default for GameFaceFit {
+    fn default() -> Self {
+        Self {
+            cell_advance_em: None,
+            px_scale: 1.0,
+            embolden: false,
+        }
+    }
+}
+
+/// The px multiplier applied to a PROPORTIONAL bundled game face
+/// ([`GameFaceFit::px_scale`]). Chosen so the widest-advance cell lands back at
+/// about the width the `M`-advance cell had: the bundled proportional faces run
+/// `max/M` ≈ 1.15, and 1/1.15 ≈ 0.87.
+pub const GAME_FACE_PX_SCALE: f32 = 0.87;
+
+/// The advance spread (`max/median`) above which a face counts as PROPORTIONAL
+/// and takes the fit. A true monospaced face measures exactly 1.0; the margin
+/// only absorbs hinting jitter, so nothing borderline is misclassified.
+const GAME_FACE_MONO_SPREAD: f32 = 1.02;
+
+/// The em-fraction probe size. Advances scale linearly with px, so any size
+/// gives the same fraction; 128 is large enough that a rasterized INK width
+/// carries ~2 decimal digits of em precision, and small enough that probing all
+/// 94 printable ASCII glyphs stays cheap (this runs once per font construction,
+/// not per frame).
+const GAME_FACE_PROBE_PX: f32 = 128.0;
+
+/// The [`GameFaceFit`] for a bundled game face, identified by its BYTES —
+/// `None` for anything that is not one of [`GAME_FONTS`], so a user's own
+/// proportional font is never silently re-fitted behind their back (that would
+/// change cell metrics for existing configs). The registry entry supplies
+/// `embolden`; the measurement supplies the rest.
+#[must_use]
+pub fn game_face_fit(bytes: &[u8]) -> Option<GameFaceFit> {
+    let entry = GAME_FONTS.iter().find(|font| {
+        std::ptr::eq(font.bytes.as_ptr(), bytes.as_ptr()) && font.bytes.len() == bytes.len()
+    })?;
+    let identity = GameFaceFit {
+        embolden: entry.embolden,
+        ..GameFaceFit::default()
+    };
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
+    // Advance AND ink per glyph: the cell has to clear whichever is wider.
+    let mut advances: Vec<f32> = Vec::new();
+    let mut widest_extent = 0.0_f32;
+    for ch in '!'..='~' {
+        let (metrics, _) = font.rasterize(ch, GAME_FACE_PROBE_PX);
+        let advance = metrics.advance_width;
+        if advance > 0.0 {
+            advances.push(advance);
+        }
+        widest_extent = widest_extent.max(advance).max(metrics.width as f32);
+    }
+    if advances.is_empty() || widest_extent <= 0.0 {
+        return Some(identity);
+    }
+    advances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max = advances[advances.len() - 1];
+    let median = advances[advances.len() / 2];
+    // Monospaced: no overrun to prevent and no slack to centre — identity.
+    if median <= 0.0 || max / median < GAME_FACE_MONO_SPREAD {
+        return Some(identity);
+    }
+    Some(GameFaceFit {
+        cell_advance_em: Some(widest_extent / GAME_FACE_PROBE_PX),
+        px_scale: GAME_FACE_PX_SCALE,
+        embolden: entry.embolden,
+    })
 }
 
 /// The bundled Symbols Nerd Font (FONT-2b): a monospace icon face carrying the full
@@ -4754,11 +4956,23 @@ impl Renderer {
     pub fn from_bytes(bytes: &[u8], px: f32, theme: Theme) -> Result<Self, String> {
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .map_err(|e| e.to_string())?;
+        // FONT-GAME-FIT: a bundled PROPORTIONAL game face rasterizes a notch
+        // smaller and takes its cell from the widest advance, not `M` (see
+        // [`GameFaceFit`]). Every other face — including the monospaced bundled
+        // one — reports the identity fit, so `px_eff == px` and the derivations
+        // below are the originals verbatim.
+        let game_fit = game_face_fit(bytes);
+        let px_eff = px * game_fit.map_or(1.0, |fit| fit.px_scale);
         let lm = font
-            .horizontal_line_metrics(px)
+            .horizontal_line_metrics(px_eff)
             .ok_or("font has no horizontal line metrics")?;
         // Monospace: every advance is equal; measure a representative glyph.
-        let adv = font.metrics('M', px).advance_width;
+        let adv = font.metrics('M', px_eff).advance_width;
+        // The cell math lives in ONE place (`fitted_cell_w`) — but that is a
+        // method and the renderer does not exist yet, so seed a placeholder here
+        // and let the shared derivation overwrite it once `r` is built. An
+        // open-coded copy here is exactly how the constructor and `set_px` drifted
+        // apart the first time.
         let cell_w = cell_w_from_advance(adv);
         // Cell geometry from the leading law (`cell_h_baseline`, W5a): the box is
         // round((ascent − descent + lineGap)·scale) and the total leading splits
@@ -4766,7 +4980,7 @@ impl Renderer {
         // USE_TYPO_METRICS) trump hhea; absent/unset, fontdue's hhea applies.
         let typo_lm = typo_line_metrics(bytes);
         let (asc, desc, gap) = typo_lm.map_or((lm.ascent, lm.descent, lm.line_gap), |t| {
-            (t.ascent * px, t.descent * px, t.line_gap * px)
+            (t.ascent * px_eff, t.descent * px_eff, t.line_gap * px_eff)
         });
         let (cell_h, baseline) = cell_h_baseline(asc, desc, gap, 1.0);
         let mut r = Renderer {
@@ -4831,8 +5045,15 @@ impl Renderer {
             color_font: None,
             color_font_paths: Vec::new(),
             runtime_fallback: RuntimeFallback::default(),
-            px,
-            px_q: GlyphKey::quantize_px(px),
+            game_fit,
+            // The size the HOST asked for, kept so the no-op guards in `set_px` /
+            // `activate_px` compare like with like: `px` below is the FITTED size,
+            // and comparing a fresh request against it would read as a size change
+            // on every call once a fitted face is active.
+            px_request: px,
+            fit_cell_pad: 0,
+            px: px_eff,
+            px_q: GlyphKey::quantize_px(px_eff),
             cell_w,
             cell_h,
             line_height_scale: 1.0,
@@ -4879,7 +5100,52 @@ impl Renderer {
         // Regular) and re-derive the cell geometry at the resolved coords.
         // A non-variable face resolves to `None` — byte-identical to before.
         r.refresh_variations();
+        // FONT-GAME-FIT: apply the shared cell derivation now that `r` exists, so
+        // a freshly constructed renderer and one that has been through
+        // `set_px`/`activate_px` agree on the cell to the pixel. Identity for
+        // every unfitted face (`fitted_cell_w` returns the `M`-advance value the
+        // constructor already computed).
+        r.cell_w = r.fitted_cell_w(r.px, r.primary_m_advance_px(r.px));
+        r.calibrate_fitted_cell();
         Ok(r)
+    }
+
+    /// FONT-GAME-FIT: widen the cell, if needed, to the WIDEST COVERAGE the real
+    /// glyph pipeline actually produces for this face at this size.
+    ///
+    /// [`fitted_cell_w`](Self::fitted_cell_w) predicts that width from fontdue
+    /// metrics plus a headroom term, and a prediction is not good enough for an
+    /// invariant: the macOS CoreText rasterizer pads its bitmaps, `stem_darken`
+    /// and the synthetic-weight dilation grow them further, and each of those is
+    /// a different amount at a different px. Rather than stack fudge factors that
+    /// silently rot, this MEASURES — the same `rasterize` the screen goes
+    /// through, so whatever any of those steps does is accounted for by
+    /// construction.
+    ///
+    /// A glyph's coverage width does not depend on `cell_w` (only its PLACEMENT
+    /// does, via [`game_fit_place`](Self::game_fit_place)), so measuring against
+    /// the provisional cell and then widening is sound. The caches are dropped
+    /// afterwards because the glyphs rasterized during the measurement carry
+    /// placements computed against that provisional cell.
+    ///
+    /// No-op for every unfitted face — the ordinary path neither measures nor
+    /// clears anything.
+    fn calibrate_fitted_cell(&mut self) {
+        if self.game_fit.and_then(|fit| fit.cell_advance_em).is_none() {
+            return;
+        }
+        let mut widest = 0usize;
+        for ch in '!'..='~' {
+            let key = self.glyph_key(ch);
+            widest = widest.max(self.glyph_image(key).width());
+        }
+        self.fit_cell_pad += widest.saturating_sub(self.cell_w);
+        let calibrated = self.cell_w.max(widest);
+        self.glyphs.clear();
+        self.keys.clear();
+        self.styled_keys.clear();
+        self.primary_gid_cache.clear();
+        self.cell_w = calibrated;
     }
 
     /// RESET the broad-coverage fallback chain to a SINGLE face from explicit bytes
@@ -7118,22 +7384,29 @@ impl Renderer {
     /// and drops the glyph caches (they were rasterized at the old px). No-op if the
     /// size is unchanged or the font lacks metrics at `px`.
     pub fn set_px(&mut self, px: f32) {
-        if (px - self.px).abs() < 0.01 {
+        if (px - self.px_request).abs() < 0.01 {
             return;
         }
+        // FONT-GAME-FIT: rasterize a fitted face at the scaled size. Identity
+        // (`px_eff == px`) for every ordinary font.
+        let px_eff = self.fitted_px(px);
         // Re-apply the live line-height scale at the new px so the cell box honours
         // both the new density AND the host's terminalLineHeight.
-        let Some((cell_h, baseline)) = self.derive_cell_geometry(px) else {
+        let Some((cell_h, baseline)) = self.derive_cell_geometry(px_eff) else {
             return;
         };
         // W9: coordinate-applied advance for an instantiated variable
         // primary; fontdue's default-instance advance otherwise (unchanged).
-        let adv = self.primary_m_advance_px(px);
-        self.px = px;
-        self.px_q = GlyphKey::quantize_px(px);
-        self.cell_w = cell_w_from_advance(adv);
+        let adv = self.primary_m_advance_px(px_eff);
+        self.px_request = px;
+        self.px = px_eff;
+        self.px_q = GlyphKey::quantize_px(px_eff);
+        self.cell_w = self.fitted_cell_w(px_eff, adv);
         self.cell_h = cell_h;
         self.baseline = baseline;
+        // FONT-GAME-FIT: the new size needs its own measurement (the rasterizer's
+        // padding and the weight dilation are both px-dependent).
+        self.calibrate_fitted_cell();
         // Glyphs were rasterized at the old px; drop the caches so they re-rasterize.
         self.glyphs.clear();
         self.keys.clear();
@@ -7177,21 +7450,25 @@ impl Renderer {
     /// the now-dead old-size atlas). See also [`Self::cell_geometry`], the pure
     /// read used to resolve a window's metrics while another size is active.
     pub fn activate_px(&mut self, px: f32) {
-        if (px - self.px).abs() < 0.01 {
+        if (px - self.px_request).abs() < 0.01 {
             return;
         }
         // Same geometry derivation as `set_px` — so the activated size renders
         // byte-identically to a fresh `set_px(px)` (only the cache lifetimes
         // differ). A font that lacks metrics at `px` keeps the current size.
-        let Some((cell_h, baseline)) = self.derive_cell_geometry(px) else {
+        let px_eff = self.fitted_px(px);
+        let Some((cell_h, baseline)) = self.derive_cell_geometry(px_eff) else {
             return;
         };
-        let adv = self.primary_m_advance_px(px);
-        self.px = px;
-        self.px_q = GlyphKey::quantize_px(px);
-        self.cell_w = cell_w_from_advance(adv);
+        let adv = self.primary_m_advance_px(px_eff);
+        self.px_request = px;
+        self.px = px_eff;
+        self.px_q = GlyphKey::quantize_px(px_eff);
+        self.cell_w = self.fitted_cell_w(px_eff, adv);
         self.cell_h = cell_h;
         self.baseline = baseline;
+        // FONT-GAME-FIT: re-measure the cell at the newly activated size.
+        self.calibrate_fitted_cell();
         // The px-baked char→key memos alone become stale (their cached key embeds
         // the OLD `px_q`); everything expensive (the atlas, shaping, faces) stays.
         self.keys.clear();
@@ -7209,6 +7486,9 @@ impl Renderer {
     /// the no-op `set_px`/`activate_px` take in that case).
     #[must_use]
     pub fn cell_geometry(&self, px: f32) -> (usize, usize, i32) {
+        // FONT-GAME-FIT: resolve at the FITTED size, exactly as `activate_px`
+        // would — so this pure read keeps agreeing with the activated renderer.
+        let px = self.fitted_px(px);
         // VARIABLE primary: resolve the m-advance AND the line metrics from ONE
         // instance parse. The two-call form below parses the face twice (once in
         // `primary_m_advance_px`, once in `derive_cell_geometry` → `geometry_metrics`),
@@ -7217,18 +7497,81 @@ impl Renderer {
         // identical to the two-call path: same `VariedMetricsPx`, same `cell_h_baseline`
         // derivation, same `+ baseline_adjust` (mirrors `derive_cell_geometry`).
         if let Some(m) = self.varied_metrics(px) {
-            let cell_w = cell_w_from_advance(m.m_advance);
+            let cell_w = self.fitted_cell_w(px, m.m_advance);
             let (cell_h, baseline) =
                 cell_h_baseline(m.ascent, m.descent, m.line_gap, self.line_height_scale);
             return (cell_w, cell_h, baseline + self.baseline_adjust);
         }
         // UNVARIED primary: `varied_metrics` returned `None` cheaply (no parse — it
         // short-circuits on empty `var_coords`), so keep the exact original fallback.
-        let cell_w = cell_w_from_advance(self.primary_m_advance_px(px));
+        let cell_w = self.fitted_cell_w(px, self.primary_m_advance_px(px));
         match self.derive_cell_geometry(px) {
             Some((cell_h, baseline)) => (cell_w, cell_h, baseline),
             None => (self.cell_w, self.cell_h, self.baseline),
         }
+    }
+
+    /// FONT-GAME-FIT: the rasterization size for a host request of `px` — scaled
+    /// down for a fitted (proportional bundled game) face, and `px` unchanged for
+    /// every other font. See [`GameFaceFit::px_scale`].
+    fn fitted_px(&self, px: f32) -> f32 {
+        px * self.game_fit.map_or(1.0, |fit| fit.px_scale)
+    }
+
+    /// FONT-GAME-FIT: the cell width at rasterization size `px_eff`. A fitted
+    /// face takes its cell from the WIDEST printable-ASCII advance, so no glyph
+    /// can overrun into the next cell; every other font keeps the historical
+    /// `M`-advance derivation, byte-for-byte.
+    fn fitted_cell_w(&self, px_eff: f32, m_advance: f32) -> usize {
+        match self.game_fit.and_then(|fit| fit.cell_advance_em) {
+            // CEIL, never round: rounding DOWN would cut the cell narrower than
+            // the very glyph it was measured from, reintroducing the overrun the
+            // fit exists to prevent. The extra headroom covers the two ways a
+            // glyph grows after this is computed: rasterization at small px can
+            // round an ink box up a pixel, and `embolden` dilates the coverage by
+            // a further `round(px/18)` px when the face carries a weight boost.
+            Some(em) => {
+                let ink = (em * px_eff).ceil().max(1.0) as usize;
+                ink + 1 + self.game_fit_embolden_px(px_eff) + self.fit_cell_pad
+            }
+            None => cell_w_from_advance(m_advance),
+        }
+    }
+
+    /// FONT-GAME-FIT: the px `apply_synthetic_style` will dilate a weight-boosted
+    /// glyph by at this size — mirrors the `(px / 18.0).round().max(1.0)` there,
+    /// and `0` when this face takes no boost.
+    fn game_fit_embolden_px(&self, px_eff: f32) -> usize {
+        match self.game_fit {
+            Some(fit) if fit.embolden && self.synthetic_styles => {
+                (px_eff / 18.0).round().max(1.0) as usize
+            }
+            _ => 0,
+        }
+    }
+
+    /// FONT-GAME-FIT: where a glyph whose final coverage is `width` px wide, with
+    /// natural bearing `xmin`, is placed in its cell — the value that REPLACES
+    /// `xmin` at blit time.
+    ///
+    /// The default blit left-anchors every glyph at its designed bearing, which
+    /// is right for a monospaced face (slack is zero) and wrong for a
+    /// proportional one: a 0.22-em `i` in a 0.91-em cell sits hard left with the
+    /// whole remainder as a gap before the next letter, so the line reads as
+    /// random spacing rather than text. Centring the INK (not the advance — a
+    /// display face's ink is what the eye actually spaces) splits the slack.
+    ///
+    /// The result is clamped into `[0, cell_w - width]`, which is what makes the
+    /// no-overrun invariant TOTAL: whatever the face does with bearings, and
+    /// however the dilation grew the bitmap, the glyph is placed inside its own
+    /// cell or flush against its left edge. Returns the untouched `xmin` when no
+    /// fit is active, so the ordinary path is byte-identical.
+    fn game_fit_place(&self, xmin: i32, width: usize) -> i32 {
+        if self.game_fit.and_then(|fit| fit.cell_advance_em).is_none() {
+            return xmin;
+        }
+        let slack = self.cell_w as i32 - width as i32;
+        (slack / 2).clamp(0, slack.max(0))
     }
 
     /// Set the line-height multiplier on the cell BOX (the host's
@@ -8646,11 +8989,37 @@ impl Renderer {
                 } else {
                     StyleBits::REGULAR
                 };
+                // FONT-GAME-FIT (weight): a bundled game face marked `embolden`
+                // takes the synthetic-bold dilation on REGULAR cells too — the
+                // face is either drawn too light to read as body text, or draws a
+                // comma whose hairline tail collapses into its period at body px.
+                // This rides the EXISTING synthesis rather than adding a second
+                // thickening path, so a genuinely bold cell is unaffected (the bit
+                // is already set) and `font_synthetic_style = false` still
+                // suppresses everything. See [`GameFont::embolden`].
+                let synth_style = if matches!(key.source, FaceId::Primary)
+                    && self.synthetic_styles
+                    && self.game_fit.is_some_and(|fit| fit.embolden)
+                {
+                    StyleBits(synth_style.0 | StyleBits::BOLD.0)
+                } else {
+                    synth_style
+                };
                 let (width, bytes) = apply_synthetic_style(synth_style, gw, gh, bytes, self.px);
                 GlyphImage::Mono {
                     width,
                     height: gh,
-                    xmin: gxmin,
+                    // FONT-GAME-FIT (rhythm): centre the glyph in its cell for a
+                    // fitted face. Only the two sources that draw from a game face
+                    // in a game-fitted cell take it — procedural cells (box
+                    // drawing) are cell-filling by construction and must stay put.
+                    // `width` (post-dilation), not `gw`: the placement has to know
+                    // how wide the coverage actually ENDED UP.
+                    xmin: if matches!(key.source, FaceId::Primary | FaceId::GameMix) {
+                        self.game_fit_place(gxmin, width)
+                    } else {
+                        gxmin
+                    },
                     ymin: gymin,
                     advance: gadv,
                     bytes,
@@ -8809,11 +9178,29 @@ impl Renderer {
                 } else {
                     StyleBits::REGULAR
                 };
+                // FONT-GAME-FIT (weight): the by-GLYPH-ID twin of the weight boost
+                // in the per-char arm above. This is the arm plain text actually
+                // takes for the primary face (keys are built by id so an Apple
+                // `.ttc`'s Mac-Roman cmap can't mis-map), so a boost applied only
+                // there would never reach the screen. See [`GameFont::embolden`].
+                let synth = if matches!(pick, FacePick::Primary)
+                    && self.synthetic_styles
+                    && self.game_fit.is_some_and(|fit| fit.embolden)
+                {
+                    StyleBits(synth.0 | StyleBits::BOLD.0)
+                } else {
+                    synth
+                };
                 let (width, bytes) = apply_synthetic_style(synth, gw, gh, bytes, self.px);
                 GlyphImage::Mono {
                     width,
                     height: gh,
-                    xmin: gxmin,
+                    // FONT-GAME-FIT (rhythm): centre in the cell, as above.
+                    xmin: if matches!(pick, FacePick::Primary) {
+                        self.game_fit_place(gxmin, width)
+                    } else {
+                        gxmin
+                    },
                     ymin: gymin,
                     advance: gadv,
                     bytes,
@@ -9120,6 +9507,11 @@ impl Renderer {
         self.poll_fallback_parses();
         let (rows, cols) = (input.rows, input.cols);
         let (w, h) = self.frame_size(rows, cols);
+        // Convert (or drop) the WALLPAPER base layer for this frame BEFORE the
+        // damage decision, so both the full path and the per-band re-establish
+        // below read one coherent generation. Identity-keyed: a stable frame
+        // costs one pointer compare.
+        ensure_wallpaper_px(wc, input, w, h);
 
         // Decide whether the cached frame can be reused, and if so which rows are
         // dirty, via the ONE shared `compute_dirty_rows` — the SAME function the
@@ -9288,6 +9680,9 @@ impl Renderer {
         // borrow here (no RefCell needed). It ends when the runner returns,
         // before `Self::cached_view(wc, …)` reborrows wc.
         let band_bg = self.frame_bg(input) | (self.bg_transmittance() << 24);
+        // `wallpaper_px` and `image_cache` are disjoint `wc` fields, so the
+        // wallpaper base slice rides alongside the mutable image-cache borrow.
+        let base = wc.wallpaper_px.as_ref().map(|p| p.px.as_slice());
         self.composite_free(
             &mut wc.image_cache,
             &mut cache.pixels,
@@ -9299,6 +9694,7 @@ impl Renderer {
                 .enumerate()
                 .filter_map(|(r, &d)| d.then_some(r)),
             Some(band_bg),
+            base,
             Some(&dirty),
         );
         // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
@@ -9557,15 +9953,24 @@ impl Renderer {
         // corrupting memory. On 64-bit the product never overflows, so this is
         // byte-identical to `w * h`. (The image-scaling paths already use checked_mul.)
         pixels.resize(w.saturating_mul(h), bg);
+        // WALLPAPER base layer: overwrite the flat clear with the converted
+        // texels (same length by the `ensure_wallpaper_px` contract), so every
+        // band starts from the backdrop exactly as the damaged path's
+        // wallpaper-aware `base_span` re-establishes it.
+        if let Some(wp) = wc.wallpaper_px.as_ref().map(|p| p.px.as_slice())
+            && wp.len() == pixels.len()
+        {
+            pixels.copy_from_slice(wp);
+        }
         // Take the per-window image cache out of `wc` so `render_row` can borrow it
         // mutably while `self` is borrowed for rasterization (and `wc.cache` is
         // written below). Restored before return.
         let mut ic = std::mem::take(&mut wc.image_cache);
-        // The whole buffer is already bg-filled, so each row's band starts from
-        // the theme background exactly as the damaged path arranges — the shared
-        // phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2) therefore needs no
-        // per-band clear pre-step on this path (`band_bg: None`).
-        self.composite_free(&mut ic, &mut pixels, w, h, input, 0..rows, None, None);
+        // The whole buffer is already base-filled, so each row's band starts from
+        // the theme background (or wallpaper) exactly as the damaged path arranges
+        // — the shared phase runner (FREE_OVERLAY_LAYER_DESIGN §3.2.2) therefore
+        // needs no per-band clear pre-step on this path (`band_bg: None`).
+        self.composite_free(&mut ic, &mut pixels, w, h, input, 0..rows, None, None, None);
         // (The comet ember bed now draws INSIDE `composite_free` — phase B2b,
         // under the glyph ink — not as a post-pass here.)
         self.draw_glow(&mut pixels, w, h, input, None);
@@ -9616,7 +10021,15 @@ impl Renderer {
     /// re-establishes the `vec![bg]` starting state for the band before its
     /// passes run, so the row is repainted from scratch exactly as a full render
     /// would.
-    fn fill_band_bg(&self, pixels: &mut [u32], w: usize, h: usize, r: usize, bg: u32) {
+    fn fill_band_bg(
+        &self,
+        pixels: &mut [u32],
+        w: usize,
+        h: usize,
+        r: usize,
+        bg: u32,
+        base: Option<&[u32]>,
+    ) {
         // The band starts `grid_top` px down (the top pad + head strip is part of
         // the bg border, filled once by the full render and never a row's
         // responsibility). Each band spans the FULL width, so the left/right
@@ -9627,7 +10040,7 @@ impl Renderer {
         if y0 >= y1 {
             return;
         }
-        pixels[y0 * w..y1 * w].fill(bg);
+        base_span(pixels, y0 * w, y1 * w, bg, base);
     }
 
     /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
@@ -9800,6 +10213,7 @@ impl Renderer {
         input: &RenderInput,
         rows: I,
         band_bg: Option<u32>,
+        base: Option<&[u32]>,
         dirty: Option<&[bool]>,
     ) where
         I: Iterator<Item = usize> + Clone,
@@ -9807,21 +10221,22 @@ impl Renderer {
         // Phase A — backgrounds.
         for r in rows.clone() {
             if let Some(bg) = band_bg {
-                self.fill_band_bg(pixels, w, h, r, bg);
+                self.fill_band_bg(pixels, w, h, r, bg, base);
                 // Band-edge pad strips: `fill_band_bg` spans the FULL width (the
                 // left/right pad columns) but starts `grid_top` px down — the TOP/
                 // BOTTOM strips belong to no row. A free sprite may spill into
                 // them (signed off-grid origin), so when the dirty set touches a
                 // grid edge, re-establish that strip from bg exactly as the GPU's
                 // scissored path does with its strip-reset quads (its edge
-                // scissor extends over the pad the same way).
+                // scissor extends over the pad the same way). Both strips are
+                // wallpaper-aware (`base_span`), like the band itself.
                 if r == 0 {
                     let top = (self.grid_top() * w).min(pixels.len());
-                    pixels[..top].fill(bg);
+                    base_span(pixels, 0, top, bg, base);
                 }
                 if r + 1 >= input.rows {
                     let grid_bot = (self.grid_top() + input.rows * self.cell_h).min(h);
-                    pixels[grid_bot * w..h * w].fill(bg);
+                    base_span(pixels, grid_bot * w, h * w, bg, base);
                 }
             }
             let ctx = self.row_ctx(input, r);
@@ -10198,23 +10613,37 @@ impl Renderer {
             bg_t,
             ..
         } = *ctx;
+        // WALLPAPER: an unselected cell whose bg resolves to its pane's live
+        // default paints NOTHING — the base fill / band re-establish already laid
+        // the backdrop texels there (the kitty below-bg cover rule, promoted to
+        // the whole frame). Selection bands and SGR-colored backgrounds still
+        // fill opaquely. `false` on every wallpaper-less frame, so the historical
+        // paths stay byte-identical.
+        let wallpaper = input.wallpaper.is_some();
         // The cell's resolved fill colour — identical on both arms, hoisted so
-        // the uniform arm can compare consecutive cells' colours.
-        let resolve = |c: usize, cell: &RenderCell| -> u32 {
+        // the uniform arm can compare consecutive cells' colours. `None` = leave
+        // the wallpaper base texels (never returned without a live wallpaper).
+        let resolve = |c: usize, cell: &RenderCell| -> Option<u32> {
             // A lead cell is wide iff the NEXT cell is its continuation.
             let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
             if input.selection_contains_cell(row, c, is_wide_lead, cell.wide) {
-                sel_bg
+                Some(sel_bg)
             } else {
                 let cell_bg = rgb_to_u32(cell.bg);
                 // "Default bg" is asked of the pane that owns this cell, not of
                 // the composed frame: two panes on one row can hold different
                 // OSC 11 / DECSCNM defaults, and a translucent window must let
                 // BOTH show glass rather than only the frame-scalar one.
-                if bg_t != 0 && cell_bg == self.cell_default_bg(input, ctx, c) {
-                    cell_bg | (bg_t << 24)
+                if cell_bg == self.cell_default_bg(input, ctx, c) {
+                    if wallpaper {
+                        None
+                    } else if bg_t != 0 {
+                        Some(cell_bg | (bg_t << 24))
+                    } else {
+                        Some(cell_bg)
+                    }
                 } else {
-                    cell_bg
+                    Some(cell_bg)
                 }
             }
         };
@@ -10237,28 +10666,34 @@ impl Renderer {
             // only the emitted rects are merged, never the decision.
             let n = cells.len().min(cols);
             let mut run_start = 0usize;
-            let mut run_bg = 0u32;
+            // `None` runs (wallpaper show-through) merge exactly like colour runs
+            // and simply emit no fill — the base texels stay.
+            let mut run_bg: Option<u32> = None;
             for (c, cell) in cells[..n].iter().enumerate() {
                 let bg = resolve(c, cell);
                 if c == run_start {
                     run_bg = bg;
                 } else if bg != run_bg {
-                    let x = self.pad + run_start * cw;
-                    self.fill_rect(
-                        pixels,
-                        w,
-                        h,
-                        x,
-                        y0,
-                        (c - run_start) * cw,
-                        self.cell_h,
-                        run_bg,
-                    );
+                    if let Some(color) = run_bg {
+                        let x = self.pad + run_start * cw;
+                        self.fill_rect(
+                            pixels,
+                            w,
+                            h,
+                            x,
+                            y0,
+                            (c - run_start) * cw,
+                            self.cell_h,
+                            color,
+                        );
+                    }
                     run_start = c;
                     run_bg = bg;
                 }
             }
-            if n > 0 {
+            if n > 0
+                && let Some(color) = run_bg
+            {
                 let x = self.pad + run_start * cw;
                 self.fill_rect(
                     pixels,
@@ -10268,7 +10703,7 @@ impl Renderer {
                     y0,
                     (n - run_start) * cw,
                     self.cell_h,
-                    run_bg,
+                    color,
                 );
             }
         } else {
@@ -10280,9 +10715,11 @@ impl Renderer {
                 // earlier and just as visible (a selection band or SGR bg
                 // marching across the split). Strictly PER COLUMN: each column
                 // clamps to its own DEC run box, so runs cannot be merged.
-                let p = self.mixed_cell_place(input, row, c, y0);
-                if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
-                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, resolve(c, cell));
+                if let Some(color) = resolve(c, cell) {
+                    let p = self.mixed_cell_place(input, row, c, y0);
+                    if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                        self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, color);
+                    }
                 }
             }
         }
@@ -10310,6 +10747,12 @@ impl Renderer {
             let bg = if input.selection_contains_cell(row, c, false, false) {
                 sel_bg
             } else {
+                // An implicit tail cell IS its pane's default bg, so under a
+                // wallpaper it shows the backdrop — the base fill already laid
+                // those texels; paint nothing.
+                if wallpaper {
+                    continue;
+                }
                 let default_bg = self.cell_default_bg(input, ctx, c);
                 if default_bg == ctx.frame_bg {
                     continue;
@@ -13663,6 +14106,13 @@ pub(crate) fn scroll_blit_plan(
     {
         return None;
     }
+    // A live WALLPAPER is anchored to the WINDOW, not the content: a rigid row
+    // blit would drag the fixed backdrop along with the scrolled text, so the
+    // rescue refuses and the genuine full repaint stands (the same per-frame
+    // cost scrollback navigation already pays).
+    if prev.wallpaper.is_some() || input.wallpaper.is_some() {
+        return None;
+    }
     // Overlays / selection are position-keyed and not relocated by the rigid blit.
     if !scroll_blittable_content(prev) || !scroll_blittable_content(input) {
         return None;
@@ -13870,10 +14320,15 @@ pub fn compute_dirty_rows(
     // (a mouse-drag selection moves the span of 1-2 rows per frame, not the screen).
     let anchor_eq = prev_input.base_y - i64::from(prev_input.display_offset)
         == input.base_y - i64::from(input.display_offset);
+    // A WALLPAPER identity change (set/cleared/re-published: new source, new
+    // window size, new dim) recolours the padding bands AND every default-bg
+    // cell exactly like a live default-bg change — same clause, same reason.
     let reusable = prev_input.rows == rows
         && prev_input.cols == cols
         && (prev_input.display_offset == input.display_offset || anchor_eq)
         && prev_input.default_bg == input.default_bg
+        && prev_input.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
+            == input.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
         && !any_double_height(prev_input)
         && !any_double_height(input);
     if !reusable {
@@ -15718,6 +16173,65 @@ fn atlas_texels_valid(atlas: &SceneAtlas) -> bool {
     atlas.width != 0 && atlas.height != 0 && atlas.rgba.len() >= need
 }
 
+/// Re-establish `pixels[start..end)` to the frame BASE: the wallpaper texels
+/// when a (frame-sized) wallpaper is live this frame, else the flat `bg` word —
+/// exactly the starting state the full path's base fill leaves for that span.
+/// `base`, when `Some`, is the converted wallpaper buffer of the SAME length as
+/// `pixels` (the `ensure_wallpaper_px` contract), so the copy indexes 1:1.
+#[inline]
+fn base_span(pixels: &mut [u32], start: usize, end: usize, bg: u32, base: Option<&[u32]>) {
+    let end = end.min(pixels.len());
+    if start >= end {
+        return;
+    }
+    match base {
+        Some(wp) if wp.len() == pixels.len() => pixels[start..end].copy_from_slice(&wp[start..end]),
+        _ => pixels[start..end].fill(bg),
+    }
+}
+
+/// Convert (or drop) the frame's WALLPAPER base layer into `wc.wallpaper_px`.
+/// Admitted only when the host kept its contract — the atlas is texel-complete
+/// and PRE-SCALED to exactly this frame's `w × h` — so every consumer can index
+/// the converted buffer 1:1 against the framebuffer; anything else renders as
+/// no wallpaper (a silent no-op, the malformed-atlas law). Identity-keyed on the
+/// published `Arc` like the GPU texture cache: a stable frame converts nothing.
+fn ensure_wallpaper_px(wc: &mut WindowCpu, input: &RenderInput, w: usize, h: usize) {
+    let Some(src_arc) = input.wallpaper.as_ref() else {
+        wc.wallpaper_px = None;
+        return;
+    };
+    let src = src_arc.as_ref();
+    if src.width as usize != w || src.height as usize != h || !atlas_texels_valid(src) {
+        wc.wallpaper_px = None;
+        return;
+    }
+    let key = std::sync::Arc::as_ptr(src_arc) as usize;
+    let need = w.saturating_mul(h);
+    if wc
+        .wallpaper_px
+        .as_ref()
+        .is_some_and(|p| p.key == key && p.px.len() == need)
+    {
+        return;
+    }
+    // Reuse the prior generation's allocation (a resize/redim republish keeps
+    // the capacity); pack straight `0x00RRGGBB` — transmittance byte 0, the
+    // opaque law the type documents.
+    let mut px = wc.wallpaper_px.take().map(|p| p.px).unwrap_or_default();
+    px.clear();
+    px.reserve(need);
+    px.extend(
+        src.rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .take(need)
+            .map(|t| rgb_to_u32([t[0], t[1], t[2]])),
+    );
+    wc.wallpaper_px = Some(WallpaperPx { key, px });
+}
+
 /// Stamp ONE peeking-cat sprite quad with NEAREST, INTEGER-STEPPED sampling —
 /// no filtering, no float texel math. Cats are baked at exact destination size
 /// (bake == dest, 1:1: the source index reduces to the dest offset exactly),
@@ -16692,6 +17206,18 @@ const PNG_DECODE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 /// output buffer. Non-8-bit depths and a pixel count that overflows or exceeds
 /// the byte budget also bail (returning `None`) — never panic, never allocate.
 pub fn decode_png_rgba8(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
+    decode_png_rgba8_bounded(bytes, IMAGE_MAX_DIMENSION)
+}
+
+/// [`decode_png_rgba8`] with a caller-chosen per-side dimension budget (the
+/// same hardening otherwise): the WALLPAPER lane admits larger sources than
+/// the inline-image path (a 5K/6K screenshot is an ordinary wallpaper), while
+/// keeping the decoder's intermediate-allocation cap and the
+/// reject-before-allocate IHDR guard.
+pub fn decode_png_rgba8_bounded(
+    bytes: &[u8],
+    max_dimension: u32,
+) -> Option<(Vec<u8>, usize, usize)> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_limits(png::Limits {
         bytes: PNG_DECODE_BYTE_LIMIT,
@@ -16705,14 +17231,20 @@ pub fn decode_png_rgba8(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     let mut reader = decoder.read_info().ok()?;
     // IHDR is parsed by `read_info`; reject oversized dims before the alloc.
     let (w, h) = (reader.info().width, reader.info().height);
-    if w == 0 || h == 0 || w > IMAGE_MAX_DIMENSION || h > IMAGE_MAX_DIMENSION {
+    if w == 0 || h == 0 || w > max_dimension || h > max_dimension {
         return None;
     }
-    // Bound the output allocation by the byte budget too, with checked math so a
-    // pixel-count overflow bails instead of wrapping.
+    // Bound the output allocation with checked math so a pixel-count overflow
+    // bails instead of wrapping. The byte budget scales with the admitted
+    // dimension budget (at the default 4096 this is exactly the historical
+    // `PNG_DECODE_BYTE_LIMIT` bound).
+    let out_budget = (max_dimension as usize)
+        .saturating_mul(max_dimension as usize)
+        .saturating_mul(4)
+        .max(PNG_DECODE_BYTE_LIMIT);
     let pixels = (w as usize).checked_mul(h as usize)?;
     let out_bytes = pixels.checked_mul(4)?;
-    if out_bytes > PNG_DECODE_BYTE_LIMIT {
+    if out_bytes > out_budget {
         return None;
     }
     let mut buf = vec![0u8; reader.output_buffer_size()];
@@ -18091,6 +18623,127 @@ mod tests {
                 "damaged selection-drag frame (to {row},{col} {side:?}) must be byte-identical to a full render"
             );
         }
+    }
+
+    /// WALLPAPER: the base layer shows through the padding bands and every
+    /// unselected default-bg cell, an SGR-colored background still covers it,
+    /// and the DAMAGED path (including a history scroll, whose blit rescue the
+    /// wallpaper refuses) stays byte-identical to a fresh full render.
+    #[test]
+    fn wallpaper_base_layer_and_damaged_parity() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        let (rows, cols) = (3usize, 8usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // Pin the engine's live default bg to the renderer theme (OSC 11) — the
+        // host does exactly this via `apply_config`, and the skip rule keys on
+        // "cell bg == resolved default".
+        term.process(b"\x1b]11;#111318\x07");
+        term.process(b"hi");
+        // Row 1, col 0: an explicit SGR background — must cover the backdrop.
+        term.process(b"\x1b[2;1H\x1b[44m \x1b[0m");
+        let (w, h) = r.frame_size(rows, cols);
+        // A frame-sized two-tone wallpaper, every texel distinct from the theme bg.
+        let mut rgba = vec![0u8; w * h * 4];
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            px[0] = if (i % w) % 2 == 0 { 0x40 } else { 0x80 };
+            px[1] = 0x20;
+            px[2] = 0x60;
+            px[3] = 0xFF;
+        }
+        let wallpaper = std::sync::Arc::new(SceneAtlas {
+            width: w as u32,
+            height: h as u32,
+            rgba,
+            version: 1,
+        });
+        let mut wc = WindowCpu::new();
+        let mut input = term.cell_frame(rows, cols);
+        input.wallpaper = Some(std::sync::Arc::clone(&wallpaper));
+        let _ = r.render_input_cached(&mut wc, &input);
+        let pixels = wc.cache.as_ref().expect("rendered").pixels.clone();
+        // Top-right pixel (a blank default-bg cell; this frame has no padding):
+        // the wallpaper texel of its column parity, opaque (transmittance 0) —
+        // not the flat theme bg.
+        let tr = w - 1;
+        let expect_tr = if (w - 1) % 2 == 0 { 0x0040_2060 } else { 0x0080_2060 };
+        assert_eq!(pixels[tr], expect_tr, "a blank cell must show the backdrop");
+        // The SGR-colored cell's interior covers the backdrop with its own bg.
+        let (cw, ch) = r.cell_size();
+        let (cx, cy) = (r.pad() + cw / 2, r.grid_top() + ch + ch / 2);
+        let colored = pixels[cy * w + cx];
+        let cell_bg = rgb_to_u32(input.cells[1][0].bg);
+        assert_eq!(
+            colored, cell_bg,
+            "an explicit SGR background must paint opaquely over the wallpaper"
+        );
+        assert_ne!(colored & 0x00ff_ffff, 0x0040_2060 & 0x00ff_ffff);
+        // A blank default-bg cell interior shows the backdrop texel.
+        let (bx, by) = (r.pad() + cw * 5 + cw / 2, r.grid_top() + ch * 2 + ch / 2);
+        let expect_blank = if (bx % 2) == 0 { 0x0040_2060 } else { 0x0080_2060 };
+        assert_eq!(
+            pixels[by * w + bx],
+            expect_blank,
+            "a default-bg cell must show the backdrop"
+        );
+        // DAMAGED-PATH PARITY: ordinary content damage, then a history scroll
+        // (the blit rescue must refuse under a wallpaper), each byte-identical
+        // to a fresh full render of the same input.
+        term.process(b"\x1b[3;1Hmt");
+        for step in 0..2 {
+            if step == 1 {
+                term.process(b"\r\nscrolled\r\nagain");
+            }
+            let mut input = term.cell_frame(rows, cols);
+            input.wallpaper = Some(std::sync::Arc::clone(&wallpaper));
+            let _ = r.render_input_cached(&mut wc, &input);
+            let damaged = wc.cache.as_ref().expect("rendered").pixels.clone();
+            let mut fresh = WindowCpu::new();
+            let _ = r.render_input_cached(&mut fresh, &input);
+            let full = fresh.cache.as_ref().expect("rendered").pixels.clone();
+            assert_eq!(
+                damaged, full,
+                "wallpaper damaged frame (step {step}) must match a full render"
+            );
+        }
+    }
+
+    /// WALLPAPER: swapping the published wallpaper `Arc` (attach, detach, or a
+    /// re-scale) must force a FULL repaint — the padding bands are not a row
+    /// the per-row diff can mark (the live default-bg law) — while re-serving
+    /// the SAME `Arc` stays on the ordinary row-damage path.
+    #[test]
+    fn wallpaper_identity_change_forces_full_repaint() {
+        let mut term = Terminal::new(3, 8);
+        term.process(b"steady");
+        let prev = term.cell_frame(3, 8);
+        let mut cur = term.cell_frame(3, 8);
+        let wallpaper = std::sync::Arc::new(SceneAtlas {
+            width: 4,
+            height: 4,
+            rgba: vec![0xFF; 64],
+            version: 1,
+        });
+        cur.wallpaper = Some(std::sync::Arc::clone(&wallpaper));
+        let mut dirty = Vec::new();
+        assert!(
+            matches!(
+                compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty),
+                DirtyDecision::FullRepaint
+            ),
+            "attaching a wallpaper must force the full path"
+        );
+        let mut prev2 = prev.clone();
+        prev2.wallpaper = Some(std::sync::Arc::clone(&wallpaper));
+        assert!(
+            matches!(
+                compute_dirty_rows(&prev2, &cur, false, None, false, None, 16, &mut dirty),
+                DirtyDecision::Rows(_)
+            ),
+            "the SAME published Arc must stay on the row-damage path"
+        );
     }
 
     /// OSC 11 / DECSCNM: a live default-background change must force a FULL repaint —

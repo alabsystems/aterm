@@ -1750,6 +1750,7 @@ mod config_asset_publication_tests {
         Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
             kitty_sprite,
+            wallpaper: crate::app_config::WallpaperAsset::None,
             themes,
             sparkle_spec_consumers: Default::default(),
         })
@@ -5729,6 +5730,172 @@ struct PaneDecoInput {
 /// The versioned free atlas Arc rides only when sprites do (a cat-free frame is
 /// byte-identical to the pre-feature input), and it is the ONE atlas every
 /// pane's sprites address — which is exactly why the panes share one engine.
+/// One WALLPAPER cover-scale generation for one window (see
+/// [`crate::WindowState::wallpaper_scaled`]): the admitted asset scaled to the
+/// window's exact frame pixel dims, toned toward the theme background, and
+/// published as a fresh `SceneAtlas` Arc — the identity every renderer keys
+/// its caches (and the damage full-repaint verdict) on.
+pub(crate) struct WallpaperScaled {
+    fp: u64,
+    dim_bits: u32,
+    bg: u32,
+    w: u32,
+    h: u32,
+    rows: usize,
+    cols: usize,
+    atlas: std::sync::Arc<aterm_core::render::SceneAtlas>,
+    /// The resolved default foreground the tint pass compared against (the
+    /// achromatic-ground fallback keeps it only where it actually reads) —
+    /// part of the cache key, like `bg`.
+    fg: u32,
+    /// WALLPAPER TEXT TINT: one pre-derived glyph color per grid cell — the
+    /// backdrop's hue under that cell, brightness-flipped per cell (light ink
+    /// over dark ground, dark ink over light ground) and walked to the WCAG
+    /// 4.5:1 floor so it stays readable wherever the picture is bright or
+    /// dark. `None` where the ground is too achromatic for a hue to mean
+    /// anything AND the ordinary foreground already reads there. Sampled from
+    /// the SCALED (visible) texels, `rows*cols` entries, row-major.
+    tint: Vec<Option<[u8; 3]>>,
+}
+
+/// One glyph tint per grid cell, sampled at each cell's center from the
+/// scaled backdrop (the picture is smooth at cell granularity, so one texel
+/// stands in for the cell; padding offsets are within a cell and immaterial).
+fn wallpaper_cell_tints(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    rows: usize,
+    cols: usize,
+    fallback_fg: u32,
+) -> Vec<Option<[u8; 3]>> {
+    let mut out = Vec::with_capacity(rows.saturating_mul(cols));
+    if w == 0 || h == 0 || rows == 0 || cols == 0 {
+        return out;
+    }
+    for r in 0..rows {
+        let y = ((r * 2 + 1) * h / (rows * 2)).min(h - 1);
+        for c in 0..cols {
+            let x = ((c * 2 + 1) * w / (cols * 2)).min(w - 1);
+            let i = (y * w + x) * 4;
+            let px = (u32::from(rgba[i]) << 16)
+                | (u32::from(rgba[i + 1]) << 8)
+                | u32::from(rgba[i + 2]);
+            out.push(wallpaper_text_tint_color(px, fallback_fg));
+        }
+    }
+    out
+}
+
+/// WCAG contrast ratio between two relative luminances.
+fn wcag_contrast(a: f32, b: f32) -> f32 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// The tint pass guarantees at least this contrast against the backdrop
+/// texel under the cell (WCAG AA for normal text). Both poles clear it at
+/// every ground luminance, so the walk below always terminates readable.
+const WALLPAPER_TINT_CONTRAST_FLOOR: f32 = 4.5;
+
+/// The ground luminance below which white ink out-contrasts black ink
+/// (`(1.05)/(L+0.05) >= (L+0.05)/0.05` ⇒ `L <= sqrt(1.05*0.05) - 0.05`).
+const LIGHT_INK_BELOW: f32 = 0.179;
+
+/// A "cool but readable" glyph tint for text sitting on `backdrop`: the
+/// backdrop's own hue, flipped to whichever brightness pole out-contrasts
+/// the ground (light ink over the picture's dark areas, dark ink over its
+/// bright ones) and then walked — brightness first, saturation after —
+/// until it clears [`WALLPAPER_TINT_CONTRAST_FLOOR`]. The letterforms pick
+/// up the image's local color AND stay legible no matter how light or dark
+/// the picture is at that cell. Near-achromatic ground (grey / washed-out
+/// areas) takes no hue — an arbitrary one would read as noise — and keeps
+/// the ordinary foreground (`None`) where it already clears the floor, else
+/// a plain readable neutral of the winning polarity.
+fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Option<[u8; 3]> {
+    use aterm_effects::color_math::{hsv2rgb, relative_luminance, rgb2hsv};
+    let ground = relative_luminance(backdrop);
+    let light_ink = ground <= LIGHT_INK_BELOW;
+    let (hue, s, _v) = rgb2hsv(backdrop);
+    if s < 0.10 {
+        if wcag_contrast(relative_luminance(fallback_fg), ground)
+            >= WALLPAPER_TINT_CONTRAST_FLOOR
+        {
+            return None;
+        }
+        let neutral = if light_ink { 0xF0 } else { 0x20 };
+        return Some([neutral, neutral, neutral]);
+    }
+    let mut sat = (s * 0.9).clamp(0.35, 0.70);
+    let mut v = if light_ink { 0.95 } else { 0.34 };
+    let mut tinted = hsv2rgb(hue, sat, v);
+    // Saturated hues can sit dark even at full brightness (pure blue) or
+    // light even quite low (yellow), so push brightness toward the pole,
+    // then bleed saturation out — sat 0 at the pole is white/black, whose
+    // contrast clears the floor on any ground the polarity choice matched.
+    for _ in 0..24 {
+        if wcag_contrast(relative_luminance(tinted), ground) >= WALLPAPER_TINT_CONTRAST_FLOOR {
+            break;
+        }
+        if light_ink && v < 1.0 {
+            v = (v + 0.06).min(1.0);
+        } else if !light_ink && v > 0.0 {
+            v = (v - 0.06).max(0.0);
+        } else {
+            sat = (sat - 0.08).max(0.0);
+        }
+        tinted = hsv2rgb(hue, sat, v);
+    }
+    Some([
+        ((tinted >> 16) & 0xff) as u8,
+        ((tinted >> 8) & 0xff) as u8,
+        (tinted & 0xff) as u8,
+    ])
+}
+
+/// Cover-scale `src` (straight sRGB RGBA8, `sw × sh`) to exactly `dw × dh`
+/// (center-crop to the destination aspect, then the shared linear-light
+/// `resample_rgba`), composite any translucency over the theme background,
+/// tone the result toward it by `dim`, and force every texel opaque — a
+/// wallpaper replaces the background-opacity glass, never composites with it.
+fn scale_wallpaper_cover(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    dim: f32,
+    bg: u32,
+) -> Vec<u8> {
+    let scale = (dw as f64 / sw as f64).max(dh as f64 / sh as f64);
+    let crop_w = ((dw as f64 / scale).round() as usize).clamp(1, sw);
+    let crop_h = ((dh as f64 / scale).round() as usize).clamp(1, sh);
+    let x0 = (sw - crop_w) / 2;
+    let y0 = (sh - crop_h) / 2;
+    let mut crop = Vec::with_capacity(crop_w * crop_h * 4);
+    for y in y0..y0 + crop_h {
+        let start = (y * sw + x0) * 4;
+        crop.extend_from_slice(&src[start..start + crop_w * 4]);
+    }
+    let mut out = aterm_render::resample_rgba(&crop, crop_w, crop_h, dw, dh);
+    let dim = dim.clamp(0.0, 1.0);
+    let bg_rgb = [
+        ((bg >> 16) & 0xff) as f32,
+        ((bg >> 8) & 0xff) as f32,
+        (bg & 0xff) as f32,
+    ];
+    for px in out.as_chunks_mut::<4>().0 {
+        let a = f32::from(px[3]) / 255.0;
+        for (i, ground) in bg_rgb.iter().enumerate() {
+            let composed = f32::from(px[i]) * a + ground * (1.0 - a);
+            let toned = composed * (1.0 - dim) + ground * dim;
+            px[i] = toned.round().clamp(0.0, 255.0) as u8;
+        }
+        px[3] = 255;
+    }
+    out
+}
+
 pub(crate) fn splice_word_deco_channels(ws: &mut crate::WindowState) {
     ws.input_scratch
         .word_decorations
@@ -10855,6 +11022,9 @@ impl App {
         // No pane fx clip on a native tab (the reused scratch may carry a
         // prior split frame's box — present-time post-fx must not inherit it).
         ws.input_scratch.fx_clip = None;
+        // Native app tabs (Settings & co.) are never wallpapered — clear any
+        // backdrop a prior terminal frame left on the reused scratch.
+        ws.input_scratch.wallpaper = None;
         for row in &mut ws.input_scratch.cells {
             row.fill(blank);
         }
@@ -10973,6 +11143,9 @@ impl App {
             fill_divider_grid(&mut window.input_scratch, rows, cols, self.theme);
             window.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
             window.input_scratch.cursor_color = aterm_core::render::COLOR_UNSET;
+            // A heterogeneous (mixed terminal/native) composite is never
+            // wallpapered — the native pane's cells would sit on the backdrop.
+            window.input_scratch.wallpaper = None;
             // Scroll anchors are terminal-only: a mixed frame whose focused leaf
             // is NATIVE has none, so start neutral and let a focused terminal
             // leaf below re-stamp them from its own extracted snapshot. Without
@@ -13267,6 +13440,80 @@ impl App {
                         cursor_color_u32,
                         glow_cfg.accent,
                     );
+
+                    // THE TYPED DOG (`aterm_effects::dog_cameo`): a VISITOR
+                    // popping up BEHIND the cursor, independent of the
+                    // companion machinery — it takes the plain presentation
+                    // gate (focused, master on, not load-shed) with no
+                    // trail-style requirement, exactly like a summon hello.
+                    // Draws in pet mode too: the pet stands at its own
+                    // position, the dog trails the caret, so they never
+                    // contest pixels.
+                    // THE VISIT RIDES THE SESSION IT WAS TYPED IN (the typed-
+                    // kitty cameo's pane law): a dog summoned in tab A must
+                    // never present on tab B's glass at tab A's caret.
+                    let dog_alpha = if win_focused
+                        && !deco_suspend
+                        && sparkle_on
+                        && ws.dog_cameo_session == Some(front_session)
+                    {
+                        ws.dog_cameo.alpha(frame_started)
+                    } else {
+                        0
+                    };
+                    if dog_alpha > 0
+                        && let Some(cell) = cur
+                        && let Some(dog_look) = ws.dog_cameo.look()
+                    {
+                        // Local-palette probe over the dog's trailing
+                        // neighborhood (the kitty's sampling law, mirrored to
+                        // the trailing side). Sampled fresh per frame — the
+                        // dog has no episode to pin colors to, and the bake
+                        // key quantization keeps this from thrashing tiles.
+                        let cw = i32::from(effect_geom.cell_w);
+                        let ch = i32::from(effect_geom.cell_h);
+                        let (crow, ccol) = cell;
+                        let probe = aterm_effects::word_decorations::CatFootprint {
+                            x: (i32::from(ccol) * cw - 4 * cw).max(0),
+                            y: i32::from(crow) * ch - ch / 2,
+                            w: (4 * cw).clamp(1, i32::from(u16::MAX)) as u16,
+                            h: (2 * ch).clamp(1, i32::from(u16::MAX)) as u16,
+                        };
+                        let colors = cursor_cat_color_key(
+                            &ws.input_scratch.cells,
+                            effect_geom,
+                            probe,
+                            default_bg_u32,
+                            cursor_color_u32,
+                            glow_cfg.accent,
+                        );
+                        if let Some(dog_fp) = ws.word_decos.dog_cameo(
+                            aterm_effects::word_decorations::DogCameoFrame {
+                                geom: effect_geom,
+                                cursor: cell,
+                                look: dog_look,
+                                colors,
+                                // Reduced motion pins the entry bounce flat;
+                                // the visit still presents statically.
+                                bob: if animate_cat {
+                                    ws.dog_cameo.bob(frame_started)
+                                } else {
+                                    0.0
+                                },
+                                alpha: dog_alpha,
+                            },
+                            &mut ws.free_scratch,
+                        ) {
+                            fp ^= dog_fp.rotate_left(31);
+                        }
+                        // The visit animates (bounce + both fades) on its own
+                        // clock; keep one-present-ahead wakes flowing while it
+                        // is live. Bounded by the ~3.2 s envelope — expiry
+                        // zeroes `dog_alpha` and the wakes stop.
+                        if let Some(window) = ws.os_window.as_ref() {
+                            window.request_redraw();
+                        }
+                    }
                     fp
                 }
             } else {
@@ -14092,6 +14339,10 @@ impl App {
                 })
         };
         let visuals = HostVisualState { invert, overlay };
+        // WALLPAPER: publish this frame's base layer into the completed
+        // `input_scratch` (terminal windows only — the native and
+        // heterogeneous prepares clear the channel on their own paths).
+        self.splice_wallpaper(id);
         // End the causal compose slice immediately before surface acquisition.
         // `present_input_scratch` supplies only post-acquire CPU raster/copy or
         // GPU encode/queue-submit CPU wall time (not shader completion), keeping
@@ -14177,7 +14428,7 @@ impl App {
                 .get(&id)
                 .and_then(|ws| ws.tab_set.active_index())
                 .unwrap_or(0);
-            let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(id, &titles, &metadata, active);
             if let Some(ws) = self.windows.get_mut(&id) {
                 ws.strip_titles_scratch = titles;
                 ws.strip_metadata_scratch = metadata;
@@ -14542,6 +14793,157 @@ impl App {
     /// encode/queue-submit. It is not a GPU-completion timestamp. Swapchain/buffer
     /// acquire and the final compositor present are excluded because their waits
     /// are intentional pacing rather than work decorative shedding can reduce.
+    /// Prepare + install this frame's WALLPAPER base layer for the TERMINAL
+    /// present: read the admitted asset off the config catalog, cover-scale it
+    /// to the frame dims implied by the CURRENT `input_scratch` grid (strip
+    /// rows included — exactly the dims the renderers' admission checks
+    /// compare), cache the result per window, and publish the `SceneAtlas` Arc
+    /// into `input_scratch.wallpaper`. Called on the TERMINAL redraw path
+    /// only; the native and heterogeneous prepares clear the channel instead —
+    /// settings and the other app tabs are never wallpapered.
+    pub(crate) fn splice_wallpaper(&mut self, id: WindowId) {
+        let fp = self.config_assets.wallpaper.fingerprint();
+        let source = match &self.config_assets.wallpaper {
+            crate::app_config::WallpaperAsset::Ready { w, h, rgba, .. } => {
+                Some((*w as usize, *h as usize, std::sync::Arc::clone(rgba)))
+            }
+            _ => None,
+        };
+        let dim = self.config.wallpaper_dim_or_default();
+        let tint_on = self.config.wallpaper_text_tint_or_default();
+        let bg = self.theme.bg;
+        let theme_fg = self.theme.fg;
+        let Some((rows, cols)) = self
+            .windows
+            .get(&id)
+            .map(|ws| (ws.input_scratch.rows, ws.input_scratch.cols))
+        else {
+            return;
+        };
+        // The RAW renderer framebuffer dims (NOT the visible-height crop the
+        // ordinary `frame_size` applies) — both renderers admit the backdrop
+        // only when it matches their own framebuffer exactly.
+        let (w, h) = self.backend.raw_frame_size(rows, cols);
+        let Some(ws) = self.windows.get_mut(&id) else {
+            return;
+        };
+        let Some((sw, sh, rgba)) = source else {
+            ws.wallpaper_scaled = None;
+            ws.input_scratch.wallpaper = None;
+            return;
+        };
+        if w == 0
+            || h == 0
+            || sw == 0
+            || sh == 0
+            || rgba.len() < sw.saturating_mul(sh).saturating_mul(4)
+        {
+            ws.wallpaper_scaled = None;
+            ws.input_scratch.wallpaper = None;
+            return;
+        }
+        let dim_bits = dim.to_bits();
+        // The resolved fg the tint's achromatic-ground fallback is judged
+        // against — the same color the tint pass below substitutes for.
+        let default_fg = if ws.input_scratch.default_fg == aterm_core::render::COLOR_UNSET {
+            theme_fg
+        } else {
+            ws.input_scratch.default_fg
+        };
+        let fresh = ws.wallpaper_scaled.as_ref().is_some_and(|cached| {
+            cached.fp == fp
+                && cached.dim_bits == dim_bits
+                && cached.bg == bg
+                && cached.fg == default_fg
+                && cached.w == w as u32
+                && cached.h == h as u32
+                && cached.rows == rows
+                && cached.cols == cols
+        });
+        if !fresh {
+            let pixels = scale_wallpaper_cover(&rgba, sw, sh, w, h, dim, bg);
+            let tint = wallpaper_cell_tints(&pixels, w, h, rows, cols, default_fg);
+            ws.wallpaper_scaled = Some(WallpaperScaled {
+                fp,
+                dim_bits,
+                bg,
+                fg: default_fg,
+                w: w as u32,
+                h: h as u32,
+                rows,
+                cols,
+                atlas: std::sync::Arc::new(aterm_core::render::SceneAtlas {
+                    width: w as u32,
+                    height: h as u32,
+                    rgba: pixels,
+                    version: fp ^ u64::from(dim_bits) ^ (((w as u64) << 32) | h as u64),
+                }),
+                tint,
+            });
+        }
+        ws.input_scratch.wallpaper = ws
+            .wallpaper_scaled
+            .as_ref()
+            .map(|scaled| std::sync::Arc::clone(&scaled.atlas));
+        // WALLPAPER TEXT TINT: recolor DEFAULT-fg glyphs toward the backdrop
+        // hue under their own cell, through the ordinary ink override channel
+        // (host-resolved final colors; the renderers' legibility floors still
+        // apply after). SGR-colored text keeps its colors, and cells already
+        // claimed by an ink producer (Sparkle Words) KEEP that ink — the
+        // user-visible feature wins over the aesthetic tint.
+        if tint_on
+            && let Some(scaled) = ws.wallpaper_scaled.as_ref()
+        {
+            let dfg = [
+                ((default_fg >> 16) & 0xff) as u8,
+                ((default_fg >> 8) & 0xff) as u8,
+                (default_fg & 0xff) as u8,
+            ];
+            // Merge-walk: the existing (sorted, unique) ink entries win their
+            // cells; the tint fills the default-fg glyph cells between them,
+            // preserving the channel's sorted-unique contract.
+            let existing = std::mem::take(&mut ws.input_scratch.ink);
+            let mut merged =
+                Vec::with_capacity(existing.len() + rows.saturating_mul(cols) / 4);
+            let mut ex = existing.iter().copied().peekable();
+            for (r, row) in ws.input_scratch.cells.iter().enumerate().take(rows) {
+                if r > usize::from(u16::MAX) {
+                    break;
+                }
+                for (c, cell) in row.iter().enumerate().take(cols) {
+                    while ex
+                        .peek()
+                        .is_some_and(|e| (usize::from(e.row), usize::from(e.col)) < (r, c))
+                    {
+                        merged.push(ex.next().expect("peeked"));
+                    }
+                    if ex
+                        .peek()
+                        .is_some_and(|e| usize::from(e.row) == r && usize::from(e.col) == c)
+                    {
+                        merged.push(ex.next().expect("peeked"));
+                        continue;
+                    }
+                    // Blanks paint no glyph; a wide continuation has no lead
+                    // glyph of its own; non-default fg keeps its SGR color.
+                    if cell.ch == ' ' || cell.wide || cell.fg != dfg || c > usize::from(u16::MAX) {
+                        continue;
+                    }
+                    let Some(color) = scaled.tint.get(r * cols + c).copied().flatten() else {
+                        continue;
+                    };
+                    merged.push(aterm_core::render::InkCell {
+                        row: r as u16,
+                        col: c as u16,
+                        color,
+                    });
+                }
+            }
+            merged.extend(ex);
+            ws.input_scratch.ink = merged;
+        }
+    }
+
     fn present_input_scratch(
         &mut self,
         id: WindowId,
@@ -15524,6 +15926,7 @@ impl App {
         ws.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
         fp ^= self.compose_cursor_companion(wid, ctx, focus_place);
         fp ^= self.compose_typed_cameo(wid, ctx, focus_place);
+        fp ^= self.compose_typed_dog(wid, ctx, focus_place);
         fp
     }
 
@@ -15667,6 +16070,104 @@ impl App {
         translate_free_into_pane(&mut ws.pane_free, place);
         ws.free_scratch.extend_from_slice(&ws.pane_free);
         fp.map_or(0, |f| f.rotate_left(11))
+    }
+
+    /// THE TYPED DOG on a composed frame — the split twin of the dog arm in
+    /// `redraw_window`, called BESIDE `compose_typed_cameo` for the same
+    /// reason that one is: the companion's early-return chain (pet mode,
+    /// `kitty_alpha == 0`) does not own the dog, which answers a keystroke.
+    ///
+    /// The dog rides the SESSION it was typed in (`dog_cameo_session`), and —
+    /// unlike the kitty cameo, which re-presents in its own pane wherever
+    /// focus goes — it simply stays invisible while another pane has focus:
+    /// the visit is a bounded ~3 s toy anchored to the caret being typed at,
+    /// and the caret it knew is gone once focus moves. Emitted at the focused
+    /// pane's geometry, then translated and cropped by
+    /// [`translate_free_into_pane`], so a dog near a divider is clipped at it
+    /// rather than drawn over the neighbour.
+    fn compose_typed_dog(
+        &mut self,
+        wid: WindowId,
+        ctx: &ComposeDecoCtx<'_>,
+        focus_place: Option<PanePlace>,
+    ) -> u64 {
+        let reduced = match self.sparkle.as_ref() {
+            Some(rs) if rs.cfg.canine => !ctx.animate_sparkles || rs.cfg.reduced_motion,
+            _ => return 0,
+        };
+        let (Some(place), Some(cell)) = (focus_place, ctx.focus_cursor) else {
+            return 0;
+        };
+        let default_bg = self.theme.bg;
+        let (accent, cursor_color) = (ctx.accent, ctx.cursor_color);
+        let term = self.pool.get(ctx.focus).map(|s| s.term.clone());
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return 0;
+        };
+        if ws.dog_cameo_session != Some(ctx.focus) {
+            return 0;
+        }
+        let alpha = ws.dog_cameo.alpha(ctx.now);
+        if alpha == 0 {
+            return 0;
+        }
+        let Some(look) = ws.dog_cameo.look() else {
+            return 0;
+        };
+        let geom = crate::word_decorations::EffectGeom {
+            cell_w: ctx.cell_w as u16,
+            cell_h: ctx.cell_h as u16,
+            rows: place.rows,
+            cols: place.cols,
+        };
+        // Palette from the pane the dog is actually on (the composed-path
+        // sampling law): refresh the pane cells from the focused terminal and
+        // probe the trailing neighborhood, exactly like the single-pane arm.
+        if let Some(term) = term.as_ref() {
+            let mut t = term_lock(term);
+            t.cell_frame_into(
+                &mut ws.deco_pane_cells,
+                usize::from(place.rows),
+                usize::from(place.cols),
+            );
+        }
+        let cw = i32::from(geom.cell_w);
+        let ch = i32::from(geom.cell_h);
+        let (crow, ccol) = cell;
+        let probe = aterm_effects::word_decorations::CatFootprint {
+            x: (i32::from(ccol) * cw - 4 * cw).max(0),
+            y: i32::from(crow) * ch - ch / 2,
+            w: (4 * cw).clamp(1, i32::from(u16::MAX)) as u16,
+            h: (2 * ch).clamp(1, i32::from(u16::MAX)) as u16,
+        };
+        let colors = cursor_cat_color_key(
+            &ws.deco_pane_cells.cells,
+            geom,
+            probe,
+            default_bg,
+            cursor_color,
+            accent,
+        );
+        ws.pane_free.clear();
+        let fp = ws.word_decos.dog_cameo(
+            aterm_effects::word_decorations::DogCameoFrame {
+                geom,
+                cursor: cell,
+                look,
+                colors,
+                bob: if reduced { 0.0 } else { ws.dog_cameo.bob(ctx.now) },
+                alpha,
+            },
+            &mut ws.pane_free,
+        );
+        translate_free_into_pane(&mut ws.pane_free, place);
+        ws.free_scratch.extend_from_slice(&ws.pane_free);
+        // Keep one-present-ahead wakes flowing while the visit animates —
+        // bounded by the envelope; expiry zeroes `alpha` and the wakes stop.
+        if let Some(w) = ws.os_window.as_ref() {
+            w.request_redraw();
+        }
+        fp.map_or(0, |f| f.rotate_left(31))
     }
 
     /// The CURSOR COMPANION on a composed frame: ONE per window, riding the
@@ -17230,7 +17731,7 @@ impl App {
             .get(&wid)
             .and_then(|ws| ws.tab_set.active_index())
             .unwrap_or(0);
-        let tab_strip = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
+        let tab_strip = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_titles_scratch = titles;
             ws.strip_metadata_scratch = metadata;
@@ -17278,6 +17779,15 @@ impl App {
                 tab_bar::solo_subtitle(&tab.presentation.title, tab.presentation.tooltip.as_deref())
             })
             .flatten();
+        // The live in-grid rename field, resolved to a POSITION for the painter (the
+        // strip is handed no session identity). The text is cloned because the paint
+        // borrows the title buffer out of the same window — one short String while a
+        // human is typing a name, and nothing at all otherwise. Its bytes are already
+        // folded into `tab_strip`, so this never needs to join the cache key.
+        let rename = self
+            .inline_rename_edit(wid)
+            .map(|edit| (edit.tab, edit.text.clone(), edit.cursor))
+            .and_then(|(tab, text, cursor)| Some((self.tab_index_for_id(wid, tab)?, text, cursor)));
         let cache_key = (tab_strip, cols, show_update, hovered, subtitle.clone());
         let hit = self.windows.get(&wid).is_some_and(|ws| {
             ws.last_strip_fp.as_ref() == Some(&cache_key) && ws.cached_strip_rows.len() == strip
@@ -17323,6 +17833,13 @@ impl App {
                     let paint = tab_bar::StripPaint {
                         hovered,
                         subtitle: subtitle.as_deref(),
+                        rename: rename.as_ref().map(|(tab, text, cursor)| {
+                            tab_bar::StripRenameField {
+                                tab: *tab,
+                                text,
+                                cursor: *cursor,
+                            }
+                        }),
                     };
                     strip_images = tab_bar::paint_strip_with_metadata(
                         &mut row,
@@ -21161,37 +21678,56 @@ mod split_sparkle_tests {
     /// class of bug the owner's "sparkle effects are NOT SINGLE PANE ONLY"
     /// ruling created this module for.
     ///
-    /// The toy is identified by SIZE: it is drawn taller than the `2·cell_h`
-    /// atlas slot, which is a height neither a word-cat nor the cursor escort
-    /// can reach. The pre-summon assertion proves the discriminator is real —
-    /// the split frame is already full of ordinary cats, and none of them
-    /// qualify.
+    /// The toy is identified by the engine's OWN FOOTPRINT: it is TEXT-SIZED
+    /// now (owner regression, 2026-08-10 — "go back to the old text kitty!"),
+    /// the same scale class as the ambient cats already on this glass, so
+    /// height cannot discriminate it. The composed frame must contain a sprite
+    /// at exactly the rect `kitty_cameo_footprint` resolves for the compose
+    /// instant, translated by the summoning pane's origin — the right pane of
+    /// this 80-column fixture starts at col 41.
     #[test]
     fn split_compose_emits_the_typed_kitty_cameo() {
         use crate::input::{InputEvent, Source};
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
         let t0 = Instant::now();
-        let (mut app, wid, _) = split_app(t0);
+        let (mut app, wid, sid) = split_app(t0);
         compose(&mut app, wid, t0);
         let t1 = t0 + Duration::from_millis(600);
         compose(&mut app, wid, t1);
-        let cell_h = app.win_cell_size(wid).1 as i32;
-        let taller_than_a_slot = |app: &App, wid: WindowId| -> bool {
+        let (cw, ch) = app.win_cell_size(wid);
+        // The right pane's own geometry (80 cols, divider at col 40): the
+        // composed emitter draws the cameo at pane-local coordinates and
+        // `translate_free_into_pane` shifts it by the pane origin.
+        let pane_geom = aterm_effects::word_decorations::EffectGeom {
+            cell_w: cw as u16,
+            cell_h: ch as u16,
+            rows: 24,
+            cols: 39,
+        };
+        let toy_sprite = |app: &App, at: Instant| -> Option<(i32, i32, u16, u16)> {
+            let f = app.windows[&wid]
+                .word_decos
+                .kitty_cameo_footprint(pane_geom, at, Some(sid))?;
+            let rect = (f.x + (41 * cw) as i32, f.y, f.w, f.h);
             app.windows[&wid]
                 .input_scratch
                 .free_sprites
                 .iter()
-                .any(|s| i32::from(s.h) > 2 * cell_h)
+                .any(|s| (s.x, s.y, s.w, s.h) == rect)
+                .then_some(rect)
         };
         assert!(
             !app.windows[&wid].input_scratch.free_sprites.is_empty(),
             "PRECONDITION: the split frame already draws ambient cats"
         );
         assert!(
-            !taller_than_a_slot(&app, wid),
-            "PRECONDITION: and NONE of them is cameo-sized, so the size test \
-             below is a real discriminator"
+            app.windows[&wid]
+                .word_decos
+                .kitty_cameo_footprint(pane_geom, t1, Some(sid))
+                .is_none(),
+            "PRECONDITION: no toy resolves before the word is typed, so the \
+             footprint match below cannot be satisfied by an ambient sprite"
         );
 
         // Type the word for real — the detector only ever sees committed keys.
@@ -21211,11 +21747,21 @@ mod split_sparkle_tests {
             app.windows[&wid].word_decos.cameo_live(Instant::now(), None),
             "PRECONDITION: typing the word summoned a cameo at all"
         );
-        compose(&mut app, wid, t1 + Duration::from_millis(16));
+        let t2 = t1 + Duration::from_millis(16);
+        compose(&mut app, wid, t2);
+        let rect = toy_sprite(&app, t2).unwrap_or_else(|| {
+            panic!(
+                "a split frame must emit the typed-kitty cameo at its own \
+                 footprint ({})",
+                channels(&app, wid, t1)
+            )
+        });
         assert!(
-            taller_than_a_slot(&app, wid),
-            "a split frame must emit the typed-kitty cameo ({})",
-            channels(&app, wid, t1)
+            i32::from(rect.3) <= 2 * ch as i32,
+            "and the toy is TEXT-sized — inside the two-row band every text \
+             cat lives in (owner, 2026-08-10): {} vs {}",
+            rect.3,
+            2 * ch
         );
     }
 
@@ -21411,15 +21957,30 @@ mod split_sparkle_tests {
         let t1 = t0 + Duration::from_millis(600);
         compose(&mut app, wid, t1);
         let (cw, cell_h) = app.win_cell_size(wid);
-        let cell_h = cell_h as i32;
-        // Every cameo sprite's x. Height is the discriminator: nothing else on
-        // glass can exceed the `2·cell_h` atlas slot.
-        let cameo_xs = |app: &App| -> Vec<i32> {
+        // Every cameo sprite's x, found by the engine's OWN FOOTPRINT: the toy
+        // is TEXT-SIZED now (owner regression, 2026-08-10), so height cannot
+        // discriminate it from the ambient cats — but the exact rect the
+        // emitter draws it at, translated by its summoning pane's origin (the
+        // right pane starts at col 41), can.
+        let pane_geom = aterm_effects::word_decorations::EffectGeom {
+            cell_w: cw as u16,
+            cell_h: cell_h as u16,
+            rows: 24,
+            cols: 39,
+        };
+        let cameo_xs = |app: &App, at: Instant| -> Vec<i32> {
+            let Some(f) = app.windows[&wid]
+                .word_decos
+                .kitty_cameo_footprint(pane_geom, at, Some(sid))
+            else {
+                return Vec::new();
+            };
+            let rect = (f.x + (41 * cw) as i32, f.y, f.w, f.h);
             app.windows[&wid]
                 .input_scratch
                 .free_sprites
                 .iter()
-                .filter(|s| i32::from(s.h) > 2 * cell_h)
+                .filter(|s| (s.x, s.y, s.w, s.h) == rect)
                 .map(|s| s.x)
                 .collect()
         };
@@ -21453,7 +22014,7 @@ mod split_sparkle_tests {
         compose(&mut app, wid, t1 + Duration::from_millis(16));
         // The right pane starts at col 41 (col 40 is the divider).
         let right_x0 = (41 * cw) as i32;
-        let focused = cameo_xs(&app);
+        let focused = cameo_xs(&app, t1 + Duration::from_millis(16));
         assert!(
             !focused.is_empty() && focused.iter().all(|&x| x >= right_x0),
             "PRECONDITION: while its own pane has focus the toy draws there: \
@@ -21475,7 +22036,7 @@ mod split_sparkle_tests {
         );
 
         compose(&mut app, wid, t1 + Duration::from_millis(32));
-        let unfocused = cameo_xs(&app);
+        let unfocused = cameo_xs(&app, t1 + Duration::from_millis(32));
         assert!(
             !unfocused.is_empty(),
             "the toy must stay on glass in the pane that summoned it — its veto \

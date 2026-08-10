@@ -179,7 +179,7 @@ pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 /// repo-trust / signed-manifest tiers (see the crate-level trust model). Set it (the
 /// owner's Developer-ID build) to additionally require the swapped bundle be
 /// Developer-ID signed by this team.
-pub const PINNED_TEAM_ID: &str = aterm_update_core::compile_time_pin!("ATERM_EXPECTED_TEAM_ID");
+pub const PINNED_TEAM_ID: &str = aterm_update_core::pins::APPLE_TEAM_ID;
 
 /// Runtime RAISE of the Tier-APPLE anchor, from `[update] require_team_id` in the
 /// GUI config. Set once, early in `main`, by [`set_required_team_id`].
@@ -240,7 +240,19 @@ pub fn effective_team_id() -> &'static str {
 /// default) disables signature checking; when set, every release manifest MUST carry a
 /// valid `aterm-appcast.toml.sig` verifying against it (mint the keypair with
 /// `atpkg-keys keygen`, keep the secret offline / in CI secrets). See [`sig`].
-pub const PINNED_UPDATE_PUBKEY: &str = aterm_update_core::compile_time_pin!("ATERM_UPDATE_PUBKEY");
+/// The CURRENT signing key. Verification must accept ANY key in
+/// [`aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS`] so a rotation does not strand
+/// clients; this constant names only the key new releases are signed with.
+pub const PINNED_UPDATE_PUBKEY: &str = aterm_update_core::pins::update_channel_signing_pubkey();
+
+/// The full channel KEYSET clients verify against — any member is authoritative.
+///
+/// Verification uses this; [`PINNED_UPDATE_PUBKEY`] (the head) is only for the
+/// cutter, which produces one signature, and for the build stamp that proves which
+/// anchor reached the artifact. Keeping them separate is deliberate: the embedded
+/// `__aterm_upin` record must name exactly one key, while a client must accept
+/// several or a rotation strands it.
+pub const PINNED_UPDATE_PUBKEYS: &[&str] = aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS;
 
 /// SHA-256 of the raw 32-byte Ed25519 update key, for shipping introspection.
 ///

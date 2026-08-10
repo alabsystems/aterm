@@ -144,6 +144,34 @@ pub fn generate_pet_from_dir(pet_dir: &Path) -> Result<String, String> {
     Ok(emit_pet(&load_glyphs(pet_dir)?))
 }
 
+/// Generate the full `dog_glyphs_gen.rs` source from the breed TOMLs in `dog_dir` — the
+/// third roster on the same parse/quantize/fail-closed path. Like the pet, the dogs are
+/// a SEPARATE roster reusing the cat module's shape types: the typed-word dog cameo is
+/// not a collectible, so dog heads must never join `GLYPHS` (the kitty log's roster cap
+/// is pinned to `GLYPH_IDS.len()`).
+///
+/// # Errors
+/// Identical to [`generate_from_dir`]: any unreadable dir, malformed TOML, unknown
+/// role/recolor/kind, missing viewbox/anchor, unknown roster-schema key, unparseable
+/// path `d`-string, or colliding variant name.
+pub fn generate_dog_from_dir(dog_dir: &Path) -> Result<String, String> {
+    Ok(emit_dog(&load_glyphs(dog_dir)?))
+}
+
+/// Generate the full `animal_glyphs_gen.rs` source from the species-head TOMLs in
+/// `animal_dir` — the same parse, quantization, and fail-closed key rejection as
+/// [`generate_from_dir`], emitted as the FOURTH separate roster (`AnimalGlyphId` /
+/// `ANIMAL_GLYPHS`): one authored head per species for the ambient animal-word
+/// decoration. Separate for the same reason the pet roster is — these must never
+/// join the collectible cat table — plus one of its own: the asset `id` doubles as
+/// the lexicon's `species` key, so the roster also emits the key → id resolver.
+///
+/// # Errors
+/// Identical to [`generate_from_dir`].
+pub fn generate_animal_from_dir(animal_dir: &Path) -> Result<String, String> {
+    Ok(emit_animal_roster(&load_glyphs(animal_dir)?))
+}
+
 /// Read, parse, order, and collision-check every roster asset in `dir` — the half of
 /// codegen the two rosters share verbatim. Non-`.toml` files (the authoring scripts
 /// that live beside the pet poses) are skipped by extension, and non-roster kinds /
@@ -517,6 +545,106 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     s
 }
 
+/// Render the dog roster source. Same drawlist rows as [`emit`], but a separate
+/// `DogGlyphId` / `DOG_GLYPH_IDS` / `DOG_GLYPHS` roster that *imports* the cat module's
+/// shape types rather than redeclaring them — the pet precedent applied to the typed
+/// dog cameo's breed selection.
+fn emit_dog(glyphs: &[Glyph]) -> String {
+    let mut s = String::new();
+    s.push_str(DOG_HEADER);
+
+    // DogGlyphId roster enum.
+    s.push_str("/// The dog roster: every authored breed head, ordered by id. Indexes\n");
+    s.push_str("/// [`DOG_GLYPHS`]. Not a collectible — the typed-word dog cameo draws one\n");
+    s.push_str("/// of these per summon; the kitty log never records them.\n");
+    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
+    s.push_str("pub enum DogGlyphId {\n");
+    for g in glyphs {
+        s.push_str("    ");
+        s.push_str(&g.variant);
+        s.push_str(",\n");
+    }
+    s.push_str("}\n\n");
+
+    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: any persisted
+    // reference resolves through `DOG_GLYPHS[i].id` strings, never a discriminant).
+    s.push_str(
+        "/// Every breed id in [`DOG_GLYPHS`] order. Pair with `DOG_GLYPHS[i].id` for stable\n",
+    );
+    s.push_str("/// string lookup.\n");
+    s.push_str("pub const DOG_GLYPH_IDS: &[DogGlyphId] = &[\n");
+    for g in glyphs {
+        s.push_str(&format!("    DogGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n\n");
+
+    // DOG_GLYPHS table.
+    s.push_str("/// Every breed head's const drawlist, indexed by [`DogGlyphId`] order.\n");
+    s.push_str("pub const DOG_GLYPHS: &[GlyphDef] = &[\n");
+    emit_glyph_rows(&mut s, glyphs);
+    s.push_str("];\n\n");
+
+    // DOG_HEADS roster (parallel to the cat's HEADS: what the summon picker draws from).
+    s.push_str("/// The breed variants the typed-summon picker draws from, uniformly.\n");
+    s.push_str("pub const DOG_HEADS: &[DogGlyphId] = &[\n");
+    for g in glyphs.iter().filter(|g| g.kind == "Head") {
+        s.push_str(&format!("    DogGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n");
+
+    s
+}
+
+fn emit_animal_roster(glyphs: &[Glyph]) -> String {
+    let mut s = String::new();
+    s.push_str(ANIMAL_HEADER);
+
+    // AnimalGlyphId roster enum.
+    s.push_str("/// The animal roster: every authored species head, ordered by id. Indexes\n");
+    s.push_str("/// [`ANIMAL_GLYPHS`]. One head per species; the id string IS the lexicon's\n");
+    s.push_str("/// `species` key.\n");
+    s.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]\n");
+    s.push_str("pub enum AnimalGlyphId {\n");
+    for g in glyphs {
+        s.push_str("    ");
+        s.push_str(&g.variant);
+        s.push_str(",\n");
+    }
+    s.push_str("}\n\n");
+
+    // Stable enum-value roster (same reason as the cat's GLYPH_IDS: species
+    // resolution goes through `ANIMAL_GLYPHS[i].id` strings, never a Rust
+    // discriminant).
+    s.push_str(
+        "/// Every species id in [`ANIMAL_GLYPHS`] order. Pair with `ANIMAL_GLYPHS[i].id`\n",
+    );
+    s.push_str("/// for stable string lookup.\n");
+    s.push_str("pub const ANIMAL_GLYPH_IDS: &[AnimalGlyphId] = &[\n");
+    for g in glyphs {
+        s.push_str(&format!("    AnimalGlyphId::{},\n", g.variant));
+    }
+    s.push_str("];\n\n");
+
+    // ANIMAL_GLYPHS table.
+    s.push_str("/// Every species head's const drawlist, indexed by [`AnimalGlyphId`] order.\n");
+    s.push_str("pub const ANIMAL_GLYPHS: &[GlyphDef] = &[\n");
+    emit_glyph_rows(&mut s, glyphs);
+    s.push_str("];\n\n");
+
+    // The lexicon-key resolver: `species = \"monkey\"` → `AnimalGlyphId::Monkey`.
+    s.push_str("/// Resolve a lexicon `species` key (`ANIMAL_GLYPHS[i].id`) to its roster id.\n");
+    s.push_str("/// Linear over a few dozen species; called at rescan, not per frame.\n");
+    s.push_str("#[must_use]\n");
+    s.push_str("pub fn animal_glyph_from_key(key: &str) -> Option<AnimalGlyphId> {\n");
+    s.push_str("    ANIMAL_GLYPHS\n");
+    s.push_str("        .iter()\n");
+    s.push_str("        .position(|g| g.id == key)\n");
+    s.push_str("        .map(|i| ANIMAL_GLYPH_IDS[i])\n");
+    s.push_str("}\n");
+
+    s
+}
+
 /// The `GlyphDef { … }` rows both roster tables are built from — identical bytes for
 /// identical assets, so the pet and the cat can never drift in drawlist encoding.
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
@@ -601,6 +729,50 @@ use crate::cat_glyphs_gen::{GlyphDef, GlyphKind, GlyphRole, Layer, Recolor};
 
 ";
 
+const DOG_HEADER: &str = "\
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// @generated by: cargo run -p aterm-effects --example gen_dog_glyphs
+//
+// DO NOT EDIT BY HAND. Regenerated from the breed head asset TOMLs under
+// crates/aterm-effects/art/dogs/. The drift test `dog_glyphs_gen_matches_assets`
+// fails if this file is stale relative to those assets.
+//
+// A SEPARATE roster on purpose, exactly like the pet's: every `GlyphKind` row in
+// the cat module's `GLYPHS` is a collectible in the GUI's kitty log, whose roster
+// cap is pinned to `GLYPH_IDS.len()` — dog heads must not join that table. Only
+// the shape vocabulary is shared: the types below are the cat module's, imported
+// rather than redeclared, so one drawlist walker paints every roster.
+
+use aterm_scene::vector::PathSeg;
+
+use crate::cat_glyphs_gen::{GlyphDef, GlyphKind, GlyphRole, Layer, Recolor};
+
+";
+
+const ANIMAL_HEADER: &str = "\
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+//
+// @generated by: cargo run -p aterm-effects --example gen_animal_glyphs
+//
+// DO NOT EDIT BY HAND. Regenerated from the species-head asset TOMLs under
+// crates/aterm-effects/art/animal/. The drift test `animal_glyphs_gen_matches_assets`
+// fails if this file is stale relative to those assets.
+//
+// A SEPARATE roster on purpose (the pet precedent): the cat module's `GLYPHS` is
+// the collectible Kitty-Log table with a spec-pinned cap, so species heads must not
+// join it. Only the shape vocabulary is shared: the types below are the cat
+// module's, imported rather than redeclared, so one drawlist walker paints all
+// three rosters. The asset `id` doubles as the lexicon's `species` key.
+
+use aterm_scene::vector::PathSeg;
+
+use crate::cat_glyphs_gen::{GlyphDef, GlyphKind, GlyphRole, Layer, Recolor};
+
+";
+
 const STRUCTS: &str = "\
 /// One glyph layer: a painter-order fill of `paths` in the glyph's fixed-point frame.
 pub struct Layer {
@@ -640,6 +812,25 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("art/pet")
     }
 
+    /// The species-head asset dir shipped with the crate.
+    fn animal_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/animal")
+    }
+
+    /// The animal roster's drift gate: regenerate the source from the assets and
+    /// assert it equals the checked-in `animal_glyphs_gen.rs`. Regenerate with
+    /// `cargo run -p aterm-effects --example gen_animal_glyphs` after touching any head.
+    #[test]
+    fn animal_glyphs_gen_matches_assets() {
+        let generated =
+            generate_animal_from_dir(&animal_dir()).expect("generate animal glyph drawlists");
+        let checked_in = include_str!("animal_glyphs_gen.rs");
+        assert_eq!(
+            generated, checked_in,
+            "animal_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_animal_glyphs`"
+        );
+    }
+
     /// The drift gate (§1): regenerate the source from the assets and assert it equals
     /// the checked-in `cat_glyphs_gen.rs`. Regenerate with
     /// `cargo run -p aterm-effects --example gen_cat_glyphs` after touching any asset.
@@ -663,6 +854,24 @@ mod tests {
         assert_eq!(
             generated, checked_in,
             "pet_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_pet_glyphs`"
+        );
+    }
+
+    /// The breed asset dir shipped with the crate.
+    fn dog_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("art/dogs")
+    }
+
+    /// The dog third of the same gate: regenerate the breed roster from `art/dogs/`
+    /// and assert it equals the checked-in `dog_glyphs_gen.rs`. Regenerate with
+    /// `cargo run -p aterm-effects --example gen_dog_glyphs` after touching any breed.
+    #[test]
+    fn dog_glyphs_gen_matches_assets() {
+        let generated = generate_dog_from_dir(&dog_dir()).expect("generate dog glyph drawlists");
+        let checked_in = include_str!("dog_glyphs_gen.rs");
+        assert_eq!(
+            generated, checked_in,
+            "dog_glyphs_gen.rs is stale — rerun `cargo run -p aterm-effects --example gen_dog_glyphs`"
         );
     }
 

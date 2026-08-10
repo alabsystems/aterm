@@ -61,15 +61,20 @@ fn main() {
     // Rosetta.  Invalid non-empty inputs fail the build instead of embedding an
     // ambiguous record; an ordinary unpinned dev build gets the explicit zero
     // sentinel and remains updater-inert.
-    let update_pin_sha256 = match std::env::var("ATERM_UPDATE_PUBKEY") {
-        Ok(encoded) if !encoded.is_empty() => {
+    // The anchor is the COMMITTED constant, not build-environment state: read it
+    // from the one file that owns it so the embedded record proves the same key the
+    // runtime verifies under. Reading an env var here would reintroduce exactly the
+    // drift this record exists to detect — a binary whose embedded pin disagrees
+    // with the anchor it actually trusts.
+    let update_pin_sha256 = match aterm_update_core::pins::update_channel_signing_pubkey() {
+        encoded if !encoded.is_empty() => {
             let raw = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
-                .expect("ATERM_UPDATE_PUBKEY must be standard base64");
+                .expect("UPDATE_CHANNEL_PUBKEYS[0] must be standard base64");
             assert_eq!(
                 raw.len(),
                 32,
-                "ATERM_UPDATE_PUBKEY must decode to an Ed25519 32-byte public key"
+                "UPDATE_CHANNEL_PUBKEYS[0] must decode to an Ed25519 32-byte public key"
             );
             Sha256::digest(raw)
                 .iter()
@@ -79,7 +84,6 @@ fn main() {
         _ => UNPINNED_UPDATE_PIN_SENTINEL.to_string(),
     };
     println!("cargo:rustc-env=ATERM_UPDATE_PIN_SHA256={update_pin_sha256}");
-    println!("cargo:rerun-if-env-changed=ATERM_UPDATE_PUBKEY");
 
     // Git commit (short, 12 hex) + a "-dirty" suffix when the tree isn't clean.
     let commit =

@@ -748,6 +748,7 @@ pub(crate) fn spawn_session(
     // needs the assembled session (it is also the overlap handoff's resume and
     // deferred-adoption primitive, which only ever see a built `Session`).
     let mut session = Session {
+        child_reaped: std::sync::atomic::AtomicBool::new(false),
         id,
         term,
         master,

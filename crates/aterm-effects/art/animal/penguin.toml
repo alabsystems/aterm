@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "penguin"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.5, center_x = 0.5, word_top = 1.0 }
+
+# Penguin: slate dome, white heart face, amber wedge beak, rosy blush.
+
+[[layer]]
+role = "outline"
+ref_fill = "#1E222B"
+recolor = "fixed"
+paths = ["M 26 72 C 26 43.3 50.2 20 80 20 C 109.8 20 134 43.3 134 72 C 134 100.7 109.8 124 80 124 C 50.2 124 26 100.7 26 72 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#2A3140"
+recolor = "fixed"
+paths = ["M 30 72 C 30 45.5 52.4 24 80 24 C 107.6 24 130 45.5 130 72 C 130 98.5 107.6 120 80 120 C 52.4 120 30 98.5 30 72 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F4F6F8"
+recolor = "fixed"
+paths = ["M 34 82 C 34 67.6 46.1 56 61 56 C 75.9 56 88 67.6 88 82 C 88 96.4 75.9 108 61 108 C 46.1 108 34 96.4 34 82 Z", "M 72 82 C 72 67.6 84.1 56 99 56 C 113.9 56 126 67.6 126 82 C 126 96.4 113.9 108 99 108 C 84.1 108 72 96.4 72 82 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#20242C"
+recolor = "fixed"
+paths = ["M 56 66 C 56 62.1 58.7 59 62 59 C 65.3 59 68 62.1 68 66 C 68 69.9 65.3 73 62 73 C 58.7 73 56 69.9 56 66 Z", "M 92 66 C 92 62.1 94.7 59 98 59 C 101.3 59 104 62.1 104 66 C 104 69.9 101.3 73 98 73 C 94.7 73 92 69.9 92 66 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 61.8 63.5 C 61.8 62.3 62.8 61.3 64 61.3 C 65.2 61.3 66.2 62.3 66.2 63.5 C 66.2 64.7 65.2 65.7 64 65.7 C 62.8 65.7 61.8 64.7 61.8 63.5 Z", "M 97.8 63.5 C 97.8 62.3 98.8 61.3 100 61.3 C 101.2 61.3 102.2 62.3 102.2 63.5 C 102.2 64.7 101.2 65.7 100 65.7 C 98.8 65.7 97.8 64.7 97.8 63.5 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#F5A623"
+recolor = "fixed"
+paths = ["M 80 72 C 87 72 92 78 90 85 C 86 93 74 93 70 85 C 68 78 73 72 80 72 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#F2B8C0"
+recolor = "fixed"
+paths = ["M 38 90 C 38 87.5 41.1 85.5 45 85.5 C 48.9 85.5 52 87.5 52 90 C 52 92.5 48.9 94.5 45 94.5 C 41.1 94.5 38 92.5 38 90 Z", "M 108 90 C 108 87.5 111.1 85.5 115 85.5 C 118.9 85.5 122 87.5 122 90 C 122 92.5 118.9 94.5 115 94.5 C 111.1 94.5 108 92.5 108 90 Z"]

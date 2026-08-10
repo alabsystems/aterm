@@ -36,7 +36,8 @@ fn run_with_deadline(
         .args(args)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", config_home)
-        .env("ATPKG_ROOTKEY_OVERRIDE", "invalid-but-nonempty-test-anchor")
+        // No root-key env var: the anchor is compiled in (aterm-update-core::pins),
+        // so the manager is enabled by construction and nothing ambient can supply it.
         .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
         .env_remove("ATPKG_DISABLE")
         .stdout(Stdio::null())

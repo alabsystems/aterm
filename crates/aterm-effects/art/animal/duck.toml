@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "duck"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.455, center_x = 0.5, word_top = 1.0 }
+
+# Duck: yellow round head, wide flat orange bill wider than the chin, happy round eyes.
+
+[[layer]]
+role = "outline"
+ref_fill = "#4A3510"
+recolor = "fixed"
+paths = ["M 28 66 C 28 39.5 51.3 18 80 18 C 108.7 18 132 39.5 132 66 C 132 92.5 108.7 114 80 114 C 51.3 114 28 92.5 28 66 Z", "M 38 100 C 38 90.6 56.8 83 80 83 C 103.2 83 122 90.6 122 100 C 122 109.4 103.2 117 80 117 C 56.8 117 38 109.4 38 100 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#F7D24B"
+recolor = "fixed"
+paths = ["M 32 66 C 32 41.7 53.5 22 80 22 C 106.5 22 128 41.7 128 66 C 128 90.3 106.5 110 80 110 C 53.5 110 32 90.3 32 66 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#F59B23"
+recolor = "fixed"
+paths = ["M 42 100 C 42 92.8 59 87 80 87 C 101 87 118 92.8 118 100 C 118 107.2 101 113 80 113 C 59 113 42 107.2 42 100 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#B5690A"
+recolor = "fixed"
+paths = ["M 50 97 C 63 108 97 108 110 97 C 102 113 58 113 50 97 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 55.5 60 C 55.5 55.6 58.4 52 62 52 C 65.6 52 68.5 55.6 68.5 60 C 68.5 64.4 65.6 68 62 68 C 58.4 68 55.5 64.4 55.5 60 Z", "M 91.5 60 C 91.5 55.6 94.4 52 98 52 C 101.6 52 104.5 55.6 104.5 60 C 104.5 64.4 101.6 68 98 68 C 94.4 68 91.5 64.4 91.5 60 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 61.8 57 C 61.8 55.8 62.8 54.8 64 54.8 C 65.2 54.8 66.2 55.8 66.2 57 C 66.2 58.2 65.2 59.2 64 59.2 C 62.8 59.2 61.8 58.2 61.8 57 Z", "M 97.8 57 C 97.8 55.8 98.8 54.8 100 54.8 C 101.2 54.8 102.2 55.8 102.2 57 C 102.2 58.2 101.2 59.2 100 59.2 C 98.8 59.2 97.8 58.2 97.8 57 Z"]

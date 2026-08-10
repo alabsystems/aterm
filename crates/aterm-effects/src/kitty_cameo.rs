@@ -18,8 +18,17 @@
 //! * **Anchored at the caret cell where the word was typed** — not carried
 //!   along by the caret afterwards. It is a toy that popped out at a place,
 //!   which is why the anchor is latched at summon time and never re-read.
-//! * **Deliberately BIGGER than the escort** ([`CAMEO_DEST_SCALE`]) so it reads
-//!   as the toy rather than as a second cursor decoration.
+//! * **TEXT-SIZED, like every cat that lives in the terminal's text.** Owner
+//!   regression report, 2026-08-10: *"AHH! the kitty that appears when I type
+//!   'Kitty' is huge! go back to the old text kitty!"* — clarified: *"like how
+//!   it appears in the regular text."* 0.19.0 drew this sprite at the full
+//!   2-cell atlas slot with a further 2.0× dest scale — a ~4-cell creature
+//!   standing ON the line, in front of the text. The cameo is now sized and
+//!   placed by the SAME law as the ambient word-cat peek
+//!   (`word_decorations::cameo_footprint_for`): a head at `cat_hart` × its own
+//!   age band, chin tucked behind the anchor row, drawn under the text. What
+//!   still distinguishes it from the escort is its ANCHOR and its lifecycle,
+//!   not its bulk — a kitty typed is a kitty that fits the line.
 //! * **Fires on EVERY typed feline completion.** The ledger's cooldown governs
 //!   whether a Kitty Log ROW is written; it has never governed whether the user
 //!   gets an answer to what they typed.
@@ -41,7 +50,9 @@
 //! simply misses frames and the cat is exactly where the wall clock says it is
 //! when the frames come back.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use crate::{cat_baker::CatColorKey, kitty_registry::KittyLook};
 
@@ -89,33 +100,15 @@ pub const CAMEO_BOB_MS: u64 = 1_500;
 /// train, short enough that the toy is on glass essentially immediately.
 pub const CAMEO_BAKE_RETRY_MS: u64 = 16;
 
-/// The cameo's drawn height as a multiple of its baked NATURAL height.
-///
-/// [`crate::cat_baker::CatBaker`] slots are exactly `2·cell_h` tall, so the
-/// largest tile the atlas can hold is a 2-cell cat — the cameo already bakes at
-/// that ceiling. Reading "bigger than the escort" therefore has to happen at
-/// DRAW time, by scaling the dest rect (the same mechanism the companion's
-/// living-cartoon squash/stretch uses).
-///
-/// OWNER, 2026-08-09: *"so I can see it more clearly"*. This was 1.5, and 1.5
-/// is the WORST ratio available here: the renderer samples NEAREST only, so a
-/// 3:2 upscale doubles every second source pixel and leaves the rest single —
-/// the cat's hairline features (whiskers, eye arcs, the maneki's bean pads)
-/// come out with alternating 1-px and 2-px strokes, which reads as a slightly
-/// broken sprite rather than a bigger one. **2.0 is the only ratio in range
-/// that is exact under NEAREST**: every source pixel becomes exactly 2×2, so
-/// the enlargement introduces no resampling error at all. It is simultaneously
-/// bigger AND cleaner, which is precisely the complaint.
-///
-/// The alternative — baking a taller tile — is not available to this module:
-/// the atlas slot band is structurally `2·cell_h`
-/// ([`crate::cat_baker::CatBaker::slot_count`]), so the natural size is already
-/// at the ceiling and the dest rect is the only lever.
-///
-/// Net: the cameo draws ~4 cells tall against the escort's ~1.7
-/// ([`crate::word_decorations::WordDecorations`]'s `COMPANION_CELL_H`) — 2.35x,
-/// a margin no one can mistake for a second cursor decoration.
-pub const CAMEO_DEST_SCALE: f32 = 2.0;
+// THERE IS DELIBERATELY NO DEST SCALE ANY MORE. 0.19.0 shipped a
+// `CAMEO_DEST_SCALE` (1.5, then 2.0) over a tile already baked at the 2-cell
+// atlas ceiling — a ~4-cell cat, which is the regression the owner reported on
+// 2026-08-10: "AHH! the kitty that appears when I type 'Kitty' is huge! go
+// back to the old text kitty!" The cameo now bakes at its exact dest size
+// (NEAREST 1:1, like every ambient word-cat) under the ambient head law in
+// `word_decorations::cameo_footprint_for`. A multiplier here is the lever the
+// next "make it its own cat" pass would reach for first; its absence is the
+// point.
 
 /// One live cameo. There is at most one per window: a second typed word
 /// REPLACES the first rather than stacking, because two toys for two keystrokes
@@ -192,8 +185,11 @@ pub struct CameoFrame {
     pub look: KittyLook,
     /// Straight alpha, `0` meaning "nothing to draw this frame".
     pub alpha: u8,
-    /// Vertical offset in CELLS, negative = higher up. Carries both the
-    /// entrance slide and the idle bob.
+    /// Vertical offset in CELLS. Positive moves the head towards its HIDDEN
+    /// side — the geometry half (`word_decorations::cameo_footprint_for`)
+    /// maps it behind the anchor line, whichever side the head peeks from —
+    /// so the entrance always reads as the classic slide-out. Carries both
+    /// the entrance slide and the idle bob.
     pub dy: f32,
 }
 
@@ -492,7 +488,8 @@ impl KittyCameo {
             anchor: c.anchor,
             look: c.look,
             alpha,
-            // Negative is UP: the cameo rises INTO place from below its rest.
+            // Positive is TOWARDS HIDDEN: the entrance starts displaced
+            // behind the anchor line and slides out into place.
             dy: bob + slide,
         })
     }
@@ -520,7 +517,10 @@ mod tests {
         cam.summon(t0, (4, 9), look(), None);
         let birth = cam.frame(t0).expect("a summoned cameo draws at once");
         assert_eq!(birth.anchor, (4, 9));
-        assert!(birth.dy > 0.0, "the entrance starts BELOW rest");
+        assert!(
+            birth.dy > 0.0,
+            "the entrance starts displaced towards the hidden side"
+        );
         assert!(cam.is_active(t0), "full motion owns the frame cadence");
 
         let dwell = cam
@@ -641,7 +641,7 @@ mod tests {
         cam.summon(late, (7, 2), look(), None);
         let f = cam.frame(late).expect("the replacement draws at once");
         assert_eq!(f.anchor, (7, 2), "the newest word owns the toy");
-        assert!(f.dy > 0.0, "and its entrance restarts from below rest");
+        assert!(f.dy > 0.0, "and its entrance restarts from the hidden side");
         // The replacement outlives the ORIGINAL's expiry: the clock restarted.
         assert!(
             cam.frame(t0 + Duration::from_millis(CAMEO_TOTAL_MS + 1))

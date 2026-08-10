@@ -109,7 +109,8 @@
 pub(crate) use macos::native_strip_container;
 #[cfg(target_os = "macos")]
 pub use macos::{
-    ToolbarHandle, begin_tab_rename, end_tab_rename, install_window_toolbar, read_tab_chrome,
+    ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
+    install_window_toolbar, read_tab_chrome,
     read_tab_menus, rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_dark,
     set_update_available, set_window_tabs,
 };
@@ -3641,6 +3642,13 @@ mod macos {
     ///
     /// Returns whether an editor is on screen; `App` refuses to hold edit state
     /// nothing is presenting (an invisible modal mode that swallows commands).
+    /// Whether a native editor COULD be installed here — the strip needs a live
+    /// window to host the field. Deliberately side-effect free, so menu
+    /// validation can ask without opening an editor.
+    pub fn can_present_tab_rename(handle: &ToolbarHandle) -> bool {
+        MainThreadMarker::new().is_some() && handle.container.window().is_some()
+    }
+
     pub fn begin_tab_rename(
         handle: &ToolbarHandle,
         tab: TabId,

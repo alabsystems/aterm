@@ -190,6 +190,10 @@ pub(crate) struct PaletteLive {
     /// frontmost (macOS keeps running windowless), so per-session rows refuse
     /// instead of silently no-op'ing through the invoke fence.
     pub terminal_front: bool,
+    /// Whether the front window can PRESENT a rename editor. Off macOS the
+    /// editor is drawn by the tab strip, so `tab_strip_rows = 0` leaves nowhere
+    /// to put it and the row must grey out rather than accept a dead click.
+    pub can_rename: bool,
     /// At least one native tab snapshot is available for identity-fresh reopen.
     pub can_reopen_closed_tab: bool,
     /// A non-expired split-leaf recovery record is available.
@@ -434,7 +438,9 @@ impl PaletteState {
                 // The pin is SESSION metadata, so a native whole tab has nothing
                 // to rename: the row disables (and the invoke fence refuses)
                 // instead of opening an editor over a surface with no session.
-                MenuAction::RenameSession => row.enabled = live.terminal_front,
+                MenuAction::RenameSession => {
+                    row.enabled = live.terminal_front && live.can_rename;
+                }
                 MenuAction::Copy => row.enabled = live.has_selection,
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
                 MenuAction::ReopenClosedTab => row.enabled = live.can_reopen_closed_tab,
@@ -1497,6 +1503,7 @@ mod tests {
         s.resolve(&PaletteLive {
             rain_on: true,
             terminal_front: true,
+            can_rename: true,
             ..Default::default()
         });
         let rain = s
@@ -1544,6 +1551,7 @@ mod tests {
         s.resolve(&PaletteLive {
             session_kitty_favourited: true,
             terminal_front: true,
+            can_rename: true,
             ..Default::default()
         });
         // (checked, enabled) for the row — PaletteRow is not `Copy`, and the

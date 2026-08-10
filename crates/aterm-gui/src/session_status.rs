@@ -15,10 +15,19 @@
 //! * **Strong shell evidence outranks raw screen movement.** A background job
 //!   printing while the shell sits at a prompt must NOT make the session
 //!   `Running` — otherwise every `tail -f &` would lie about the pane.
-//! * **`waiting_input` is never inferred from silence.** A quiet foreground job
-//!   may be CPU-bound, sleeping, blocked on the network, in a pager, or at a
-//!   REPL. Those are [`Phase::Quiet`] with [`Confidence::Heuristic`], which is
-//!   honest; claiming a human is being awaited is not.
+//! * **There is no "waiting for input" phase, because there is no honest local
+//!   source for one.** RFC §6 permits the claim from exactly three places: a
+//!   user pin, a trusted child protocol, or shell-integration prompt-input
+//!   readiness. Aterm has no phase pin, no child protocol carries such a
+//!   signal, and the one shell mark that means "the prompt is ready for a
+//!   command" (`BlockState::EnteringCommand`) is already spent on
+//!   [`Phase::Idle`] — promoting it would raise an attention badge on every
+//!   idle shell in every tab. A quiet foreground job may be CPU-bound,
+//!   sleeping, blocked on the network, in a pager, or at a REPL, so it is
+//!   [`Phase::Quiet`] with [`Confidence::Heuristic`], which is honest;
+//!   claiming a human is being awaited is not. The phase was specified before
+//!   a source existed and has been REMOVED rather than left as scaffolding —
+//!   see the `phase=` vocabulary in `docs/INTROSPECTION.md`.
 //!
 //! The activity primitive is the PAIR `(is_alternate_screen, content_seq)`, never
 //! the sequence alone: the main and alternate grids keep independent counters, so
@@ -43,11 +52,23 @@ pub(crate) enum Phase {
     /// A foreground job exists but no display activity has been observed
     /// recently. NOT a claim that anyone is being awaited.
     Quiet,
-    /// Known to be awaiting input. Only ever set from the narrow sources in
-    /// [`Evidence::waiting_input_signal`].
-    WaitingInput,
     /// The PTY has ended. Pairs with [`Status::last_outcome`].
     Exited,
+}
+
+impl Phase {
+    /// The normative wire spelling (RFC §3), shared by the `status` verb and
+    /// the timeline. Stable: a consumer may match on these.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Starting => "starting",
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Quiet => "quiet",
+            Self::Exited => "exited",
+        }
+    }
 }
 
 /// Result of the last COMPLETED unit of work. Survives phase changes until the
@@ -69,6 +90,17 @@ pub(crate) enum Outcome {
 impl Outcome {
     pub(crate) const fn is_failure(self) -> bool {
         matches!(self, Self::Failure { .. } | Self::Signal { .. })
+    }
+
+    /// The normative wire spelling (RFC §3). The payload (`exit_code`,
+    /// `signal`) rides its own fields so this stays a bare token.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Success => "success",
+            Self::Failure { .. } => "failure",
+            Self::Signal { .. } => "signal",
+        }
     }
 }
 
@@ -108,6 +140,22 @@ pub(crate) enum Reason {
     NoEvidence,
 }
 
+impl Reason {
+    /// The normative wire spellings (RFC §3).
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pin => "pin",
+            Self::ShellBlock => "shell_block",
+            Self::LifecycleExit => "lifecycle_exit",
+            Self::ForegroundJob => "fg_job",
+            Self::ContentActivity => "content_activity",
+            Self::OutputActivity => "output_activity",
+            Self::Stall => "stall",
+            Self::NoEvidence => "no_evidence",
+        }
+    }
+}
+
 /// Shell-integration evidence: the strongest routinely-available signal, and the
 /// only local source that can distinguish "at a prompt" from "quiet job".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,11 +168,13 @@ pub(crate) enum ShellEvidence {
 
 /// How the session's PTY ended, when that is actually known.
 ///
-/// Not yet produced by the observer: `Wake::Exit` carries session and window
-/// identity but no exit status, and a session is normally removed on exit.
-/// Carrying the status is the prerequisite named in RFC §5, evidence row 3.
+/// Produced at the `Wake::Exit` edge by [`crate::App::note_session_exit`], which
+/// collects the child's status with a non-blocking `waitpid` while it is still
+/// an unreaped zombie. `Exited { exit_code: None }` is the honest answer for the
+/// three cases in which no status exists — an adopted session, a master that
+/// went unreadable without the child exiting, and a child something else already
+/// reaped — and must never be read as success.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum Lifecycle {
     Exited { exit_code: Option<i32> },
     Signalled { signal: u8 },
@@ -145,10 +195,10 @@ pub(crate) struct ActivitySample {
 /// caller's job (and the only part that touches a lock).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Evidence {
-    /// A phase pinned explicitly by the user. Outranks everything.
+    /// A phase pinned explicitly by the user. Outranks everything. No surface
+    /// writes one yet (session metadata carries title/description/icon only),
+    /// so the branch is live but unfed — see RFC §9's remaining work.
     pub(crate) pin: Option<Phase>,
-    /// Set only by the narrow sources permitted by RFC §6 — never inferred.
-    pub(crate) waiting_input_signal: bool,
     pub(crate) shell: Option<ShellEvidence>,
     pub(crate) lifecycle: Option<Lifecycle>,
     /// `tcgetpgrp`-derived: is a foreground job distinct from the shell running?
@@ -348,20 +398,9 @@ impl StatusFsm {
             };
         }
 
-        // 3. Waiting-for-input is only ever SIGNALLED, never inferred.
-        if evidence.waiting_input_signal {
-            return Candidate {
-                phase: Phase::WaitingInput,
-                confidence: Confidence::Strong,
-                reasons: vec![Reason::ShellBlock],
-                conflict: false,
-                outcome: None,
-            };
-        }
-
         let moved = self.moved_recently(now) || self.output_recently(&evidence.activity, now);
 
-        // 4. Shell integration: the strongest routine evidence. It OUTRANKS raw
+        // 3. Shell integration: the strongest routine evidence. It OUTRANKS raw
         //    screen movement, so a background job printing at a prompt stays
         //    Idle rather than masquerading as the foreground task.
         if let Some(shell) = evidence.shell {
@@ -402,7 +441,7 @@ impl StatusFsm {
             };
         }
 
-        // 5. No shell integration. A foreground-job Boolean still separates
+        // 4. No shell integration. A foreground-job Boolean still separates
         //    "shell is waiting for me" from "something is running".
         match evidence.foreground_job {
             Some(true) if moved => Candidate {
@@ -426,7 +465,7 @@ impl StatusFsm {
                 conflict: false,
                 outcome: None,
             },
-            // 6. Nothing but the screen. Movement is weak evidence of work;
+            // 5. Nothing but the screen. Movement is weak evidence of work;
             //    silence tells us nothing at all, so say so.
             None if moved => Candidate {
                 phase: Phase::Running,
@@ -548,7 +587,6 @@ pub(crate) fn summary_text(status: &Status) -> Option<String> {
             _ => "running".to_string(),
         },
         (Phase::Quiet, _) => "quiet".to_string(),
-        (Phase::WaitingInput, _) => "waiting for input".to_string(),
         (Phase::Idle, Outcome::Failure { exit_code }) => format!("failed (exit {exit_code})"),
         (Phase::Idle, Outcome::Signal { signal }) => format!("killed (signal {signal})"),
         (Phase::Idle, Outcome::Success) => "done".to_string(),
@@ -571,8 +609,8 @@ pub(crate) fn summary_text(status: &Status) -> Option<String> {
 /// `dirty` is never claimed here: it means unsaved editor state, which a
 /// terminal has none of. A split tab folds these bits per LEAF
 /// ([`crate::tab_model::aggregate_presentations`]) rather than folding phases
-/// into one — a highest-attention phase would let a `WaitingInput` pane hide a
-/// `Running` sibling, and an exited pane hide both, which is exactly what
+/// into one — a highest-attention phase would let an `Exited` pane hide a
+/// `Running` sibling's failure, which is exactly what
 /// [`crate::tab_model::TabIndicators`] exists to prevent.
 #[must_use]
 pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicators {
@@ -583,11 +621,18 @@ pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicat
         // `quiet_after`. Mapping busy to Running alone would dark the dot in the
         // middle of a link step and read as "finished".
         busy: matches!(status.phase, Phase::Running | Phase::Quiet),
+        // A native leaf's own out-of-band mark. A terminal never raises it, and
+        // the status path must never write it — that separation is what lets the
+        // classifier's bit below be recomputed instead of latched.
+        attention: false,
         // The outcome outlives the phase that produced it (see [`Outcome`]), so a
         // command that failed keeps its tab marked while the shell honestly sits
         // back at `Idle` — the tab is how a user learns about a pane they are
-        // not looking at.
-        attention: status.last_outcome.is_failure() || status.phase == Phase::WaitingInput,
+        // not looking at. A FAILURE is the only thing that raises attention:
+        // there is no local evidence for "this pane is waiting for you" (see the
+        // module docs), and inventing one from silence would mark half the
+        // window.
+        status_attention: status.last_outcome.is_failure(),
     }
 }
 
@@ -598,6 +643,10 @@ pub(crate) fn status_indicators(status: &Status) -> crate::tab_model::TabIndicat
 pub(crate) struct StatusObserver {
     policy: StatusPolicy,
     min_interval: Duration,
+    /// Last applied `tab_status_badge`. Held here purely so a flip is
+    /// DETECTABLE — it gates chrome, not classification, so nothing else in
+    /// this module reads it.
+    badge: bool,
     sessions: std::collections::HashMap<u64, SessionSlot>,
 }
 
@@ -608,6 +657,13 @@ struct SessionSlot {
     /// Bumped only when the PUBLISHED status changes, so chrome can skip
     /// recomposition on an unchanged frame.
     revision: u64,
+    /// STICKY: how this session's PTY ended, once it has. Sticky because a
+    /// `--hold` pane outlives its shell and keeps being swept — without this the
+    /// next sweep would find `tcgetpgrp` failing, read that as "no foreground
+    /// job", and publish `Idle`, which chrome renders as "ready". A dead pane
+    /// claiming to be a shell at a prompt is the one lie this field exists to
+    /// prevent.
+    lifecycle: Option<Lifecycle>,
 }
 
 impl StatusObserver {
@@ -615,6 +671,9 @@ impl StatusObserver {
         Self {
             policy,
             min_interval,
+            // Matches `tab_status_badge`'s default, so the first reconfigure
+            // after startup does not report a phantom flip.
+            badge: true,
             sessions: std::collections::HashMap::new(),
         }
     }
@@ -628,19 +687,61 @@ impl StatusObserver {
     }
 
     /// Fold one observation in. Returns `true` when the published status changed.
+    ///
+    /// A recorded exit OVERRIDES the caller's `lifecycle` field: the PTY ending
+    /// is a fact about the session, and no later sample of a dead pane can
+    /// un-end it.
     pub(crate) fn observe(&mut self, session: u64, evidence: &Evidence, now: Instant) -> bool {
         let policy = self.policy;
         let slot = self.sessions.entry(session).or_insert_with(|| SessionSlot {
             fsm: StatusFsm::new(policy, now),
             next_due: now,
             revision: 1,
+            lifecycle: None,
         });
         slot.next_due = now + self.min_interval;
-        let changed = slot.fsm.observe(evidence, now);
+        let changed = match slot.lifecycle {
+            Some(lifecycle) => {
+                let mut evidence = *evidence;
+                evidence.lifecycle = Some(lifecycle);
+                slot.fsm.observe(&evidence, now)
+            }
+            None => slot.fsm.observe(evidence, now),
+        };
         if changed {
             slot.revision = slot.revision.saturating_add(1);
         }
         changed
+    }
+
+    /// Record that this session's PTY ended, and classify it at once.
+    ///
+    /// Called from the `Wake::Exit` edge rather than discovered on the sweep:
+    /// the exit status is only collectable in the window before teardown, and
+    /// polling the session store from the observation path would put a second
+    /// lock on the output path for a fact that arrives as an event anyway.
+    /// Returns whether the published status changed.
+    pub(crate) fn note_exit(
+        &mut self,
+        session: u64,
+        lifecycle: Lifecycle,
+        evidence: &Evidence,
+        now: Instant,
+    ) -> bool {
+        let policy = self.policy;
+        self.sessions
+            .entry(session)
+            .or_insert_with(|| SessionSlot {
+                fsm: StatusFsm::new(policy, now),
+                next_due: now,
+                revision: 1,
+                lifecycle: None,
+            })
+            .lifecycle = Some(lifecycle);
+        // Exit is `Confidence::Exact`, so it bypasses dwell and publishes on
+        // this very call — a session that has ended must not be reported as
+        // running for another three-quarters of a second.
+        self.observe(session, evidence, now)
     }
 
     /// Earliest instant at which SOME session owes a time-driven transition, for
@@ -648,6 +749,12 @@ impl StatusObserver {
     /// edge-driven: a build that finishes and then prints nothing leaves its tab
     /// showing busy forever, because the observation that would retire it never
     /// runs.
+    /// Remember the badge switch so a flip is detectable. Returns whether it
+    /// actually moved, which is the caller's signal to refold every tab.
+    pub(crate) fn set_badge(&mut self, badge: bool) -> bool {
+        std::mem::replace(&mut self.badge, badge) != badge
+    }
+
     pub(crate) fn next_wake(&self) -> Option<Instant> {
         self.sessions
             .values()
@@ -669,6 +776,45 @@ impl StatusObserver {
         self.sessions.remove(&session);
     }
 
+    /// Adopt a new policy at runtime. Returns whether anything actually moved,
+    /// so the caller can skip the chrome fan-out on a no-op edit.
+    ///
+    /// Every LIVE session is rewritten, not just the observer's own field:
+    /// [`StatusFsm`] holds its own copy of the policy (taken once at
+    /// construction), so updating the observer alone would apply a Settings edit
+    /// to sessions opened AFTER it and silently leave every existing tab on the
+    /// old numbers. `next_due` is clamped down for the same reason — a shortened
+    /// interval that waited out the OLD one would read as "the setting did
+    /// nothing".
+    pub(crate) fn reconfigure(
+        &mut self,
+        policy: StatusPolicy,
+        min_interval: Duration,
+        now: Instant,
+    ) -> bool {
+        let moved = self.policy.quiet_after != policy.quiet_after
+            || self.policy.dwell != policy.dwell
+            || self.min_interval != min_interval;
+        if !moved {
+            return false;
+        }
+        self.policy = policy;
+        self.min_interval = min_interval;
+        for slot in self.sessions.values_mut() {
+            slot.fsm.policy = policy;
+            slot.next_due = slot.next_due.min(now + min_interval);
+        }
+        true
+    }
+
+    /// Forget every session's classifier state. Used when `tab_status` is turned
+    /// OFF: the records describe a subsystem that is no longer running, and
+    /// keeping them would let a stale phase sit on a tab forever.
+    pub(crate) fn clear(&mut self) -> bool {
+        let had = !self.sessions.is_empty();
+        self.sessions.clear();
+        had
+    }
 }
 
 impl crate::App {
@@ -682,7 +828,14 @@ impl crate::App {
     /// becoming a classification flood. Contention is a SKIP, never a wait: the
     /// next sweep re-observes, and a missed sample only delays a transition by
     /// the observation interval.
+    ///
+    /// `tab_status = false` is a REAL off: the sweep returns before touching the
+    /// pool, so a user who does not want this subsystem pays no lock attempt, no
+    /// `tcgetpgrp`, and no map lookup for it.
     pub(crate) fn observe_session_statuses(&mut self, now: std::time::Instant) -> Vec<u64> {
+        if !self.config.tab_status_or_default() {
+            return Vec::new();
+        }
         let due: Vec<(u64, i32, i32)> = self
             .pool
             .iter()
@@ -718,8 +871,9 @@ impl crate::App {
             };
             let evidence = Evidence {
                 pin: None,
-                waiting_input_signal: false,
                 shell: shell_evidence(&guard),
+                // The exit fact arrives as an EVENT (`note_session_exit`) and is
+                // held sticky on the slot, so the sweep never has to discover it.
                 lifecycle: None,
                 foreground_job,
                 activity: ActivitySample {
@@ -736,6 +890,111 @@ impl crate::App {
         changed
     }
 
+    /// Record a session's PTY exit and publish `Exited` immediately.
+    ///
+    /// Called at the TOP of the `Wake::Exit` arm, before anything closes: the
+    /// child is still an unreaped zombie at that instant, which is the only
+    /// window in which its status can be collected (`aterm_pty` reaps on the
+    /// teardown thread and throws the status away). `None` from the collector is
+    /// carried through as `Outcome::None` — an adopted session, a master that
+    /// went unreadable without the child exiting, and an already-reaped child
+    /// are all genuinely unknown, and a fabricated success would be worse than a
+    /// blank.
+    ///
+    /// Whether anyone SEES this depends on `--hold`: without it the tab closes
+    /// and the slot is retired moments later. With it the pane survives its
+    /// shell, and this is what stops the next sweep — which finds `tcgetpgrp`
+    /// failing and reads that as "no foreground job" — from publishing `Idle`
+    /// and rendering a dead pane as "ready".
+    pub(crate) fn note_session_exit(&mut self, session: u64) {
+        if !self.config.tab_status_or_default() {
+            return;
+        }
+        let Some(pooled) = self.pool.get(session) else {
+            return;
+        };
+        // `collect_exit_status` REAPS the zombie, which frees the pid. Latch that
+        // on the session so teardown cannot later `killpg` a number the kernel
+        // has since reissued — under `--hold` the session outlives this by
+        // minutes.
+        let collected = aterm_pty::collect_exit_status(pooled.pid);
+        if collected.is_some() {
+            pooled
+                .child_reaped
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let lifecycle = match collected {
+            Some(aterm_pty::ChildExit::Code(code)) => Lifecycle::Exited {
+                exit_code: Some(code),
+            },
+            Some(aterm_pty::ChildExit::Signal(signal)) => Lifecycle::Signalled { signal },
+            None => Lifecycle::Exited { exit_code: None },
+        };
+        // The remaining evidence is irrelevant — a lifecycle exit short-circuits
+        // classification — so this deliberately takes NO terminal lock on the
+        // exit path, where the reader thread has just finished with it.
+        let evidence = Evidence {
+            pin: None,
+            shell: None,
+            lifecycle: Some(lifecycle),
+            foreground_job: None,
+            activity: ActivitySample {
+                alt_screen: false,
+                content_seq: 0,
+                last_output: None,
+            },
+        };
+        if self
+            .session_status
+            .note_exit(session, lifecycle, &evidence, std::time::Instant::now())
+        {
+            self.refresh_session_status_chrome(session);
+        }
+    }
+
+    /// Adopt a new `tab_status*` generation. Called from the one config
+    /// publication point, after `self.config` is live.
+    pub(crate) fn reconfigure_session_status(&mut self) {
+        let now = std::time::Instant::now();
+        // Turning the master switch OFF must actually retire what is on screen:
+        // the published records describe a classifier that is no longer running,
+        // and a tab left holding the last phase it saw would be a permanent lie.
+        let moved = if self.config.tab_status_or_default() {
+            self.session_status.reconfigure(
+                self.config.tab_status_policy(),
+                self.config.tab_status_observe_interval(),
+                now,
+            )
+        } else {
+            self.session_status.clear()
+        };
+        // The badge switch changes no POLICY — it only decides whether a record
+        // reaches chrome — so `reconfigure` cannot see it move. Track it here or
+        // toggling "show status on tabs" leaves every existing badge exactly as
+        // it was until some unrelated status transition happens to repaint it.
+        let badge = self.config.tab_status_badge_or_default();
+        let badge_moved = self.session_status.set_badge(badge);
+        if !moved && !badge_moved {
+            return;
+        }
+        // Every window, not just the focused one: the badge is how a background
+        // tab reports itself, so a policy change that only settled the front tab
+        // would leave the rest showing the old classification.
+        let windows: Vec<_> = self.windows.keys().copied().collect();
+        for wid in &windows {
+            let tabs: Vec<_> = self.windows[wid]
+                .tab_set
+                .tabs()
+                .iter()
+                .map(|tab| tab.id)
+                .collect();
+            for tab_id in tabs {
+                self.refresh_tab_status_indicators(*wid, tab_id);
+            }
+        }
+        self.refresh_tab_chrome_windows(windows);
+    }
+
     /// Short status text for this session's chrome, or `None` when there is
     /// nothing honest to say.
     pub(crate) fn session_status_text(&self, session: u64) -> Option<String> {
@@ -748,10 +1007,19 @@ impl crate::App {
 
     /// This session's contribution to its tab's indicator bits. A session with
     /// nothing published yet contributes nothing, rather than a guess.
+    ///
+    /// `tab_status_badge = false` contributes nothing either, WITHOUT stopping
+    /// classification: the record stays readable through the `status` verb and
+    /// the tooltip, and only the tab chrome goes quiet. (The master
+    /// `tab_status` switch is enforced one level up, where it saves the work
+    /// rather than discarding it.)
     pub(crate) fn session_status_indicators(
         &self,
         session: u64,
     ) -> crate::tab_model::TabIndicators {
+        if !self.config.tab_status_badge_or_default() {
+            return crate::tab_model::TabIndicators::default();
+        }
         self.session_status
             .status(session)
             .map_or_else(Default::default, status_indicators)
@@ -780,6 +1048,96 @@ impl crate::App {
     pub(crate) fn retire_session_status(&mut self, session: u64) {
         self.session_status.retire(session);
     }
+
+    /// Project one session's SUBJECT + STATUS onto the `status` verb's reply
+    /// body (RFC §8). The caller adds the `OK ` prefix and the newline.
+    ///
+    /// Runs on the event loop, so the Subject ladder uses the same discipline as
+    /// tab titles: the `ctx.meta` LEAF lock first — a pin returns without the
+    /// terminal lock ever being attempted — then `try_lock`, with contention
+    /// reported as `subject_source=unavailable` rather than silently answered
+    /// from a lower rung. A driver polling under load must be able to tell "the
+    /// title changed" from "I could not look".
+    pub(crate) fn session_status_record(&self, session: u64) -> Result<String, String> {
+        let Some(pooled) = self.pool.get(session) else {
+            return Err(format!("no such session {session}"));
+        };
+        let enabled = self.config.tab_status_or_default();
+        let pin = {
+            let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            meta.presentation_value("title")
+        };
+        let (subject, subject_source) = match pin {
+            Some(title) if !title.is_empty() => (Some(title), "pin"),
+            // Rungs 2 and 4 (RFC §4). Rung 3 (command-derived) has no producer
+            // and rung 5 (shell name) is not resolvable here, so an empty
+            // terminal answers `-`/`unavailable` instead of inventing one.
+            _ => {
+                let rungs = |t: &aterm_core::terminal::Terminal| {
+                    let osc = t.title().to_string();
+                    if osc.is_empty() {
+                        (
+                            t.current_working_directory()
+                                .map(crate::app_tabs::home_abbreviated),
+                            "cwd",
+                        )
+                    } else {
+                        (Some(osc), "osc")
+                    }
+                };
+                match pooled.term.try_lock() {
+                    Ok(t) => rungs(&t),
+                    Err(std::sync::TryLockError::Poisoned(p)) => rungs(&p.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) => (None, "unavailable"),
+                }
+            }
+        };
+        let opt = |value: Option<&str>| {
+            value.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode)
+        };
+        let Some(status) = self.session_status.status(session) else {
+            // Never classified. Distinct from `phase=unknown`, which IS a
+            // classification ("evidence was looked for and none was usable").
+            return Ok(format!(
+                "schema=1 sid={session} subject={} subject_source={subject_source} observed=false \
+                 phase=unknown since_ms=- outcome=none exit_code=- signal=- detail=- \
+                 confidence=unknown reasons=- conflict=false revision=0 enabled={enabled}",
+                opt(subject.as_deref())
+            ));
+        };
+        // `Status::since` is a raw `Instant`, so the reply carries an AGE rather
+        // than a timestamp — there is no epoch a reader could align it against.
+        let since_ms = std::time::Instant::now()
+            .saturating_duration_since(status.since)
+            .as_millis();
+        let (exit_code, signal) = match status.last_outcome {
+            Outcome::Failure { exit_code } => (exit_code.to_string(), "-".to_string()),
+            Outcome::Signal { signal } => ("-".to_string(), signal.to_string()),
+            Outcome::None | Outcome::Success => ("-".to_string(), "-".to_string()),
+        };
+        let reasons = if status.reasons.is_empty() {
+            "-".to_string()
+        } else {
+            status
+                .reasons
+                .iter()
+                .map(|reason| reason.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        Ok(format!(
+            "schema=1 sid={session} subject={} subject_source={subject_source} observed=true \
+             phase={} since_ms={since_ms} outcome={} exit_code={exit_code} signal={signal} \
+             detail={} confidence={} reasons={reasons} conflict={} revision={} enabled={enabled}",
+            opt(subject.as_deref()),
+            status.phase.as_str(),
+            status.last_outcome.as_str(),
+            opt(status.detail.as_deref()),
+            status.confidence.as_str(),
+            status.conflict,
+            self.session_status.revision(session),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -807,7 +1165,6 @@ mod tests {
     fn evidence(activity: ActivitySample) -> Evidence {
         Evidence {
             pin: None,
-            waiting_input_signal: false,
             shell: None,
             lifecycle: None,
             foreground_job: None,
@@ -841,9 +1198,13 @@ mod tests {
         assert!(fsm.status().since <= t1);
     }
 
+    /// The RFC's narrowest rule, restated as a property of the whole phase
+    /// vocabulary now that `waiting_input` has been removed for want of an
+    /// honest source: NOTHING the classifier can observe locally may ever raise
+    /// attention on a pane that has merely gone silent. A pager, a REPL, a
+    /// password prompt and a `sleep` are indistinguishable from here.
     #[test]
-    fn silence_never_becomes_waiting_input() {
-        // A quiet foreground job may be CPU-bound, sleeping, or in a pager.
+    fn silence_is_quiet_and_never_asks_for_the_user() {
         let t0 = Instant::now();
         let mut fsm = StatusFsm::new(policy(), t0);
         let mut ev = evidence(blank(7));
@@ -853,20 +1214,57 @@ mod tests {
 
         assert_eq!(fsm.status().phase, Phase::Quiet);
         assert_eq!(fsm.status().confidence, Confidence::Heuristic);
-        assert_ne!(fsm.status().phase, Phase::WaitingInput);
+        assert!(
+            !status_indicators(fsm.status()).wants_attention(),
+            "a silent pane must never claim to be waiting for a human"
+        );
     }
 
+    /// The complete phase vocabulary, pinned against its wire spellings. This is
+    /// the `status` verb's contract: a phase the classifier cannot produce has
+    /// no business being in the enum, and a consumer matching these tokens must
+    /// be able to trust the list is exhaustive.
     #[test]
-    fn waiting_input_requires_an_explicit_signal() {
+    fn every_phase_is_reachable_and_has_a_wire_spelling() {
+        let spellings = [
+            (Phase::Unknown, "unknown"),
+            (Phase::Starting, "starting"),
+            (Phase::Idle, "idle"),
+            (Phase::Running, "running"),
+            (Phase::Quiet, "quiet"),
+            (Phase::Exited, "exited"),
+        ];
+        for (phase, wire) in spellings {
+            assert_eq!(phase.as_str(), wire);
+        }
+
+        // Each one, produced by the classifier from real evidence — no phase in
+        // the vocabulary is scaffolding.
         let t0 = Instant::now();
         let mut fsm = StatusFsm::new(policy(), t0);
+        assert_eq!(fsm.status().phase, Phase::Starting, "seeded");
+
         let mut ev = evidence(blank(1));
-        ev.waiting_input_signal = true;
-
         settle(&mut fsm, &ev, t0);
+        assert_eq!(fsm.status().phase, Phase::Unknown, "no evidence");
 
-        assert_eq!(fsm.status().phase, Phase::WaitingInput);
-        assert_eq!(fsm.status().confidence, Confidence::Strong);
+        ev.foreground_job = Some(false);
+        let t1 = settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Idle);
+
+        ev.foreground_job = Some(true);
+        ev.activity.content_seq = 2;
+        let t2 = settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Running);
+
+        ev.activity.last_output = None;
+        let t3 = settle(&mut fsm, &ev, t2 + QUIET * 2);
+        assert_eq!(fsm.status().phase, Phase::Quiet);
+
+        ev.lifecycle = Some(Lifecycle::Exited { exit_code: Some(3) });
+        fsm.observe(&ev, t3 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Exited);
+        assert_eq!(fsm.status().last_outcome, Outcome::Failure { exit_code: 3 });
     }
 
     #[test]
@@ -1002,7 +1400,10 @@ mod tests {
 
         let cases = [
             (Phase::Running, Outcome::None, (true, false)),
-            (Phase::WaitingInput, Outcome::None, (false, true)),
+            // An exited session with NO collectable status raises nothing: an
+            // adopted shell, or a master that went unreadable, is unknown — not
+            // a failure worth marking a tab for.
+            (Phase::Exited, Outcome::None, (false, false)),
             // A finished failure keeps the tab marked while the shell honestly
             // sits back at a prompt.
             (
@@ -1032,7 +1433,11 @@ mod tests {
                 TabIndicators {
                     dirty: false,
                     busy,
-                    attention,
+                    // A terminal NEVER writes the out-of-band bit: that
+                    // separation is what lets the classifier's own bit be
+                    // recomputed rather than latched.
+                    attention: false,
+                    status_attention: attention,
                 },
                 "{phase:?} with {outcome:?}"
             );
@@ -1127,7 +1532,8 @@ mod tests {
             TabIndicators {
                 dirty: false,
                 busy: true,
-                attention: true,
+                attention: false,
+                status_attention: true,
             }
         );
     }
@@ -1168,11 +1574,406 @@ mod tests {
                 dirty: false,
                 busy: true,
                 attention: false,
+                status_attention: false,
             }
         );
         assert!(
             app.tab_strip_metadata(wid).first().expect("one tab").busy,
             "the bits both strip renderers read must carry it"
         );
+    }
+
+    /// THE ATTENTION LATCH. `refresh_tab_status_indicators` used to OR the
+    /// STORED bit back in to preserve the two out-of-band native writers — and
+    /// so ORed back its OWN previous contribution, marking a tab for the life of
+    /// the process after one failed command. On a tab mixing terminal and native
+    /// leaves the stale terminal bit could then never be cleared.
+    #[test]
+    fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        // A MIXED tab: the terminal leaf (session 0) plus a native sibling.
+        let native = app
+            .view_store
+            .insert_native(crate::tab_model::AppInstanceId::from_stored(7))
+            .expect("native view identity space");
+        let split = app
+            .windows
+            .get_mut(&wid)
+            .and_then(|window| window.tab_set.active_mut())
+            .is_some_and(|tab| tab.split_focused(crate::tab_model::SplitAxis::Vertical, native));
+        assert!(split, "mixed terminal + native tab");
+        let tab_id = app.windows[&wid].tab_set.active().expect("active tab").id;
+
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(
+            attention_of(&app, wid, tab_id),
+            "a failed command marks the tab"
+        );
+
+        // The native sibling raises its own attention OUT OF BAND (a failed
+        // document shutdown / an update announcement): not derivable from the
+        // runtime presentation, so the status path must never erase it — and
+        // note it does so while the classifier's own bit is ALSO set, which one
+        // shared bool could not have told apart.
+        app.windows
+            .get_mut(&wid)
+            .and_then(|window| window.tab_set.active_mut())
+            .expect("active tab")
+            .presentation
+            .indicators
+            .attention = true;
+
+        // A new unit of work clears the terminal's outcome.
+        ev.shell = Some(ShellEvidence::Executing);
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t0 + Duration::from_millis(10));
+        let t1 = settle_observer(&mut app.session_status, 0, &ev, t0 + Duration::from_millis(10));
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.last_outcome),
+            Some(Outcome::None),
+            "the classifier itself has let go of the failure"
+        );
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(
+            attention_of(&app, wid, tab_id),
+            "the NATIVE sibling's out-of-band mark survives"
+        );
+
+        // Now the native owner clears its own bit. With the latch gone, nothing
+        // is left claiming attention.
+        app.windows
+            .get_mut(&wid)
+            .and_then(|window| window.tab_set.active_mut())
+            .expect("active tab")
+            .presentation
+            .indicators
+            .attention = false;
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(
+            !attention_of(&app, wid, tab_id),
+            "the terminal's own bit must be clearable, not self-sustaining"
+        );
+
+        // And the same on a PURE-terminal tab, which the latch broke too.
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
+        let t2 = settle_observer(&mut app.session_status, 0, &ev, t1 + Duration::from_millis(10));
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(attention_of(&app, wid, tab_id));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        settle_observer(&mut app.session_status, 0, &ev, t2 + Duration::from_millis(10));
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(
+            !attention_of(&app, wid, tab_id),
+            "a passing command retires the previous failure's mark"
+        );
+    }
+
+    /// What the CHROME shows: the fold both renderers and the introspection
+    /// serializer read, not either owner's field alone.
+    fn attention_of(app: &crate::App, wid: crate::WindowId, tab_id: crate::tab_model::TabId) -> bool {
+        app.windows[&wid]
+            .tab_set
+            .get(tab_id)
+            .expect("tab")
+            .presentation
+            .indicators
+            .wants_attention()
+    }
+
+    /// [`settle`] for the observer, which owns the dwell clock through its slots.
+    fn settle_observer(
+        observer: &mut StatusObserver,
+        session: u64,
+        ev: &Evidence,
+        at: Instant,
+    ) -> Instant {
+        observer.observe(session, ev, at);
+        let later = at + DWELL;
+        observer.observe(session, ev, later);
+        later
+    }
+
+    /// A PTY exit publishes `Exited` immediately and STAYS there. Under `--hold`
+    /// the pane outlives its shell and keeps being swept; with the child gone
+    /// `tcgetpgrp` fails, which reads as "no foreground job" — and would have
+    /// published `Idle`, which chrome renders as "ready". A dead pane claiming
+    /// to be a shell at a prompt is the exact lie the sticky lifecycle prevents.
+    #[test]
+    fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
+        let mut app = crate::App::headless_for_test();
+        app.hold = true;
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        ev.activity.last_output = Some(t0);
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        assert_eq!(app.session_status.status(0).map(|s| s.phase), Some(Phase::Running));
+
+        // The stub session's pid is not a real child, so the collector honestly
+        // answers "unknown" rather than inventing a code.
+        app.note_session_exit(0);
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.phase),
+            Some(Phase::Exited),
+            "exit is Exact and bypasses dwell"
+        );
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.last_outcome),
+            Some(Outcome::None),
+            "an uncollectable status is unknown, NEVER success"
+        );
+
+        // The `--hold` sweep: the child is gone, so `tcgetpgrp` reports no
+        // foreground job. Without the sticky fact this republished `Idle`.
+        let mut after = evidence(blank(2));
+        after.foreground_job = Some(false);
+        let t1 = t0 + DWELL * 4;
+        settle_observer(&mut app.session_status, 0, &after, t1);
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.phase),
+            Some(Phase::Exited),
+            "a dead pane must not claim to be a shell at a prompt"
+        );
+        assert_eq!(
+            app.session_status_text(0).as_deref(),
+            Some("exited"),
+            "and chrome must not read 'ready'"
+        );
+    }
+
+    /// A collected code becomes the session's outcome, and a failure marks the
+    /// tab. This is what `Lifecycle` is FOR — the enum stopped being scaffolding
+    /// when the exit edge started feeding it.
+    #[test]
+    fn a_collected_exit_code_becomes_the_outcome() {
+        let t0 = Instant::now();
+        let cases = [
+            (
+                Lifecycle::Exited { exit_code: Some(0) },
+                Outcome::Success,
+                false,
+            ),
+            (
+                Lifecycle::Exited { exit_code: Some(7) },
+                Outcome::Failure { exit_code: 7 },
+                true,
+            ),
+            (Lifecycle::Exited { exit_code: None }, Outcome::None, false),
+            (
+                Lifecycle::Signalled { signal: 9 },
+                Outcome::Signal { signal: 9 },
+                true,
+            ),
+        ];
+        for (lifecycle, outcome, attention) in cases {
+            let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
+            let ev = evidence(blank(1));
+            assert!(observer.note_exit(1, lifecycle, &ev, t0), "{lifecycle:?}");
+            let status = observer.status(1).expect("published");
+            assert_eq!(status.phase, Phase::Exited, "{lifecycle:?}");
+            assert_eq!(status.last_outcome, outcome, "{lifecycle:?}");
+            assert_eq!(status.confidence, Confidence::Exact, "{lifecycle:?}");
+            assert_eq!(status.reasons, vec![Reason::LifecycleExit], "{lifecycle:?}");
+            assert_eq!(
+                status_indicators(status).status_attention,
+                attention,
+                "{lifecycle:?}"
+            );
+        }
+    }
+
+    /// A live policy edit must reach sessions that ALREADY exist. The FSM holds
+    /// its own copy of the policy, so updating only the observer would apply a
+    /// Settings change to future sessions and silently leave every open tab on
+    /// the old numbers.
+    #[test]
+    fn a_policy_edit_reaches_live_sessions_and_reopens_the_deadline() {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(250));
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        settle_observer(&mut observer, 1, &ev, t0);
+
+        // A candidate serving its dwell owes a wake at first_seen + dwell.
+        ev.foreground_job = Some(false);
+        let t1 = t0 + DWELL;
+        observer.observe(1, &ev, t1);
+        let before = observer.next_wake().expect("a pending candidate owes a wake");
+        assert_eq!(before, t1 + DWELL);
+
+        assert!(
+            observer.reconfigure(
+                StatusPolicy {
+                    quiet_after: QUIET,
+                    dwell: Duration::from_millis(10),
+                },
+                Duration::from_millis(10),
+                t1,
+            ),
+            "a real change reports that it moved"
+        );
+        let after = observer.next_wake().expect("still owed");
+        assert_eq!(
+            after,
+            t1 + Duration::from_millis(10),
+            "the LIVE session's dwell moved, not just the observer's field"
+        );
+        assert!(
+            observer.due(1, t1 + Duration::from_millis(10)),
+            "the shortened interval takes effect now, not after one old interval"
+        );
+        assert!(
+            !observer.reconfigure(
+                StatusPolicy {
+                    quiet_after: QUIET,
+                    dwell: Duration::from_millis(10),
+                },
+                Duration::from_millis(10),
+                t1,
+            ),
+            "a no-op edit costs no fan-out"
+        );
+    }
+
+    /// `tab_status = false` is a REAL off: no classification at all, and the
+    /// records already on screen are retired rather than frozen.
+    #[test]
+    fn turning_tab_status_off_stops_classifying_and_retires_the_records() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let tab_id = app.windows[&wid].tab_set.active().expect("active tab").id;
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        app.refresh_tab_status_indicators(wid, tab_id);
+        assert!(attention_of(&app, wid, tab_id));
+
+        app.config.tab_status = Some(false);
+        app.reconfigure_session_status();
+        assert!(
+            app.session_status.status(0).is_none(),
+            "a stale phase must not sit on a tab after the classifier stops"
+        );
+        assert!(
+            !attention_of(&app, wid, tab_id),
+            "and the chrome settles in the same pass"
+        );
+        assert!(
+            app.observe_session_statuses(t0 + DWELL * 4).is_empty(),
+            "the sweep returns before it touches the pool"
+        );
+        app.note_session_exit(0);
+        assert!(
+            app.session_status.status(0).is_none(),
+            "not even the exit edge classifies while the subsystem is off"
+        );
+    }
+
+    /// `tab_status_badge = false` keeps the record and only quiets the chrome —
+    /// the two switches are independent on purpose.
+    #[test]
+    fn the_badge_switch_quiets_chrome_without_stopping_classification() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let tab_id = app.windows[&wid].tab_set.active().expect("active tab").id;
+        app.config.tab_status_badge = Some(false);
+
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        app.refresh_tab_status_indicators(wid, tab_id);
+
+        assert!(!attention_of(&app, wid, tab_id), "no mark on the tab");
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.last_outcome),
+            Some(Outcome::Failure { exit_code: 1 }),
+            "the record is still classified and still readable"
+        );
+        assert_eq!(app.session_status_text(0).as_deref(), Some("failed (exit 1)"));
+    }
+
+    /// The `status` verb's reply, field by field. `schema=` leads so a consumer
+    /// can reject an unknown MAJOR from the first token.
+    #[test]
+    fn the_status_record_is_versioned_and_separates_unobserved_from_unknown() {
+        let mut app = crate::App::headless_for_test();
+
+        // Never classified. This is NOT `phase=unknown`, which means the
+        // classifier looked and found no usable evidence.
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.starts_with("schema=1 sid=0 "), "{record}");
+        assert!(record.contains(" observed=false "), "{record}");
+        assert!(record.contains(" phase=unknown "), "{record}");
+        assert!(record.contains(" revision=0 "), "{record}");
+        assert!(record.contains(" enabled=true"), "{record}");
+
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(3) });
+        settle_observer(&mut app.session_status, 0, &ev, t0);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.contains(" observed=true "), "{record}");
+        assert!(record.contains(" phase=idle "), "{record}");
+        assert!(record.contains(" outcome=failure exit_code=3 signal=- "), "{record}");
+        assert!(record.contains(" confidence=strong "), "{record}");
+        assert!(record.contains(" reasons=shell_block "), "{record}");
+        assert!(record.contains(" conflict=false "), "{record}");
+        assert!(
+            !record.contains('\n'),
+            "the record must stay ONE line: {record}"
+        );
+
+        // `tab_status = false` is disclosed rather than left to be inferred from
+        // a wall of `unknown`.
+        app.config.tab_status = Some(false);
+        let record = app.session_status_record(0).expect("live session");
+        assert!(record.ends_with(" enabled=false"), "{record}");
+
+        assert!(
+            app.session_status_record(9999).is_err(),
+            "an unknown session is an error, not a blank record"
+        );
+    }
+
+    /// The Subject ladder under contention. A pin is answered from the LEAF lock
+    /// and never touches the terminal; a contended terminal reports
+    /// `unavailable` rather than silently falling to a lower rung, which a
+    /// poller would otherwise read as a real title change.
+    #[test]
+    fn the_subject_ladder_never_blocks_and_never_fakes_a_lower_rung() {
+        let app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+
+        let held = term.lock().unwrap_or_else(|p| p.into_inner());
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" subject=- subject_source=unavailable "),
+            "a contended terminal is unavailable, not a lower rung: {record}"
+        );
+
+        // The pin outranks everything and is read from the metadata LEAF, so it
+        // answers with the terminal mutex still held by someone else.
+        app.pool
+            .get(0)
+            .expect("session 0")
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set("title", Some("deploy".to_string()))
+            .expect("a short title is within cap");
+        let record = app.session_status_record(0).expect("live session");
+        assert!(
+            record.contains(" subject=deploy subject_source=pin "),
+            "the pin must not need the terminal lock: {record}"
+        );
+        drop(held);
     }
 }

@@ -4927,6 +4927,11 @@ fn handle(
         // twin of `history`) — pure observer of the ctx ring, cross-session
         // correct like `cast`/`history`, no `is_cross` guard.
         "timeline" => control_session::cmd_timeline(ctx, rest),
+        // `status`: the TARGET session's Subject + classified Status record. A
+        // main-thread hop, unlike its `meta`/`timeline` neighbours: the
+        // classifier is `App` state owned by the event loop, not ctx state the
+        // control thread can read directly.
+        "status" => control_media::cmd_session_status(proxy, session, rest),
         // `sessions`/`grant`/`revoke`/`whoami` are handled SELF-SCOPED above.
         _ => "ERR unknown verb (try: help)\n".to_string(),
     };
@@ -7763,6 +7768,11 @@ mod tests {
                 // `escalated_op_fences_invoke_and_open_indirect_seams`).
                 "meta",
                 "timeline",
+                // `status` OBSERVES the local status classifier. It has no write
+                // sub-form at all — the only things that move a status are the
+                // session itself and `settings set tab_status …` — so unlike
+                // `meta` it takes no `escalated_op` entry.
+                "status",
                 "metrics",
                 // `tone` OBSERVES the mood classifier; the knob it reports is
                 // rewritten through `settings` (ConfigWrite), never here.
@@ -11668,10 +11678,15 @@ mod tests {
         let ctx = test_ctx();
         let read = edge_granted(Op::ReadScreen, &ctx);
         let write = edge_granted(Op::WriteInput, &ctx);
-        for v in ["edges", "grants", "family", "ready"] {
+        for v in ["edges", "grants", "family", "ready", "status"] {
             assert_eq!(required_op(v), Some(Op::ReadScreen), "{v} is read-side");
             assert!(gate_allows(read, v, &ctx), "read edge may {v}");
             assert!(!gate_allows(write, v, &ctx), "write edge may NOT {v}");
+        }
+        // `status` has no write sub-form at all, so nothing about its arguments
+        // may ever escalate it — unlike `meta`, whose `set`/`unset` do.
+        for rest in ["status", "@s-a status", "status set idle"] {
+            assert_eq!(escalated_op("status", rest), None, "{rest}");
         }
     }
 

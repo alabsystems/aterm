@@ -21,12 +21,14 @@
 //! created, an unwritable one is logged, never a panic.
 
 use crate::app_config::{
-    Config, DEFAULT_TITLE_SUMMARY_CONTEXT_LINES, DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS,
+    Config, DEFAULT_TAB_STATUS_DWELL_MS, DEFAULT_TAB_STATUS_QUIET_AFTER_MS,
+    DEFAULT_TITLE_SUMMARY_CONTEXT_LINES, DEFAULT_TITLE_SUMMARY_INTERVAL_SECONDS,
     DEFAULT_TITLE_SUMMARY_MODEL, DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS,
-    EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT, MAX_TITLE_SUMMARY_CONTEXT_LINES,
-    MAX_TITLE_SUMMARY_INTERVAL_SECONDS, MAX_TITLE_SUMMARY_TIMEOUT_SECONDS,
-    MIN_TITLE_SUMMARY_CONTEXT_LINES, MIN_TITLE_SUMMARY_INTERVAL_SECONDS,
-    MIN_TITLE_SUMMARY_TIMEOUT_SECONDS,
+    EXAMPLE_EXPLICIT_OLLAMA_TITLE_SUMMARY_ENDPOINT, MAX_TAB_STATUS_DWELL_MS,
+    MAX_TAB_STATUS_QUIET_AFTER_MS, MAX_TITLE_SUMMARY_CONTEXT_LINES,
+    MAX_TITLE_SUMMARY_INTERVAL_SECONDS, MAX_TITLE_SUMMARY_TIMEOUT_SECONDS, MIN_TAB_STATUS_DWELL_MS,
+    MIN_TAB_STATUS_QUIET_AFTER_MS, MIN_TITLE_SUMMARY_CONTEXT_LINES,
+    MIN_TITLE_SUMMARY_INTERVAL_SECONDS, MIN_TITLE_SUMMARY_TIMEOUT_SECONDS,
 };
 
 /// The TOML keys the settings model edits, paired with how each should be TYPED
@@ -282,6 +284,13 @@ pub(crate) const SMART_TITLE_KEYS: &[&str] = &[
     EDIT_TAB_TITLE_FORMAT,
     EDIT_WINDOW_TITLE_FORMAT,
 ];
+/// Tab Subject & Status (RFC §12). `EDIT_TAB_STATUS` is the master switch; the
+/// other three are inert while it is off, which [`crate::native_settings`]
+/// discloses rather than leaving the reader to infer.
+pub(crate) const EDIT_TAB_STATUS: &str = "tab_status";
+pub(crate) const EDIT_TAB_STATUS_QUIET_AFTER_MS: &str = "tab_status_quiet_after_ms";
+pub(crate) const EDIT_TAB_STATUS_DWELL_MS: &str = "tab_status_dwell_ms";
+pub(crate) const EDIT_TAB_STATUS_BADGE: &str = "tab_status_badge";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
 pub(crate) const EDIT_ALLOW_WINDOW_OPS: &str = "allow_window_ops";
@@ -425,6 +434,17 @@ pub(crate) const EDIT_FONT_WEIGHT_DARK_NUDGE: &str = "font_weight_dark_nudge";
 pub(crate) const EDIT_BACKGROUND_OPACITY: &str = "background_opacity";
 /// M5 macOS vibrancy material (`background_material`).
 pub(crate) const EDIT_BACKGROUND_MATERIAL: &str = "background_material";
+/// Terminal-tab backdrop image path (`wallpaper`). Unlike the other
+/// filesystem-backed asset keys this one stays STRUCTURED-writable: the
+/// Settings ▸ Wallpaper file picker writes it, and the versioned service
+/// re-resolves the image inline on that patch (see
+/// `VersionedConfigService::apply` — the wallpaper re-admit arm).
+pub(crate) const EDIT_WALLPAPER: &str = "wallpaper";
+/// Wallpaper legibility dim (`wallpaper_dim`, default 0.3, clamp 0..=1).
+pub(crate) const EDIT_WALLPAPER_DIM: &str = "wallpaper_dim";
+/// Backdrop-hue glyph tint while a wallpaper is attached
+/// (`wallpaper_text_tint`, default ON).
+pub(crate) const EDIT_WALLPAPER_TEXT_TINT: &str = "wallpaper_text_tint";
 /// B.9 per-session temporal recorder opt-in (`temporal_recording`, default OFF).
 pub(crate) const EDIT_TEMPORAL_RECORDING: &str = "temporal_recording";
 /// All-edge interior window padding in logical px (`window_padding`, default 12,
@@ -952,6 +972,13 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_WINDOW_COLORSPACE,
     EDIT_BACKGROUND_OPACITY,
     EDIT_BACKGROUND_MATERIAL,
+    // The wallpaper recolors the LIVE grid on save (the same truthful-preview
+    // rationale as the game fonts); the dim and glyph tint ride the same
+    // repaint. A workbench backdrop projection joins the preview-matrix
+    // campaign.
+    EDIT_WALLPAPER,
+    EDIT_WALLPAPER_DIM,
+    EDIT_WALLPAPER_TEXT_TINT,
     EDIT_RESTORE_SESSION,
     EDIT_WINDOW_PADDING,
     EDIT_WINDOW_PADDING_TOP,
@@ -969,6 +996,13 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_TITLE_SUMMARY_ALLOW_REMOTE,
     EDIT_TAB_TITLE_FORMAT,
     EDIT_WINDOW_TITLE_FORMAT,
+    // Tab-chrome state (a busy dot, an attention mark) has no workbench scene to
+    // project into: the preview draws a grid, not a tab strip, and the bits come
+    // from a live classifier rather than from any property of a rendered cell.
+    EDIT_TAB_STATUS,
+    EDIT_TAB_STATUS_QUIET_AFTER_MS,
+    EDIT_TAB_STATUS_DWELL_MS,
+    EDIT_TAB_STATUS_BADGE,
     EDIT_STREAM_FADE,
     EDIT_STREAM_FADE_MS,
 ];
@@ -1227,6 +1261,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_CURSOR_GLOW_SDR_BOOST
         | EDIT_FONT_WEIGHT_DARK_NUDGE
         | EDIT_BACKGROUND_OPACITY
+        | EDIT_WALLPAPER_DIM
         | EDIT_WINDOW_PADDING
         | EDIT_WINDOW_PADDING_TOP => EditKind::Float,
         EDIT_SCROLLBACK
@@ -1240,6 +1275,8 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TITLE_SUMMARY_TIMEOUT_SECONDS
         | EDIT_TITLE_SUMMARY_INTERVAL_SECONDS
         | EDIT_TITLE_SUMMARY_CONTEXT_LINES
+        | EDIT_TAB_STATUS_QUIET_AFTER_MS
+        | EDIT_TAB_STATUS_DWELL_MS
         | EDIT_SEARCH_HISTORY_LINES
         | EDIT_ADJUST_BASELINE
         | EDIT_ADJUST_UNDERLINE_POSITION
@@ -1266,6 +1303,8 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_DESCRIPTIVE_TITLES
         | EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT
         | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
+        | EDIT_TAB_STATUS
+        | EDIT_TAB_STATUS_BADGE
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION
         | EDIT_CURSOR_TRAIL_RING
@@ -1285,7 +1324,8 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         // match is consulted).
         | EDIT_PACKAGES_ENABLED
         | EDIT_PACKAGES_AUTO_UPDATE
-        | EDIT_PACKAGES_AUTO_INSTALL => EditKind::Bool,
+        | EDIT_PACKAGES_AUTO_INSTALL
+        | EDIT_WALLPAPER_TEXT_TINT => EditKind::Bool,
         EDIT_CURSOR_TRAIL_STYLE => EditKind::Enum {
             options: CURSOR_TRAIL_STYLES,
         },
@@ -1551,6 +1591,19 @@ fn integer_domain(key: &str) -> std::ops::RangeInclusive<i64> {
                 .expect("smart-title context floor fits i64")
                 ..=i64::try_from(MAX_TITLE_SUMMARY_CONTEXT_LINES)
                     .expect("smart-title context ceiling fits i64")
+        }
+        // Tab-status policy: same rule as the smart-title trio — the writer
+        // enforces the RESOLVER's domain, so a saved value is exactly the value
+        // the next reload classifies with.
+        EDIT_TAB_STATUS_QUIET_AFTER_MS => {
+            i64::try_from(MIN_TAB_STATUS_QUIET_AFTER_MS).expect("tab-status quiet floor fits i64")
+                ..=i64::try_from(MAX_TAB_STATUS_QUIET_AFTER_MS)
+                    .expect("tab-status quiet ceiling fits i64")
+        }
+        EDIT_TAB_STATUS_DWELL_MS => {
+            i64::try_from(MIN_TAB_STATUS_DWELL_MS).expect("tab-status dwell floor fits i64")
+                ..=i64::try_from(MAX_TAB_STATUS_DWELL_MS)
+                    .expect("tab-status dwell ceiling fits i64")
         }
         // `Option<u16>` fields: the window grid + tab-strip sizes.
         EDIT_COLUMNS | EDIT_LINES | EDIT_TAB_STRIP_ROWS => 0..=i64::from(u16::MAX),
@@ -2070,8 +2123,14 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_MINIMUM_CONTRAST
         | EDIT_BOLD_IS_BRIGHT
         | EDIT_FAINT_OPACITY => Section::Appearance,
-        // The indexed palette + M5 glass are colour-behaviour too.
-        EDIT_PALETTE | EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => Section::Appearance,
+        // The indexed palette + M5 glass are colour-behaviour too, and the
+        // wallpaper backdrop is the same surface (what the window ground shows).
+        EDIT_PALETTE
+        | EDIT_BACKGROUND_OPACITY
+        | EDIT_BACKGROUND_MATERIAL
+        | EDIT_WALLPAPER
+        | EDIT_WALLPAPER_DIM
+        | EDIT_WALLPAPER_TEXT_TINT => Section::Appearance,
         // Window sizing + chrome: the initial grid, the tab strip, the version
         // pill, the interior padding, and what a fresh launch reopens.
         EDIT_COLUMNS
@@ -2094,7 +2153,11 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_TITLE_SUMMARY_INCLUDE_OUTPUT
         | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
         | EDIT_TAB_TITLE_FORMAT
-        | EDIT_WINDOW_TITLE_FORMAT => Section::Window,
+        | EDIT_WINDOW_TITLE_FORMAT
+        | EDIT_TAB_STATUS
+        | EDIT_TAB_STATUS_QUIET_AFTER_MS
+        | EDIT_TAB_STATUS_DWELL_MS
+        | EDIT_TAB_STATUS_BADGE => Section::Window,
         // Keyboard & clipboard behavior — how what you type and copy is handled.
         EDIT_COPY_ON_SELECT
         | EDIT_CONFIRM_MULTILINE_PASTE
@@ -2215,6 +2278,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_FAINT_OPACITY => ("Text & Contrast", 2),
         // M5 window glass (opacity + vibrancy material).
         EDIT_BACKGROUND_OPACITY | EDIT_BACKGROUND_MATERIAL => ("Transparency", 3),
+        // The terminal-tab backdrop image, its legibility dim, and the
+        // backdrop-hue glyph tint.
+        EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
         EDIT_SERIOUS_MODE => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
@@ -2265,7 +2331,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // the dark-theme weight nudge is a rasterization knob like `font_weight`.
         EDIT_FONT_FEATURES => ("Shaping", 1),
         EDIT_FONT_WEIGHT_DARK_NUDGE => ("Rendering", 3),
-        // Window › sizing, Smart Titles, interior padding, chrome, then session.
+        // Window › sizing, Smart Titles, tab status, interior padding, chrome,
+        // then session. Tab Status sits next to Smart Titles because both answer
+        // "what does this tab say about its session".
         EDIT_COLUMNS | EDIT_LINES | EDIT_TAB_STRIP_ROWS => ("Size", 0),
         EDIT_DESCRIPTIVE_TITLES
         | EDIT_TITLE_SUMMARY_PROVIDER
@@ -2281,6 +2349,10 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
         | EDIT_TAB_TITLE_FORMAT
         | EDIT_WINDOW_TITLE_FORMAT => ("Smart Titles", 1),
+        EDIT_TAB_STATUS
+        | EDIT_TAB_STATUS_QUIET_AFTER_MS
+        | EDIT_TAB_STATUS_DWELL_MS
+        | EDIT_TAB_STATUS_BADGE => ("Tab Status", 2),
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => ("Window padding", 2),
         EDIT_SHOW_BUILD_BADGE | EDIT_ACTIVE_TAB_COLOR => ("Chrome", 3),
         EDIT_RESTORE_SESSION => ("Session", 4),
@@ -2588,6 +2660,18 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
             MAX_TITLE_SUMMARY_CONTEXT_LINES as f64,
             1.0,
         ),
+        // Tab-status policy, on the resolver's own domain. Step 50ms: finer than
+        // that is below the observation budget and could not be observed anyway.
+        EDIT_TAB_STATUS_QUIET_AFTER_MS => r(
+            MIN_TAB_STATUS_QUIET_AFTER_MS as f64,
+            MAX_TAB_STATUS_QUIET_AFTER_MS as f64,
+            50.0,
+        ),
+        EDIT_TAB_STATUS_DWELL_MS => r(
+            MIN_TAB_STATUS_DWELL_MS as f64,
+            MAX_TAB_STATUS_DWELL_MS as f64,
+            50.0,
+        ),
         // W5 typography/appearance sliders — the same bounds the config
         // resolvers clamp to, so the slider can't express an out-of-range value.
         EDIT_LINE_HEIGHT => r(0.8, 2.0, 0.05),
@@ -2612,6 +2696,8 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
         EDIT_FONT_WEIGHT_DARK_NUDGE => r(0.0, 300.0, 10.0),
         // M5 glass (resolver clamps 0..=1).
         EDIT_BACKGROUND_OPACITY => r(0.0, 1.0, 0.05),
+        // Wallpaper legibility dim (resolver clamps 0..=1).
+        EDIT_WALLPAPER_DIM => r(0.0, 1.0, 0.05),
         // Interior window padding, logical px (resolver clamps 0..=64; the top
         // override is additionally capped at the base pad AT THE RESOLVER, so
         // the slider spans the full static domain and the resolver owns the
@@ -2716,6 +2802,14 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "vibrancy",
             "blur",
             "material",
+        ],
+        EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => &[
+            "wallpaper",
+            "background",
+            "image",
+            "backdrop",
+            "picture",
+            "photo",
         ],
         EDIT_TEMPORAL_RECORDING => &["temporal", "recording", "replay", "history", "time"],
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => {
@@ -2943,6 +3037,35 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "tab",
             "window",
             "activity",
+        ],
+        EDIT_TAB_STATUS | EDIT_TAB_STATUS_BADGE => &[
+            "tab status",
+            "status",
+            "badge",
+            "indicator",
+            "busy",
+            "attention",
+            "running",
+            "failed",
+            "session",
+        ],
+        EDIT_TAB_STATUS_QUIET_AFTER_MS => &[
+            "tab status",
+            "quiet",
+            "stall",
+            "idle",
+            "timeout",
+            "milliseconds",
+            "busy",
+        ],
+        EDIT_TAB_STATUS_DWELL_MS => &[
+            "tab status",
+            "dwell",
+            "hysteresis",
+            "flap",
+            "debounce",
+            "settle",
+            "milliseconds",
         ],
         // Nested tables share one intent vocabulary per table.
         k if k.starts_with("net.") => &["network", "remote", "drive", "listener", "tls"],
@@ -3890,6 +4013,40 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: window_title_format,
         },
         EditField {
+            label: "Classify session status",
+            key: EDIT_TAB_STATUS,
+            kind: EditKind::Bool,
+            seed: Some(cfg.tab_status_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            label: "Quiet after (ms)",
+            key: EDIT_TAB_STATUS_QUIET_AFTER_MS,
+            kind: EditKind::Integer,
+            seed: cfg.tab_status_quiet_after_ms.map(|ms| ms.to_string()),
+            placeholder: cfg.tab_status_quiet_after_ms.map_or_else(
+                || format!("{DEFAULT_TAB_STATUS_QUIET_AFTER_MS} (default)"),
+                |ms| ms.to_string(),
+            ),
+        },
+        EditField {
+            label: "Status dwell (ms)",
+            key: EDIT_TAB_STATUS_DWELL_MS,
+            kind: EditKind::Integer,
+            seed: cfg.tab_status_dwell_ms.map(|ms| ms.to_string()),
+            placeholder: cfg.tab_status_dwell_ms.map_or_else(
+                || format!("{DEFAULT_TAB_STATUS_DWELL_MS} (default)"),
+                |ms| ms.to_string(),
+            ),
+        },
+        EditField {
+            label: "Show status on tabs",
+            key: EDIT_TAB_STATUS_BADGE,
+            kind: EditKind::Bool,
+            seed: Some(cfg.tab_status_badge_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
             label: "Searchable scrollback lines",
             key: EDIT_SEARCH_HISTORY_LINES,
             kind: EditKind::Integer,
@@ -4075,6 +4232,33 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 Some(v) => format!("{v}"),
                 None => "1.0 (solid)".to_string(),
             },
+        },
+        EditField {
+            label: "Wallpaper image",
+            key: EDIT_WALLPAPER,
+            kind: EditKind::Text,
+            seed: cfg.wallpaper.clone(),
+            placeholder: cfg
+                .wallpaper
+                .clone()
+                .unwrap_or_else(|| "none (flat background)".to_string()),
+        },
+        EditField {
+            label: "Wallpaper dim",
+            key: EDIT_WALLPAPER_DIM,
+            kind: EditKind::Float,
+            seed: cfg.wallpaper_dim.map(|v| format!("{v}")),
+            placeholder: match cfg.wallpaper_dim {
+                Some(v) => format!("{v}"),
+                None => "0.3 (default)".to_string(),
+            },
+        },
+        EditField {
+            label: "Wallpaper text tint",
+            key: EDIT_WALLPAPER_TEXT_TINT,
+            kind: EditKind::Bool,
+            seed: Some(cfg.wallpaper_text_tint_or_default().to_string()),
+            placeholder: String::new(),
         },
         EditField {
             label: "Background material",

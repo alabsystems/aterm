@@ -519,6 +519,91 @@ pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     ev.logical_key.clone()
 }
 
+/// Classify one keystroke as a SINGLE-LINE TEXT-FIELD edit, or `None` when it is
+/// not one.
+///
+/// aterm has exactly one in-grid text-field keymap and this is it: the find bar's
+/// query and the tab strip's inline rename share it, so the standard
+/// macOS/readline motions — `^A`/`Home`/`⌘←` to the start, `^E`/`End`/`⌘→` to the
+/// end, `^B`/`^F` and `←`/`→` by character, `⌥←`/`⌥→` by word, `^K`/`^U`/`^W`/
+/// `⌥⌫`/`⌘⌫` to kill, `^D`/`⌦` forward-delete — cannot mean two different things
+/// in two aterm fields. Every one of them repeats on a held key through this
+/// classification.
+///
+/// Two deliberate exclusions: `↑`/`↓` are NOT claimed (a one-line field has no
+/// vertical motion, and the find bar spends them on match navigation), and plain
+/// `⌥`+letter is not bound — macOS composes characters there (é, ß, ƒ), so word
+/// motion lives on `⌥`+ARROW only.
+///
+/// The trailing text arm accepts only PRINTABLE text: `ev.text` carries `"\u{1b}"`
+/// for ⎋, `"\r"` for ⏎ and `"\t"` for ⇥ (winit's `NamedKey::to_text`), and those
+/// named keys are commands to the field's owner, never content — inserting their
+/// payloads would type an escape into the text instead of closing the field.
+fn field_edit_action(mods: ModifiersState, ev: &KeyEvent) -> Option<crate::app_search::SearchEdit> {
+    use crate::app_search::SearchEdit;
+    let base = base_logical_key(ev);
+    let base_is = |want: &str| matches!(&base, Key::Character(c) if c.eq_ignore_ascii_case(want));
+    let ctrl = mods.control_key() && !mods.super_key() && !mods.alt_key();
+    // macOS text-field convention: ⌥ = by word, ⌘ = to the end of the line.
+    let by_word = mods.alt_key() && !mods.control_key() && !mods.super_key();
+    let to_edge = mods.super_key() && !mods.control_key() && !mods.alt_key();
+    match &ev.logical_key {
+        Key::Named(NamedKey::ArrowLeft) if to_edge => Some(SearchEdit::MoveStart),
+        Key::Named(NamedKey::ArrowRight) if to_edge => Some(SearchEdit::MoveEnd),
+        Key::Named(NamedKey::ArrowLeft) if by_word => Some(SearchEdit::MoveWordLeft),
+        Key::Named(NamedKey::ArrowRight) if by_word => Some(SearchEdit::MoveWordRight),
+        Key::Named(NamedKey::ArrowLeft) => Some(SearchEdit::MoveCharLeft),
+        Key::Named(NamedKey::ArrowRight) => Some(SearchEdit::MoveCharRight),
+        Key::Named(NamedKey::Home) => Some(SearchEdit::MoveStart),
+        Key::Named(NamedKey::End) => Some(SearchEdit::MoveEnd),
+        Key::Named(NamedKey::Backspace) if to_edge => Some(SearchEdit::KillToStart),
+        Key::Named(NamedKey::Backspace) if by_word => Some(SearchEdit::DeleteWordBack),
+        Key::Named(NamedKey::Backspace) => Some(SearchEdit::DeleteBack),
+        Key::Named(NamedKey::Delete) if by_word => Some(SearchEdit::DeleteWordForward),
+        Key::Named(NamedKey::Delete) => Some(SearchEdit::DeleteForward),
+        _ if ctrl && base_is("a") => Some(SearchEdit::MoveStart),
+        _ if ctrl && base_is("e") => Some(SearchEdit::MoveEnd),
+        _ if ctrl && base_is("b") => Some(SearchEdit::MoveCharLeft),
+        _ if ctrl && base_is("f") => Some(SearchEdit::MoveCharRight),
+        _ if ctrl && base_is("d") => Some(SearchEdit::DeleteForward),
+        _ if ctrl && base_is("h") => Some(SearchEdit::DeleteBack),
+        _ if ctrl && base_is("k") => Some(SearchEdit::KillToEnd),
+        _ if ctrl && base_is("u") => Some(SearchEdit::KillToStart),
+        _ if ctrl && base_is("w") => Some(SearchEdit::DeleteWordBack),
+        _ if !mods.super_key() && !mods.control_key() => ev
+            .text
+            .as_ref()
+            .map(|text| -> String { text.chars().filter(|c| !c.is_control()).collect() })
+            .filter(|text| !text.is_empty())
+            .map(SearchEdit::Insert),
+        _ => None,
+    }
+}
+
+/// Is this a bare MODIFIER press? A focused text field must neither consume one as
+/// content nor treat it as leaving the field — `⇧` before a capital letter is the
+/// most ordinary keystroke in a rename there is.
+fn is_bare_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::Hyper
+                | NamedKey::Symbol
+                | NamedKey::AltGraph
+                | NamedKey::CapsLock
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+                | NamedKey::Fn
+                | NamedKey::FnLock
+        )
+    )
+}
+
 /// The default (hardcoded) scrollback chord, if any: Shift + PageUp/PageDown/Home/End
 /// → a [`ScrollIntent`], else `None` so the key falls through to the PTY encoder.
 /// Shift must be the SOLE chord modifier (Ctrl/Alt/Super excluded; Caps/Num Lock are
@@ -1230,8 +1315,15 @@ impl App {
             // otherwise) — which answered the keystroke by waking the animal
             // that already lives on the cursor. It now summons the standalone
             // CAMEO ([`aterm_effects::kitty_cameo`]): a free-floating sprite
-            // anchored where the word was typed, drawn bigger than the escort
-            // so it reads as the toy, and it NEVER wakes the companion.
+            // anchored where the word was typed, and it NEVER wakes the
+            // companion.
+            //
+            // OWNER REGRESSION RULING, 2026-08-10: the cameo is TEXT-SIZED —
+            // 0.19.0 drew it at ~4 cells ("AHH! the kitty that appears when I
+            // type 'Kitty' is huge! go back to the old text kitty!"), and it
+            // now wears the ambient word-cat's own head law ("like how it
+            // appears in the regular text"). What distinguishes it from the
+            // escort is its anchor and identity, not its bulk.
             //
             // The ledger tier above is unchanged and still runs first: a cameo
             // is a VIEW, so it writes no collectible row of its own, and the
@@ -1351,6 +1443,46 @@ impl App {
             && ws.cursor_cat.on_curse(now, 1)
             && let Some(w) = ws.os_window.as_ref()
         {
+            w.request_redraw();
+        }
+    }
+
+    /// Summon the typed-word DOG cameo (detector: [`crate::kitty_summon`],
+    /// canine arm — fires only past the typed-a-lot gate).
+    ///
+    /// The dog is a VISITOR, not a companion: no identity, no ledger row, no
+    /// Kitty Log interaction of any kind. Each summon mints one fresh ident
+    /// from the shared App-wide summon sequence purely as the SEED for the
+    /// cameo's breed/coat roll, so back-to-back summons parade different
+    /// breeds. Gated by the same sparkle master the kitty summon respects,
+    /// plus the canine family's own enable bit — family off ⇒ fully inert.
+    ///
+    /// scope-waiver: "App-wide summon sequence" names a monotonic COUNTER read
+    /// for a seed, not an enforcer with an ownership chain. No instance count
+    /// can falsify it — one process, one sequence, and a second one would change
+    /// which breed appears, nothing else — so OB-17's declaration channel has
+    /// nothing to pin.
+    fn summon_typed_dog(&mut self, wid: WindowId, session: u64, now: std::time::Instant) {
+        let Some(rs) = self.sparkle.as_ref() else {
+            return;
+        };
+        if !rs.cfg.canine {
+            return;
+        }
+        let seed = next_kitty_summon_ident(
+            &mut self.kitty_summon_seq,
+            crate::kitty_summon::DOG_SUMMON_IDENT_TAG,
+        );
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        ws.dog_cameo.on_summon(now, seed);
+        // The visit is scoped to the session the keystroke landed in — the
+        // renderers only present it while that session fronts their pane.
+        ws.dog_cameo_session = Some(session);
+        // The summon must present even mid-idle (a no-echo prompt draws no
+        // frames on its own) — same first-frame law as the kitty cameo.
+        if let Some(w) = ws.os_window.as_ref() {
             w.request_redraw();
         }
     }
@@ -1538,6 +1670,24 @@ impl App {
                 }
                 return InputOutcome::Ok;
             }
+        }
+        // INLINE RENAME FIELD: the engine-neutral twin of `on_key_rename_mode`.
+        // Controller `key`/`text`/`paste` bytes arrive HERE (they never pass
+        // through `on_key`), so without this seam the in-grid editor would be
+        // undrivable — and therefore un-endable — from a headless instance. The
+        // consumed PRESS is recorded in the same set the overlay gate uses, so its
+        // RELEASE is swallowed by the pre-gate check at the top of this function
+        // and a Kitty `REPORT_EVENT_TYPES` app is never left with an orphan.
+        if target_session.is_none() && self.rename_input_event(wid, &ev) {
+            if let InputEvent::Key {
+                key, event_type, ..
+            } = &ev
+                && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
+                && let Some(ws) = self.windows.get_mut(&wid)
+            {
+                ws.overlay_consumed_keys.insert(key.clone());
+            }
+            return InputOutcome::Ok;
         }
         // NATIVE TAB INPUT BOUNDARY: the active first-party app owns text,
         // keyboard, paste, pointer, and local scrolling. Route both Human and
@@ -2359,6 +2509,12 @@ impl App {
                     // identity for a typed word.
                     if summoned.feline || summoned.profanity {
                         self.react_typed_word(wid, input_now, summoned);
+                    }
+                    // THE DOG (canine arm): fires only once the detector's
+                    // typed-a-lot gate has opened — see `kitty_summon`'s
+                    // `DOG_SUMMON_KEYS`.
+                    if summoned.canine {
+                        self.summon_typed_dog(wid, session, input_now);
                     }
                 }
                 outcome
@@ -3402,6 +3558,18 @@ impl App {
                 self.apply_search_repeat_action(wid, action);
                 true
             }
+            LocalRepeatAction::Rename { session, edit } => {
+                // The owner is the SESSION being renamed, checked against the live
+                // in-grid edit: a repeat that outlives its editor (commit, cancel,
+                // a superseding rename on another tab) is dropped, not replayed
+                // into whatever field exists now.
+                if self.inline_rename_edit(wid).map(|live| live.session) != Some(session) {
+                    return false;
+                }
+                self.note_update_handoff_activity();
+                self.reset_blink(wid);
+                self.rename_field_edit(wid, edit)
+            }
             LocalRepeatAction::Vi { session, action } => {
                 let Some(term) = self
                     .front_terminal(wid)
@@ -4150,6 +4318,22 @@ impl App {
             );
             return;
         }
+        // INLINE RENAME FIELD (the in-grid strip's own editor): a focused text
+        // field owns the keyboard, so it is asked before the native view, before
+        // the rebindable chords, and before any `[key_sequences]` rule can write
+        // raw bytes out from under it. Unlike the overlay gate above it is NOT a
+        // swallow-all: a command it does not own settles the edit and falls
+        // through, which is the same rule the menu divert follows.
+        let rename_repeat = self.rename_repeat_action(wid, mods, &ev);
+        if self.on_key_rename_mode(wid, mods, &ev) {
+            self.note_press_disposition(
+                wid,
+                &ev,
+                rename_repeat
+                    .map(|(session, edit)| crate::LocalRepeatAction::Rename { session, edit }),
+            );
+            return;
+        }
         // NATIVE KEYBOARD OWNERSHIP: once a native view is frontmost, classify
         // host commands and lower the key into the engine-neutral input seam
         // BEFORE any terminal vi/find/raw-sequence/PTY shortcut path can observe
@@ -4712,7 +4896,6 @@ impl App {
         ev: &KeyEvent,
     ) -> Option<crate::SearchRepeatAction> {
         use crate::SearchRepeatAction as Action;
-        use crate::app_search::SearchEdit;
 
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
             return None;
@@ -4723,48 +4906,36 @@ impl App {
         let ctrl = mods.control_key() && !mods.super_key() && !mods.alt_key();
         let bare_cmd =
             mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
-        // macOS text-field convention: ⌥ = by word, ⌘ = to the end of the line.
-        let by_word = mods.alt_key() && !mods.control_key() && !mods.super_key();
-        let to_edge = mods.super_key() && !mods.control_key() && !mods.alt_key();
-        let edit = |e: SearchEdit| Some(Action::Edit(e));
+        // MATCH NAVIGATION gets first claim, then the generic field keymap. The two
+        // sets are disjoint (↑/↓ and ^S/^R/⌘S/⌘R are not field motions), so this
+        // ordering is the same dispatch the single flat match had.
         match &ev.logical_key {
-            Key::Named(NamedKey::ArrowDown) => Some(Action::Step(true)),
-            Key::Named(NamedKey::ArrowUp) => Some(Action::Step(false)),
-            Key::Named(NamedKey::ArrowLeft) if to_edge => edit(SearchEdit::MoveStart),
-            Key::Named(NamedKey::ArrowRight) if to_edge => edit(SearchEdit::MoveEnd),
-            Key::Named(NamedKey::ArrowLeft) if by_word => edit(SearchEdit::MoveWordLeft),
-            Key::Named(NamedKey::ArrowRight) if by_word => edit(SearchEdit::MoveWordRight),
-            Key::Named(NamedKey::ArrowLeft) => edit(SearchEdit::MoveCharLeft),
-            Key::Named(NamedKey::ArrowRight) => edit(SearchEdit::MoveCharRight),
-            Key::Named(NamedKey::Home) => edit(SearchEdit::MoveStart),
-            Key::Named(NamedKey::End) => edit(SearchEdit::MoveEnd),
-            Key::Named(NamedKey::Backspace) if to_edge => edit(SearchEdit::KillToStart),
-            Key::Named(NamedKey::Backspace) if by_word => edit(SearchEdit::DeleteWordBack),
-            Key::Named(NamedKey::Backspace) => edit(SearchEdit::DeleteBack),
-            Key::Named(NamedKey::Delete) if by_word => edit(SearchEdit::DeleteWordForward),
-            Key::Named(NamedKey::Delete) => edit(SearchEdit::DeleteForward),
-            // Match navigation keeps first claim on ^S/^R (emacs isearch-repeat).
-            _ if ctrl && base_is("s") => Some(Action::Repeat(true)),
-            _ if ctrl && base_is("r") => Some(Action::Repeat(false)),
-            _ if bare_cmd && base_is("s") => Some(Action::Repeat(true)),
-            _ if bare_cmd && base_is("r") => Some(Action::Repeat(false)),
-            _ if ctrl && base_is("a") => edit(SearchEdit::MoveStart),
-            _ if ctrl && base_is("e") => edit(SearchEdit::MoveEnd),
-            _ if ctrl && base_is("b") => edit(SearchEdit::MoveCharLeft),
-            _ if ctrl && base_is("f") => edit(SearchEdit::MoveCharRight),
-            _ if ctrl && base_is("d") => edit(SearchEdit::DeleteForward),
-            _ if ctrl && base_is("h") => edit(SearchEdit::DeleteBack),
-            _ if ctrl && base_is("k") => edit(SearchEdit::KillToEnd),
-            _ if ctrl && base_is("u") => edit(SearchEdit::KillToStart),
-            _ if ctrl && base_is("w") => edit(SearchEdit::DeleteWordBack),
-            _ if !mods.super_key() && !mods.control_key() => ev
-                .text
-                .as_ref()
-                .map(|text| -> String { text.chars().filter(|c| !c.is_control()).collect() })
-                .filter(|text| !text.is_empty())
-                .map(|text| Action::Edit(SearchEdit::Insert(text))),
-            _ => None,
+            Key::Named(NamedKey::ArrowDown) => return Some(Action::Step(true)),
+            Key::Named(NamedKey::ArrowUp) => return Some(Action::Step(false)),
+            // emacs isearch-repeat.
+            _ if (ctrl || bare_cmd) && base_is("s") => return Some(Action::Repeat(true)),
+            _ if (ctrl || bare_cmd) && base_is("r") => return Some(Action::Repeat(false)),
+            _ => {}
         }
+        field_edit_action(mods, ev).map(Action::Edit)
+    }
+
+    /// Classify a keystroke aimed at the IN-GRID rename field into the repeatable
+    /// [`crate::app_search::SearchEdit`] it drives, paired with the session it
+    /// belongs to. `None` when no in-grid edit is live on `wid` or the key is not
+    /// a field edit.
+    ///
+    /// The session travels with the action for the same reason it does on the find
+    /// and vi paths: a held ⌫ must repeat against the target captured at PRESS
+    /// time, never against whatever the window is showing three repeats later.
+    fn rename_repeat_action(
+        &self,
+        wid: WindowId,
+        mods: ModifiersState,
+        ev: &KeyEvent,
+    ) -> Option<(u64, crate::app_search::SearchEdit)> {
+        let session = self.inline_rename_edit(wid)?.session;
+        Some((session, field_edit_action(mods, ev)?))
     }
 
     /// Open a directed terminal search or repeat an already-open one, then bind the
@@ -4805,6 +4976,153 @@ impl App {
             crate::SearchRepeatAction::Step(forward) => self.search_step_in(wid, forward),
             crate::SearchRepeatAction::Repeat(forward) => self.search_repeat_in(wid, forward),
             crate::SearchRepeatAction::Edit(edit) => self.search_edit_in(wid, edit),
+        }
+    }
+
+    /// IN-GRID RENAME dispatch of [`on_key`]: while the tab strip's own inline
+    /// pin editor owns `wid`, a keystroke drives the FIELD instead of the terminal.
+    ///
+    /// Shaped like [`Self::divert_menu_action_around_rename`], not like a modal
+    /// swallow-all, because those are the same policy reached by two routes and
+    /// they must not disagree:
+    ///
+    /// * field edits, `⌘V`, ⎋ and ⏎/⇥ belong to the editor — handled, `true`;
+    /// * a bare modifier is neither content nor an exit — swallowed, `true`;
+    /// * EVERYTHING ELSE settles the edit (keeping what was typed, the
+    ///   "clicking away" rule) and returns `false`, so the command it was
+    ///   actually aimed at runs against a settled world instead of from under a
+    ///   focused field.
+    ///
+    /// Placed EARLY in `on_key` — above the rebindable `[keybindings]` and
+    /// `[key_sequences]` block — so ⎋ can never reach the PTY and a configured
+    /// raw-byte rule can never fire from under the field. That is the modal-focus
+    /// leak the find bar, which sits much lower, has to patch case by case.
+    ///
+    /// A NATIVE (macOS) edit is not touched here: AppKit's field editor is the
+    /// first responder and already owns those keys.
+    fn on_key_rename_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
+        let Some(session) = self.inline_rename_edit(wid).map(|edit| edit.session) else {
+            return false;
+        };
+        // A live IME composition owns its keystrokes: the composed result arrives
+        // once, as `Ime::Commit` (which `on_ime_commit` routes into the field).
+        // Inserting the composing keys here as well would type every dead-key
+        // press AND its result.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| !ws.preedit.is_empty())
+        {
+            return true;
+        }
+        if is_bare_modifier_key(&ev.logical_key) {
+            return true;
+        }
+        if let Some((_, edit)) = self.rename_repeat_action(wid, mods, ev) {
+            self.rename_field_edit(wid, edit);
+            return true;
+        }
+        let base = base_logical_key(ev);
+        let bare_cmd =
+            mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
+        match &ev.logical_key {
+            // ⎋ is the ONE cancel, exactly as in the macOS field editor.
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_session_rename(wid, session);
+                return true;
+            }
+            // ⏎ and ⇥ commit. Empty CLEARS the pin — the whole point of the
+            // placeholder showing what the ladder falls back to.
+            Key::Named(NamedKey::Enter | NamedKey::Tab) => {
+                let text = self
+                    .inline_rename_edit(wid)
+                    .map(|edit| edit.text.clone())
+                    .unwrap_or_default();
+                self.commit_session_rename(wid, session, &text);
+                return true;
+            }
+            // ⌘V pastes into the FIELD, never the PTY behind it.
+            _ if bare_cmd && matches!(&base, Key::Character(c) if c.eq_ignore_ascii_case("v")) => {
+                self.rename_paste_in(wid);
+                return true;
+            }
+            _ => {}
+        }
+        // Anything else is the user leaving the field to do something else.
+        self.settle_rename_edit(wid);
+        false
+    }
+
+    /// The ENGINE-NEUTRAL twin of [`Self::on_key_rename_mode`] — reached by
+    /// controller `key`/`text`/`paste` verbs, mirroring `palette_input_event`.
+    /// Returns whether the field consumed the event (the caller then swallows it
+    /// from the PTY).
+    ///
+    /// This is what makes the in-grid editor headlessly drivable, and it is a
+    /// PREREQUISITE for holding edit state under `--headless` at all: state a
+    /// running instance cannot end is the phantom this pair exists to avoid.
+    pub(crate) fn rename_input_event(
+        &mut self,
+        wid: WindowId,
+        ev: &crate::input::InputEvent,
+    ) -> bool {
+        use crate::app_search::SearchEdit;
+        use crate::input::InputEvent;
+        use aterm_types::keyboard::{Key as TKey, KeyEventType, NamedKey as TNamed};
+        let Some(session) = self.inline_rename_edit(wid).map(|edit| edit.session) else {
+            return false;
+        };
+        match ev {
+            InputEvent::Key {
+                key, event_type, ..
+            } => {
+                // A RELEASE is not an edit. Its PRESS was recorded by the caller's
+                // consumed-press set, which swallows it before this gate is reached.
+                if matches!(event_type, KeyEventType::Release) {
+                    return false;
+                }
+                match key {
+                    TKey::Named(TNamed::Escape) => self.cancel_session_rename(wid, session),
+                    TKey::Named(TNamed::Enter | TNamed::NumpadEnter | TNamed::Tab) => {
+                        let text = self
+                            .inline_rename_edit(wid)
+                            .map(|edit| edit.text.clone())
+                            .unwrap_or_default();
+                        self.commit_session_rename(wid, session, &text);
+                    }
+                    TKey::Named(TNamed::Backspace) => {
+                        self.rename_field_edit(wid, SearchEdit::DeleteBack);
+                    }
+                    TKey::Named(TNamed::Delete) => {
+                        self.rename_field_edit(wid, SearchEdit::DeleteForward);
+                    }
+                    TKey::Named(TNamed::ArrowLeft) => {
+                        self.rename_field_edit(wid, SearchEdit::MoveCharLeft);
+                    }
+                    TKey::Named(TNamed::ArrowRight) => {
+                        self.rename_field_edit(wid, SearchEdit::MoveCharRight);
+                    }
+                    TKey::Named(TNamed::Home) => {
+                        self.rename_field_edit(wid, SearchEdit::MoveStart);
+                    }
+                    TKey::Named(TNamed::End) => {
+                        self.rename_field_edit(wid, SearchEdit::MoveEnd);
+                    }
+                    TKey::Named(TNamed::Space) => {
+                        self.rename_field_edit(wid, SearchEdit::Insert(" ".to_string()));
+                    }
+                    TKey::Character(c) if !c.is_control() => {
+                        self.rename_field_edit(wid, SearchEdit::Insert(c.to_string()));
+                    }
+                    _ => {}
+                }
+                true
+            }
+            InputEvent::Text(text) | InputEvent::Paste(text) => {
+                self.rename_field_edit(wid, SearchEdit::Insert(text.clone()));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -5846,6 +6164,14 @@ impl App {
         if text.is_empty() {
             return;
         }
+        // The INLINE RENAME field claims composed text for the same reason, and
+        // ahead of find: it is the more deeply focused of the two (its key gate
+        // sits above find's in `on_key`). Without this, CJK input and every macOS
+        // ⌥-dead-key would type into the shell behind an open rename field.
+        if self.inline_rename_edit(wid).is_some() {
+            self.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(text));
+            return;
+        }
         // FIND MODE owns composed text too. On macOS the ⌥-dead-key sequences the find
         // keymap deliberately leaves unbound (⌥e e → é, ⌥s → ß) arrive HERE as an IME
         // commit, not as `KeyEvent::text` — without this they would land in the SHELL
@@ -5977,21 +6303,22 @@ impl App {
             _ => None,
         };
         if let Some(edit) = editing {
+            // The IN-GRID field has no selection model, so Copy/Select All are
+            // inert there — but they are still CLAIMED, because the alternative is
+            // the modal-focus leak this whole function exists to close: ⌘V landing
+            // in the PTY behind a focused field.
+            if self.inline_rename_edit(window).is_some() {
+                if matches!(edit, RenameEditorEdit::Paste) {
+                    self.rename_paste_in(window);
+                }
+                return true;
+            }
             return self
                 ._toolbars
                 .get(&window)
                 .is_some_and(|handle| self.apprt.rename_editor_edit(handle, edit));
         }
-        let text = self
-            ._toolbars
-            .get(&window)
-            .and_then(|handle| self.apprt.rename_editor_text(handle));
-        match (self.rename_edit_session(window), text) {
-            (Some(session), Some(text)) => self.commit_session_rename(window, session, &text),
-            // No native field behind the state (headless, or a platform without
-            // an editor): end it without inventing text to write.
-            _ => self.end_session_rename_editor(window),
-        }
+        self.settle_rename_edit(window);
         false
     }
 
@@ -10193,6 +10520,53 @@ mod typed_kitty_summon_tests {
         assert!(model.check_invariant("HelloIndependentOfTrailMaster", &off_spec));
     }
 
+    /// Typing `dog` through the REAL input path summons the dog cameo — but
+    /// only after the window has typed a lot ([`crate::kitty_summon`]'s
+    /// `DOG_SUMMON_KEYS`). A re-summon while visible parades a different
+    /// breed, and nothing ever lands in the Kitty Log (dogs are visitors).
+    #[test]
+    fn typing_dog_after_the_gate_pops_the_dog_cameo() {
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        assert!(app.sparkle.is_some(), "sparkle resolves ON by default");
+        let wid = WindowId(0);
+
+        type_word(&mut app, wid, "dog ");
+        assert!(
+            !app.windows[&wid].dog_cameo.active(std::time::Instant::now()),
+            "no dog before the typed-a-lot gate opens"
+        );
+
+        for _ in 0..30 {
+            type_word(&mut app, wid, "qwzx qwzx qwzx qwzx ");
+        }
+        type_word(&mut app, wid, "dog");
+        let now = std::time::Instant::now();
+        assert!(
+            app.windows[&wid].dog_cameo.active(now),
+            "the earned dog arrives on the completing letter"
+        );
+        let first = app.windows[&wid]
+            .dog_cameo
+            .look()
+            .expect("a summoned dog has a rolled look");
+
+        type_word(&mut app, wid, " puppy");
+        let second = app.windows[&wid]
+            .dog_cameo
+            .look()
+            .expect("the parade re-rolls a look");
+        assert_ne!(
+            first.breed, second.breed,
+            "a re-summon while visible parades a DIFFERENT breed"
+        );
+        assert_eq!(
+            app.kitty_log.log().sightings,
+            0,
+            "dogs are visitors — the Kitty Log records nothing"
+        );
+    }
+
     /// THE WORD ENGINE'S "A HUMAN TYPED" WITNESS IS ACTUALLY WIRED.
     ///
     /// Owner, 2026-08-09 ("when the screen draws, new kitties appear; I want
@@ -11482,6 +11856,272 @@ mod tone_status_tests {
         assert!(
             line.contains(&format!("window_chars={}", secret.len())),
             "only the count is reported: {line}",
+        );
+    }
+}
+
+/// THE INLINE RENAME FIELD IS A TEXT FIELD, and it is the SAME text field the find
+/// bar is — same reducer, same keymap. These drive the shipping `on_key` routing
+/// with real winit events, so they pin the whole chain: the early gate that keeps
+/// ⎋ and `[key_sequences]` raw bytes off the PTY, the field edit, the commit/cancel
+/// exits, and the "everything else settles and falls through" rule that makes a
+/// command reached from the keyboard behave like the same command reached from a
+/// menu.
+#[cfg(test)]
+mod rename_field_key_tests {
+    use crate::{App, WindowId};
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    /// A pressed key event shaped like the platform's: `text` is what winit
+    /// reports, INCLUDING the control strings it produces for ⎋ (`\u{1b}`), ⏎
+    /// (`\r`) and ⇥ (`\t`) — the payloads that must never reach a pin as text.
+    fn press(logical: Key, text: Option<&str>) -> KeyEvent {
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::KeyA),
+            logical,
+            text.map(SmolStr::new),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        )
+    }
+
+    fn named(key: NamedKey) -> KeyEvent {
+        press(Key::Named(key), key.to_text())
+    }
+
+    fn character(ch: &str) -> KeyEvent {
+        press(Key::Character(SmolStr::new(ch)), Some(ch))
+    }
+
+    /// An app with the in-grid strip on and an editor open over its active tab.
+    fn app_editing() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        assert!(app.begin_active_session_rename(wid));
+        (app, wid)
+    }
+
+    fn field(app: &App, wid: WindowId) -> Option<(String, usize)> {
+        app.inline_rename_edit(wid)
+            .map(|edit| (edit.text.clone(), edit.cursor))
+    }
+
+    fn pin(app: &App, session: u64) -> Option<String> {
+        app.pool
+            .get(session)?
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .user_title
+            .clone()
+    }
+
+    fn type_str(app: &mut App, wid: WindowId, text: &str) {
+        for ch in text.chars() {
+            app.on_key(wid, character(&ch.to_string()));
+        }
+    }
+
+    /// TYPING lands in the field, not the shell; ⏎ commits it as the pin.
+    #[test]
+    fn typing_edits_the_field_and_return_commits_the_pin() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "build agent");
+        assert_eq!(field(&app, wid), Some(("build agent".to_string(), 11)));
+
+        app.on_key(wid, named(NamedKey::Enter));
+        assert_eq!(pin(&app, 0).as_deref(), Some("build agent"));
+        assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
+    }
+
+    /// ⎋ CANCELS and its `"\u{1b}"` text payload never becomes content — the same
+    /// trap the find bar's classifier has to dodge.
+    #[test]
+    fn escape_cancels_and_types_nothing() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "discard");
+        app.on_key(wid, named(NamedKey::Escape));
+        assert_eq!(app.rename_edit_session(wid), None, "⎋ closed the editor");
+        assert_eq!(pin(&app, 0), None, "and wrote nothing");
+
+        // Reopening starts from the (still unset) pin, not from what was typed.
+        assert!(app.begin_active_session_rename(wid));
+        assert_eq!(field(&app, wid), Some((String::new(), 0)));
+    }
+
+    /// ⇥ COMMITS, like every other way of leaving a field, and leaves no tab
+    /// character behind.
+    #[test]
+    fn tab_commits_rather_than_typing_a_tab() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "ci");
+        app.on_key(wid, named(NamedKey::Tab));
+        assert_eq!(pin(&app, 0).as_deref(), Some("ci"));
+    }
+
+    /// The FIELD KEYMAP is the find bar's: ^A/^E/^K/⌫ and the arrows all mean in
+    /// a pin exactly what they mean in a query.
+    #[test]
+    fn the_field_speaks_the_shared_single_line_keymap() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "release");
+        app.on_key(wid, named(NamedKey::Backspace));
+        assert_eq!(field(&app, wid), Some(("releas".to_string(), 6)));
+
+        let ctrl = |app: &mut App, ch: &str| {
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::CONTROL;
+            app.on_key(wid, character(ch));
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        };
+        ctrl(&mut app, "a");
+        assert_eq!(field(&app, wid), Some(("releas".to_string(), 0)), "^A");
+        app.on_key(wid, named(NamedKey::ArrowRight));
+        ctrl(&mut app, "k");
+        assert_eq!(field(&app, wid), Some(("r".to_string(), 1)), "^K");
+        ctrl(&mut app, "e");
+        assert_eq!(field(&app, wid), Some(("r".to_string(), 1)), "^E");
+    }
+
+    /// A BARE MODIFIER is neither content nor an exit. Without this, ⇧ before a
+    /// capital letter would settle the edit and the next character would go to
+    /// the shell.
+    #[test]
+    fn a_bare_shift_does_not_end_the_edit() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "a");
+        app.on_key(wid, named(NamedKey::Shift));
+        assert_eq!(
+            field(&app, wid),
+            Some(("a".to_string(), 1)),
+            "the field is untouched and still open"
+        );
+    }
+
+    /// EVERYTHING ELSE SETTLES AND FALLS THROUGH: a key the field does not own
+    /// commits what was typed and then keeps going, so the command it was aimed at
+    /// runs against a settled world. This is the same rule
+    /// `divert_menu_action_around_rename` applies to menu commands — one policy,
+    /// two routes.
+    #[test]
+    fn an_unowned_key_settles_the_edit_and_does_not_swallow_itself() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "kept");
+        let mods = ModifiersState::empty();
+        let f5 = named(NamedKey::F5);
+        assert!(
+            !app.on_key_rename_mode(wid, mods, &f5),
+            "the gate declines the key so its real handler still runs"
+        );
+        assert_eq!(app.rename_edit_session(wid), None, "the edit is settled");
+        assert_eq!(
+            pin(&app, 0).as_deref(),
+            Some("kept"),
+            "keeping what you typed"
+        );
+    }
+
+    /// A HELD key repeats against the SESSION captured at press time, and a repeat
+    /// that outlives its editor is dropped rather than replayed into whatever
+    /// field exists later.
+    #[test]
+    fn a_held_key_repeats_against_the_renamed_session_only() {
+        let (mut app, wid) = app_editing();
+        type_str(&mut app, wid, "abc");
+        let mods = ModifiersState::empty();
+        let backspace = named(NamedKey::Backspace);
+        let (session, edit) = app
+            .rename_repeat_action(wid, mods, &backspace)
+            .expect("⌫ is a repeatable field edit");
+        assert_eq!(session, 0);
+
+        assert!(app.apply_local_repeat_action(
+            wid,
+            crate::LocalRepeatAction::Rename {
+                session,
+                edit: edit.clone()
+            }
+        ));
+        assert_eq!(field(&app, wid), Some(("ab".to_string(), 2)));
+
+        // A repeat naming a session that is no longer being edited is refused.
+        assert!(!app.apply_local_repeat_action(
+            wid,
+            crate::LocalRepeatAction::Rename { session: 99, edit }
+        ));
+        assert_eq!(field(&app, wid), Some(("ab".to_string(), 2)));
+    }
+
+    /// COMPOSED TEXT (CJK, macOS ⌥-dead-keys) belongs to the field too. It arrives
+    /// as an IME commit, not as `KeyEvent::text`, so without its own branch it
+    /// would land in the shell behind the editor.
+    #[test]
+    fn an_ime_commit_lands_in_the_field_not_the_shell() {
+        let (mut app, wid) = app_editing();
+        app.on_ime_commit(wid, "é".to_string());
+        assert_eq!(field(&app, wid), Some(("é".to_string(), 2)));
+    }
+
+    /// B1 WIRING: the tab CONTEXT-menu wake takes the same divert the menu bar
+    /// takes. Scraped from the source because the arm needs an `ActiveEventLoop`
+    /// no unit test can build — and the defect was precisely a MISSING call, which
+    /// is what a source assertion can prove and a behavioural one cannot.
+    #[test]
+    fn the_tab_context_menu_wake_diverts_around_a_live_rename() {
+        let source = include_str!("lib.rs");
+        let arm = source
+            .split_once("Wake::TabMenuAction {")
+            .expect("the tab context-menu wake arm")
+            .1;
+        let dispatch = arm
+            .find("self.dispatch_tab_menu_action(")
+            .expect("the arm dispatches");
+        let divert = arm
+            .find("self.divert_menu_action_around_rename(")
+            .expect("the arm must divert around a live rename, exactly as the menu bar does");
+        assert!(
+            divert < dispatch,
+            "the divert has to run BEFORE the command, or the edit is discarded rather than kept"
+        );
+    }
+
+    /// B2 WIRING: a click on a DIFFERENT tab chip settles the edit. Same reason
+    /// for a source assertion — and the settle must be on the human `SelectTab`
+    /// gesture, never inside `switch_tab_in`, which every programmatic path
+    /// (including the control socket's `tab <N>`) runs through.
+    #[test]
+    fn selecting_another_tab_settles_the_edit_without_touching_switch_tab_in() {
+        let source = include_str!("lib.rs");
+        let arm = source
+            .split_once("Wake::SelectTab { window, index } => {")
+            .expect("the native tab-select wake arm")
+            .1;
+        let switch = arm.find("self.switch_tab_in(").expect("the arm switches");
+        let settle = arm
+            .find("self.settle_rename_edit(")
+            .expect("clicking another chip is a click away, which COMMITS");
+        assert!(
+            settle < switch,
+            "settle before the tab changes under the editor"
+        );
+
+        let tabs = include_str!("app_tabs.rs");
+        let body = tabs
+            .split_once("pub(crate) fn switch_tab_in(")
+            .expect("switch_tab_in exists")
+            .1;
+        let end = body
+            .find("\n    pub(crate) fn ")
+            .or_else(|| body.find("\n    fn "))
+            .unwrap_or(body.len());
+        assert!(
+            !body[..end].contains("settle_rename_edit"),
+            "the shared programmatic body must stay free of the human gesture's policy"
         );
     }
 }

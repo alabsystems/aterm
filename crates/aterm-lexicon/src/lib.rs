@@ -44,8 +44,17 @@ pub enum Class {
     Profanity,
     /// The cat / kitty / kitten family — drawn as the steady cat-paw.
     Feline,
+    /// The dog / puppy family — the canine counterpart of [`Class::Feline`].
+    Canine,
     /// The orca / cetacean family — drawn as the randomized "splash" of water droplets.
     Orca,
+    /// The ambient animal-word family (monkey / camel / penguin / …): ordinary
+    /// English animal nouns, each entry tagged with a `species` id that names
+    /// the authored sprite the renderer peeks beside the word. Entries ride
+    /// `ambiguous = true` by design: animal nouns ARE ordinary prose, so they
+    /// defer at the live caret (no fire inside `been` while typing past `bee`)
+    /// and stay out of the fold-collision gate's unambiguous set.
+    Animal,
     /// Hype / emphasis words — drawn as the animated-ink shimmer only (no
     /// sprite overlay). The builtin lexicon ships NO emphasis forms: the class
     /// is populated entirely by the user's `extra_words` / lexicon override.
@@ -65,6 +74,14 @@ pub struct LangId(pub u16);
 /// the [`LangSet`] bitset is taken. [`Lexicon::lang_code`] renders it as
 /// `"unknown"` (the language table never grows into this slot).
 const UNKNOWN_LANG: LangId = LangId((LangSet::CAPACITY - 1) as u16);
+
+/// Interned species identifier for [`Class::Animal`] surfaces: an index into
+/// the [`Lexicon`]'s species table ([`Lexicon::species_code`] resolves it back
+/// to the TOML `species` id, which is also the renderer's authored-sprite key).
+/// Ids are assigned in first-appearance TOML order across all well-formed
+/// animal entries.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub struct SpeciesId(pub u16);
 
 /// A set of interned languages, as a `u64` bitset (bit `i` ⇔ `LangId(i)`).
 ///
@@ -181,6 +198,11 @@ pub struct Match {
     /// surface remains a normal match. A surface claimed by any non-ambiguous
     /// entry of the winning class is non-ambiguous here.
     pub ambiguous: bool,
+    /// For [`Class::Animal`] matches: which authored species sprite this
+    /// surface names ([`Lexicon::species_code`] resolves the string id).
+    /// `None` for every other class, and for a (malformed) animal entry that
+    /// carried no `species` key.
+    pub species: Option<SpeciesId>,
 }
 
 /// Collision-free identity of one exact recognized surface in a compiled
@@ -313,6 +335,9 @@ pub struct Lexicon {
     /// ⇔ `langs[i]`). The reserved [`UNKNOWN_LANG`] slot is never stored here;
     /// [`Self::lang_code`] renders it as `"unknown"`.
     langs: Vec<String>,
+    /// Interned [`Class::Animal`] species ids, in first-appearance TOML order
+    /// ([`SpeciesId`] `i` ⇔ `species[i]`).
+    species: Vec<String>,
     /// Data problems found during build (same surface in both classes, unknown
     /// class). Empty for a well-formed lexicon; surfaced by the CI validator.
     conflicts: Vec<String>,
@@ -332,6 +357,7 @@ struct LexiconHit {
     langs: LangSet,
     form_id: FormId,
     ambiguous: bool,
+    species: Option<SpeciesId>,
 }
 
 // ---- TOML shapes ----
@@ -359,6 +385,12 @@ struct RawEntry {
     cjk: bool,
     #[serde(default)]
     ambiguous: bool,
+    /// [`Class::Animal`] only: the species id naming the authored sprite for
+    /// every surface in this entry (e.g. `species = "monkey"`). Ignored (with
+    /// a conflicts-channel note) on other classes; its absence on an animal
+    /// entry is likewise recorded and the entry skipped.
+    #[serde(default)]
+    species: String,
     #[serde(default)]
     #[allow(dead_code, reason = "documentation field for human reviewers")]
     notes: String,
@@ -472,14 +504,16 @@ impl Lexicon {
     }
 
     fn build(raw: RawLexicon, raw_exc: RawExceptions, langs: &Langs) -> Lexicon {
-        let mut spaced: FxHashMap<String, (Class, LangSet, bool)> = FxHashMap::default();
-        let mut cjk_forms: FxHashMap<String, (Class, LangSet, bool)> = FxHashMap::default();
+        let mut spaced: FxHashMap<String, PendingHit> = FxHashMap::default();
+        let mut cjk_forms: FxHashMap<String, PendingHit> = FxHashMap::default();
         let mut cjk_exceptions: FxHashSet<String> = FxHashSet::default();
         let mut user_surfaces: FxHashSet<String> = FxHashSet::default();
         let mut conflicts = Vec::new();
         let mut max_cjk = 1usize;
         // Interned language codes, first-appearance order (see the field doc).
         let mut lang_table: Vec<String> = Vec::new();
+        // Interned animal species ids, first-appearance order (see the field doc).
+        let mut species_table: Vec<String> = Vec::new();
         // Running count of surface forms materialized so far, shared across every
         // entry, to bound the total against MAX_TOTAL_SURFACES (see its docs).
         let mut total: usize = 0;
@@ -488,7 +522,9 @@ impl Lexicon {
             let class = match e.class.as_str() {
                 "profanity" => Class::Profanity,
                 "feline" => Class::Feline,
+                "canine" => Class::Canine,
                 "orca" => Class::Orca,
+                "animal" => Class::Animal,
                 "emphasis" => Class::Emphasis,
                 other => {
                     // Composed without `format!` (see `DebugText`); byte-for-byte
@@ -507,6 +543,32 @@ impl Lexicon {
             // input, never on the configured `languages`. The gating itself
             // still keys on the RAW entry code — its semantics are unchanged.
             let lset = LangSet::EMPTY.with(intern_lang(&mut lang_table, &e.lang));
+            // Animal entries carry the species id that names their authored
+            // sprite; the id is interned BEFORE the ambiguous gating (exactly
+            // like the language intern above) so SpeciesId assignment depends
+            // only on the TOML input. A malformed pairing — animal without a
+            // species, species on another class — is recorded and the field
+            // (or entry) dropped rather than half-honored.
+            let species = match (class, e.species.trim()) {
+                (Class::Animal, "") => {
+                    let mut msg = String::from("animal entry without species (lang ");
+                    msg.push_str(&e.lang);
+                    msg.push_str("): entry skipped");
+                    conflicts.push(msg);
+                    continue;
+                }
+                (Class::Animal, sp) => Some(intern_species(&mut species_table, sp)),
+                (_, "") => None,
+                (_, sp) => {
+                    let mut msg = String::from("species ");
+                    msg.push_str(&DebugText(sp).to_string());
+                    msg.push_str(" on non-animal entry (lang ");
+                    msg.push_str(&e.lang);
+                    msg.push_str("): field ignored");
+                    conflicts.push(msg);
+                    None
+                }
+            };
             if e.ambiguous && !langs.enabled(&e.lang) {
                 continue;
             }
@@ -599,7 +661,15 @@ impl Lexicon {
                         msg.push_str(") requires cjk_single_char = true to scan");
                         conflicts.push(msg);
                     }
-                    insert_class(&mut cjk_forms, key, class, lset, e.ambiguous);
+                    insert_class(
+                        &mut cjk_forms,
+                        key,
+                        class,
+                        lset,
+                        e.ambiguous,
+                        species,
+                        &mut conflicts,
+                    );
                 } else {
                     let key = fold(s);
                     // A surface that is not a single scannable token (contains a
@@ -632,7 +702,15 @@ impl Lexicon {
                         // exempt it.
                         user_surfaces.insert(key.clone());
                     }
-                    insert_class(&mut spaced, key, class, lset, e.ambiguous);
+                    insert_class(
+                        &mut spaced,
+                        key,
+                        class,
+                        lset,
+                        e.ambiguous,
+                        species,
+                        &mut conflicts,
+                    );
                 }
             }
         }
@@ -664,6 +742,7 @@ impl Lexicon {
             cjk_exceptions,
             max_cjk,
             langs: lang_table,
+            species: species_table,
             conflicts,
             user_surfaces,
         }
@@ -677,6 +756,24 @@ impl Lexicon {
         self.langs
             .get(usize::from(id.0))
             .map_or("unknown", String::as_str)
+    }
+
+    /// The interned species id for an animal match (`"monkey"`, `"camel"`, …)
+    /// — the renderer's authored-sprite key. An id this lexicon never handed
+    /// out renders as `"unknown"`.
+    #[must_use]
+    pub fn species_code(&self, id: SpeciesId) -> &str {
+        self.species
+            .get(usize::from(id.0))
+            .map_or("unknown", String::as_str)
+    }
+
+    /// Every interned species id, in [`SpeciesId`] order — the roster ⇄ lexicon
+    /// drift gate's enumeration surface (each tag here must name authored art,
+    /// and vice versa; see `animal_art_quality`).
+    #[must_use]
+    pub fn species_codes(&self) -> &[String] {
+        &self.species
     }
 
     /// Data problems found at build time (a surface claimed by both classes, an
@@ -958,6 +1055,7 @@ impl Lexicon {
             form_id: hit.form_id,
             form_hash: fnv1a64(folded.as_str()),
             ambiguous: hit.ambiguous,
+            species: hit.species,
         });
     }
 
@@ -1050,6 +1148,7 @@ impl Lexicon {
                                 form_id: hit.form_id,
                                 form_hash: fnv1a64(&window[..bounds[l - 1]]),
                                 ambiguous: hit.ambiguous,
+                                species: hit.species,
                             });
                         }
                         p = p.saturating_add(l);
@@ -1087,47 +1186,95 @@ fn intern_lang(table: &mut Vec<String>, code: &str) -> LangId {
     LangId((table.len() - 1) as u16)
 }
 
-/// Cross-class homograph precedence, TOTAL ORDER: profanity > feline > orca >
-/// emphasis. A surface that is an expletive in *any* enabled language (e.g.
-/// "poes": Dutch pussycat, Afrikaans vulgar) is treated as profanity, so it
-/// sparkles rather than getting a friendly paw; likewise a user emphasis word
-/// colliding with a builtin feline form keeps the cat.
+/// Intern an animal `species` id into `table` (first-appearance order). The
+/// species namespace is a plain index table — no bitset, so no reserved
+/// overflow slot; the id count is bounded by the u16 cast staying lossless
+/// (the roster is a few dozen species, the cap is structural, not reachable).
+fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
+    if let Some(i) = table.iter().position(|s| s == code) {
+        return SpeciesId(i as u16);
+    }
+    let i = table.len().min(usize::from(u16::MAX));
+    if i == usize::from(u16::MAX) {
+        return SpeciesId(u16::MAX);
+    }
+    table.push(code.to_string());
+    SpeciesId(i as u16)
+}
+/// Cross-class homograph precedence, TOTAL ORDER:
+/// `profanity > feline > canine > orca > animal > emphasis`.
+///
+/// A surface that is an expletive in *any* enabled language
+/// (e.g. "poes": Dutch pussycat, Afrikaans vulgar; "anjing": Indonesian dog,
+/// in-language curse) is treated as profanity, so it sparkles rather than
+/// getting a friendly paw; likewise a user emphasis word colliding with a
+/// builtin feline form keeps the cat.
 fn class_rank(class: Class) -> u8 {
     match class {
-        Class::Profanity => 3,
-        Class::Feline => 2,
-        Class::Orca => 1,
+        Class::Profanity => 5,
+        Class::Feline => 4,
+        Class::Canine => 3,
+        Class::Orca => 2,
+        Class::Animal => 1,
         Class::Emphasis => 0,
     }
 }
+
+/// A surface's precedence-in-progress record: [`LexiconHit`] minus the
+/// [`FormId`], which is assigned only after every class collision has settled
+/// ([`finalize_hits`]).
+type PendingHit = (Class, LangSet, bool, Option<SpeciesId>);
 
 /// Insert a surface, resolving collisions: a higher-ranked class REPLACES the
 /// entry and keeps ONLY its own languages (the surface is displayed as the
 /// winning class, so only that class's claimants may be attributed); the SAME
 /// class UNIONS the language sets (`kucing` = id ∪ ms ∪ jv); a lower-ranked
 /// class is dropped entirely, languages included.
+///
+/// Species follows the same law as the class it annotates: a replacement takes
+/// the winner's species, a same-class union keeps the FIRST claimant's species
+/// (TOML order is the tiebreak; the data discipline is one surface → one
+/// species, pinned by `animal_surface_species_are_unique`).
 fn insert_class(
-    map: &mut FxHashMap<String, (Class, LangSet, bool)>,
+    map: &mut FxHashMap<String, PendingHit>,
     key: String,
     class: Class,
     langs: LangSet,
     ambiguous: bool,
+    species: Option<SpeciesId>,
+    conflicts: &mut Vec<String>,
 ) {
     match map.get_mut(&key) {
-        Some((prev, set, prev_ambiguous)) if class_rank(class) > class_rank(*prev) => {
+        Some((prev, set, prev_ambiguous, prev_species))
+            if class_rank(class) > class_rank(*prev) =>
+        {
             *prev = class;
             *set = langs;
             *prev_ambiguous = ambiguous;
+            *prev_species = species;
         }
-        Some((prev, set, prev_ambiguous)) if *prev == class => {
+        Some((prev, set, prev_ambiguous, prev_species)) if *prev == class => {
             *set = set.union(langs);
             // One unambiguous claimant is sufficient to make the winning
             // surface safe for immediate live-cursor decoration.
             *prev_ambiguous &= ambiguous;
+            match (*prev_species, species) {
+                (Some(a), Some(b)) if a != b => {
+                    // Two species claim one surface — a data bug (which sprite
+                    // would the word show?). First claimant wins (TOML order);
+                    // the loss is recorded, never silent.
+                    let mut msg = String::from("surface ");
+                    msg.push_str(&DebugText(&key).to_string());
+                    msg.push_str(" claimed by two animal species: kept the first");
+                    conflicts.push(msg);
+                }
+                (None, sp @ Some(_)) => *prev_species = sp,
+                _ => {}
+            }
         }
         Some(_) => {}
         None => {
-            map.insert(key, (class, langs, ambiguous));
+            map.insert(key, (class, langs, ambiguous, species));
         }
     }
 }
@@ -1136,14 +1283,14 @@ fn insert_class(
 /// deterministic ID to every exact key. This is build-time work; scans retain
 /// the compact `Copy` value and perform no extra lookup or allocation.
 fn finalize_hits(
-    map: FxHashMap<String, (Class, LangSet, bool)>,
+    map: FxHashMap<String, PendingHit>,
     next_form_id: &mut u64,
 ) -> FxHashMap<String, LexiconHit> {
     let mut entries: Vec<_> = map.into_iter().collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut out = FxHashMap::default();
     out.reserve(entries.len());
-    for (key, (class, langs, ambiguous)) in entries {
+    for (key, (class, langs, ambiguous, species)) in entries {
         let form_id = FormId::exact(*next_form_id);
         *next_form_id = next_form_id
             .checked_add(1)
@@ -1155,6 +1302,7 @@ fn finalize_hits(
                 langs,
                 form_id,
                 ambiguous,
+                species,
             },
         );
     }

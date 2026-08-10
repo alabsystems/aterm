@@ -436,10 +436,19 @@ mod tests {
         assert_eq!(verify_detached(&pk, &tampered, &sig), Err(Reject::Verify));
     }
 
-    // (6) Empty pin ⇒ enabled()==false AND verify_detached("",..)==Err(Disabled),
-    // before any crypto — the fail-closed, inert default of an unsigned build.
+    // (6) An empty anchor short-circuits before any crypto — the fail-closed
+    // default for a build that pins nothing (a fork that has not committed its
+    // own anchor).
+    //
+    // NOTE the deliberate behavior change: the anchor is now a COMMITTED constant
+    // (`aterm_update_core::pins::PKG_ROOT_PUBKEY`), not `option_env!`, so an
+    // ordinary source build is package-ENABLED rather than inert. This test used
+    // to assert `PINNED_PKG_ROOTKEY.is_empty()`, which was only ever true because
+    // the anchor came from the build environment — the same property that let a
+    // locally built atpkg silently trust nobody. Inertness is now reachable only
+    // by committing an empty anchor, or by `ATPKG_DISABLE`.
     #[test]
-    fn empty_pin_is_disabled_and_inert() {
+    fn an_empty_anchor_is_disabled_and_inert_before_any_crypto() {
         let kp = keypair(&ROOT_SEED);
         let sig = sign(&kp, MANIFEST);
         assert_eq!(
@@ -447,12 +456,14 @@ mod tests {
             Err(Reject::Disabled),
             "empty key short-circuits before crypto"
         );
-        // A plain build leaves the pin empty ⇒ the manager is inert.
-        assert!(crate::PINNED_PKG_ROOTKEY.is_empty());
-        assert!(!crate::enabled());
-        // verify_index (which uses the const pin) is therefore Disabled even for a
-        // byte-perfect, correctly-signed index.
-        assert_eq!(verify_index(MANIFEST.to_vec(), &sig), Err(Reject::Disabled));
+        assert!(
+            !crate::PINNED_PKG_ROOTKEY.is_empty(),
+            "this build commits an anchor; an empty one would silently unpin atpkg"
+        );
+        assert!(
+            crate::enabled(),
+            "a committed anchor enables the manager by construction"
+        );
     }
 
     // (7) A pkg signed by a key the index does NOT delegate REJECTS under verify_pkg,

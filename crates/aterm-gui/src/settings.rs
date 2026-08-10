@@ -7718,13 +7718,15 @@ mod tests {
         };
         assert_eq!(
             caps(prefs::Section::Appearance),
-            // Full-coverage growth: the Transparency box plus one box per
-            // decorative nested table (sparkle words / matrix rain).
+            // Full-coverage growth: the Transparency box, the Wallpaper box
+            // (backdrop image + dim), plus one box per decorative nested table
+            // (sparkle words / matrix rain).
             [
                 "Theme",
                 "Colors",
                 "Text & Contrast",
                 "Transparency",
+                "Wallpaper",
                 "Sparkle words",
                 "Matrix rain"
             ]
@@ -7761,6 +7763,7 @@ mod tests {
             [
                 "Size",
                 "Smart Titles",
+                "Tab Status",
                 "Window padding",
                 "Chrome",
                 "Session"
@@ -7818,6 +7821,11 @@ mod tests {
             // Transparency: opacity then material.
             prefs::EDIT_BACKGROUND_OPACITY,
             prefs::EDIT_BACKGROUND_MATERIAL,
+            // Wallpaper: the backdrop image, its legibility dim, then the
+            // backdrop-hue glyph tint.
+            prefs::EDIT_WALLPAPER,
+            prefs::EDIT_WALLPAPER_DIM,
+            prefs::EDIT_WALLPAPER_TEXT_TINT,
         ];
         assert_eq!(&controls[..head.len()], head);
         // The decorative nested tables close the pane: every sparkle-words leaf

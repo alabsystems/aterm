@@ -2151,6 +2151,11 @@ pub(crate) enum AppEffect {
     OpenDocumentEditor {
         document: DocumentId,
     },
+    /// Open the host's native image picker for the terminal WALLPAPER; on an
+    /// approved selection the host writes the `wallpaper` key through the
+    /// versioned config lane (which re-decodes the image), so no reply is
+    /// needed — the view converges via the ordinary config-change projection.
+    ChooseWallpaperImage,
     RequestCloseSelf,
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
@@ -2319,6 +2324,10 @@ impl UpdateCx<'_> {
     pub(crate) fn open_document_editor(&mut self, document: DocumentId) {
         self.effects
             .push(AppEffect::OpenDocumentEditor { document });
+    }
+
+    pub(crate) fn choose_wallpaper_image(&mut self) {
+        self.effects.push(AppEffect::ChooseWallpaperImage);
     }
 
     pub(crate) fn clipboard(&mut self, request: ClipboardRequest) -> OperationId {

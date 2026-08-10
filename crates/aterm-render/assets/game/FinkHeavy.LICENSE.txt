@@ -1,0 +1,23 @@
+FinkHeavy
+Copyright 1993-1996 Brand Design Co., Inc./House Industries. Font by Ken Barber.
+
+FinkHeavy is the ACTUAL Animal Crossing typeface — Nintendo licensed it from
+House Industries for the games' English releases (GameCube era through New
+Leaf). Not a lookalike: this is the real face, version 001.000, as vendored by
+Animal Crossing fan projects (retrieved from a GitHub mirror; the same bytes
+circulate across the AC fan community).
+
+REDISTRIBUTION NOTICE — READ BEFORE SHIPPING A RELEASE
+------------------------------------------------------
+This is a COMMERCIAL typeface owned by House Industries, sold today as part of
+their Fink family (https://houseind.com). There is no free-use grant of any
+kind; the copies circulating in the fan community are unlicensed. Embedding
+these bytes in the aterm binary IS redistribution. Before this asset ships in
+a cut release, license the face from House Industries or swap the
+`animal-crossing` entry to an open substitute — the retired Chewy (Apache-2.0)
+remains the honest fallback. Until then it is a development-branch asset only.
+
+File: FinkHeavy.ttf
+SHA-256: 2f538a1478a3758a1c5d67c705ef87a32284b5036b3f468c20aaf1a3861f0530
+Retrieved: 2026-08-06 from github.com/AkiraNim/CLTCrossing
+(CltCrossing/assets/Fonts/FinkHeavy.ttf)

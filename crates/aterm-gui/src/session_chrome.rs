@@ -79,6 +79,11 @@ pub(crate) struct SessionChromeInput {
     /// Whether a registry identity exists — gates the `Copy Session ID` action
     /// (greyed out rather than copying an empty string).
     pub has_session: bool,
+    /// Whether this window can PRESENT a rename editor at all. Off macOS the
+    /// editor is painted by the tab strip, so `tab_strip_rows = 0` leaves the
+    /// command with nowhere to go and the row greys out instead of accepting a
+    /// click that only reaches a log line.
+    pub can_rename: bool,
     /// The recent timeline tail, NEWEST-FIRST, already capped to
     /// [`TIMELINE_TAIL`] by the caller (the composer re-caps defensively).
     pub timeline: Vec<TimelineNote>,
@@ -389,7 +394,7 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
     entries.push(TabMenuEntry::Action {
         label: "Rename Session…",
         action: MenuAction::RenameSession,
-        enabled: input.has_session,
+        enabled: input.has_session && input.can_rename,
     });
     entries.push(TabMenuEntry::Action {
         label: "Copy Session ID",
@@ -483,6 +488,7 @@ mod tests {
 
     fn full_input() -> SessionChromeInput {
         SessionChromeInput {
+            can_rename: true,
             label: "build agent".to_string(),
             icon: Some("🤖".to_string()),
             description: Some("Rebuilds the docs site".to_string()),

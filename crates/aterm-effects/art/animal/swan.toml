@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "swan"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.48, center_x = 0.5, word_top = 1.0 }
+
+# Swan: elegant white head, black mask knob at the bill base, orange wedge bill.
+
+[[layer]]
+role = "outline"
+ref_fill = "#2B2622"
+recolor = "fixed"
+paths = ["M 32 66 C 32 38.4 53.5 16 80 16 C 106.5 16 128 38.4 128 66 C 128 93.6 106.5 116 80 116 C 53.5 116 32 93.6 32 66 Z", "M 60 87 L 100 87 C 100 108 90 126 80 126 C 70 126 60 108 60 87 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#FAFAF6"
+recolor = "fixed"
+paths = ["M 36 66 C 36 40.6 55.7 20 80 20 C 104.3 20 124 40.6 124 66 C 124 91.4 104.3 112 80 112 C 55.7 112 36 91.4 36 66 Z"]
+
+[[layer]]
+role = "coat_shade"
+ref_fill = "#E9E9E1"
+recolor = "fixed"
+paths = ["M 104 95 C 113 87 118 77 118 64 C 122 80 115 100 101 107 C 98 105 100 98 104 95 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#221E1C"
+recolor = "fixed"
+paths = ["M 64 77 C 69 72 91 72 96 77 C 100 81 100 88 96 92 L 64 92 C 60 88 60 81 64 77 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#F08A26"
+recolor = "fixed"
+paths = ["M 64 90 L 96 90 C 96 106 88 122 80 122 C 72 122 64 106 64 90 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 57 64 C 57 60.1 59.7 57 63 57 C 66.3 57 69 60.1 69 64 C 69 67.9 66.3 71 63 71 C 59.7 71 57 67.9 57 64 Z", "M 91 64 C 91 60.1 93.7 57 97 57 C 100.3 57 103 60.1 103 64 C 103 67.9 100.3 71 97 71 C 93.7 71 91 67.9 91 64 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 62.8 61.5 C 62.8 60.3 63.8 59.3 65 59.3 C 66.2 59.3 67.2 60.3 67.2 61.5 C 67.2 62.7 66.2 63.7 65 63.7 C 63.8 63.7 62.8 62.7 62.8 61.5 Z", "M 96.8 61.5 C 96.8 60.3 97.8 59.3 99 59.3 C 100.2 59.3 101.2 60.3 101.2 61.5 C 101.2 62.7 100.2 63.7 99 63.7 C 97.8 63.7 96.8 62.7 96.8 61.5 Z"]

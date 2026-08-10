@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "snake"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.44, center_x = 0.5, word_top = 1.0 }
+
+# Snake: tapered green head (wide brow, narrow snout), lidded yellow eyes, forked red tongue.
+
+[[layer]]
+role = "outline"
+ref_fill = "#1F3D15"
+recolor = "fixed"
+paths = ["M 80 20 C 108 20 130 39 130 62 C 130 92 106 114 80 114 C 54 114 30 92 30 62 C 30 39 52 20 80 20 Z", "M 74 102 L 86 102 L 86 115 L 94 126 L 86 130 L 80 121 L 74 130 L 66 126 L 74 115 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#5CB44A"
+recolor = "fixed"
+paths = ["M 80 24 C 104 24 126 41 126 62 C 126 90 103 110 80 110 C 57 110 34 90 34 62 C 34 41 56 24 80 24 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#B9DE96"
+recolor = "fixed"
+paths = ["M 56 92 C 56 84.3 66.7 78 80 78 C 93.3 78 104 84.3 104 92 C 104 99.7 93.3 106 80 106 C 66.7 106 56 99.7 56 92 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#F0D95C"
+recolor = "fixed"
+paths = ["M 48.5 58 C 48.5 52.8 52.8 48.5 58 48.5 C 63.2 48.5 67.5 52.8 67.5 58 C 67.5 63.2 63.2 67.5 58 67.5 C 52.8 67.5 48.5 63.2 48.5 58 Z", "M 92.5 58 C 92.5 52.8 96.8 48.5 102 48.5 C 107.2 48.5 111.5 52.8 111.5 58 C 111.5 63.2 107.2 67.5 102 67.5 C 96.8 67.5 92.5 63.2 92.5 58 Z"]
+
+[[layer]]
+role = "iris"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 53 59 C 53 56.2 55.2 54 58 54 C 60.8 54 63 56.2 63 59 C 63 61.8 60.8 64 58 64 C 55.2 64 53 61.8 53 59 Z", "M 97 59 C 97 56.2 99.2 54 102 54 C 104.8 54 107 56.2 107 59 C 107 61.8 104.8 64 102 64 C 99.2 64 97 61.8 97 59 Z"]
+
+[[layer]]
+role = "coat_shade"
+ref_fill = "#3E8A2E"
+recolor = "fixed"
+paths = ["M 47.5 47.5 L 68.5 47.5 L 68.5 56 C 62 52 54 52 47.5 56 Z", "M 91.5 47.5 L 112.5 47.5 L 112.5 56 C 106 52 98 52 91.5 56 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 58.3 57.5 C 58.3 56.3 59.3 55.3 60.5 55.3 C 61.7 55.3 62.7 56.3 62.7 57.5 C 62.7 58.7 61.7 59.7 60.5 59.7 C 59.3 59.7 58.3 58.7 58.3 57.5 Z", "M 102.3 57.5 C 102.3 56.3 103.3 55.3 104.5 55.3 C 105.7 55.3 106.7 56.3 106.7 57.5 C 106.7 58.7 105.7 59.7 104.5 59.7 C 103.3 59.7 102.3 58.7 102.3 57.5 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#2C5E1E"
+recolor = "fixed"
+paths = ["M 69.5 90 C 69.5 88.6 70.6 87.5 72 87.5 C 73.4 87.5 74.5 88.6 74.5 90 C 74.5 91.4 73.4 92.5 72 92.5 C 70.6 92.5 69.5 91.4 69.5 90 Z", "M 85.5 90 C 85.5 88.6 86.6 87.5 88 87.5 C 89.4 87.5 90.5 88.6 90.5 90 C 90.5 91.4 89.4 92.5 88 92.5 C 86.6 92.5 85.5 91.4 85.5 90 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#2C5E1E"
+recolor = "fixed"
+paths = ["M 62 98 C 72 107 88 107 98 98 C 90 114 70 114 62 98 Z"]
+
+[[layer]]
+role = "pink"
+ref_fill = "#E03B3B"
+recolor = "fixed"
+paths = ["M 77 105 L 83 105 L 83 116 L 90 125 L 85 127.5 L 80 119.5 L 75 127.5 L 70 125 L 77 116 Z"]

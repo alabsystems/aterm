@@ -1417,6 +1417,13 @@ enum LocalRepeatAction {
         session: u64,
         action: SearchRepeatAction,
     },
+    /// One edit of the tab strip's INLINE RENAME field, pinned to the session
+    /// being renamed — a held ⌫ must keep deleting from that session's pin, never
+    /// from whatever field a mid-hold tab switch put under the caret.
+    Rename {
+        session: u64,
+        edit: crate::app_search::SearchEdit,
+    },
     Vi {
         session: u64,
         action: crate::vi_keys::ViAction,
@@ -1802,6 +1809,14 @@ enum Wake {
     /// decides whether the classifier runs ([`App::tone_status`]). Pure read;
     /// the mood is otherwise observable only by ear.
     ToneStatus {
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
+    /// `status` (control socket): the target session's SUBJECT + classified
+    /// STATUS record ([`App::session_status_record`]). A main-thread hop rather
+    /// than a control-thread read like `meta`, because the classifier's state is
+    /// a plain `App` field owned by the event loop.
+    ReadSessionStatus {
+        session: u64,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `spawn` (control socket): open ONE new tab session in the frontmost
@@ -3078,6 +3093,18 @@ impl Backend {
         )
     }
 
+    /// The RAW (legacy `2*pad`) frame size the renderers rasterize at, before
+    /// the visible-height crop above. The WALLPAPER host prepare scales to
+    /// THESE dims — both renderers admit the backdrop only when it matches
+    /// their own framebuffer exactly (the `ensure_wallpaper_px` /
+    /// `ensure_wallpaper_tex` contract).
+    fn raw_frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
+        match self {
+            Backend::Cpu(r) => r.frame_size(rows, cols),
+            Backend::Gpu(g) => g.frame_size(rows, cols),
+        }
+    }
+
     /// Push the cursor blink phase (`on` = solid) into the renderer's state.
     fn set_cursor_blink_phase(&mut self, on: bool) {
         match self {
@@ -3552,6 +3579,12 @@ impl BackendSlot {
         self.ready().frame_size(rows, cols)
     }
 
+    /// See [`Backend::raw_frame_size`] — the uncropped renderer framebuffer
+    /// dims the wallpaper prepare must match exactly.
+    fn raw_frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
+        self.ready().raw_frame_size(rows, cols)
+    }
+
     fn configure_gpu_visible_y(
         &mut self,
         rows: usize,
@@ -3821,6 +3854,13 @@ struct Session {
     /// HANG UP the job tree (SIGHUP) so the reader's blocking `read(master)` gets
     /// EOF and ends — the non-blocking teardown that avoids the macOS quit-hang.
     pid: i32,
+    /// Set once this session's child has ALREADY been reaped (the status path
+    /// takes the exit code with a `waitpid`, which frees the pid). Teardown must
+    /// then NOT signal that pid: under `--hold` the `Session` outlives the reap
+    /// indefinitely, the kernel can reissue the number to an unrelated process
+    /// group, and `hangup`/`reap` would `killpg` — escalating to SIGKILL —
+    /// somebody else's processes.
+    child_reaped: std::sync::atomic::AtomicBool,
     /// Original outgoing pool id when this session owns a PTY adopted through
     /// the current seamless-update handshake. Together with `master` + `pid`,
     /// this lets readiness prove the exact set that reached the live child pool.
@@ -3947,7 +3987,16 @@ impl Drop for Session {
         // (1) Hang up the child's session so the reader unblocks (EOF). Cheap,
         // non-blocking, UI-thread-safe. Dropping the last `Arc<SinkWriter>` clone
         // (here + when the reader exits + when mirrors release) closes the fd.
-        aterm_pty::hangup(self.pid);
+        // A child already reaped by the status path must never be signalled: its
+        // pid is free and may now name an unrelated process group. Everything
+        // below this point that ends the READER (the wake pipe, the stop flag)
+        // still runs — only the pid-addressed signals are skipped.
+        let already_reaped = self
+            .child_reaped
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !already_reaped {
+            aterm_pty::hangup(self.pid);
+        }
         // (1b) MEM-L2: also POKE this session's reader through its wake pipe, then close
         // our (write) end. `hangup` only SIGHUPs the SHELL's pgroup; a child that
         // re-parented itself into another pgroup (setsid / double-fork / `disown`) keeps
@@ -3980,8 +4029,9 @@ impl Drop for Session {
         self.reflow_cancel
             .store(true, std::sync::atomic::Ordering::Release);
         let pid = self.pid;
-        // Nothing to reap for a stub/sentinel session (no real child).
-        if pid <= 1 {
+        // Nothing to reap for a stub/sentinel session (no real child), and
+        // nothing to reap for a child the status path already collected.
+        if pid <= 1 || already_reaped {
             return;
         }
         // (2) Reap the child OFF the UI thread — bounded, self-terminating.
@@ -5526,6 +5576,15 @@ struct WindowState {
     /// only on the committed key-press path — it never sees screen content, so
     /// `cat`ing a file full of "kitty" cannot summon the cameo.
     kitty_summon: crate::kitty_summon::TypedKittySummon,
+    /// TYPED-word DOG cameo lifecycle (`aterm_effects::dog_cameo`): the
+    /// envelope + rolled breed for the canine summon `kitty_summon` fires once
+    /// its typed-a-lot gate opens. Pure presentation state — dogs are never
+    /// recorded anywhere.
+    dog_cameo: aterm_effects::dog_cameo::DogCameo,
+    /// The session the live dog visit was summoned in — the dog's pane/tab
+    /// scope, the same law the typed-kitty cameo's pane tag enforces: a toy
+    /// summoned in tab A must never present on tab B's glass.
+    dog_cameo_session: Option<u64>,
     /// SING-ALONG detector (`aterm_effects::kitty_sing`): the
     /// held-key repeat run, fed on the SAME committed key-press path as
     /// `kitty_summon` (typed provenance only — PTY output and pastes can
@@ -5974,6 +6033,18 @@ struct WindowState {
     /// `last_strip_fp` so moving BETWEEN tabs repaints and moving WITHIN one does
     /// not. Always `None` while the in-grid strip is disabled.
     strip_hover: Option<usize>,
+    /// The last in-grid strip PRESS on a tab chip: when it happened, and which
+    /// STABLE tab it landed on. A second press on the SAME tab within
+    /// [`MULTI_CLICK_MS`] is a double-click, which opens the inline rename editor.
+    ///
+    /// The strip needs its own tiny FSM because AppKit's double-click service does
+    /// not exist off macOS, and because the grid's streak
+    /// (`last_press`/`click_count`) is not shareable: that one takes a BLOCKING
+    /// terminal lock to resolve a grid cell, and a strip click writing into it
+    /// would poison the word/line selection streak. Keyed on the tab ID rather
+    /// than the column because an equal-share relayout moves the column under a
+    /// stationary pointer whenever a tab opens or closes between the two clicks.
+    strip_press: Option<(Instant, tab_model::TabId)>,
     /// The live inline SESSION-RENAME edit on this window's tab strip, or `None`
     /// when nothing is being edited. See [`app_rename::TabRenameEdit`] for why
     /// it is keyed on a session id and carries the tab id only for positioning.
@@ -6190,6 +6261,11 @@ struct WindowState {
     /// Set by Cmd-W; the loop closes this window after the handler returns
     /// (renamed from the old `App.should_exit`).
     pending_close: bool,
+    /// WALLPAPER cover-scale cache: the admitted wallpaper asset scaled to
+    /// exactly THIS window's frame pixel dims and toned toward the theme bg,
+    /// rebuilt only when (asset, dim, theme bg, frame dims) change. `None`
+    /// when no wallpaper is admitted. See [`crate::app_render::WallpaperScaled`].
+    pub(crate) wallpaper_scaled: Option<crate::app_render::WallpaperScaled>,
 }
 
 impl WindowState {
@@ -6929,6 +7005,8 @@ impl WindowState {
             cursor_cat: crate::kitty_cursor::CursorCat::default(),
             cursor_pet: aterm_effects::kitty_pet::PetBrain::default(),
             kitty_summon: crate::kitty_summon::TypedKittySummon::default(),
+            dog_cameo: aterm_effects::dog_cameo::DogCameo::default(),
+            dog_cameo_session: None,
             kitty_sing: aterm_effects::kitty_sing::KittySing::default(),
             music_notes: aterm_effects::kitty_sing::MusicNotes::default(),
             sing_riff_bar: None,
@@ -7023,6 +7101,7 @@ impl WindowState {
             tab_segments: Vec::new(),
             last_strip_fp: None,
             strip_hover: None,
+            strip_press: None,
             rename_edit: None,
             cached_strip_rows: Vec::new(),
             strip_row_pool: Vec::new(),
@@ -7061,6 +7140,7 @@ impl WindowState {
             notice_card: None,
             level_up_card: None,
             pending_close: false,
+            wallpaper_scaled: None,
         }
     }
 }
@@ -9755,6 +9835,7 @@ impl App {
         // opens. Publish the canonical front-tab content at this same stabilization
         // point so Split/Open Session grey out over native whole tabs.
         menu::set_active_tab_is_terminal(focused_session.is_some());
+        menu::set_rename_surface_available(self.can_rename_session(front));
         let next_active = focused_session.and_then(|session| {
             self.pool.get(session).map(|live| control::ActiveSession {
                 term: live.term.clone(),
@@ -9922,6 +10003,8 @@ impl App {
 
         let startup_config = Config::default();
         let path_generation = startup_config.prepare_path_feed_generation();
+        let status_policy = startup_config.tab_status_policy();
+        let status_interval = startup_config.tab_status_observe_interval();
         native_config_service.complete_startup_path_generation(
             path_generation.sparkle.consumer_capabilities(),
             Arc::clone(&path_generation.trail_packs),
@@ -9983,10 +10066,7 @@ impl App {
             theme,
             config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
-            session_status: session_status::StatusObserver::new(
-                session_status::StatusPolicy::default(),
-                std::time::Duration::from_millis(250),
-            ),
+            session_status: session_status::StatusObserver::new(status_policy, status_interval),
             serious_mode: false,
             sparkle: None,
             prepared_sparkle,
@@ -11571,7 +11651,7 @@ impl App {
             // background change that doesn't alter the visible strip (e.g. a
             // title that hashes the same) costs no extra present.
             let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-            let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
             let needs_redraw = self
                 .windows
                 .get(&wid)
@@ -13296,6 +13376,14 @@ impl ApplicationHandler<Wake> for App {
                 // `ExitIffEmpty` invariant). At n==1 this exits the app exactly as
                 // before. An already-closed/unknown session closes nothing.
                 let _ = window;
+                // TAB SUBJECT & STATUS: collect the child's exit status FIRST.
+                // This is the only instant at which it is answerable — the child
+                // is still an unreaped zombie, and `Session::drop`'s teardown
+                // reap (which discards the status) has not run because nothing
+                // has closed yet. Under `--hold` the pane survives its shell, so
+                // this is also what keeps a dead pane from being re-classified
+                // as an idle prompt on the next sweep.
+                self.note_session_exit(session);
                 let to_close = self.exit_session_logical(session);
                 // Exit is a first-class WAKE event, symmetric with `Wake::Output`:
                 // wake every parked observer (`await`/`ready`/`subscribe`) of this
@@ -13568,6 +13656,16 @@ impl ApplicationHandler<Wake> for App {
             // the window (`sync_active_session` when it is the front window); the
             // native segments then re-track via `refresh_window_tabs` in `sync_window`.
             Wake::SelectTab { window, index } => {
+                // A click on a DIFFERENT chip is "a click away", and clicking away
+                // keeps what you typed. The macOS strip's `TabView` is a plain
+                // NSView that never takes first responder, so AppKit never ends
+                // field editing for it and `controlTextDidEndEditing:` never fires
+                // — typing would keep landing in a field floating over the old tab.
+                // Settled HERE and not in `switch_tab_in`: both `SelectTab`
+                // constructors are human gestures on the strip, while
+                // `switch_tab_in` is the shared body every programmatic path
+                // (including the control socket's `tab <N>`) runs through.
+                self.settle_rename_edit(window);
                 self.switch_tab_in(window, index);
             }
             // A native tab's close × was clicked — close tab `index` of `window` as a
@@ -13575,6 +13673,12 @@ impl ApplicationHandler<Wake> for App {
             // take. If it was the window's LAST tab, flag + escalate (we have `el`
             // here) so the window tears down, exactly like a tab-strip close.
             Wake::CloseTab { window, index } => {
+                // Settle FIRST, like every other spelling of "close". The native
+                // close ✕ posts this wake, while the in-grid ✕, ⌘W and the
+                // context menu all settle on their way in — without this, the
+                // same gesture committed the pin or threw it away depending on
+                // which ✕ the user happened to click.
+                self.settle_rename_edit(window);
                 if self.close_tab_at(window, index)
                     && let Some(ws) = self.windows.get_mut(&window)
                 {
@@ -13593,6 +13697,18 @@ impl ApplicationHandler<Wake> for App {
                 tab,
                 action,
             } => {
+                // The SAME divert the menu bar takes (`dispatch_menu_action` runs
+                // it first thing). Without it the two spellings of one command
+                // disagreed: Close Tab from the menu bar committed the edit, while
+                // Close Tab from the chip's own context menu closed the tab out
+                // from under the editor and the resulting "tab vanished" cancel
+                // DISCARDED what was typed. Guarded at the wake, not at
+                // `dispatch_tab_menu_action`'s head — the menu-bar path reaches
+                // that dispatcher through `dispatch_menu_action`, which has
+                // already diverted, so a guard there would divert twice.
+                if self.divert_menu_action_around_rename(action) {
+                    return;
+                }
                 self.dispatch_tab_menu_action(el, window, tab, action);
             }
             // A tab chip was double-clicked: open the inline pin editor over that
@@ -13970,6 +14086,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ToneStatus { reply } => {
                 let _ = reply.send(self.tone_status());
+            }
+            Wake::ReadSessionStatus { session, reply } => {
+                let _ = reply.send(self.session_status_record(session));
             }
             Wake::SettingsShowSection { route, reply } => {
                 let _ = reply.send(self.settings_show_route(route));
@@ -16099,8 +16218,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         config: config.clone(),
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
         session_status: session_status::StatusObserver::new(
-            session_status::StatusPolicy::default(),
-            std::time::Duration::from_millis(250),
+            config.tab_status_policy(),
+            config.tab_status_observe_interval(),
         ),
         serious_mode: config.serious_mode_or_default(),
         sparkle: None,
@@ -16408,6 +16527,7 @@ fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
         )),
     });
     Session {
+        child_reaped: std::sync::atomic::AtomicBool::new(false),
         id,
         term: Arc::new(Mutex::new(Terminal::new(24, 80))),
         master: -1,
@@ -23594,6 +23714,7 @@ mod session_pool_tests {
             )),
         });
         Session {
+            child_reaped: std::sync::atomic::AtomicBool::new(false),
             id,
             term: Arc::new(Mutex::new(Terminal::new(24, 80))),
             master: -1,

@@ -62,6 +62,27 @@
 //!   `cargo clippy` is wrong here and fails closed: the stage2 tree ships no
 //!   `cargo-clippy`, so it would resolve one off PATH and drive a stable rustc
 //!   that rejects this workspace's `-Ztrust-verify=off`.
+//!
+//!   THE IDENTITY-GUARD ABORT IS NOT A LINT RESULT. Branded Tippy authenticates
+//!   its own toolchain (see [`TIPPY_IDENTITY_ABORTS`]), and any create/unlink/
+//!   rename in ANY ancestor of the stage2 sysroot mid-run aborts it — a run can
+//!   lint clean, print `Finished dev profile`, and still exit non-zero. This
+//!   lane retries that signature and only that signature; a real `-D warnings`
+//!   failure is never retried into a pass.
+//!
+//!   RUNNING IT BY HAND — two traps. The path must be CANONICAL:
+//!   `$HOME/trust/build/host/stage2/bin` traverses a symlink and is refused
+//!   outright ("traverses a symlink or non-canonical path"); use
+//!   `$HOME/trust/build/<host-triple>/stage2/bin`. (This verb is safe either way —
+//!   `trust_stage2_bin` canonicalizes — but a human copying the `build/host`
+//!   path is not.) And give each concurrent invoker its OWN `CARGO_TARGET_DIR`:
+//!   the guarded window spans cargo's build-lock WAIT, so a shared
+//!   `target-tippy` leaves a fast crate exposed for as long as it is queued.
+//!   The working single-crate form of this lane is:
+//!   `PATH="$HOME/trust/build/<triple>/stage2/bin:$PATH"
+//!   CARGO_TARGET_DIR=<root>/target-tippy TRUST_NO_MIGRATE_WARN=1 targo-tippy
+//!   -p <crate> --all-targets -- -D warnings` (add `--no-deps` to see one
+//!   crate's own findings when a workspace peer is red).
 //! - `counts`: COMPUTED-ONLY PROOF INVENTORY. Counts ordinary `#[kani::proof]`
 //!   attributes under workspace crates, fails closed on scan/read errors or an
 //!   empty inventory, and rejects a hand-maintained README total. The semantic
@@ -1535,6 +1556,88 @@ fn run_shell_env(
     }
 }
 
+/// The two signatures branded Tippy emits when its TOOLCHAIN-IDENTITY guard
+/// trips. Neither is a lint result: the run can lint completely clean, print
+/// `Finished dev profile`, and still exit non-zero.
+///
+/// `AuthenticatedDriverExecution::capture` snapshots the stage2 sysroot's whole
+/// ANCESTOR-DIRECTORY CHAIN (up to `/`) plus `trustc`/`tippy-driver` — dev, ino,
+/// mode, nlink, uid, gid, mtime, ctime for each — and re-validates before AND
+/// after the guarded operation. An entry created, removed or renamed in ANY
+/// ancestor mid-run aborts it. A `$HOME/trust` rebuild relinking stage2 is the
+/// realistic trigger; sampling this box's real chain at 4 Hz for 15 minutes
+/// found zero churn, so it is rare but genuinely environmental.
+/// Attempts allowed for a tippy run aborted by the identity guard. Three is
+/// generous for an abort whose trigger is a one-off filesystem event; a run
+/// that trips it three times is telling you the tree is not quiet.
+const TIPPY_IDENTITY_RETRIES: u32 = 3;
+
+const TIPPY_IDENTITY_ABORTS: [&str; 2] = [
+    "branded Tippy driver identity changed",
+    "compiler identity changed while Targo was running",
+];
+
+/// [`run_shell_env`] that also TEES stderr, so a caller can tell a transient
+/// environment abort from a real finding. Only the tippy lane needs this; every
+/// other lane's failure means what it says.
+fn run_shell_env_capturing(
+    desc: &str,
+    program: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    path_prefix: Option<&Path>,
+    cwd: &Path,
+) -> (bool, String) {
+    use std::io::Read as _;
+    eprintln!("  $ {program} {}", args.join(" "));
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    if let Some(prefix) = path_prefix {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let mut entries = vec![prefix.to_path_buf()];
+        entries.extend(std::env::split_paths(&existing));
+        match std::env::join_paths(entries) {
+            Ok(joined) => {
+                command.env("PATH", joined);
+            }
+            Err(e) => eprintln!("  {desc}: could not extend PATH ({e}); using inherited PATH"),
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {desc}: could not run ({e})");
+            return (false, String::new());
+        }
+    };
+    let mut captured = String::new();
+    if let Some(mut err) = child.stderr.take() {
+        let mut buf = Vec::new();
+        let _ = err.read_to_end(&mut buf);
+        captured = String::from_utf8_lossy(&buf).into_owned();
+        // TEE: the operator must still see the findings live, exactly as the
+        // uncaptured lanes print them.
+        eprint!("{captured}");
+    }
+    match child.wait() {
+        Ok(s) if s.success() => (true, captured),
+        Ok(s) => {
+            eprintln!("  {desc}: FAILED (exit {:?})", s.code());
+            (false, captured)
+        }
+        Err(e) => {
+            eprintln!("  {desc}: could not run ({e})");
+            (false, captured)
+        }
+    }
+}
+
 fn run_shell(desc: &str, program: &str, args: &[&str]) -> bool {
     eprintln!("  $ {program} {}", args.join(" "));
     let status = Command::new(program)
@@ -1756,20 +1859,64 @@ impl LintLanes for LiveLintLanes<'_> {
             // other's cache), and tippy's own directory first on PATH so it
             // finds its `tippy-driver`.
             LintLane::Tippy => match resolve_tippy(self.tools) {
-                Some(bin) => run_shell_env(
-                    "tippy",
-                    &bin.to_string_lossy(),
-                    &["--workspace", "--all-targets", "--", "-D", "warnings"],
-                    &[
-                        (
-                            "CARGO_TARGET_DIR",
-                            self.root.join("target-tippy").to_string_lossy().as_ref(),
-                        ),
-                        ("TRUST_NO_MIGRATE_WARN", "1"),
-                    ],
-                    Some(self.tools),
-                    self.root,
-                ),
+                // RETRY THE IDENTITY ABORT, AND ONLY THAT. See
+                // [`TIPPY_IDENTITY_ABORTS`]: the guard can trip on a clean run,
+                // so reporting it as red is a lie in one direction — and
+                // retrying anything else would be a lie in the far worse
+                // direction, turning a genuine `-D warnings` failure into a
+                // pass. The match is on the abort signature alone.
+                //
+                // The window is wider than the compile: it spans cargo's
+                // BUILD-LOCK WAIT, so with one shared `target-tippy` a
+                // two-second leaf crate can sit exposed for minutes queued
+                // behind another build. That is why the crates observed failing
+                // were the FAST ones, and why concurrent invokers should each
+                // use their own `CARGO_TARGET_DIR`.
+                Some(bin) => {
+                    let mut outcome = false;
+                    for attempt in 1..=TIPPY_IDENTITY_RETRIES {
+                        let (ok, stderr) = run_shell_env_capturing(
+                            "tippy",
+                            &bin.to_string_lossy(),
+                            &["--workspace", "--all-targets", "--", "-D", "warnings"],
+                            &[
+                                (
+                                    "CARGO_TARGET_DIR",
+                                    self.root.join("target-tippy").to_string_lossy().as_ref(),
+                                ),
+                                ("TRUST_NO_MIGRATE_WARN", "1"),
+                            ],
+                            Some(self.tools),
+                            self.root,
+                        );
+                        if ok {
+                            outcome = true;
+                            break;
+                        }
+                        let aborted = TIPPY_IDENTITY_ABORTS
+                            .iter()
+                            .any(|sig| stderr.contains(sig));
+                        if !aborted {
+                            // A real finding (or any other failure): report it.
+                            break;
+                        }
+                        if attempt == TIPPY_IDENTITY_RETRIES {
+                            eprintln!(
+                                "  tippy: toolchain-identity abort on all {TIPPY_IDENTITY_RETRIES} \
+                                 attempts — NOTHING WAS LINTED. This is an environment abort, not \
+                                 a clean lint: something changed an ancestor of the stage2 sysroot \
+                                 mid-run (a $HOME/trust rebuild will do it). Re-run once the tree is \
+                                 quiet."
+                            );
+                            break;
+                        }
+                        eprintln!(
+                            "  tippy: toolchain-identity abort (attempt \
+                             {attempt}/{TIPPY_IDENTITY_RETRIES}) — transient, retrying"
+                        );
+                    }
+                    outcome
+                }
                 None => {
                     eprintln!(
                         "  tippy: NOT RUN — no targo-tippy/targo-clippy in {}. Nothing was \
@@ -2243,6 +2390,50 @@ fn gate_perf_with(lanes: &mut dyn PerfLanes) -> bool {
         );
     }
     ok
+}
+
+
+#[cfg(test)]
+mod tippy_identity_retry_tests {
+    use super::*;
+
+    /// THE IDENTITY ABORT IS RETRIED; A REAL FINDING IS NOT.
+    ///
+    /// Both directions matter and only one of them is obvious. Retrying the
+    /// abort is what stops a clean tree reading as red. NOT retrying anything
+    /// else is what stops a genuine `-D warnings` failure being retried into a
+    /// pass — the far worse error, and the reason the match is on the abort
+    /// signature alone rather than on "did it fail".
+    #[test]
+    fn only_the_identity_abort_is_retried() {
+        // Non-vacuity: the signatures the lane matches on must be the ones
+        // branded Tippy actually prints, so a reworded upstream message shows
+        // up here rather than as a silently un-retried abort.
+        assert!(TIPPY_IDENTITY_ABORTS
+            .iter()
+            .any(|s| s.contains("driver identity changed")));
+        assert!(TIPPY_IDENTITY_ABORTS
+            .iter()
+            .any(|s| s.contains("while Targo was running")));
+
+        let abort = "error: branded Tippy driver identity changed: selected Trust \
+                     toolchain directory ancestor /Users changed identity or contents";
+        let finding = "error: unused variable: `now`\nerror: could not compile";
+        let is_abort =
+            |text: &str| TIPPY_IDENTITY_ABORTS.iter().any(|sig| text.contains(sig));
+
+        assert!(is_abort(abort), "the guard trip must be recognised");
+        assert!(
+            !is_abort(finding),
+            "a real -D warnings finding must NEVER be retried into a pass"
+        );
+        // The budget is finite: an abort that never clears has to fail, or a
+        // permanently churning tree would spin here forever. Checked at COMPILE
+        // time — it is a claim about a constant, and a runtime assert over
+        // constants is exactly the vacuous shape this session spent four rounds
+        // removing.
+        const { assert!(TIPPY_IDENTITY_RETRIES >= 2 && TIPPY_IDENTITY_RETRIES <= 5) };
+    }
 }
 
 #[cfg(test)]

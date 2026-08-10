@@ -129,6 +129,23 @@ fn is_denied_env_key(key: &std::ffi::OsStr) -> bool {
     }
 }
 
+/// How a spawned child ended, as far as the platform can actually say.
+///
+/// Deliberately platform-neutral and deliberately partial: the collector that
+/// produces it ([`collect_exit_status`]) never blocks, so "not yet exited" and
+/// "not ours to reap" both answer `None` rather than a fabricated code. An
+/// ADOPTED session (the seamless-update handoff) is a child of the PREVIOUS
+/// aterm process and can never yield a status at all — treat `None` as an
+/// honest unknown, never as success.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildExit {
+    /// Normal termination with this status code.
+    Code(i32),
+    /// Killed by this signal (Unix only; Windows reports the code the kernel
+    /// substitutes).
+    Signal(u8),
+}
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]

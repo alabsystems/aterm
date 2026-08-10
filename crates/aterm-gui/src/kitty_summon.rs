@@ -4,7 +4,7 @@
 //! TYPED-WORD detector: the companion reacts to words you TYPE at the prompt,
 //! in every language the lexicon knows.
 //!
-//! Two families are recognized, both straight out of [`aterm_lexicon`]:
+//! Three families are recognized, all straight out of [`aterm_lexicon`]:
 //!
 //! * [`Class::Feline`] — typing `kitty` (or `gato`, `chat`, `neko`, `kucing`,
 //!   `猫`, …) summons a kitty cameo IN the terminal, the input-path twin of the
@@ -13,6 +13,11 @@
 //!   makes the companion WINCE. The screen scanner already reacts to profanity
 //!   it can SEE (`word_decorations`'s `CurseCue`); this is the same reaction
 //!   owed to a word that is merely typed, including into a no-echo prompt.
+//! * [`Class::Canine`] — typing `dog` / `puppy` (or `perro`, `chiot`,
+//!   `hund`, `子犬`, …) pops up a DOG next to the cursor — but only after the
+//!   window has typed a lot ([`DOG_SUMMON_KEYS`] printed keystrokes). Every
+//!   summon rolls a fresh breed from the authored roster
+//!   (`aterm_effects::dog_cameo`); dogs carry no ledger tier at all.
 //!
 //! MULTILINGUAL BY CONSTRUCTION, AND WORD-BOUNDED. Until 2026-07-26 this module
 //! hardcoded `WORD: [char; 5] = ['k','i','t','t','y']` and completed on a
@@ -80,6 +85,16 @@ use std::time::{Duration, Instant};
 /// two-tier note in the module docs.
 pub(crate) const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// THE DOG GATE (owner's design, 2026-08-10: "you have to type a lot first"):
+/// canine completions summon only after this many PRINTED keystrokes have been
+/// fed to this window's detector, lifetime-of-the-window. The kitty answers
+/// its name from the first keystroke — it lives here; the dog has to hear a
+/// LOT of typing before it trots over from wherever dogs wait. Counted on the
+/// same committed-key path as the rolling window (PTY output, paste, and IME
+/// non-commits can never inflate it), never reset by session switches,
+/// breaks, or backspaces — deleting text does not un-type it.
+pub(crate) const DOG_SUMMON_KEYS: u64 = 500;
+
 /// What one keystroke did to the typed-feline detector.
 ///
 /// Ordered so folding several outcomes (a multi-char IME commit) with `max`
@@ -117,6 +132,11 @@ pub(crate) struct TypedHit {
     pub(crate) feline: bool,
     /// A profanity word completed — the companion's WINCE reaction is owed.
     pub(crate) profanity: bool,
+    /// A canine word completed AND the window has typed a lot
+    /// ([`DOG_SUMMON_KEYS`]) — the dog cameo is owed. Below the gate a canine
+    /// completion is consumed silently (no tier, no ledger, no reaction): the
+    /// dog simply has not arrived yet.
+    pub(crate) canine: bool,
 }
 
 impl TypedHit {
@@ -127,6 +147,7 @@ impl TypedHit {
             summon: self.summon.max(other.summon),
             feline: self.feline || other.feline,
             profanity: self.profanity || other.profanity,
+            canine: self.canine || other.canine,
         }
     }
 }
@@ -161,6 +182,16 @@ pub(crate) const TYPED_SUMMON_IDENT_TAG: u64 = 0x7479_7065_644B_6974;
 /// namespace tag, not the sequence.
 pub(crate) const FAVOURITE_IDENT_TAG: u64 = 0x6661_764B_6974_7479;
 
+/// Ident-namespace tag for typed DOG summons (`b"typedDog"` as big-endian
+/// ASCII), XOR'd with the same App-wide summon sequence. Dogs carry NO ledger
+/// tier — the Kitty Log is cats — so this ident is never recorded anywhere:
+/// it exists purely as the per-summon SEED for the dog cameo's breed/coat
+/// roll, fresh per summon so "dog dog dog" parades different breeds.
+///
+/// scope-waiver: same shape as [`TYPED_SUMMON_IDENT_TAG`] — a constant
+/// namespace tag, not the sequence.
+pub(crate) const DOG_SUMMON_IDENT_TAG: u64 = 0x7479_7065_6444_6f67;
+
 /// Per-window detector state: the rolling keystroke window (keyed to the
 /// session it was typed into), the summon cooldown stamp, and the resident
 /// scan buffers.
@@ -182,6 +213,11 @@ pub(crate) struct TypedKittySummon {
     chars: Vec<char>,
     matches: Vec<Match>,
     scratch: ScanScratch,
+    /// Lifetime count of printed keystrokes fed to this window's detector —
+    /// the [`DOG_SUMMON_KEYS`] gate's odometer. Deliberately NOT reset by
+    /// session switches, breaks, or backspaces (see the gate's doc), and not
+    /// persisted: each window earns its dog fresh.
+    keys_typed: u64,
 }
 
 impl TypedKittySummon {
@@ -221,6 +257,7 @@ impl TypedKittySummon {
         opts: &ScanOptions,
     ) -> TypedHit {
         self.rekey(session);
+        self.keys_typed = self.keys_typed.saturating_add(1);
         self.buf.push(ch);
         self.trim();
         let Self {
@@ -253,9 +290,8 @@ impl TypedKittySummon {
         self.buf.clear();
         match class {
             Class::Profanity => TypedHit {
-                summon: TypedSummon::None,
-                feline: false,
                 profanity: true,
+                ..TypedHit::default()
             },
             Class::Feline => {
                 let summon = if self
@@ -271,9 +307,17 @@ impl TypedKittySummon {
                 TypedHit {
                     summon,
                     feline: true,
-                    profanity: false,
+                    ..TypedHit::default()
                 }
             }
+            // The dog comes only once the window has TYPED A LOT (the
+            // [`DOG_SUMMON_KEYS`] gate). Below the gate the completion is
+            // still consumed — the letters were spent calling a dog that has
+            // not arrived yet — and nothing tiers, records, or reacts.
+            Class::Canine => TypedHit {
+                canine: self.keys_typed >= DOG_SUMMON_KEYS,
+                ..TypedHit::default()
+            },
             // Other classes (orca, emphasis) carry no companion reaction.
             _ => TypedHit::default(),
         }
@@ -504,22 +548,119 @@ mod tests {
     }
 
     /// `merge` keeps the strongest of each independent axis, so one IME commit
-    /// carrying both families owes both reactions.
+    /// carrying several families owes every reaction.
     #[test]
     fn merge_keeps_every_axis() {
         let feline = TypedHit {
             summon: TypedSummon::CameoAndLog,
             feline: true,
-            profanity: false,
+            ..TypedHit::default()
         };
         let curse = TypedHit {
-            summon: TypedSummon::None,
-            feline: false,
             profanity: true,
+            ..TypedHit::default()
         };
-        let both = feline.merge(curse);
-        assert_eq!(both.summon, TypedSummon::CameoAndLog);
-        assert!(both.feline && both.profanity);
+        let dog = TypedHit {
+            canine: true,
+            ..TypedHit::default()
+        };
+        let all = feline.merge(curse).merge(dog);
+        assert_eq!(all.summon, TypedSummon::CameoAndLog);
+        assert!(all.feline && all.profanity && all.canine);
+    }
+
+    /// Feed a string one char at a time; count CANINE hits (gate-passed dogs).
+    fn feed_dogs(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
+        let lx = lex();
+        let opts = ScanOptions::default();
+        s.chars()
+            .filter(|&c| d.note_char(now, session, c, &lx, &opts).canine)
+            .count()
+    }
+
+    /// Type `n` keystrokes of neutral filler (letters + spaces, never a
+    /// lexicon word) to walk the odometer forward.
+    fn type_filler(d: &mut TypedKittySummon, now: Instant, session: u64, n: u64) {
+        let lx = lex();
+        let opts = ScanOptions::default();
+        let filler: Vec<char> = "qwzx ".chars().collect();
+        for i in 0..n {
+            let c = filler[(i % filler.len() as u64) as usize];
+            assert_eq!(
+                d.note_char(now, session, c, &lx, &opts),
+                TypedHit::default(),
+                "filler must never fire anything"
+            );
+        }
+    }
+
+    /// THE DOG GATE: `dog` and `puppy` summon nothing until the window has
+    /// typed [`DOG_SUMMON_KEYS`] keystrokes — then they summon every time,
+    /// with no ledger tier and no companion reaction flags.
+    #[test]
+    fn dogs_arrive_only_after_a_lot_of_typing() {
+        let mut d = TypedKittySummon::default();
+        let t = Instant::now();
+        assert_eq!(
+            feed_dogs(&mut d, t, 7, "dog "),
+            0,
+            "no dog fresh out of the box"
+        );
+        assert_eq!(feed_dogs(&mut d, t, 7, "puppy "), 0, "no puppy either");
+        // "dog puppy " above already advanced the odometer by 11; filler walks
+        // it to exactly one keystroke short of the gate.
+        type_filler(&mut d, t, 7, DOG_SUMMON_KEYS - 11 - 4);
+        assert_eq!(feed_dogs(&mut d, t, 7, "dog "), 0, "one short of the gate");
+        assert_eq!(feed_dogs(&mut d, t, 7, "dog "), 1, "the gate opened — dog!");
+        assert_eq!(
+            feed_dogs(&mut d, t, 7, "puppy puppy "),
+            2,
+            "every completion summons once earned (no cooldown tier for dogs)"
+        );
+        let lx = lex();
+        let opts = ScanOptions::default();
+        let mut earned = TypedKittySummon::default();
+        type_filler(&mut earned, t, 7, DOG_SUMMON_KEYS);
+        for c in "dog".chars() {
+            let hit = earned.note_char(t, 7, c, &lx, &opts);
+            assert!(!hit.summon.shows_cameo(), "a dog is not a kitty cameo");
+            assert!(!hit.feline && !hit.profanity, "a dog owes no cat reaction");
+        }
+    }
+
+    /// The odometer is a lifetime count: session switches, breaks, and
+    /// backspaces clear the WORD window but never un-type the keystrokes.
+    #[test]
+    fn the_gate_odometer_survives_window_resets() {
+        let mut d = TypedKittySummon::default();
+        let t = Instant::now();
+        type_filler(&mut d, t, 1, DOG_SUMMON_KEYS / 2);
+        d.note_break();
+        for _ in 0..8 {
+            d.note_backspace(1);
+        }
+        type_filler(&mut d, t, 2, DOG_SUMMON_KEYS.div_ceil(2));
+        assert_eq!(
+            feed_dogs(&mut d, t, 2, " dog "),
+            1,
+            "typing across sessions/breaks still adds up to a lot"
+        );
+    }
+
+    /// Multilingual like everything else here: once earned, the listed
+    /// languages' dog words summon through the same detector.
+    #[test]
+    fn earned_dogs_answer_in_every_listed_language() {
+        let t = Instant::now();
+        for word in ["dog", "puppy", "perro", "cachorro", "hund", "inu"] {
+            let mut d = TypedKittySummon::default();
+            type_filler(&mut d, t, 7, DOG_SUMMON_KEYS);
+            assert_eq!(
+                feed_dogs(&mut d, t, 7, &format!("{word} ")),
+                1,
+                "typing {word:?} summons the dog once earned"
+            );
+        }
     }
 
     /// Backspace tolerance as documented: fixing a typo mid-word keeps the

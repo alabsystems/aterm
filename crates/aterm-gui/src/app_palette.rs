@@ -110,8 +110,12 @@ impl App {
         let terminal_front = self
             .frontmost_window
             .is_some_and(|wid| self.front_terminal(wid).is_some());
+        let can_rename = self
+            .frontmost_window
+            .is_some_and(|wid| self.can_rename_session(wid));
         PaletteLive {
             has_selection,
+            can_rename,
             settings_open: self.settings_tab_open(),
             rain_on,
             session_kitty_favourited,

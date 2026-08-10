@@ -2006,6 +2006,7 @@ mod tests {
         let rgba: Arc<[u8]> = Arc::from([0xff, 0x22, 0xaa, 0xff]);
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
+            wallpaper: crate::app_config::WallpaperAsset::None,
             kitty_sprite: crate::app_config::KittySpriteAsset::Ready {
                 source_id: Arc::from("test.png"),
                 w: 1,

@@ -190,7 +190,7 @@ GOTCHAS
   * INERT BY DEFAULT: a plain `cargo build` bakes no root key, so the network verbs
     (install/update/sync/rollback) refuse with exit 1. Local read/maintenance verbs
     (list/which/run/doctor/verify/...) still work. Enable without a rebuild by exporting
-    ATPKG_ROOTKEY_OVERRIDE=<base64 ed25519 pubkey>; kill switch is ATPKG_DISABLE.
+    The root anchor is compiled in (see aterm-update-core::pins); kill switch is ATPKG_DISABLE.
   * Channel is hard-wired to "stable" today; the real verbs are exactly atpkg's match
     arms (doctor/which/list/run/uninstall/install/update/sync/rollback/pin/gc/verify/...)."#,
         ),

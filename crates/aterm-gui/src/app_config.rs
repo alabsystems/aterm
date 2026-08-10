@@ -193,6 +193,28 @@ pub(crate) struct Config {
     /// `nyan` spelling on purpose: renaming it would orphan every
     /// `cursor_nyan_sprite` line already sitting in a user's `config.toml`.
     pub(crate) cursor_nyan_sprite: Option<String>,
+    /// WALLPAPER image path: a picture drawn as the BACKDROP of every terminal
+    /// tab (settings and other native tabs are never wallpapered). The image is
+    /// cover-scaled to the window, toned toward the theme background by
+    /// [`wallpaper_dim`](Self::wallpaper_dim), and shows through every cell
+    /// whose background is the terminal default; selections and explicitly
+    /// colored backgrounds still paint over it. Set from Settings ▸ Wallpaper
+    /// (Choose Image… / Detach) or by hand. PNG everywhere; JPEG/HEIC/TIFF/GIF
+    /// and friends decode through the system on macOS. `~` expands to $HOME.
+    /// Unset ⇒ no wallpaper (the flat theme background, exactly as before).
+    pub(crate) wallpaper: Option<String>,
+    /// How strongly the wallpaper is toned toward the theme background for
+    /// text legibility: `0.0` shows the raw image, `1.0` is the flat theme
+    /// background. Default 0.3.
+    pub(crate) wallpaper_dim: Option<f32>,
+    /// WALLPAPER TEXT TINT: default-colored glyphs pick up the hue of the
+    /// backdrop under their own cell at an automatically readable brightness —
+    /// light ink over the picture's dark areas, dark ink over its bright
+    /// ones, always clearing a WCAG contrast floor — so the text shimmers
+    /// with the picture behind it and stays legible on any wallpaper.
+    /// SGR-colored text (prompts, `ls` colors) keeps its own colors. Only
+    /// active while a wallpaper is attached. Default ON.
+    pub(crate) wallpaper_text_tint: Option<bool>,
     /// How long (milliseconds) a swept cell takes to fade out. Default 260.
     pub(crate) cursor_trail_ms: Option<u64>,
     /// Maximum comet length in cells (a long jump keeps the brightest cells
@@ -493,6 +515,25 @@ pub(crate) struct Config {
     /// Composition of application title and live description in the native
     /// window title. Defaults to `title-description`.
     pub(crate) window_title_format: Option<TitleFormat>,
+    /// Master switch for per-session status classification (RFC: Tab Subject &
+    /// Status §12). Default ON. `false` genuinely stops the classifier — no
+    /// evidence is gathered, no terminal lock is attempted, and no session ever
+    /// publishes a status — rather than merely hiding what it computed.
+    pub(crate) tab_status: Option<bool>,
+    /// How long a foreground job may print nothing before its phase becomes
+    /// `quiet`. Default 5000; clamped to 500..=120000 so a typo can neither make
+    /// every job look stalled instantly nor keep a finished build lit for hours.
+    pub(crate) tab_status_quiet_after_ms: Option<u64>,
+    /// Minimum time a candidate phase must hold before it is published. Default
+    /// 750; clamped to 0..=10000. Zero is legal and means "publish every
+    /// transition", which is honest for scripted/headless drivers even though it
+    /// lets a spinner flap the badge.
+    pub(crate) tab_status_dwell_ms: Option<u64>,
+    /// Whether a classified status projects onto the tab's busy/attention
+    /// indicator bits. Default ON. Turning this off keeps classification running
+    /// (the record stays readable through the `status` verb and the tooltip) and
+    /// only stops the tab chrome from marking itself.
+    pub(crate) tab_status_badge: Option<bool>,
     /// BiDi (right-to-left) text handling: `"implicit"` (default — automatic
     /// per-line UAX#9 reordering, so Hebrew/Arabic display in visual order),
     /// `"disabled"` (keep logical order), or `"explicit"` (app-controlled). Maps to
@@ -804,6 +845,25 @@ pub(crate) const DEFAULT_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 20;
 pub(crate) const MIN_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 1;
 pub(crate) const MAX_TITLE_SUMMARY_TIMEOUT_SECONDS: u64 = 120;
 
+/// Tab Subject & Status policy bounds (RFC §12). Declared `pub(crate)` so
+/// `prefs` derives its slider domain from the SAME numbers the resolver clamps
+/// to — a Settings save can then never write a value reload would silently
+/// rewrite.
+pub(crate) const DEFAULT_TAB_STATUS_QUIET_AFTER_MS: u64 = 5_000;
+pub(crate) const MIN_TAB_STATUS_QUIET_AFTER_MS: u64 = 500;
+pub(crate) const MAX_TAB_STATUS_QUIET_AFTER_MS: u64 = 120_000;
+pub(crate) const DEFAULT_TAB_STATUS_DWELL_MS: u64 = 750;
+pub(crate) const MIN_TAB_STATUS_DWELL_MS: u64 = 0;
+pub(crate) const MAX_TAB_STATUS_DWELL_MS: u64 = 10_000;
+/// Nominal observation budget: at most one classification per session per this
+/// interval (RFC §10). NOT a config key — the RFC's configuration surface is the
+/// four `tab_status*` keys, and an interval the user can raise independently of
+/// dwell would just be a way to make dwell unserviceable.
+const NOMINAL_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 250;
+/// Floor on that budget, which `tab_status_dwell_ms = 0` would otherwise take to
+/// zero and turn every output burst into a classification.
+const MIN_TAB_STATUS_OBSERVE_INTERVAL_MS: u64 = 50;
+
 /// An ordered font list (W6 `fallback_fonts`) that deserializes from EITHER a
 /// TOML array of strings (`["A", "B"]`) or a single comma-separated string
 /// (`"A, B"` — the form the Settings text editor writes, so a Save round-trips
@@ -897,6 +957,8 @@ pub(crate) struct SparkleWordsConfig {
     pub(crate) profanity: Option<SparkleProfanityConfig>,
     /// The steady feline CAT-PAW sub-table.
     pub(crate) feline: Option<SparkleFelineConfig>,
+    /// The typed-word DOG cameo sub-table.
+    pub(crate) canine: Option<SparkleCanineConfig>,
     /// Retained compatibility-only Orca sub-table. It parses and round-trips,
     /// but `ORCA_SUSPENDED` makes the whole subtree have no runtime effect.
     pub(crate) orca: Option<SparkleOrcaConfig>,
@@ -1095,6 +1157,16 @@ pub(crate) const MAX_KITTY_SPRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_KITTY_SPRITE_DIMENSION: usize = 1024;
 const MAX_KITTY_SOURCE_ID_BYTES: usize = 2 * 1024;
 const MAX_KITTY_REASON_BYTES: usize = 320;
+
+/// Bounded read for the configured WALLPAPER image file (a photo is an
+/// ordinary source, so this is far above the kitty sprite's 8 MiB).
+pub(crate) const MAX_WALLPAPER_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Reject a wallpaper whose DECODED dims exceed this per side (the
+/// allocation bound; a 5K/6K screenshot fits comfortably).
+pub(crate) const MAX_WALLPAPER_SOURCE_DIMENSION: usize = 8192;
+/// Downscale an admitted wallpaper so neither side exceeds this (the resident
+/// memory bound — still larger than any window it will be cover-scaled to).
+pub(crate) const MAX_WALLPAPER_KEEP_DIMENSION: usize = 4096;
 
 /// The installed-theme directory is ambient user input.  Discovery retains a
 /// bounded, deterministic prefix and every individual file is read through a
@@ -1579,6 +1651,65 @@ impl KittySpriteAsset {
     }
 }
 
+/// The admitted WALLPAPER image for one config revision — the `wallpaper` key
+/// resolved once at the same seam as the rainbow kitty sprite, so live
+/// rendering, validation, and Settings all see one decode verdict. `Ready`
+/// holds straight sRGB RGBA8, already bounded to
+/// [`MAX_WALLPAPER_KEEP_DIMENSION`] per side; per-window cover-scaling to the
+/// frame happens at splice time against this one source.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WallpaperAsset {
+    /// No `wallpaper` key configured — no backdrop, the historical frame.
+    #[default]
+    None,
+    Ready {
+        source_id: std::sync::Arc<str>,
+        w: u32,
+        h: u32,
+        rgba: std::sync::Arc<[u8]>,
+        fp: u64,
+    },
+    Invalid {
+        source_id: std::sync::Arc<str>,
+        bounded_reason: std::sync::Arc<str>,
+    },
+}
+
+impl WallpaperAsset {
+    /// Stable paint identity. The variant is part of the identity, so
+    /// `Invalid` can never alias `None` even though both paint no backdrop.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        match self {
+            Self::None => 0x5741_4C4C_5F4F_4646, // "WALL_OFF"
+            Self::Ready { fp, .. } => *fp,
+            Self::Invalid {
+                source_id,
+                bounded_reason,
+            } => stable_asset_fingerprint(
+                0x77,
+                source_id.as_bytes(),
+                0,
+                0,
+                bounded_reason.as_bytes(),
+            ),
+        }
+    }
+
+    pub(crate) fn source_id(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Ready { source_id, .. } | Self::Invalid { source_id, .. } => Some(source_id),
+        }
+    }
+
+    pub(crate) fn diagnostic(&self) -> Option<&str> {
+        match self {
+            Self::Invalid { bounded_reason, .. } => Some(bounded_reason),
+            Self::None | Self::Ready { .. } => None,
+        }
+    }
+}
+
 /// Every non-text config asset admitted at one revision.  `ConfigSnapshot`
 /// carries one outer `Arc<ConfigAssetCatalog>` and the live host, capture, and
 /// all Settings views clone that exact Arc; there is no independently-resolved
@@ -1587,6 +1718,9 @@ impl KittySpriteAsset {
 pub(crate) struct ConfigAssetCatalog {
     pub(crate) trail_packs: std::sync::Arc<TrailPackCatalog>,
     pub(crate) kitty_sprite: KittySpriteAsset,
+    /// The admitted wallpaper image (the `wallpaper` key), resolved at the
+    /// same revision seam as the kitty sprite.
+    pub(crate) wallpaper: WallpaperAsset,
     pub(crate) themes: std::sync::Arc<ThemeCatalog>,
     /// Shared-setting consumers derived from the exact admitted inline + Toy
     /// Pack spec table and prepared lexicon. `Some(default())` is an
@@ -1605,6 +1739,7 @@ impl ConfigAssetCatalog {
         std::sync::Arc::new(Self {
             trail_packs: TrailPackCatalog::empty(),
             kitty_sprite: KittySpriteAsset::BuiltIn,
+            wallpaper: WallpaperAsset::None,
             themes: ThemeCatalog::empty(),
             sparkle_spec_consumers: None,
         })
@@ -1791,6 +1926,22 @@ pub(crate) struct SparkleFelineConfig {
     /// Extra whole words to treat as feline (added to the lexicon).
     pub(crate) extra_words: Option<Vec<String>>,
     /// Folded surfaces to never decorate as feline.
+    pub(crate) ignore_words: Option<Vec<String>>,
+}
+
+/// `[sparkle_words.canine]` — the typed-word DOG cameo. Unlike the ambient
+/// families this class draws nothing from the screen scanner; its `enabled`
+/// gates the input-path summon (typing `dog`/`puppy`/… after a lot of typing),
+/// and its word lists ride the same lexicon override as every other class.
+#[derive(Default, Clone, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct SparkleCanineConfig {
+    /// Summon dogs for typed canine words. Default TRUE (takes effect only
+    /// when the sparkle master is on).
+    pub(crate) enabled: Option<bool>,
+    /// Extra whole words to treat as canine (added to the lexicon).
+    pub(crate) extra_words: Option<Vec<String>>,
+    /// Folded surfaces to never treat as canine.
     pub(crate) ignore_words: Option<Vec<String>>,
 }
 
@@ -2362,6 +2513,58 @@ impl Config {
         self.window_title_format.unwrap_or_default()
     }
 
+    /// Master switch for status classification. Batteries-on, and `false` is a
+    /// real off: the observer stops gathering evidence entirely, so a user who
+    /// does not want this subsystem pays nothing for it.
+    pub(crate) fn tab_status_or_default(&self) -> bool {
+        self.tab_status.unwrap_or(true)
+    }
+
+    /// Whether a status projects onto the tab's indicator bits. Independent of
+    /// [`Self::tab_status_or_default`]: the record can be useful to a script
+    /// while the chrome stays quiet.
+    pub(crate) fn tab_status_badge_or_default(&self) -> bool {
+        self.tab_status_badge.unwrap_or(true)
+    }
+
+    /// Stall threshold, bounded so a mistyped value can neither call every job
+    /// quiet on arrival nor keep a finished one lit past any useful horizon.
+    pub(crate) fn tab_status_quiet_after_ms_or_default(&self) -> u64 {
+        self.tab_status_quiet_after_ms
+            .unwrap_or(DEFAULT_TAB_STATUS_QUIET_AFTER_MS)
+            .clamp(MIN_TAB_STATUS_QUIET_AFTER_MS, MAX_TAB_STATUS_QUIET_AFTER_MS)
+    }
+
+    /// Publication dwell, bounded so hysteresis cannot be set long enough to
+    /// make the badge useless.
+    pub(crate) fn tab_status_dwell_ms_or_default(&self) -> u64 {
+        self.tab_status_dwell_ms
+            .unwrap_or(DEFAULT_TAB_STATUS_DWELL_MS)
+            .clamp(MIN_TAB_STATUS_DWELL_MS, MAX_TAB_STATUS_DWELL_MS)
+    }
+
+    /// The resolved classifier policy.
+    pub(crate) fn tab_status_policy(&self) -> crate::session_status::StatusPolicy {
+        crate::session_status::StatusPolicy {
+            quiet_after: std::time::Duration::from_millis(
+                self.tab_status_quiet_after_ms_or_default(),
+            ),
+            dwell: std::time::Duration::from_millis(self.tab_status_dwell_ms_or_default()),
+        }
+    }
+
+    /// The observation budget interval. Derived rather than configured: an
+    /// interval COARSER than the dwell would make the dwell unserviceable (a
+    /// candidate could not be re-seen inside its own window), so the budget
+    /// tracks dwell downward and stops at a floor that keeps an output flood
+    /// from becoming a classification flood.
+    pub(crate) fn tab_status_observe_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.tab_status_dwell_ms_or_default().clamp(
+            MIN_TAB_STATUS_OBSERVE_INTERVAL_MS,
+            NOMINAL_TAB_STATUS_OBSERVE_INTERVAL_MS,
+        ))
+    }
+
     /// Whether the cursor motion-trail ("streaming trailer") is on. DEFAULT ON with the
     /// `rainbow kitty` style (owner call — batteries-on delight): the trail ignites a ~260ms
     /// additive aurora on each cursor move and decays to EXACTLY 0% idle, so a still
@@ -2434,6 +2637,22 @@ impl Config {
             Some(_) => 0.0,
             None => 0.4,
         }
+    }
+
+    /// The wallpaper legibility dim (`wallpaper_dim`): the fraction the image
+    /// is toned toward the theme background. Clamped to `0..=1`; a non-finite
+    /// value and the unset default both read 0.3.
+    pub(crate) fn wallpaper_dim_or_default(&self) -> f32 {
+        match self.wallpaper_dim {
+            Some(value) if value.is_finite() => value.clamp(0.0, 1.0),
+            _ => 0.3,
+        }
+    }
+
+    /// Whether default-fg glyphs take the backdrop-hue tint while a wallpaper
+    /// is attached (`wallpaper_text_tint`). Default ON.
+    pub(crate) fn wallpaper_text_tint_or_default(&self) -> bool {
+        self.wallpaper_text_tint.unwrap_or(true)
     }
 
     /// The parsed `motion` policy mode (W11): `auto` (DEFAULT — use the available
@@ -2800,6 +3019,7 @@ impl Config {
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: std::sync::Arc::new(TrailPackCatalog::default()),
             kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            wallpaper: resolve_wallpaper_asset(self.wallpaper.as_deref()),
             themes,
             sparkle_spec_consumers: None,
         })
@@ -2822,6 +3042,7 @@ impl Config {
         std::sync::Arc::new(ConfigAssetCatalog {
             trail_packs: self.resolve_trail_pack_catalog(),
             kitty_sprite: resolve_kitty_sprite_asset(self.cursor_nyan_sprite.as_deref()),
+            wallpaper: resolve_wallpaper_asset(self.wallpaper.as_deref()),
             themes,
             sparkle_spec_consumers: None,
         })
@@ -3096,6 +3317,7 @@ impl Config {
         }
         let prof = sw.profanity.clone().unwrap_or_default();
         let fel = sw.feline.clone().unwrap_or_default();
+        let can_cfg = sw.canine.clone().unwrap_or_default();
         let orca_cfg = sw.orca.clone().unwrap_or_default();
         let ink_cfg = sw.ink.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
@@ -3106,6 +3328,11 @@ impl Config {
         let sparkle_words = prof.enabled.unwrap_or(true);
         let profanity = sparkle_words;
         let feline = fel.enabled.unwrap_or(true);
+        // The dog rides the PRODUCT switch like every non-feline effect (the
+        // two-toys law: the historical profanity key is the Sparkle Words
+        // master, keyword kitties alone stay independent), with its own
+        // enable bit under it for turning just the dogs off.
+        let canine = sparkle_words && can_cfg.enabled.unwrap_or(true);
         // v3 §4: the orca class is SUSPENDED — the resolver ANDs the single
         // const gate (engine/lexicon/splash untouched; flip ORCA_SUSPENDED to
         // re-enable).
@@ -3138,7 +3365,7 @@ impl Config {
         let emphasis = sparkle_words
             && emph.enabled.unwrap_or(true)
             && (ink_enabled || spec_table.has_custom());
-        if !profanity && !feline && !orca && !emphasis {
+        if !profanity && !feline && !canine && !orca && !emphasis {
             return None;
         }
         let ink_loop = ink_cfg.loop_.unwrap_or(false);
@@ -3171,6 +3398,7 @@ impl Config {
             &sw.deny,
             &prof.ignore_words,
             &fel.ignore_words,
+            &can_cfg.ignore_words,
             &orca_cfg.ignore_words,
             &emph.ignore_words,
         ]
@@ -3182,6 +3410,7 @@ impl Config {
         Some(crate::word_decorations::DecoConfig {
             profanity,
             feline,
+            canine,
             orca,
             emphasis,
             ink_enabled,
@@ -3293,10 +3522,12 @@ impl Config {
         }
         let prof = sw.profanity.clone().unwrap_or_default();
         let fel = sw.feline.clone().unwrap_or_default();
+        let can_cfg = sw.canine.clone().unwrap_or_default();
         let orca_cfg = sw.orca.clone().unwrap_or_default();
         let emph = sw.emphasis.clone().unwrap_or_default();
         append_extra_words_entry(&mut out, "profanity", prof.extra_words.as_deref());
         append_extra_words_entry(&mut out, "feline", fel.extra_words.as_deref());
+        append_extra_words_entry(&mut out, "canine", can_cfg.extra_words.as_deref());
         append_extra_words_entry(&mut out, "orca", orca_cfg.extra_words.as_deref());
         append_extra_words_entry(&mut out, "emphasis", emph.extra_words.as_deref());
         // Each strict pack was already production-scanner validated. Preserve
@@ -4622,6 +4853,144 @@ fn resolve_kitty_sprite_asset(raw: Option<&str>) -> KittySpriteAsset {
         source_id,
         w,
         h,
+        rgba: std::sync::Arc::from(rgba),
+        fp,
+    }
+}
+
+fn invalid_wallpaper(source_id: &str, reason: impl AsRef<str>) -> WallpaperAsset {
+    WallpaperAsset::Invalid {
+        source_id: bounded_asset_text(source_id, MAX_KITTY_SOURCE_ID_BYTES),
+        bounded_reason: bounded_asset_text(reason.as_ref(), MAX_KITTY_REASON_BYTES),
+    }
+}
+
+/// Decode the configured wallpaper's bytes to straight sRGB RGBA8: PNG through
+/// the shared hardened decoder (wallpaper dimension budget), and every other
+/// format (JPEG/HEIC/TIFF/GIF, …) through the system `NSBitmapImageRep` lane on
+/// macOS — the decoded rep is converted to sRGB and re-encoded as PNG so Rust
+/// reads a standardized straight-RGBA channel order (the window-capture
+/// pattern), never the rep's implementation-defined layout.
+fn decode_wallpaper_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+    if let Some(decoded) =
+        aterm_render::decode_png_rgba8_bounded(bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32)
+    {
+        return Ok(decoded);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        decode_wallpaper_appkit(bytes)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(format!(
+            "not a decodable PNG (up to {MAX_WALLPAPER_SOURCE_DIMENSION} px per side; \
+             other formats need macOS)"
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
+    use objc2_app_kit::{
+        NSBitmapImageFileType, NSBitmapImageRep, NSBitmapImageRepPropertyKey,
+        NSColorRenderingIntent, NSColorSpace,
+    };
+    use objc2_foundation::{NSData, NSDictionary};
+
+    let data = NSData::with_bytes(bytes);
+    // SAFETY: pure raster construction from immutable bytes; NSBitmapImageRep
+    // is not main-thread-bound (no view or window involvement).
+    let Some(rep) = (unsafe { NSBitmapImageRep::imageRepWithData(&data) }) else {
+        return Err("not a decodable image".to_string());
+    };
+    let (pw, ph) = unsafe { (rep.pixelsWide(), rep.pixelsHigh()) };
+    if pw <= 0
+        || ph <= 0
+        || pw as usize > MAX_WALLPAPER_SOURCE_DIMENSION
+        || ph as usize > MAX_WALLPAPER_SOURCE_DIMENSION
+    {
+        return Err(format!(
+            "decoded image must be 1..={MAX_WALLPAPER_SOURCE_DIMENSION} pixels per side"
+        ));
+    }
+    // Convert the pixels (not merely retag) to the renderer's canonical sRGB
+    // before Rust reads them — the window-capture rule.
+    let srgb = unsafe { NSColorSpace::sRGBColorSpace() };
+    let rep = unsafe {
+        rep.bitmapImageRepByConvertingToColorSpace_renderingIntent(
+            &srgb,
+            NSColorRenderingIntent::Perceptual,
+        )
+    }
+    .ok_or_else(|| "could not convert the image to sRGB".to_string())?;
+    let properties = NSDictionary::<NSBitmapImageRepPropertyKey, objc2::runtime::AnyObject>::new();
+    // PNG standardizes the rep's implementation-defined channel order and
+    // premultiplication into straight RGBA before Rust reads it.
+    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties) }
+        .ok_or_else(|| "could not re-encode the decoded image".to_string())?;
+    let png_len = png.length();
+    let mut png_bytes = vec![0_u8; png_len];
+    if png_len != 0 {
+        // SAFETY: the Vec owns `png_len` initialized bytes and the non-null
+        // destination remains valid for the duration of NSData's bounded copy.
+        let destination = std::ptr::NonNull::new(png_bytes.as_mut_ptr().cast())
+            .ok_or_else(|| "could not allocate the decoded image bytes".to_string())?;
+        unsafe {
+            png.getBytes_length(destination, png_len);
+        }
+    }
+    aterm_render::decode_png_rgba8_bounded(&png_bytes, MAX_WALLPAPER_SOURCE_DIMENSION as u32)
+        .ok_or_else(|| "could not read the decoded image pixels".to_string())
+}
+
+pub(crate) fn resolve_wallpaper_asset(raw: Option<&str>) -> WallpaperAsset {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return WallpaperAsset::None;
+    };
+    if raw.len() > MAX_KITTY_SOURCE_ID_BYTES {
+        return invalid_wallpaper(raw, "configured wallpaper source is too long");
+    }
+    let source_id = std::sync::Arc::<str>::from(raw);
+    let path = sparkle_expand_tilde(raw);
+    let bytes = match aterm_effects::file_feed::read_bounded_regular_file(
+        &path,
+        MAX_WALLPAPER_FILE_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => return invalid_wallpaper(&source_id, format!("unreadable ({error})")),
+    };
+    let (mut rgba, mut w, mut h) = match decode_wallpaper_bytes(&bytes) {
+        Ok(decoded) => decoded,
+        Err(reason) => return invalid_wallpaper(&source_id, reason),
+    };
+    if w == 0 || h == 0 || rgba.len() != w.saturating_mul(h).saturating_mul(4) {
+        return invalid_wallpaper(&source_id, "decoded image has inconsistent dimensions");
+    }
+    // Bound resident memory: downscale (linear-light, aspect-preserving) so
+    // neither side exceeds the keep budget. Windows are cover-scaled FROM this,
+    // and the budget exceeds any frame, so no visible quality is lost.
+    let longest = w.max(h);
+    if longest > MAX_WALLPAPER_KEEP_DIMENSION {
+        let dw = (w * MAX_WALLPAPER_KEEP_DIMENSION / longest).max(1);
+        let dh = (h * MAX_WALLPAPER_KEEP_DIMENSION / longest).max(1);
+        rgba = aterm_render::resample_rgba(&rgba, w, h, dw, dh);
+        (w, h) = (dw, dh);
+    }
+    let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
+        return invalid_wallpaper(&source_id, "decoded dimensions are out of range");
+    };
+    // `stable_asset_fingerprint` folds u16 dims; the wallpaper's exceed u16 in
+    // principle, so fold the true u32 dims through the source stream instead.
+    let mut identity = Vec::with_capacity(source_id.len() + 8);
+    identity.extend_from_slice(source_id.as_bytes());
+    identity.extend_from_slice(&w32.to_le_bytes());
+    identity.extend_from_slice(&h32.to_le_bytes());
+    let fp = stable_asset_fingerprint(0x57, &identity, 0, 0, &rgba);
+    WallpaperAsset::Ready {
+        source_id,
+        w: w32,
+        h: h32,
         rgba: std::sync::Arc::from(rgba),
         fp,
     }
@@ -6839,6 +7208,7 @@ impl App {
             prepared.assets = std::sync::Arc::new(ConfigAssetCatalog {
                 trail_packs: std::sync::Arc::clone(&prepared.assets.trail_packs),
                 kitty_sprite: prepared.assets.kitty_sprite.clone(),
+                wallpaper: prepared.assets.wallpaper.clone(),
                 themes: std::sync::Arc::clone(&self.config_assets.themes),
                 sparkle_spec_consumers: prepared.assets.sparkle_spec_consumers.clone(),
             });
@@ -7149,6 +7519,11 @@ impl App {
         // queued provider work immediately and repaint tab/window composition even if
         // every terminal is currently idle.
         self.reconfigure_title_summaries();
+        // Tab status is live authority for the same reason: the policy is COPIED
+        // into every per-session classifier at construction, so without this a
+        // Settings edit would apply only to sessions opened afterwards, and the
+        // event loop's wait deadline would still be serving the old interval.
+        self.reconfigure_session_status();
         // Per-keystroke config caches (predictive_echo / cursor_trail_style): a reload
         // can change either, so drop the resolved values — they re-resolve on the next
         // keystroke. Keeps a live style/predict change taking effect immediately.
@@ -7300,6 +7675,16 @@ impl App {
             warns.push(format!(
                 "config cursor_nyan_sprite {source:?} invalid: {reason}"
             ));
+        }
+        // An unadmittable wallpaper silently renders as no backdrop — surface
+        // the decode verdict on the same banner (the kitty-sprite rule).
+        if let Some(reason) = config_snapshot.assets.wallpaper.diagnostic() {
+            let source = config_snapshot
+                .assets
+                .wallpaper
+                .source_id()
+                .unwrap_or("configured source");
+            warns.push(format!("config wallpaper {source:?} invalid: {reason}"));
         }
         // W6: re-resolve the per-style / fallback font keys (families → paths),
         // riding the same banner for unresolvable entries. The diff against the
@@ -8254,6 +8639,73 @@ window_title_format = "description"
             None,
             "non-network providers ignore stale endpoint settings"
         );
+    }
+
+    #[test]
+    fn tab_status_policy_defaults_and_clamps_both_ends() {
+        let default = Config::default();
+        assert!(default.tab_status_or_default(), "batteries on");
+        assert!(default.tab_status_badge_or_default());
+        assert_eq!(default.tab_status_quiet_after_ms_or_default(), 5_000);
+        assert_eq!(default.tab_status_dwell_ms_or_default(), 750);
+        assert_eq!(
+            default.tab_status_policy().quiet_after,
+            std::time::Duration::from_millis(5_000)
+        );
+        assert_eq!(
+            default.tab_status_policy().dwell,
+            std::time::Duration::from_millis(750)
+        );
+
+        // Both ends of both numeric keys: a typo can neither call every job
+        // stalled on arrival nor make hysteresis long enough to be useless.
+        assert_eq!(
+            cfg("tab_status_quiet_after_ms = 0").tab_status_quiet_after_ms_or_default(),
+            500
+        );
+        assert_eq!(
+            cfg("tab_status_quiet_after_ms = 999999").tab_status_quiet_after_ms_or_default(),
+            120_000
+        );
+        assert_eq!(
+            cfg("tab_status_dwell_ms = 0").tab_status_dwell_ms_or_default(),
+            0
+        );
+        assert_eq!(
+            cfg("tab_status_dwell_ms = 999999").tab_status_dwell_ms_or_default(),
+            10_000
+        );
+        assert!(!cfg("tab_status = false").tab_status_or_default());
+        assert!(!cfg("tab_status_badge = false").tab_status_badge_or_default());
+    }
+
+    /// The observation budget is DERIVED, not configured: it must never be
+    /// coarser than the dwell it has to serve (a candidate that cannot be
+    /// re-seen inside its own window can never be published), and never fall to
+    /// zero, which would turn every output burst into a classification.
+    #[test]
+    fn the_observation_interval_tracks_dwell_between_a_floor_and_the_budget() {
+        let ms = |toml: &str| cfg(toml).tab_status_observe_interval().as_millis();
+        assert_eq!(
+            Config::default().tab_status_observe_interval().as_millis(),
+            250
+        );
+        assert_eq!(ms("tab_status_dwell_ms = 0"), 50, "floored, never zero");
+        assert_eq!(ms("tab_status_dwell_ms = 100"), 100, "tracks a short dwell");
+        assert_eq!(
+            ms("tab_status_dwell_ms = 9000"),
+            250,
+            "capped at the budget"
+        );
+        for dwell in [0_u64, 1, 100, 750, 5_000, 10_000, 999_999] {
+            let config = cfg(&format!("tab_status_dwell_ms = {dwell}"));
+            let interval = config.tab_status_observe_interval().as_millis();
+            let resolved = u128::from(config.tab_status_dwell_ms_or_default());
+            assert!(
+                interval <= resolved.max(50),
+                "interval {interval} outruns dwell {resolved}"
+            );
+        }
     }
 
     #[test]

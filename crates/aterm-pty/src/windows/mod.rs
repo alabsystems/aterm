@@ -762,6 +762,17 @@ pub fn exit_code(pid: i32) -> Option<i32> {
     code.map(|c| c as i32)
 }
 
+/// Platform-neutral twin of the Unix collector: the recorded exit code, if the
+/// waiter thread has already observed the child end.
+///
+/// Windows has no signal delivery, so every termination — including a kernel
+/// kill — is reported as a CODE. `None` means the same thing it does on Unix:
+/// the status is not knowable right now, never that the child succeeded.
+#[must_use]
+pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
+    exit_code(pid).map(crate::ChildExit::Code)
+}
+
 /// Close a session's master key: remove the registry entry (subsequent ops get
 /// the documented registry-miss semantics), request hangup so an orphaned
 /// child cannot outlive its master (the Unix close-the-master EOF analog), and

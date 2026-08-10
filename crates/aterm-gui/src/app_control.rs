@@ -967,7 +967,10 @@ fn indicator_state(tab: &Tab) -> String {
     if indicators.busy {
         states.push("busy");
     }
-    if indicators.attention {
+    // ONE `attention` token on the wire, folded from both owners: the split into
+    // separate fields is an internal ownership fix, and the introspection reply
+    // stays byte-identical.
+    if indicators.wants_attention() {
         states.push("attention");
     }
     if states.is_empty() {

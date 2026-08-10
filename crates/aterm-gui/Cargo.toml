@@ -190,7 +190,10 @@ fontdue = "0.9"
 [build-dependencies]
 # The build script derives the exact 64-byte lowercase updater-key fingerprint
 # record embedded in a dedicated Mach-O section.  It deliberately hashes the
-# same raw Ed25519 key bytes that `aterm-update` verifies at runtime.
+# same raw Ed25519 key bytes that `aterm-update` verifies at runtime — read from
+# the committed anchor in `aterm-update-core::pins`, never from the environment,
+# so the embedded record cannot disagree with the key actually trusted.
+aterm-update-core = { workspace = true }
 base64 = "0.22.1"
 sha2 = { workspace = true }
 # Windows only: compile + link the application .ico (assets/aterm.rc → assets/
@@ -319,7 +322,7 @@ objc2-app-kit = { version = "0.2", features = ["block2", "NSGraphics", "NSColorS
 # already in the tree transitively via objc2-app-kit, so this adds bindings only.
 # (The `a11y-appkit` feature below just enables the extra NSAccessibility
 # bindings; the base crates are no longer gated behind it.)
-objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSUserDefaults", "NSDictionary", "NSValue", "NSGeometry", "NSProcessInfo", "NSDate", "NSRunLoop", "NSData"] }
 objc2 = { version = "0.5" }
 block2 = "0.5"
 # macOS Keychain storage for network-drive tokens (net_connections.rs): a saved

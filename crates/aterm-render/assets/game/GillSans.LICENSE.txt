@@ -1,0 +1,27 @@
+Gill Sans UltraBold
+Digitized data copyright © 1991-2001 Agfa Monotype Corporation. All rights reserved.
+
+Gill Sans UltraBold is the face of the classic Roblox logo (2005-2017) — not a
+lookalike, the actual typeface. This copy is the UltraBold member extracted from
+the Gill Sans collection Apple bundles with macOS
+(/System/Library/Fonts/Supplemental/GillSans.ttc, face index 6, macOS version
+16.0d1e1).
+
+REDISTRIBUTION NOTICE — READ BEFORE SHIPPING A RELEASE
+------------------------------------------------------
+This is a COMMERCIAL RETAIL typeface owned by Monotype. Apple's macOS font
+bundling license covers use ON macOS — it grants no right to extract the face
+and redistribute it inside another program. Of everything in this directory it
+is the clearest-cut "may not ship" asset: unlike Hylia Serif (author invites
+contact) or the fan faces (no license at all), this one has an owner with a
+published licensing program and a legal department.
+
+Embedding these bytes in the aterm binary IS redistribution. Before this asset
+ships in a cut release, either license the face from Monotype
+(https://www.monotype.com) or swap the `roblox` entry to an open substitute —
+the retired Luckiest Guy (Apache-2.0) remains the honest fallback. Until then
+it is a development-branch asset only.
+
+File: GillSansUltraBold.ttf
+SHA-256: 021814d465b5e883648a9ea3b865a9b5c72f95dfcce8f9873abb9fdaa0cc49f5
+Extracted: 2026-08-06 from macOS GillSans.ttc with fontTools (TTCollection face 6)

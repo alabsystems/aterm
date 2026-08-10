@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "dinosaur"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.47, center_x = 0.5, word_top = 1.0 }
+
+# Dinosaur: friendly green t-rex, deep pale jaw, two tiny teeth, brow bumps, three-spike back ridge.
+
+[[layer]]
+role = "outline"
+ref_fill = "#24401A"
+recolor = "fixed"
+paths = ["M 26 80 C 26 54.6 50.2 34 80 34 C 109.8 34 134 54.6 134 80 C 134 105.4 109.8 126 80 126 C 50.2 126 26 105.4 26 80 Z", "M 42 46 L 54 24 L 66 44 Z", "M 68 42 L 80 18 L 92 42 Z", "M 94 44 L 106 24 L 118 46 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#6FA84E"
+recolor = "fixed"
+paths = ["M 30 80 C 30 56.8 52.4 38 80 38 C 107.6 38 130 56.8 130 80 C 130 103.2 107.6 122 80 122 C 52.4 122 30 103.2 30 80 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#4E8038"
+recolor = "fixed"
+paths = ["M 46 44 L 54 27 L 62 43 Z", "M 71 41 L 80 22 L 89 41 Z", "M 98 43 L 106 27 L 114 44 Z"]
+
+[[layer]]
+role = "coat_shade"
+ref_fill = "#4E8038"
+recolor = "fixed"
+paths = ["M 50 52 C 50 48.7 55.4 46 62 46 C 68.6 46 74 48.7 74 52 C 74 55.3 68.6 58 62 58 C 55.4 58 50 55.3 50 52 Z", "M 86 52 C 86 48.7 91.4 46 98 46 C 104.6 46 110 48.7 110 52 C 110 55.3 104.6 58 98 58 C 91.4 58 86 55.3 86 52 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#C9E3A0"
+recolor = "fixed"
+paths = ["M 38 98 C 38 84.7 56.8 74 80 74 C 103.2 74 122 84.7 122 98 C 122 111.3 103.2 122 80 122 C 56.8 122 38 111.3 38 98 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 55 62 C 55 57.6 58.6 54 63 54 C 67.4 54 71 57.6 71 62 C 71 66.4 67.4 70 63 70 C 58.6 70 55 66.4 55 62 Z", "M 89 62 C 89 57.6 92.6 54 97 54 C 101.4 54 105 57.6 105 62 C 105 66.4 101.4 70 97 70 C 92.6 70 89 66.4 89 62 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 64 59.5 C 64 58.3 65 57.3 66.2 57.3 C 67.4 57.3 68.4 58.3 68.4 59.5 C 68.4 60.7 67.4 61.7 66.2 61.7 C 65 61.7 64 60.7 64 59.5 Z", "M 96 59.5 C 96 58.3 97 57.3 98.2 57.3 C 99.4 57.3 100.4 58.3 100.4 59.5 C 100.4 60.7 99.4 61.7 98.2 61.7 C 97 61.7 96 60.7 96 59.5 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#3E6B2C"
+recolor = "fixed"
+paths = ["M 66 86 C 66 83.8 67.8 82 70 82 C 72.2 82 74 83.8 74 86 C 74 88.2 72.2 90 70 90 C 67.8 90 66 88.2 66 86 Z", "M 86 86 C 86 83.8 87.8 82 90 82 C 92.2 82 94 83.8 94 86 C 94 88.2 92.2 90 90 90 C 87.8 90 86 88.2 86 86 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#3E6B2C"
+recolor = "fixed"
+paths = ["M 52 102 C 64 114 96 114 108 102 C 100 120 60 120 52 102 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 64 108 L 69 118 L 74 108 Z", "M 86 108 L 91 118 L 96 108 Z"]

@@ -2134,6 +2134,14 @@ impl App {
                     self.handle_tab_strip_click(wid, col);
                     return;
                 }
+                // Below the strip, on a native view: still a click away from an
+                // open in-grid rename field, so it still commits. Same rule as the
+                // terminal path — the field's exit must not depend on what kind of
+                // content happens to be under the pointer.
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 let editor_target = self.native_editor_pointer_target(wid, px, py);
                 let press = self.retained_native_leaf_at_pointer(wid, px, py).and_then(
                     |(artifact, x, y)| {
@@ -2334,6 +2342,16 @@ impl App {
             if let Some(col) = self.strip_col_at(wid, px, py) {
                 self.handle_tab_strip_click(wid, col);
                 return;
+            }
+            // OUTSIDE the strip with an in-grid rename field open: this is the
+            // "click away" every other exit already honours, so it COMMITS what was
+            // typed. It deliberately does NOT swallow the click — clicking the grid
+            // on macOS ends the edit AND lands in the terminal, and the two
+            // platforms must not differ on that. The streak dies with it: a press
+            // in the grid is not part of a chip double-click.
+            if self.inline_rename_edit(wid).is_some() {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
             }
         }
         // FIND-BAR TOGGLES: a left press on the find bar's `Aa` / `.*` indicators flips

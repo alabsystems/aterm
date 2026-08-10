@@ -9000,10 +9000,14 @@ mod encode_worker_tests {
     /// while the toy is on glass must show it, or a screenshot silently
     /// disagrees with the screen.
     ///
-    /// Identified by height: the cameo exceeds the `2·cell_h` atlas slot that
-    /// bounds every word-cat and the cursor escort. The pre-summon assertion
-    /// proves the discriminator bites — the frame already carries an ambient
-    /// cat and it does not qualify.
+    /// Identified by the engine's OWN FOOTPRINT: the toy is TEXT-SIZED now
+    /// (owner regression, 2026-08-10 — "go back to the old text kitty!"), the
+    /// same scale class as every ambient cat, so height cannot discriminate it
+    /// any more. The capture must instead contain a sprite at exactly the rect
+    /// [`aterm_effects::word_decorations::WordDecorations::kitty_cameo_footprint`]
+    /// resolves for the capture instant — the emitter draws through that same
+    /// geometry, so a capture that carries the toy matches it byte for byte
+    /// and one that dropped it cannot.
     #[test]
     fn headless_capture_carries_the_typed_kitty_cameo() {
         use crate::input::{InputEvent, Source};
@@ -9026,23 +9030,37 @@ mod encode_worker_tests {
             term.cell_frame_into(&mut ws.input_scratch, ws.rows as usize, ws.cols as usize);
         }
         app.splice_word_decorations(wid, t0);
-        let cell_h = app.win_cell_size(wid).1 as i32;
+        let (cell_w, cell_h) = app.win_cell_size(wid);
         assert!(cell_h > 0, "PRECONDITION: the fixture has real cell metrics");
-        let cameo_sized = |app: &App| {
+        let session = app.front_terminal(wid).expect("front terminal").session;
+        let geom = |app: &App| crate::word_decorations::EffectGeom {
+            cell_w: cell_w as u16,
+            cell_h: cell_h as u16,
+            rows: app.windows[&wid].rows as u16,
+            cols: app.windows[&wid].cols as u16,
+        };
+        let toy_rect = |app: &App, at: Instant| {
+            app.windows[&wid]
+                .word_decos
+                .kitty_cameo_footprint(geom(app), at, Some(session))
+                .map(|f| (f.x, f.y, f.w, f.h))
+        };
+        let carries = |app: &App, rect: (i32, i32, u16, u16)| {
             app.windows[&wid]
                 .input_scratch
                 .free_sprites
                 .iter()
-                .any(|s| i32::from(s.h) > 2 * cell_h)
+                .any(|s| (s.x, s.y, s.w, s.h) == rect)
         };
         assert!(
             !app.windows[&wid].input_scratch.free_sprites.is_empty(),
             "PRECONDITION: the capture already carries an ambient cat"
         );
-        assert!(
-            !cameo_sized(&app),
-            "PRECONDITION: and no ambient sprite is cameo-sized, so the height \
-             test below is a real discriminator"
+        assert_eq!(
+            toy_rect(&app, t0),
+            None,
+            "PRECONDITION: no toy resolves before the word is typed, so the \
+             footprint match below cannot be satisfied by an ambient sprite"
         );
 
         for c in "kitty".chars() {
@@ -9063,8 +9081,16 @@ mod encode_worker_tests {
             "PRECONDITION: typing the word summoned a cameo at all"
         );
         app.splice_word_decorations(wid, at);
+        let rect = toy_rect(&app, at).expect("the live toy resolves a footprint");
         assert!(
-            cameo_sized(&app),
+            i32::from(rect.3) <= 2 * cell_h as i32,
+            "the toy is TEXT-sized — inside the two-row band every text cat \
+             lives in (owner, 2026-08-10): {} vs {}",
+            rect.3,
+            2 * cell_h
+        );
+        assert!(
+            carries(&app, rect),
             "a capture must carry the typed-kitty cameo the glass is showing"
         );
     }
@@ -9110,12 +9136,32 @@ mod encode_worker_tests {
             cell_h > 0 && cell_w > 0,
             "PRECONDITION: the fixture has real cell metrics"
         );
-        let cameo_sized = |app: &App| {
+        // THE TOY IS TEXT-SIZED (owner regression, 2026-08-10), so height no
+        // longer discriminates it from an ambient cat. Its witness is the
+        // engine's own footprint for tab A's cameo — the exact rect the
+        // emitter would draw it at, at the instant the capture ran. `carries`
+        // therefore names the toy itself: a leaked capture reproduces this
+        // rect byte for byte, a scoped one cannot contain it.
+        let toy_rect = |app: &App, at: Instant| {
+            let geom = crate::word_decorations::EffectGeom {
+                cell_w: cell_w as u16,
+                cell_h: cell_h as u16,
+                rows: app.windows[&wid].rows as u16,
+                cols: app.windows[&wid].cols as u16,
+            };
             app.windows[&wid]
-                .input_scratch
-                .free_sprites
-                .iter()
-                .any(|s| i32::from(s.h) > 2 * cell_h)
+                .word_decos
+                .kitty_cameo_footprint(geom, at, Some(session_a))
+                .map(|f| (f.x, f.y, f.w, f.h))
+        };
+        let carries_toy = |app: &App, at: Instant| {
+            toy_rect(app, at).is_some_and(|rect| {
+                app.windows[&wid]
+                    .input_scratch
+                    .free_sprites
+                    .iter()
+                    .any(|s| (s.x, s.y, s.w, s.h) == rect)
+            })
         };
         let any_cat = |app: &App| !app.windows[&wid].input_scratch.free_sprites.is_empty();
         // A CAT AT A NAMED COLUMN, because "some cat is present" measures the
@@ -9134,9 +9180,9 @@ mod encode_worker_tests {
                 .any(|s| (s.x - i32::from(col) * cell_w).abs() <= cell_w)
         };
         assert!(
-            any_cat(&app) && !cameo_sized(&app),
-            "PRECONDITION: tab A's capture draws ambient cats and none is \
-             cameo-sized, so the height test is a real discriminator"
+            any_cat(&app) && toy_rect(&app, t0).is_none(),
+            "PRECONDITION: tab A's capture draws ambient cats while no toy \
+             resolves yet, so the footprint match is a real discriminator"
         );
         // Where tab A's ambient cat stands: `kitty` begins at column 6 of
         // "hello kitty friend". Pinned as a PRECONDITION so the negative it
@@ -9163,7 +9209,7 @@ mod encode_worker_tests {
         let at = t0 + Duration::from_millis(16);
         app.splice_word_decorations(wid, at);
         assert!(
-            cameo_sized(&app),
+            carries_toy(&app, at),
             "PRECONDITION: the summoning tab's capture really carries the toy"
         );
 
@@ -9225,7 +9271,7 @@ mod encode_worker_tests {
              capture is of tab B's grid, where that column is blank"
         );
         assert!(
-            !cameo_sized(&app),
+            !carries_toy(&app, at + Duration::from_millis(16)),
             "a capture of another tab must not contain tab A's toy"
         );
 
@@ -9239,7 +9285,7 @@ mod encode_worker_tests {
         );
         app.splice_word_decorations(wid, at + Duration::from_millis(32));
         assert!(
-            cameo_sized(&app),
+            carries_toy(&app, at + Duration::from_millis(32)),
             "and tab A's own capture still carries it"
         );
     }

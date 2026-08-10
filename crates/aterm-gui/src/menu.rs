@@ -437,7 +437,27 @@ pub(crate) fn set_active_tab_is_terminal(terminal: bool) {
     ACTIVE_TAB_IS_TERMINAL.store(terminal, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the front window can actually PRESENT an inline rename editor. Off
+/// macOS the editor is drawn by the tab strip, so `tab_strip_rows = 0` leaves
+/// nowhere to put it — and an action that cannot run must not look available.
+/// Published exactly like [`set_active_tab_is_terminal`], from the same
+/// stabilization point, because AppKit validates menu commands synchronously
+/// when a menu opens.
+static RENAME_SURFACE_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_rename_surface_available(available: bool) {
+    RENAME_SURFACE_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn rename_surface_available() -> bool {
+    RENAME_SURFACE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn native_menu_action_enabled(action: MenuAction) -> bool {
+    if matches!(action, MenuAction::RenameSession) && !rename_surface_available() {
+        return false;
+    }
     !requires_terminal_tab(action)
         || ACTIVE_TAB_IS_TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
 }

@@ -265,6 +265,16 @@ pub(crate) trait AppRt {
     /// update state and its action live in the version menu. See `toolbar.rs`.
     fn set_toolbar_update_available(&self, handle: &toolbar::ToolbarHandle, available: bool);
 
+    /// Whether this platform could present the native rename editor, WITHOUT
+    /// presenting it. `begin_tab_rename` installs the field as a side effect, so
+    /// a surface asking "should this command be enabled?" cannot use it.
+    /// Default: `false` — no native editor here, so the tab strip is the only
+    /// surface, and a window with `tab_strip_rows = 0` has none.
+    fn can_present_tab_rename(&self, handle: &toolbar::ToolbarHandle) -> bool {
+        let _ = handle;
+        false
+    }
+
     /// Open the INLINE SESSION-RENAME editor over the strip's `tab` chip, seeded
     /// with `seed` (the current pin — EMPTY when unpinned) and placeheld with
     /// `placeholder` (the label the ladder falls back to, so an empty field
@@ -475,6 +485,10 @@ pub(crate) struct AppRtMacOS;
 
 #[cfg(target_os = "macos")]
 impl AppRt for AppRtMacOS {
+    fn can_present_tab_rename(&self, handle: &toolbar::ToolbarHandle) -> bool {
+        toolbar::can_present_tab_rename(handle)
+    }
+
     /// Paint the NSWindow background the terminal's theme background colour (`bg`,
     /// as `0x00RRGGBB`), so the transparent titlebar and the bare single-tab
     /// compact bar read as a SEAMLESS extension of the terminal body rather than a

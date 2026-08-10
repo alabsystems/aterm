@@ -36,6 +36,51 @@ pub enum SigReject {
     Verify,
 }
 
+/// Verify `sig` over `msg` against ANY member of a channel keyset, returning the
+/// INDEX of the member that verified.
+///
+/// This is what makes key rotation possible. A client that accepts exactly one key
+/// is stranded the moment that key is replaced: it cannot be told about the new one
+/// by a release it will refuse to verify. Accepting any member lets a build shipped
+/// before a rotation and one shipped after it both keep updating.
+///
+/// The index matters to callers: index 0 is the key this build would sign with, so a
+/// hit at any other index means an outgoing (or pre-seeded) key produced the
+/// signature — worth a warning, never a rejection.
+///
+/// Fail-closed in the same order as [`verify_detached`], with one addition: a
+/// malformed or empty member can neither GRANT nor DENY. It is skipped, and the
+/// verdict comes from the usable members. If NO member was usable the answer is
+/// [`SigReject::BadKey`] — a keyset of nothing but garbage must not read as "the
+/// signature was bad".
+pub fn verify_detached_any(
+    pubkeys_b64: &[&str],
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<usize, SigReject> {
+    if pubkeys_b64.is_empty() {
+        return Err(SigReject::Disabled);
+    }
+    if sig.len() != 64 {
+        return Err(SigReject::BadSig);
+    }
+    let mut usable = 0usize;
+    for (index, key) in pubkeys_b64.iter().enumerate() {
+        match verify_detached(key, msg, sig) {
+            Ok(()) => return Ok(index),
+            // The member is well-formed and simply did not sign this message.
+            Err(SigReject::Verify) => usable += 1,
+            // Empty/undecodable/wrong-length member: not an authority, not a verdict.
+            Err(_) => {}
+        }
+    }
+    if usable == 0 {
+        Err(SigReject::BadKey)
+    } else {
+        Err(SigReject::Verify)
+    }
+}
+
 /// Verify that `sig` is a valid Ed25519 signature by `pubkey_b64` over `msg`.
 /// Cheapest-first, fail-closed: empty pin → decode+length-check the key → length-check
 /// the signature → the actual crypto, last.
@@ -116,6 +161,89 @@ mod tests {
         );
         assert_eq!(
             verify_detached(&pk, b"m", &[0u8; 10]),
+            Err(SigReject::BadSig)
+        );
+    }
+
+    /// ROTATION: a signature by ANY member verifies, and the returned index says
+    /// WHICH — so a caller can tell a head-key signature from an outgoing one.
+    #[test]
+    fn accepts_any_member_of_the_keyset() {
+        let k1 = keypair();
+        let k2 = Ed25519KeyPair::from_seed_unchecked(&[9u8; 32]).unwrap();
+        let p1 = B64.encode(k1.public_key().as_ref());
+        let p2 = B64.encode(k2.public_key().as_ref());
+        let msg = b"appcast bytes";
+        let s1 = k1.sign(msg);
+        let s2 = k2.sign(msg);
+
+        // Head key signs, head key listed first.
+        assert_eq!(verify_detached_any(&[&p1, &p2], msg, s1.as_ref()), Ok(0));
+        // Outgoing key signs while still in its window — accepted, at its index.
+        assert_eq!(verify_detached_any(&[&p1, &p2], msg, s2.as_ref()), Ok(1));
+        // Order is not load-bearing for ACCEPTANCE, only for reporting.
+        assert_eq!(verify_detached_any(&[&p2, &p1], msg, s1.as_ref()), Ok(1));
+    }
+
+    /// The control that makes the test above non-vacuous: a key OUTSIDE the set is
+    /// still refused. Without this, an implementation that accepted anything would
+    /// pass `accepts_any_member_of_the_keyset`.
+    #[test]
+    fn a_key_outside_the_keyset_is_refused() {
+        let k1 = keypair();
+        let retired = Ed25519KeyPair::from_seed_unchecked(&[3u8; 32]).unwrap();
+        let p1 = B64.encode(k1.public_key().as_ref());
+        let msg = b"appcast bytes";
+        let sig = retired.sign(msg);
+        assert_eq!(
+            verify_detached_any(&[&p1], msg, sig.as_ref()),
+            Err(SigReject::Verify),
+            "a retired key must stop working once dropped from the set"
+        );
+    }
+
+    /// An empty SLICE is unpinned (Disabled) — distinct from a set whose members
+    /// are all unusable, which is BadKey. Conflating them would report a broken
+    /// keyset as "this channel is unsigned".
+    #[test]
+    fn an_empty_keyset_is_disabled_and_garbage_is_bad_key() {
+        let kp = keypair();
+        let sig = kp.sign(b"m");
+        assert_eq!(
+            verify_detached_any(&[], b"m", sig.as_ref()),
+            Err(SigReject::Disabled)
+        );
+        assert_eq!(
+            verify_detached_any(&["not-base64!!"], b"m", sig.as_ref()),
+            Err(SigReject::BadKey)
+        );
+    }
+
+    /// A malformed or empty member can neither GRANT nor DENY: it is skipped, and a
+    /// good member beside it still verifies. A keyset is not made useless by one bad
+    /// entry, and a bad entry never authorises anything.
+    #[test]
+    fn a_malformed_member_can_neither_grant_nor_deny() {
+        let kp = keypair();
+        let pk = B64.encode(kp.public_key().as_ref());
+        let msg = b"m";
+        let sig = kp.sign(msg);
+        assert_eq!(verify_detached_any(&["not-base64!!", &pk], msg, sig.as_ref()), Ok(1));
+        assert_eq!(verify_detached_any(&["", &pk], msg, sig.as_ref()), Ok(1));
+        assert_eq!(
+            verify_detached_any(&[&B64.encode([0u8; 16]), &pk], msg, sig.as_ref()),
+            Ok(1)
+        );
+    }
+
+    /// Signature length is checked ONCE, before any member is tried — a wrong-length
+    /// signature is BadSig regardless of how many keys are listed.
+    #[test]
+    fn signature_length_is_checked_before_any_member() {
+        let kp = keypair();
+        let pk = B64.encode(kp.public_key().as_ref());
+        assert_eq!(
+            verify_detached_any(&[&pk, &pk], b"m", &[0u8; 10]),
             Err(SigReject::BadSig)
         );
     }

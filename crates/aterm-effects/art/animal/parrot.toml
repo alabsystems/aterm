@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "parrot"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.47, center_x = 0.5, word_top = 1.0 }
+
+# Parrot: bright red macaw head, white eye rings, big pale hooked beak with dark tip, yellow/blue wing band below.
+
+[[layer]]
+role = "outline"
+ref_fill = "#3A1210"
+recolor = "fixed"
+paths = ["M 24 74 C 24 45.3 49.1 22 80 22 C 110.9 22 136 45.3 136 74 C 136 102.7 110.9 126 80 126 C 49.1 126 24 102.7 24 74 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#DE3B2C"
+recolor = "fixed"
+paths = ["M 28 74 C 28 47.5 51.3 26 80 26 C 108.7 26 132 47.5 132 74 C 132 100.5 108.7 122 80 122 C 51.3 122 28 100.5 28 74 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#F2C230"
+recolor = "fixed"
+paths = ["M 32 88 C 48 104 112 104 128 88 C 126 104 106 118 80 118 C 54 118 34 104 32 88 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#2E6BD6"
+recolor = "fixed"
+paths = ["M 36 99 C 50 115 110 115 124 99 C 120 114 102 122 80 122 C 58 122 40 114 36 99 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F4EEE6"
+recolor = "fixed"
+paths = ["M 39 62 C 39 54.8 44.8 49 52 49 C 59.2 49 65 54.8 65 62 C 65 69.2 59.2 75 52 75 C 44.8 75 39 69.2 39 62 Z", "M 95 62 C 95 54.8 100.8 49 108 49 C 115.2 49 121 54.8 121 62 C 121 69.2 115.2 75 108 75 C 100.8 75 95 69.2 95 62 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 45.5 62 C 45.5 58.4 48.4 55.5 52 55.5 C 55.6 55.5 58.5 58.4 58.5 62 C 58.5 65.6 55.6 68.5 52 68.5 C 48.4 68.5 45.5 65.6 45.5 62 Z", "M 101.5 62 C 101.5 58.4 104.4 55.5 108 55.5 C 111.6 55.5 114.5 58.4 114.5 62 C 114.5 65.6 111.6 68.5 108 68.5 C 104.4 68.5 101.5 65.6 101.5 62 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 51.8 59.5 C 51.8 58.3 52.8 57.3 54 57.3 C 55.2 57.3 56.2 58.3 56.2 59.5 C 56.2 60.7 55.2 61.7 54 61.7 C 52.8 61.7 51.8 60.7 51.8 59.5 Z", "M 107.8 59.5 C 107.8 58.3 108.8 57.3 110 57.3 C 111.2 57.3 112.2 58.3 112.2 59.5 C 112.2 60.7 111.2 61.7 110 61.7 C 108.8 61.7 107.8 60.7 107.8 59.5 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#D5CBBB"
+recolor = "fixed"
+paths = ["M 80 62 C 93 62 101 71 100 82 C 99 92 90 100 85 105 C 82 108 78 108 75 105 C 70 100 61 92 60 82 C 59 71 67 62 80 62 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#4A3B33"
+recolor = "fixed"
+paths = ["M 66 84 C 71 96 77 103 80 104 C 83 103 89 96 94 84 C 93 99 87 107 80 107 C 73 107 67 99 66 84 Z"]

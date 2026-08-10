@@ -1280,11 +1280,37 @@ fn node_at_path_mut<'a, T>(
 }
 
 /// Independent tab-state flags; no state hides another state.
+///
+/// The two attention bits are SEPARATE FIELDS, one per owner, because a single
+/// shared bool cannot be recomputed. The status classifier refolds its bit from
+/// the tab's leaves on every publication, while a failed document shutdown or a
+/// settings/update announcement writes its own bit out of band and is not
+/// derivable from anything the classifier can see. Merged into one bool, the
+/// recomputing owner had to OR the stored value back in to avoid erasing the
+/// other — and so ORed back its OWN previous contribution, latching a failure
+/// onto the tab for the life of the process. Ask [`Self::wants_attention`] at
+/// every render seam; never read one field alone.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct TabIndicators {
     pub(crate) dirty: bool,
     pub(crate) busy: bool,
+    /// Raised OUT OF BAND by a native leaf's owner (a failed document shutdown,
+    /// an update announcement). Never written by the status path.
     pub(crate) attention: bool,
+    /// Raised by the session STATUS classifier — today, a failed last outcome.
+    /// Fully recomputed from the tab's terminal leaves on every pass, so it
+    /// clears itself when the failure is superseded.
+    pub(crate) status_attention: bool,
+}
+
+impl TabIndicators {
+    /// Whether anything at all wants the user's eye. The chrome shows ONE mark,
+    /// so every renderer and the introspection serializer fold here rather than
+    /// picking a field.
+    #[must_use]
+    pub(crate) const fn wants_attention(self) -> bool {
+        self.attention || self.status_attention
+    }
 }
 
 /// Closed icon identity for first-party, non-terminal tab applications.
@@ -1355,7 +1381,11 @@ pub(crate) fn aggregate_presentations(
         count += 1;
         indicators.dirty |= presentation.indicators.dirty;
         indicators.busy |= presentation.indicators.busy;
+        // Both attention owners fold independently, so a native leaf's
+        // out-of-band mark and a terminal leaf's failure can neither hide nor
+        // erase one another.
         indicators.attention |= presentation.indicators.attention;
+        indicators.status_attention |= presentation.indicators.status_attention;
         closable &= presentation.closable;
         if fallback.is_none() {
             fallback = Some(presentation.clone());
@@ -2008,6 +2038,7 @@ mod tests {
                             dirty: false,
                             busy: true,
                             attention: false,
+                            status_attention: false,
                         },
                         closable: true,
                         tooltip: Some("primary".to_string()),
@@ -2022,6 +2053,10 @@ mod tests {
                             dirty: true,
                             busy: false,
                             attention: true,
+                            // The classifier's own bit folds independently, so a
+                            // sibling's terminal failure cannot be hidden by, or
+                            // hide, this leaf's out-of-band mark.
+                            status_attention: true,
                         },
                         closable: false,
                         tooltip: None,
@@ -2037,6 +2072,7 @@ mod tests {
                 dirty: true,
                 busy: true,
                 attention: true,
+                status_attention: true,
             }
         );
         assert!(!aggregate.closable);

@@ -2023,6 +2023,62 @@ pub fn hangup(pid: i32) {
 /// was never force-killed. `ECHILD` now switches to a signal-0 liveness poll
 /// with the SAME grace/escalation schedule (launchd reaps the corpse, so no
 /// zombie risk on this path — only the escalation matters).
+/// Collect an exited child's status WITHOUT blocking and WITHOUT waiting for
+/// teardown — the one narrow window in which a shell's exit code is still
+/// answerable.
+///
+/// Call this at the PTY-exit edge, before [`reap`] runs on the teardown thread.
+/// aterm never installs a `SIGCHLD` handler and the child is a direct `forkpty`
+/// child, so between the reader seeing EOF and the session being dropped the
+/// child is an unreaped zombie whose status is still collectable. [`reap`] does
+/// the same `waitpid` and throws the status away, which is why this exists
+/// separately rather than as a return value there: `reap` is a teardown helper
+/// that may run long after anyone cares.
+///
+/// Three honest `None`s, all of which the caller must treat as "unknown", never
+/// as success:
+///
+/// * the child has NOT exited — EOF on the master means the master went
+///   unreadable, which a read error or a closed slave can also cause;
+/// * `ECHILD` — an ADOPTED session (parented to launchd after an overlap
+///   handoff), or one already reaped;
+/// * a non-positive pid.
+///
+/// Never escalate to a blocking wait to "get a real answer": this runs on the
+/// UI thread and an unbounded wait there is the defect, not the unknown.
+///
+/// INTERACTION WITH [`reap`]. Once this has reaped, `reap`'s own `waitpid`
+/// answers `ECHILD` and takes its not-our-child branch. That branch is safe here
+/// for the same reason it is safe for an adopted shell: it identity-checks with
+/// `getpgid(pid) == pid` before it will signal anything, so a dead child answers
+/// `ESRCH` and returns, and a recycled pid is overwhelmingly not a fresh session
+/// leader and is refused. This must stay on the EXIT edge only — calling it on
+/// the close path would disarm `reap`'s SIGKILL escalation against a
+/// HUP-ignoring shell, which is the whole reason that branch exists.
+#[must_use]
+pub fn collect_exit_status(pid: i32) -> Option<crate::ChildExit> {
+    if pid <= 1 {
+        return None;
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: `WNOHANG` `waitpid` with a valid out-param. Returns the pid when
+    // reaped, 0 when the child is alive, -1 when it is not ours.
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
+        return None;
+    }
+    if libc::WIFEXITED(status) {
+        return Some(crate::ChildExit::Code(libc::WEXITSTATUS(status)));
+    }
+    if libc::WIFSIGNALED(status) {
+        // Signal numbers are small positives; the cast cannot lose information
+        // for any signal a process can actually be killed by.
+        return Some(crate::ChildExit::Signal(libc::WTERMSIG(status) as u8));
+    }
+    // Stopped/continued without WUNTRACED/WCONTINUED is not reachable here, and
+    // is not an exit in any case.
+    None
+}
+
 pub fn reap(pid: i32) {
     if pid <= 1 {
         return;

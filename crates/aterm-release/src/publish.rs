@@ -211,10 +211,18 @@ fn workspace_mirror_slug(repo: &Path) -> Result<Option<String>> {
 /// journal for the same reason as [`workspace_mirror_slug`]: it is tracked
 /// repository policy at the claim commit, and one reader keeps one answer for
 /// the whole pipeline (pre-claim, lock, preflip, flip, recovery).
-fn workspace_channel_pubkey(repo: &Path) -> Result<Option<String>> {
-    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
-        .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
-    mirror::update_channel_pubkey(&cargo_text)
+fn workspace_channel_pubkey(_repo: &Path) -> Result<Option<String>> {
+    // ONE anchor. This used to parse `[workspace.metadata.aterm]
+    // update_channel_pubkey` out of Cargo.toml, which meant the key the CUTTER
+    // enforced and the key CLIENTS verify against were two separately edited
+    // committed values that nothing compared. Editing one and not the other would
+    // have produced releases signed by a key no client accepts — and neither the
+    // build nor the cut would have said a word.
+    //
+    // Both now read `aterm_update_core::pins`. `None` means the channel is
+    // unpinned (a fork), exactly as an absent manifest key used to.
+    let head = aterm_update_core::pins::update_channel_signing_pubkey();
+    Ok((!head.is_empty()).then(|| head.to_string()))
 }
 
 /// Parse the GitHub repository addressed by an `origin` URL.  Release state is
@@ -2509,24 +2517,22 @@ pub fn committed_channel_signature_policy(
     let committed = canonical_update_pubkey(committed)?;
     let Some(material) = material_pubkey else {
         return Err(Error::new(format!(
-            "{} {} = \"{committed}\" commits every cut for the pinned public channel to \
-             that signature, but ~/.aterm/release.conf provides no signing material — a \
-             keyless machine may not cut for a pinned channel; no ledger claim was made. \
-             Recover the offline signing configuration on this machine, or drop the pin \
-             in a tracked commit (the same deliberate act as removing {} itself)",
-            mirror::CHANNEL_TABLE,
-            mirror::CHANNEL_PUBKEY_KEY,
+            "the committed channel anchor (aterm-update-core::pins, \
+             UPDATE_CHANNEL_PUBKEYS[0] = \"{committed}\") commits every cut for the \
+             pinned public channel to that signature, but no signing material was \
+             supplied — a keyless machine may not cut for a pinned channel; no ledger \
+             claim was made. Supply the key, or unpin the channel in a tracked commit \
+             (the same deliberate act as removing {} itself)",
             mirror::CHANNEL_KEY,
         )));
     };
     let material = canonical_update_pubkey(material)?;
     if material != committed {
         return Err(Error::new(format!(
-            "the configured signing key's public identity {material} is not the committed \
-             channel pin {committed} ({} {}); refusing a release the pinned channel's \
-             clients would reject",
-            mirror::CHANNEL_TABLE,
-            mirror::CHANNEL_PUBKEY_KEY,
+            "the configured signing key's public identity {material} is not the \
+             committed channel anchor {committed} (aterm-update-core::pins, \
+             UPDATE_CHANNEL_PUBKEYS[0]); refusing a release the pinned channel's \
+             clients would reject"
         )));
     }
     Ok(SignaturePolicy {
@@ -5604,19 +5610,18 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     step(
         "signature",
         &match (
-            mirror::update_channel_pubkey(&cargo_text)?,
+            workspace_channel_pubkey(repo)?,
             signature_policy.required,
         ) {
             (Some(pin), _) => format!(
-                "committed {} {} pins signing to {pin} · configured key matches",
-                mirror::CHANNEL_TABLE,
-                mirror::CHANNEL_PUBKEY_KEY
+                "committed channel anchor (aterm-update-core::pins) pins signing to \
+                 {pin} · configured key matches"
             ),
             (None, true) => {
                 "signing key configured · matches persisted public identity".to_string()
             }
             (None, false) => {
-                "no committed channel pin and no signing configuration".to_string()
+                "no committed channel anchor and no signing configuration".to_string()
             }
         },
     );

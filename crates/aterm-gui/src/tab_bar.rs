@@ -56,7 +56,8 @@ impl TabStripMetadata {
             icon: presentation.icon,
             dirty: presentation.indicators.dirty,
             busy: presentation.indicators.busy,
-            attention: presentation.indicators.attention,
+            // The strip draws ONE attention mark, so the two owners fold here.
+            attention: presentation.indicators.wants_attention(),
             closable: presentation.closable,
         }
     }
@@ -910,6 +911,7 @@ pub fn paint_strip(
     let paint = StripPaint {
         hovered,
         subtitle: None,
+        rename: None,
     };
     let _ = paint_strip_impl(row, segments, titles, None, paint, active, theme, None);
 }
@@ -928,6 +930,26 @@ pub(crate) struct StripPaint<'a> {
     /// The lone tab's one-line description ([`solo_subtitle`]), drawn dim after
     /// the centred title. `None` = nothing the title does not already say.
     pub subtitle: Option<&'a str>,
+    /// The live inline SESSION-RENAME field, when this window has one and the
+    /// in-grid strip is what presents it. `None` = paint labels as usual.
+    pub rename: Option<StripRenameField<'a>>,
+}
+
+/// The in-grid inline rename editor, as the strip painter needs it: WHICH tab it
+/// sits over, and the field's text + caret.
+///
+/// Deliberately positional, not identity-bearing: the strip is handed no session
+/// ids (it never has been), so `App` resolves the edited tab's CURRENT index once
+/// per paint. Everything about ownership — which session, which surface — stays in
+/// [`crate::app_rename::TabRenameEdit`].
+#[derive(Clone, Copy)]
+pub(crate) struct StripRenameField<'a> {
+    /// Index of the edited tab in `titles`/`segments`.
+    pub tab: usize,
+    /// The field's text.
+    pub text: &'a str,
+    /// Caret position in `text`, as a BYTE offset on a char boundary.
+    pub cursor: usize,
 }
 
 /// Paint the shipping strip from canonical presentation metadata and return sparse
@@ -1006,6 +1028,28 @@ fn paint_strip_impl(
                     put(row, c, ' ', StripRole::Inactive);
                 }
                 let title = titles.get(i).map(String::as_str).unwrap_or("");
+                // EDITING the lone tab: the band becomes one left-aligned field
+                // inset from both edges. The centred title+description group is
+                // dropped for the duration — a centred field recentres itself (and
+                // takes the caret with it) on every character typed, and the
+                // description recomposes underneath, which is unusable. The icon
+                // and status marks go too: the field gets the whole band.
+                if let Some(edit) = paint.rename.filter(|edit| edit.tab == i) {
+                    let start = usize::from(seg.start_col) + SOLO_EDGE_COLS;
+                    let end = usize::from(seg.end_col).saturating_sub(SOLO_EDGE_COLS);
+                    if start < end {
+                        paint_rename_field(
+                            row,
+                            start..end,
+                            edit.text,
+                            edit.cursor,
+                            title,
+                            theme,
+                            None,
+                        );
+                    }
+                    continue;
+                }
                 let (title, subtitle) = solo_band_text(title, paint.subtitle, span as usize);
                 let width = title.chars().count()
                     + subtitle
@@ -1046,7 +1090,18 @@ fn paint_strip_impl(
                 for c in seg.start_col..seg.end_col {
                     put(row, c, ' ', tab_role);
                 }
-                let item = metadata.and_then(|items| items.get(i)).copied();
+                let editing = paint.rename.filter(|edit| edit.tab == i);
+                // While a chip is being EDITED it spends its whole interior on the
+                // field: the icon and the status canvas are suppressed for the
+                // duration. `tab_content_layout` can legitimately hand back a
+                // ONE-cell title span on a narrow equal-share segment, and a
+                // one-cell field is a caret with no text. The close column and the
+                // segment bounds are untouched either way — this is paint, and the
+                // hit geometry is not paint's to move.
+                let item = metadata
+                    .and_then(|items| items.get(i))
+                    .copied()
+                    .filter(|_| editing.is_none());
                 let layout = item.map_or_else(
                     || TabContentLayout {
                         icon_start: None,
@@ -1081,14 +1136,32 @@ fn paint_strip_impl(
                 }
                 // Title region follows the icon/status slots. The close column remains
                 // exactly where pure layout put it, so paint can never perturb input.
-                let avail = layout.title_end.saturating_sub(layout.title_start);
                 let raw = titles.get(i).map(String::as_str).unwrap_or("");
-                let label = truncate_title(raw, avail as usize);
-                for (col, ch) in (layout.title_start..).zip(label.chars()) {
-                    if col >= layout.title_end {
-                        break;
+                if let Some(edit) = editing {
+                    // The field takes the title span verbatim — never
+                    // `truncate_title`, which would ellipsise the middle of what
+                    // you are typing. It scrolls instead, like any text field.
+                    paint_rename_field(
+                        row,
+                        usize::from(layout.title_start)..usize::from(layout.title_end),
+                        edit.text,
+                        edit.cursor,
+                        raw,
+                        theme,
+                        // The edited chip keeps its selected seam. Only the ACTIVE
+                        // chip has one to keep — a context-menu rename can target a
+                        // background tab, which stays unselected while you type.
+                        is_active.then_some(colors.accent),
+                    );
+                } else {
+                    let avail = layout.title_end.saturating_sub(layout.title_start);
+                    let label = truncate_title(raw, avail as usize);
+                    for (col, ch) in (layout.title_start..).zip(label.chars()) {
+                        if col >= layout.title_end {
+                            break;
+                        }
+                        put(row, col, strip_char(ch), tab_role);
                     }
-                    put(row, col, strip_char(ch), tab_role);
                 }
                 if let Some(cx) = seg.close_col
                     && paint.hovered == Some(i)
@@ -1309,6 +1382,104 @@ fn append_status_image(
     ));
 }
 
+/// Clipped-edge markers for the inline rename field — the find bar's glyphs, so
+/// the two in-grid single-line fields say "the text continues past here" the same
+/// way.
+const RENAME_SCROLL_LEFT: char = '‹';
+const RENAME_SCROLL_RIGHT: char = '›';
+
+/// Paint the inline SESSION-RENAME field across `field` (a column range of `row`):
+/// a recessed well holding the visible slice of `text`, with a REVERSE-VIDEO block
+/// caret on the character at `cursor`.
+///
+/// This is [`crate::find_bar`]'s well, in the strip — deliberately the same
+/// machine, because it is the same thing: aterm's one in-grid single-line text
+/// field. The caret costs no cell (so text never shifts when it moves), the view
+/// scrolls the MINIMUM needed to keep the caret inside, and `‹`/`›` mark an edge
+/// the text continues past without ever overwriting the caret. An empty field
+/// shows the label the ladder would fall back to, dimmed — so "empty means use
+/// that" is visible rather than folklore.
+///
+/// `underline` keeps the ACTIVE chip's accent seam under the field cells: the tab
+/// being edited must not stop looking selected while you type.
+///
+/// The visible characters go through [`strip_char`], the same 1-char-per-cell
+/// projection the titles use, and the caret is placed by CHAR index into that
+/// projection — so a wide/non-BMP character in a pin cannot desync the painted
+/// caret column from the byte offset the state holds.
+fn paint_rename_field(
+    row: &mut [RenderCell],
+    field: std::ops::Range<usize>,
+    text: &str,
+    cursor: usize,
+    placeholder: &str,
+    theme: Theme,
+    underline: Option<[u8; 3]>,
+) {
+    let width = field.len();
+    if width == 0 || field.end > row.len() {
+        return;
+    }
+    let c = crate::chrome_band::band_colors(theme);
+    let well = |ch: char, fg: [u8; 3], bg: [u8; 3]| {
+        let mut cell = crate::chrome_band::cell(ch, fg, bg, false, false);
+        if let Some(accent) = underline {
+            cell.underline = UnderlineStyle::Single;
+            cell.underline_color = Some(accent);
+        }
+        cell
+    };
+    let chars: Vec<char> = text.chars().map(strip_char).collect();
+    // Caret in CHARS of the same projection the cells carry. The byte offset is
+    // always on a char boundary (the field reducer's invariant), so counting the
+    // prefix is exact.
+    let caret = text
+        .get(..cursor.min(text.len()))
+        .map_or(chars.len(), |head| head.chars().count())
+        .min(chars.len());
+    for cell in &mut row[field.clone()] {
+        *cell = well(' ', c.value, c.field_bg);
+    }
+    // The caret can sit one past the last character, so the scrollable extent is
+    // `len + 1` even though only `len` cells carry a glyph.
+    let max_start = (chars.len() + 1).saturating_sub(width);
+    let scroll = caret.saturating_sub(width - 1).min(max_start);
+    for i in 0..width {
+        let index = scroll + i;
+        let ch = chars.get(index).copied().unwrap_or(' ');
+        row[field.start + i] = if index == caret {
+            // Reverse video: the well's background becomes the ink.
+            well(ch, c.field_bg, c.caret)
+        } else {
+            well(ch, c.value, c.field_bg)
+        };
+        if index > chars.len() {
+            break;
+        }
+    }
+    if chars.is_empty() {
+        // An empty field means "fall back down the ladder". Show WHAT it falls back
+        // to, dimmed, after the caret — never as content, so Return still clears.
+        let hint: Vec<char> = placeholder.chars().map(strip_char).collect();
+        for (i, ch) in hint.iter().enumerate() {
+            let col = field.start + 2 + i;
+            if col >= field.end {
+                break;
+            }
+            row[col] = well(*ch, c.label, c.field_bg);
+        }
+    }
+    // Clipped-edge markers, never over the caret (the caret's cell is the one place
+    // the user is looking, and it already proves where the edit position is).
+    if scroll > 0 && caret != scroll {
+        row[field.start] = well(RENAME_SCROLL_LEFT, c.label, c.field_bg);
+    }
+    let last = scroll + width - 1;
+    if last < chars.len() && caret != last {
+        row[field.end - 1] = well(RENAME_SCROLL_RIGHT, c.label, c.field_bg);
+    }
+}
+
 /// Blank cells between the SOLO band's title and its description.
 const SOLO_GAP_COLS: usize = 3;
 /// Cells kept clear at EACH end of the solo band, so the centred group never
@@ -1389,6 +1560,218 @@ mod tests {
         assert_eq!(segs[1].end_col, 80);
     }
 
+    /// THE INLINE RENAME FIELD replaces the chip's title span with the find bar's
+    /// well: the text verbatim (never ellipsised — you are typing it), a
+    /// REVERSE-VIDEO block caret on the edit position, and the selected chip's
+    /// accent seam kept underneath so the tab still reads as selected.
+    #[test]
+    fn the_rename_field_paints_the_text_with_a_reverse_video_caret() {
+        let theme = Theme::default();
+        let metadata = [
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("a")),
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("b")),
+        ];
+        let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
+        let titles = ["one".to_string(), "two".to_string()];
+        let mut row = vec![blank_cell(theme); 60];
+        paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: None,
+                rename: Some(StripRenameField {
+                    tab: 0,
+                    text: "build",
+                    cursor: 2,
+                }),
+            },
+            0,
+            theme,
+            None,
+        );
+        let seg = segments[0];
+        let painted: String = row[seg.start_col as usize..seg.end_col as usize]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(painted.contains("build"), "the field's text, not the title");
+        assert!(
+            !painted.contains("one"),
+            "the label is replaced while editing, not drawn beside the field"
+        );
+        // The caret cell is the one at the edit position, reverse-videoed: the
+        // well's background becomes its ink, so the caret costs no cell.
+        let colors = crate::chrome_band::band_colors(theme);
+        let caret = row
+            .iter()
+            .find(|cell| cell.ch == 'i')
+            .expect("the character under the caret is still drawn");
+        assert_eq!(caret.fg, colors.field_bg, "reverse video: bg becomes ink");
+        assert_eq!(caret.bg, colors.caret);
+        assert_eq!(
+            caret.underline,
+            UnderlineStyle::Single,
+            "the edited chip is still the selected one"
+        );
+        // The tab NOT being edited keeps its ordinary label.
+        let other: String = row[segments[1].start_col as usize..segments[1].end_col as usize]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(other.contains("two"));
+    }
+
+    /// A narrow chip would leave `tab_content_layout` a one-cell title span once
+    /// the icon and status canvas took their share — a caret with no text. While
+    /// editing they are suppressed, so the field gets the chip's whole interior
+    /// and still scrolls rather than truncating.
+    #[test]
+    fn a_busy_narrow_chip_spends_its_whole_interior_on_the_field() {
+        let theme = Theme::default();
+        let mut presentation = crate::tab_model::TabPresentation::terminal("a");
+        presentation.icon = Some(TabIconKind::Settings);
+        presentation.indicators.busy = true;
+        presentation.indicators.attention = true;
+        let metadata = [
+            TabStripMetadata::from_presentation(&presentation),
+            TabStripMetadata::from_presentation(&presentation),
+        ];
+        let segments = layout_segments_with_metadata(28, 2, &metadata, 0, false);
+        let titles = ["one".to_string(), "two".to_string()];
+        let mut row = vec![blank_cell(theme); 28];
+        let images = paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: None,
+                rename: Some(StripRenameField {
+                    tab: 0,
+                    text: "abcdef",
+                    cursor: 6,
+                }),
+            },
+            0,
+            theme,
+            None,
+        );
+        let seg = segments[0];
+        let painted: String = row[seg.start_col as usize..seg.end_col as usize]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            painted.contains("def"),
+            "the field scrolled to keep the caret in view: {painted:?}"
+        );
+        assert!(
+            !painted.contains('…'),
+            "a field scrolls; it never ellipsises what you are typing: {painted:?}"
+        );
+        assert!(
+            images
+                .iter()
+                .all(|(col, _)| *col < seg.start_col as usize || *col >= seg.end_col as usize),
+            "the edited chip's icon and status marks yield their cells to the field"
+        );
+    }
+
+    /// EDITING THE LONE TAB: the solo band becomes one left-aligned field. The
+    /// centred title+description group is dropped — a centred field recentres
+    /// itself (and the caret with it) on every character typed.
+    #[test]
+    fn editing_the_solo_band_drops_the_centred_group_for_a_left_aligned_field() {
+        let theme = Theme::default();
+        let metadata = [TabStripMetadata::from_presentation(
+            &crate::tab_model::TabPresentation::terminal("aterm"),
+        )];
+        let segments = layout_segments_with_metadata(40, 1, &metadata, 0, false);
+        let band = segments[0];
+        assert!(band.solo);
+        let mut row = vec![blank_cell(theme); 40];
+        paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &["aterm".to_string()],
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: Some("~/aterm"),
+                rename: Some(StripRenameField {
+                    tab: 0,
+                    text: "agent",
+                    cursor: 5,
+                }),
+            },
+            0,
+            theme,
+            None,
+        );
+        let painted: String = row[..band.end_col as usize].iter().map(|c| c.ch).collect();
+        assert!(painted.contains("agent"), "the field is drawn");
+        assert!(
+            !painted.contains("~/aterm"),
+            "the description would recompose under the caret: {painted:?}"
+        );
+        let first = painted.find(|c: char| c != ' ').expect("some ink");
+        assert_eq!(
+            first, SOLO_EDGE_COLS,
+            "left-aligned at the band's inset, not centred"
+        );
+    }
+
+    /// An EMPTY field shows the label the ladder falls back to, dimmed — so
+    /// "commit empty and it falls back to that" is visible rather than folklore.
+    #[test]
+    fn an_empty_rename_field_placeholds_with_the_resolved_label() {
+        let theme = Theme::default();
+        let metadata = [
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("a")),
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal("b")),
+        ];
+        let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
+        let titles = ["vim src/main.rs".to_string(), "two".to_string()];
+        let mut row = vec![blank_cell(theme); 60];
+        paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: None,
+                rename: Some(StripRenameField {
+                    tab: 0,
+                    text: "",
+                    cursor: 0,
+                }),
+            },
+            0,
+            theme,
+            None,
+        );
+        let seg = segments[0];
+        let painted: String = row[seg.start_col as usize..seg.end_col as usize]
+            .iter()
+            .map(|c| c.ch)
+            .collect();
+        assert!(
+            painted.contains("vim src"),
+            "the fallback label is the placeholder: {painted:?}"
+        );
+        let colors = crate::chrome_band::band_colors(theme);
+        let hint = row
+            .iter()
+            .find(|cell| cell.ch == 'v')
+            .expect("the placeholder is drawn");
+        assert_eq!(hint.fg, colors.label, "dimmed — it is not content");
+    }
+
     /// The SOLO band paints the window's title, not a chip: no raised card, no
     /// selection underline, no `✕`, the title CENTRED and its description trailing
     /// in the dim tone. The native strip's solo band, in cells.
@@ -1411,6 +1794,7 @@ mod tests {
                 // Hovered, and STILL no ✕: a title band has none to reveal.
                 hovered: Some(0),
                 subtitle: Some("~/aterm"),
+                rename: None,
             },
             0,
             theme,
@@ -1470,6 +1854,7 @@ mod tests {
                 StripPaint {
                     hovered,
                     subtitle: None,
+                    rename: None,
                 },
                 0,
                 theme,
@@ -1692,6 +2077,7 @@ mod tests {
             StripPaint {
                 hovered: Some(0),
                 subtitle: None,
+                rename: None,
             },
             0,
             theme,
@@ -1804,6 +2190,7 @@ mod tests {
             StripPaint {
                 hovered: Some(0),
                 subtitle: None,
+                rename: None,
             },
             0,
             theme,

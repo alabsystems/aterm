@@ -1030,6 +1030,24 @@ pub struct RenderInput {
     /// still fills). Cells absent here take the ordinary glyph dispatch, so a
     /// frame with no images is byte-identical to the pre-image path.
     pub images: Vec<Vec<(usize, aterm_grid::ImageRef)>>,
+    /// WALLPAPER base layer: a host-prepared RGBA8 image, PRE-SCALED to exactly
+    /// this frame's pixel dimensions (cover-fit) and PRE-BLENDED toward the theme
+    /// background by the configured dim — the renderer only blits, never scales,
+    /// so the CPU copy and the GPU 1:1 NEAREST-sampled texture stay byte-exact.
+    /// When set, the frame's base (the clear, the padding bands, and every
+    /// UNSELECTED cell whose bg resolves to its pane's live default) shows these
+    /// texels instead of the flat default background; selected cells and SGR-
+    /// colored backgrounds still paint opaquely over it (the kitty
+    /// below-bg-image cover rule). Wallpaper pixels are OPAQUE: they replace the
+    /// background-opacity glass rather than compositing with it. Compared by
+    /// SNAPSHOT IDENTITY (`Arc::as_ptr`) like every atlas — the host publishes a
+    /// fresh `Arc` per (source, size, dim) revision, and an identity change
+    /// forces a full repaint (the padding strips are not a row the per-row diff
+    /// can mark; same law as a live default-bg change). It also disables the E7
+    /// scroll-blit rescue: a row blit would drag the fixed backdrop along with
+    /// the content. `None` — every pre-wallpaper frame — is byte-identical to
+    /// the historical render paths.
+    pub wallpaper: Option<std::sync::Arc<SceneAtlas>>,
     /// The LIVE default background colour (`0x00RRGGBB`) for this frame: the engine's
     /// dynamic default-bg already folded with DECSCNM reverse-video, resolved by
     /// [`Terminal::cell_frame_into`](crate::terminal::Terminal::cell_frame_into).
@@ -1136,6 +1154,7 @@ impl Clone for RenderInput {
             line_size_spans: self.line_size_spans.clone(),
             default_bg_spans: self.default_bg_spans.clone(),
             images: self.images.clone(),
+            wallpaper: self.wallpaper.clone(),
             default_bg: self.default_bg,
             default_fg: self.default_fg,
             cursor_color: self.cursor_color,
@@ -1202,6 +1221,7 @@ impl Clone for RenderInput {
         self.line_size_spans.clone_from(&source.line_size_spans);
         self.default_bg_spans.clone_from(&source.default_bg_spans);
         self.images.clone_from(&source.images);
+        self.wallpaper.clone_from(&source.wallpaper);
         self.default_bg = source.default_bg;
         self.default_fg = source.default_fg;
         self.cursor_color = source.cursor_color;
@@ -1266,6 +1286,8 @@ impl PartialEq for RenderInput {
             && self.line_size_spans == other.line_size_spans
             && self.default_bg_spans == other.default_bg_spans
             && self.images == other.images
+            && self.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
+                == other.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
             && self.default_bg == other.default_bg
             && self.default_fg == other.default_fg
             && self.cursor_color == other.cursor_color
@@ -1347,6 +1369,7 @@ impl RenderInput {
             line_size_spans: Vec::new(),
             default_bg_spans: Vec::new(),
             images: Vec::new(),
+            wallpaper: None,
             default_bg: COLOR_UNSET,
             default_fg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
@@ -1497,6 +1520,7 @@ impl RenderInput {
         self.rain_quads.clear();
         self.rain_atlas = None;
         self.rain_add.clear();
+        self.wallpaper = None;
     }
 
     /// The emoji grapheme-cluster string at viewport cell `(row, col)`, if this

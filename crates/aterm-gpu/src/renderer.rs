@@ -2564,6 +2564,13 @@ pub struct GpuRenderer {
     /// the cat regime (bake == dest size, 1:1; `FreeSampler::Linear` deferred).
     /// `None` until the first free-sprite frame.
     free_atlas: Option<SpriteTex>,
+    /// The uploaded frame-sized RGBA8 WALLPAPER texture
+    /// (`RenderInput::wallpaper`, host pre-scaled + pre-dimmed) + bind group,
+    /// identity-cached like `free_atlas`. Bound with the NEAREST glyph
+    /// `sampler` — the wallpaper is baked at exact frame size (1:1, the cat
+    /// regime), so the GPU reads the very texel the CPU base copy lays down.
+    /// `None` until the first wallpaper frame.
+    wallpaper_tex: Option<SpriteTex>,
     /// The uploaded RGBA8 PHOSPHOR rain-glyph atlas (`RenderInput::rain_atlas`,
     /// the `RainBaker` white-coverage tiles) + bind group, version-cached like
     /// `cat_atlas`. Bound with the NEAREST glyph `sampler` — rain tiles are
@@ -3068,6 +3075,14 @@ struct Instances {
     /// FREE-floating OVER-TEXT sprites (`FreeZ::OverText`), drawn after the
     /// wdeco streams and immediately BEFORE the cursor. Empty when unused.
     free_over: Vec<GlyphInstance>,
+    /// WALLPAPER base-layer quads (`RenderInput::wallpaper`): 1:1 NEAREST
+    /// samples of the frame-sized wallpaper texture, drawn FIRST in the base-bg
+    /// half — before every cell background — so unselected default-bg cells
+    /// (which push no quad under a live wallpaper) reveal the backdrop. FULL
+    /// scope pushes one whole-frame quad over the clear; DIRTY scope pushes the
+    /// band/strip re-establish quads the theme-bg resets would otherwise push
+    /// (same rects, textured). Empty for every wallpaper-free frame.
+    wallpaper: Vec<GlyphInstance>,
     cursor_block: Vec<BgInstance>,
     cursor_glyph: Vec<GlyphInstance>,
     cursor_color: Vec<GlyphInstance>,
@@ -3105,6 +3120,7 @@ impl Instances {
         self.cat_over.clear();
         self.free_under.clear();
         self.free_over.clear();
+        self.wallpaper.clear();
         self.cursor_block.clear();
         self.cursor_glyph.clear();
         self.cursor_color.clear();
@@ -3148,6 +3164,7 @@ struct VertexBuffers {
     cat_over: VertexBuffer,
     free_under: VertexBuffer,
     free_over: VertexBuffer,
+    wallpaper: VertexBuffer,
     cursor_block: VertexBuffer,
     cursor_glyph: VertexBuffer,
     cursor_color: VertexBuffer,
@@ -3187,6 +3204,7 @@ impl VertexBuffers {
             cat_over: VertexBuffer::new(device, "aterm-gpu cat over instances"),
             free_under: VertexBuffer::new(device, "aterm-gpu free under-text instances"),
             free_over: VertexBuffer::new(device, "aterm-gpu free over-text instances"),
+            wallpaper: VertexBuffer::new(device, "aterm-gpu wallpaper base instances"),
             cursor_block: VertexBuffer::new(device, "aterm-gpu cursor block fill"),
             cursor_glyph: VertexBuffer::new(device, "aterm-gpu cursor cut-out glyph"),
             cursor_color: VertexBuffer::new(device, "aterm-gpu cursor colour glyph"),
@@ -4417,6 +4435,7 @@ impl GpuRenderer {
             sprite_over_pipeline,
             cat_atlas: None,
             free_atlas: None,
+            wallpaper_tex: None,
             rain_atlas: None,
             bloom_strength: BLOOM_STRENGTH,
             bloom_radius: BLOOM_RADIUS,
@@ -9985,6 +10004,92 @@ impl GpuRenderer {
         });
     }
 
+    /// (Re)upload the frame-sized WALLPAPER texture (`RenderInput::wallpaper`,
+    /// host pre-scaled to the frame pixel dims and pre-dimmed) when the frame
+    /// carries a different published snapshot than the resident copy
+    /// (`Arc::ptr_eq` — the host publishes a fresh `Arc` per (source, size,
+    /// dim) revision), or clear it when the frame has no wallpaper. The
+    /// `ensure_free_atlas` pattern verbatim: ONE bind group over `atlas_bgl`
+    /// carrying the NEAREST glyph `sampler` (bake == dest size, 1:1), so the
+    /// sampled texel is byte-identical to the CPU base copy's word.
+    fn ensure_wallpaper_tex(&mut self, input: &RenderInput) {
+        let Some(src_arc) = input.wallpaper.as_ref() else {
+            self.wallpaper_tex = None;
+            return;
+        };
+        let src = src_arc.as_ref();
+        let need = (src.width as usize)
+            .saturating_mul(src.height as usize)
+            .saturating_mul(4);
+        if src.width == 0 || src.height == 0 || src.rgba.len() < need {
+            self.wallpaper_tex = None;
+            return;
+        }
+        // Identity skip, not `(version, w, h)`: see `SpriteTex::src`.
+        if matches!(&self.wallpaper_tex, Some(s) if Arc::ptr_eq(&s.src, src_arc)) {
+            return;
+        }
+        let device = &self.ctx.device;
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("aterm-gpu wallpaper"),
+            size: wgpu::Extent3d {
+                width: src.width,
+                height: src.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &src.rgba[..need],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(src.width * 4),
+                rows_per_image: Some(src.height),
+            },
+            wgpu::Extent3d {
+                width: src.width,
+                height: src.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("aterm-gpu wallpaper bind"),
+                layout: &self.atlas_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        // NEAREST — bake == dest size (see the fn doc).
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+        self.wallpaper_tex = Some(SpriteTex {
+            bind,
+            w: src.width,
+            h: src.height,
+            src: Arc::clone(src_arc),
+        });
+    }
+
     /// (Re)upload the PHOSPHOR rain-glyph atlas (`RenderInput::rain_atlas`, the
     /// `RainBaker` white-coverage tiles) when the frame carries a different
     /// published snapshot than the resident copy (`Arc::ptr_eq`, see
@@ -10210,6 +10315,8 @@ impl GpuRenderer {
         self.ensure_free_atlas(input);
         // PHOSPHOR rain atlas upload, the same version-keyed pattern.
         self.ensure_rain_atlas(input);
+        // WALLPAPER texture upload, identity-keyed like the free atlas.
+        self.ensure_wallpaper_tex(input);
 
         // Which rows to (re)build instances for. FULL: every row. Dirty: only the
         // flagged rows (others are preserved on the offscreen by LoadOp::Load).
@@ -10238,6 +10345,32 @@ impl GpuRenderer {
             RepaintScope::Full => None,
         };
 
+        // WALLPAPER admission for THIS frame: the uploaded texture must match
+        // the frame pixel dims exactly (the host pre-scales; anything else —
+        // a resize race, a malformed atlas — renders as no wallpaper, the CPU
+        // `ensure_wallpaper_px` rule). When live, the base-bg half draws the
+        // textured base quads FIRST and the cell loops below push NO quad for
+        // an unselected default-bg cell, revealing the backdrop (the CPU
+        // `resolve` None arm).
+        let wallpaper_on = input.wallpaper.is_some()
+            && self
+                .wallpaper_tex
+                .as_ref()
+                .is_some_and(|s| s.w == w && s.h == h);
+        // One 1:1 textured quad over rect `(x, y, rw, rh)` of the frame-sized
+        // wallpaper texture (uv == rect / frame dims; identity tint, opaque).
+        let wallpaper_quad = |x: f32, y: f32, rw: f32, rh: f32| GlyphInstance {
+            rect: [x, y, rw, rh],
+            uv: [
+                x / w as f32,
+                y / h as f32,
+                rw / w as f32,
+                rh / h as f32,
+            ],
+            color: [255, 255, 255, 255],
+            // fs_sprite_over blends un-remapped: bg unused.
+            bg: [0, 0, 0, 0],
+        };
         // Visible rows, already resolved by `extract` under the lock.
         let rendered: &[Vec<aterm_core::terminal::RenderCell>] = &input.cells;
 
@@ -10260,6 +10393,17 @@ impl GpuRenderer {
         // retained — no per-frame allocation in the steady state). They are
         // rebuilt below with identical contents in identical order.
         self.inst.clear();
+
+        // WALLPAPER, FULL scope: the whole-frame base quad over the pass clear
+        // — the GPU twin of the CPU full path's whole-buffer wallpaper copy.
+        // Pushed AFTER the instance reset above (a push before it is silently
+        // wiped — the bug that made the backdrop appear only on repainted
+        // rows); the DIRTY-scope band/strip quads push inside the row loop.
+        if wallpaper_on && matches!(scope, RepaintScope::Full) {
+            self.inst
+                .wallpaper
+                .push(wallpaper_quad(0.0, 0.0, w as f32, h as f32));
+        }
 
         // Atlas for every drawable glyph across the grid: each char resolves
         // to its full glyph identity (face/style/size) via the CPU renderer's
@@ -10636,17 +10780,34 @@ impl GpuRenderer {
             && let Some((f, last)) = dirty_band
         {
             if f == 0 && grid_top > 0 {
-                bg_inst.push(BgInstance {
-                    rect: [0, 0, w as u16, grid_top as u16],
-                    color: theme_bg,
-                });
+                if wallpaper_on {
+                    // Re-establish the strip from the BACKDROP texels, exactly
+                    // the bytes FULL's whole-frame wallpaper quad gives it.
+                    self.inst
+                        .wallpaper
+                        .push(wallpaper_quad(0.0, 0.0, w as f32, grid_top as f32));
+                } else {
+                    bg_inst.push(BgInstance {
+                        rect: [0, 0, w as u16, grid_top as u16],
+                        color: theme_bg,
+                    });
+                }
             }
             let grid_bot = ((grid_top + rows * ch) as u32).min(h);
             if last + 1 >= rows && grid_bot < h {
-                bg_inst.push(BgInstance {
-                    rect: [0, grid_bot as u16, w as u16, (h - grid_bot) as u16],
-                    color: theme_bg,
-                });
+                if wallpaper_on {
+                    self.inst.wallpaper.push(wallpaper_quad(
+                        0.0,
+                        grid_bot as f32,
+                        w as f32,
+                        (h - grid_bot) as f32,
+                    ));
+                } else {
+                    bg_inst.push(BgInstance {
+                        rect: [0, grid_bot as u16, w as u16, (h - grid_bot) as u16],
+                        color: theme_bg,
+                    });
+                }
             }
         }
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
@@ -10716,10 +10877,22 @@ impl GpuRenderer {
             // seam and no stale contamination. (FULL path keeps the pass Clear, so
             // it does NOT emit this — its whole-target clear already covers it.)
             if matches!(scope, RepaintScope::Dirty(_)) {
-                bg_inst.push(BgInstance {
-                    rect: [0, y0u, w as u16, ch as u16],
-                    color: theme_bg,
-                });
+                if wallpaper_on {
+                    // The band re-establish, from the BACKDROP instead of the
+                    // theme bg — the wallpaper stream draws before the per-cell
+                    // REPLACE quads below, so explicit backgrounds still cover.
+                    self.inst.wallpaper.push(wallpaper_quad(
+                        0.0,
+                        (grid_top + r * ch) as f32,
+                        w as f32,
+                        ch as f32,
+                    ));
+                } else {
+                    bg_inst.push(BgInstance {
+                        rect: [0, y0u, w as u16, ch as u16],
+                        color: theme_bg,
+                    });
+                }
             }
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // This cell's origin, advance and (mixed rows only) run box in
@@ -10749,6 +10922,14 @@ impl GpuRenderer {
                 let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
                 let cell_bg = aterm_render::rgb_to_u32(cell.bg);
                 let default_bg = aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
+                // WALLPAPER: an unselected default-bg cell pushes NO quad — the
+                // wallpaper base quad already laid the backdrop there (the CPU
+                // `resolve` None arm). The image_bg_cover push below is
+                // unreachable under this condition, so kitty's cover rule is
+                // untouched.
+                if wallpaper_on && !selected && cell_bg == default_bg {
+                    continue;
+                }
                 let color = if selected {
                     // The active/inactive selection band colour captured above.
                     rgb4_u32(theme_selection)
@@ -10832,6 +11013,11 @@ impl GpuRenderer {
                         aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
                     let color = if selected {
                         rgb4_u32(theme_selection)
+                    } else if wallpaper_on {
+                        // An implicit tail cell IS its pane's default bg, so
+                        // under a wallpaper it shows the backdrop (the CPU tail
+                        // loop's wallpaper `continue`).
+                        continue;
                     } else if default_bg != frame_bg {
                         // This cell's bg IS its pane default, so it carries the
                         // background-opacity alpha under pass-1's default-bg rule.
@@ -12251,8 +12437,14 @@ impl GpuRenderer {
         let cat_bind = self.cat_atlas.as_ref().map(|s| &s.bind);
         let free_bind = self.free_atlas.as_ref().map(|s| &s.bind);
         let rain_bind = self.rain_atlas.as_ref().map(|s| &s.bind);
+        let wallpaper_bind = self.wallpaper_tex.as_ref().map(|s| &s.bind);
 
         let (device, queue) = (&self.ctx.device, &self.ctx.queue);
+        let wallpaper_buf = self.vbufs.wallpaper.upload(
+            device,
+            queue,
+            bytemuck::cast_slice(&self.inst.wallpaper),
+        );
         let bg_buf = self
             .vbufs
             .bg
@@ -12605,6 +12797,7 @@ impl GpuRenderer {
         // ENCODE scope so the (conditional) multiple passes below all share them.
         #[derive(PartialEq, Clone, Copy)]
         enum Pipe {
+            Wallpaper,
             Bg,
             CursorBlend,
             Glyph,
@@ -12630,6 +12823,7 @@ impl GpuRenderer {
             Rain,
             Cat,
             Free,
+            Wallpaper,
         }
         // Bind the pipeline (+ atlas group) only on a change, then draw. References
         // the `pass`/`cur_pipe`/`cur_atlas` in scope at the CALL SITE (each pass
@@ -12688,6 +12882,21 @@ impl GpuRenderer {
         // back-to-back in ONE pass, byte-identical to the historical fused emit.
         macro_rules! emit_base_bg {
             ($p:ident, $cp:ident, $ca:ident) => {
+                // WALLPAPER base quads FIRST — before every cell background —
+                // so default-bg cells (which push no quad under a live
+                // wallpaper) reveal the backdrop. Same src-over pipeline as the
+                // sprites; identity tint + opaque alpha ⇒ dst = texel, the CPU
+                // base copy byte-for-byte. Empty (no draw) without a wallpaper.
+                draw_stream!(
+                    $p,
+                    $cp,
+                    $ca,
+                    wallpaper_buf,
+                    self.inst.wallpaper,
+                    Pipe::Wallpaper,
+                    &self.sprite_over_pipeline,
+                    wallpaper_bind.map(|b| (Atlas::Wallpaper, b))
+                );
                 // bg / under-text sprites — all OVER or REPLACE, composited in
                 // linear light on the sRGB view.
                 draw_stream!(

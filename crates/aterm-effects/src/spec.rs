@@ -80,6 +80,13 @@ pub struct GraphicSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Collection {
     Cats,
+    /// The ambient animal roster: the SPECIES-keyed peeking head. Which
+    /// species rides the occurrence (resolved from the lexicon's `species`
+    /// tag at rescan), not this spec — one collection covers every animal.
+    /// Builtin-only for now: Toy Pack schema v1 still accepts only `"cats"`
+    /// (a pack word cannot name a species), so packs fail closed exactly as
+    /// before.
+    Animals,
 }
 
 /// The ink axis: a colorway + whether the animated intro runs once

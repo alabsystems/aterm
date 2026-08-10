@@ -130,6 +130,135 @@ fn next_word_boundary(s: &str, at: usize) -> usize {
     idx
 }
 
+/// Apply one [`SearchEdit`] to a bare `(text, cursor)` single-line field, returning
+/// `true` when the TEXT changed and `false` for a pure caret move.
+///
+/// The whole editing model of every in-grid single-line field lives here, on the
+/// two values a field actually is — the find bar owns a [`SearchState`], the tab
+/// strip's inline rename owns a `String` plus a byte offset, and both get the same
+/// caret motions, word/line kills and paste behaviour from ONE reducer rather than
+/// two that drift.
+///
+/// Pure and total: every offset is clamped into `text` and floored onto a char
+/// boundary, so no edit — including one applied a frame after the text it was
+/// classified against — can panic or split a multi-byte character.
+pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: SearchEdit) -> bool {
+    // The largest char boundary at or before `at`, already clamped into `text`.
+    let floor = |text: &str, at: usize| -> usize {
+        let mut at = at.min(text.len());
+        while at > 0 && !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    };
+    let prev_char = |text: &str, at: usize| -> usize {
+        text[..at]
+            .chars()
+            .next_back()
+            .map_or(at, |c| at - c.len_utf8())
+    };
+    let next_char = |text: &str, at: usize| -> usize {
+        text[at..].chars().next().map_or(at, |c| at + c.len_utf8())
+    };
+    *cursor = floor(text, *cursor);
+    let at = *cursor;
+    match edit {
+        SearchEdit::Insert(insert) => {
+            // ⎋/⏎/⇥ and friends are COMMANDS in a one-line field, and a multi-line
+            // clipboard is not one line: keep the printable characters only. The two
+            // Unicode line/paragraph separators are line breaks that `is_control`
+            // does NOT classify as such, so they are named explicitly.
+            let insert: String = insert
+                .chars()
+                .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
+                .collect();
+            if insert.is_empty() {
+                return false;
+            }
+            text.insert_str(at, &insert);
+            *cursor = at + insert.len();
+            true
+        }
+        SearchEdit::DeleteBack => {
+            let start = prev_char(text, at);
+            if start == at {
+                return false;
+            }
+            text.replace_range(start..at, "");
+            *cursor = start;
+            true
+        }
+        SearchEdit::DeleteForward => {
+            let end = next_char(text, at);
+            if end == at {
+                return false;
+            }
+            text.replace_range(at..end, "");
+            true
+        }
+        SearchEdit::DeleteWordBack => {
+            let start = prev_word_boundary(text, at);
+            if start == at {
+                return false;
+            }
+            text.replace_range(start..at, "");
+            *cursor = start;
+            true
+        }
+        SearchEdit::DeleteWordForward => {
+            let end = next_word_boundary(text, at);
+            if end == at {
+                return false;
+            }
+            text.replace_range(at..end, "");
+            true
+        }
+        SearchEdit::KillToStart => {
+            if at == 0 {
+                return false;
+            }
+            text.replace_range(..at, "");
+            *cursor = 0;
+            true
+        }
+        SearchEdit::KillToEnd => {
+            if at == text.len() {
+                return false;
+            }
+            text.truncate(at);
+            true
+        }
+        SearchEdit::MoveCharLeft => {
+            *cursor = prev_char(text, at);
+            false
+        }
+        SearchEdit::MoveCharRight => {
+            *cursor = next_char(text, at);
+            false
+        }
+        SearchEdit::MoveWordLeft => {
+            *cursor = prev_word_boundary(text, at);
+            false
+        }
+        SearchEdit::MoveWordRight => {
+            *cursor = next_word_boundary(text, at);
+            false
+        }
+        SearchEdit::MoveStart => {
+            *cursor = 0;
+            false
+        }
+        SearchEdit::MoveEnd => {
+            *cursor = text.len();
+            false
+        }
+        SearchEdit::MoveTo(offset) => {
+            *cursor = floor(text, offset);
+            false
+        }
+    }
+}
+
 /// In-progress Cmd-F find over the full live screen + scrollback history. Matches are
 /// `(row, start_col, end_col)` in SELECTION coordinates (0..rows = live screen,
 /// negative = scrollback); the current one is highlighted by setting the text
@@ -221,126 +350,7 @@ impl SearchState {
     /// boundary, so no edit — including one applied a frame after the text it was
     /// classified against — can panic or split a multi-byte character.
     pub(crate) fn edit(&mut self, edit: SearchEdit) -> bool {
-        self.cursor = self.floor_boundary(self.cursor.min(self.query.len()));
-        let at = self.cursor;
-        match edit {
-            SearchEdit::Insert(text) => {
-                // ⎋/⏎/⇥ and friends are COMMANDS in find mode, and a multi-line
-                // clipboard is not a query: keep the printable characters only. The two
-                // Unicode line/paragraph separators are line breaks that `is_control`
-                // does NOT classify as such, so they are named explicitly.
-                let text: String = text
-                    .chars()
-                    .filter(|c| !c.is_control() && !matches!(c, '\u{2028}' | '\u{2029}'))
-                    .collect();
-                if text.is_empty() {
-                    return false;
-                }
-                self.query.insert_str(at, &text);
-                self.cursor = at + text.len();
-                true
-            }
-            SearchEdit::DeleteBack => {
-                let start = self.prev_char(at);
-                if start == at {
-                    return false;
-                }
-                self.query.replace_range(start..at, "");
-                self.cursor = start;
-                true
-            }
-            SearchEdit::DeleteForward => {
-                let end = self.next_char(at);
-                if end == at {
-                    return false;
-                }
-                self.query.replace_range(at..end, "");
-                true
-            }
-            SearchEdit::DeleteWordBack => {
-                let start = prev_word_boundary(&self.query, at);
-                if start == at {
-                    return false;
-                }
-                self.query.replace_range(start..at, "");
-                self.cursor = start;
-                true
-            }
-            SearchEdit::DeleteWordForward => {
-                let end = next_word_boundary(&self.query, at);
-                if end == at {
-                    return false;
-                }
-                self.query.replace_range(at..end, "");
-                true
-            }
-            SearchEdit::KillToStart => {
-                if at == 0 {
-                    return false;
-                }
-                self.query.replace_range(..at, "");
-                self.cursor = 0;
-                true
-            }
-            SearchEdit::KillToEnd => {
-                if at == self.query.len() {
-                    return false;
-                }
-                self.query.truncate(at);
-                true
-            }
-            SearchEdit::MoveCharLeft => {
-                self.cursor = self.prev_char(at);
-                false
-            }
-            SearchEdit::MoveCharRight => {
-                self.cursor = self.next_char(at);
-                false
-            }
-            SearchEdit::MoveWordLeft => {
-                self.cursor = prev_word_boundary(&self.query, at);
-                false
-            }
-            SearchEdit::MoveWordRight => {
-                self.cursor = next_word_boundary(&self.query, at);
-                false
-            }
-            SearchEdit::MoveStart => {
-                self.cursor = 0;
-                false
-            }
-            SearchEdit::MoveEnd => {
-                self.cursor = self.query.len();
-                false
-            }
-            SearchEdit::MoveTo(offset) => {
-                self.cursor = self.floor_boundary(offset.min(self.query.len()));
-                false
-            }
-        }
-    }
-
-    /// The largest char boundary at or before `at` (already clamped to the query).
-    fn floor_boundary(&self, at: usize) -> usize {
-        let mut at = at;
-        while at > 0 && !self.query.is_char_boundary(at) {
-            at -= 1;
-        }
-        at
-    }
-
-    fn prev_char(&self, at: usize) -> usize {
-        self.query[..at]
-            .chars()
-            .next_back()
-            .map_or(at, |c| at - c.len_utf8())
-    }
-
-    fn next_char(&self, at: usize) -> usize {
-        self.query[at..]
-            .chars()
-            .next()
-            .map_or(at, |c| at + c.len_utf8())
+        apply_field_edit(&mut self.query, &mut self.cursor, edit)
     }
 
     /// Temporary native-title projection while find owns the chrome. Kept on

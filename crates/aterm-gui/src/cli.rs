@@ -166,7 +166,9 @@ const HELP_TAIL: &str = concat!(
     "              title_summary_ca_file,\n",
     "              title_summary_interval_seconds,\n",
     "              title_summary_context_lines, title_summary_include_output,\n",
-    "              title_summary_allow_remote, tab_title_format, window_title_format.\n",
+    "              title_summary_allow_remote, tab_title_format, window_title_format,\n",
+    "              tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
+    "              tab_status_badge.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_trail, cursor_trail_style\n",
     "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
@@ -263,6 +265,15 @@ const STARTER_CONFIG: &str = "\
 # title_summary_allow_remote = false # privacy gate; filtering is heuristic, so remote consent may expose terminal context
 # tab_title_format = \"title-description\" # title | description | title-description | description-title
 # window_title_format = \"title-description\" # title | description | title-description | description-title
+
+# --- tab subject & status -------------------------------------------------------
+# Entirely local classification of what each session is DOING (running / quiet /
+# idle / exited), from shell integration, the foreground-job boolean, and screen
+# movement. No model, no network. tab_status = false stops the classifier itself.
+# tab_status = true                # classify session status (default ON)
+# tab_status_quiet_after_ms = 5000 # a silent foreground job becomes \"quiet\" after this, clamped to 500..=120000
+# tab_status_dwell_ms = 750        # hysteresis before a phase is published, clamped to 0..=10000
+# tab_status_badge = true          # project status onto the tab's busy/attention marks
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off

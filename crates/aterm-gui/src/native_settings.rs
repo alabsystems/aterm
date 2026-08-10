@@ -55,6 +55,9 @@ pub(crate) enum SettingsRoute {
     /// The selected-tab color spectrum (HSV wheel + hex + the "Transparent
     /// white" reset) — a SPECIAL page over the ONE `active_tab_color` key.
     TabColor,
+    /// The terminal-tab backdrop image — a SPECIAL page over the `wallpaper`
+    /// key (Choose Image… opens the system picker; Detach clears it).
+    Wallpaper,
     KeyboardInput,
     Terminal,
     Security,
@@ -64,11 +67,12 @@ pub(crate) enum SettingsRoute {
 }
 
 impl SettingsRoute {
-    pub(crate) const ALL: [Self; 14] = [
+    pub(crate) const ALL: [Self; 15] = [
         Self::Home,
         Self::Modified,
         Self::Manual,
         Self::Appearance,
+        Self::Wallpaper,
         Self::TextFonts,
         Self::CursorMotion,
         Self::WindowTabs,
@@ -91,6 +95,7 @@ impl SettingsRoute {
             Self::CursorMotion => "/cursor-motion",
             Self::WindowTabs => "/window-tabs",
             Self::TabColor => "/tab-color",
+            Self::Wallpaper => "/wallpaper",
             Self::KeyboardInput => "/keyboard-input",
             Self::Terminal => "/terminal",
             Self::Security => "/security",
@@ -110,6 +115,7 @@ impl SettingsRoute {
             Self::CursorMotion => "Cursor & Motion",
             Self::WindowTabs => "Window",
             Self::TabColor => "Tab Color",
+            Self::Wallpaper => "Wallpaper",
             Self::KeyboardInput => "Keyboard & Input",
             Self::Terminal => "Terminal",
             Self::Security => "Security",
@@ -141,6 +147,7 @@ impl SettingsRoute {
             | Self::Modified
             | Self::Manual
             | Self::TabColor
+            | Self::Wallpaper
             | Self::SoftwareUpdate
             | Self::Packages
             | Self::About => None,
@@ -1547,6 +1554,14 @@ impl SettingsApp {
             && let Some(route) = SettingsRoute::from_path(path)
         {
             view.navigate(route);
+            // The Wallpaper page's calling card: arriving with NO wallpaper
+            // attached opens the system picker right away (the page still
+            // offers the button, and cancel simply leaves the page showing).
+            if route == SettingsRoute::Wallpaper
+                && view.raw_value(prefs::EDIT_WALLPAPER).is_none()
+            {
+                cx.choose_wallpaper_image();
+            }
             cx.invalidate_presentation();
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
@@ -1761,6 +1776,35 @@ impl SettingsApp {
             let operation = cx.config_patch(patch.clone());
             view.pending.insert(operation, PendingAction::Config(patch));
             view.feedback = Some("Back to the boring old color…".to_string());
+            cx.repaint(crate::native_app::DamageRegion::All);
+            return EventResult::Handled;
+        }
+
+        // Wallpaper page: open the system image picker. The HOST owns the modal
+        // and the config write (the versioned lane re-decodes the picked image),
+        // so the reducer only requests it — the view converges through the
+        // ordinary config-change projection.
+        if action == "settings/wallpaper/choose" {
+            cx.choose_wallpaper_image();
+            return EventResult::Handled;
+        }
+        // Wallpaper page: Detach clears the ONE `wallpaper` key — every
+        // terminal tab returns to the flat theme background.
+        if action == "settings/wallpaper/detach" {
+            if Self::reject_pending_key(view, prefs::EDIT_WALLPAPER, cx) {
+                return EventResult::Handled;
+            }
+            let patch = ConfigPatch {
+                base_revision: self.config_revision,
+                edits: vec![ConfigEdit {
+                    key: prefs::EDIT_WALLPAPER.to_string(),
+                    expected: ExpectedConfigValue::Exact(view.raw_value(prefs::EDIT_WALLPAPER)),
+                    value: None,
+                }],
+            };
+            let operation = cx.config_patch(patch.clone());
+            view.pending.insert(operation, PendingAction::Config(patch));
+            view.feedback = Some("Wallpaper detached.".to_string());
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
         }
@@ -5973,6 +6017,7 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
             "ADVANCED",
             &[
                 SettingsRoute::Appearance,
+                SettingsRoute::Wallpaper,
                 SettingsRoute::TextFonts,
                 SettingsRoute::CursorMotion,
             ],
@@ -6026,6 +6071,7 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
                     SettingsRoute::CursorMotion => "Cursor",
                     SettingsRoute::WindowTabs => "Window",
                     SettingsRoute::TabColor => "Tab Color",
+                    SettingsRoute::Wallpaper => "Wallpaper",
                     SettingsRoute::KeyboardInput => "Keyboard",
                     SettingsRoute::Terminal => "Terminal",
                     SettingsRoute::Security => "Security",
@@ -6095,6 +6141,7 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::CursorMotion => ButtonIcon::Cursor,
         SettingsRoute::WindowTabs => ButtonIcon::Window,
         SettingsRoute::TabColor => ButtonIcon::Appearance,
+        SettingsRoute::Wallpaper => ButtonIcon::Appearance,
         SettingsRoute::KeyboardInput => ButtonIcon::Keyboard,
         SettingsRoute::Terminal => ButtonIcon::Terminal,
         SettingsRoute::Security => ButtonIcon::Security,
@@ -6122,6 +6169,7 @@ fn page(
             SettingsRoute::Manual => manual_page(state, cx, width),
             SettingsRoute::Modified => settings_fields_page(state, true, cx, width),
             SettingsRoute::TabColor => tab_color_page(state, width),
+            SettingsRoute::Wallpaper => wallpaper_page(state, width),
             SettingsRoute::SoftwareUpdate => {
                 update_page(state, update, width, cx.viewport.width, cx.viewport.height)
             }
@@ -8371,6 +8419,115 @@ fn tab_color_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
         Some("Exact hex editing lives on the Window page under Chrome."),
         None,
         vec![wheel, status, reset],
+        width,
+    );
+    out.push(card);
+    out
+}
+
+/// The Wallpaper page: the system image picker over the ONE `wallpaper` key.
+/// "Choose Image…" opens the native open panel (the host writes the approved
+/// path through the versioned config lane, which re-decodes the image on the
+/// spot); the status line reports the committed path plus the decode verdict;
+/// "Detach" clears the key so every terminal tab returns to the flat theme
+/// background. The legibility dim slider lives on the Appearance page with the
+/// other registered rows (this page points there).
+fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode> {
+    let mut out = page_heading(
+        "Wallpaper",
+        "Pick an image and every terminal tab wears it — settings tabs stay plain.",
+    );
+    let current = state.raw_value(prefs::EDIT_WALLPAPER);
+    let pending = state.config_key_pending(prefs::EDIT_WALLPAPER);
+    let status_text = match (&current, &state.config_assets().wallpaper) {
+        (
+            Some(path),
+            crate::app_config::WallpaperAsset::Invalid { bounded_reason, .. },
+        ) => format!("Current: {path} — {bounded_reason}"),
+        (Some(path), _) => format!("Current: {path}"),
+        (None, _) => "No wallpaper — the flat theme background (the default).".to_string(),
+    };
+    let status = UiNode::new(
+        "settings/wallpaper/current",
+        UiContent::Text(TextSpec {
+            text: status_text,
+            role: SemanticRole::Status,
+            style: StyleRef::Quiet,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(22.0)),
+    );
+    let choose = UiNode::new(
+        "settings/wallpaper/choose",
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Choose Image…"),
+                ActionId::new("settings/wallpaper/choose"),
+            )
+            .state(ControlState {
+                enabled: !pending,
+                busy: pending,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Setting),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(220.0 * settings_text_scale().min(1.4)))
+            .height(Length::Fixed(32.0)),
+    );
+    // Detach: back to the flat background. Only offered while a wallpaper is
+    // actually attached, exactly what the user is undoing.
+    let detach = UiNode::new(
+        "settings/wallpaper/detach",
+        UiContent::Button(
+            Control::new(
+                ButtonSpec::new("Detach"),
+                ActionId::new("settings/wallpaper/detach"),
+            )
+            .state(ControlState {
+                enabled: current.is_some() && !pending,
+                busy: pending,
+                ..ControlState::default()
+            })
+            .style(StyleRef::Setting),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(220.0 * settings_text_scale().min(1.4)))
+            .height(Length::Fixed(32.0)),
+    );
+    let hint = UiNode::new(
+        "settings/wallpaper/hint",
+        UiContent::Text(TextSpec {
+            text: "Appearance page extras: \"Wallpaper dim\" tones the image toward the \
+                   theme background; \"Wallpaper text tint\" colors the text to match \
+                   the picture behind it."
+                .to_string(),
+            role: SemanticRole::Status,
+            style: StyleRef::Quiet,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(22.0)),
+    );
+    let (card, _height) = top_card(
+        "wallpaper",
+        "Terminal backdrop",
+        Some(
+            "The picture is cover-scaled to the window and shows through every cell \
+             that carries the default background; selections and colored backgrounds \
+             still paint over it.",
+        ),
+        None,
+        vec![status, choose, detach, hint],
         width,
     );
     out.push(card);
@@ -12358,6 +12515,8 @@ fn bounded_numeric_nonfinite_effective(key: &str) -> Option<(f64, &'static str)>
         prefs::EDIT_CURSOR_TRAIL_BLOOM_RADIUS => (2.2, "default"),
         prefs::EDIT_TRAIL_SOUND_VOLUME => (0.0, "muted"),
         prefs::EDIT_BACKGROUND_OPACITY => (1.0, "solid default"),
+        // `wallpaper_dim_or_default`: a non-finite dim reads the 0.3 default.
+        prefs::EDIT_WALLPAPER_DIM => (0.3, "default"),
         prefs::EDIT_WINDOW_PADDING => (f64::from(crate::PAD_LOGICAL_PX), "default"),
         prefs::EDIT_WINDOW_PADDING_TOP => (f64::from(crate::PAD_TOP_LOGICAL_PX), "default"),
         _ => return None,
@@ -15318,6 +15477,7 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
             SettingsRoute::CursorMotion => "Cursor, motion, trails, and sound.",
             SettingsRoute::WindowTabs => "Padding, chrome, and Smart Titles.",
             SettingsRoute::TabColor => "Any color for your selected tab.",
+            SettingsRoute::Wallpaper => "An image behind every terminal tab.",
             SettingsRoute::KeyboardInput => "Keyboard, paste safety, and local echo.",
             SettingsRoute::Terminal => "Shell, scrollback, protocols, and sessions.",
             SettingsRoute::Security => "Permissions and containment.",
@@ -15341,6 +15501,9 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
             "Window geometry, title and Description formatting, live Activity, and chrome."
         }
         SettingsRoute::TabColor => "A free-pick spectrum for the selected tab's color.",
+        SettingsRoute::Wallpaper => {
+            "A picture behind every terminal tab; settings and other app tabs stay plain."
+        }
         SettingsRoute::KeyboardInput => "Keyboard, clipboard, paste safety, and local echo.",
         SettingsRoute::Terminal => "Shell, scrollback, terminal protocols, and session behavior.",
         SettingsRoute::Security => "Explicit permissions and containment policy.",
@@ -21961,6 +22124,7 @@ mod tests {
             (prefs::EDIT_TRAIL_SOUND_VOLUME, 0.0),
             (prefs::EDIT_FONT_WEIGHT_DARK_NUDGE, 0.0),
             (prefs::EDIT_BACKGROUND_OPACITY, 1.0),
+            (prefs::EDIT_WALLPAPER_DIM, 0.3),
             (prefs::EDIT_WINDOW_PADDING, f64::from(crate::PAD_LOGICAL_PX)),
             (
                 prefs::EDIT_WINDOW_PADDING_TOP,
@@ -30809,6 +30973,7 @@ enabled = true
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
             kitty_sprite: crate::app_config::KittySpriteAsset::BuiltIn,
+            wallpaper: crate::app_config::WallpaperAsset::None,
             themes: crate::app_config::ThemeCatalog::empty(),
             sparkle_spec_consumers: Some(Arc::new(consumers)),
         });
@@ -30830,6 +30995,7 @@ enabled = true
         let exact_all_false = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: crate::app_config::TrailPackCatalog::empty(),
             kitty_sprite: crate::app_config::KittySpriteAsset::BuiltIn,
+            wallpaper: crate::app_config::WallpaperAsset::None,
             themes: crate::app_config::ThemeCatalog::empty(),
             sparkle_spec_consumers: Some(Arc::new(Default::default())),
         });

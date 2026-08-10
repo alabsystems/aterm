@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "flamingo"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.42, center_x = 0.5, word_top = 1.0 }
+
+# Flamingo: pink round head, big drooping bill with the signature kink and black tip half.
+
+[[layer]]
+role = "outline"
+ref_fill = "#3A2331"
+recolor = "fixed"
+paths = ["M 34 54 C 34 30.8 54.6 12 80 12 C 105.4 12 126 30.8 126 54 C 126 77.2 105.4 96 80 96 C 54.6 96 34 77.2 34 54 Z", "M 66 74 L 95 74 L 94 98 C 102 104 108 112 106 119 C 104 128 94 130 86 126 C 77 121 68 113 65 104 C 63 94 65 84 66 74 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#F27097"
+recolor = "fixed"
+paths = ["M 38 54 C 38 33 56.8 16 80 16 C 103.2 16 122 33 122 54 C 122 75 103.2 92 80 92 C 56.8 92 38 75 38 54 Z"]
+
+[[layer]]
+role = "nose"
+ref_fill = "#F6E7E1"
+recolor = "fixed"
+paths = ["M 69 76 L 92 76 L 91 99 C 98 105 103 112 102 117 C 100 124 92 126 86 123 C 78 119 69 111 68 103 C 67 93 68 84 69 76 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#241E26"
+recolor = "fixed"
+paths = ["M 90 101 C 96.5 106.5 100.5 112 99.5 116.5 C 98 122 91 124 85.5 121.5 C 79 118 72.5 110.5 70 104 C 76 108 85 106.5 90 101 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 58.5 56 C 58.5 52.7 61 50 64 50 C 67 50 69.5 52.7 69.5 56 C 69.5 59.3 67 62 64 62 C 61 62 58.5 59.3 58.5 56 Z", "M 90.5 56 C 90.5 52.7 93 50 96 50 C 99 50 101.5 52.7 101.5 56 C 101.5 59.3 99 62 96 62 C 93 62 90.5 59.3 90.5 56 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 63.6 54 C 63.6 52.8 64.6 51.8 65.8 51.8 C 67 51.8 68 52.8 68 54 C 68 55.2 67 56.2 65.8 56.2 C 64.6 56.2 63.6 55.2 63.6 54 Z", "M 95.6 54 C 95.6 52.8 96.6 51.8 97.8 51.8 C 99 51.8 100 52.8 100 54 C 100 55.2 99 56.2 97.8 56.2 C 96.6 56.2 95.6 55.2 95.6 54 Z"]

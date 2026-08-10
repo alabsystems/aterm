@@ -26,9 +26,10 @@ use aterm_render::{
 
 use crate::effect_util::{
     STAR_ARM, STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE, STAR_GLINT,
-    STAR_GLINT_COV, STAR_STACK_ADD, STAR_WAIST, dust_r, fire_ramp, lerp_rgb,
-    push_dust_mote, push_fx_rect as push_rect, push_twinkle_star, star_accent, star_arm,
-    star_arm_px, twinkle_env, twinkle_peak, twinkle_rgb, water_ramp,
+    STAR_GLINT_COV, STAR_OVER_CENTRE_LAYS, STAR_OVER_LAYS, STAR_STACK_ADD, STAR_TAPER_BODY,
+    STAR_WAIST, dust_r, fire_ramp, lerp_rgb, push_dust_mote, push_fx_rect as push_rect,
+    push_twinkle_star, star_accent, star_arm, star_arm_px, twinkle_env, twinkle_peak, twinkle_rgb,
+    water_ramp,
 };
 use crate::trail_sweep::{line_cells_tail, row_sweep_cells, wrap_fold_cells};
 use crate::typing_momentum::TypingMomentum;
@@ -2705,14 +2706,24 @@ const ERASE_MOM_FLOOR: f32 = 0.55;
 /// letting a full-line kill scale linearly into a screen-filling cloud.
 const ERASE_WEIGHT_CAP: f32 = 3.4;
 /// Sparkles at drive 1.0. Sized so a COLD single-character Backspace (drive =
-/// [`ERASE_MOM_FLOOR`]) still throws the ~6 the shipping poof always did — the
-/// energy law must make deletes MORE expressive, never quietly thin out the
-/// most common one — while a hot word kill lands near 27 and a hot line kill
-/// hits [`ERASE_POOF_CAP`].
-const ERASE_POOF_STARS: f32 = 7.0;
+/// [`ERASE_MOM_FLOOR`]) still throws the handful the shipping poof always did
+/// — the energy law must make deletes MORE expressive, never quietly thin out
+/// the most common one — while a hot word kill lands mid-band and a hot line
+/// kill hits [`ERASE_POOF_CAP`].
+///
+/// 7 → 11 (sized so a line kill would look heavy; it looked like a cloud) → 7
+/// in the blind density cut → 8. The cut restored the pre-inflation number
+/// exactly, which is the tell that it was undoing rather than tuning: a
+/// dark-ground capture of Ctrl-W at 7 puts about half a dozen grains around the
+/// caret, which reads as a small puff rather than as something vanishing. One
+/// more grain, and the taper makes each of them a lighter mark than the crosses
+/// the old number was judged against.
+const ERASE_POOF_STARS: f32 = 8.0;
 /// Hard ceiling on one poof's sparkle count, well under `MAX_PARTICLES` so a
-/// held Ctrl-U mash can never crowd out the rest of the family.
-const ERASE_POOF_CAP: usize = 15;
+/// held Ctrl-U mash can never crowd out the rest of the family. Moved with
+/// [`ERASE_POOF_STARS`] so a full line kill keeps the same headroom over the
+/// word kill it has to out-weigh.
+const ERASE_POOF_CAP: usize = 18;
 /// How wide, in CELLS, one poof's debris may spread — regardless of how long
 /// the erased span was.
 ///
@@ -3671,10 +3682,16 @@ impl CursorGlow {
     const RAINBOW_JUMP_CAP: usize = 4;
     /// Ceiling on the METEOR's shed sparks per fling (see `push_jump_streak`).
     /// A screen-crossing Ctrl-A at 80 columns would otherwise strew 44 grains
-    /// in one frame and a mash would strew four times that; 14 is enough to
-    /// read as a burning trail and leaves the shared `MAX_PARTICLES` budget to
-    /// the landing burst that follows immediately behind it.
-    const METEOR_SPARK_CAP: usize = 6;
+    /// in one frame and a mash would strew four times that; a handful is enough
+    /// to read as a burning trail and leaves the shared `MAX_PARTICLES` budget
+    /// to the landing burst that follows immediately behind it.
+    ///
+    /// 14 → 6 in the blind density cut, on the sound principle that a fling must
+    /// not out-throw the landing it arrives at → 8. The principle stands and the
+    /// number was set against a landing of 11; at [`Self::RAINBOW_BURST_STARS`]
+    /// = 14 the trail can carry eight and still be the quieter half of the
+    /// gesture, which is what a trail is for.
+    const METEOR_SPARK_CAP: usize = 8;
     // ---- FAST-GLIDE rainbow shooting star (velocity-triggered) --------------
     /// EMA attack coefficient for [`GlideState::vel`] on each observed move: a
     /// couple of consecutive fast frames ramp the spine toward the true speed.
@@ -3749,8 +3766,22 @@ impl CursorGlow {
     /// starburst. A short jump throws fewer (graduated by distance, floor 1);
     /// this is the ceiling. Per-burst quad cost is a closed form (stars × ~2·R
     /// scanline rows × ≤2 spans, capped by [`Self::MAX_QUADS`]).
-    /// RAISED 10 → 18 (owner: "an even bigger brighter landing").
-    const RAINBOW_BURST_STARS: usize = 11;
+    /// 10 → 18 (owner: "an even bigger brighter landing") → 11 in the density
+    /// cut that followed ("in 0.18.0 there were too many of them") → 14 now.
+    ///
+    /// THE CUT WAS MADE BLIND AND OVERSHOT HERE. It was written without a build
+    /// or a capture (see 0405571c's own note), and 11 is barely above the 10 the
+    /// owner had asked to EXCEED. A white-ground and dark-ground capture of a
+    /// Ctrl-A fling at 11 shows the landing as a handful of small coloured
+    /// grains scattered mostly BELOW the line — legible as feedback, not as an
+    /// event, which is the one thing this gesture is for.
+    ///
+    /// 14 is also the count the SILHOUETTE now argues for: a tapered star reads
+    /// as more delicate than the constant-thickness cross the same number of
+    /// marks used to make, so the count that reads as "too many" moved up with
+    /// it. Still well under 18, and the landing's WEIGHT still lives mostly in
+    /// the impact bloom rather than in confetti.
+    const RAINBOW_BURST_STARS: usize = 14;
     /// Starburst life (seconds): a brisk celebratory bloom-and-fade, in the same
     /// register as the ZOOM streak's `0.26..0.78` so the two read as one event.
     /// Lengthened with the streak it lands from, and for the same reason — the
@@ -3773,7 +3804,15 @@ impl CursorGlow {
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
-    const RAINBOW_TERMINUS_STARS: usize = 8;
+    ///
+    /// 14 → 8 in the blind density cut ("a dissolve should feather, not spray")
+    /// → 10. The direction was right and the distance was guessed: these stars
+    /// walk a FEATHER (`rainbow_terminus_feather` shortens each one's life as it
+    /// approaches the ribbon's body), so the count is how many steps the
+    /// gradient gets, and eight steps over a feather is visibly steppy where ten
+    /// reads continuous. A tapered star is the smaller mark besides, so the
+    /// number that reads as "spray" moved up with the silhouette.
+    const RAINBOW_TERMINUS_STARS: usize = 10;
     /// How near the last column (in cells) counts as "at the far-right margin"
     /// for the graceful end-of-line terminus dissolve.
     const RAINBOW_TERMINUS_MARGIN: usize = 1;
@@ -7137,11 +7176,9 @@ impl CursorGlow {
         // and the line it leaves still holds the command you just typed. Peeked,
         // never consumed — the un-hinted jump arm owns the return license.
         //
-        let returned = self
-            .return_hint
-            .is_some_and(|t| {
-                now.saturating_duration_since(t).as_secs_f32() <= Self::RETURN_HINT_FRESH
-            });
+        let returned = self.return_hint.is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::RETURN_HINT_FRESH
+        });
         // A COMPOSER NEWLINE IS A GESTURE TOO — and it was the residual this arm
         // shipped with, knowingly retiring light that had every right to be there.
         //
@@ -13082,10 +13119,17 @@ impl CursorGlow {
             // legacy stars (the cold 1-in-6 population) are never dimmed or
             // recoloured, so the hot/cold boundary is seamless for them.
             let u = m as f32 / u32::MAX as f32;
-            // THINNED 0.30 -> 0.13. Recruiting to ~1-in-3 starred cells made
-            // the sky a texture rather than a scatter; at 1-in-5 an individual
-            // star is a thing you notice again.
-            let p = 0.13 * self.rainbow.disp;
+            // THINNED 0.30 -> 0.13, then 0.13 -> 0.17. Recruiting to ~1-in-3
+            // starred cells made the sky a texture rather than a scatter; at
+            // ~1-in-5 an individual star is a thing you notice again. The
+            // half-step back up is what a CAPTURE says the blind cut missed:
+            // TEXT FIRST (below) sheds every star whose cell holds a glyph, so
+            // the recruited population only ever lands in the sky BESIDE the
+            // typed run — over the run itself the field is empty either way —
+            // and 0.13 left that sky nearly bare. At 0.17 the hot sky is
+            // ~1-in-4, still a scatter, and each mark is now a tapered needle
+            // rather than a cross, i.e. a lighter thing to add one more of.
+            let p = 0.17 * self.rainbow.disp;
             let recruited = !legacy && u < p;
             let dim = if recruited {
                 (((p - u) / p.max(1e-6)) * 3.0).min(1.0)
@@ -15953,8 +15997,10 @@ fn push_rainbow_streak_over(
 /// brightness statement, in one place so no light-theme emitter can re-derive it
 /// wrong.
 ///
-/// [`push_twinkle_over`] lays THREE coincident source-over marks (two arms and
-/// the nucleus), so the plus's centre composites to `1-(1-a)^3` while one disc at
+/// [`push_twinkle_over`]'s centre composites to [`STAR_OVER_CENTRE_LAYS`]
+/// coincident source-over marks (it lays [`STAR_OVER_LAYS`] since the arms
+/// gained their taper, at a per-lay alpha solved to hold this same stack — see
+/// the rasterizer), i.e. to `1-(1-a)^3`, while one disc at
 /// the same `a` reaches only `a`. Swapping the shape at equal alpha is therefore
 /// a silent cut of up to ~60/255, exactly where the mark is loudest — the mark
 /// the owner asked to make BRIGHTER. Solve for the alpha that reproduces the
@@ -15972,6 +16018,10 @@ fn push_rainbow_streak_over(
 /// Pinned by `the_fresh_ink_mote_keeps_the_plus_s_brightness` and
 /// `every_round_grain_composites_to_the_plus_it_replaced`.
 fn stacked_ink_alpha(cov: u8, role: InkRole) -> u32 {
+    // The exponent is [`STAR_OVER_CENTRE_LAYS`], spelled as `powi(3)` because
+    // this price must stay byte-stable; the assert is what keeps the two from
+    // drifting apart when the star's lay count changes again.
+    const _: () = assert!(STAR_OVER_CENTRE_LAYS == 3.0);
     let a1 = f32::from(cov.min(role.alpha_cap() as u8)) / 255.0;
     let cap1 = role.alpha_cap() / 255.0;
     let ceiling = (1.0 - (1.0 - cap1).powi(3)) * 255.0;
@@ -16027,7 +16077,18 @@ fn push_twinkle_over(
     const ROLE: InkRole = InkRole::OverText;
     let ink = ROLE.ink(rgb);
     let cap = u32::from(cov).clamp(1, ROLE.alpha_cap() as u32);
-    let star = (ink & 0x00FF_FFFF) | (cap << 24);
+    // THE CENTRE STACK IS HELD AT [`STAR_OVER_CENTRE_LAYS`]. The taper below
+    // lays [`STAR_OVER_LAYS`] marks coincident at the crossing where the
+    // untapered plus laid three, so a per-lay alpha of `cap` would silently
+    // DARKEN every star's middle — and worse, break the price
+    // [`stacked_ink_alpha`] pays the round grain to match "the plus it
+    // replaced". Solve for the alpha whose full stack reproduces the three-lay
+    // centre instead: the crossing is byte-for-byte what it was, and the taper
+    // shows up exactly where it should — as the POINTS, which carry only the
+    // tip lay and are therefore lighter than the shipped arm.
+    let a = cap as f32 / 255.0;
+    let lay = (1.0 - (1.0 - a).powf(STAR_OVER_CENTRE_LAYS / STAR_OVER_LAYS as f32)) * 255.0;
+    let star = (ink & 0x00FF_FFFF) | ((lay.round() as u32).clamp(1, cap) << 24);
     // The arms carry MASS. A source-over hairline on white is dust: the dark
     // arm's additive plus reads because every lit pixel is at full coverage,
     // while a 1 px source-over arm behind a radial falloff is a few counts off
@@ -16036,8 +16097,15 @@ fn push_twinkle_over(
     // (in part) from its own crossing, so a sparkle reads as a sparkle rather
     // than as a stray '+'.
     let waist = (arm * STAR_WAIST).max(1.0);
+    // THE TAPER, in ink. Each arm is TWO lays: a full-length TIP lay and a
+    // shorter BODY lay ([`STAR_TAPER_BODY`]) stacked over it, so the arm
+    // composites heaviest at the crossing and thinnest at the points — the same
+    // needle the additive star ramps its coverage into.
+    let body = (arm * STAR_TAPER_BODY).max(1.0);
     push_halo_over(halos, geom, cx, cy, arm, waist, star, 255);
     push_halo_over(halos, geom, cx, cy, waist, arm, star, 255);
+    push_halo_over(halos, geom, cx, cy, body, waist, star, 255);
+    push_halo_over(halos, geom, cx, cy, waist, body, star, 255);
     let core = (arm * STAR_CORE).max(1.0);
     push_halo_over(halos, geom, cx, cy, core, core, star, 255);
     if gold {
@@ -16226,7 +16294,15 @@ fn push_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, rx: f32, ry:
 /// This is the helper the shooting-star head wrote out by hand first; every
 /// other additive stardust site now calls it, so the law has ONE spelling and a
 /// new emitter cannot quietly ship the 1x version again.
-fn push_dust_halo(out: &mut Vec<RainHalo>, geom: Geom, cx: f32, cy: f32, r: f32, rgb: u32, cov: u8) {
+fn push_dust_halo(
+    out: &mut Vec<RainHalo>,
+    geom: Geom,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    rgb: u32,
+    cov: u8,
+) {
     if cov == 0 {
         return;
     }
@@ -16418,6 +16494,61 @@ mod tests {
             head: 0,
         }
     }
+
+    /// THE STAR KIT'S SILHOUETTE PROBE — the widest 1 px tall RUN of light in a
+    /// quad batch, in px.
+    ///
+    /// A 4-point star is the only mark these streams lay a `2·arm+1` px
+    /// HAIRLINE for: a stardust mote's skirt is a 3-5 px square, the moon's
+    /// limbs are 3 px, and a chunky burst star is a stack of short scanline
+    /// spans. So "does this batch contain a cross" has always been "is there a
+    /// 1 px tall run of at least 7 px in it", and every census below asks it
+    /// through this one probe.
+    ///
+    /// It used to be readable off a SINGLE quad (`h == 1 && w >= 7`), because
+    /// an arm was one rect of constant thickness — which is precisely the plus
+    /// the owner rejected. Now that arms taper, an arm arrives as a bright BODY
+    /// span with dimmer POINT spans either side of it, so the run has to be
+    /// re-assembled from the pixels before it can be measured. (`push_fx_rect`
+    /// splits at cell-row boundaries, which is why this unions per row rather
+    /// than trusting any one quad.)
+    fn hairline_runs(qs: &[GlowQuad]) -> Vec<u32> {
+        let mut rows: std::collections::BTreeMap<u16, Vec<(u32, u32)>> =
+            std::collections::BTreeMap::new();
+        for q in qs.iter().filter(|q| q.h == 1) {
+            rows.entry(q.y)
+                .or_default()
+                .push((u32::from(q.x), u32::from(q.x) + u32::from(q.w)));
+        }
+        let mut runs = Vec::new();
+        for spans in rows.values_mut() {
+            spans.sort_unstable();
+            let (mut s, mut e) = spans[0];
+            for &(a, b) in spans.iter().skip(1) {
+                if a <= e {
+                    e = e.max(b);
+                } else {
+                    runs.push(e - s);
+                    (s, e) = (a, b);
+                }
+            }
+            runs.push(e - s);
+        }
+        runs
+    }
+
+    /// How many 4-point STARS a batch drew — one hairline run of `>= 7` px
+    /// apiece. See [`hairline_runs`].
+    fn star_count(qs: &[GlowQuad]) -> usize {
+        hairline_runs(qs).into_iter().filter(|&r| r >= 7).count()
+    }
+
+    /// Is this batch a 4-point star? The family's smallest star (`arm` 3) lays
+    /// a 7 px hairline and nothing else these streams carry reaches past 5.
+    fn is_star(qs: &[GlowQuad]) -> bool {
+        star_count(qs) > 0
+    }
+
     fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
         GlowConfig {
             enabled,
@@ -24568,7 +24699,10 @@ mod tests {
                  fold exemption is still reading the landing column alone"
             );
             assert_eq!(pops, 0, "…and its fresh-ink pops with it (column {lc})");
-            assert!(landing > 0, "the LANDING row must still be lit (column {lc})");
+            assert!(
+                landing > 0,
+                "the LANDING row must still be lit (column {lc})"
+            );
             assert!(
                 stamped >= 3,
                 "column {lc}: the vacated row must be RETIRED at the move \
@@ -27342,10 +27476,38 @@ mod tests {
             (2.0 * waist).round() as i32,
             "the additive arm's thickness left the light arm's waist"
         );
+        // THE TAPER — same body fraction on both grounds. The light star
+        // stacks a shorter BODY lay over its full-length arm; the additive one
+        // draws its full-coverage run at the same fraction and then ramps out
+        // to the tip, so `2·arm+1` is the mark's REACH rather than one rect.
+        let body = (arm * STAR_TAPER_BODY).max(1.0);
+        assert!(
+            has(body, waist, 0.0, 0.0) && has(waist, body, 0.0, 0.0),
+            "the light star lost the body lay that makes its arm taper"
+        );
+        let b = crate::effect_util::star_body_px(arm as i32);
+        assert_eq!(
+            b,
+            body.round() as i32,
+            "the additive body left the light body's fraction"
+        );
         assert!(
             dark.iter()
-                .any(|q| i32::from(q.w) == 2 * arm as i32 + 1 && i32::from(q.h) == t),
-            "no additive arm of 2*arm+1 at the shared waist"
+                .any(|q| i32::from(q.w) == 2 * b + 1 && i32::from(q.h) == t),
+            "no additive body of 2*body+1 at the shared waist"
+        );
+        let reach = dark
+            .iter()
+            .filter(|q| {
+                i32::from(q.y) <= cy as i32 && (cy as i32) < i32::from(q.y) + i32::from(q.h)
+            })
+            .map(|q| i32::from(q.x) + i32::from(q.w))
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            reach,
+            cx as i32 + arm as i32 + 1,
+            "the additive arm no longer REACHES the shared half-length"
         );
         // NUCLEUS — both grounds draw one, at the same shared extent.
         let core = (arm * STAR_CORE).max(1.0);
@@ -27375,8 +27537,8 @@ mod tests {
             plain.iter().map(|h| (h.cx, h.cy, h.rx, h.ry)).collect();
         assert_eq!(
             plain_ell.len(),
-            3,
-            "a plain ink star is arms + nucleus, nothing else"
+            STAR_OVER_LAYS,
+            "a plain ink star is arms + their body lays + nucleus, nothing else"
         );
     }
 
@@ -27613,8 +27775,9 @@ mod tests {
                     .filter(|h| (f32::from(h.cy) - sky).abs() <= 1.0)
                     .collect();
                 match marks.len() {
-                    // `push_twinkle_over` lays arms + arms + nucleus.
-                    3 => plus += 1,
+                    // `push_twinkle_over` lays each arm's tip and body, plus
+                    // the nucleus — [`STAR_OVER_LAYS`] in all.
+                    STAR_OVER_LAYS => plus += 1,
                     // …the stardust mote is one disc.
                     1 => dust += 1,
                     0 => {}
@@ -27718,16 +27881,27 @@ mod tests {
         let plus = sky_marks(0);
         let mote = sky_marks(32);
         // NON-VACUOUS, part 1: the two seeds really did deal opposite shapes.
-        assert_eq!(plus.len(), 3, "seed 0 must deal the plus (arms + nucleus)");
+        assert_eq!(
+            plus.len(),
+            STAR_OVER_LAYS,
+            "seed 0 must deal the plus (each arm's tip and body, plus the nucleus)"
+        );
         assert_eq!(mote.len(), 1, "seed 32 must deal the round mote");
         // …and they really are the same mark at the same brightness underneath:
-        // all three of the plus's lays carry ONE alpha, which is the `scov` both
-        // shapes were priced from.
-        let cap = alpha(&plus[0]);
+        // every one of the plus's lays carries ONE alpha. That alpha is NOT the
+        // `scov` both shapes were priced from — the taper solves it down so the
+        // stack still composites to [`STAR_OVER_CENTRE_LAYS`] — so the centre is
+        // computed from what was actually laid rather than from a lay count.
+        let lay = alpha(&plus[0]);
         assert!(
-            plus.iter().all(|h| alpha(h) == cap),
-            "the plus's three lays must share one alpha to compare against"
+            plus.iter().all(|h| alpha(h) == lay),
+            "the plus's lays must share one alpha to compare against"
         );
+        let stacked = 1.0 - (1.0 - f32::from(lay as u8) / 255.0).powi(plus.len() as i32);
+        // …and the `scov` behind it, recovered from that centre through the
+        // stack the family prices against ([`STAR_OVER_CENTRE_LAYS`]).
+        let cap =
+            (255.0 * (1.0 - (1.0 - stacked).powf(1.0 / STAR_OVER_CENTRE_LAYS))).round() as u32;
         // NON-VACUOUS, part 2: the sample is IN the range where the old ceiling
         // bit. `1-(1-a)^3 > 190/255` needs `a > 93`; below that the clamp was
         // never reached and this test would prove nothing.
@@ -27739,7 +27913,6 @@ mod tests {
 
         // THE CLAIM: the mote's single lay reproduces the plus's COMPOSITED
         // centre, to within the 1/255 the byte can express.
-        let stacked = 1.0 - (1.0 - f32::from(cap as u8) / 255.0).powi(3);
         let want = stacked * 255.0;
         let got = alpha(&mote[0]) as f32;
         assert!(
@@ -28291,9 +28464,10 @@ mod tests {
             out
         };
         // THE RENDERER'S OWN ARITHMETIC: additive light, per channel, saturating
-        // at the byte. Returns `(peak pixel channel, total light over the mark)`
-        // — the centre the eye reads, and the mark's whole contribution.
-        let raster = |qs: &[GlowQuad]| -> (u32, u64) {
+        // at the byte. Returns `(peak pixel channel, total light over the mark,
+        // fill)` — the centre the eye reads, the mark's whole contribution, and
+        // the share of its own bounding box it lights.
+        let raster = |qs: &[GlowQuad]| -> (u32, u64, f32) {
             let mut px: std::collections::HashMap<(u32, u32), [u32; 3]> =
                 std::collections::HashMap::new();
             for q in qs {
@@ -28317,7 +28491,12 @@ mod tests {
                 .max()
                 .unwrap_or(0);
             let total: u64 = px.values().map(|c| u64::from(c[0] + c[1] + c[2])).sum();
-            (peak, total)
+            let bbox = |f: fn(&(u32, u32)) -> u32| {
+                let lo = px.keys().map(f).min().unwrap_or(0);
+                (px.keys().map(f).max().unwrap_or(0) - lo + 1) as f32
+            };
+            let fill = px.len() as f32 / (bbox(|k| k.0) * bbox(|k| k.1));
+            (peak, total, fill)
         };
         // THE COVERAGE THE EMITTER ASKED FOR, read off the mark's own widest lay:
         // a plus's ARM (7-9 px of hairline, against a 1 px nucleus) and a mote's
@@ -28333,12 +28512,19 @@ mod tests {
         let requested = |qs: &[GlowQuad]| -> u32 {
             qs.iter()
                 .max_by_key(|q| u32::from(q.w) * u32::from(q.h))
-                .map(|q| ((q.color >> 16) & 0xff).max((q.color >> 8) & 0xff).max(q.color & 0xff))
+                .map(|q| {
+                    ((q.color >> 16) & 0xff)
+                        .max((q.color >> 8) & 0xff)
+                        .max(q.color & 0xff)
+                })
                 .unwrap_or(0)
         };
-        // A plus is the only silhouette with an ARM: `2·arm+1` (7 or 9) px wide
-        // and exactly 1 px tall at this cell height. A mote's skirt is a 3-5 px
-        // square and its hot core smaller still, so neither can forge one.
+        // A plus is HOLLOW and a mote is SOLID. The cross lights two hairlines
+        // (and, since the taper, their thinning points) inside a `2·arm+1`
+        // square — a third of it at most — while a mote fills its skirt
+        // outright. Measured on the COMPOSITED PIXELS, so no quad shape can
+        // forge it: the old probe looked for a `w >= 7` arm rect, which the
+        // taper retired along with the single full-length arm quad.
         let (mut plus, mut dust) = (Vec::new(), Vec::new());
         for row in 1..16u16 {
             for col in 0..g.cols as u16 {
@@ -28346,9 +28532,9 @@ mod tests {
                 if marks.is_empty() {
                     continue;
                 }
-                let (peak, total) = raster(&marks);
+                let (peak, total, fill) = raster(&marks);
                 let lit = (peak, total, requested(&marks));
-                if marks.iter().any(|q| q.h == 1 && q.w >= 7) {
+                if fill < 0.6 {
                     plus.push(lit);
                 } else {
                     dust.push(lit);
@@ -28389,8 +28575,7 @@ mod tests {
         // cross (so the bar cannot be met by weakening the reference), the dust
         // half is the fix. The 2/255 slack is the byte rounding in `premul_rgb`
         // and the `as u8` truncation of the core's share, nothing else.
-        let stacked =
-            |req: u32| (crate::effect_util::STAR_STACK_ADD * req as f32).min(255.0);
+        let stacked = |req: u32| (crate::effect_util::STAR_STACK_ADD * req as f32).min(255.0);
         for (name, pop) in [("cross", &plus), ("mote", &dust)] {
             for &(peak, _, req) in pop.iter() {
                 assert!(
@@ -28527,9 +28712,12 @@ mod tests {
             }
             count
         };
-        // A 4-point star's horizontal ARM: 13 px wide, exactly 1 px tall. A
-        // mote's widest lay is 5 px.
-        let crosses = |qs: &[GlowQuad]| qs.iter().filter(|q| q.h == 1 && q.w >= 7).count();
+        // HOW MANY CROSSES — counted as 1 px tall hairline RUNS of 7 px or more
+        // ([`star_count`]): the fan's own star lays a 13 px one and its
+        // sparkles a 7 px one, while a mote's widest lay is 5 px and a chunky
+        // burst star is a stack of short scanline spans. A run, not a quad,
+        // because the taper spreads one arm over a body span and its points.
+        let crosses = star_count;
 
         // DARK: the full fan, no sparkles, so the stream is the fan alone.
         let (out, _) = emit(true, burst(0.3, n as u8, 0));
@@ -28551,13 +28739,14 @@ mod tests {
             let seed = (k as f32 + 0.1) / n as f32;
             let (o, _) = emit(true, burst(seed, n as u8, 0));
             assert_eq!(crosses(&o), 1, "seed {seed}: exactly one cross");
-            // Which ray it is, by the arm's own x — the fan is an even ring, so
-            // distinct rays land at distinct x.
+            // Which ray it is, by the cross's own x — the fan is an even ring,
+            // so distinct rays land at distinct x. Read off the arm's BODY, its
+            // widest 1 px lay, since the taper leaves the arm in several.
             let x = o
                 .iter()
-                .find(|q| q.h == 1 && q.w >= 7)
-                .map(|q| q.x)
-                .unwrap_or(0);
+                .filter(|q| q.h == 1)
+                .max_by_key(|q| q.w)
+                .map_or(0, |q| q.x);
             crowned.insert(x);
         }
         assert!(
@@ -28685,14 +28874,14 @@ mod tests {
             );
             (out, halos)
         };
-        // A 4-point star's HORIZONTAL ARM — 7-9 px wide and exactly 1 px tall at
-        // this cell height — is the only mark of its shape in the pour: the
-        // moon's limbs are 3 px, the glitter grain is a 5 px square, and the
-        // mini-comet's dash is velocity-aligned and draws nothing at rest. (The
-        // vertical arm is NOT usable as a second witness: `push_fx_rect` splits
-        // every mark at the cell-row boundary, so a 7 px vertical hairline
-        // arrives as two shorter quads whenever it straddles one.)
-        let is_plus = |out: &[GlowQuad]| out.iter().any(|q| q.h == 1 && q.w >= 7);
+        // A 4-point star's HORIZONTAL ARM — a 7-9 px, 1 px tall run at this cell
+        // height — is the only mark of its shape in the pour: the moon's limbs
+        // are 3 px, the glitter grain is a 5 px square, and the mini-comet's
+        // dash is velocity-aligned and draws nothing at rest. (The vertical arm
+        // is NOT usable as a second witness: `push_fx_rect` splits every mark at
+        // the cell-row boundary, so a 7 px vertical hairline arrives as two
+        // shorter quads whenever it straddles one.)
+        let is_plus = |out: &[GlowQuad]| is_star(out);
 
         // THE DEAL, EXACTLY — over the bucket that owns the star. `hue = k/512`
         // lands `seed` on 8k, i.e. every member of bucket 0 in order, so this is
@@ -28701,7 +28890,11 @@ mod tests {
         for k in 0..512u32 {
             let hue = k as f32 / 512.0;
             let seed = (hue * 4096.0) as u32;
-            assert_eq!(seed % 8, 0, "fixture: hue {hue} must land in the star bucket");
+            assert_eq!(
+                seed % 8,
+                0,
+                "fixture: hue {hue} must land in the star bucket"
+            );
             let (out, halos) = emit(hue);
             let plus = is_plus(&out);
             assert_eq!(
@@ -28799,8 +28992,7 @@ mod tests {
             // that owns this pixel's row may contribute, or the disc would be
             // added once per band it was split into.
             let (x0, y0) = (i32::from(h.x), i32::from(h.y));
-            if !((x0..x0 + i32::from(h.w)).contains(&px)
-                && (y0..y0 + i32::from(h.h)).contains(&py))
+            if !((x0..x0 + i32::from(h.w)).contains(&px) && (y0..y0 + i32::from(h.h)).contains(&py))
             {
                 continue;
             }
@@ -28835,8 +29027,7 @@ mod tests {
         let mut dst = 0x00FF_FFFFu32;
         for h in halos {
             let (x0, y0) = (i32::from(h.x), i32::from(h.y));
-            if !((x0..x0 + i32::from(h.w)).contains(&px)
-                && (y0..y0 + i32::from(h.h)).contains(&py))
+            if !((x0..x0 + i32::from(h.w)).contains(&px) && (y0..y0 + i32::from(h.h)).contains(&py))
             {
                 continue;
             }
@@ -28950,16 +29141,19 @@ mod tests {
                 let hue = s as f32 / 4096.0;
                 let (out, halos) = emit(style, hue);
                 let centre = composited_light_at(&out, &halos, cx, cy);
-                // THE ARM identifies a plus: 1 px tall and at least 7 px wide, the
-                // only mark of that shape any of these three arms draws. Its own
-                // coverage is what the emitter asked for; the nucleus beside it
-                // carries only `STAR_CORE_ADD` of that, and the diffraction glints
-                // are 1x1 dots thrown clear of the centre.
-                let arm = out
-                    .iter()
-                    .filter(|q| q.h == 1 && q.w >= 7)
-                    .map(|q| chan(q.color))
-                    .max();
+                // THE ARM identifies a plus ([`is_star`]) — the only 7 px
+                // hairline any of these three arms draws. The coverage the
+                // emitter asked for is then its BODY's, the arm's widest span:
+                // the point spans past it ride the taper DOWN, the nucleus
+                // beside it carries only `STAR_CORE_ADD`, and the diffraction
+                // glints are 1x1 dots thrown clear of the centre — so the body
+                // is both the widest 1 px lay and the only one at full `cov`.
+                let arm = is_star(&out).then(|| {
+                    out.iter()
+                        .filter(|q| q.h == 1)
+                        .max_by_key(|q| q.w)
+                        .map_or(0, |q| chan(q.color))
+                });
                 let req = if let Some(a) = arm {
                     plus_n += 1;
                     a
@@ -29074,7 +29268,13 @@ mod tests {
                 born,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_particles(born + Duration::from_millis(AGE_MS), &c, g, &mut out, &mut halos);
+            glow.emit_particles(
+                born + Duration::from_millis(AGE_MS),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
             assert!(halos.is_empty(), "comet debris draws quads, never halos");
             out
         };
@@ -29107,7 +29307,11 @@ mod tests {
             let body = cross
                 .iter()
                 .filter(|q| q.w == q.h && q.w >= 3)
-                .map(|q| ((q.color >> 16) & 0xff).max((q.color >> 8) & 0xff).max(q.color & 0xff))
+                .map(|q| {
+                    ((q.color >> 16) & 0xff)
+                        .max((q.color >> 8) & 0xff)
+                        .max(q.color & 0xff)
+                })
                 .max()
                 .expect("the dealt grain drew its square body");
             assert!(
@@ -29289,7 +29493,13 @@ mod tests {
                 seed: i as f32 / 200.0,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
-            glow.emit_rainbow_glide_stars(born + Duration::from_millis(40), &c, g, &mut out, &mut halos);
+            glow.emit_rainbow_glide_stars(
+                born + Duration::from_millis(40),
+                &c,
+                g,
+                &mut out,
+                &mut halos,
+            );
             let head_q = out.iter().filter(|q| achromatic(q.color)).count();
             let head_h = halos.iter().filter(|h| achromatic(h.color)).count();
             // EXACTLY ONE HEAD PER STAR, one shape or the other — the count
@@ -29936,11 +30146,27 @@ mod tests {
         // momentum spine, which this script deliberately leaves at zero (no
         // `note_typed`), so its repriced arm is inert here by construction rather
         // than unchanged.
+        // RECAPTURED for THE TAPER (owner, 2026-08-10: the needle star "is
+        // better", and the kit's marks "read as PLUS SIGNS"). Exactly ONE index
+        // moved, and it is the one that should:
+        //
+        //   * 3 (Sparkle) — the pour's star grains. A 4-point star's arm is no
+        //     longer one rect of constant thickness held to a square end; it is
+        //     a full-coverage BODY through the crossing running out into POINTS
+        //     that dim toward [`STAR_TIP_COV`] and thin with them (THE TAPER, in
+        //     `effect_util`). Same reach, same crossing brightness, different
+        //     silhouette — which is the whole point, so these pixels SHOULD
+        //     change.
+        //
+        // The other eight did not, and that is the control rather than an
+        // oversight: RainbowKitty (2) draws its stars off the momentum spine
+        // this script deliberately leaves at zero, and the remaining seven draw
+        // no `push_twinkle_star` mark in it at all.
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
             13259144446454873362,
-            11795279380596197491,
+            15428187357465854247,
             15099317426123974543,
             8477863368341368663,
             9248424784827790764,
@@ -32305,11 +32531,7 @@ halo = "add"
         for step in 0..40u64 {
             let at = t0 + Duration::from_secs_f32(FRESH_INK_LIFE_S * step as f32 / 40.0);
             for color in pops(&mut glow, at, &mut out) {
-                let (r, gg, b) = (
-                    (color >> 16) & 0xff,
-                    (color >> 8) & 0xff,
-                    color & 0xff,
-                );
+                let (r, gg, b) = ((color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
                 assert!(
                     r >= FRESH_INK_MIN_READABLE_COV as u32,
                     "an emitted pop is never under the readable floor: {color:#08x}"

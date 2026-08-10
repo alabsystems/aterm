@@ -42,7 +42,7 @@ use aterm_update_core::tag::{TagError, TagKind};
 use aterm_update_core::{HttpError, token};
 
 use crate::manifest::{Manifest, Ready};
-use crate::{PINNED_UPDATE_PUBKEY, Source, bundle, install, paths::Staging, sig};
+use crate::{Source, bundle, install, paths::Staging, sig};
 
 /// Which credential lane the last COMPLETED releases-LIST request used. Read by the
 /// background loop to pick a check cadence the lane's rate-limit budget can afford
@@ -442,7 +442,7 @@ struct AuthoritativeRelease {
 /// order. Every page must already have been collected before this runs.
 fn select_authoritative_release(
     releases: Vec<Release>,
-    pinned_update_pubkey: &str,
+    pinned_update_pubkeys: &[&str],
 ) -> Result<Option<AuthoritativeRelease>, String> {
     let mut seen_tags = std::collections::BTreeSet::new();
     let mut selected: Option<AuthoritativeRelease> = None;
@@ -486,7 +486,7 @@ fn select_authoritative_release(
     if let Some(candidate) = &mut selected {
         candidate.version =
             canonical_authority_version(&candidate.release.tag_name, &candidate.tag)?;
-        if pinned_update_pubkey.is_empty() {
+        if pinned_update_pubkeys.is_empty() {
             return Ok(selected);
         }
         candidate.signature_index = Some(
@@ -522,7 +522,7 @@ struct AuthoritativeFetch {
 /// Older appcasts are never downloaded, regardless of REST row order.
 fn fetch_authoritative_release(
     candidate: Option<AuthoritativeRelease>,
-    pinned_update_pubkey: &str,
+    pinned_update_pubkeys: &[&str],
     download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
 ) -> AuthoritativeFetch {
     let mut fetched = AuthoritativeFetch::default();
@@ -561,13 +561,25 @@ fn fetch_authoritative_release(
                 return fetched;
             }
         };
-        if let Err(error) = sig::verify_detached(pinned_update_pubkey, &bytes, &sigbytes) {
-            crate::warn(&format!(
-                "release manifest signature did not verify ({error:?}); refusing authoritative {}",
+        match sig::verify_detached_any(pinned_update_pubkeys, &bytes, &sigbytes) {
+            // Index 0 is the key this build would sign with. Any other member is an
+            // outgoing key inside its retirement window (or one pre-seeded ahead of a
+            // rotation): still authoritative, but worth saying out loud so a stalled
+            // rotation is visible in the log rather than silent until the key is dropped.
+            Ok(0) => {}
+            Ok(index) => crate::warn(&format!(
+                "release manifest for {} was signed by channel key #{index}, not the current \
+                 one — a key rotation is in progress or incomplete",
                 candidate.release.tag_name
-            ));
-            fetched.manifest_rejected = true;
-            return fetched;
+            )),
+            Err(error) => {
+                crate::warn(&format!(
+                    "release manifest signature did not verify ({error:?}); refusing authoritative {}",
+                    candidate.release.tag_name
+                ));
+                fetched.manifest_rejected = true;
+                return fetched;
+            }
         }
     }
     let text = match String::from_utf8(bytes) {
@@ -909,7 +921,7 @@ fn check_and_stage_inner(
         return Ok(None);
     };
 
-    let authoritative = match select_authoritative_release(release_catalog, PINNED_UPDATE_PUBKEY) {
+    let authoritative = match select_authoritative_release(release_catalog, crate::PINNED_UPDATE_PUBKEYS) {
         Ok(candidate) => candidate,
         Err(error) => {
             crate::warn(&error);
@@ -937,7 +949,7 @@ fn check_and_stage_inner(
     let mut download = |url: &str, max_bytes: u64| {
         aterm_update_core::download_bytes(url, tok.as_deref(), max_bytes)
     };
-    let fetched = fetch_authoritative_release(authoritative, PINNED_UPDATE_PUBKEY, &mut download);
+    let fetched = fetch_authoritative_release(authoritative, crate::PINNED_UPDATE_PUBKEYS, &mut download);
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let manifest_rejected = fetched.manifest_rejected;
     let best = fetched.selected;
@@ -1698,7 +1710,7 @@ mod tests {
         // CompleteMetadataArbitration transition.
         for (position, order) in orders.into_iter().enumerate() {
             let releases = order.map(|index| base[index].clone()).to_vec();
-            let selected = select_authoritative_release(releases, "")
+            let selected = select_authoritative_release(releases, &[])
                 .expect("canonical catalog")
                 .expect("one authority");
             assert_eq!(selected.tag, vec![0, 10, 0]);
@@ -1732,7 +1744,7 @@ mod tests {
                 release_with_appcast("v0.8.0", "older-8-503"),
                 release_with_appcast("v0.9.0", "older-9-503"),
             ],
-            "",
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1758,7 +1770,7 @@ mod tests {
                 release_with_appcast("v0.8.0", "older-8-503"),
                 release_with_appcast("v0.9.0", "older-9-503"),
             ],
-            "",
+            &[],
         );
         assert!(real_error.is_err());
         let mut before = catalog_model_state(&model, orders[0], false);
@@ -1777,7 +1789,7 @@ mod tests {
 
         // Drive the real unsigned fetch. The historical 503 URLs are present but
         // invocation-counted and must never be called.
-        let selected = select_authoritative_release(base.to_vec(), "")
+        let selected = select_authoritative_release(base.to_vec(), &[])
             .unwrap()
             .unwrap();
         let selection_before = catalog_model_state(&model, orders[0], false);
@@ -1794,7 +1806,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+        let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
         assert!(fetched.selected.is_some());
         assert_eq!(urls, ["authoritative-10"]);
         let mut verified = selected_state.clone();
@@ -1824,7 +1836,7 @@ mod tests {
             release_with_signed_appcast("v0.9.0", "signed-old-9", "signed-old-9-sig"),
             release_with_signed_appcast("v0.10.0", "signed-high", "signed-high-sig"),
         ];
-        let selected = select_authoritative_release(signed_base.to_vec(), &public_key)
+        let selected = select_authoritative_release(signed_base.to_vec(), &[public_key.as_str()])
             .unwrap()
             .unwrap();
         let selection_before = catalog_model_state(&model, orders[5], true);
@@ -1842,7 +1854,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &public_key, &mut download);
+        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
         assert!(fetched.selected.is_some());
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
         let mut verified = selected_state.clone();
@@ -1864,7 +1876,7 @@ mod tests {
         // Once the authoritative manifest succeeds under a pinned policy, a
         // signature transport failure is terminal with one manifest attempt and
         // one signature attempt. It cannot be projected as an unsigned failure.
-        let selected = select_authoritative_release(signed_base.to_vec(), &public_key)
+        let selected = select_authoritative_release(signed_base.to_vec(), &[public_key.as_str()])
             .unwrap()
             .unwrap();
         let selection_before = catalog_model_state(&model, orders[1], true);
@@ -1878,7 +1890,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &public_key, &mut download);
+        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
         assert!(fetched.selected.is_none());
         assert!(fetched.appcast_fetch_error);
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
@@ -1905,7 +1917,7 @@ mod tests {
 
         // A fetched but invalid authoritative signature is a rejection, also
         // terminal after exactly the same two bounded transport attempts.
-        let selected = select_authoritative_release(signed_base.to_vec(), &public_key)
+        let selected = select_authoritative_release(signed_base.to_vec(), &[public_key.as_str()])
             .unwrap()
             .unwrap();
         let selection_before = catalog_model_state(&model, orders[3], true);
@@ -1919,7 +1931,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &public_key, &mut download);
+        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
         assert!(fetched.selected.is_none());
         assert!(fetched.manifest_rejected);
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
@@ -1956,7 +1968,7 @@ mod tests {
                 "RejectAuthoritativeManifest",
             ),
         ] {
-            let selected = select_authoritative_release(base.to_vec(), "")
+            let selected = select_authoritative_release(base.to_vec(), &[])
                 .unwrap()
                 .unwrap();
             let selection_before = catalog_model_state(&model, orders[2], false);
@@ -1966,7 +1978,7 @@ mod tests {
                 calls += 1;
                 manifest_result.clone()
             };
-            let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
             assert_eq!(calls, 1);
             assert!(fetched.selected.is_none());
             let mut refused = selected_state.clone();
@@ -1998,7 +2010,7 @@ mod tests {
         // closure exists, and projects to RefuseMetadata with zero fetches.
         let real_error = select_authoritative_release(
             vec![release_with_appcast("v0.010.0", "must-not-fetch")],
-            "",
+            &[],
         );
         assert!(real_error.is_err());
         let before = model.successors("ObserveMalformedCandidate", &model.init_state())[0].clone();
@@ -2054,7 +2066,7 @@ mod tests {
                 manifest_bytes_with_dmg("0.10.0", 10, 0, "../aterm-0.10.0.dmg"),
             ),
         ] {
-            let selected = select_authoritative_release(vec![release], "")
+            let selected = select_authoritative_release(vec![release], &[])
                 .unwrap()
                 .unwrap();
             let selection_before = catalog_model_state(&model, orders[0], false);
@@ -2065,7 +2077,7 @@ mod tests {
                 assert_eq!(url, "authoritative-10", "{label}");
                 Ok(manifest.clone())
             };
-            let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
             assert!(fetched.selected.is_none(), "{label}");
             assert!(fetched.manifest_rejected, "{label}");
             assert!(!fetched.appcast_fetch_error, "{label}");
@@ -2089,7 +2101,7 @@ mod tests {
 
         // NEGATIVE CONTROL: corrupting the real v0.10.0 selection into row-order
         // v0.9.0 cannot validate as CompleteMetadataArbitration.
-        let selected = select_authoritative_release(base.to_vec(), "")
+        let selected = select_authoritative_release(base.to_vec(), &[])
             .unwrap()
             .unwrap();
         let before = catalog_model_state(&model, orders[0], false);
@@ -2126,7 +2138,7 @@ mod tests {
             [2, 1, 0],
         ] {
             let releases = order.map(|index| base[index].clone()).to_vec();
-            let authoritative = select_authoritative_release(releases, "")
+            let authoritative = select_authoritative_release(releases, &[])
                 .unwrap()
                 .expect("one authoritative release");
             assert_eq!(authoritative.release.tag_name, "v0.10.0");
@@ -2141,7 +2153,7 @@ mod tests {
                     unexpected => panic!("unexpected asset fetch: {unexpected}"),
                 }
             };
-            let fetched = fetch_authoritative_release(Some(authoritative), "", &mut download);
+            let fetched = fetch_authoritative_release(Some(authoritative), &[], &mut download);
             assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
             assert_eq!(urls, ["authoritative-10"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2159,7 +2171,7 @@ mod tests {
             release_with_signed_appcast("v0.9.0", "older-503", "older-signature"),
             release_with_signed_appcast("v0.10.0", "highest-manifest", "highest-signature"),
         ];
-        let authoritative = select_authoritative_release(releases, &public_key)
+        let authoritative = select_authoritative_release(releases, &[public_key.as_str()])
             .unwrap()
             .unwrap();
         let mut urls = Vec::new();
@@ -2173,7 +2185,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(authoritative), &public_key, &mut download);
+        let fetched = fetch_authoritative_release(Some(authoritative), &[public_key.as_str()], &mut download);
         assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
         assert_eq!(urls, ["highest-manifest", "highest-signature"]);
         assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2210,7 +2222,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for releases in [catalog.clone(), catalog.iter().rev().cloned().collect()] {
-            let selected = select_authoritative_release(releases, "")
+            let selected = select_authoritative_release(releases, &[])
                 .unwrap()
                 .expect("canonical maximum exists");
             assert_eq!(selected.release.tag_name, "v0.54.0");
@@ -2223,7 +2235,7 @@ mod tests {
                     Err("historical asset must not be fetched".into())
                 }
             };
-            let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
             assert_eq!(fetched.selected.unwrap().0.version, "0.54.0");
             assert_eq!(urls, ["authoritative-54"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2238,7 +2250,7 @@ mod tests {
                     release_with_appcast("v0.54.0", "canonical"),
                     release_with_appcast(same_or_newer_noncanonical, "must-not-fetch"),
                 ],
-                "",
+                &[],
             )
             .err()
             .expect("a noncanonical numeric maximum must fail closed");
@@ -2253,7 +2265,7 @@ mod tests {
                 release_with_appcast("v0.54.0", "canonical"),
                 release_with_appcast("v0.legacy.1", "must-not-fetch"),
             ],
-            "",
+            &[],
         )
         .err()
         .expect("an unorderable historical exact-name tag must fail closed");
@@ -2271,7 +2283,7 @@ mod tests {
                 lower.clone(),
                 release_with_appcast("v0.10.0", "unsigned-highest"),
             ],
-            &public_key,
+            &[public_key.as_str()],
         )
         .err()
         .expect("unsigned highest must defer");
@@ -2284,7 +2296,7 @@ mod tests {
             url: "highest-signature-b".into(),
             size: 0,
         });
-        let err = select_authoritative_release(vec![duplicate_sig, lower], &public_key)
+        let err = select_authoritative_release(vec![duplicate_sig, lower], &[public_key.as_str()])
             .err()
             .expect("duplicate highest signature must defer");
         assert!(
@@ -2311,7 +2323,7 @@ mod tests {
                 release_with_appcast("v0.61", "retired-app-channel-head"),
                 release_with_appcast("v0.5.0", "current-head"),
             ],
-            "",
+            &[],
         )
         .expect("a retired two-component release is skipped, not an error")
         .expect("the current-scheme candidate is elected");
@@ -2332,7 +2344,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), "", &mut download);
+        let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
         assert_eq!(fetched.selected.unwrap().0.version, "0.5.0");
         assert_eq!(urls, ["current-head"]);
         assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2345,7 +2357,7 @@ mod tests {
                     release_with_appcast(legacy, "retired-must-not-fetch"),
                     release_with_appcast("v0.5.0", "current-head"),
                 ],
-                "",
+                &[],
             )
             .expect("retired two-component releases are inert archive history")
             .expect("the current-scheme candidate is elected");
@@ -2399,7 +2411,7 @@ mod tests {
             };
             let selected = select_authoritative_release(
                 vec![renamed, release_with_appcast("v0.5.0", "current-head")],
-                "",
+                &[],
             )
             .expect("an archive release without the exact appcast asset is inert, not an error")
             .expect("the current-series candidate is elected");
@@ -2429,7 +2441,7 @@ mod tests {
                 release_with_appcast("v0.21.2607041853", "archive"),
                 release_with_appcast("v0.5.0", "current-public-lineage"),
             ],
-            "",
+            &[],
         )
         .expect("orderable")
         .expect("a candidate is elected");
@@ -2449,7 +2461,7 @@ mod tests {
             .enumerate()
             .map(|(index, tag)| release_with_appcast(tag, &format!("retired-{index}")))
             .collect::<Vec<_>>();
-        let selected = select_authoritative_release(only_legacy, "")
+        let selected = select_authoritative_release(only_legacy, &[])
             .expect("retired releases are skipped, never an error");
         assert!(
             selected.is_none(),
@@ -2463,7 +2475,7 @@ mod tests {
         let public_key = B64.encode(keypair.public_key().as_ref());
         let selected = select_authoritative_release(
             vec![release_with_appcast("v0.61", "retired-unsigned")],
-            &public_key,
+            &[public_key.as_str()],
         )
         .expect("a retired unsigned release is skipped, not a signature failure");
         assert!(selected.is_none());
@@ -2484,7 +2496,7 @@ mod tests {
                         .iter()
                         .map(|tag| release_with_appcast(tag, tag))
                         .collect(),
-                    "",
+                    &[],
                 )
                 .unwrap()
                 .expect("a numeric maximum exists");
@@ -2516,7 +2528,7 @@ mod tests {
         ] {
             let err = select_authoritative_release(
                 vec![release_with_appcast(malformed, "must-not-fetch")],
-                "",
+                &[],
             )
             .err()
             .expect("nonnumeric exact-name candidate must fail closed");
@@ -2528,7 +2540,7 @@ mod tests {
         for noncanonical_maximum in ["v00.10.0", "v0.010.0", "v0.10.00", "v0.10.0000000"] {
             let err = select_authoritative_release(
                 vec![release_with_appcast(noncanonical_maximum, "must-not-fetch")],
-                "",
+                &[],
             )
             .err()
             .expect("noncanonical numeric maximum must fail closed");
@@ -2544,7 +2556,7 @@ mod tests {
             url: "manifest-b".into(),
             size: 0,
         });
-        let err = select_authoritative_release(vec![duplicate_asset], "")
+        let err = select_authoritative_release(vec![duplicate_asset], &[])
             .err()
             .expect("duplicate exact assets must fail closed");
         assert!(err.contains("duplicate assets"), "{err}");
@@ -2554,7 +2566,7 @@ mod tests {
                 release_with_appcast("v0.10.0", "manifest-a"),
                 release_with_appcast("v0.10.0", "manifest-b"),
             ],
-            "",
+            &[],
         )
         .err()
         .expect("duplicate canonical candidates must fail closed");
@@ -2571,7 +2583,7 @@ mod tests {
                 release_with_appcast("v0.10.0", "manifest-a"),
                 release_with_appcast("v00.010.00", "manifest-b"),
             ],
-            "",
+            &[],
         )
         .err()
         .expect("an aliasing spelling must fail closed");
@@ -2585,7 +2597,7 @@ mod tests {
                 release_with_appcast("v0.9.0", "older-must-not-fetch"),
                 release_with_appcast("v0.10.0", "mismatched-highest"),
             ],
-            "",
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -2598,7 +2610,7 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(authoritative), "", &mut download);
+        let fetched = fetch_authoritative_release(Some(authoritative), &[], &mut download);
         assert!(fetched.selected.is_none());
         assert!(fetched.manifest_rejected);
         assert_eq!(urls, ["mismatched-highest"]);
@@ -2897,5 +2909,71 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// ROTATION, end to end through the real selection + fetch path: a client whose
+    /// keyset holds BOTH the incoming and the outgoing key installs a release signed
+    /// by EITHER. This is the whole point of the keyset — without it, the release
+    /// that would tell a client about the new key is itself unverifiable.
+    #[test]
+    fn a_release_signed_by_either_keyset_member_is_authoritative() {
+        let outgoing = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
+        let incoming = Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
+        let k_out = B64.encode(outgoing.public_key().as_ref());
+        let k_in = B64.encode(incoming.public_key().as_ref());
+        let manifest = manifest_bytes("0.10.0", 10, 0);
+        // Head = incoming (post-promotion), outgoing still inside its window.
+        let keyset = [k_in.as_str(), k_out.as_str()];
+
+        for (who, signer) in [("incoming", &incoming), ("outgoing", &outgoing)] {
+            let signature = signer.sign(&manifest).as_ref().to_vec();
+            let releases = vec![release_with_signed_appcast(
+                "v0.10.0",
+                "m-url",
+                "sig-url",
+            )];
+            let selected = select_authoritative_release(releases, &keyset)
+                .unwrap()
+                .expect("a signed candidate is selected");
+            let mut download = |url: &str, _max: u64| match url {
+                "m-url" => Ok(manifest.clone()),
+                "sig-url" => Ok(signature.clone()),
+                other => Err(format!("unexpected fetch {other}")),
+            };
+            let fetched =
+                fetch_authoritative_release(Some(selected), &keyset, &mut download);
+            assert!(
+                !fetched.manifest_rejected,
+                "{who} key is in the keyset and must be accepted"
+            );
+        }
+    }
+
+    /// The non-vacuity control for the test above: once a key is DROPPED from the
+    /// keyset it stops working. Without this, an implementation that accepted any
+    /// signature at all would pass the rotation test.
+    #[test]
+    fn a_retired_key_is_refused_once_dropped_from_the_keyset() {
+        let retired = Ed25519KeyPair::from_seed_unchecked(&SIGNING_SEED).unwrap();
+        let current = Ed25519KeyPair::from_seed_unchecked(&[42u8; 32]).unwrap();
+        let k_current = B64.encode(current.public_key().as_ref());
+        let manifest = manifest_bytes("0.10.0", 10, 0);
+        let signature = retired.sign(&manifest).as_ref().to_vec();
+
+        let releases = vec![release_with_signed_appcast("v0.10.0", "m-url", "sig-url")];
+        let keyset = [k_current.as_str()];
+        let selected = select_authoritative_release(releases, &keyset)
+            .unwrap()
+            .expect("a signed candidate is selected");
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(manifest.clone()),
+            "sig-url" => Ok(signature.clone()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let fetched = fetch_authoritative_release(Some(selected), &keyset, &mut download);
+        assert!(
+            fetched.manifest_rejected,
+            "a key no longer in the keyset must not authenticate a release"
+        );
     }
 }

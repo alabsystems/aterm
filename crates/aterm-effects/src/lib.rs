@@ -29,6 +29,17 @@
 //!   the state machines and their config clamps — hosts expose it, embedders
 //!   cannot bypass it.
 
+/// The animal roster's bake path: one authored species head → an exact-size
+/// RGBA tile, handed to the shared cat atlas through `CatBaker::host_tile`.
+/// The decision twin of [`pet_baker`], for the ambient animal-word decoration.
+pub mod animal_baker;
+/// `@generated` — the checked-in const drawlists for the ANIMAL roster (do not
+/// edit by hand). Produced by `cargo run -p aterm-effects --example
+/// gen_animal_glyphs`; kept honest by the `animal_glyphs_gen_matches_assets`
+/// drift test. `include!`d for the same reason [`cat_glyphs_gen`] is.
+pub mod animal_glyphs_gen {
+    include!("animal_glyphs_gen.rs");
+}
 pub mod cat_baker;
 /// Cat-art v4 codegen (docs/cat-art-v4-design.md §1): the generator that turns the
 /// semantic glyph asset TOMLs into the checked-in [`cat_glyphs_gen`] const drawlists.
@@ -42,6 +53,20 @@ pub mod cat_glyphs_gen {
     include!("cat_glyphs_gen.rs");
 }
 pub mod color_math;
+/// The dog roster's bake path: one authored breed head → an exact-size RGBA
+/// tile, handed to the shared cat atlas through `CatBaker::host_tile` — the
+/// [`pet_baker`] pattern applied to the typed-word dog cameo.
+pub mod dog_baker;
+/// The typed-word DOG cameo — the canine twin of the typed-"kitty" summon's
+/// hello: lifecycle envelope, breed/coat roll, and the happy entry bounce.
+pub mod dog_cameo;
+/// `@generated` — the checked-in const drawlists for the DOG roster (do not edit
+/// by hand). Produced by `cargo run -p aterm-effects --example gen_dog_glyphs`;
+/// kept honest by the `dog_glyphs_gen_matches_assets` drift test. `include!`d for
+/// the same reason [`cat_glyphs_gen`] is.
+pub mod dog_glyphs_gen {
+    include!("dog_glyphs_gen.rs");
+}
 pub mod cursor_beam;
 pub mod cursor_comet;
 pub mod cursor_droplet;

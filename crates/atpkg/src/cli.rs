@@ -144,11 +144,7 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
 /// `atpkg` (no verb) — the inert/enabled posture, observable from the shell.
 fn status() {
     if manager_enabled() {
-        let anchor = if root_override().is_some() {
-            "root key via ATPKG_ROOTKEY_OVERRIDE"
-        } else {
-            "root key pinned"
-        };
+        let anchor = "root key pinned";
         println!(
             "atpkg: enabled ({anchor}). Verbs: doctor, which, list, run, uninstall, \
              install, seed, update, sync, rollback, pin, unpin, gc, verify, link, unlink, refresh."
@@ -824,39 +820,21 @@ fn resolve_fetcher(layout: &crate::store::Layout) -> Box<dyn crate::flow::Fetche
     }
 }
 
-/// The out-of-band root-key OVERRIDE (§8): a caller/config-supplied Ed25519 root public key
-/// (base64) via `ATPKG_ROOTKEY_OVERRIDE`, routed through the SAME `sig::verify_index_with` seam
-/// as the compile-time [`crate::PINNED_PKG_ROOTKEY`] — so a mirror, or a second owner account,
-/// can be trusted WITHOUT a rebuild. It only swaps WHICH root key anchors verification; it
-/// NEVER disables it. The selected index must still carry a valid Ed25519 signature over its
-/// exact bytes under this key or nothing verifies (fail-closed at [`crate::select_index`]).
-/// `None` when unset/empty — the pinned key stands.
-fn root_override() -> Option<String> {
-    std::env::var("ATPKG_ROOTKEY_OVERRIDE")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-/// Pure override→pin precedence: the override key when present (non-empty), else the pinned
-/// key. Split out from [`effective_root_key`] so the precedence is unit-testable without
-/// mutating the process environment. NEVER returns anything that disables verify — an empty
-/// resolved key simply means "no anchor", which fails closed at [`manager_enabled`].
-fn resolve_root_key(override_key: Option<&str>, pinned: &str) -> String {
-    match override_key {
-        Some(k) if !k.is_empty() => k.to_string(),
-        _ => pinned.to_string(),
-    }
-}
-
-/// The root public key the network verbs verify under: the out-of-band [`root_override`] when
-/// set, else the compile-time [`crate::PINNED_PKG_ROOTKEY`]. Every flow entry point takes THIS
-/// in place of a bare pin, so trusting a mirror/second account needs no rebuild.
+/// The root public key the network verbs verify under: the committed anchor
+/// [`crate::PINNED_PKG_ROOTKEY`], and nothing else.
+///
+/// There used to be an `ATPKG_ROOTKEY_OVERRIDE` here that swapped WHICH root key
+/// anchored verification "without a rebuild". It is gone. However carefully it was
+/// scoped, it let ambient process state decide what the package manager trusted —
+/// an unpinned build could be handed an anchor by an environment variable. Trusting
+/// a mirror or a second owner account is now a committed change to
+/// `aterm_update_core::pins`, visible in a diff like any other trust decision.
 fn effective_root_key() -> String {
-    resolve_root_key(root_override().as_deref(), crate::PINNED_PKG_ROOTKEY)
+    crate::PINNED_PKG_ROOTKEY.to_string()
 }
 
-/// Whether the manager may act on the network verbs: SOME root key to verify under (pinned OR
-/// overridden) AND the user has not opted out via `ATPKG_DISABLE`.
+/// Whether the manager may act on the network verbs: a committed root anchor to
+/// verify under AND the user has not opted out via `ATPKG_DISABLE`.
 fn manager_enabled() -> bool {
     crate::manager_enabled()
 }
@@ -2279,47 +2257,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The out-of-band root-key override (step 22a) SWAPS which root key anchors verification,
-    /// never disables it: an override wins over the pin, an empty/absent override falls back to
-    /// the pin, and the resolved key is exactly what the flow verifies under.
+    /// REGRESSION: no ambient state may supply the verification anchor.
+    ///
+    /// `ATPKG_ROOTKEY_OVERRIDE` used to swap which root key anchored verification,
+    /// and could supply one to a build that had none — an environment variable
+    /// deciding trust. The anchor is now the committed constant and only that, so
+    /// setting the old variable must change nothing.
     #[test]
-    fn root_key_override_takes_precedence_over_the_pin() {
-        // Override present ⇒ it wins (trust a mirror/second account without a rebuild).
+    fn no_environment_variable_can_supply_the_verification_anchor() {
+        // SAFETY: single-threaded test process; the point is that the value is
+        // ignored, so no other thread can observe a meaningful difference.
+        unsafe { std::env::set_var("ATPKG_ROOTKEY_OVERRIDE", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") };
         assert_eq!(
-            resolve_root_key(Some("OVERRIDE_KEY"), "PINNED_KEY"),
-            "OVERRIDE_KEY"
+            effective_root_key(),
+            crate::PINNED_PKG_ROOTKEY,
+            "the committed anchor is the only anchor; the env var must be inert"
         );
-        // Absent or empty override ⇒ the pin stands (never silently blanks the anchor).
-        assert_eq!(resolve_root_key(None, "PINNED_KEY"), "PINNED_KEY");
-        assert_eq!(resolve_root_key(Some(""), "PINNED_KEY"), "PINNED_KEY");
-        // With no pin at all, an override still supplies the anchor.
-        assert_eq!(resolve_root_key(Some("OVERRIDE_KEY"), ""), "OVERRIDE_KEY");
-        assert_eq!(
-            resolve_root_key(None, ""),
-            "",
-            "no override, no pin ⇒ no anchor"
-        );
+        unsafe { std::env::remove_var("ATPKG_ROOTKEY_OVERRIDE") };
+        assert_eq!(effective_root_key(), crate::PINNED_PKG_ROOTKEY);
     }
 
-    /// Enablement follows the resolved key AND the opt-out. The override can ENABLE the manager
-    /// without a rebuild (pin empty), but `ATPKG_DISABLE` still wins, and it can never bypass
-    /// verify — enablement only decides whether a verified install is attempted.
+    /// Enablement follows the COMPILED anchor and the opt-out, and nothing else.
+    /// `ATPKG_DISABLE` may only ever subtract authority — a kill switch that can
+    /// turn the manager off is safe; one that could turn it on was not, which is
+    /// why the root-key override is gone.
     #[test]
-    fn override_can_enable_without_a_rebuild_but_never_bypasses_disable() {
-        // No pin, no override ⇒ inert.
-        assert!(!crate::manager_enabled_with("", None, false));
-        // Override with no compile-time pin ⇒ enabled (the without-a-rebuild path).
-        assert!(crate::manager_enabled_with("", Some("OVERRIDE_KEY"), false));
-        // A pin alone ⇒ enabled.
-        assert!(crate::manager_enabled_with("PINNED_KEY", None, false));
-        // ATPKG_DISABLE opt-out wins even with a valid key present.
-        assert!(!crate::manager_enabled_with(
-            "PINNED_KEY",
-            Some("OVERRIDE_KEY"),
-            true
-        ));
-        // An empty override never enables on its own.
-        assert!(!crate::manager_enabled_with("", Some(""), false));
+    fn enablement_follows_the_compiled_anchor_and_the_kill_switch_only() {
+        // No compiled anchor ⇒ inert. There is no longer any way to supply one
+        // at runtime, so this state can only be changed by a commit.
+        assert!(!crate::manager_enabled_with("", false));
+        // A compiled anchor ⇒ enabled.
+        assert!(crate::manager_enabled_with("PINNED_KEY", true) == false);
+        assert!(crate::manager_enabled_with("PINNED_KEY", false));
+        // The opt-out wins even with a valid anchor present.
+        assert!(!crate::manager_enabled_with("PINNED_KEY", true));
     }
 
     // ---- token chain precedence (pure split — no env mutation, no subprocess) ----

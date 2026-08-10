@@ -289,6 +289,7 @@ impl VersionedConfigService {
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&path_feeds.trail_packs),
             kitty_sprite: preliminary.kitty_sprite.clone(),
+            wallpaper: preliminary.wallpaper.clone(),
             themes: Arc::clone(&preliminary.themes),
             sparkle_spec_consumers: Some(Arc::new(path_feeds.sparkle.consumer_capabilities())),
         });
@@ -325,6 +326,7 @@ impl VersionedConfigService {
         let assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs,
             kitty_sprite: self.assets.kitty_sprite.clone(),
+            wallpaper: self.assets.wallpaper.clone(),
             themes: Arc::clone(&self.assets.themes),
             sparkle_spec_consumers: Some(Arc::new(consumers)),
         });
@@ -617,8 +619,25 @@ impl VersionedConfigService {
             self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
                 trail_packs: Arc::clone(&self.assets.trail_packs),
                 kitty_sprite: self.assets.kitty_sprite.clone(),
+                wallpaper: self.assets.wallpaper.clone(),
                 themes: Arc::clone(&self.assets.themes),
                 sparkle_spec_consumers: None,
+            });
+        }
+        // WALLPAPER: unlike the manual-only asset-source keys (which a worker
+        // must co-admit with the text), the wallpaper key IS structured-writable
+        // — the Settings file picker writes it — so this patch lane re-resolves
+        // the image inline; without this the catalog would keep serving the
+        // previous picture (or none) under the new path.
+        if self.config.wallpaper != next_config.wallpaper {
+            self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
+                trail_packs: Arc::clone(&self.assets.trail_packs),
+                kitty_sprite: self.assets.kitty_sprite.clone(),
+                wallpaper: crate::app_config::resolve_wallpaper_asset(
+                    next_config.wallpaper.as_deref(),
+                ),
+                themes: Arc::clone(&self.assets.themes),
+                sparkle_spec_consumers: self.assets.sparkle_spec_consumers.clone(),
             });
         }
 
@@ -776,6 +795,7 @@ impl VersionedConfigService {
         self.assets = Arc::new(crate::app_config::ConfigAssetCatalog {
             trail_packs: Arc::clone(&self.assets.trail_packs),
             kitty_sprite: self.assets.kitty_sprite.clone(),
+            wallpaper: self.assets.wallpaper.clone(),
             themes,
             sparkle_spec_consumers: self.assets.sparkle_spec_consumers.clone(),
         });

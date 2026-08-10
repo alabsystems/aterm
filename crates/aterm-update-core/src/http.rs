@@ -819,6 +819,8 @@ mod tests {
     #[test]
     fn release_asset_bound_is_githubs_ceiling_and_covers_batteries_included() {
         assert_eq!(RELEASE_ASSET_DOWNLOAD_BOUND, 2 * 1024 * 1024 * 1024);
-        assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000);
+        // A claim about a constant belongs at COMPILE time; a runtime assert
+        // over constants can never fail a run that compiled.
+        const { assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000) };
     }
 }

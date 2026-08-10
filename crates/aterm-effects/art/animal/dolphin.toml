@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "dolphin"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.47, center_x = 0.5, word_top = 1.0 }
+
+# Dolphin: light grey melon dome, rostrum/beak bulging out below the chin,
+# pale belly patch, cheerful upturned smile on the beak, soft blush.
+
+[[layer]]
+role = "outline"
+ref_fill = "#2B3844"
+recolor = "fixed"
+paths = ["M 25 68 C 25 40.4 49.6 18 80 18 C 110.4 18 135 40.4 135 68 C 135 95.6 110.4 118 80 118 C 49.6 118 25 95.6 25 68 Z", "M 50 102 C 50 91 63.4 82 80 82 C 96.6 82 110 91 110 102 C 110 113 96.6 122 80 122 C 63.4 122 50 113 50 102 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#A9C0D2"
+recolor = "fixed"
+paths = ["M 29 68 C 29 42.6 51.8 22 80 22 C 108.2 22 131 42.6 131 68 C 131 93.4 108.2 114 80 114 C 51.8 114 29 93.4 29 68 Z", "M 54 102 C 54 93.2 65.6 86 80 86 C 94.4 86 106 93.2 106 102 C 106 110.8 94.4 118 80 118 C 65.6 118 54 110.8 54 102 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#EDF3F7"
+recolor = "fixed"
+paths = ["M 42 92 C 42 82.6 59 75 80 75 C 101 75 118 82.6 118 92 C 118 101.4 101 109 80 109 C 59 109 42 101.4 42 92 Z"]
+
+[[layer]]
+role = "coat_shade"
+ref_fill = "#8FA8BB"
+recolor = "fixed"
+paths = ["M 53 102 C 53 92.6 65.1 85 80 85 C 94.9 85 107 92.6 107 102 C 107 111.4 94.9 119 80 119 C 65.1 119 53 111.4 53 102 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#D2DFE9"
+recolor = "fixed"
+paths = ["M 46 42 C 58 28 102 28 114 42 C 102 33 58 33 46 42 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 48 62 C 48 57.9 50.7 54.5 54 54.5 C 57.3 54.5 60 57.9 60 62 C 60 66.1 57.3 69.5 54 69.5 C 50.7 69.5 48 66.1 48 62 Z", "M 100 62 C 100 57.9 102.7 54.5 106 54.5 C 109.3 54.5 112 57.9 112 62 C 112 66.1 109.3 69.5 106 69.5 C 102.7 69.5 100 66.1 100 62 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 53.8 59 C 53.8 57.8 54.8 56.8 56 56.8 C 57.2 56.8 58.2 57.8 58.2 59 C 58.2 60.2 57.2 61.2 56 61.2 C 54.8 61.2 53.8 60.2 53.8 59 Z", "M 105.8 59 C 105.8 57.8 106.8 56.8 108 56.8 C 109.2 56.8 110.2 57.8 110.2 59 C 110.2 60.2 109.2 61.2 108 61.2 C 106.8 61.2 105.8 60.2 105.8 59 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#2E3B46"
+recolor = "fixed"
+paths = ["M 58 97 C 72 107 88 107 102 97 C 94 112 66 112 58 97 Z"]
+
+[[layer]]
+role = "blush"
+ref_fill = "#F0B6C0"
+recolor = "fixed"
+paths = ["M 47 84 C 47 82.1 49.2 80.5 52 80.5 C 54.8 80.5 57 82.1 57 84 C 57 85.9 54.8 87.5 52 87.5 C 49.2 87.5 47 85.9 47 84 Z", "M 103 84 C 103 82.1 105.2 80.5 108 80.5 C 110.8 80.5 113 82.1 113 84 C 113 85.9 110.8 87.5 108 87.5 C 105.2 87.5 103 85.9 103 84 Z"]

@@ -1354,8 +1354,9 @@ fn signing_is_never_required_by_history_but_metadata_stays_coherent() {
     assert!(publish::channel_signature_required(&orphan).is_err());
 }
 
-/// The COMMITTED channel pin (`[workspace.metadata.aterm]
-/// update_channel_pubkey`), as folded into the signing verdict by
+/// The COMMITTED channel anchor (`aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS[0]`
+/// — it used to ALSO live in `[workspace.metadata.aterm] update_channel_pubkey`, two
+/// separately edited values nothing compared), as folded into the signing verdict by
 /// `committed_channel_signature_policy` — the seam behind
 /// `preflight_signature_policy`, which every flavor (cut, resume via
 /// revalidate, recovery, the yank successor) derives its policy from.
@@ -1365,15 +1366,16 @@ const OTHER_KEY: &str = "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
 
 #[test]
 fn a_committed_pin_makes_a_keyless_cut_fail_closed_before_any_claim() {
-    // v0.16.0's exact failure: no ~/.aterm/release.conf, so the cutter treated
-    // the missing per-machine opt-in as permission and published the pinned
-    // public channel unsigned. With the pin committed this is a hard pre-claim
-    // error that names the pin, the config path, and the rule.
+    // v0.16.0's exact failure: no signing material, so the cutter treated the
+    // missing per-machine opt-in as permission and published the pinned public
+    // channel unsigned. With the anchor committed this is a hard pre-claim error
+    // that names the anchor, where it lives, and the rule.
     let error = publish::committed_channel_signature_policy(Some(CHANNEL_PIN), None)
         .expect_err("a keyless machine may not cut for a pinned channel")
         .to_string();
     assert!(error.contains(CHANNEL_PIN), "{error}");
-    assert!(error.contains("~/.aterm/release.conf"), "{error}");
+    assert!(error.contains("aterm-update-core::pins"), "{error}");
+    assert!(error.contains("no signing material was supplied"), "{error}");
     assert!(
         error.contains("may not cut for a pinned channel"),
         "{error}"

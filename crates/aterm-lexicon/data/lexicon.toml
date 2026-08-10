@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Sparkle-words lexicon. Each [[entry]] declares surface forms for one
-# (class, language). class = "profanity" | "feline" | "orca" | "emphasis".
-# Cross-class homographs resolve by total order: profanity > feline > orca > emphasis.
+# (class, language). class = "profanity" | "feline" | "canine" | "orca" | "animal" | "emphasis".
+# Cross-class homographs resolve by total order: profanity > feline > canine > orca > animal > emphasis.
+# class = "animal" entries additionally carry species = "<id>" naming the authored sprite.
 # mode="suffix": surfaces = stems x suffixes (+ forms[]). mode="forms": forms[] only.
 # cjk=true: no-space script; forms[] are whole compounds matched by maximal run.
 # ambiguous=true: only loaded when the entry's lang is in the configured `languages`.
@@ -1250,3 +1251,887 @@ forms    = ["sūds"]
 cjk      = false
 ambiguous= true
 notes    = "FOLD COLLISION with ordinary English: sūds -> suds. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for lv — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous lv entry and gated behind ambiguous=true, so a lv user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
+
+
+# ===================== group: canine (2026-08-10) =====================
+# The dog / puppy family — the canine counterpart of the feline group, added
+# for the typed-word dog summon. Same laws as feline: whole-word only,
+# profanity outranks canine (id/ms "anjing" and jv "asu" are profanity-claimed
+# and stay that way), and any surface that folds to an ordinary English word
+# rides ambiguous=true (pinned by `no_unambiguous_surface_is_an_ordinary_english_word`).
+
+[[entry]]
+class    = "canine"
+lang     = "en"
+mode     = "forms"
+forms    = ["dog", "dogs", "doggy", "doggies", "doggie", "doggo", "doggos", "puppy", "puppies", "pup", "pups", "pupper", "puppers", "pooch", "pooches", "woof", "woofs"]
+cjk      = false
+ambiguous= false
+notes    = "Bare 'dog' is 3 folded chars; the <=3 short-word guard is feline-only (bare-cat opt-in), so 'dog' matches unconditionally — it is the family's namesake and the typed summon's primary trigger. woof/woofs are the onomatopoeic dog-calls (woof is also the weaving term, accepted like 'meow' the name). doggo/pupper are internet-speak."
+
+[[entry]]
+class    = "canine"
+lang     = "es"
+mode     = "suffix"
+stems    = ["perr"]
+suffixes = ["o", "os", "a", "as", "ito", "itos", "ita", "itas"]
+forms    = ["cachorro", "cachorros", "cachorrito", "cachorritos"]
+cjk      = false
+ambiguous= false
+notes    = "perro/perra + plurals + diminutives -ito/-ita (puppy). cachorro = puppy/cub (shared with pt, same class -> language sets union)."
+
+[[entry]]
+class    = "canine"
+lang     = "fr"
+mode     = "forms"
+forms    = ["chien", "chiens", "chiot", "chiots", "toutou", "toutous"]
+cjk      = false
+ambiguous= false
+notes    = "chien(s) = dog(s); chiot(s) = puppy; toutou = affectionate 'doggy'. chienne omitted (doubles as an insult, mirroring fr feline's omission of 'chatte')."
+
+[[entry]]
+class    = "canine"
+lang     = "it"
+mode     = "forms"
+forms    = ["cagnolino", "cagnolini", "cucciolo", "cuccioli", "cagnetto", "cagnetti"]
+cjk      = false
+ambiguous= false
+notes    = "Diminutives cagnolino/cagnetto (doggy) and cucciolo (puppy/cub) are collision-free. The bare noun rides the ambiguous sibling below."
+
+[[entry]]
+class    = "canine"
+lang     = "it"
+mode     = "forms"
+forms    = ["cane", "cani"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: cane (walking stick). Gated so only users who list 'it' get the bare noun; the diminutives above load unconditionally."
+
+[[entry]]
+class    = "canine"
+lang     = "pt"
+mode     = "forms"
+forms    = ["cão", "cães", "cachorro", "cachorros", "cachorrinho", "cachorrinhos", "cachorrinha", "cachorrinhas"]
+cjk      = false
+ambiguous= false
+notes    = "cão/cães = dog(s); cachorro = dog (BR) / puppy (PT); cachorrinho/-a = little dog/puppy. cadela omitted (doubles as an insult)."
+
+[[entry]]
+class    = "canine"
+lang     = "ca"
+mode     = "forms"
+forms    = ["gos", "gossos", "gosset", "gossets", "cadell", "cadells"]
+cjk      = false
+ambiguous= false
+notes    = "gos/gossos = dog(s); gosset(s) = doggy (diminutive); cadell(s) = puppy. 'gos' is 3 folded chars but the short-word guard is feline-only."
+
+[[entry]]
+class    = "canine"
+lang     = "de"
+mode     = "forms"
+forms    = ["hund", "hunde", "hündchen", "welpe", "welpen", "wauwau"]
+cjk      = false
+ambiguous= false
+notes    = "Hund(e) = dog(s) (shared surface with sv/da/no, same class -> union); Hündchen = doggy; Welpe(n) = puppy; Wauwau = childspeak 'doggy'. Hündin omitted (doubles as an insult)."
+
+[[entry]]
+class    = "canine"
+lang     = "nl"
+mode     = "forms"
+forms    = ["hond", "honden", "hondje", "hondjes"]
+cjk      = false
+ambiguous= false
+notes    = "hond(en) = dog(s); hondje(s) = doggy (diminutive). Dutch 'pup'/'puppy' are shared with the English surfaces (same class -> union)."
+
+[[entry]]
+class    = "canine"
+lang     = "sv"
+mode     = "forms"
+forms    = ["hundar", "valp", "valpar", "vovve", "vovven"]
+cjk      = false
+ambiguous= false
+notes    = "hund/hundar = dog(s) (bare 'hund' shared with de); valp(ar) = puppy; vovve = childspeak 'doggy'."
+
+[[entry]]
+class    = "canine"
+lang     = "da"
+mode     = "forms"
+forms    = ["hunde", "hvalp", "hvalpe", "vovse"]
+cjk      = false
+ambiguous= false
+notes    = "hund/hunde = dog(s) (bare 'hund' shared with de/sv); hvalp(e) = puppy; vovse = childspeak 'doggy'."
+
+[[entry]]
+class    = "canine"
+lang     = "no"
+mode     = "forms"
+forms    = ["hunder", "valper", "valpen", "bisk"]
+cjk      = false
+ambiguous= false
+notes    = "hund/hunder = dog(s), valp(er) = puppy (bare forms shared with sv/da); bisk = colloquial 'doggy/mutt'."
+
+[[entry]]
+class    = "canine"
+lang     = "ru"
+mode     = "forms"
+forms    = ["собака", "собаки", "собачка", "собачки", "пёс", "пес", "щенок", "щенки", "щеночек"]
+cjk      = false
+ambiguous= false
+notes    = "собака = dog; собачка = doggy (diminutive); пёс/пес (with and without ё) = dog (m.); щенок/щенки = puppy/puppies; щеночек = little puppy."
+
+[[entry]]
+class    = "canine"
+lang     = "uk"
+mode     = "forms"
+forms    = ["песик", "цуценя", "цуценята", "собачки"]
+cjk      = false
+ambiguous= false
+notes    = "собака/собаки shared with ru (same class -> union); песик = doggy; цуценя(та) = puppy/puppies."
+
+[[entry]]
+class    = "canine"
+lang     = "pl"
+mode     = "forms"
+forms    = ["piesek", "pieski", "szczeniak", "szczeniaki", "szczenię"]
+cjk      = false
+ambiguous= false
+notes    = "piesek/pieski = doggy; szczeniak/szczenię = puppy. The bare noun rides the ambiguous sibling below."
+
+[[entry]]
+class    = "canine"
+lang     = "pl"
+mode     = "forms"
+forms    = ["pies", "psy"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: pies (plural of pie). Gated so only users who list 'pl' get the bare noun; the diminutives above load unconditionally."
+
+[[entry]]
+class    = "canine"
+lang     = "cs"
+mode     = "forms"
+forms    = ["pejsek", "pejsci", "štěně", "štěňata"]
+cjk      = false
+ambiguous= false
+notes    = "pejsek = doggy (diminutive); štěně/štěňata = puppy/puppies. Bare pes/psi ride the ambiguous sibling below."
+
+[[entry]]
+class    = "canine"
+lang     = "cs"
+mode     = "forms"
+forms    = ["pes", "psi"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English/tech: 'pes' (anatomy) and 'psi' (Greek letter, pressure unit — extremely common in terminals). Gated behind the cs language opt-in."
+
+[[entry]]
+class    = "canine"
+lang     = "tr"
+mode     = "forms"
+forms    = ["köpekler", "yavru köpek", "kuçu"]
+cjk      = false
+ambiguous= false
+notes    = "köpekler = dogs; yavru köpek = puppy (multiword -> forms mode); kuçu (kuçu kuçu) = the doggy-calling word. Bare 'köpek' rides the ambiguous sibling below."
+
+[[entry]]
+class    = "canine"
+lang     = "tr"
+mode     = "forms"
+forms    = ["köpek"]
+cjk      = false
+ambiguous= true
+notes    = "FOLD COLLISION with ordinary English: köpek -> kopek (the Russian currency unit, an English dictionary word). Gated behind the tr language opt-in; köpekler and yavru köpek above load unconditionally."
+
+[[entry]]
+class    = "canine"
+lang     = "id"
+mode     = "forms"
+forms    = ["anak anjing"]
+cjk      = false
+ambiguous= false
+notes    = "anak anjing = puppy ('child dog', multiword -> forms mode). Bare 'anjing' is profanity-claimed (id/ms curse usage) and cross-class precedence keeps it there — the sparkle, not the dog."
+
+[[entry]]
+class    = "canine"
+lang     = "sw"
+mode     = "forms"
+forms    = ["mbwa", "mtoto wa mbwa", "mbwa mdogo"]
+cjk      = false
+ambiguous= false
+notes    = "N-class noun: singular and plural both 'mbwa'. Puppy = 'mtoto wa mbwa' (offspring of dog) or 'mbwa mdogo' (small dog). Multiword -> forms mode, mirroring the sw feline entry."
+
+[[entry]]
+class    = "canine"
+lang     = "ja"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["犬", "いぬ", "イヌ", "子犬", "仔犬", "こいぬ", "わんこ", "ワンコ", "わんちゃん"]
+notes    = "犬 = inu (dog); 子犬/仔犬/こいぬ = puppy; わんこ/ワンコ/わんちゃん = affectionate 'doggy'. Single ideograph 犬 rides the cjk_single_char opt-in like 猫. ROMAJI lives in its own cjk=false entry below, mirroring the ja feline split."
+
+[[entry]]
+class    = "canine"
+lang     = "ja"
+mode     = "forms"
+forms    = ["inu", "koinu", "wanko"]
+cjk      = false
+ambiguous= false
+notes    = "ROMAJI transliterations, mirroring the ja feline romaji entry — the cjk=true entry is matched by maximal run and can never match latin keyboard text. None are ordinary words in another listed language."
+
+[[entry]]
+class    = "canine"
+lang     = "zh"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["狗", "小狗", "狗狗", "幼犬", "小狗狗"]
+notes    = "狗 = dog (single ideograph rides the cjk_single_char opt-in); 小狗 = little dog/puppy; 狗狗 = doggy; 幼犬 = puppy (formal). Same characters in simplified and traditional."
+
+[[entry]]
+class    = "canine"
+lang     = "ko"
+mode     = "forms"
+cjk      = true
+ambiguous= false
+forms    = ["강아지", "멍멍이", "댕댕이", "아기강아지"]
+notes    = "강아지 = puppy (and the everyday affectionate 'dog'); 멍멍이 = doggy (from 멍멍 'woof'); 댕댕이 = internet-speak doggo; 아기강아지 = baby puppy. Bare 개 omitted: single syllable, heavily overloaded ('item/opening' counter, curse prefix 개-)."
+
+[[entry]]
+class    = "canine"
+lang     = "vi"
+mode     = "forms"
+forms    = ["con chó", "chó con", "cún", "cún con"]
+cjk      = false
+ambiguous= false
+notes    = "con chó = 'the dog'; chó con = puppy; cún / cún con = affectionate puppy. Bare 'chó' is deliberately absent: folding strips the tone mark and bare 'cho' is an ordinary English/Vietnamese letter sequence (the pick->pic lesson)."
+
+[[entry]]
+class    = "canine"
+lang     = "hi"
+mode     = "forms"
+forms    = ["कुत्ता", "कुत्ते", "पिल्ला", "पिल्ले", "कुत्ता बच्चा"]
+cjk      = false
+ambiguous= false
+notes    = "कुत्ता/कुत्ते = dog(s); पिल्ला/पिल्ले = puppy/puppies. Devanagari is a spaced script, cjk=false. कुत्ती omitted (doubles as an insult)."
+
+[[entry]]
+class    = "canine"
+lang     = "ar"
+mode     = "forms"
+forms    = ["كلب", "كلاب", "جرو", "جراء"]
+cjk      = false
+ambiguous= false
+notes    = "كلب/كلاب = dog(s); جرو/جراء = puppy/puppies. Best-effort MSA; dialect forms welcome via PR."
+
+[[entry]]
+class    = "canine"
+lang     = "he"
+mode     = "forms"
+forms    = ["כלב", "כלבים", "גור", "גורים", "כלבלב"]
+cjk      = false
+ambiguous= false
+notes    = "כלב/כלבים = dog(s); גור(ים) = puppy/pup(s); כלבלב = doggy (diminutive). כלבה omitted (doubles as an insult)."
+
+[[entry]]
+class    = "canine"
+lang     = "fa"
+mode     = "forms"
+forms    = ["سگ", "توله", "توله سگ", "سگ کوچولو"]
+cjk      = false
+ambiguous= false
+notes    = "سگ = dog; توله / توله سگ = puppy; سگ کوچولو = little doggy. Multiword -> forms mode."
+
+# ===================== group: animal (2026-08-10) =====================
+# The ambient animal-word roster: ordinary English animal nouns, each entry
+# tagged with the species id that names its authored sprite (see
+# crates/aterm-effects/art/animal/ and the Animal collection in
+# word_decorations). EVERY entry rides ambiguous = true by design: these
+# surfaces ARE ordinary English prose, so the live-caret deferral is the
+# mid-typing guard ('bee' inside 'been' never fires) and the fold-collision
+# gate's unambiguous set stays clean; the default languages = ["en"]
+# un-gates them for everyone. Homograph law: profanity > feline > orca >
+# animal, so cat/kitty keep the cat and orca keeps its splash. One surface ->
+# one species, pinned by animal_surface_species_are_unique.
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "monkey"
+forms    = ["monkey", "monkeys"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "camel"
+forms    = ["camel", "camels"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "elephant"
+forms    = ["elephant", "elephants"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["giraffe", "giraffes"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "lion"
+forms    = ["lion", "lions"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "tiger"
+forms    = ["tiger", "tigers"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "bear"
+forms    = ["bear", "bears"]
+cjk      = false
+ambiguous= true
+notes    = "Doubles as the English verb; ambiguous=true caret deferral is the only guard we need — a settled 'bear' showing a bear IS the feature."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "panda"
+forms    = ["panda", "pandas"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "koala"
+forms    = ["koala", "koalas"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "kangaroo"
+forms    = ["kangaroo", "kangaroos"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "zebra"
+forms    = ["zebra", "zebras"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "horse"
+forms    = ["horse", "horses", "pony", "ponies"]
+cjk      = false
+ambiguous= true
+notes    = "The pony rides the horse sprite."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "cow"
+forms    = ["cow", "cows"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "pig"
+forms    = ["pig", "pigs", "piggy"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "sheep"
+forms    = ["sheep", "lamb", "lambs"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "goat"
+forms    = ["goat", "goats"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "donkey"
+forms    = ["donkey", "donkeys"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["rabbit", "rabbits", "bunny", "bunnies"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "mouse"
+forms    = ["mouse", "mice"]
+cjk      = false
+ambiguous= true
+notes    = "Also the pointing device; deliberate — the sprite is friendly either way."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "hamster"
+forms    = ["hamster", "hamsters"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["squirrel", "squirrels"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "hedgehog"
+forms    = ["hedgehog", "hedgehogs"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "fox"
+forms    = ["fox", "foxes"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "wolf"
+forms    = ["wolf", "wolves"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "deer"
+forms    = ["deer"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "moose"
+forms    = ["moose"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "raccoon"
+forms    = ["raccoon", "raccoons"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "otter"
+forms    = ["otter", "otters"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "seal"
+forms    = ["seal", "seals"]
+cjk      = false
+ambiguous= true
+notes    = "Doubles as the English verb/noun; same deliberate call as bear."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "penguin"
+forms    = ["penguin", "penguins"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "owl"
+forms    = ["owl", "owls"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "eagle"
+forms    = ["eagle", "eagles"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "duck"
+forms    = ["duck", "ducks", "duckling", "ducklings"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "chicken"
+forms    = ["chicken", "chickens", "hen", "hens", "rooster", "roosters"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "goose"
+forms    = ["goose", "geese"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "swan"
+forms    = ["swan", "swans"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "parrot"
+forms    = ["parrot", "parrots"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "flamingo"
+forms    = ["flamingo", "flamingos", "flamingoes"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "frog"
+forms    = ["frog", "frogs"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "turtle"
+forms    = ["turtle", "turtles", "tortoise", "tortoises"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "snake"
+forms    = ["snake", "snakes"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "lizard"
+forms    = ["lizard", "lizards", "gecko", "geckos"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["crocodile", "crocodiles", "alligator", "alligators", "croc", "crocs", "gator", "gators"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "shark"
+forms    = ["shark", "sharks"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "whale"
+forms    = ["whale", "whales"]
+cjk      = false
+ambiguous= true
+notes    = "orca stays the orca class's splash (higher rank); the generic whale is this sprite."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "dolphin"
+forms    = ["dolphin", "dolphins"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "fish"
+forms    = ["fish", "fishes"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "octopus"
+forms    = ["octopus", "octopuses"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "crab"
+forms    = ["crab", "crabs"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "lobster"
+forms    = ["lobster", "lobsters"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "jellyfish"
+forms    = ["jellyfish"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "bee"
+forms    = ["bee", "bees", "bumblebee", "bumblebees"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["butterfly", "butterflies"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "ladybug"
+forms    = ["ladybug", "ladybugs", "ladybird", "ladybirds"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "spider"
+forms    = ["spider", "spiders"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "snail"
+forms    = ["snail", "snails"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "bat"
+forms    = ["bat", "bats"]
+cjk      = false
+ambiguous= true
+notes    = "Also the sports bat; same deliberate call as bear."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "gorilla"
+forms    = ["gorilla", "gorillas"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "hippo"
+forms    = ["hippo", "hippos", "hippopotamus"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "rhino"
+forms    = ["rhino", "rhinos", "rhinoceros"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "sloth"
+forms    = ["sloth", "sloths"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "cheetah"
+forms    = ["cheetah", "cheetahs"]
+cjk      = false
+ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["dinosaur", "dinosaurs", "dino", "dinos"]
+cjk      = false
+ambiguous= true
+notes    = "Extinct but non-negotiable with the audience."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "peacock"
+forms    = ["peacock", "peacocks"]
+cjk      = false
+ambiguous= true

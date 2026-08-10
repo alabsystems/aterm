@@ -366,6 +366,17 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "meta -> OK title= user_title= description= icon= cwd= state= (pct-encoded; '-' = unset). `meta set <title|description|icon> <text...>` / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks the OSC title in tab labels; caps: title 120B, description 1024B, icon 64B)",
     ),
+    // `status` is the READ-ONLY Subject+Status record (RFC: Tab Subject &
+    // Status §8) — what a session IS and what it is DOING, classified entirely
+    // locally. Versioned because a later interpretation tier consumes the same
+    // record; there is no write sub-form, so it takes no `escalated_op` entry.
+    v(
+        "status",
+        Read,
+        Status,
+        Session,
+        "status -> OK schema=1 sid= subject= subject_source=pin|osc|cwd|unavailable observed= phase=unknown|starting|idle|running|quiet|exited since_ms= outcome=none|success|failure|signal exit_code= signal= detail= confidence=exact|strong|heuristic|unknown reasons= conflict= revision= enabled= : the session's SUBJECT + classified STATUS (pct-encoded; '-' = unset). Read-only. `observed=false` means never classified, which is NOT `phase=unknown` (classified, no evidence); `subject_source=unavailable` means the terminal lock was contended, never a silent fall to a lower rung. Fields are ADDITIVE and never bump the schema, so reject an unknown schema MAJOR rather than best-effort parsing, and treat an unknown phase/outcome/reason token as unknown rather than an error. `enabled=false` means `tab_status` is off and every phase will read unknown",
+    ),
     v(
         "timeline",
         Read,
@@ -912,6 +923,10 @@ mod tests {
         assert_eq!(framing_of("meta", "@s-a meta unset icon"), Status);
         assert_eq!(framing_of("timeline", "timeline"), Lines);
         assert_eq!(framing_of("timeline", "@s-a timeline 10 since=3"), Lines);
+        // The Subject+Status record is ONE versioned status line, with no
+        // sub-form to change that.
+        assert_eq!(framing_of("status", "status"), Status);
+        assert_eq!(framing_of("status", "@s-a status"), Status);
     }
 
     #[test]

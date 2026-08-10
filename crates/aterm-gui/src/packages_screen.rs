@@ -129,16 +129,12 @@ pub(crate) struct PackagesStatusReport {
     /// pinned root key like any unpinned build. Only a truly solitary binary
     /// (e.g. a copied-out executable) has none.
     pub(crate) available: bool,
-    /// The co-located CLI's OWN posture, mirrored: a root anchor exists (the
-    /// compiled pin, or `ATPKG_ROOTKEY_OVERRIDE` — which the CLI honors) and
-    /// `ATPKG_DISABLE` is unset. False ⇒ the manager is inert by construction.
+    /// The co-located CLI's OWN posture, mirrored: the compiled root anchor is
+    /// present and `ATPKG_DISABLE` is unset. False ⇒ inert by construction.
     pub(crate) manager_enabled: bool,
     /// `ATPKG_DISABLE` was set at collection time — the inert cause is the
     /// user's opt-out, NOT a missing key; the page must say the true reason.
     pub(crate) disabled_by_env: bool,
-    /// The root anchor is `ATPKG_ROOTKEY_OVERRIDE` rather than the compiled
-    /// pin (the CLI's status calls this "root key via ATPKG_ROOTKEY_OVERRIDE").
-    pub(crate) override_root: bool,
     /// The pinned root key's operator-facing fingerprint (the doctor line).
     pub(crate) root_fingerprint: String,
     /// `status.toml` existed and parsed (atpkg has run at least once).
@@ -162,7 +158,6 @@ impl PackagesStatusReport {
             available: false,
             manager_enabled: false,
             disabled_by_env: false,
-            override_root: false,
             root_fingerprint: String::new(),
             recorded: false,
             updated_at: String::new(),
@@ -224,7 +219,6 @@ impl PackagesStatusReport {
             available,
             manager_enabled,
             disabled_by_env: false,
-            override_root: false,
             root_fingerprint,
             recorded: status.is_some(),
             updated_at: status.map(|s| s.updated_at.clone()).unwrap_or_default(),
@@ -300,12 +294,11 @@ fn collect_packages_status_from_layout(
             }
         })
         .unwrap_or_default();
-    // Mirror the CO-LOCATED CLI's own posture, not just the compiled pin:
-    // `ATPKG_ROOTKEY_OVERRIDE` (which the CLI honors as the root anchor) can
-    // enable an unpinned build, and `ATPKG_DISABLE` inerts a pinned one — the
-    // page must report the cause that is actually in force.
+    // Mirror the CO-LOCATED CLI's own posture: `ATPKG_DISABLE` inerts a pinned
+    // build, and the page must report the cause actually in force. There is no
+    // longer any root-key override — the anchor is compiled in, so the pin's
+    // fingerprint is always the live one.
     let disabled_by_env = std::env::var_os("ATPKG_DISABLE").is_some();
-    let override_root = std::env::var("ATPKG_ROOTKEY_OVERRIDE").is_ok_and(|k| !k.is_empty());
     let manager_enabled = atpkg::manager_enabled();
     let mut report = PackagesStatusReport::from_parts(
         available,
@@ -315,7 +308,6 @@ fn collect_packages_status_from_layout(
         &links,
     );
     report.disabled_by_env = disabled_by_env;
-    report.override_root = override_root;
     report.collection_error = collection_error_summary(errors, error_count);
     report
 }
@@ -662,14 +654,9 @@ impl PackagesState {
             available: report.available,
             manager_enabled: report.manager_enabled,
             disabled_by_env: report.disabled_by_env,
-            // Under an override the compiled pin's digest is NOT the live
-            // anchor — say what the CLI's own status says instead of showing
-            // a fingerprint of a key that is not in force.
-            root_fingerprint: if report.override_root {
-                "root key via ATPKG_ROOTKEY_OVERRIDE".to_string()
-            } else {
-                report.root_fingerprint.clone()
-            },
+            // The compiled pin IS the live anchor now, so its fingerprint is
+            // always the honest one to show.
+            root_fingerprint: report.root_fingerprint.clone(),
             recorded: report.recorded,
             updated_at: report.updated_at.clone(),
             outcome: report.outcome.clone(),

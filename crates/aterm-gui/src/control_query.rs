@@ -2188,6 +2188,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
         images: _,           // frame "images" (F1)
+        wallpaper: _, // OMITTED: host-owned backdrop base layer (render bling), not engine cell content
         default_bg: _, // OMITTED: engine-resolved live default-bg for padding, not per-cell content (cells carry their own bg)
         default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content
         cursor_color: _, // frame "cursor.color" (fixed RGB or "default")

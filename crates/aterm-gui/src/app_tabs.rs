@@ -570,7 +570,10 @@ impl App {
                     indicators: crate::tab_model::TabIndicators {
                         dirty: presentation.indicators.dirty,
                         busy: presentation.indicators.busy,
+                        // A native leaf is the OUT-OF-BAND attention owner; it
+                        // has no session and therefore no classified status.
                         attention: presentation.indicators.attention,
+                        status_attention: false,
                     },
                     closable: presentation.closable,
                     tooltip: presentation.tooltip,
@@ -680,10 +683,7 @@ impl App {
             return false;
         }
         // OR across leaves so one pane never hides another (the invariant
-        // `TabIndicators` exists for). A native sibling contributes nothing here
-        // and keeps whatever it wrote out of band: `dirty` and its own
-        // `attention` are preserved, and only bits terminals actually own are
-        // recomputed.
+        // `TabIndicators` exists for).
         let folded = sessions
             .into_iter()
             .map(|session| self.session_status_indicators(session))
@@ -692,27 +692,33 @@ impl App {
                 |acc, bits| crate::tab_model::TabIndicators {
                     dirty: acc.dirty,
                     busy: acc.busy || bits.busy,
-                    attention: acc.attention || bits.attention,
+                    attention: acc.attention,
+                    status_attention: acc.status_attention || bits.status_attention,
                 },
             );
-        let Some(tab) = self
-            .windows
-            .get_mut(&wid)
-            .and_then(|window| {
-                let index = window
-                    .tab_set
-                    .tabs()
-                    .iter()
-                    .position(|tab| tab.id == tab_id)?;
-                window.tab_set.tab_at_mut(index)
-            })
-        else {
+        let Some(tab) = self.windows.get_mut(&wid).and_then(|window| {
+            let index = window
+                .tab_set
+                .tabs()
+                .iter()
+                .position(|tab| tab.id == tab_id)?;
+            window.tab_set.tab_at_mut(index)
+        }) else {
             return false;
         };
+        // The two RECOMPUTED bits are written wholesale; the two bits terminals
+        // do not own pass through untouched. `dirty` means unsaved editor state,
+        // and `attention` belongs to whichever native leaf raised it out of band
+        // (a failed document shutdown, an update announcement) — neither is
+        // derivable from a classifier, and neither may be erased by this pass.
+        // Because `status_attention` is its own field, this can be a plain
+        // assignment: the read-modify-write that used to latch a failure onto
+        // the tab for the process lifetime is simply gone.
         let indicators = crate::tab_model::TabIndicators {
             dirty: tab.presentation.indicators.dirty,
             busy: folded.busy,
-            attention: folded.attention || tab.presentation.indicators.attention,
+            attention: tab.presentation.indicators.attention,
+            status_attention: folded.status_attention,
         };
         let changed = tab.presentation.indicators != indicators;
         tab.presentation.indicators = indicators;
@@ -1452,7 +1458,9 @@ impl App {
                 })
                 .collect()
         };
+        let can_rename = self.can_rename_session(retry_window);
         let input = chrome::SessionChromeInput {
+            can_rename,
             label: label.to_string(),
             icon: meta.presentation_value("icon"),
             description: meta.presentation_value("description"),
@@ -1511,8 +1519,16 @@ impl App {
     /// Full shipping fingerprint: live titles plus canonical icon/dirty/closable
     /// metadata. A save, app-kind change, or close-policy change therefore invalidates
     /// the cached strip even when its visible title stays byte-identical.
+    ///
+    /// It also carries `wid`'s live IN-GRID rename field. That field is painted INTO
+    /// the strip, so unless its text and caret move this number, two independent
+    /// caches swallow every keystroke: the RepaintKey early-out (this value) and the
+    /// painted-row cache (`last_strip_fp`, which keys on this value). A NATIVE edit
+    /// is deliberately absent — AppKit paints that one, and folding it in would
+    /// repaint the in-grid strip for a field that is not on it.
     pub(crate) fn tab_strip_fingerprint_from_parts(
         &self,
+        wid: WindowId,
         titles: &[String],
         metadata: &[crate::tab_bar::TabStripMetadata],
         active: usize,
@@ -1528,6 +1544,12 @@ impl App {
             t.hash(&mut h);
         }
         metadata.hash(&mut h);
+        if let Some(edit) = self.inline_rename_edit(wid) {
+            edit.session.hash(&mut h);
+            edit.tab.hash(&mut h);
+            edit.text.hash(&mut h);
+            edit.cursor.hash(&mut h);
+        }
         // Never collide with the disabled-strip sentinel (0): a real strip always
         // sets at least bit 0, so a zero-hash strip still forces the first repaint.
         h.finish() | 1
@@ -2359,6 +2381,11 @@ impl App {
                 })
                 .collect()
         });
+        // The in-grid twin of the native strip's `sync_rename_overlay`, driven from
+        // the same place for the same reason: this is the one function every
+        // structural tab change funnels through, so it is where an editor notices
+        // its tab is gone.
+        self.reap_stale_rename_edit(wid);
         let titles = self.tab_titles(wid);
         // Composed per-tab chrome (tooltip + context-menu model) rides the same
         // refresh: epoch-cached, so a steady prompt pays one leaf-lock read per
@@ -2481,7 +2508,7 @@ impl App {
             // per-tab meta-lock + term-try-lock + compose round trips.
             let (titles, metadata) = self.refresh_window_tabs(wid);
             let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
-            let fp = self.tab_strip_fingerprint_from_parts(&titles, &metadata, active);
+            let fp = self.tab_strip_fingerprint_from_parts(wid, &titles, &metadata, active);
             let strip_changed = self
                 .windows
                 .get(&wid)
@@ -3350,27 +3377,85 @@ impl App {
     /// open a tab. A click on bare strip background is ignored. The CLOSE of the last
     /// tab signals the window to close via `ws.pending_close` (the mouse handler has
     /// no `ActiveEventLoop`), mirroring Cmd-W. Repaints after any state change.
+    ///
+    /// A SECOND press on the same chip within [`crate::MULTI_CLICK_MS`] opens the
+    /// inline rename editor — the in-grid twin of the macOS strip's
+    /// `event.clickCount() == 2`, which is a service AppKit provides and winit does
+    /// not. The streak lives on `ws.strip_press`, never on the grid's
+    /// `last_press`/`click_count`: sharing those would both take a blocking
+    /// terminal lock on a chrome path and corrupt the grid's word/line selection.
     pub(crate) fn handle_tab_strip_click(&mut self, wid: WindowId, col: u16) {
         let Some(segs) = self.windows.get(&wid).map(|ws| ws.tab_segments.clone()) else {
             return;
         };
         let Some(hit) = tab_bar::hit_test(&segs, col) else {
-            return; // bare strip background
+            // Bare strip background is not a chip, so it breaks the streak — and it
+            // is still "away" from the field.
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+            return;
         };
         match hit {
             // Target the CLICKED window, not the frontmost — Close already does, so
             // Select/NewTab must too (a click on a non-front window's strip must act
             // on THAT window even if focus hasn't transferred yet).
-            tab_bar::TabHit::Select(i) => self.switch_tab_in(wid, i),
-            tab_bar::TabHit::NewTab => self.open_tab_in(wid),
+            tab_bar::TabHit::Select(i) => {
+                let tab = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|ws| ws.tab_set.tabs().get(i))
+                    .map(|tab| tab.id);
+                let now = std::time::Instant::now();
+                let repeat = tab.is_some_and(|tab| {
+                    self.windows.get(&wid).is_some_and(|ws| {
+                        ws.strip_press.is_some_and(|(at, was)| {
+                            was == tab
+                                && now.duration_since(at).as_millis() <= crate::MULTI_CLICK_MS
+                        })
+                    })
+                });
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.strip_press = tab.map(|tab| (now, tab));
+                }
+                // A click on a DIFFERENT chip is a click away and COMMITS, matching
+                // the macOS `Wake::SelectTab` arm and every other exit. A click on
+                // the chip already being edited is not leaving the field.
+                let editing_this = self
+                    .inline_rename_edit(wid)
+                    .map(|edit| edit.tab)
+                    .is_some_and(|edited| Some(edited) == tab);
+                if !editing_this {
+                    self.settle_rename_edit(wid);
+                }
+                match (repeat, tab) {
+                    (true, Some(tab)) => {
+                        self.begin_session_rename(wid, tab);
+                    }
+                    _ => self.switch_tab_in(wid, i),
+                }
+            }
+            tab_bar::TabHit::NewTab => {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
+                self.open_tab_in(wid);
+            }
             // The leading `↻` update alert (off-macOS chrome — menu-adjacent there):
             // ONE CLICK applies the staged build (the owner's "click-upgrade" ask; the
             // old click-to-details flow was the "too many clicking" complaint). With
             // nothing actually staged it falls back to the details overlay — never a
             // blind restart, never a dead click. Details stay reachable via the App
             // menu's "Check for Updates…".
-            tab_bar::TabHit::Update => self.apply_update_or_details(),
+            tab_bar::TabHit::Update => {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
+                self.apply_update_or_details();
+            }
             tab_bar::TabHit::Close(i) => {
+                self.clear_strip_press(wid);
+                // The tab is about to stop existing. Settling FIRST means a name
+                // typed into the chip you then close is kept — the same order the
+                // menu-bar and context-menu Close Tab now follow.
+                self.settle_rename_edit(wid);
                 if self.close_tab_at(wid, i)
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
@@ -3382,6 +3467,28 @@ impl App {
             && let Some(w) = &ws.os_window
         {
             w.request_redraw();
+        }
+    }
+
+    /// Break the strip's double-click streak. Any hit that is not "the same chip
+    /// again" ends it, so a Close/`+`/`↻`/background click between two chip presses
+    /// cannot be counted as a double-click on the chip.
+    pub(crate) fn clear_strip_press(&mut self, wid: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.strip_press = None;
+        }
+    }
+
+    /// Cancel a live edit whose TAB has gone away. The in-grid twin of the macOS
+    /// strip's `sync_rename_overlay`, and never a commit: the user was naming
+    /// something that no longer exists. Without it a background close or a
+    /// `tab close` verb would leave an invisible field owning the keyboard.
+    pub(crate) fn reap_stale_rename_edit(&mut self, wid: WindowId) {
+        let Some(tab) = self.inline_rename_edit(wid).map(|edit| edit.tab) else {
+            return;
+        };
+        if self.tab_index_for_id(wid, tab).is_none() {
+            self.end_session_rename_editor(wid);
         }
     }
 
@@ -5536,6 +5643,153 @@ mod session_chrome_app_tests {
             app.tab_session_id_text(wid, index),
             popped_sid,
             "still the session the menu was popped on"
+        );
+    }
+}
+
+/// THE IN-GRID STRIP'S CLICK STREAK — the service AppKit provides on macOS
+/// (`event.clickCount() == 2`) and winit does not, so off macOS the strip has to
+/// keep its own. These drive `handle_tab_strip_click` against real laid-out
+/// segments, so they pin the mapping from a column to a gesture, not just the FSM.
+#[cfg(test)]
+mod rename_strip_click_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A two-tab window with the in-grid strip painted, so `ws.tab_segments` is
+    /// the real laid-out geometry a click hit-tests against.
+    fn app_with_two_tabs() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.splice_tab_strip(wid);
+        (app, wid)
+    }
+
+    /// A column inside tab `index`'s chip that is not its close `✕`.
+    fn chip_col(app: &App, wid: WindowId, index: usize) -> u16 {
+        let seg = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|seg| seg.kind == tab_bar::TabHit::Select(index))
+            .expect("the tab has a segment");
+        seg.start_col + 1
+    }
+
+    fn pin(app: &App, session: u64) -> Option<String> {
+        app.pool
+            .get(session)?
+            .ctx
+            .meta
+            .lock()
+            .unwrap()
+            .user_title
+            .clone()
+    }
+
+    /// DOUBLE-CLICK OPENS THE EDITOR. One click only switches; the second within
+    /// the multi-click interval opens the inline rename over that chip.
+    #[test]
+    fn a_second_click_on_the_same_chip_opens_the_inline_editor() {
+        let (mut app, wid) = app_with_two_tabs();
+        let col = chip_col(&app, wid, 0);
+
+        app.handle_tab_strip_click(wid, col);
+        assert_eq!(app.windows[&wid].tabs.active, 0, "the first click switches");
+        assert_eq!(app.rename_edit_session(wid), None, "and only switches");
+
+        app.handle_tab_strip_click(wid, col);
+        assert_eq!(
+            app.rename_edit_session(wid),
+            Some(0),
+            "the second click on the SAME chip edits its focused session"
+        );
+    }
+
+    /// The streak is keyed on the STABLE tab, not the column: clicking two
+    /// different chips in quick succession is two single clicks, however close
+    /// together their columns end up after a relayout.
+    #[test]
+    fn two_different_chips_are_never_a_double_click() {
+        let (mut app, wid) = app_with_two_tabs();
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1));
+        assert_eq!(app.rename_edit_session(wid), None);
+        assert_eq!(app.windows[&wid].tabs.active, 1);
+    }
+
+    /// A slow second click is a new gesture, not a double-click.
+    #[test]
+    fn a_stale_press_does_not_complete_a_double_click() {
+        let (mut app, wid) = app_with_two_tabs();
+        let col = chip_col(&app, wid, 0);
+        app.handle_tab_strip_click(wid, col);
+        let stale = Instant::now() - Duration::from_millis(crate::MULTI_CLICK_MS as u64 + 50);
+        let tab = app.windows[&wid].tab_set.tabs()[0].id;
+        app.windows.get_mut(&wid).unwrap().strip_press = Some((stale, tab));
+        app.handle_tab_strip_click(wid, col);
+        assert_eq!(app.rename_edit_session(wid), None);
+    }
+
+    /// CLICKING ANOTHER CHIP IS A CLICK AWAY, and clicking away keeps what you
+    /// typed — the in-grid twin of the macOS `Wake::SelectTab` fix. Clicking the
+    /// chip you are ALREADY editing is not leaving the field, so it keeps editing.
+    #[test]
+    fn selecting_another_chip_commits_while_the_edited_chip_keeps_editing() {
+        let (mut app, wid) = app_with_two_tabs();
+        let tab0 = app.windows[&wid].tab_set.tabs()[0].id;
+        assert!(app.begin_session_rename(wid, tab0));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
+
+        // The chip under the editor: still editing, nothing written.
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
+        assert_eq!(app.rename_edit_session(wid), Some(0), "still editing");
+        assert_eq!(pin(&app, 0), None, "nothing committed yet");
+
+        // A different chip: commit, then switch.
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 1));
+        assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
+        assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
+        assert_eq!(app.windows[&wid].tabs.active, 1, "and the tab switched");
+    }
+
+    /// The `+` is not a chip, so it both breaks the streak and settles the edit.
+    #[test]
+    fn the_new_tab_affordance_settles_the_edit_and_breaks_the_streak() {
+        let (mut app, wid) = app_with_two_tabs();
+        let tab0 = app.windows[&wid].tab_set.tabs()[0].id;
+        let plus = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|seg| seg.kind == tab_bar::TabHit::NewTab)
+            .map(|seg| seg.start_col + 1)
+            .expect("the strip has a + affordance");
+        assert!(app.begin_session_rename(wid, tab0));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
+
+        app.handle_tab_strip_click(wid, plus);
+        assert_eq!(app.rename_edit_session(wid), None);
+        assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
+        assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
+    }
+
+    /// A TAB THAT VANISHES mid-edit cancels — never a commit, because the user was
+    /// naming something that no longer exists. The in-grid twin of the macOS
+    /// strip's `sync_rename_overlay`, driven from the same structural refresh.
+    #[test]
+    fn a_vanished_tab_reaps_the_editor_instead_of_leaving_a_modal() {
+        let (mut app, wid) = app_with_two_tabs();
+        let tab1 = app.windows[&wid].tab_set.tabs()[1].id;
+        assert!(app.begin_session_rename(wid, tab1));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("ghost".into()));
+
+        app.close_tab_at(wid, 1);
+        let _ = app.refresh_window_tabs(wid);
+        assert_eq!(
+            app.rename_edit_session(wid),
+            None,
+            "no invisible field is left owning the keyboard"
         );
     }
 }

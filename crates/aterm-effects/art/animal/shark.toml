@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+id = "shark"
+kind = "head"
+viewbox = [160, 132]
+anchor = { eye_y = 0.48, center_x = 0.5, word_top = 1.0 }
+
+# Shark: grey-blue teardrop head with pointed snout up top, white lower face,
+# triple gill bars on each cheek, wide dark grin with two white tooth triangles.
+
+[[layer]]
+role = "outline"
+ref_fill = "#232D38"
+recolor = "fixed"
+paths = ["M 80 8 C 108 20 134 48 134 82 C 134 108 110 126 80 126 C 50 126 26 108 26 82 C 26 48 52 20 80 8 Z"]
+
+[[layer]]
+role = "coat"
+ref_fill = "#7E95AA"
+recolor = "fixed"
+paths = ["M 80 14 C 105 25.5 130 50.5 130 82 C 130 105.5 108 122 80 122 C 52 122 30 105.5 30 82 C 30 50.5 55 25.5 80 14 Z"]
+
+[[layer]]
+role = "muzzle"
+ref_fill = "#F3F6F8"
+recolor = "fixed"
+paths = ["M 48 99 C 48 88 62.3 79 80 79 C 97.7 79 112 88 112 99 C 112 110 97.7 119 80 119 C 62.3 119 48 110 48 99 Z"]
+
+[[layer]]
+role = "pattern"
+ref_fill = "#435666"
+recolor = "fixed"
+paths = ["M 34 86 C 34 82.1 34.9 79 36 79 C 37.1 79 38 82.1 38 86 C 38 89.9 37.1 93 36 93 C 34.9 93 34 89.9 34 86 Z", "M 41 86 C 41 82.1 41.9 79 43 79 C 44.1 79 45 82.1 45 86 C 45 89.9 44.1 93 43 93 C 41.9 93 41 89.9 41 86 Z", "M 48 86 C 48 82.1 48.9 79 50 79 C 51.1 79 52 82.1 52 86 C 52 89.9 51.1 93 50 93 C 48.9 93 48 89.9 48 86 Z", "M 108 86 C 108 82.1 108.9 79 110 79 C 111.1 79 112 82.1 112 86 C 112 89.9 111.1 93 110 93 C 108.9 93 108 89.9 108 86 Z", "M 115 86 C 115 82.1 115.9 79 117 79 C 118.1 79 119 82.1 119 86 C 119 89.9 118.1 93 117 93 C 115.9 93 115 89.9 115 86 Z", "M 122 86 C 122 82.1 122.9 79 124 79 C 125.1 79 126 82.1 126 86 C 126 89.9 125.1 93 124 93 C 122.9 93 122 89.9 122 86 Z"]
+
+[[layer]]
+role = "eye"
+ref_fill = "#2A2430"
+recolor = "fixed"
+paths = ["M 50 63 C 50 58.9 52.7 55.5 56 55.5 C 59.3 55.5 62 58.9 62 63 C 62 67.1 59.3 70.5 56 70.5 C 52.7 70.5 50 67.1 50 63 Z", "M 98 63 C 98 58.9 100.7 55.5 104 55.5 C 107.3 55.5 110 58.9 110 63 C 110 67.1 107.3 70.5 104 70.5 C 100.7 70.5 98 67.1 98 63 Z"]
+
+[[layer]]
+role = "catch_light"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 55.8 60 C 55.8 58.8 56.8 57.8 58 57.8 C 59.2 57.8 60.2 58.8 60.2 60 C 60.2 61.2 59.2 62.2 58 62.2 C 56.8 62.2 55.8 61.2 55.8 60 Z", "M 103.8 60 C 103.8 58.8 104.8 57.8 106 57.8 C 107.2 57.8 108.2 58.8 108.2 60 C 108.2 61.2 107.2 62.2 106 62.2 C 104.8 62.2 103.8 61.2 103.8 60 Z"]
+
+[[layer]]
+role = "mouth"
+ref_fill = "#26313C"
+recolor = "fixed"
+paths = ["M 54 93 C 68 99 92 99 106 93 C 100 114 60 114 54 93 Z"]
+
+[[layer]]
+role = "detail"
+ref_fill = "#FFFFFF"
+recolor = "fixed"
+paths = ["M 65 98 L 75 98 L 70 106.5 Z", "M 85 98 L 95 98 L 90 106.5 Z"]

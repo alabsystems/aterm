@@ -862,10 +862,10 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
     }
 
     let package_disabled = std::env::var_os("ATPKG_DISABLE").is_some();
-    let package_root_available = std::env::var("ATPKG_ROOTKEY_OVERRIDE")
-        .ok()
-        .is_some_and(|key| !key.is_empty())
-        || !atpkg::PINNED_PKG_ROOTKEY.is_empty();
+    // The compiled anchor is the ONLY anchor. `ATPKG_ROOTKEY_OVERRIDE` used to be
+    // consulted here and could enable an unpinned build; it is gone, because an
+    // environment variable must never decide what is trusted.
+    let package_root_available = !atpkg::PINNED_PKG_ROOTKEY.is_empty();
     warnings.extend(package_capability_warnings(
         config,
         package_disabled,
@@ -962,7 +962,7 @@ fn package_capability_warnings(
     let reason = if disabled {
         Some("$ATPKG_DISABLE is set")
     } else if !root_available {
-        Some("no package verification root is pinned or supplied by $ATPKG_ROOTKEY_OVERRIDE")
+        Some("no package verification root is pinned in this build")
     } else {
         None
     };

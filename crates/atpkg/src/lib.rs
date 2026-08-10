@@ -144,10 +144,7 @@ pub use sourcebuild::{
 /// never in CI (mirroring the Developer-ID identity, `docs/RELEASING.md`). Verbatim
 /// shape of `aterm-update`'s `PINNED_TEAM_ID` idiom (`crates/aterm-update/src/lib.rs`),
 /// expanded inline here so the pin reads atpkg's own build env.
-pub const PINNED_PKG_ROOTKEY: &str = match option_env!("ATERM_PKG_ROOTKEY") {
-    Some(k) => k,
-    None => "",
-};
+pub const PINNED_PKG_ROOTKEY: &str = aterm_update_core::pins::PKG_ROOT_PUBKEY;
 
 /// Whether the manager is configured to act: a root key must be pinned AND the user
 /// must not have opted out via `ATPKG_DISABLE`. Fail closed — an empty pin is never
@@ -158,26 +155,27 @@ pub fn enabled() -> bool {
     !PINNED_PKG_ROOTKEY.is_empty() && std::env::var_os("ATPKG_DISABLE").is_none()
 }
 
-/// Effective CLI posture: a non-empty out-of-band root override is the same
-/// verification anchor the verbs consume, and can therefore enable an
-/// otherwise-unpinned build. This is the shared admission predicate for the
-/// CLI and aterm's native Packages surface.
+/// Effective CLI posture: the compiled root anchor, plus the `ATPKG_DISABLE` kill
+/// switch. This is the shared admission predicate for the CLI and aterm's native
+/// Packages surface.
+///
+/// `ATPKG_ROOTKEY_OVERRIDE` is GONE. It supplied "the same verification anchor the
+/// verbs consume", so an environment variable could ENABLE an otherwise-unpinned
+/// build — i.e. ambient state decided what the package manager trusted. The anchor
+/// now lives in reviewed source ([`aterm_update_core::pins::PKG_ROOT_PUBKEY`]) and
+/// nothing outside a commit can change it. An alternate package owner commits their
+/// own anchor, which is the same deliberate act, visible in a diff.
+///
+/// `ATPKG_DISABLE` stays: turning the manager OFF is fail-safe, and a kill switch
+/// that only ever subtracts authority cannot be used to grant any.
 #[must_use]
 pub fn manager_enabled() -> bool {
-    manager_enabled_with(
-        PINNED_PKG_ROOTKEY,
-        std::env::var("ATPKG_ROOTKEY_OVERRIDE").ok().as_deref(),
-        std::env::var_os("ATPKG_DISABLE").is_some(),
-    )
+    manager_enabled_with(PINNED_PKG_ROOTKEY, std::env::var_os("ATPKG_DISABLE").is_some())
 }
 
 #[must_use]
-pub fn manager_enabled_with(pinned: &str, override_key: Option<&str>, disabled: bool) -> bool {
-    !disabled
-        && !override_key
-            .filter(|key| !key.is_empty())
-            .unwrap_or(pinned)
-            .is_empty()
+pub fn manager_enabled_with(pinned: &str, disabled: bool) -> bool {
+    !disabled && !pinned.is_empty()
 }
 
 /// A short, dependency-free fingerprint of the pinned root key, so `atpkg doctor` can

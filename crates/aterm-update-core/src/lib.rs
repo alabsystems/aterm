@@ -14,7 +14,7 @@
 //! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; the release-tag
 //! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
 //! they cannot disagree about which releases are candidates; and a generic
-//! compile-time-pin idiom ([`compile_time_pin!`] + [`pin_active`]).
+//! trust anchors ([`pins`] — committed constants, never build-environment state).
 //!
 //! `aterm-update` layers the macOS-only pieces (DMG mount/extract, codesign/spctl
 //! verification, the atomic `RENAME_SWAP` bundle exchange + re-exec, the `.app`
@@ -28,6 +28,7 @@
 #![cfg_attr(trust_verify, register_tool(trust))]
 
 pub mod manifest;
+pub mod pins;
 pub mod tag;
 pub mod token;
 
@@ -51,31 +52,6 @@ pub use source::{
 };
 pub use sys::{FileLock, same_volume};
 
-/// Read a compile-time pin from the named build environment variable, or `""` if it
-/// was unset at build time. Generic over the variable name so each consumer pins a
-/// different anchor (e.g. an Apple Team ID). Crucially, `option_env!` expands in the
-/// crate that INVOKES the macro, so the pin reads that crate's OWN build env — not
-/// this crate's — keeping the value identical to an inline `option_env!` const.
-///
-/// An empty pin is the fail-closed default: with no anchor compiled in there is
-/// nothing to trust, so [`pin_active`] reports inactive and the consumer stays inert.
-#[macro_export]
-macro_rules! compile_time_pin {
-    ($v:literal) => {
-        match option_env!($v) {
-            Some(x) => x,
-            None => "",
-        }
-    };
-}
-
-/// Whether a compile-time pin is active: it must be non-empty (an anchor was baked
-/// in at build time) AND the user must not have opted out via `opt_out_env`. Fail
-/// closed — an empty pin is never active.
-#[must_use]
-pub fn pin_active(pin: &str, opt_out_env: &str) -> bool {
-    !pin.is_empty() && std::env::var_os(opt_out_env).is_none()
-}
 
 /// Emit a non-fatal updater warning to the app log. Routed through `aterm_log` (the
 /// global logger `aterm-gui` installs), with the same `aterm-update:` prefix the

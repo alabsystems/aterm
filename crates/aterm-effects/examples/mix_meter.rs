@@ -99,10 +99,7 @@ fn main() {
     ];
 
     println!("MIX METER — {style:?} @ {SR} Hz, Tone::Technical, heat 0.5, pan 0\n");
-    println!(
-        "{:<12} {:>12} {:>12}   {}",
-        "gesture", "@vol 0.40", "@gain 1.0", "vs Typed"
-    );
+    println!("{:<12} {:>12} {:>12}   vs Typed", "gesture", "@vol 0.40", "@gain 1.0");
     println!("{}", "-".repeat(56));
 
     let typed_ref = peak_of(
@@ -128,7 +125,7 @@ fn main() {
     // read at the peak the listener actually meets.
     let riff = peak_of(
         style,
-        SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 4, key: 0 }),
+        SoundGesture::Celebration(CelebrationGesture::riff_bar(4, 0)),
         DEFAULT_VOLUME,
         1.0,
     );
@@ -138,7 +135,7 @@ fn main() {
         db(riff),
         db(peak_of(
             style,
-            SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 4, key: 0 }),
+            SoundGesture::Celebration(CelebrationGesture::riff_bar(4, 0)),
             1.0,
             1.0
         )),
