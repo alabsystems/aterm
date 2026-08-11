@@ -3162,8 +3162,8 @@ impl WordDecorations {
         // never stands ahead of it in open space.
         let mid = i32::from(col) * cw + cw / 2;
         let center = f32::from(GLYPHS[look.variant as usize].center_x) / f32::from(FIXED_ONE);
-        let x = (mid - (center * f32::from(w)).round() as i32)
-            .clamp(0, (grid_w - i32::from(w)).max(0));
+        let x =
+            (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - i32::from(w)).max(0));
         // VERTICAL: the chin slice tucks behind the anchor row exactly like
         // the ambient peek — chin at the row's top edge, body in the rows
         // above. A top row with no room above mirrors DOWN (the ambient
@@ -3717,7 +3717,16 @@ impl WordDecorations {
             tint: 0x00FF_FFFF,
             alpha: pet.alpha,
             flip_x: pet.facing_left,
-            z: FreeZ::OverText,
+            // HIDE-BEHIND-WORDS (wave 4c): while the brain says it is
+            // hiding, the pet drops UNDER the glyphs — the word draws over
+            // the cat's body and stays readable in front of it (the ink
+            // law's under-exception: legibility wins because the TEXT is on
+            // top), with the ears and crown poking above the line.
+            z: if pet.under_ink {
+                FreeZ::UnderText
+            } else {
+                FreeZ::OverText
+            },
             sampler: FreeSampler::Nearest,
         };
 
@@ -4287,7 +4296,10 @@ impl WordDecorations {
         };
         edit_row == row
             && edit_col >= start_col.saturating_sub(TYPED_EDIT_REACH_COLS)
-            && edit_col <= end_col.saturating_add(1).saturating_add(TYPED_EDIT_REACH_COLS)
+            && edit_col
+                <= end_col
+                    .saturating_add(1)
+                    .saturating_add(TYPED_EDIT_REACH_COLS)
     }
 
     /// Whether a live, unspent edit keystroke witnesses THIS pane's scan at
@@ -6168,9 +6180,7 @@ impl WordDecorations {
                     // from the companion's cell — either animal being there is
                     // enough, and neither may mask the other.
                     let vetoed_by = |cell: Option<(u16, u16)>| {
-                        cell.is_some_and(|c| {
-                            caret_on_span(c, occ.row, occ.start_col, occ.end_col)
-                        })
+                        cell.is_some_and(|c| caret_on_span(c, occ.row, occ.start_col, occ.end_col))
                     };
                     if (companion_at.is_some() && claim == Some(occ.ident))
                         || vetoed_by(companion_at)
@@ -8151,8 +8161,7 @@ fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -
     let w_i = i32::from(w);
     let grid_w = i32::from(geom.cols) * cw;
     let mid = (i32::from(occ.start_col) * cw + (i32::from(occ.end_col) + 1) * cw) / 2;
-    let center =
-        f32::from(ANIMAL_GLYPHS[species as usize].center_x) / f32::from(FIXED_ONE);
+    let center = f32::from(ANIMAL_GLYPHS[species as usize].center_x) / f32::from(FIXED_ONE);
     let x = (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - w_i).max(0));
     CatGeom {
         w,
@@ -8324,7 +8333,6 @@ impl CatIdlePose {
         bob_px: 0,
         lead_px: 0,
     };
-
 
     /// `td_ms` is the DWELL-relative clock (zero at the end of the rise), so the
     /// entrance and the exit keep their authored kinematics exactly.
@@ -13129,7 +13137,15 @@ mod tests {
                  PLACE, before anything replaces it"
             );
 
-            wd.rescan(gap, rows, cols, &lex, &c, 2, played_at + Duration::from_millis(16));
+            wd.rescan(
+                gap,
+                rows,
+                cols,
+                &lex,
+                &c,
+                2,
+                played_at + Duration::from_millis(16),
+            );
             assert!(
                 wd.persist[&first.ident].continuity_tainted,
                 "{label}: PRECONDITION — the overwrite must taint the episode, \
@@ -13216,7 +13232,10 @@ mod tests {
         // ONE frame: the cat is on glass and rising, nowhere near done.
         let mid = t0 + Duration::from_millis(60);
         let (free, _, _) = tick_cat(&mut wd, mid, &c, g);
-        assert!(!free.is_empty(), "PRECONDITION: the cat is actually drawing");
+        assert!(
+            !free.is_empty(),
+            "PRECONDITION: the cat is actually drawing"
+        );
         assert!(
             wd.persist[&first.ident].peek_started && !wd.persist[&first.ident].peek_done,
             "PRECONDITION: mid-animation — started, NOT finished"
@@ -14606,7 +14625,8 @@ mod tests {
         // two tiles a frame, so early frames may legitimately emit nothing.
         let mut seen: Vec<(u16, u16, u16)> = Vec::new(); // (y, h, ay)
         for ms in (0..(CAT_RISE_MS + DWELL_QUIET_MS + CAT_DESCEND_MS + 400)).step_by(16) {
-            let (free, _, _) = tick_cat_at(&mut wd, t0 + Duration::from_millis(ms), &c, g, None, true);
+            let (free, _, _) =
+                tick_cat_at(&mut wd, t0 + Duration::from_millis(ms), &c, g, None, true);
             for s in free.iter().filter(|s| matches!(s.z, FreeZ::UnderText)) {
                 seen.push((s.y as u16, s.h, s.ay));
             }
@@ -15594,7 +15614,15 @@ mod tests {
         // Erase it, then let the grace TTL run out with the screen empty: this
         // is a user who cleared, went and did something else, and came back.
         term.process(b"\x1b[2J\x1b[H");
-        wd.rescan(&term, rows, cols, &lex, &c, 2, done_t + Duration::from_millis(16));
+        wd.rescan(
+            &term,
+            rows,
+            cols,
+            &lex,
+            &c,
+            2,
+            done_t + Duration::from_millis(16),
+        );
         let expired_at = done_t + GRACE_TTL + Duration::from_secs(1);
         wd.rescan(&term, rows, cols, &lex, &c, 3, expired_at);
         assert!(
@@ -15729,8 +15757,12 @@ mod tests {
             // fixture's own proof that only the keystroke's PLACE can be
             // separating the verdicts below.
             assert!(
-                wd.last_caret
-                    .is_some_and(|cell| caret_on_span(cell, back.row, back.start_col, back.end_col)),
+                wd.last_caret.is_some_and(|cell| caret_on_span(
+                    cell,
+                    back.row,
+                    back.start_col,
+                    back.end_col
+                )),
                 "{label}: PRECONDITION — the caret really is parked on the word \
                  in the restored frame, in BOTH arms (got {:?})",
                 wd.last_caret
@@ -15932,7 +15964,15 @@ mod tests {
         // The single-pane renderer takes over pane 1's grid, and the user has
         // moved the caret since.
         survivor.process(b"\r\n\r\nkitty");
-        wd.rescan(&survivor, rows, cols, &lex, &c, 2, t0 + Duration::from_millis(16));
+        wd.rescan(
+            &survivor,
+            rows,
+            cols,
+            &lex,
+            &c,
+            2,
+            t0 + Duration::from_millis(16),
+        );
         let live_caret = wd.last_caret.expect("the single-pane rescan re-stamped it");
         assert_ne!(
             live_caret, parked_caret,
@@ -16765,7 +16805,10 @@ mod tests {
         let a = sample(&mut still, &rc, 900);
         let b = sample(&mut still, &rc, 1900);
         assert!(a.is_some(), "the reduced-motion cat is still shown");
-        assert_eq!(a, b, "reduced motion holds the settled pose perfectly still");
+        assert_eq!(
+            a, b,
+            "reduced motion holds the settled pose perfectly still"
+        );
     }
 
     /// §5.6 kitten build: 1.3× overshoot + the 2 px landing bounce (dest-rect
@@ -18079,8 +18122,9 @@ mod tests {
         // The first overlapping flash occupies t0, so the episode under test
         // receives a delayed t1 slot.
         assert_eq!(reserve_overlapping(&mut wd, blocker, t0), t0);
-        let original_start = grant_ignition(&mut wd.ignitions, None, old_owner, t0, (100, 100), 88.0)
-            .expect("live target fits structural cap");
+        let original_start =
+            grant_ignition(&mut wd.ignitions, None, old_owner, t0, (100, 100), 88.0)
+                .expect("live target fits structural cap");
         assert_eq!(original_start, t1);
         wd.persist
             .get_mut(&old_owner)
@@ -19422,7 +19466,15 @@ mod tests {
             // KEYSTROKE-REAL: each char is a committed key, which is what the
             // typed witness now requires on top of the caret's position.
             wd.note_typed_edit(at(100 * (i as u64 + 1)), None);
-            wd.rescan(&term, 4, 40, &lexicon, &c, i as u64 + 1, at(100 * (i as u64 + 1)));
+            wd.rescan(
+                &term,
+                4,
+                40,
+                &lexicon,
+                &c,
+                i as u64 + 1,
+                at(100 * (i as u64 + 1)),
+            );
         }
         assert_eq!(wd.combo_births.len(), 2);
         wd.hard_reset();
@@ -19501,7 +19553,15 @@ mod tests {
             // KEYSTROKE-REAL: each char is a committed key, which is what the
             // typed witness now requires on top of the caret's position.
             wd.note_typed_edit(at(60 * (i as u64 + 1)), None);
-            wd.rescan(&term, 20, 40, &lexicon, &c, i as u64 + 1, at(60 * (i as u64 + 1)));
+            wd.rescan(
+                &term,
+                20,
+                40,
+                &lexicon,
+                &c,
+                i as u64 + 1,
+                at(60 * (i as u64 + 1)),
+            );
         }
         let ep5 = &wd.persist[&wd.occ[4].ident];
         assert_eq!(ep5.burst_tier, supernova::SuperTier::Nuke);
@@ -19658,8 +19718,8 @@ mod tests {
         tick_nova(&mut wd, t0, &c, g, None, None);
         let a_fuck = wd.occ[0].ident;
         assert_eq!(wd.persist[&a_fuck].nova_start, Some(t0), "pane A granted");
-        let a_win = supernova::total_ms(wd.persist[&a_fuck].burst_tier)
-            .max(supernova::SUPER_TOTAL_MS);
+        let a_win =
+            supernova::total_ms(wd.persist[&a_fuck].burst_tier).max(supernova::SUPER_TOTAL_MS);
         // Park A mid-window; bind B at a disjoint px origin (the limiter
         // admits disjoint regions — only the MUTEX can serialize this).
         wd.bind_pane(2, (400, 0));
@@ -21241,7 +21301,12 @@ mod tests {
 
         let mut vetoed = WordDecorations::default();
         vetoed.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        vetoed.summon_cameo(t0, (occ.row, occ.end_col + 1), KittyLook::for_session(3), None);
+        vetoed.summon_cameo(
+            t0,
+            (occ.row, occ.end_col + 1),
+            KittyLook::for_session(3),
+            None,
+        );
         let (vetoed_free, _, _) = tick_cat(&mut vetoed, sample, &c, g);
         assert!(
             vetoed_free.is_empty(),

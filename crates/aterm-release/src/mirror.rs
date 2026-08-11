@@ -53,9 +53,6 @@ pub const CHANNEL_TABLE: &str = "[workspace.metadata.aterm]";
 /// The key inside [`CHANNEL_TABLE`] naming the public update channel.
 pub const CHANNEL_KEY: &str = "update_channel";
 
-/// The key inside [`CHANNEL_TABLE`] committing the channel to one
-/// release-signing public key.
-
 /// `OWNER/REPO` of the public update channel, from `[workspace.metadata.aterm]
 /// update_channel` in the WORKSPACE manifest.
 ///

@@ -17,8 +17,20 @@
 //!   cargo run -p aterm-effects --example typing_voice_ab [-- <out_dir>]
 //!   afplay target/typing-voice-ab/a-neutral.wav
 //!
+//! It also benches the GESTURE FAMILY (`trail_sound`'s `gesture_shape` law):
+//! each of Typed / Backspace / Glide± / Sweep± is rendered in ISOLATION from
+//! the same melody state and reported by first-note pitch, travel in
+//! semitones, note count, timbre (centroid, energy over 2 kHz) and CREST — so
+//! "a deletion is a keystroke inverted" and "a word motion is a character
+//! motion at scale" are measurements rather than intentions. (The note COUNT
+//! on a word run reads ±1: its notes overlap heavily, and the beat between a
+//! pulse and its own sub-octave can clear the refractory. TRAVEL is the exact
+//! scale measurement; the note count is a sanity check.)
+//!
 //! Scenarios:
 //! - `a-neutral`     — no celebration: the untransposed typed melody.
+//! - `f-family`      — a word typed, corrected, and word-motioned over: the
+//!   whole edit vocabulary in one audible pass.
 //! - `b-after-song-` — a song, then SILENCE, then typing: the key is handed
 //!   back by `is_quiet()`, so this must equal `a-neutral` note for note.
 //! - `d-leak-`       — a song, then typing at 6-8 cps: the gaps between
@@ -216,6 +228,62 @@ fn scenario_during_song(ch: char) -> Scenario {
     }
 }
 
+/// THE EDIT VOCABULARY in one pass: type a word, walk back over it with word
+/// motions, correct it with backspaces, type again. This is the scenario the
+/// one-family rule exists for — the four gestures are heard against each other
+/// rather than one at a time.
+fn scenario_family() -> Scenario {
+    let mut cues: Vec<Cue> = Vec::new();
+    let mut t = 0.5f32;
+    let typed = |cues: &mut Vec<Cue>, t: &mut f32, n: usize, pan: f32| {
+        for _ in 0..n {
+            cues.push((*t, SoundGesture::Trail(SoundKind::Typed), pan, 0.45));
+            *t += 0.13;
+        }
+    };
+    typed(&mut cues, &mut t, 7, -0.4);
+    t += 0.35;
+    // Back over the word, then forward again — the WORD motions.
+    cues.push((
+        t,
+        SoundGesture::Trail(SoundKind::Sweep { dir: -1 }),
+        0.0,
+        0.4,
+    ));
+    t += 0.6;
+    cues.push((
+        t,
+        SoundGesture::Trail(SoundKind::Sweep { dir: 1 }),
+        0.2,
+        0.4,
+    ));
+    t += 0.6;
+    // A character motion, for the scale comparison.
+    cues.push((
+        t,
+        SoundGesture::Trail(SoundKind::Glide { dir: -1 }),
+        0.1,
+        0.4,
+    ));
+    t += 0.35;
+    // The correction: four deletions, then the word again.
+    for _ in 0..4 {
+        cues.push((t, SoundGesture::Trail(SoundKind::Backspace), 0.1, 0.5));
+        t += 0.16;
+    }
+    t += 0.3;
+    typed(&mut cues, &mut t, 6, 0.5);
+    t += 0.4;
+    cues.push((t, SoundGesture::Trail(SoundKind::Jump), -0.9, 0.5));
+    Scenario {
+        name: "f-family".into(),
+        cues,
+        window: (0.3, t + 0.6),
+        seconds: t + 1.6,
+        isolate_typing: false,
+    }
+}
+
 fn render_cues(cues: &[Cue], seconds: f32) -> Vec<f32> {
     let sc = Scenario {
         name: String::new(),
@@ -254,7 +322,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
         let n = 256.min(frames - f);
         let t = f as f32 / SR as f32;
         while cue_i < sc.cues.len() && sc.cues[cue_i].0 <= t {
-            let (ct, kind, pan, heat) = sc.cues[cue_i].clone();
+            let (ct, kind, pan, heat) = sc.cues[cue_i];
             synth.push(SoundEvent {
                 style: GlowStyle::RainbowKitty,
                 voice: SoundVoice::Style,
@@ -566,6 +634,159 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE GESTURE-FAMILY PROBE — each gesture alone, from one melody state
+// ---------------------------------------------------------------------------
+
+/// Render ONE gesture in isolation after a single settling keystroke, so every
+/// probe starts from the same melody state (same phrase, same degree) and the
+/// pitches are directly comparable.
+fn probe(kind: SoundGesture) -> Vec<f32> {
+    let mut synth = TrailSynth::new(SR as f32, SEED);
+    let ev = |kind| SoundEvent {
+        style: GlowStyle::RainbowKitty,
+        voice: SoundVoice::Style,
+        kind,
+        pan: 0.0,
+        heat: 0.5,
+        hue: 0.0,
+        gain: 0.4,
+        tone: Tone::Technical,
+        bed: false,
+    };
+    // One keystroke settles the phrase generator out of its opening cadence.
+    synth.push(ev(SoundGesture::Trail(SoundKind::Typed)));
+    // ~340 ms — long enough for the settling note to die completely (so its
+    // tail is not read as the probe's first onset) and short enough to stay
+    // inside `PHRASE_PAUSE_S`, so every probe plays in the same phrase.
+    let mut warm = vec![0.0f32; 16_384 * CHANNELS];
+    synth.render(&mut warm);
+    synth.push(ev(kind));
+    let frames = SR as usize; // 1 s — longer than any family gesture
+    let mut stereo = vec![0.0f32; frames * CHANNELS];
+    synth.render(&mut stereo);
+    (0..frames)
+        .map(|i| 0.5 * (stereo[i * 2] + stereo[i * 2 + 1]))
+        .collect()
+}
+
+struct FamilyRow {
+    name: String,
+    notes: usize,
+    first_hz: f64,
+    last_hz: f64,
+    /// Travel from first note to last, in semitones (the gesture's SCALE).
+    travel_st: f64,
+    /// Offset of the first note from the reference keystroke, in semitones
+    /// (the gesture's DIRECTION).
+    offset_st: f64,
+    centroid_hz: f64,
+    hi_frac: f64,
+    peak_db: f64,
+    crest_db: f64,
+}
+
+/// Notes inside a gesture are never closer than [`CURSOR_SWEEP_STEP_S`]
+/// (55 ms), so a 50 ms refractory turns the envelope-ripple of a pulse wave
+/// beating against its own sub-octave into the single onset it really is.
+const REFRACTORY: usize = SR as usize / 20;
+
+/// The family's contour BEND settles over ~12 ms; anchoring the pitch window
+/// 25 ms past the onset measures the note the gesture LANDS on rather than the
+/// scoop it arrives through.
+const SETTLE: usize = SR as usize / 40;
+
+/// Onsets of the NOTES inside one gesture. `onsets` uses a 1.3 ms max-envelope,
+/// which is the right resolution for a 6-8 cps typing stream but reads the
+/// ~200 Hz beat between a pulse and its own sub-octave as a stream of false
+/// attacks inside a single note. Here the envelope is a 5.3 ms RMS (the beat
+/// averages out) with a 40 ms refractory — still well under the
+/// `CURSOR_SWEEP_STEP_S` spacing that separates a run's real notes.
+fn note_onsets(x: &[f32]) -> Vec<usize> {
+    const W: usize = 256;
+    let env: Vec<f32> = x
+        .chunks(W)
+        .map(|c| (c.iter().map(|v| v * v).sum::<f32>() / c.len() as f32).sqrt())
+        .collect();
+    let peak = env.iter().fold(0.0f32, |m, &v| m.max(v));
+    // RISE detection, not threshold crossing: the notes of a word-scale run
+    // are 55 ms apart under a 180 ms decay, so they never fall back to a floor
+    // between attacks — only the derivative separates them.
+    let mut out: Vec<usize> = Vec::new();
+    for i in 0..env.len() {
+        if env[i] <= peak * 0.15 {
+            continue;
+        }
+        // The FIRST audible window is an onset by definition (its attack is
+        // shorter than one window, so there is no rise to see); after that a
+        // note announces itself by a rise over the decay it lands on.
+        let rise = i == 0 || env[i] > env[i - 1] * 1.3;
+        if !rise {
+            continue;
+        }
+        let at = i * W;
+        if out.is_empty() || out.last().is_some_and(|&p| at >= p + REFRACTORY) {
+            out.push(at);
+        }
+    }
+    out
+}
+
+fn family_row(name: &str, x: &[f32], reference_hz: f64) -> FamilyRow {
+    let w = hann();
+    let ons = note_onsets(x);
+    let hzs: Vec<f64> = ons
+        .iter()
+        .filter(|&&s| s + SETTLE + FFT_N < x.len())
+        .map(|&s| f64::from(peak_hz(&mag_at(x, s + SETTLE, &w), 120.0, 6000.0)))
+        .collect();
+    let first = hzs.first().copied().unwrap_or(0.0);
+    let last = hzs.last().copied().unwrap_or(0.0);
+    // Score the gesture's OWN BODY — first onset to 200 ms past the last, so a
+    // four-note run and a single note are each measured over themselves and
+    // the crest figure isn't inflated by trailing silence.
+    let from = ons.first().copied().unwrap_or(0);
+    let to = (ons.last().copied().unwrap_or(0) + SR as usize / 5).min(x.len());
+    let seg = &x[from..to];
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    let mut hi_e = 0.0f64;
+    let hz_per_bin = f64::from(SR) / FFT_N as f64;
+    let mut s = from;
+    while s + FFT_N <= to {
+        for (k, &m) in mag_at(x, s, &w).iter().enumerate() {
+            let e = f64::from(m) * f64::from(m);
+            num += e * k as f64 * hz_per_bin;
+            den += e;
+            if k as f64 * hz_per_bin > 2000.0 {
+                hi_e += e;
+            }
+        }
+        s += FFT_N / 2;
+    }
+    let peak = 20.0 * f64::from(seg.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6)).log10();
+    FamilyRow {
+        name: name.into(),
+        notes: hzs.len(),
+        first_hz: first,
+        last_hz: last,
+        travel_st: if first > 0.0 {
+            12.0 * (last / first).log2()
+        } else {
+            0.0
+        },
+        offset_st: if first > 0.0 && reference_hz > 0.0 {
+            12.0 * (first / reference_hz).log2()
+        } else {
+            0.0
+        },
+        centroid_hz: if den < 1e-12 { 0.0 } else { num / den },
+        hi_frac: if den < 1e-12 { 0.0 } else { hi_e / den },
+        peak_db: peak,
+        crest_db: peak - rms_db(seg),
+    }
+}
+
 fn wav_bytes(mono: &[f32]) -> Vec<u8> {
     let data_len = (mono.len() * 4) as u32;
     let mut w = Vec::with_capacity(44 + data_len as usize);
@@ -593,7 +814,7 @@ fn main() {
         .map_or_else(|| PathBuf::from("target/typing-voice-ab"), PathBuf::from);
     std::fs::create_dir_all(&out).expect("out dir");
 
-    let mut scenarios = vec![scenario_neutral()];
+    let mut scenarios = vec![scenario_neutral(), scenario_family()];
     // Real held keys, spanning the root/mode classes the mixer produces.
     for ch in ['a', 'e', 'k', 'o', 'z', ' '] {
         scenarios.push(scenario_after_song(ch));
@@ -672,9 +893,68 @@ fn main() {
             .collect();
         println!("  {:<22} {}", r.name, cells.join("  "));
     }
-    println!("\npeak dBFS");
+    println!("\npeak dBFS / CREST dB (peak − rms: how much of the level is transient)");
     for r in &reports {
-        println!("  {:<22} {:>7.2}", r.name, r.peak_db);
+        println!(
+            "  {:<22} {:>7.2} {:>8.2}",
+            r.name,
+            r.peak_db,
+            r.peak_db - r.rms_db
+        );
+    }
+
+    // THE GESTURE FAMILY, each gesture alone from one melody state.
+    println!(
+        "\nGESTURE FAMILY — one rule (gesture_shape: dir signs the offset+bend, \
+         scale sets the notes), measured\n{:<12} {:>5} {:>9} {:>9} {:>9} {:>9} \
+         {:>8} {:>7} {:>8} {:>8}",
+        "gesture",
+        "notes",
+        "first Hz",
+        "last Hz",
+        "travel st",
+        "offset st",
+        "cent Hz",
+        "hi>2k",
+        "peak dB",
+        "crest dB"
+    );
+    let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed));
+    let reference = family_row("Typed", &typed_probe, 0.0).first_hz;
+    let family: [(&str, SoundGesture); 6] = [
+        ("Typed", SoundGesture::Trail(SoundKind::Typed)),
+        ("Backspace", SoundGesture::Trail(SoundKind::Backspace)),
+        ("Glide +", SoundGesture::Trail(SoundKind::Glide { dir: 1 })),
+        ("Glide -", SoundGesture::Trail(SoundKind::Glide { dir: -1 })),
+        ("Sweep +", SoundGesture::Trail(SoundKind::Sweep { dir: 1 })),
+        ("Sweep -", SoundGesture::Trail(SoundKind::Sweep { dir: -1 })),
+    ];
+    for (name, g) in family {
+        let x = probe(g);
+        std::fs::write(
+            out.join(format!(
+                "g-{}.wav",
+                name.replace(' ', "")
+                    .replace('+', "fwd")
+                    .replace('-', "back")
+            )),
+            wav_bytes(&x),
+        )
+        .expect("wav");
+        let r = family_row(name, &x, reference);
+        println!(
+            "{:<12} {:>5} {:>9.1} {:>9.1} {:>9.2} {:>9.2} {:>8.0} {:>7.3} {:>8.2} {:>8.2}",
+            r.name,
+            r.notes,
+            r.first_hz,
+            r.last_hz,
+            r.travel_st,
+            r.offset_st,
+            r.centroid_hz,
+            r.hi_frac,
+            r.peak_db,
+            r.crest_db
+        );
     }
 
     // Machine-readable, for the next agent.

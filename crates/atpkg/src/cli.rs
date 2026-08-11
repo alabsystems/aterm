@@ -50,7 +50,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("install") => return cmd_install(args.get(1)),
         Some("seed") => return cmd_seed(&args[1..]),
         Some("update") => return cmd_update(args.get(1)),
-        Some("sync") => return cmd_sync(),
         Some("rollback") => return cmd_rollback(args.get(1)),
         Some("pin") => return cmd_pin(args.get(1), true),
         Some("unpin") => return cmd_pin(args.get(1), false),
@@ -112,7 +111,6 @@ fn verb_mutates_store(verb: &str) -> bool {
         "install"
             | "seed"
             | "update"
-            | "sync"
             | "rollback"
             | "uninstall"
             | "gc"
@@ -1697,17 +1695,6 @@ fn default_link_bins(program: &str) -> Vec<std::path::PathBuf> {
     ))]
 }
 
-/// `atpkg sync` — the whole-CHANNEL coherence-group update (§7/§11). Identical wiring to
-/// `atpkg update` (no arg): [`crate::apply_channel`] over the config-resolved
-/// `[packages].channel` (default `stable`) with the SAME
-/// fetcher selection ([`resolve_fetcher`], honoring `ATPKG_REGISTRY=dir:`), the SAME durable
-/// floor read + record, the SAME [`report_channel_apply`] surfacing, and the SAME
-/// GC-after-activate + shell-hook refresh at the CLI edge. Exposed as its own verb so
-/// `aterm pkg sync` reads as "make my whole toolchain coherent with the channel"; the
-/// out-of-band root override applies transparently (both route through [`effective_root_key`]).
-fn cmd_sync() -> ExitCode {
-    cmd_update_all()
-}
 
 /// `atpkg update <program>` — update ONE program (§11 tuple-split fix). A coherence-GROUP
 /// member is routed through the transactional [`crate::flow::apply_program`] so its whole
@@ -2206,7 +2193,6 @@ mod tests {
             "install",
             "seed",
             "update",
-            "sync",
             "rollback",
             "uninstall",
             "gc",
@@ -2265,16 +2251,24 @@ mod tests {
     /// setting the old variable must change nothing.
     #[test]
     fn no_environment_variable_can_supply_the_verification_anchor() {
-        // SAFETY: single-threaded test process; the point is that the value is
-        // ignored, so no other thread can observe a meaningful difference.
-        unsafe { std::env::set_var("ATPKG_ROOTKEY_OVERRIDE", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=") };
+        // NO `set_var` HERE, deliberately. The claim is that the anchor is a
+        // COMPILED constant and the variable is not consulted at all — and
+        // `effective_root_key` reads no environment, which is the property
+        // under test. Mutating the process-global environment to demonstrate
+        // that would race every other test in this binary (cargo runs them on
+        // threads) to prove something the source already settles, and the lint
+        // that flags it is right.
         assert_eq!(
             effective_root_key(),
             crate::PINNED_PKG_ROOTKEY,
-            "the committed anchor is the only anchor; the env var must be inert"
+            "the committed anchor is the only anchor"
         );
-        unsafe { std::env::remove_var("ATPKG_ROOTKEY_OVERRIDE") };
-        assert_eq!(effective_root_key(), crate::PINNED_PKG_ROOTKEY);
+        // NON-VACUITY: the reader must contain no env lookup at all, so this
+        // cannot pass by the variable merely being unset in this process.
+        assert!(
+            !include_str!("cli.rs").contains("ATPKG_ROOTKEY_OVERRIDE\""),
+            "no env-var lookup may reach the anchor"
+        );
     }
 
     /// Enablement follows the COMPILED anchor and the opt-out, and nothing else.
@@ -2287,7 +2281,7 @@ mod tests {
         // at runtime, so this state can only be changed by a commit.
         assert!(!crate::manager_enabled_with("", false));
         // A compiled anchor ⇒ enabled.
-        assert!(crate::manager_enabled_with("PINNED_KEY", true) == false);
+        assert!(!crate::manager_enabled_with("PINNED_KEY", true));
         assert!(crate::manager_enabled_with("PINNED_KEY", false));
         // The opt-out wins even with a valid anchor present.
         assert!(!crate::manager_enabled_with("PINNED_KEY", true));

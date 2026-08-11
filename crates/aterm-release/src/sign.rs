@@ -3,10 +3,8 @@
 
 //! Signing (release spec §6 `sign.rs`, absorbing notarize.sh): inside-out
 //! codesign. Default is ad-hoc (`--sign -`) — the shipped tier, unchanged. If
-//! `~/.aterm/release.conf` exists (KEY=value parsed in-process, NEVER
-//! shell-sourced; refused unless owner-only-writable + owned — the ported
-//! release-conf.sh stat checks) and sets `ATERM_SIGN_ID`, the dormant Dev-ID
-//! hook runs nested-first with hardened runtime + entitlements, signs the DMG,
+//! a Developer-ID identity is supplied, the dormant Dev-ID hook runs
+//! nested-first with hardened runtime + entitlements, signs the DMG,
 //! and drives `notarytool submit --wait` + staple + spctl — keeping the old
 //! refusal preflights (reject ad-hoc identity, require hardened runtime). The
 //! hook adds zero steps to the default path.
@@ -23,147 +21,137 @@
 //!     runtime preflights (pure, fixture-tested in tests/signconf.rs), submit
 //!     --wait, staple, validate, spctl assessment.
 
+use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
-// ~/.aterm/release.conf — in-process KEY=value parsing (spec decision 10)
+// Release credentials — ONE profile file, named by ONE explicit flag
 // ---------------------------------------------------------------------------
 
-/// The owner's per-machine release credentials, parsed from
-/// `~/.aterm/release.conf`. Keys of record (docs/RELEASING.md):
-/// ATERM_UPDATE_PUBKEY, ATERM_UPDATE_SIGN_KEY, ATERM_PKG_ROOTKEY,
-/// ATERM_SIGN_ID, ATERM_TEAM_ID / ATERM_EXPECTED_TEAM_ID,
-/// ATERM_NOTARY_PROFILE, ATERM_APPLE_ID, ATERM_APP_PASSWORD. Unknown keys are
-/// carried (they may feed future tiers) but only ever exported by name — the
-/// file can no longer execute anything.
-#[derive(Debug)]
-pub struct ReleaseConf {
-    /// Ordered (later assignment to the same key wins, like the shell source).
-    vars: Vec<(String, String)>,
+/// The owner's signing material, loaded from the path given to
+/// `cargo ship cut --release-credentials <path>`.
+///
+/// This replaces the per-machine `~/.aterm/release.conf`. That file was AMBIENT:
+/// present or absent, invisible either way, and discovered only at the moment of
+/// failure — a full cut could clear every gate and then die because a file nobody
+/// mentioned was missing. A flag is present or absent in the command you ran, so
+/// "what signed this?" is answered by reading it.
+///
+/// The profile carries ONLY the Ed25519 signing key. It deliberately does not carry
+/// Apple credentials: `pins::APPLE_TEAM_ID` is empty, aterm ships ad-hoc signed, and
+/// there is no configured Developer-ID path to preserve. Turning Tier APPLE on is a
+/// reviewed change that adds the anchor AND the credentials together.
+///
+/// ```toml
+/// signing_key = "<base64 PKCS#8 Ed25519 private key>"
+/// ```
+///
+/// Base64 is required, not incidental: `atpkg-keys keygen` writes BINARY PKCS#8, so a
+/// raw paste into TOML cannot round-trip. The loader says so rather than failing with
+/// a parse error nobody can act on.
+#[derive(Clone)]
+pub struct ReleaseCredentials {
+    /// Raw PKCS#8 bytes. Never logged, never journaled, never serialized.
+    pkcs8: Vec<u8>,
+    /// The derived public identity — the only part that is ever recorded.
+    pubkey_b64: String,
 }
 
-impl ReleaseConf {
-    /// Last assignment wins — matches sourcing the file into a shell.
-    pub fn get(&self, key: &str) -> Option<&str> {
-        self.vars
-            .iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
+impl std::fmt::Debug for ReleaseCredentials {
+    /// Hand-written so the private key can never reach a log through a derive.
+    /// Only the public identity is printable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReleaseCredentials")
+            .field("pubkey", &self.pubkey_b64)
+            .field("pkcs8", &"<redacted>")
+            .finish()
     }
+}
 
-    /// The Developer-ID signing identity, when the owner configured one.
-    pub fn sign_id(&self) -> Option<&str> {
-        self.get("ATERM_SIGN_ID").filter(|s| !s.is_empty())
-    }
-
-    /// The compile-time pins the conf must deliver into child cargo env
-    /// (spec §6): updater Tier SIG pubkey, atpkg trust-root pubkey, and the
-    /// Apple Team ID pin — read by `option_env!` in aterm-update / atpkg, so
-    /// they must be present in the BUILD's environment, not just at signing.
-    pub fn env_pins(&self) -> Vec<(String, String)> {
-        [
-            "ATERM_PKG_ROOTKEY",
-            "ATERM_UPDATE_PUBKEY",
-            "ATERM_EXPECTED_TEAM_ID",
-        ]
-        .iter()
-        // EMPTY assignments are dropped, not exported: a stale `KEY=` line
-        // would otherwise pin the empty string into the cargo child env and
-        // OVERRIDE a non-empty value the operator has exported — baking an
-        // inert client while the cut's own gates pass under the env key
-        // (adversarial review 2026-07-30). An absent pin and an empty pin mean
-        // the same thing (inert); only a real value is worth exporting.
-        .filter_map(|k| {
-            self.get(k)
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-                .map(|v| (k.to_string(), v.to_string()))
-        })
-        .collect()
-    }
-
-    /// notarytool credentials, keychain profile tried first (notarize.sh's
-    /// precedence). None ⇒ signing may still happen, notarization is skipped
-    /// by the caller with a clear message.
-    pub fn notary_auth(&self) -> Option<NotaryAuth> {
-        if let Some(profile) = self.get("ATERM_NOTARY_PROFILE").filter(|s| !s.is_empty()) {
-            return Some(NotaryAuth::KeychainProfile(profile.to_string()));
+impl ReleaseCredentials {
+    /// Load and validate the profile at `path`.
+    ///
+    /// Enforces the ownership rule `release.conf` had — owner-only, no group/other
+    /// write — because the file still holds a private key, and derives the public
+    /// identity IN-PROCESS. The old path shelled out to `atpkg-keys pubkey`, which
+    /// meant a release could not be cut without a second binary built and on disk.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            check_credentials_perms(meta.uid(), meta.mode(), current_uid()?, path)?;
         }
-        match (
-            self.get("ATERM_APPLE_ID").filter(|s| !s.is_empty()),
-            self.get("ATERM_TEAM_ID").filter(|s| !s.is_empty()),
-            self.get("ATERM_APP_PASSWORD").filter(|s| !s.is_empty()),
-        ) {
-            (Some(id), Some(team), Some(pw)) => Some(NotaryAuth::AppleId {
-                apple_id: id.to_string(),
-                team_id: team.to_string(),
-                password: pw.to_string(),
-            }),
-            _ => None,
+        let text = std::fs::read_to_string(path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        let encoded = credentials_signing_key(&text)?;
+        let pkcs8 = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|_| {
+                format!(
+                    "{}: signing_key is not valid base64. `atpkg-keys keygen` writes BINARY \
+                     PKCS#8 — base64-encode those bytes rather than pasting them",
+                    path.display()
+                )
+            })?;
+        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|_| format!("{}: signing_key is not a PKCS#8 Ed25519 key", path.display()))?;
+        let pubkey_b64 = {
+            use ring::signature::KeyPair as _;
+            base64::engine::general_purpose::STANDARD.encode(keypair.public_key().as_ref())
+        };
+        Ok(Self { pkcs8, pubkey_b64 })
+    }
+
+    /// The public identity of the loaded key — what preflight matches against the
+    /// committed anchor, and the only value the journal records.
+    #[must_use]
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey_b64
+    }
+
+    /// Detached Ed25519 signature over `msg`.
+    pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        let keypair = ring::signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+            .map_err(|_| "signing key became unusable after load".to_string())?;
+        Ok(keypair.sign(msg).as_ref().to_vec())
+    }
+}
+
+/// Pull `signing_key` out of the profile without a TOML dependency: the file has one
+/// key of record, and a hand-rolled reader keeps the parse surface as small as the
+/// secret it is reading.
+fn credentials_signing_key(text: &str) -> Result<&str, String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!("not a `key = value` line: {line}"));
+        };
+        if key.trim() != "signing_key" {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .ok_or_else(|| "signing_key must be a quoted string".to_string())?;
+        if value.is_empty() {
+            return Err("signing_key is empty".to_string());
+        }
+        return Ok(value);
     }
+    Err("no `signing_key` in the credentials profile".to_string())
 }
 
-/// Load `~/.aterm/release.conf`. `Ok(None)` when absent — NOT an error:
-/// builds without credentials keep the defaults (ad-hoc sign, Tier REPO
-/// updater, inert atpkg) — strictly fail-closed, like release-conf.sh.
-pub fn load_default() -> Result<Option<ReleaseConf>, String> {
-    #[cfg(unix)]
-    {
-        let home = std::env::var_os("HOME").ok_or("HOME not set")?;
-        load_conf(&PathBuf::from(home).join(".aterm/release.conf"))
-    }
-    // Windows: `~/.aterm/release.conf` is a Unix location and the refusal
-    // rules below are uid/mode-based, so credentials never load here —
-    // builds keep the fail-closed defaults (ad-hoc sign, Tier REPO, inert
-    // atpkg), exactly like a Unix host with no conf present.
-    #[cfg(not(unix))]
-    {
-        Ok(None)
-    }
-}
-
-/// Load a conf file with the ported release-conf.sh refusals: must be owned
-/// by the current user and not group/other-writable (`chmod 600` is the
-/// documented remediation). We no longer source it, but it still selects the
-/// signing identity and the compile-time trust pins — a file someone else can
-/// edit must never steer a release.
-pub fn load_conf(path: &Path) -> Result<Option<ReleaseConf>, String> {
-    let meta = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("stat {}: {e}", path.display())),
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        check_conf_perms(meta.uid(), meta.mode(), current_uid()?, path)?;
-    }
-    // Windows has no uid/mode semantics to enforce the refusal rules with, so
-    // an existing conf is REFUSED outright rather than loaded unverified —
-    // same fail-closed posture, stricter arm.
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        return Err(format!(
-            "REFUSING {} — the ownership/mode refusals guarding release \
-             credentials are Unix-only; run release signing from macOS",
-            path.display()
-        ));
-    }
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let vars = parse_conf(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-    println!("==> release credentials loaded from {}", path.display());
-    Ok(Some(ReleaseConf { vars }))
-}
-
-/// The pure refusal rule (fixture-tested): refuse a conf not owned by the
-/// current uid, or writable by group/other — release-conf.sh's stat checks
-/// (`%u` vs `id -u`; mode regex `[2367]$|[2367][0-7]$` ⇒ any g/o write bit).
-pub fn check_conf_perms(
+/// The pure refusal rule (fixture-tested): refuse a credentials profile not owned
+/// by the current uid, or writable by group/other. It holds a private key, so the
+/// ownership guarantee `release.conf` carried is kept verbatim.
+pub fn check_credentials_perms(
     owner_uid: u32,
     mode: u32,
     current_uid: u32,
@@ -175,9 +163,14 @@ pub fn check_conf_perms(
             path.display()
         ));
     }
-    if mode & 0o022 != 0 {
+    // TIGHTENED from the old conf rule (`0o022`, group/other WRITE) to `0o077`, any
+    // group/other access. release.conf held identities and paths; this file holds the
+    // PRIVATE KEY, so a world-READABLE profile is a leak even though nobody else can
+    // write it. Caught by its own test, which passed at 0644 under the old mask.
+    if mode & 0o077 != 0 {
         return Err(format!(
-            "REFUSING {} — group/other-writable (mode {:03o}); chmod 600 it",
+            "REFUSING {} — group/other-accessible (mode {:03o}); it holds a private key, \
+             chmod 600 it",
             path.display(),
             mode & 0o777
         ));
@@ -200,61 +193,6 @@ fn current_uid() -> Result<u32, String> {
         .trim()
         .parse()
         .map_err(|e| format!("id -u parse: {e}"))
-}
-
-/// Parse the KEY=value body IN-PROCESS. Accepted per line: blank, `#` comment,
-/// `KEY=value` (optionally `export KEY=value`, the common env-file spelling),
-/// with the value optionally wrapped in matching single or double quotes.
-/// REFUSED with the line number: non-assignment lines, invalid key names, and
-/// values still containing `$`/backtick after quote-stripping — the file is
-/// data now, and a value written expecting shell expansion would otherwise be
-/// exported verbatim and silently diverge from the sourcing era.
-pub fn parse_conf(text: &str) -> Result<Vec<(String, String)>, String> {
-    let mut vars = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let lineno = i + 1;
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let line = line
-            .strip_prefix("export ")
-            .map(str::trim_start)
-            .unwrap_or(line);
-        let Some((key, value)) = line.split_once('=') else {
-            return Err(format!(
-                "line {lineno}: not a KEY=value assignment: {raw:?}"
-            ));
-        };
-        let key = key.trim_end();
-        let valid_key = !key.is_empty()
-            && !key.starts_with(|c: char| c.is_ascii_digit())
-            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid_key {
-            return Err(format!("line {lineno}: invalid key name {key:?}"));
-        }
-        let value = strip_quotes(value.trim());
-        if value.contains('$') || value.contains('`') {
-            return Err(format!(
-                "line {lineno}: value of {key} contains shell expansion ($ or `) — \
-                 release.conf is parsed, not sourced; use a literal value"
-            ));
-        }
-        vars.push((key.to_string(), value.to_string()));
-    }
-    Ok(vars)
-}
-
-/// Strip ONE pair of matching surrounding quotes (the sourcing-era spelling
-/// `ATERM_SIGN_ID="Developer ID Application: …"`). No escape processing —
-/// values are identities, key material and paths, all literal.
-fn strip_quotes(v: &str) -> &str {
-    for q in ['"', '\''] {
-        if v.len() >= 2 && v.starts_with(q) && v.ends_with(q) {
-            return &v[1..v.len() - 1];
-        }
-    }
-    v
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +279,9 @@ pub fn sign_dmg(dmg: &Path, sign_id: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// notarytool credentials (notarize.sh's two spellings; keychain profile is
-/// tried first — see [`ReleaseConf::notary_auth`]).
+/// tried first). DORMANT: Tier APPLE is off (`pins::APPLE_TEAM_ID` is empty), so
+/// nothing constructs this today. Turning the tier on adds the credentials to the
+/// release-credentials profile in the same reviewed change that commits the anchor.
 pub enum NotaryAuth {
     KeychainProfile(String),
     AppleId {
@@ -517,28 +457,19 @@ pub fn notarize(artifact: &Path, auth: &NotaryAuth) -> Result<(), String> {
 /// Sign + notarize the DMG when the conf enables the owner path; a no-op
 /// (returning false) otherwise. The one call chunk C's pipeline makes after
 /// `dmg::create` — keeps the Dev-ID hook to zero steps on the default path.
-pub fn sign_and_notarize_dmg(dmg: &Path, conf: Option<&ReleaseConf>) -> Result<bool, String> {
-    let Some(conf) = conf else { return Ok(false) };
-    let Some(id) = conf.sign_id() else {
-        return Ok(false);
-    };
+pub fn sign_and_notarize_dmg(dmg: &Path, sign_id: Option<&str>) -> Result<bool, String> {
+    // Tier APPLE is OFF: `pins::APPLE_TEAM_ID` is empty and aterm ships ad-hoc, so
+    // callers pass `None` and this is a no-op. The Developer-ID and notarization
+    // machinery below the fold (`sign_dmg`, `notarize`) is kept intact and unused —
+    // turning the tier on is a reviewed change that commits the anchor AND supplies
+    // the credentials, not a matter of a file happening to exist on some machine.
+    let Some(id) = sign_id else { return Ok(false) };
     sign_dmg(dmg, id)?;
-    match conf.notary_auth() {
-        Some(auth) => {
-            notarize(dmg, &auth)?;
-            Ok(true)
-        }
-        None => {
-            // Signed but not notarized: allowed (the owner may staple later),
-            // but say so — notarize.sh's "never no-ops silently" contract.
-            println!(
-                "    NOTE: no notary credentials in release.conf \
-                 (ATERM_NOTARY_PROFILE or ATERM_APPLE_ID/ATERM_TEAM_ID/ATERM_APP_PASSWORD) — \
-                 DMG signed but NOT notarized."
-            );
-            Ok(false)
-        }
-    }
+    println!(
+        "    NOTE: Developer-ID signed, not notarized — Tier APPLE credentials are \
+         not part of the release-credentials profile yet"
+    );
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------

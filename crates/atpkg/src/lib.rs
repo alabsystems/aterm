@@ -52,7 +52,6 @@ pub mod cache;
 /// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
 pub mod cli;
 pub mod companions;
-pub mod compat;
 pub mod config;
 pub mod cost;
 pub mod discovery;
@@ -89,7 +88,6 @@ pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
 pub use bundled::bundled_seed_dir;
 pub use cache::IndexCache;
-pub use compat::supports;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
 pub use discovery::{IndexRepo, resolve_account, resolve_account_with};
@@ -134,16 +132,13 @@ pub use sourcebuild::{
     Installed as SourceInstalled, Provenance, SourceBuildError, build_and_install,
 };
 
-/// The base64 Ed25519 **root** public key this binary trusts, baked in at compile
-/// time from `ATERM_PKG_ROOTKEY`. Empty (the default when the env var is unset at
-/// build time) **disables the manager entirely**, fail-closed: with no anchor pinned
-/// there is nothing to trust, so no index ever verifies.
+/// The base64 Ed25519 **root** public key this binary trusts.
 ///
-/// The owner's local release build exports `ATERM_PKG_ROOTKEY=<base64 root pubkey>`;
-/// the root **secret** key lives only in the owner's keychain — never in the repo,
-/// never in CI (mirroring the Developer-ID identity, `docs/RELEASING.md`). Verbatim
-/// shape of `aterm-update`'s `PINNED_TEAM_ID` idiom (`crates/aterm-update/src/lib.rs`),
-/// expanded inline here so the pin reads atpkg's own build env.
+/// A committed constant ([`aterm_update_core::pins::PKG_ROOT_PUBKEY`]), not a build
+/// env var: what a binary trusts is a property of the source, identical on every
+/// machine. Empty disables the manager entirely, fail-closed — with no anchor there
+/// is nothing to trust, so no index ever verifies. The root SECRET key lives only
+/// offline.
 pub const PINNED_PKG_ROOTKEY: &str = aterm_update_core::pins::PKG_ROOT_PUBKEY;
 
 /// Whether the manager is configured to act: a root key must be pinned AND the user

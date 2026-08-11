@@ -201,13 +201,7 @@ impl KittyCameo {
     ///
     /// `pane` is the split pane the keystroke landed in (`None` for an unsplit
     /// window) — see [`Cameo::pane`].
-    pub fn summon(
-        &mut self,
-        now: Instant,
-        anchor: (u16, u16),
-        look: KittyLook,
-        pane: Option<u64>,
-    ) {
+    pub fn summon(&mut self, now: Instant, anchor: (u16, u16), look: KittyLook, pane: Option<u64>) {
         self.live = Some(Cameo {
             born: now,
             anchor,
@@ -343,8 +337,7 @@ impl KittyCameo {
     /// Whether the live cameo's owning session passes `visible`. Vacuously true
     /// when nothing is live — every caller pairs it with a liveness test.
     fn owner_visible(&self, visible: &impl Fn(u64) -> bool) -> bool {
-        self.live
-            .is_none_or(|c| c.pane.is_none_or(visible))
+        self.live.is_none_or(|c| c.pane.is_none_or(visible))
     }
 
     /// The REDUCED-MOTION one-shot erase wake: the instant the single held pose
@@ -781,10 +774,7 @@ mod tests {
     fn the_palette_latches_at_the_first_drawn_frame() {
         let t0 = Instant::now();
         let mut cam = KittyCameo::default();
-        assert!(
-            !cam.wants_colors(),
-            "no cameo, nothing to sample"
-        );
+        assert!(!cam.wants_colors(), "no cameo, nothing to sample");
         cam.summon(t0, (4, 9), look(), Some(1));
         assert!(cam.wants_colors(), "a fresh toy has no palette yet");
 
@@ -797,10 +787,7 @@ mod tests {
             background: 3,
         };
         assert_eq!(cam.latch_colors(mine), mine, "the first sample is taken");
-        assert!(
-            !cam.wants_colors(),
-            "and the host is told to stop sampling"
-        );
+        assert!(!cam.wants_colors(), "and the host is told to stop sampling");
         assert_eq!(
             cam.latch_colors(someone_elses),
             mine,
@@ -810,7 +797,10 @@ mod tests {
 
         // A NEW toy is a new sample: the latch is per cameo, not per engine.
         cam.summon(t0 + Duration::from_millis(10), (7, 2), look(), Some(1));
-        assert!(cam.wants_colors(), "the replacement wears its own place's colours");
+        assert!(
+            cam.wants_colors(),
+            "the replacement wears its own place's colours"
+        );
         assert_eq!(cam.latch_colors(someone_elses), someone_elses);
     }
 

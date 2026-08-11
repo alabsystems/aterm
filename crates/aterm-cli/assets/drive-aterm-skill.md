@@ -40,7 +40,7 @@ Not for one-shot non-interactive commands — use Bash for those.
 | `ATERM_NO_CONTROL_SOCK` | server | Anything but `0`/empty disables the socket; wins over an explicit path. |
 | `ATERM_PARENT_SESSION_ID` | **client** | Injected into every child shell. Powers `@self`, the ` *` marker in `ls`, and flagless socket resolution to *your own* instance. |
 | `XDG_RUNTIME_DIR` | both | Rendezvous dir is `$XDG_RUNTIME_DIR/aterm`, else `~/Library/Application Support/aterm`. **Client needs the same value as the server** or discovery looks in the wrong place. |
-| `ATERM_HEADLESS=1` | server | No window; engine + PTY + socket only. Same as `--headless`. |
+| `ATERM_HEADLESS=1` | server | No window; engine + PTY + socket only. Exactly `--headless` (prefer the flag). `0`/`off`/empty do NOT arm it and say so on stderr. |
 | `ATERM_COLUMNS` / `ATERM_LINES` | server | Initial grid (clamped 20..=500 / 5..=300). |
 | `ATERM_EXEC` | server | Run this in the PTY then exec `$SHELL` — deterministic paint instead of a host-specific prompt. |
 | `ATERM_CTL` | `drive`, `fleet` | Path to the `aterm-ctl` client they shell out to. |
@@ -54,9 +54,9 @@ Auth is automatic: a per-launch 32-byte token file sits beside the socket
 
 ```sh
 RUN=$(mktemp -d); SOCK="$RUN/c.sock"
-ATERM_HEADLESS=1 ATERM_CONTROL_SOCK="$SOCK" XDG_RUNTIME_DIR="$RUN" \
+ATERM_CONTROL_SOCK="$SOCK" XDG_RUNTIME_DIR="$RUN" \
   ATERM_COLUMNS=100 ATERM_LINES=30 SHELL=/bin/sh \
-  aterm-gui >"$RUN/gui.log" 2>&1 &
+  aterm-gui --headless >"$RUN/gui.log" 2>&1 &
 for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
 ```
 

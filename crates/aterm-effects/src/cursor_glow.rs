@@ -2373,6 +2373,15 @@ struct JumpStreak {
     life: f32,
     /// Typing heat at launch — scales the streak's thickness + brightness.
     mom: f32,
+    /// HOW BIG THE JUMP WAS, `0..=1`, ramped to
+    /// [`CursorGlow::RAINBOW_JUMP_GRADE_FULL`]. Held on the streak rather than
+    /// recomputed in the emitter because the streak outlives the move that
+    /// made it: `dist` is gone by the next frame, and a grade re-derived from
+    /// the surviving endpoints would silently change under a reflow.
+    grade: f32,
+    /// This jump came up a SUPERNOVA — the same verdict its landing carries,
+    /// rolled once for the pair (see [`CursorGlow::RAINBOW_NOVA_CHANCE`]).
+    nova: bool,
 }
 
 /// One rainbow kitty FAST-JUMP STARBURST (owner: "for fast cursor jumps a starburst
@@ -2413,6 +2422,12 @@ struct Starburst {
     /// `push_twinkle_star` on dark and `push_twinkle_over` on light — literally
     /// the typing starfield's own geometry on both grounds.
     sparkles: u8,
+    /// This landing is a SUPERNOVA: the flash blooms harder and holds longer,
+    /// and the star fan is thrown through a shell of rainbow glitter spawned
+    /// at the same instant. `false` for every glide landing and for the
+    /// ordinary jump — the roll lives on the JUMP path alone (see
+    /// [`CursorGlow::RAINBOW_NOVA_CHANCE`]).
+    nova: bool,
 }
 
 /// One FAST-GLIDE rainbow SHOOTING STAR (owner: "some rainbow streak when
@@ -2838,6 +2853,43 @@ const RAINBOW_METEOR_NUCLEUS_R: f32 = 0.62;
 /// bright dot.
 const RAINBOW_METEOR_COMA_R: f32 = 2.4;
 const RAINBOW_METEOR_COMA_GAIN: f32 = 0.34;
+
+/// THE SUPERNOVA CORONA — the rainbow shockwave's radius, as a fraction of the
+/// LANDING'S OWN REACH, from birth ([`RAINBOW_NOVA_CORONA_R0`], inside the star
+/// fan) to the end of the flash. It finishes PAST the rim the stars are still
+/// travelling to, which is what makes it read as a wave overtaking the debris
+/// rather than as more debris.
+const RAINBOW_NOVA_CORONA_R: f32 = 1.35;
+const RAINBOW_NOVA_CORONA_R0: f32 = 0.25;
+/// Sides of the polygon the ring is drawn as. Enough that the stroke reads as
+/// a circle rather than as a wheel at the radii this thing reaches.
+const RAINBOW_NOVA_RING_SIDES: usize = 32;
+/// Ring stroke thickness as a fraction of its radius, floored at a pixel and a
+/// half and capped at half a cell so a late, large ring stays a STROKE.
+const RAINBOW_NOVA_RING_TH: f32 = 0.10;
+/// Vertical squash on the ring. A terminal cell is taller than it is wide, so
+/// a circle drawn in pixels reads as a tall oval against the grid it explodes
+/// on; the shell grains take the same correction.
+const RAINBOW_NOVA_CORONA_SQUASH: f32 = 0.62;
+/// Bead coverage as a fraction of the flash's.
+const RAINBOW_NOVA_CORONA_GAIN: f32 = 1.15;
+/// The nova's white core, as a multiple of the ordinary landing flash's gain.
+///
+/// THIS IS THE ONE THAT MATTERED, and it took four capture rounds to find
+/// because it is not a shape problem at all. Every mark in this family is
+/// budgeted under [`RAINBOW_TRANSIENT_COV_CAP`] = 118/255 — a ceiling set for
+/// light a typist reads THROUGH all day — so at the ordinary landing's 0.55 of
+/// it the flash lands at 65/255. No arrangement of marks under 65/255 is going
+/// to read as a detonation; the first three rounds moved the corona's shape,
+/// radius and count while the answer was that none of it had any light.
+///
+/// The exemption is the one [`CursorGlow::emit_rainbow_starburst`] already
+/// argues for itself, applied to the rarest member of the same family: this is
+/// a ~0.3 s bloom on a deliberate screen-crossing jump that comes up about one
+/// time in six, not continuous light anyone reads through. WCAG 2.3.1 is
+/// untouched — the flash span did not move, and one bloom per jump is orders
+/// below the 3 Hz bar this crate certifies.
+const RAINBOW_NOVA_FLASH_GAIN: f32 = 2.6;
 
 // ---- THE LANDING FLASH -----------------------------------------------------
 /// Share of the starburst's life the impact bloom occupies. Well under 1 so the
@@ -3265,9 +3317,9 @@ pub struct CursorGlow {
     /// cursor cat, so the delete burst fires whether or not the cat is flying
     /// (the cat's tongue-out "oops" layers on top when it happens to be present).
     bs_poof_hint: Option<Instant>,
-    /// The cursor row's FILL as it stood when that Backspace key arrived —
-    /// `(row, fill)`, stamped by [`Self::note_backspace`] from whatever probe
-    /// the host had last handed over.
+    /// The cursor row's FILL as it stood when the erase key arrived —
+    /// `(row, fill)`, stamped by [`Self::note_backspace`] AND [`Self::note_kill`]
+    /// from whatever probe the host had last handed over.
     ///
     /// WHY A STAMP AND NOT THE LIVE DIFF. `poof_scan`'s span branch proves an
     /// erasure by diffing the PREVIOUS presented row against this frame's. That
@@ -3284,6 +3336,9 @@ pub struct CursorGlow {
     /// `None` means the host had nothing to give at the key — which is NOT
     /// evidence that nothing was erased, and the fallback treats it that way
     /// (see `poof_scan`).
+    ///
+    /// It is ALSO the clock the caret fallback's grace can be released early
+    /// against — see [`Self::poof_erase_witnessed`].
     bs_baseline: Option<(u16, u16)>,
     /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]): the host saw
     /// the attached app's DECTCEM-hide-inside-DEC-2026 repaint bracket (the
@@ -3756,6 +3811,91 @@ impl CursorGlow {
     /// `emit_rainbow_jump_landing`), so a screen-crossing fling still throws the
     /// full [`Self::RAINBOW_BURST_STARS`] chunky stars.
     const RAINBOW_BURST_MIN_DIST: f32 = 2.0;
+    /// THE JUMP GRADE — "BIGGER BRIGHTER CURSOR STREAK and a BIGGER IMPACT
+    /// EFFECT when the cursor jumps large distances!" (owner, 2026-08-10).
+    ///
+    /// Distance (cells) at which a jump is drawn at full size. Below it the
+    /// streak and the impact ramp `0 → 1` from the ordinary jump's draw;
+    /// above it nothing further is bought, so a 200-column paste and a
+    /// screen-crossing Ctrl-A read as the same event — which they are.
+    ///
+    /// Why this was needed at all: the ZOOM streak's thickness rode ONLY the
+    /// typing momentum you happened to carry into it, so a two-cell hop and a
+    /// fling across the window drew the identical bar. The one thing that
+    /// scaled with distance was the streak's LIFE — the jump lasted longer
+    /// without ever looking bigger. 34 cells is roughly half a standard
+    /// window, i.e. a jump you could not have made by typing.
+    const RAINBOW_JUMP_GRADE_FULL: f32 = 34.0;
+    /// How much fatter a fully-graded fling's streak is than a bare jump's
+    /// (a multiplier on the momentum-derived thickness, so a hot fling is
+    /// still fatter than a cold one at the same distance).
+    const RAINBOW_JUMP_FAT_GAIN: f32 = 0.85;
+    /// …and how much brighter. Deliberately smaller than the fat gain: the
+    /// head coverage already sits near [`RAINBOW_TRANSIENT_COV_CAP`], so most
+    /// of "brighter" has to be bought as AREA (a fatter band beam and a wider
+    /// nucleus) rather than as coverage that would only clamp.
+    const RAINBOW_JUMP_BRIGHT_GAIN: f32 = 0.28;
+
+    // ── THE RAINBOW GLITTER SUPERNOVA ──────────────────────────────────────
+    //
+    // OWNER, 2026-08-10: "have a random effect where this is bright rainbow
+    // glitter supernova on landing impact with a big bright rainbow cursor
+    // path jump streak on a big cursor jump."
+    //
+    // A TIER on the existing jump, not a new effect — the same axis
+    // `SuperTier` takes inside `BurstKind::SuperNova` (see `supernova.rs`),
+    // and for the same reason: forking it into its own kind would fork the
+    // streak cap, the burst cap, the quad budget, the reduced-motion arm and
+    // the two emitters. One roll, read by both halves of the jump so the fat
+    // streak and the glitter landing can never disagree about which jump they
+    // are dressing.
+    /// Chance a qualifying big jump comes up a supernova. A TREAT: often
+    /// enough that a working session sees a few, rare enough that seeing one
+    /// still registers as luck rather than as the way jumps look.
+    const RAINBOW_NOVA_CHANCE: f32 = 0.16;
+    /// A supernova is only ever offered to a genuinely big jump — comfortably
+    /// past [`Self::RAINBOW_BURST_MIN_DIST`], so word-motion editing can never
+    /// roll one however long you edit.
+    const RAINBOW_NOVA_MIN_DIST: f32 = 14.0;
+    /// The supernova's multipliers on an already fully-graded jump: the streak
+    /// body, the landing's scatter reach, and its star count.
+    const RAINBOW_NOVA_FAT: f32 = 1.6;
+    const RAINBOW_NOVA_REACH: f32 = 1.7;
+    const RAINBOW_NOVA_STARS: f32 = 1.5;
+    /// Grains in the supernova's GLITTER SHELL — the ring of rainbow dust
+    /// thrown radially off the impact, which is the thing that makes it read
+    /// as a detonation rather than as a larger version of the ordinary
+    /// landing. Rides the same glitter particle path as the trail's own
+    /// sparkles (`cov_scale < 0.9`), so it is the family's dust, not a new
+    /// species; [`Self::MAX_PARTICLES`]-bounded like every other spawn.
+    const RAINBOW_NOVA_GLITTER: usize = 28;
+    /// Outward speed of a shell grain, in cell heights per second, before its
+    /// per-grain jitter.
+    ///
+    /// SET AGAINST THE FAN, not by taste — and the first cut (5.2) was set by
+    /// taste and was wrong. A landing's star fan eases out to `reach`, which a
+    /// supernova puts near 5.8 cell heights; a shell at 5.2 cells/s covers
+    /// about 2.6 of them in a grain's life, so every grain died INSIDE the fan
+    /// and the whole shell read as a slightly untidier version of the ordinary
+    /// landing. Captured and compared side by side against its non-nova
+    /// neighbour at 50 ms before this was believed.
+    ///
+    /// At 15 the median grain clears ~7 cell heights — past the fan, into
+    /// empty sky, which is what makes the ring legible AS a ring.
+    const RAINBOW_NOVA_SHELL_SPEED: f32 = 15.0;
+    /// Shell grain life (seconds), before its per-grain jitter. Long enough to
+    /// be READ at the distance the speed above throws it.
+    const RAINBOW_NOVA_SHELL_LIFE: f32 = 0.42;
+    /// The shell's brightness, expressed in the glitter sentinel's own
+    /// currency — `cov_scale` is BOTH the shape band and the brightness
+    /// multiplier (`base_cov · cov_scale`), so a supernova grain has to buy
+    /// its light at the top of its band rather than anywhere it likes. The
+    /// body sits just under [`ERASE_ROUND_SCALE_MAX`] (round, and as bright as
+    /// round gets); the accent sits just under the glitter ceiling (a `+`,
+    /// near full punch). The erase poof's dimmer [`ERASE_ROUND_SCALE`] is
+    /// right for a deletion and wrong for a detonation.
+    const RAINBOW_NOVA_SHELL_COV: f32 = 0.58;
+    const RAINBOW_NOVA_SHELL_ACCENT_COV: f32 = 0.85;
     /// How recently a committed TYPED press must have landed for a jump to earn
     /// its landing celebration. An ACTIVITY witness, not a ribbon one: a jump is
     /// worth marking when it punctuates your work, even if the trail has already
@@ -3934,6 +4074,13 @@ impl CursorGlow {
     /// the PRECISE span branch always gets first shot at the echo (a shell's
     /// EL lands within a frame or two; Claude Code's reflow never span-matches
     /// at any delay, so the fallback costs it ~4 imperceptible frames).
+    ///
+    /// It is a CAP, not a floor: [`Self::poof_erase_witnessed`] releases it the
+    /// moment the probe proves the erase is already on glass, because at that
+    /// point the span branch has had its shot on that very probe and declined.
+    /// The timer is what governs the cases with no witness — a reflow that
+    /// re-rowed the caret, a kill whose echo never shows, a host that had no
+    /// probe to stamp at the key.
     const POOF_FALLBACK_GRACE: f32 = 0.06;
     const POOF_MIN_GAP: f32 = 0.14;
     /// A stored row probe older than this cannot witness a kill (seconds).
@@ -4489,6 +4636,25 @@ impl CursorGlow {
         self.sound_cues.drain(..)
     }
 
+    /// TAKE BACK the cue [`Self::cue_keystroke`] just recorded, so the host can
+    /// hand it to the synth AT THE KEY instead of waiting for the next render
+    /// tick's [`Self::drain_sound_cues`].
+    ///
+    /// WHY THE KEY SEAM STILL RECORDS AND THEN TAKES, rather than the engine
+    /// simply handing the cue back: the record is what runs the silence law
+    /// ([`Self::sound_live`]), the backlog bound, the column sample, and the
+    /// timbre prediction. Splitting that into a second construction path is how
+    /// a key-time click and an echo-time click drift apart. So the cue is built
+    /// exactly once, by the one function that knows how, and this only changes
+    /// WHO carries it to the speaker.
+    ///
+    /// Valid ONLY immediately after a `true` from `cue_keystroke` — it pops the
+    /// most recent cue, which is that one. Anything older stays queued for the
+    /// frame drain, so a host that never calls this is byte-identical.
+    pub fn take_key_cue(&mut self) -> Option<SoundCue> {
+        self.sound_cues.pop()
+    }
+
     /// Fire's eased DISPLAY TEMPERATURE 0..1 — the one number every fire layer
     /// reads: coal-floored (relaxed typing keeps a small live flame), quench-
     /// damped (deleting douses it), attack/release-eased (the whole look ramps
@@ -4709,6 +4875,16 @@ impl CursorGlow {
         // symmetric; the second is the span's extra weight.
         self.erase_mom.advance(now);
         self.erase_mom.advance(now);
+        // Stamp the PRE-kill row exactly as `note_backspace` does — the two poof
+        // licences share every downstream gate, so they must share the witness
+        // too. This one is read ONLY by `poof_erase_witnessed` (the fallback's
+        // early release); the plain-Backspace `bs_erased` law cannot see a
+        // kill-stamped value, because the only thing that arms `bs_poof_hint`
+        // is `note_backspace`, which re-stamps this field unconditionally.
+        self.bs_baseline = self
+            .row_cur_meta
+            .or(self.row_prev_meta)
+            .map(|m| (m.row, m.fill));
         if moves_cursor {
             self.nav_hint = Some(now);
         }
@@ -5184,6 +5360,27 @@ impl CursorGlow {
         match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
+        }
+    }
+
+    /// THE ERASE IS ALREADY ON GLASS: this frame's probe shows the caret's row
+    /// SHORTER than the row stamped at the erase key ([`Self::bs_baseline`]).
+    ///
+    /// Two readers, one law. It is the strong arm of the plain-Backspace
+    /// witness (did that Backspace erase anything at all?) and it is the caret
+    /// fallback's EARLY RELEASE from [`Self::POOF_FALLBACK_GRACE`] (has the
+    /// precise span branch already had its shot?). Both questions have the same
+    /// answer for the same reason: a row that has shrunk since the key is a row
+    /// whose erase has landed, and a landed erase is one the span branch has
+    /// seen — it diffs the very probe this reads.
+    ///
+    /// `None` baseline (the host had no probe at the key) is deliberately NOT a
+    /// witness in either direction: it is the "was not composing" case, so the
+    /// fallback falls back to its timed grace.
+    fn poof_erase_witnessed(&self) -> bool {
+        match (self.bs_baseline, self.row_cur_meta) {
+            (Some((brow, bfill)), Some(cur)) => cur.row == brow && cur.fill < bfill,
+            _ => false,
         }
     }
 
@@ -5776,6 +5973,10 @@ impl CursorGlow {
                 // where a screen-crossing jump throws the full handful.
                 stars: 6,
                 sparkles: Self::GLIDE_LAND_SPARKLES,
+                // A GLIDE is a continuous run of the cursor, not a leap: the
+                // supernova is the big-JUMP treat, and dressing a fast drag
+                // as one would spend the rarity on the gesture you make most.
+                nova: false,
             });
         }
         self.fire_meteors
@@ -7813,7 +8014,11 @@ impl CursorGlow {
             // A no-op whenever the geometry did not change (every non-reflow jump).
             let pr_c = pr.min(geom.rows.saturating_sub(1) as u16);
             let pc_c = pc.min(geom.cols.saturating_sub(1) as u16);
-            self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist);
+            // ONE ROLL for the whole jump, taken before either half draws:
+            // the fat streak and the glitter landing are two halves of one
+            // event, so they read one verdict.
+            let nova = self.roll_jump_nova(dist);
+            self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist, nova);
             // LANDING PAYLOAD (Features A + B) — the celebratory STARBURST at
             // the landing and the graceful dissolve of the abandoned ribbon
             // TERMINUS at the pre-jump head. Split into `emit_rainbow_jump_landing`
@@ -7838,7 +8043,7 @@ impl CursorGlow {
             // it: it feathers the ribbon end the jump abandoned, and a reflow has
             // already rewritten those cells — the re-anchor snuff owns that.)
             if !reflow_licensed {
-                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus);
+                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus, nova);
             }
             // The hue still advances and the landing ring/particles below still
             // fire; only the per-cell spark path is skipped.
@@ -7877,12 +8082,16 @@ impl CursorGlow {
                 let chf = geom.ch as f32;
                 let oxf = geom.origin_x as f32;
                 let oyf = geom.origin_y as f32;
+                // One roll here too, and taken UNCONDITIONALLY — outside the
+                // streak's own distance gate — so the draw order of the two
+                // halves cannot shift the `frand` stream under the landing.
+                let nova = self.roll_jump_nova(dist);
                 if dist >= Self::RAINBOW_STREAK_MIN_DIST {
-                    self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist);
+                    self.push_jump_streak(now, geom, (pr, pc), (cr, cc), dist, nova);
                 }
                 let landing = (oxf + (cc as f32 + 0.5) * cwf, oyf + (cr as f32 + 0.5) * chf);
                 let terminus = (oxf + (pc as f32 + 0.5) * cwf, oyf + (pr as f32 + 0.5) * chf);
-                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus);
+                self.emit_rainbow_jump_landing(now, geom, dist, landing, terminus, nova);
             }
         } else if rainbow_kitty && deletion {
             // BACKSPACE = SPARKLE GLITTER CLOUD POOF (rainbow kitty only): a deletion echo
@@ -9678,18 +9887,40 @@ impl CursorGlow {
         // weaker witness — the caret is off column 0, so a Backspace here COULD
         // have erased. A no-op Backspace at the left margin (and its autorepeat
         // there) still stays silent, which is the case this gate exists for.
-        let bs_erased = match (self.bs_baseline, self.row_cur_meta) {
-            (Some((brow, bfill)), Some(cur)) => cur.row == brow && cur.fill < bfill,
-            (None, Some(cur)) => cur.caret > 0,
-            _ => false,
-        };
+        let erase_on_glass = self.poof_erase_witnessed();
+        let bs_erased = erase_on_glass
+            || matches!(
+                (self.bs_baseline, self.row_cur_meta),
+                (None, Some(cur)) if cur.caret > 0
+            );
+        // THE GRACE, OR THE PROOF IT WAS WAITING FOR. The grace buys the precise
+        // span branch first shot at the echo; `erase_on_glass` says the echo is
+        // ALREADY on the probe this frame and the span branch (which ran above,
+        // on this same probe) declined it. Waiting out the rest of the timer
+        // then buys nothing but latency — and it is not a small latency: from a
+        // QUIET screen the erase's own damage drives this tick within a frame of
+        // the keypress, so the poof used to sit out ~50 ms of grace watching a
+        // gap the user is already looking at.
+        //
+        // WHY THIS CANNOT STEAL THE SPAN BRANCH'S SHOT. The span branch answers
+        // by diffing the PREVIOUS probe against this one. For it to match on a
+        // LATER frame it needs a shrink between this probe and that one — i.e.
+        // the erase would still have to be in the future — which is exactly what
+        // `erase_on_glass` rules out: the caret's row is already SHORTER than it
+        // was at the key. A second shrink after that is a second erase, and
+        // `POOF_MIN_GAP` (not the grace) is what governs those.
+        //
+        // The timed grace stays as the cap for every case with no witness: a
+        // reflow that re-rowed the caret, a kill whose echo never shows, a host
+        // that had no probe to stamp at the key.
         if fresh_kill
             && gap_ok
             && !poofed
             && (!bs_only || erasure_proven || bs_erased)
-            && poof_hint_at.is_some_and(|t| {
-                now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
-            })
+            && (erase_on_glass
+                || poof_hint_at.is_some_and(|t| {
+                    now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
+                }))
             && let Some(cur) = self.row_cur_meta
         {
             let c0 = cur.caret;
@@ -11582,6 +11813,35 @@ impl CursorGlow {
     /// tick's `geom`, so after a shrink the prior cell can sit outside the effects
     /// box and `beam_clip` would cut the tail off mid-air. A no-op whenever the
     /// geometry did not change (every non-reflow jump).
+    /// How big this jump is, `0..=1` — the shared ramp both halves of the
+    /// draw read, so the streak and the landing can never grade it
+    /// differently. See [`Self::RAINBOW_JUMP_GRADE_FULL`].
+    fn jump_grade(dist: f32) -> f32 {
+        (dist / Self::RAINBOW_JUMP_GRADE_FULL).clamp(0.0, 1.0)
+    }
+
+    /// Roll THE SUPERNOVA for one jump — the owner's "random effect".
+    ///
+    /// Called EXACTLY ONCE per observed jump, in the caller, and handed to
+    /// both [`Self::push_jump_streak`] and [`Self::emit_rainbow_jump_landing`]
+    /// rather than re-rolled inside each: the two are separate calls on two
+    /// different branches (an un-hinted jump and a navigation one), and a
+    /// second draw would let a supernova landing arrive under an ordinary
+    /// streak — the one pairing the request rules out ("glitter supernova on
+    /// landing impact WITH a big bright rainbow cursor path jump streak").
+    ///
+    /// Rides the module's existing `frand` stream, so it inherits its
+    /// determinism: a driven script rolls the same jumps every run, which is
+    /// what makes the effect testable at all. Reduced motion never rolls —
+    /// the shell is pure outward motion and there is no still frame of it
+    /// that means anything, the argument `scatter_rainbow_terminus` makes.
+    fn roll_jump_nova(&mut self, dist: f32) -> bool {
+        if self.reduced_motion || dist < Self::RAINBOW_NOVA_MIN_DIST {
+            return false;
+        }
+        self.frand() < Self::RAINBOW_NOVA_CHANCE
+    }
+
     fn push_jump_streak(
         &mut self,
         now: Instant,
@@ -11589,6 +11849,7 @@ impl CursorGlow {
         from: (u16, u16),
         to: (u16, u16),
         dist: f32,
+        nova: bool,
     ) {
         if self.rainbow.jumps.len() >= Self::RAINBOW_JUMP_CAP {
             self.rainbow.jumps.remove(0);
@@ -11616,6 +11877,11 @@ impl CursorGlow {
             // The fling's fatness rides the EASED momentum you HAD (a leap from a
             // hot run throws a fat rainbow), not the raw last keystroke.
             mom: self.rainbow.disp,
+            // …AND the distance, which it never did before: the ZOOM's only
+            // distance term was its life, so a screen-crossing fling drew the
+            // same bar as a two-cell hop and merely held it longer.
+            grade: Self::jump_grade(dist),
+            nova,
         });
         // THE METEOR'S SHED SPARKS — "including [the] same sparkles that appear
         // in the cursor trail". A meteor is a nucleus, a tail, AND the grains
@@ -11690,6 +11956,7 @@ impl CursorGlow {
         dist: f32,
         landing: (f32, f32),
         terminus: (f32, f32),
+        nova: bool,
     ) {
         // The landing star scatter (any qualifying jump, burst-capped).
         // GRADUATED by distance: a short Option-B/F hop
@@ -11715,14 +11982,26 @@ impl CursorGlow {
             // ("an even bigger brighter landing"): the burst now spreads over
             // roughly a cell and a half more, and saturates its star count in
             // half the distance it used to.
-            let reach = (1.15 + 0.13 * dist).clamp(1.4, 3.4) * geom.ch as f32;
+            // A SUPERNOVA throws its stars through a wider sky, and a merely
+            // large jump lands harder than it used to: the reach ceiling
+            // itself now rides the grade, so "bigger impact when the cursor
+            // jumps large distances" is bought where the eye reads size —
+            // across the fan, not in a single brighter dot.
+            let grade = Self::jump_grade(dist);
+            let nova_reach = if nova { Self::RAINBOW_NOVA_REACH } else { 1.0 };
+            let reach =
+                (1.15 + 0.13 * dist).clamp(1.4, 3.4 + 1.1 * grade) * nova_reach * geom.ch as f32;
             // Star count ramps 1 → RAINBOW_BURST_STARS across ~2..38 cells: the
             // farther the leap, the more stars scatter off the landing. The
             // FLOOR stays at one — a two-cell Option-B/F hop earns exactly one
             // small star, deliberately, so ordinary word-motion editing is not
             // a fireworks show; only the SLOPE steepened (dist/3.2 → dist/2.2),
             // so a real fling saturates instead of trickling.
-            let stars = (1 + (dist / 2.2) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
+            // A supernova saturates the fan outright — it is the one landing
+            // that gets every star the cap allows.
+            let nova_stars = if nova { Self::RAINBOW_NOVA_STARS } else { 1.0 };
+            let stars =
+                (1 + (dist * nova_stars / 2.2) as usize).clamp(1, Self::RAINBOW_BURST_STARS) as u8;
             // …and the SAME twinkle the cursor trail scatters while you type,
             // interleaved with the colour stars (see `emit_rainbow_starburst`).
             // Zero on a short hop for the same anti-noise reason the star floor
@@ -11741,7 +12020,15 @@ impl CursorGlow {
                 seed,
                 stars,
                 sparkles,
+                nova,
             });
+            // THE GLITTER SHELL — what makes a supernova a supernova rather
+            // than a larger ordinary landing. Spawned HERE, at the same edge
+            // as the burst and under the same activity witness, so the shell
+            // and the fan can never arrive without each other.
+            if nova {
+                self.spawn_nova_shell(now, geom, landing, seed);
+            }
             // SOUND: the starburst's aural twin, cued at the SAME edge under the
             // SAME gate, so the star scatter and the chime can never diverge —
             // including on the NAVIGATION arm (a hinted Ctrl-A/E leap reaches
@@ -11777,6 +12064,63 @@ impl CursorGlow {
         // Asking the ribbon cannot drift from it.
         if self.sparks.iter().any(|s| s.typing) {
             self.scatter_rainbow_terminus(now, geom, terminus.0, terminus.1);
+        }
+    }
+
+    /// THE RAINBOW GLITTER SUPERNOVA'S SHELL — the ring of dust a nova
+    /// landing throws radially off the impact (owner, 2026-08-10: "bright
+    /// rainbow glitter supernova on landing impact").
+    ///
+    /// A shell, not a fountain: every grain leaves the SAME point along an
+    /// evenly-fanned direction, which is what reads as a detonation. The two
+    /// deliberate departures from a perfect ring are what keep it from
+    /// reading as a mechanical circle — a per-grain speed jitter, so the
+    /// front is ragged, and a small downward gravity, so the whole shell
+    /// drifts as it thins.
+    ///
+    /// ONE DUST, NOT A NEW SPECIES. These are the trail's own glitter
+    /// particles: the body spawns in the ROUND band ([`ERASE_ROUND_SCALE`])
+    /// and every fourth grain in the PLUS band, the same "sparks are the
+    /// body, `+` the accent" split the erase poof and the landing fan already
+    /// keep. Hues walk the spectrum around the ring rather than being drawn
+    /// at random, so the shell IS a rainbow rather than a handful of coloured
+    /// dots.
+    ///
+    /// Bounded by [`Self::MAX_PARTICLES`] like every other spawn, and rolled
+    /// only when the caller's one nova verdict says so — reduced motion never
+    /// gets here, because [`Self::roll_jump_nova`] refuses to roll under it.
+    fn spawn_nova_shell(&mut self, now: Instant, geom: Geom, at: (f32, f32), seed: f32) {
+        use std::f32::consts::TAU;
+        let chf = geom.ch as f32;
+        let n = Self::RAINBOW_NOVA_GLITTER;
+        for k in 0..n {
+            if self.particles.len() >= Self::MAX_PARTICLES {
+                break;
+            }
+            let r0 = self.frand();
+            let r1 = self.frand();
+            // Evenly fanned off the burst's own seed, so the shell and the
+            // star fan it is thrown through share one rotation instead of
+            // reading as two unrelated sprays.
+            let ang = (seed + (k as f32 + r0 * 0.35) / n as f32) * TAU;
+            let speed = Self::RAINBOW_NOVA_SHELL_SPEED * chf * (0.55 + r1 * 0.75);
+            self.particles.push(Particle {
+                x0: at.0,
+                y0: at.1,
+                vx: ang.cos() * speed,
+                vy: ang.sin() * speed * 0.62, // squashed: a terminal cell is tall
+                gy: 1.4 * chf,
+                life: Self::RAINBOW_NOVA_SHELL_LIFE + r1 * 0.34,
+                // Around the ring, not at random — the shell reads as one
+                // rainbow coming apart.
+                hue: (k as f32 / n as f32).rem_euclid(1.0),
+                cov_scale: if k % 4 == 0 {
+                    Self::RAINBOW_NOVA_SHELL_ACCENT_COV // the PLUS accent
+                } else {
+                    Self::RAINBOW_NOVA_SHELL_COV // the ROUND body
+                },
+                born: now,
+            });
         }
     }
 
@@ -11925,13 +12269,114 @@ impl CursorGlow {
             // effect, and there is no still frame of it that means anything.
             if !self.reduced_motion && u < RAINBOW_LAND_FLASH_SPAN {
                 let fu = u / RAINBOW_LAND_FLASH_SPAN;
+                // DARK ONLY, the same rule the streak's brightness gain
+                // takes: on a white ground this flash is source-over INK, and
+                // more of it is a bigger stain over the line the cursor landed
+                // on, not a brighter light. White keeps the nova's extra SIZE
+                // (reach, stars, the shell) and none of its extra opacity.
+                let nova_flash = if b.nova && cfg.dark_theme {
+                    RAINBOW_NOVA_FLASH_GAIN
+                } else {
+                    1.0
+                };
                 let fcov = (RAINBOW_TRANSIENT_COV_CAP
                     * RAINBOW_LAND_FLASH_GAIN
+                    * nova_flash
                     * (1.0 - fu).powf(1.6)
                     * cfg.intensity)
                     .clamp(0.0, 255.0);
                 if fcov >= 1.0 {
-                    let fr = base_r * (0.8 + RAINBOW_LAND_FLASH_GROW * (1.0 - (1.0 - fu).powi(2)));
+                    // A SUPERNOVA's bloom opens WIDER, not longer: the span is
+                    // untouched, so the flash still finishes before the stars
+                    // do and still reads as their cause rather than as a mark
+                    // competing with them. The one thing scaled is how far it
+                    // gets in that same time — the impact, which is what was
+                    // asked for.
+                    let grow = if b.nova {
+                        RAINBOW_LAND_FLASH_GROW * Self::RAINBOW_NOVA_REACH
+                    } else {
+                        RAINBOW_LAND_FLASH_GROW
+                    };
+                    let fr = base_r * (0.8 + grow * (1.0 - (1.0 - fu).powi(2)));
+                    // THE RAINBOW CORONA — the supernova's own mark, and the
+                    // reason it reads as one.
+                    //
+                    // Captured and compared before this existed: a nova
+                    // landing beside its non-nova neighbour at 60/150/300 ms
+                    // was indistinguishable. Everything the tier had bought
+                    // so far — 1.7x reach, a saturated star count, a glitter
+                    // shell — was MORE OF THE SAME MARKS, and the eye reads a
+                    // wider scatter of the same dots as the same event, not a
+                    // bigger one. What was missing was a mark the ordinary
+                    // landing does not have at all.
+                    //
+                    // Six concentric halos, outermost RED through innermost
+                    // VIOLET, expanding on the flash's own clock. Additive
+                    // stacking is the point: each shell only shows alone in
+                    // the annulus outside the next one in, so the bloom is a
+                    // hot white centre with the spectrum ringing out of it —
+                    // a rainbow shockwave, drawn entirely with the nucleus /
+                    // coma idiom this module already uses for the meteor
+                    // head. Six halos, so it costs the same as one more star.
+                    if b.nova && cfg.dark_theme {
+                        let ccov = fcov * RAINBOW_NOVA_CORONA_GAIN;
+                        // SIZED AGAINST THE FAN, not against the flash — the
+                        // third and last thing capture had to teach this
+                        // corona. Tied to the flash radius it topped out at
+                        // roughly half the star fan's reach, i.e. it expanded
+                        // INTO the debris and was read as more debris. A
+                        // shockwave has to outrun what it threw: born inside
+                        // the fan and ending past its rim, on the flash's own
+                        // short clock, so the ring is visibly overtaking the
+                        // stars rather than sitting among them.
+                        let rr = b.reach
+                            * (RAINBOW_NOVA_CORONA_R0
+                                + (RAINBOW_NOVA_CORONA_R - RAINBOW_NOVA_CORONA_R0) * fu);
+                        // A CLOSED POLYLINE, not dots — and that is the whole
+                        // difference. Everything this tier had bought until
+                        // now was MORE of marks the ordinary landing already
+                        // throws by the dozen: a wider fan of the same
+                        // confetti, brighter grains of the same glitter. At a
+                        // full-width fling the plain landing is already at the
+                        // star cap, so "the same, but more" has nowhere left
+                        // to go — photographed side by side at 60, 150 and
+                        // 300 ms it was indistinguishable every time, through
+                        // three separate attempts (nested discs, then beads,
+                        // then a bigger ring of beads).
+                        //
+                        // A supernova needs a mark the landing does NOT have.
+                        // A ring is that mark: one continuous stroke where
+                        // everything else here is a population, expanding past
+                        // the debris it threw. Drawn with the module's own beam
+                        // rasterizer as a 32-gon whose vertex colours walk the
+                        // spectrum the whole way round, so the ring IS the
+                        // rainbow rather than being tinted by one.
+                        let th = (rr * RAINBOW_NOVA_RING_TH).clamp(1.5, chf * 0.5);
+                        let mut ring = Vec::with_capacity(RAINBOW_NOVA_RING_SIDES + 1);
+                        for k in 0..=RAINBOW_NOVA_RING_SIDES {
+                            let f = k as f32 / RAINBOW_NOVA_RING_SIDES as f32;
+                            let ang = (b.seed + f) * TAU;
+                            ring.push(BeamVertex {
+                                x: b.cx + ang.cos() * rr,
+                                // Squashed: a terminal cell is taller than it
+                                // is wide, so a circle in PIXELS reads as a
+                                // tall oval against the grid it explodes on.
+                                y: b.cy + ang.sin() * rr * RAINBOW_NOVA_CORONA_SQUASH,
+                                color: rainbow_gradient_of(&RAINBOW_BANDS, f),
+                                cov: ccov as u8,
+                            });
+                        }
+                        // `straighten: 0` — an RDP pass would flatten the
+                        // polygon it is being handed into a chord.
+                        // `step: 2` — the stroke is 6-16 px thick, so 2 px
+                        // major-axis sampling costs it nothing visible and
+                        // halves a large ring's quad demand, which at full
+                        // radius is the single biggest draw this module makes.
+                        comet_beam(out, geom.beam_clip(), &ring, th, 2, 0.0);
+                        if out.len() >= Self::MAX_QUADS {
+                            return;
+                        }
+                    }
                     if cfg.dark_theme {
                         push_halo(
                             halos,
@@ -12515,9 +12960,35 @@ impl CursorGlow {
                 px = -px;
                 py = -py;
             }
-            // Slim streak at low momentum, a fat rainbow at full heat.
-            let total = chf * (0.36 + 0.34 * j.mom);
-            let head_cov = (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity).clamp(0.0, 255.0);
+            // Slim streak at low momentum, a fat rainbow at full heat — and
+            // BIGGER THE FURTHER IT CAME (owner, 2026-08-10). The grade is a
+            // second, independent term rather than a replacement: a hot fling
+            // is still fatter than a cold one over the same distance, and a
+            // long jump from a cold prompt is still a big jump. A supernova
+            // multiplies what the grade has already earned, so the treat is
+            // visibly the same streak turned up rather than a different mark.
+            let fat = (1.0 + Self::RAINBOW_JUMP_FAT_GAIN * j.grade)
+                * if j.nova { Self::RAINBOW_NOVA_FAT } else { 1.0 };
+            let total = chf * (0.36 + 0.34 * j.mom) * fat;
+            // BRIGHTER too, but the small term of the pair: head coverage
+            // already sits at the transient cap, so pushing it mostly clamps.
+            // The gain is what survives the clamp on a dim/low-intensity
+            // config; the fat above is where the eye actually reads "bigger".
+            //
+            // DARK ONLY. On a white ground "brighter" would mean more
+            // saturated INK, and the light arm's opacity is bounded by
+            // legibility, not by taste — [`LIGHT_INK_ALPHA_CAP`] is the whole
+            // reason that arm exists. So on white the entire big-jump budget
+            // is spent on AREA (the `fat` above, which the light streak and
+            // its nucleus both ride), which is the only currency a white
+            // ground actually has.
+            let bright = if cfg.dark_theme {
+                1.0 + Self::RAINBOW_JUMP_BRIGHT_GAIN * j.grade
+            } else {
+                1.0
+            };
+            let head_cov =
+                (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity * bright).clamp(0.0, 255.0);
             if head_cov < 1.0 {
                 continue;
             }
@@ -12531,7 +13002,8 @@ impl CursorGlow {
             // It is a HALO, not a quad: the nucleus must be round and soft at
             // any jump angle, and the band beam below is the only other thing
             // drawn here, so nothing else claims that centre.
-            let nuc = (RAINBOW_METEOR_NUCLEUS_COV * fade * cfg.intensity).clamp(0.0, 255.0);
+            let nuc =
+                (RAINBOW_METEOR_NUCLEUS_COV * fade * cfg.intensity * bright).clamp(0.0, 255.0);
             if nuc >= 1.0 {
                 let rn = total * RAINBOW_METEOR_NUCLEUS_R * (0.75 + 0.25 * fade);
                 if cfg.dark_theme {
@@ -16760,6 +17232,65 @@ mod tests {
         assert_eq!(cues[0].kind, SoundKind::Typed);
     }
 
+    /// RESPONSIVENESS: `take_key_cue` hands the click back to the host so it can
+    /// reach the synth ON the key thread instead of on the next render tick —
+    /// the last frame of quantization on the audio half of the feedback.
+    ///
+    /// Taking it must change WHO carries the cue and nothing else: the credit
+    /// ledger still mutes the echo (one character, one click), and cues recorded
+    /// earlier stay queued for the frame drain that owns them.
+    #[test]
+    fn take_key_cue_hands_back_the_click_without_touching_the_ledger() {
+        use crate::trail_sound::SoundKind;
+        let mut glow = CursorGlow::default();
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        // An ECHO-born cue the render drain already owns, left undrained.
+        let echo = t0 + Duration::from_millis(1);
+        glow.note_typed(echo);
+        glow.tick(Some((2, 1)), echo, &c, g, &mut out);
+        assert_eq!(
+            glow.sound_cues.len(),
+            1,
+            "precondition: a cue is queued for the frame drain"
+        );
+
+        // The key: record, then take the click straight back.
+        let key = t0 + Duration::from_millis(20);
+        assert!(glow.cue_keystroke(key), "a live engine clicks at the key");
+        let taken = glow.take_key_cue().expect("the key's own cue comes back");
+        assert_eq!(taken.kind, SoundKind::Typed);
+        assert_eq!(
+            taken.col, 1,
+            "…carrying the pre-echo cursor cell, exactly as the drain would have"
+        );
+        assert_eq!(
+            glow.sound_cues.len(),
+            1,
+            "it pops ITS cue — the older one still belongs to the frame drain"
+        );
+
+        // The ledger is untouched: this character's echo stays silent.
+        let key_echo = t0 + Duration::from_millis(45);
+        glow.note_typed(key_echo);
+        glow.tick(Some((2, 2)), key_echo, &c, g, &mut out);
+        let drained: Vec<_> = glow.drain_sound_cues().collect();
+        assert_eq!(
+            drained.len(),
+            1,
+            "only the pre-existing echo cue drains — the credit muted this echo"
+        );
+
+        // And a host that takes with nothing recorded gets nothing.
+        assert!(
+            glow.take_key_cue().is_none(),
+            "an empty queue hands back no click"
+        );
+    }
+
     /// REGRESSION (adversarial review): a printable key whose echo lands as a
     /// JUMP rather than as `typing` must still speak exactly ONCE, and must not
     /// leave its credit behind.
@@ -18632,6 +19163,98 @@ mod tests {
             glow.next_change_deadline(moved, frame),
             Some(moved + CursorGlow::EMBER_POLL_INTERVAL),
             "coarse ember preserves its low-wakeup deadline"
+        );
+    }
+
+    /// RESPONSIVENESS: THE GRACE IS A CAP, NOT A FLOOR. Once the probe shows
+    /// the erase is already on glass, the caret fallback answers on THAT frame
+    /// instead of sitting out the rest of [`CursorGlow::POOF_FALLBACK_GRACE`] —
+    /// the span branch ran on the same probe and declined, so the remaining
+    /// wait bought nothing but latency the user is staring at.
+    ///
+    /// Shape: a reflowing TUI (the case the fallback exists for) replaces the
+    /// caret row with a SHORTER one, so no stable prefix/suffix survives and
+    /// the precise branch cannot answer at any delay.
+    #[test]
+    fn a_witnessed_erase_releases_the_fallback_grace_early() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        glow.observe_row(2, 0, &row("the quick brown fox jumps over it"), t0);
+        glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        // The kill key, and the reflowed (shorter, unrelated) row one frame later.
+        let key = t0 + Duration::from_millis(16);
+        glow.note_kill(key, false);
+        let echo = key + Duration::from_millis(8);
+        glow.observe_row(2, 0, &row("pulled up"), echo);
+        glow.tick(Some((2, 0)), echo, &c, g, &mut out);
+        // PRE-FIX PREDICATE, stated so this cannot pass vacuously: the timed
+        // grace alone is still WIDE open at this instant.
+        assert!(
+            echo.saturating_duration_since(key).as_secs_f32() < CursorGlow::POOF_FALLBACK_GRACE,
+            "precondition: the old timer would still be holding the poof back"
+        );
+        assert!(
+            !glow.vapor.is_empty(),
+            "the erase is on glass, so the poof lands on the frame it happens \
+             — not {} ms later",
+            (CursorGlow::POOF_FALLBACK_GRACE * 1000.0) as u32 - 8
+        );
+        // …and it consumed its licence, so this is still ONE kill, one poof.
+        assert!(glow.kill_hint.is_none(), "the fallback consumed the hint");
+        let answered = glow.vapor.len();
+        let later = echo + Duration::from_millis(120);
+        glow.observe_row(2, 0, &row("pulled up"), later);
+        glow.tick(Some((2, 0)), later, &c, g, &mut out);
+        assert!(
+            glow.vapor.len() <= answered,
+            "the released grace must not license a SECOND poof"
+        );
+    }
+
+    /// …and the release is a WITNESS, not a deletion of the grace. A kill whose
+    /// row has NOT shrunk since the key (an echo-less kill, a repaint that
+    /// changed nothing) still serves the full grace before the caret fallback
+    /// answers — the span branch keeps its first shot exactly where it always
+    /// had one.
+    #[test]
+    fn an_unwitnessed_kill_still_serves_the_full_grace() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        glow.observe_row(2, 7, &row("$ hello world"), t0);
+        glow.tick(Some((2, 7)), t0, &c, g, &mut out);
+        let key = t0 + Duration::from_millis(16);
+        glow.note_kill(key, false);
+        // Inside the grace, row UNCHANGED: no witness, so nothing may fire.
+        let inside = key + Duration::from_millis(8);
+        glow.observe_row(2, 7, &row("$ hello world"), inside);
+        glow.tick(Some((2, 7)), inside, &c, g, &mut out);
+        assert!(
+            glow.vapor.is_empty() && glow.last_poof.is_none(),
+            "no shrink since the key ⇒ the span branch keeps its whole window"
+        );
+        // Past the grace, still unchanged: the timer answers, as it always did.
+        let past = key + Duration::from_millis(70);
+        glow.observe_row(2, 7, &row("$ hello world"), past);
+        glow.tick(Some((2, 7)), past, &c, g, &mut out);
+        assert!(
+            glow.last_poof.is_some(),
+            "the timed grace remains the cap for every unwitnessed case"
         );
     }
 
@@ -21316,6 +21939,7 @@ mod tests {
                 CursorGlow::RAINBOW_BURST_MIN_DIST,
                 (x, 48.0),
                 (40.0, 48.0),
+                false,
             );
             assert!(model.fire("FastJump", &mut state));
             assert_eq!(
@@ -21383,6 +22007,7 @@ mod tests {
             CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (250.0, 48.0),
             (40.0, 48.0),
+            false,
         );
         assert!(model.fire("SlowJump", &mut state));
         assert_eq!(state, before_slow, "slow jump is a modeled no-op");
@@ -21453,6 +22078,7 @@ mod tests {
             CursorGlow::RAINBOW_BURST_MIN_DIST,
             (300.0, 48.0),
             (40.0, 48.0),
+            false,
         );
         assert!(model.fire("FastJump", &mut state));
         assert_eq!(glow.rainbow.bursts.len(), 1);
@@ -21522,6 +22148,7 @@ mod tests {
             CursorGlow::RAINBOW_BURST_MIN_DIST,
             (120.0, 48.0),
             (40.0, 48.0),
+            false,
         );
         assert!(model.fire("JumpTerminus", &mut state));
         assert!(
@@ -21561,6 +22188,7 @@ mod tests {
             CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (120.0, 48.0),
             (40.0, 48.0),
+            false,
         );
         assert!(model.fire("JumpTerminus", &mut state));
         assert!(
@@ -21577,6 +22205,7 @@ mod tests {
             CursorGlow::RAINBOW_BURST_MIN_DIST - 0.1,
             (120.0, 48.0),
             (40.0, 48.0),
+            false,
         );
         assert!(model.fire("JumpTerminus", &mut state));
         assert_eq!(
@@ -23222,19 +23851,486 @@ mod tests {
             born,
             life: 1.0,
             mom: 1.0,
+            grade: 1.0,
+            nova: false,
         });
         let mut zoom = Vec::new();
         let mut zoom_halos = Vec::new();
         glow.emit_rainbow_jumps(born, &c, g, &mut zoom, &mut zoom_halos); // u = 0: full length
         assert!(!zoom.is_empty(), "a fresh streak draws at full length");
-        // Measured demand: 2208 quads graded vs 3829 at the old uniform
-        // step 1 (slab cores plus AA edges and cell-row splits) — the bound
-        // sits between the two with headroom on both sides, so regressing the
-        // tail/mid strides back to 1 trips it.
+        let measure = |grade: f32, nova: bool| {
+            let mut gl = CursorGlow::default();
+            gl.rainbow.jumps.push(JumpStreak {
+                x0: 4.0,
+                y0: 8.0,
+                x1: 292.0,
+                y1: 88.0,
+                born,
+                life: 1.0,
+                mom: 1.0,
+                grade,
+                nova,
+            });
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            gl.emit_rainbow_jumps(born, &c, g, &mut o, &mut h);
+            o.len()
+        };
+        // The bound is stated as the invariant it exists for, not as a magic
+        // number: RAINBOW_JUMP_CAP live streaks at their WORST — a full-width
+        // leap, full momentum, fully graded AND a supernova — must still
+        // leave the landing crown, ring and particles room in MAX_QUADS.
+        //
+        // Measured across the whole fat range at this geometry: 2208 quads at
+        // grade 0, 2628 at grade 1, 2730 graded-and-nova, against 3829 at the
+        // old uniform step 1. The fat gains cost only ~24% because the demand
+        // is dominated by sampling ALONG the streak, which the graded strides
+        // own; thickness mostly widens each slab rather than adding slabs.
+        // The bound sits between 2730 and 3829, so regressing the tail/mid
+        // strides back to 1 still trips it.
+        let worst = measure(1.0, true);
         assert!(
-            zoom.len() < 2600,
-            "graded strides bound the streak's quad demand: {}",
+            zoom.len() < 3000 && worst < 3000,
+            "graded strides bound the streak's quad demand: {} plain, {worst} at \
+             its fattest",
             zoom.len()
+        );
+        assert!(
+            worst * CursorGlow::RAINBOW_JUMP_CAP < CursorGlow::MAX_QUADS * 3 / 4,
+            "and a full cap of the fattest streaks still leaves the landing \
+             payload room: {} of {}",
+            worst * CursorGlow::RAINBOW_JUMP_CAP,
+            CursorGlow::MAX_QUADS
+        );
+    }
+
+    /// OWNER, 2026-08-10: "BIGGER BRIGHTER CURSOR STREAK … when the cursor
+    /// jumps large distances!"
+    ///
+    /// The defect this pins: before the grade, the ZOOM's only distance term
+    /// was its LIFE. A two-cell hop and a screen-crossing fling drew the
+    /// identical bar — the long one merely held it on glass a little longer —
+    /// so the streak said how long you had been jumping, never how far.
+    ///
+    /// Measured as the beam's PERPENDICULAR extent on a horizontal jump, which
+    /// is the thing an eye calls "bigger", rather than as a quad count (which
+    /// a stride change could move without the streak looking any different).
+    #[test]
+    fn a_longer_jump_draws_a_fatter_streak() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let born = Instant::now();
+        // Thickness of the drawn beam, in px, at identical momentum: only the
+        // grade differs between the two runs.
+        let thickness = |grade: f32, nova: bool| {
+            let mut gl = CursorGlow::default();
+            gl.rainbow.jumps.push(JumpStreak {
+                x0: 16.0,
+                y0: 48.0,
+                x1: 300.0,
+                y1: 48.0, // horizontal: perpendicular IS y
+                born,
+                life: 1.0,
+                mom: 0.6,
+                grade,
+                nova,
+            });
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            gl.emit_rainbow_jumps(born, &c, g, &mut o, &mut h);
+            let lo = o.iter().map(|q| u32::from(q.y)).min().unwrap_or(0);
+            let hi = o
+                .iter()
+                .map(|q| u32::from(q.y) + u32::from(q.h))
+                .max()
+                .unwrap_or(0);
+            hi - lo
+        };
+        let hop = thickness(0.0, false);
+        let fling = thickness(1.0, false);
+        let nova = thickness(1.0, true);
+        assert!(
+            fling * 2 > hop * 3,
+            "a fully-graded fling must draw a visibly fatter streak than a bare \
+             jump at the same heat: {fling} vs {hop} px"
+        );
+        assert!(
+            nova * 20 > fling * 27,
+            "and a supernova is fatter still — the same streak turned up, not a \
+             different mark: {nova} vs {fling} px"
+        );
+        // The grade is a SECOND term, not a replacement: heat still matters at
+        // a fixed distance, or a cold screen-crossing jump would look exactly
+        // like a hot one.
+        let cold = {
+            let mut gl = CursorGlow::default();
+            gl.rainbow.jumps.push(JumpStreak {
+                x0: 16.0,
+                y0: 48.0,
+                x1: 300.0,
+                y1: 48.0,
+                born,
+                life: 1.0,
+                mom: 0.0,
+                grade: 1.0,
+                nova: false,
+            });
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            gl.emit_rainbow_jumps(born, &c, g, &mut o, &mut h);
+            let lo = o.iter().map(|q| u32::from(q.y)).min().unwrap_or(0);
+            let hi = o
+                .iter()
+                .map(|q| u32::from(q.y) + u32::from(q.h))
+                .max()
+                .unwrap_or(0);
+            hi - lo
+        };
+        assert!(
+            cold < fling,
+            "momentum still reads at a fixed distance: {cold} cold vs {fling} hot"
+        );
+    }
+
+    /// The white ground buys the SAME "bigger" in the only currency it has.
+    ///
+    /// On dark, a big jump is bought partly as light. On white the light arm's
+    /// opacity is bounded by legibility ([`LIGHT_INK_ALPHA_CAP`]) — that bound
+    /// is the whole reason the arm exists — so the brightness gain is dark-only
+    /// and the entire budget goes to AREA. This pins both halves: the light
+    /// streak really does grow, and it does NOT breach the cap while growing.
+    #[test]
+    fn the_light_ground_grows_the_jump_without_breaching_its_ink_cap() {
+        let g = geom();
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.dark_theme = false;
+        let born = Instant::now();
+        let run = |grade: f32, nova: bool| {
+            let mut gl = CursorGlow::default();
+            gl.rainbow.jumps.push(JumpStreak {
+                x0: 16.0,
+                y0: 48.0,
+                x1: 300.0,
+                y1: 48.0,
+                born,
+                life: 1.0,
+                mom: 0.6,
+                grade,
+                nova,
+            });
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            gl.emit_rainbow_jumps(born, &c, g, &mut o, &mut h);
+            assert!(o.is_empty(), "the light arm draws no additive quads");
+            let span = h.iter().map(|q| u32::from(q.ry)).max().unwrap_or(0);
+            let peak = h.iter().map(|q| (q.color >> 24) & 0xff).max().unwrap_or(0);
+            (span, peak)
+        };
+        let (hop_span, hop_peak) = run(0.0, false);
+        let (nova_span, nova_peak) = run(1.0, true);
+        assert!(
+            nova_span * 2 > hop_span * 3,
+            "a big light jump grows: {nova_span} vs {hop_span} px"
+        );
+        for peak in [hop_peak, nova_peak] {
+            assert!(
+                peak <= LIGHT_INK_ALPHA_CAP as u32,
+                "and never buys its size in ink the reader has to see through: \
+                 {peak} > {LIGHT_INK_ALPHA_CAP}"
+            );
+        }
+    }
+
+    /// THE SUPERNOVA ROLL — the owner's "random effect", and the three things
+    /// that make it safe to be random.
+    #[test]
+    fn the_supernova_rolls_only_for_a_real_leap() {
+        let mut gl = CursorGlow {
+            rng: 0x9E37_79B9,
+            ..CursorGlow::default()
+        };
+        // The xorshift seeds LAZILY inside `observe`, and 0 is its fixed
+        // point — a default engine poked directly returns a constant 0.0
+        // forever. Production can only reach `roll_jump_nova` from inside
+        // `observe`, i.e. always past that seed; a unit test has to do it by
+        // hand or it measures the fixed point instead of the roll.
+        // (1) Never below the floor, however many times it is asked.
+        for _ in 0..500 {
+            assert!(
+                !gl.roll_jump_nova(CursorGlow::RAINBOW_NOVA_MIN_DIST - 0.01),
+                "word-motion editing can never roll a supernova"
+            );
+        }
+        // (2) Never under reduced motion — the shell IS outward movement, and
+        // there is no still frame of it that means anything.
+        let mut reduced = CursorGlow::default();
+        reduced.set_reduced_motion(true);
+        for _ in 0..500 {
+            assert!(!reduced.roll_jump_nova(200.0), "reduced motion never rolls");
+        }
+        // (3) Above the floor it is a TREAT, not the way jumps look: the
+        // observed rate tracks the declared chance.
+        let hits = (0..4000)
+            .filter(|_| gl.roll_jump_nova(CursorGlow::RAINBOW_NOVA_MIN_DIST + 1.0))
+            .count();
+        let rate = hits as f32 / 4000.0;
+        assert!(
+            (rate - CursorGlow::RAINBOW_NOVA_CHANCE).abs() < 0.04,
+            "the roll must honour its declared chance: {rate} vs {}",
+            CursorGlow::RAINBOW_NOVA_CHANCE
+        );
+    }
+
+    /// The supernova's GLITTER SHELL: a ring of the trail's own dust thrown
+    /// radially off the impact, spawned at the SAME edge as the star fan and
+    /// under the same witness — so a nova landing can never arrive without it,
+    /// and an ordinary landing can never grow one.
+    #[test]
+    fn a_supernova_landing_throws_a_rainbow_glitter_shell() {
+        let g = geom();
+        let born = Instant::now();
+        let land = (160.0f32, 48.0f32);
+        let shell = |nova: bool| {
+            let mut gl = CursorGlow::default();
+            arm_rainbow_witnesses(&mut gl, born, 2, 5);
+            gl.emit_rainbow_jump_landing(born, g, 30.0, land, (20.0, 48.0), nova);
+            // Shell grains are the only particles born exactly AT the impact;
+            // the terminus feather scatters around the abandoned head.
+            gl.particles
+                .iter()
+                .filter(|p| (p.x0 - land.0).abs() < 0.01 && (p.y0 - land.1).abs() < 0.01)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            shell(false).is_empty(),
+            "an ordinary landing grows no shell — the treat has to stay a treat"
+        );
+        let grains = shell(true);
+        assert_eq!(
+            grains.len(),
+            CursorGlow::RAINBOW_NOVA_GLITTER,
+            "a supernova throws its whole shell"
+        );
+        // A SHELL, not a fountain: the directions have to reach round the
+        // circle, or it reads as a spray with a favourite side.
+        let mut quadrants = [false; 4];
+        for p in &grains {
+            let q = usize::from(p.vx < 0.0) | (usize::from(p.vy < 0.0) << 1);
+            quadrants[q] = true;
+        }
+        assert!(
+            quadrants.iter().all(|&hit| hit),
+            "the shell must leave in every direction, got {quadrants:?}"
+        );
+        // …and it is the FAMILY's dust: every grain rides the glitter
+        // sentinel, mostly ROUND body with the '+' as an accent.
+        assert!(
+            grains.iter().all(|p| p.cov_scale < 0.9),
+            "shell grains are the trail's own glitter, not a new species"
+        );
+        let rounds = grains
+            .iter()
+            .filter(|p| p.cov_scale < ERASE_ROUND_SCALE_MAX)
+            .count();
+        assert!(
+            rounds * 2 > grains.len(),
+            "sparks are the body and '+' the accent: {rounds} round of {}",
+            grains.len()
+        );
+        // The rainbow is in the COLOUR, walking the spectrum around the ring.
+        let (lo, hi) = grains.iter().fold((f32::MAX, f32::MIN), |(l, h), p| {
+            (l.min(p.hue), h.max(p.hue))
+        });
+        assert!(
+            hi - lo > 0.8,
+            "the shell IS a rainbow coming apart, not a handful of coloured \
+             dots: hue span {}",
+            hi - lo
+        );
+    }
+
+    /// THE SHOCKWAVE — the one mark the ordinary landing does not have, and
+    /// the reason a supernova is legible AS one.
+    ///
+    /// Everything else the tier buys is MORE of something the landing already
+    /// throws by the dozen: a wider fan of the same confetti, brighter grains
+    /// of the same glitter, a bigger bloom. At a screen-crossing fling the
+    /// plain landing is already AT the star cap, so "the same, but more" has
+    /// nowhere left to go — captured side by side at 60, 150 and 300 ms across
+    /// three separate attempts (nested discs, beads, a bigger ring of beads)
+    /// the nova was indistinguishable every time. A ring is one continuous
+    /// stroke where everything else here is a population.
+    ///
+    /// Pinned as a RING, not merely as "some extra quads": a stroke whose
+    /// lit pixels sit in an ANNULUS with a hollow middle, whose colour walks
+    /// the whole spectrum, and which grows over the flash's life to finish
+    /// past the rim the stars are still travelling to.
+    #[test]
+    fn a_supernova_rings_a_rainbow_shockwave_past_its_own_debris() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let born = Instant::now();
+        let reach = 4.5 * g.ch as f32;
+        let shot = |nova: bool, ms: u64| {
+            let mut gl = CursorGlow::default();
+            gl.rainbow.bursts.push(Starburst {
+                cx: 160.0,
+                cy: 48.0,
+                born,
+                life: CursorGlow::RAINBOW_BURST_LIFE,
+                reach,
+                seed: 0.3,
+                stars: CursorGlow::RAINBOW_BURST_STARS as u8,
+                sparkles: 1,
+                nova,
+            });
+            let (mut o, mut h) = (Vec::new(), Vec::new());
+            gl.emit_rainbow_starburst(born + Duration::from_millis(ms), &c, g, &mut o, &mut h);
+            o
+        };
+        // The radial extent of everything drawn, and whether anything at all
+        // is drawn near the centre — a ring is hollow, a fan is not.
+        let annulus = |quads: &[GlowQuad]| {
+            let (mut near, mut far) = (0usize, 0.0f32);
+            for q in quads {
+                let dx = f32::from(q.x) + f32::from(q.w) * 0.5 - 160.0;
+                let dy = f32::from(q.y) + f32::from(q.h) * 0.5 - 48.0;
+                let r = (dx * dx + dy * dy).sqrt();
+                far = far.max(r);
+                if r < reach * 0.18 {
+                    near += 1;
+                }
+            }
+            (near, far)
+        };
+        let (_, plain_far) = annulus(&shot(false, 90));
+        let nova = shot(true, 90);
+        let (nova_near, nova_far) = annulus(&nova);
+        assert!(
+            nova_far > plain_far * 1.3,
+            "the shockwave outruns the debris: {nova_far} vs {plain_far}"
+        );
+        assert!(
+            nova_near * 6 < nova.len(),
+            "and it is a RING, not a disc — {nova_near} of {} quads sit in the \
+             hollow middle",
+            nova.len()
+        );
+        // It EXPANDS: a wave that stood still would be a decoration.
+        let early_q = shot(true, 10);
+        let late_q = shot(true, 200);
+        let (_, early) = annulus(&early_q);
+        let (_, late) = annulus(&late_q);
+        assert!(
+            late > early * 1.5,
+            "the ring has to grow on the flash's clock: {early} -> {late}"
+        );
+        // AND IT PAYS FOR ITSELF. A ring's quad demand grows with its radius,
+        // so the widest frame is the one that could starve the fan drawn after
+        // it. The 2 px major-axis stride is what keeps it affordable; at a
+        // stride of 1 this is twice the number.
+        assert!(
+            late_q.len() < CursorGlow::MAX_QUADS / 4,
+            "the widest shockwave leaves the landing room: {} of {}",
+            late_q.len(),
+            CursorGlow::MAX_QUADS
+        );
+        // The colour walks the WHOLE spectrum, or it is a tinted ring rather
+        // than a rainbow one. Each quad is premultiplied light; a full walk
+        // puts some quad's dominant channel in each of R, G and B.
+        let mut dominant = [false; 3];
+        for q in &nova {
+            let ch = [
+                (q.color >> 16) & 0xff,
+                (q.color >> 8) & 0xff,
+                q.color & 0xff,
+            ];
+            let hi = ch.iter().copied().max().unwrap_or(0);
+            if hi > 24 {
+                for (k, &v) in ch.iter().enumerate() {
+                    if v == hi {
+                        dominant[k] = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            dominant.iter().all(|&hit| hit),
+            "the ring IS the rainbow, not a ring tinted by one: {dominant:?}"
+        );
+        // WHITE GROUND: no ring. It would be a saturated ink band drawn clean
+        // across the reader's own line — the one thing this family may never
+        // do — so the light arm keeps the nova's extra SIZE and none of this.
+        let mut c_light = cfg(GlowStyle::RainbowKitty, true);
+        c_light.dark_theme = false;
+        let mut gl = CursorGlow::default();
+        gl.rainbow.bursts.push(Starburst {
+            cx: 160.0,
+            cy: 48.0,
+            born,
+            life: CursorGlow::RAINBOW_BURST_LIFE,
+            reach,
+            seed: 0.3,
+            stars: 4,
+            sparkles: 0,
+            nova: true,
+        });
+        let (mut lo, mut lh) = (Vec::new(), Vec::new());
+        gl.emit_rainbow_starburst(
+            born + Duration::from_millis(90),
+            &c_light,
+            g,
+            &mut lo,
+            &mut lh,
+        );
+        assert!(
+            lo.is_empty(),
+            "the light ground draws no additive shockwave"
+        );
+        // The bound is the fan's OWN stacked ceiling — the figure a three-lay
+        // plus already composited to, which `the_light_theme_landing_...`
+        // derives and enforces for the ordinary landing. The point here is
+        // that a NOVA does not move it: the brightness half of the tier is
+        // dark-only, so white sees the extra size and none of the extra ink.
+        let stacked_cap = (1.0 - (1.0 - LIGHT_INK_ALPHA_CAP / 255.0).powi(3)) * 255.0;
+        assert!(
+            lh.iter()
+                .all(|q| (1..=(stacked_cap as u32)).contains(&((q.color >> 24) & 0xff))),
+            "and its landing stays inside the fan's own ink ceiling at nova \
+             brightness, exactly as an ordinary one does"
+        );
+    }
+
+    /// The landing's IMPACT grows with the jump too, and the supernova opens
+    /// it wider still — bought as reach and star count, the two things the
+    /// eye reads as size, and never as a longer flash (the bloom must still
+    /// finish before the stars do, or it stops reading as their cause).
+    #[test]
+    fn a_bigger_jump_lands_harder() {
+        let g = geom();
+        let born = Instant::now();
+        let landing = |dist: f32, nova: bool| {
+            let mut gl = CursorGlow::default();
+            arm_rainbow_witnesses(&mut gl, born, 2, 5);
+            gl.emit_rainbow_jump_landing(born, g, dist, (160.0, 48.0), (20.0, 48.0), nova);
+            let b = *gl.rainbow.bursts.first().expect("a witnessed jump lands");
+            (b.reach, b.stars, b.life, b.nova)
+        };
+        let (near_r, near_s, near_life, _) = landing(6.0, false);
+        let (far_r, far_s, far_life, _) = landing(40.0, false);
+        let (nova_r, _nova_s, nova_life, nova_flag) = landing(40.0, true);
+        assert!(
+            far_r > near_r && far_s > near_s,
+            "a longer jump lands wider and throws more: {far_r}/{far_s} vs \
+             {near_r}/{near_s}"
+        );
+        assert!(
+            nova_r > far_r * 1.5 && nova_flag,
+            "and a supernova opens wider than the biggest ordinary landing: \
+             {nova_r} vs {far_r}"
+        );
+        assert_eq!(
+            (near_life, far_life),
+            (nova_life, nova_life),
+            "no landing buys its size in TIME — the bloom still finishes \
+             before the stars"
         );
     }
 
@@ -26276,6 +27372,7 @@ mod tests {
                 seed: i as f32 / 6.0 + 0.05,
                 stars: 2,
                 sparkles: 0,
+                nova: false,
             });
             let (mut out, mut halos) = (Vec::new(), Vec::new());
             glow.emit_rainbow_starburst(born, &c, g, &mut out, &mut halos);
@@ -26840,7 +27937,7 @@ mod tests {
         let mut drained = CursorGlow::default();
         drained.rainbow.disp = 0.3;
         drained.note_typed(t0);
-        drained.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        drained.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0), false);
         assert!(
             drained.particles.is_empty(),
             "a drained ribbon dissolves nothing, however warm the spine or fresh \
@@ -26851,7 +27948,7 @@ mod tests {
         let mut live = CursorGlow::default();
         live.rainbow.disp = 0.3;
         arm_rainbow_witnesses(&mut live, t0, 2, 5);
-        live.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        live.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0), false);
         assert!(
             !live.particles.is_empty(),
             "a live ribbon licenses the terminus scatter"
@@ -26869,7 +27966,7 @@ mod tests {
                 && blipped.rainbow.disp >= CursorGlow::RAINBOW_TERMINUS_MIN_DISP,
             "precondition: both retired proxies are still armed after the blip"
         );
-        blipped.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0));
+        blipped.emit_rainbow_jump_landing(t0, g, 20.0, (300.0, 40.0), (60.0, 40.0), false);
         assert!(
             blipped.particles.is_empty(),
             "and the ribbon-truth gate still refuses — the case the two proxies \
@@ -26989,6 +28086,7 @@ mod tests {
                 seed: 0.3,
                 stars: CursorGlow::RAINBOW_BURST_STARS as u8,
                 sparkles: 0,
+                nova: false,
             });
         };
         let extent = |out: &[GlowQuad]| -> f32 {
@@ -27040,7 +28138,7 @@ mod tests {
         let stars_for = |dist: f32| -> u8 {
             let mut glow = CursorGlow::default();
             arm_rainbow_witnesses(&mut glow, born, 2, 5);
-            glow.emit_rainbow_jump_landing(born, g, dist, (100.0, 40.0), (40.0, 40.0));
+            glow.emit_rainbow_jump_landing(born, g, dist, (100.0, 40.0), (40.0, 40.0), false);
             glow.rainbow.bursts.first().map_or(0, |b| b.stars)
         };
         assert_eq!(
@@ -27088,6 +28186,7 @@ mod tests {
                 seed: 0.3,
                 stars: CursorGlow::RAINBOW_BURST_STARS as u8,
                 sparkles: 0,
+                nova: false,
             });
         };
 
@@ -27366,6 +28465,8 @@ mod tests {
             born,
             life: 0.4,
             mom: 1.0,
+            grade: 1.0,
+            nova: false,
         };
         let c_dark = cfg(GlowStyle::RainbowKitty, true);
         let dark = CursorGlow {
@@ -28659,6 +29760,7 @@ mod tests {
             seed,
             stars,
             sparkles,
+            nova: false,
         };
         let emit = |dark: bool, b: Starburst| -> (Vec<GlowQuad>, Vec<RainHalo>) {
             let mut c = cfg(GlowStyle::RainbowKitty, true);

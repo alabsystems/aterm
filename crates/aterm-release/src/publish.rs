@@ -42,6 +42,10 @@ use crate::{buildplan, bundle, changelog, dmg, gates, manifest_out, mirror, sign
 /// CLI parse table in tests/resume.rs.)
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CutOptions {
+    /// Path to the ONE credentials profile (`--release-credentials`). A PATH only
+    /// here: the loaded material lives in `CutCtx`, and only the derived public
+    /// identity is ever journaled.
+    pub release_credentials: Option<PathBuf>,
     /// Gates + provisional n + full local build into dist/ — zero commits,
     /// zero network mutations (the one network touch is the gates' fetch).
     pub dry_run: bool,
@@ -2813,59 +2817,27 @@ fn signer_tool(repo: &Path) -> Result<PathBuf> {
     ))
 }
 
+/// The loaded signing identity. There is no longer a `tool` or a `key_path`: the
+/// key is held in memory by [`sign::ReleaseCredentials`], loaded once from the path
+/// given to `--release-credentials`, and signing happens in-process. The old shape
+/// carried a PATH and shelled out to `atpkg-keys pubkey`, which meant a release could
+/// not be cut without a second binary built and present.
 struct SigningMaterial {
-    tool: PathBuf,
-    key_path: String,
     pubkey: String,
 }
 
-fn load_signing_material(repo: &Path) -> Result<Option<SigningMaterial>> {
-    let conf = sign::load_default()?;
-    let configured_pubkey = conf
-        .as_ref()
-        .and_then(|conf| conf.get("ATERM_UPDATE_PUBKEY"))
-        .filter(|value| !value.is_empty());
-    let key_path = conf
-        .as_ref()
-        .and_then(|conf| conf.get("ATERM_UPDATE_SIGN_KEY"))
-        .filter(|value| !value.is_empty());
-    if configured_pubkey.is_none() && key_path.is_none() {
+/// Derive the signing identity from the credentials supplied on the command line.
+///
+/// `None` means no `--release-credentials` was given — legal only for an unpinned
+/// channel, which `committed_channel_signature_policy` decides, not this function.
+/// Nothing here reads the filesystem or the environment: whether a machine can cut
+/// is now a property of the command that ran, not of ambient state.
+fn load_signing_material(creds: Option<&sign::ReleaseCredentials>) -> Result<Option<SigningMaterial>> {
+    let Some(creds) = creds else {
         return Ok(None);
-    }
-    let (Some(configured_pubkey), Some(key_path)) = (configured_pubkey, key_path) else {
-        return Err(Error::new(
-            "Tier-SIG configuration is incomplete: both ATERM_UPDATE_PUBKEY and \
-             ATERM_UPDATE_SIGN_KEY are required; no ledger claim was made",
-        ));
     };
-    let configured_pubkey = canonical_update_pubkey(configured_pubkey)?;
-    let tool = signer_tool(repo)?;
-    let derived = Command::new(&tool)
-        .arg("pubkey")
-        .arg(key_path)
-        .output()
-        .map_err(|error| Error::new(format!("spawn {} pubkey: {error}", tool.display())))?;
-    if !derived.status.success() {
-        return Err(Error::new(
-            "atpkg-keys could not derive the configured signing key's public identity \
-             (private key path and tool stderr suppressed); recover the offline key before cutting",
-        ));
-    }
-    let actual_pubkey = canonical_update_pubkey(
-        std::str::from_utf8(&derived.stdout)
-            .map_err(|_| Error::new("atpkg-keys pubkey returned non-UTF-8 output"))?
-            .trim(),
-    )?;
-    if actual_pubkey != configured_pubkey {
-        return Err(Error::new(
-            "ATERM_UPDATE_PUBKEY does not match the actual configured signing key; refusing \
-             key substitution or an unverifiable release (key values suppressed)",
-        ));
-    }
     Ok(Some(SigningMaterial {
-        tool,
-        key_path: key_path.to_string(),
-        pubkey: actual_pubkey,
+        pubkey: canonical_update_pubkey(creds.pubkey())?,
     }))
 }
 
@@ -3865,7 +3837,10 @@ fn verify_release_asset_digest_inner(
     }
 }
 
-fn preflight_signature_policy(repo: &Path) -> Result<SignaturePolicy> {
+fn preflight_signature_policy(
+    repo: &Path,
+    creds: Option<&sign::ReleaseCredentials>,
+) -> Result<SignaturePolicy> {
     // Signing is opt-in UNLESS the workspace commits a channel pin. Without
     // `[workspace.metadata.aterm] update_channel_pubkey` the channel is Tier
     // REPO (SHA-256 + monotonic build number); no signing key is required to
@@ -3878,7 +3853,7 @@ fn preflight_signature_policy(repo: &Path) -> Result<SignaturePolicy> {
     // reopened to unsigned bytes by any pipeline flavor.
     committed_channel_signature_policy(
         workspace_channel_pubkey(repo)?.as_deref(),
-        load_signing_material(repo)?
+        load_signing_material(creds)?
             .as_ref()
             .map(|material| material.pubkey.as_str()),
     )
@@ -3889,7 +3864,13 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
         .signature_pubkey
         .as_deref()
         .ok_or_else(|| Error::new("signature-required cut has no persisted channel public key"))?;
-    let material = load_signing_material(&ctx.repo)?.ok_or_else(|| {
+    let creds = ctx.credentials.as_ref().ok_or_else(|| {
+        Error::new(
+            "signature-required cut has no credentials; pass --release-credentials <path> \
+             (it is required on resume and recovery too, not only on the fresh cut)",
+        )
+    })?;
+    let material = load_signing_material(Some(creds))?.ok_or_else(|| {
         Error::new("signature-required resume needs the recovered offline signing configuration")
     })?;
     if material.pubkey != expected_pubkey {
@@ -3898,23 +3879,15 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
              refusing key substitution",
         ));
     }
+    // Signed IN-PROCESS. This used to spawn `atpkg-keys sign` with the private key's
+    // PATH on the command line — visible in a process listing, and unusable unless a
+    // second binary happened to be built.
     let signature = manifest.with_extension("toml.sig");
-    let out = Command::new(&material.tool)
-        .arg("sign")
-        .arg(&material.key_path)
-        .arg(manifest)
-        .arg(&signature)
-        .output()
-        .map_err(|error| Error::new(format!("spawn {} sign: {error}", material.tool.display())))?;
-    if !out.status.success() {
-        return Err(Error::new(
-            "atpkg-keys sign failed (private key path and tool stderr suppressed)",
-        ));
-    }
     let manifest_bytes = fs::read(manifest)
         .map_err(|error| Error::new(format!("read {}: {error}", manifest.display())))?;
-    let signature_bytes = fs::read(&signature)
-        .map_err(|error| Error::new(format!("read {}: {error}", signature.display())))?;
+    let signature_bytes = creds.sign(&manifest_bytes).map_err(Error::new)?;
+    fs::write(&signature, &signature_bytes)
+        .map_err(|error| Error::new(format!("write {}: {error}", signature.display())))?;
     verify_detached_manifest_signature(expected_pubkey, &manifest_bytes, &signature_bytes)?;
     step(
         "",
@@ -4100,6 +4073,12 @@ pub fn monotonic_ok(n: u64, our_tag: &str, best: Option<(&str, u64)>) -> Result<
 /// Everything the pipeline steps share, resolved once up front (or from the
 /// journal on `--resume`).
 pub struct CutCtx {
+    /// The signing material, loaded ONCE from `--release-credentials` at the entry
+    /// point and carried for the life of the cut. Never serialized: the Journal keeps
+    /// only `signature_pubkey`, the public identity. A path would prove nothing —
+    /// file contents change between reading and signing — so the identity is what is
+    /// recorded and matched.
+    pub credentials: Option<sign::ReleaseCredentials>,
     pub repo: PathBuf,
     pub dist: PathBuf,
     pub journal_path: PathBuf,
@@ -4892,6 +4871,7 @@ pub fn run_recover_lost(
     version: &str,
     owner: &str,
     old_process_stopped: bool,
+    credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
     if !old_process_stopped {
         return Err(Error::new(RECOVERY_STOPPED_PROCESS_REFUSAL));
@@ -4962,7 +4942,7 @@ pub fn run_recover_lost(
     // Validate the immutable signing identity before rotating a killed
     // process's token.  Missing key recovery therefore leaves the old fence
     // untouched and the channel visibly blocked, never silently unsigned.
-    let signature_policy = preflight_signature_policy(repo)?;
+    let signature_policy = preflight_signature_policy(repo, credentials)?;
     if let Some(journal) = &journal
         && (journal.signature_required != signature_policy.required
             || journal.signature_pubkey.as_deref() != signature_policy.pubkey.as_deref())
@@ -4989,13 +4969,16 @@ pub fn run_recover_lost(
     {
         confirm_release_lease_owner(&git, &owner).and_then(|lease| {
             resume_cut(
-                repo,
-                &repo.join("dist"),
-                &journal_path,
+                ResumePaths {
+                    repo,
+                    dist: &repo.join("dist"),
+                    journal_path: &journal_path,
+                },
                 &slug,
                 journal,
                 Instant::now(),
                 Some((lease, fence.clone())),
+                credentials,
             )
         })
     } else {
@@ -5011,6 +4994,7 @@ pub fn run_recover_lost(
                 abandoned_journal,
             },
             &fence,
+            credentials,
         )
     };
     combine_with_fence_release(result, &git, &fence)
@@ -5030,6 +5014,7 @@ fn recover_under_fence(
     slug: &str,
     plan: LostRecoveryPlan<'_>,
     fence: &PublisherFenceGuard,
+    credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
     let LostRecoveryPlan {
         version,
@@ -5045,7 +5030,7 @@ fn recover_under_fence(
     let tag = format!("v{version}");
     match verify::release_state(slug, &tag)? {
         verify::ReleaseState::Published => {
-            let fresh_policy = fresh_published_recovery_signature_policy(repo, slug, version)?;
+            let fresh_policy = fresh_published_recovery_signature_policy(repo, slug, version, credentials)?;
             recover_published_cut(
                 repo,
                 slug,
@@ -5055,6 +5040,7 @@ fn recover_under_fence(
                 &fresh_policy,
                 lease,
                 fence.clone(),
+                credentials,
             )
         }
         verify::ReleaseState::Draft | verify::ReleaseState::Absent => {
@@ -5098,7 +5084,7 @@ fn recover_under_fence(
                 }
                 verify::ReleaseState::Published => {
                     let fresh_policy =
-                        fresh_published_recovery_signature_policy(repo, slug, version)?;
+                        fresh_published_recovery_signature_policy(repo, slug, version, credentials)?;
                     return recover_published_cut(
                         repo,
                         slug,
@@ -5108,6 +5094,7 @@ fn recover_under_fence(
                         &fresh_policy,
                         lease,
                         fence.clone(),
+                        credentials,
                     );
                 }
             }
@@ -5139,6 +5126,7 @@ fn fresh_published_recovery_signature_policy(
     repo: &Path,
     slug: &str,
     version: &str,
+    credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<SignaturePolicy> {
     let state = verify::release_state(slug, &format!("v{version}"))?;
     if state != verify::ReleaseState::Published {
@@ -5146,7 +5134,7 @@ fn fresh_published_recovery_signature_policy(
             "recovery release v{version} changed away from Published while refreshing its signature authority"
         )));
     }
-    preflight_signature_policy(repo)
+    preflight_signature_policy(repo, credentials)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5159,6 +5147,7 @@ fn recover_published_cut(
     signature_policy: &SignaturePolicy,
     lease: ReleaseLeaseGuard,
     fence: PublisherFenceGuard,
+    credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
     let git = GitCli::new(repo);
     assert_publisher_session(&git, &lease, &fence)?;
@@ -5330,6 +5319,7 @@ fn recover_published_cut(
         ),
     );
     let mut ctx = CutCtx {
+        credentials: credentials.cloned(),
         repo: repo.to_path_buf(),
         dist,
         journal_path,
@@ -5368,6 +5358,16 @@ fn recover_published_cut(
 /// bumping Cargo.toml therefore lands on the already-published guard in
 /// [`verify::derive_cut_mode`], which names the bump.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
+    // Loaded ONCE, here, from the path on the command line. Every later stage —
+    // build, resume, recovery, flip — reads this value rather than re-discovering
+    // credentials, so a cut cannot change identity halfway through.
+    let credentials = opts
+        .release_credentials
+        .as_deref()
+        .map(sign::ReleaseCredentials::load)
+        .transpose()
+        .map_err(Error::new)?;
+    let credentials = credentials.as_ref();
     let t0 = Instant::now();
     let dist = repo.join("dist");
     let journal_path = dist.join("cut-state.toml");
@@ -5419,7 +5419,18 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                     .to_string(),
             ));
         }
-        return resume_cut(repo, &dist, &journal_path, &origin_slug, j, t0, None);
+        return resume_cut(
+            ResumePaths {
+                repo,
+                dist: &dist,
+                journal_path: &journal_path,
+            },
+            &origin_slug,
+            j,
+            t0,
+            None,
+            credentials,
+        );
     }
     if let Some(j) = &existing {
         match j.first_incomplete() {
@@ -5606,7 +5617,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     };
     let newest_channel = channel.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    let signature_policy = preflight_signature_policy(repo)?;
+    let signature_policy = preflight_signature_policy(repo, credentials)?;
     step(
         "signature",
         &match (
@@ -5710,6 +5721,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let min_build = effective_min_build(opts.min_build, newest_min_build, build)?;
 
     let mut ctx = CutCtx {
+        credentials: credentials.cloned(),
         repo: repo.to_path_buf(),
         dist,
         journal_path: journal_path.clone(),
@@ -5768,15 +5780,28 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
 
 /// `--resume`: rebuild the context from the journal and re-enter at the first
 /// incomplete step (spec §5).
+/// The three PATHS a resume works over, bundled because they always travel
+/// together and are always derived from the same repo root — passing them
+/// singly is what pushed this signature past the argument-count bar.
+struct ResumePaths<'a> {
+    repo: &'a Path,
+    dist: &'a Path,
+    journal_path: &'a Path,
+}
+
 fn resume_cut(
-    repo: &Path,
-    dist: &Path,
-    journal_path: &Path,
+    paths: ResumePaths<'_>,
     origin_slug: &str,
     journal: Journal,
     t0: Instant,
     recovered_session: Option<(ReleaseLeaseGuard, PublisherFenceGuard)>,
+    credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
+    let ResumePaths {
+        repo,
+        dist,
+        journal_path,
+    } = paths;
     journal.ensure_resumable()?;
     let Some(next) = journal.first_incomplete() else {
         return Err(Error::new(
@@ -5801,7 +5826,7 @@ fn resume_cut(
     // signing key. The claim-commit/clean-tree proof above applies to every
     // resume, including late upload/flip/verify entries.
     if !journal.is_done("build") && journal.signature_required {
-        let material = load_signing_material(repo)?.ok_or_else(|| {
+        let material = load_signing_material(credentials)?.ok_or_else(|| {
             Error::new(
                 "signature-required resume cannot rebuild without the recovered offline signing configuration",
             )
@@ -5816,6 +5841,7 @@ fn resume_cut(
     let (lease, fence) =
         recovered_session.map_or((None, None), |(lease, fence)| (Some(lease), Some(fence)));
     let mut ctx = CutCtx {
+        credentials: credentials.cloned(),
         repo: repo.to_path_buf(),
         dist: dist.to_path_buf(),
         journal_path: journal_path.to_path_buf(),
@@ -6004,7 +6030,7 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
-    let observed = preflight_signature_policy(&ctx.repo)?;
+    let observed = preflight_signature_policy(&ctx.repo, ctx.credentials.as_ref())?;
     if observed.required != ctx.signature_required
         || observed.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
@@ -6113,20 +6139,10 @@ fn run_gate_script(repo: &Path) -> Result<()> {
 /// notarize hook → provenance → manifest + notes. One re-enterable unit whose
 /// outputs are all functions of (version, build_number, claim commit).
 fn step_build(ctx: &mut CutCtx) -> Result<()> {
-    let conf = sign::load_default()?;
-    let mut build_env = conf
-        .as_ref()
-        .map(sign::ReleaseConf::env_pins)
-        .unwrap_or_default();
-    if ctx.signature_required {
-        build_env.retain(|(key, _)| key != "ATERM_UPDATE_PUBKEY");
-        build_env.push((
-            "ATERM_UPDATE_PUBKEY".to_string(),
-            ctx.signature_pubkey
-                .clone()
-                .ok_or_else(|| Error::new("signed build has no persisted public key"))?,
-        ));
-    }
+    // No ambient credentials, and no trust anchors injected into the child build.
+    // Both anchors are committed constants (`aterm_update_core::pins`) that the
+    // child compiles in directly, so exporting them here would only create a second
+    // source that could disagree with the first — the exact bug 068a6e2c removed.
 
     step(
         "build",
@@ -6141,7 +6157,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         build_number: ctx.build,
         short_version: ctx.version.clone(),
         arm64_only: ctx.arm64_only,
-        extra_env: build_env,
         expected_update_pin_sha256: ctx
             .signature_pubkey
             .as_deref()
@@ -6188,17 +6203,13 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // than silently shipping either half.
     let seed = match crate::seedpack::resolve(&ctx.dist) {
         Some(dir) => {
-            let root_key = conf
-                .as_ref()
-                .and_then(|c| c.get("ATERM_PKG_ROOTKEY"))
-                .map(str::trim)
-                .filter(|k| !k.is_empty())
-                .map(str::to_string)
-                .or_else(|| {
-                    std::env::var("ATERM_PKG_ROOTKEY")
-                        .ok()
-                        .filter(|k| !k.is_empty())
-                });
+            // The committed anchor, not conf and not $ATERM_PKG_ROOTKEY. The env
+            // fallback here was the last place an environment variable could decide
+            // which root a sealed seed trusts.
+            let root_key = {
+                let k = aterm_update_core::pins::PKG_ROOT_PUBKEY;
+                (!k.is_empty()).then(|| k.to_string())
+            };
             let Some(root_key) = root_key else {
                 return Err(Error::new(format!(
                     "{} is present but no ATERM_PKG_ROOTKEY is configured (release.conf or env) — \
@@ -6240,7 +6251,9 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
-    let sign_id = conf.as_ref().and_then(|c| c.sign_id()).map(str::to_string);
+    // Tier APPLE is off (`pins::APPLE_TEAM_ID` is empty), so there is no
+    // Developer-ID identity: the bundle is signed ad-hoc, as it ships today.
+    let sign_id: Option<String> = None;
     let signed_by = sign::sign_app(
         &app,
         &ctx.repo.join("apps/aterm-mac/aterm.entitlements"),
@@ -6257,7 +6270,10 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     );
 
     let dout = dmg::create(&app, &ctx.dist, &ctx.version)?;
-    sign::sign_and_notarize_dmg(&dout.path, conf.as_ref())?;
+    // Tier APPLE is off: `pins::APPLE_TEAM_ID` is empty and aterm ships ad-hoc, so
+    // there is no Developer-ID identity to pass. Turning it on is a reviewed change
+    // that adds the anchor AND the credentials together.
+    sign::sign_and_notarize_dmg(&dout.path, None)?;
     // Re-hash AFTER the Dev-ID hook: codesign REWRITES the DMG bytes (and the
     // notarization staple appends its ticket), so the digest dmg::create
     // minted covers the pre-hook bytes only. The manifest sha256 must be
@@ -6358,7 +6374,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         )?
         .unwrap_or_else(|| ctx.slug.clone()),
         min_os: &min_os,
-        team_id: &manifest_team_id(conf.as_ref()),
+        team_id: aterm_update_core::pins::APPLE_TEAM_ID,
         pub_date: &bundle::epoch_to_rfc3339(unix_now()),
         min_build: ctx.min_build,
         changelog: &body,
@@ -6398,34 +6414,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     }
     Ok(())
 }
-
-/// team_id for the manifest: `""` = ad-hoc tier (the shipped default). When a
-/// Dev-ID identity is configured, prefer the explicit conf keys, else parse
-/// the "(TEAMID)" suffix of the identity, in that order.
-fn manifest_team_id(conf: Option<&sign::ReleaseConf>) -> String {
-    let Some(c) = conf else { return String::new() };
-    let Some(id) = c.sign_id() else {
-        return String::new();
-    };
-    for key in ["ATERM_TEAM_ID", "ATERM_EXPECTED_TEAM_ID"] {
-        if let Some(t) = c.get(key)
-            && !t.is_empty()
-        {
-            return t.to_string();
-        }
-    }
-    // "(ABCDE12345)" — exactly 10 uppercase alphanumerics.
-    id.split('(')
-        .filter_map(|part| part.split(')').next())
-        .find(|t| {
-            t.len() == 10
-                && t.bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        })
-        .map(str::to_string)
-        .unwrap_or_default()
-}
-
 /// Step "selfcheck" (spec §7 step 4): triple build-number agreement
 /// (binary == plist == manifest == n), DMG digest, codesign, the shared +
 /// vendored-v0.25 manifest proof, and the client-rule monotonic check.

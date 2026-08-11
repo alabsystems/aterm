@@ -209,8 +209,11 @@ fn socket_from_line(line: &str) -> Option<String> {
 /// Spawn level 0 directly, returning (child, socket-path). Reads the child's stderr
 /// until the "listening at" line (then stops, leaving the child running).
 fn spawn_root(gui: &Path) -> io::Result<(std::process::Child, String)> {
+    // Headless via the FLAG — the canonical arming ($ATERM_HEADLESS is an exact
+    // equivalent). The launch announces the mode on stderr, on the line before
+    // the "listening at" line this function scans for.
     let mut child = Command::new(gui)
-        .env("ATERM_HEADLESS", "1")
+        .arg("--headless")
         .env("ATERM_LINES", "40")
         .env("ATERM_COLUMNS", "120")
         .stdin(Stdio::null())
@@ -331,9 +334,12 @@ fn spawn_child(parent_sock: &str, gui: &Path, errfile: &str) -> io::Result<Strin
     // depth>=2 nesting. (Manual concatenation; `fmt::Arguments` is
     // unlowerable for the verifier.)
     let mut launch = String::new();
-    launch.push_str("ATERM_HEADLESS=1 ATERM_LINES=40 ATERM_COLUMNS=120 ");
+    launch.push_str("ATERM_LINES=40 ATERM_COLUMNS=120 ");
     launch.push_str(&sh_quote(&g));
-    launch.push_str(" 2>");
+    // Headless via the FLAG (see `spawn_root`): the inner instance must never
+    // depend on the outer's environment, which CONSUMED `ATERM_HEADLESS` at its
+    // own boot precisely so a nested aterm is not a surprise headless engine.
+    launch.push_str(" --headless 2>");
     launch.push_str(&sh_quote(errfile));
     type_line(parent_sock, &launch)?;
     let deadline = Instant::now() + Duration::from_secs(20);

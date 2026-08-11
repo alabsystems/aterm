@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
@@ -23,6 +23,109 @@ use crate::{
     App, Backend, BackendSlot, CloseOutcome, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget,
     Session, TabIndex, WindowId, WindowState, pane, seed_cell_px,
 };
+
+/// A screen's usable placement rectangle in LOGICAL POINTS, top-left origin with
+/// y growing DOWN — the space [`Window::outer_position`] reports once converted to
+/// logical, so an anchor position, a window size, and this rectangle are directly
+/// comparable. On macOS it excludes the menu bar and the Dock
+/// ([`AppRt::window_work_area_pts`]); elsewhere it is the full monitor rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WorkAreaPts {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+}
+
+/// How far down-and-right of the window it was opened from a new window is placed,
+/// in LOGICAL POINTS. Sized to clear a standard titlebar, so the previous window
+/// keeps a graspable strip of its own frame (and its traffic lights) visible —
+/// which is the whole point: a new window must never sit exactly on top of the one
+/// the user was just looking at. Roughly what AppKit's own `cascadeTopLeftFromPoint:`
+/// steps by, and what Terminal/Finder cascade by.
+const CASCADE_STEP_PTS: f64 = 26.0;
+
+/// The smallest slice of a cascaded frame that must stay inside the work area, in
+/// points: enough of its top-left corner to see it and grab it.
+///
+/// A cascaded window is deliberately ALLOWED to hang past the right and bottom
+/// edges — macOS places windows that way, and permitting it is what keeps the
+/// cascade meaningful for a parent that already fills the screen. Wrapping on "the
+/// whole frame no longer fits" would send a work-area-sized window straight back to
+/// the work area's origin: exactly on top of the window it was supposed to clear.
+const CASCADE_MIN_VISIBLE_PTS: f64 = 160.0;
+
+/// Where a freshly-created window goes so it does not eclipse `anchor` (the outer
+/// top-left, in points, of the window it was opened from).
+///
+/// A diagonal step down-right, wrapped PER AXIS back to the work area's edge once
+/// the step would push the frame's grabbable corner ([`CASCADE_MIN_VISIBLE_PTS`])
+/// off that edge: the cascade marches down-right, returns to the top of the screen
+/// when it runs out of height (keeping its column, so the run continues rightwards)
+/// and to the left when it runs out of width. Same shape as AppKit's own cascade,
+/// and it can never march unboundedly off-screen. The final clamp is the fail-safe
+/// for an anchor that is itself off the work area (a window dragged nearly
+/// off-screen, or left behind by a display change).
+///
+/// `None` for degenerate geometry (a non-finite coordinate, a negative frame, or an
+/// empty work area — e.g. a monitor winit reports as 0×0); the caller then leaves
+/// the OS placement alone rather than moving the window somewhere nonsensical.
+#[must_use]
+fn cascade_top_left_pts(
+    anchor: (f64, f64),
+    step: f64,
+    window: (f64, f64),
+    area: WorkAreaPts,
+) -> Option<(f64, f64)> {
+    let finite = [
+        anchor.0, anchor.1, step, window.0, window.1, area.x, area.y, area.w, area.h,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    if !finite || area.w <= 0.0 || area.h <= 0.0 || window.0 < 0.0 || window.1 < 0.0 {
+        return None;
+    }
+    // A frame smaller than the grabbable minimum must be kept whole, not have a
+    // phantom 160 pt demanded of it.
+    let keep_x = window.0.min(CASCADE_MIN_VISIBLE_PTS);
+    let keep_y = window.1.min(CASCADE_MIN_VISIBLE_PTS);
+    let mut x = anchor.0 + step;
+    let mut y = anchor.1 + step;
+    if x + keep_x > area.x + area.w {
+        x = area.x;
+    }
+    if y + keep_y > area.y + area.h {
+        y = area.y;
+    }
+    Some((
+        x.clamp(area.x, (area.x + area.w - keep_x).max(area.x)),
+        y.clamp(area.y, (area.y + area.h - keep_y).max(area.y)),
+    ))
+}
+
+/// Which existing window a new one cascades off, given the MRU focus stack and the
+/// ids of the windows that actually own an OS window (ASCENDING — `App.windows` is
+/// a `BTreeMap`, so its key order already is).
+///
+/// Most-recently-focused first, because that is the window the user was in; the
+/// highest attached id otherwise, which is the most recently CREATED window and
+/// therefore where an unfocused burst (session restore) last placed a frame.
+/// Excluding `new` is load-bearing, not defensive: `frontmost_window` — and, once
+/// the OS focuses it, `focus_order` — name the new window itself, and cascading a
+/// window off its own position would step it away from nothing on every attach.
+#[must_use]
+fn cascade_anchor_of(
+    new: WindowId,
+    focus_order: &[WindowId],
+    attached: &[WindowId],
+) -> Option<WindowId> {
+    focus_order
+        .iter()
+        .rev()
+        .find(|wid| **wid != new && attached.contains(wid))
+        .or_else(|| attached.iter().rev().find(|wid| **wid != new))
+        .copied()
+}
 
 /// Authority currently owning the native window title.
 ///
@@ -376,6 +479,110 @@ impl App {
         // and still far earlier than any overlay can be opened.
     }
 
+    /// The window a NEW window should be offset from: the most recently FOCUSED
+    /// other window that still owns an OS window, falling back to the highest-id
+    /// other attached window when no focus history exists (a restore loop creating
+    /// several windows back-to-back, or a control-driven open before any
+    /// `Focused(true)` arrives).
+    ///
+    /// `frontmost_window` is deliberately NOT the source: every creation path
+    /// re-points it at the brand-new window BEFORE the OS surface attaches, so it
+    /// would name the very window being placed. `focus_order`'s last entry is still
+    /// the window the user was actually in — the new one is not in it yet, since
+    /// nothing has focused it. `None` means this is the only window on glass:
+    /// nothing to avoid, so the OS's own (centred) placement stands.
+    fn cascade_anchor_window(&self, new: WindowId) -> Option<Arc<Window>> {
+        let attached: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, ws)| ws.os_window.is_some())
+            .map(|(wid, _)| *wid)
+            .collect();
+        let anchor = cascade_anchor_of(new, &self.focus_order, &attached)?;
+        self.windows.get(&anchor)?.os_window.clone()
+    }
+
+    /// The usable placement rectangle of the screen `window` occupies, in points:
+    /// the real work area when the platform can measure one (macOS: menu bar and
+    /// Dock excluded), else the winit monitor rectangle — the FULL display. Off
+    /// macOS that fallback only makes the cascade wrap a little later than it
+    /// ideally would; it never places a window wrongly.
+    fn work_area_pts(&self, window: &Window) -> Option<WorkAreaPts> {
+        if let Some(area) = self.apprt.window_work_area_pts(window) {
+            return Some(area);
+        }
+        let monitor = window.current_monitor()?;
+        let scale = monitor.scale_factor();
+        let origin = monitor.position().to_logical::<f64>(scale);
+        let size = monitor.size().to_logical::<f64>(scale);
+        Some(WorkAreaPts {
+            x: origin.x,
+            y: origin.y,
+            w: size.width,
+            h: size.height,
+        })
+    }
+
+    /// Offset a freshly created 2nd..Nth window down-and-right of the window it was
+    /// opened from, so that window stays visible behind it.
+    ///
+    /// winit gives a window it creates with no explicit position the OS default
+    /// placement, and on macOS that is `NSWindow::center` — so a new window, which
+    /// inherits the front window's grid and therefore its exact size, lands
+    /// pixel-perfectly ON TOP of it and Cmd-N reads as "nothing happened". Every
+    /// new-window path funnels through `attach_os_window`, so placing it there
+    /// covers Cmd-N, Move Tab to New Window, Open Session in New Window, and the
+    /// restore loop's extra windows alike.
+    ///
+    /// Called AFTER the real frame size is known (the frame is what decides where
+    /// the cascade must wrap) and BEFORE the surface exists, so no present has
+    /// happened yet and the window never visibly hops. Best-effort in every
+    /// direction — no other window (the first window), an unreadable position, or
+    /// degenerate screen geometry all simply leave the OS placement in force.
+    /// Callers carrying an EXPLICIT position (session restore, the seamless-update
+    /// window carry) apply theirs after the attach and deliberately win over this.
+    fn cascade_window_placement(&self, new: WindowId, window: &Window) {
+        let Some(anchor) = self.cascade_anchor_window(new) else {
+            return;
+        };
+        let Ok(anchor_origin) = anchor.outer_position() else {
+            return;
+        };
+        let Some(area) = self.work_area_pts(&anchor) else {
+            return;
+        };
+        // Points, not pixels: the anchor and the new window can sit on displays with
+        // different scale factors, and winit's physical coordinates are each scaled
+        // by their own display's factor — only the logical space is common.
+        let anchor_pts = anchor_origin.to_logical::<f64>(anchor.scale_factor());
+        let frame_pts = window.outer_size().to_logical::<f64>(window.scale_factor());
+        let Some((x, y)) = cascade_top_left_pts(
+            (anchor_pts.x, anchor_pts.y),
+            CASCADE_STEP_PTS,
+            (frame_pts.width, frame_pts.height),
+            area,
+        ) else {
+            return;
+        };
+        // Where a window lands is otherwise invisible to everything but the eye:
+        // no control verb reports a frame's screen origin, and the OS placement it
+        // replaces leaves no trace. One `$ATERM_LOG=debug` record (coordinates and
+        // screen metrics only — never window content) makes the decision auditable.
+        aterm_log::debug!(
+            "window {} placed at ({x:.0},{y:.0}) pt, cascaded from ({:.0},{:.0}) — frame {:.0}x{:.0} in work area {:.0}x{:.0}+{:.0}+{:.0}",
+            new.0,
+            anchor_pts.x,
+            anchor_pts.y,
+            frame_pts.width,
+            frame_pts.height,
+            area.w,
+            area.h,
+            area.x,
+            area.y
+        );
+        window.set_outer_position(LogicalPosition::new(x, y));
+    }
+
     /// Create the OS window + present surface for logical window `wid` and attach
     /// them to its [`WindowState`]. Factored out of `resumed` so it serves BOTH the
     /// first window (at `resumed`) and every Cmd-N 2nd..Nth window (at
@@ -673,6 +880,13 @@ impl App {
             let (cw, ch) = self.cell_size();
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
         }
+        // Don't eclipse the window this one was opened from: step the frame down and
+        // right so the previous window stays visible behind it. Placed HERE — after
+        // the size correction above (the real frame decides where the cascade wraps)
+        // and before any present — so the move is never on glass. A no-op for the
+        // first window, and overridden by the explicit positions the restore /
+        // seamless-update carries apply after the attach returns.
+        self.cascade_window_placement(wid, &window);
         // Paint the window background the terminal's theme background colour so the
         // transparent titlebar — and the bare single-tab compact bar — reads as a
         // seamless extension of the terminal body instead of a distinct lighter chrome
@@ -1950,6 +2164,163 @@ fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 1440×900-point work area whose origin is NOT (0, 0) — the menu-bar band on
+    /// the main display, and the general case on a secondary one. Placements that
+    /// silently assume a zero origin fail against this.
+    const SCREEN: WorkAreaPts = WorkAreaPts {
+        x: 0.0,
+        y: 25.0,
+        w: 1440.0,
+        h: 875.0,
+    };
+
+    #[test]
+    fn a_new_window_never_lands_exactly_on_the_window_it_was_opened_from() {
+        let anchor = (400.0, 200.0);
+        let placed = cascade_top_left_pts(anchor, CASCADE_STEP_PTS, (900.0, 600.0), SCREEN)
+            .expect("ordinary geometry places the window");
+        assert_ne!(
+            placed, anchor,
+            "the regression: winit centres every new window, so a same-sized window \
+             lands pixel-exactly on its parent"
+        );
+        assert_eq!(
+            placed,
+            (anchor.0 + CASCADE_STEP_PTS, anchor.1 + CASCADE_STEP_PTS),
+            "an ordinary cascade is one diagonal step down-right"
+        );
+        // Both offsets are strictly positive, so the parent keeps a visible strip
+        // along its top AND its left edge — not just a sliver on one axis.
+        assert!(placed.0 > anchor.0 && placed.1 > anchor.1);
+    }
+
+    #[test]
+    fn the_cascade_wraps_per_axis_instead_of_marching_off_screen() {
+        let window = (900.0, 600.0);
+        // Bottom edge reached: y returns to the top of the work area, x keeps its
+        // column so the run continues rightwards rather than restarting in place.
+        let low = (300.0, 720.0);
+        let placed = cascade_top_left_pts(low, CASCADE_STEP_PTS, window, SCREEN)
+            .expect("ordinary geometry places the window");
+        assert_eq!(placed, (low.0 + CASCADE_STEP_PTS, SCREEN.y));
+
+        // Right edge reached: x returns to the left of the work area.
+        let far_right = (1260.0, 100.0);
+        let placed = cascade_top_left_pts(far_right, CASCADE_STEP_PTS, window, SCREEN)
+            .expect("ordinary geometry places the window");
+        assert_eq!(placed, (SCREEN.x, far_right.1 + CASCADE_STEP_PTS));
+
+        // The bottom-right corner wraps both axes at once, back to the origin.
+        let corner = (1260.0, 720.0);
+        assert_eq!(
+            cascade_top_left_pts(corner, CASCADE_STEP_PTS, window, SCREEN),
+            Some((SCREEN.x, SCREEN.y))
+        );
+    }
+
+    #[test]
+    fn a_screen_filling_parent_is_still_stepped_off_not_wrapped_back_onto() {
+        // The zoomed/maximized case, and the reason the wrap tests the grabbable
+        // corner rather than the whole frame: the new window inherits the front
+        // window's grid, so parent and child are the same size. Wrapping on "the
+        // frame no longer fits" would put the child back at the work-area origin —
+        // the exact eclipse this placement exists to prevent.
+        let filled = (SCREEN.x, SCREEN.y);
+        let frame = (SCREEN.w, SCREEN.h);
+        let placed = cascade_top_left_pts(filled, CASCADE_STEP_PTS, frame, SCREEN)
+            .expect("a screen-filling window is still placed");
+        assert_eq!(
+            placed,
+            (SCREEN.x + CASCADE_STEP_PTS, SCREEN.y + CASCADE_STEP_PTS)
+        );
+        assert_ne!(placed, filled, "the child must not land on its parent");
+    }
+
+    #[test]
+    fn every_placement_keeps_a_grabbable_corner_on_screen() {
+        let inside = |(x, y): (f64, f64), window: (f64, f64)| {
+            let keep_x = window.0.min(CASCADE_MIN_VISIBLE_PTS);
+            let keep_y = window.1.min(CASCADE_MIN_VISIBLE_PTS);
+            x >= SCREEN.x
+                && y >= SCREEN.y
+                && x + keep_x <= SCREEN.x + SCREEN.w
+                && y + keep_y <= SCREEN.y + SCREEN.h
+        };
+
+        // A window larger than the whole work area still gets a reachable top-left
+        // (never pushed up under the menu bar), even though it cannot fit.
+        let huge = (2000.0, 1400.0);
+        let placed = cascade_top_left_pts((100.0, 100.0), CASCADE_STEP_PTS, huge, SCREEN)
+            .expect("an oversized window is still placed");
+        assert!(inside(placed, huge), "{placed:?} left the usable screen");
+
+        // An anchor already off the work area (a window dragged nearly off-screen,
+        // or left behind by a display change) is pulled back rather than followed.
+        let window = (900.0, 600.0);
+        let placed = cascade_top_left_pts((5000.0, 5000.0), CASCADE_STEP_PTS, window, SCREEN)
+            .expect("an off-screen anchor is still placed");
+        assert!(inside(placed, window), "{placed:?} followed the anchor off");
+
+        // A frame narrower than the grabbable minimum is kept WHOLE on screen — the
+        // minimum must never demand more than the window actually is.
+        let tiny = (90.0, 40.0);
+        let placed = cascade_top_left_pts((1420.0, 880.0), CASCADE_STEP_PTS, tiny, SCREEN)
+            .expect("a tiny window is still placed");
+        assert!(inside(placed, tiny), "{placed:?} left the usable screen");
+        assert!(placed.0 + tiny.0 <= SCREEN.x + SCREEN.w);
+        assert!(placed.1 + tiny.1 <= SCREEN.y + SCREEN.h);
+    }
+
+    #[test]
+    fn degenerate_geometry_leaves_the_os_placement_alone() {
+        let empty = WorkAreaPts {
+            x: 0.0,
+            y: 0.0,
+            w: 0.0,
+            h: 0.0,
+        };
+        assert_eq!(
+            cascade_top_left_pts((10.0, 10.0), CASCADE_STEP_PTS, (900.0, 600.0), empty),
+            None,
+            "a 0x0 monitor must not be treated as a placement target"
+        );
+        assert_eq!(
+            cascade_top_left_pts((f64::NAN, 10.0), CASCADE_STEP_PTS, (900.0, 600.0), SCREEN),
+            None,
+            "a non-finite coordinate must not reach the clamp"
+        );
+        assert_eq!(
+            cascade_top_left_pts(
+                (10.0, 10.0),
+                CASCADE_STEP_PTS,
+                (f64::INFINITY, 600.0),
+                SCREEN
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn the_cascade_anchors_on_the_window_the_user_was_in_never_on_the_new_one() {
+        let (a, b, new) = (WindowId(0), WindowId(1), WindowId(2));
+        let attached = [a, b, new];
+        assert_eq!(
+            cascade_anchor_of(new, &[a, b], &attached),
+            Some(b),
+            "the most recently focused OTHER window is the anchor"
+        );
+        // The new window is frontmost — and may already have taken OS focus — before
+        // its surface attaches. Anchoring on itself would place it nowhere.
+        assert_eq!(cascade_anchor_of(new, &[a, b, new], &attached), Some(b));
+        // No focus history at all (a restore loop): the newest OTHER window.
+        assert_eq!(cascade_anchor_of(new, &[], &attached), Some(b));
+        // A remembered window that is gone or never got a surface is skipped.
+        assert_eq!(cascade_anchor_of(new, &[b, a], &[a, new]), Some(a));
+        // The first window on glass has nothing to avoid.
+        assert_eq!(cascade_anchor_of(new, &[], &[new]), None);
+        assert_eq!(cascade_anchor_of(new, &[new], &[]), None);
+    }
 
     #[test]
     fn first_successful_target_offers_milestones_even_after_early_backend_finalize() {

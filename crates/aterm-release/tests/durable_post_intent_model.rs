@@ -73,6 +73,8 @@ fn journal() -> Journal {
 fn context(root: &Path, with_journal: bool) -> CutCtx {
     let journal_path = root.join("nested/dist/cut-state.toml");
     CutCtx {
+        // No credentials: this model exercises journal/state transitions, not signing.
+        credentials: None,
         repo: root.to_path_buf(),
         dist: root.join("nested/dist"),
         journal_path,

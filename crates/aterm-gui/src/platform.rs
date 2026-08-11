@@ -217,6 +217,22 @@ pub(crate) trait AppRt {
         0.0
     }
 
+    /// The usable placement area of the screen `window` sits on — the display
+    /// rectangle MINUS the permanent system chrome (on macOS the menu bar and the
+    /// Dock: `NSScreen.visibleFrame`) — in LOGICAL POINTS with a TOP-LEFT origin and
+    /// y growing DOWN, i.e. the same space `Window::outer_position().to_logical()`
+    /// reports. This is what the new-window cascade wraps against, so a cascaded
+    /// window never lands under the menu bar or behind the Dock.
+    ///
+    /// `None` when the platform cannot answer (no native window, an off-screen
+    /// window whose `screen` is nil, or a backend with no work-area concept — every
+    /// non-macOS apprt today). Callers then fall back to the winit monitor bounds,
+    /// which are the FULL display rectangle — a slightly later wrap, never a wrong
+    /// one. See [`crate::app_window::WorkAreaPts`].
+    fn window_work_area_pts(&self, _window: &Window) -> Option<crate::app_window::WorkAreaPts> {
+        None
+    }
+
     /// M3 (Windows scRGB): the display's reference-white scale (`SDR-white / 80`) for
     /// the EDR present, so the grid isn't dim (scRGB `1.0` == 80 nits). Default `1.0`
     /// (no scaling) — correct on macOS (the extended-linear layer auto-maps `1.0` → SDR
@@ -761,6 +777,61 @@ impl AppRt for AppRtMacOS {
             let bounds: NSRect = msg_send![content_view, bounds];
             let layout: NSRect = msg_send![&*ns_window, contentLayoutRect];
             (bounds.size.height - layout.size.height).max(0.0)
+        }
+    }
+
+    /// `NSScreen.visibleFrame` of the screen this window is on, flipped into
+    /// winit's top-left-origin point space (see [`AppRt::window_work_area_pts`]).
+    ///
+    /// AppKit's screen space is BOTTOM-left origin; winit reports window positions
+    /// relative to the TOP-left of the MAIN display (`CGMainDisplayID`), so the flip
+    /// must use the identical law as winit's own `flip_window_screen_coordinates`
+    /// (`y_top = main_height - rect.height - rect.origin.y`) — anything else would
+    /// silently offset the whole cascade on a multi-display desktop. The main
+    /// display's height therefore comes from the same CoreGraphics call winit uses,
+    /// NOT from `NSScreen.mainScreen` (which is the FOCUSED screen, not the origin
+    /// screen).
+    fn window_work_area_pts(&self, window: &Window) -> Option<crate::app_window::WorkAreaPts> {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use objc2_app_kit::NSView;
+        use objc2_foundation::NSRect;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayBounds(display: u32) -> NSRect;
+        }
+
+        let Ok(handle) = window.window_handle() else {
+            return None;
+        };
+        let RawWindowHandle::AppKit(h) = handle.as_raw() else {
+            return None;
+        };
+        // SAFETY: `ns_view` is this window's live NSView (winit owns it for the
+        // window's lifetime), borrowed on the main thread as AppKit requires; every
+        // message below is a side-effect-free geometry read, and the CoreGraphics
+        // pair is a flat display-bounds getter that neither allocates nor dispatches.
+        unsafe {
+            let view: &NSView = &*(h.ns_view.as_ptr() as *const NSView);
+            let ns_window = view.window()?;
+            // Nil for a window that is not on any screen (fully off-screen, or a
+            // hidden window the WindowServer has not placed yet) — fail closed to
+            // the caller's monitor-bounds fallback rather than guess a screen.
+            let screen: *mut AnyObject = msg_send![&*ns_window, screen];
+            if screen.is_null() {
+                return None;
+            }
+            let visible: NSRect = msg_send![screen, visibleFrame];
+            let main_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+            Some(crate::app_window::WorkAreaPts {
+                x: visible.origin.x,
+                y: main_height - visible.size.height - visible.origin.y,
+                w: visible.size.width,
+                h: visible.size.height,
+            })
         }
     }
 

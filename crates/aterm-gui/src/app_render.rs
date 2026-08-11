@@ -958,22 +958,56 @@ mod sing_riff_gain_tests {
 /// The per-event trail-audio POLICY the host resolves once per drain and
 /// stamps on every emitted [`SoundEvent`] — the knobs ride together so the
 /// synth stays policy-free.
-struct TrailSoundPolicy {
+pub(crate) struct TrailSoundPolicy {
     /// The `trail_sound_style` override (default `Style` = follow the visual
     /// trail style).
-    voice: aterm_effects::trail_sound::SoundVoice,
+    pub(crate) voice: aterm_effects::trail_sound::SoundVoice,
     /// Resolved gain (`None` = muted: focus/knob/volume law — see
     /// [`trail_sound_gain`]).
-    gain: Option<f32>,
+    pub(crate) gain: Option<f32>,
     /// The window's cached tone-of-typing verdict (`tone_infer`). The host
     /// resolves it (knob off ⇒ the neutral `Technical` identity) exactly
     /// like it resolves gain.
-    tone: aterm_effects::tone::Tone,
+    pub(crate) tone: aterm_effects::tone::Tone,
     /// The `trail_sound_bed` knob (default OFF — the owner dislikes the
     /// drone): with it off no event ever feeds the synth's bed layer, so
     /// the ambient texture contributes exactly zero samples while the notes
     /// keep playing.
-    bed: bool,
+    pub(crate) bed: bool,
+}
+
+/// Map ONE drained cue onto its synth event: the pan normalization, the gesture
+/// namespacing, and the policy stamp.
+///
+/// Extracted so the KEY-TIME typing click (`app_input`, which hands its cue
+/// straight to the synth instead of waiting for the next drain) is built by the
+/// exact same code as the frame drain. Two constructions of "a trail cue as a
+/// sound event" would drift — a differently-normalized pan or a dropped `bed`
+/// flag would make the same keystroke sound like two different instruments
+/// depending on which seam carried it.
+pub(crate) fn trail_sound_event(
+    cue: &aterm_effects::cursor_glow::SoundCue,
+    style: crate::cursor_glow::GlowStyle,
+    cols: u16,
+    policy: &TrailSoundPolicy,
+    gain: f32,
+) -> aterm_effects::trail_sound::SoundEvent {
+    aterm_effects::trail_sound::SoundEvent {
+        style,
+        voice: policy.voice,
+        kind: aterm_effects::trail_sound::SoundGesture::Trail(cue.kind),
+        pan: if cols > 1 {
+            let last = (cols - 1) as f32;
+            ((cue.col as f32).min(last) / last) * 2.0 - 1.0
+        } else {
+            0.0
+        },
+        heat: cue.heat,
+        hue: cue.hue,
+        gain,
+        tone: policy.tone,
+        bed: policy.bed,
+    }
 }
 
 /// Drain every visual spawn cue and optionally emit its allocation-free sound
@@ -992,22 +1026,7 @@ fn drain_trail_sound_cues(
         let Some(gain) = policy.gain else {
             continue;
         };
-        emit(aterm_effects::trail_sound::SoundEvent {
-            style,
-            voice: policy.voice,
-            kind: aterm_effects::trail_sound::SoundGesture::Trail(cue.kind),
-            pan: if cols > 1 {
-                let last = (cols - 1) as f32;
-                ((cue.col as f32).min(last) / last) * 2.0 - 1.0
-            } else {
-                0.0
-            },
-            heat: cue.heat,
-            hue: cue.hue,
-            gain,
-            tone: policy.tone,
-            bed: policy.bed,
-        });
+        emit(trail_sound_event(&cue, style, cols, &policy, gain));
         emitted += 1;
     }
     emitted
@@ -9594,6 +9613,22 @@ impl App {
             0x001A_1B26,
             0.5,
         )
+    }
+
+    /// The resolved aurora STYLE alone — [`Self::glow_config`]'s `style` field
+    /// without building the rest of the config (colours, geometry, the pack).
+    ///
+    /// For the KEY-TIME typing click, which needs the synth voice on the
+    /// keypress path and must not pay a full config resolve per keystroke to
+    /// get it. `glow_style_matches_glow_config` pins the two together: the
+    /// click must name the same instrument the frame drain would have.
+    pub(crate) fn glow_style(&self) -> crate::cursor_glow::GlowStyle {
+        crate::app_config::resolve_trail_style(
+            self.config.cursor_trail_style_raw(),
+            &self.config_assets.trail_packs,
+        )
+        .style
+        .unwrap_or(crate::cursor_glow::GlowStyle::Lumen)
     }
 
     /// Whether the ACTIVE trail style is the native cadence-comet — the one style
@@ -23085,6 +23120,23 @@ mod tone_melody_seam_tests {
             "the classifier must actually have run under the live-audio gate",
         );
 
+        // THE RAMP-UP IS NOT THE PIN. Each key-time click is delivered ON its
+        // keypress (RESPONSIVENESS audit #3: the click no longer waits for a
+        // render tick), so it carries the mood the classifier held AT THAT KEY —
+        // Technical while the line is still ambiguous, then Excited, then
+        // Frustrated. That is the LIVE shape: a real session interleaves frames
+        // with keys, so the drain stamped the same evolving verdict; only a
+        // fixture that types a whole line without a single frame in between ever
+        // saw one uniform mood. So: discard the ramp-up, then pin exactly what
+        // the seam promises — once the verdict is in, every click carries it.
+        tick(&mut app, wid);
+        let _ = app.trail_audio.take_captured_for_test();
+        type_line(&mut app, wid, " so broken");
+        assert_eq!(
+            app.windows[&wid].tone_tracker.current(),
+            Tone::Frustrated,
+            "precondition: the register has not moved under the second line",
+        );
         tick(&mut app, wid);
         let tones = trail_tones(&app.trail_audio.take_captured_for_test());
         assert!(
@@ -23109,6 +23161,12 @@ mod tone_melody_seam_tests {
         assert_eq!(app.windows[&wid].tone_tracker.current(), Tone::Frustrated);
 
         app.config.tone_melody = Some(false);
+        // Clear what was already SPOKEN before the toggle. The key-time click is
+        // delivered on its keypress, so those events left with the mood that was
+        // live when the key went down — they are not the knob's business, and a
+        // seam that could retroactively re-stamp a click already at the synth
+        // would be the actual bug. What the knob owns is everything from here on.
+        let _ = app.trail_audio.take_captured_for_test();
         type_line(&mut app, wid, " and again");
         tick(&mut app, wid);
 
@@ -23181,5 +23239,149 @@ mod tone_melody_seam_tests {
                  toggle-off: {binding:?}",
             );
         }
+        // …AND THE FOURTH SEAM, which does not live in this file. The KEY-TIME
+        // typing click reaches the synth from `app_input` without a drain, so a
+        // scan of this file alone would report full coverage while the hottest
+        // audio path stamped whatever it liked. Same two refusals, same helper.
+        let key_seam = include_str!("app_input.rs");
+        let key_policies: Vec<&str> = key_seam
+            .match_indices("TrailSoundPolicy {")
+            .filter_map(|(at, _)| key_seam[at..].split('}').next())
+            .collect();
+        assert_eq!(
+            key_policies.len(),
+            1,
+            "expected exactly the key-time click's policy in `app_input`",
+        );
+        for policy in &key_policies {
+            assert!(
+                policy.contains("tone_tracker") && policy.contains(".effective("),
+                "the key-time click must resolve its tone through the SAME \
+                 helper the drains use: {policy:?}",
+            );
+            assert!(
+                !policy.contains(".current()"),
+                "`current()` ignores the knob: {policy:?}",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_time_click_tests {
+    //! RESPONSIVENESS: the typing click is delivered ON the keypress, not on the
+    //! next render tick — so its event must be built by the SAME code the frame
+    //! drain uses, and must name the SAME instrument.
+    use super::{TrailSoundPolicy, trail_sound_event};
+
+    fn cue(col: u16) -> aterm_effects::cursor_glow::SoundCue {
+        aterm_effects::cursor_glow::SoundCue {
+            kind: aterm_effects::trail_sound::SoundKind::Typed,
+            col,
+            heat: 0.42,
+            hue: 0.7,
+            dir: 0,
+        }
+    }
+
+    fn policy() -> TrailSoundPolicy {
+        TrailSoundPolicy {
+            voice: aterm_effects::trail_sound::SoundVoice::Style,
+            gain: Some(0.4),
+            tone: aterm_effects::tone::Tone::Playful,
+            bed: true,
+        }
+    }
+
+    /// Every policy axis rides the event, and the pan is normalized against the
+    /// terminal width exactly as the drain does it — the key seam hands the same
+    /// `cols` (the terminal the keystroke went to), so a click cued at the key
+    /// lands at the same stereo position its echo would have.
+    #[test]
+    fn the_event_carries_the_whole_policy_and_the_drain_pan() {
+        let p = policy();
+        let ev = trail_sound_event(&cue(0), crate::cursor_glow::GlowStyle::Fire, 80, &p, 0.4);
+        assert!((ev.pan - -1.0).abs() < 1e-6, "column 0 pans hard left");
+        assert!((ev.heat - 0.42).abs() < 1e-6);
+        assert!((ev.hue - 0.7).abs() < 1e-6);
+        assert!((ev.gain - 0.4).abs() < 1e-6);
+        assert!(ev.bed, "the bed knob rides the event");
+        assert_eq!(ev.style, crate::cursor_glow::GlowStyle::Fire);
+        assert!(matches!(
+            ev.kind,
+            aterm_effects::trail_sound::SoundGesture::Trail(
+                aterm_effects::trail_sound::SoundKind::Typed
+            )
+        ));
+        let right = trail_sound_event(&cue(79), crate::cursor_glow::GlowStyle::Fire, 80, &p, 0.4);
+        assert!((right.pan - 1.0).abs() < 1e-6, "the last column pans right");
+        // Past the last column clamps rather than panning outside the field.
+        let past = trail_sound_event(&cue(999), crate::cursor_glow::GlowStyle::Fire, 80, &p, 0.4);
+        assert!((past.pan - 1.0).abs() < 1e-6);
+        // A degenerate one-column terminal never divides by zero.
+        let narrow = trail_sound_event(&cue(0), crate::cursor_glow::GlowStyle::Fire, 1, &p, 0.4);
+        assert!((narrow.pan - 0.0).abs() < 1e-6);
+    }
+
+    /// THE LATENCY PIN: a keypress reaches the audio host WITHOUT a render tick.
+    ///
+    /// Before, the cue was recorded at the key and carried to the synth only by
+    /// the next tick's drain, so the click's arrival was quantized to the frame
+    /// train — 0-16.7 ms on a 60 Hz panel, and further on a loaded frame — after
+    /// the ~20 ms budget in which a click still feels attached to the finger.
+    /// The negative control is the fixture itself: NOTHING here ticks between
+    /// the key and the capture, so under the old wiring this list is empty.
+    #[test]
+    fn a_keypress_reaches_the_audio_host_with_no_render_tick() {
+        use crate::input::{InputEvent, Source};
+        use aterm_effects::trail_sound::{SoundGesture, SoundKind};
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+
+        let mut app = crate::App::headless_for_test();
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        let wid = crate::WindowId(0);
+        // ONE drawing tick, because the engine's silence law arms the key seam
+        // only on a tick that actually drew (`cursor_glow::sound_live`) — the
+        // same reason a session's very first keystroke before any frame is
+        // legitimately silent. Everything after this point is key-path only.
+        app.tick_cursor_fx(
+            wid,
+            super::CursorFxInputs::sample_for_test(std::time::Instant::now()),
+        )
+        .expect("the fixture window ticks");
+        let _ = app.trail_audio.take_captured_for_test();
+
+        let _ = app.input(
+            wid,
+            InputEvent::Key {
+                key: Key::Character('a'),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            Source::Human,
+        );
+
+        let spoken = app.trail_audio.take_captured_for_test();
+        assert!(
+            spoken
+                .iter()
+                .any(|ev| matches!(ev.kind, SoundGesture::Trail(SoundKind::Typed))),
+            "the click must be at the synth already — no frame in the audio path",
+        );
+    }
+
+    /// THE INSTRUMENT CANNOT DRIFT. The key seam reads [`crate::App::glow_style`]
+    /// (cheap, no config build); the frame drain stamps `glow_config().style`. If
+    /// those ever disagree, the same keystroke sounds like one instrument when the
+    /// click rides the key and another when it rides an echo.
+    #[test]
+    fn glow_style_matches_glow_config() {
+        let app = crate::App::headless_for_test();
+        assert_eq!(
+            app.glow_style(),
+            app.glow_config().style,
+            "the key-time click must name the frame drain's instrument"
+        );
     }
 }

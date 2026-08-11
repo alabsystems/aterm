@@ -38,23 +38,51 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 /// (`~/.rustup/toolchains/trust/bin/{rustc,cargo}`) is gone — the 2026-07-30
 /// purge ships trust-named binaries only, so the gates resolve those directly.
 pub fn trust_stage2_bin() -> Result<PathBuf> {
-    let dir = match env::var_os("TRUST_STAGE2_BIN") {
-        Some(v) => PathBuf::from(v),
-        None => {
-            let home = env::var("HOME")
-                .map_err(|_| Error::new("HOME is unset — cannot locate the Trust toolchain"))?;
-            Path::new(&home).join("trust/build/host/stage2/bin")
+    // Resolution order, first hit wins. No step requires anyone to remember an
+    // environment variable: a toolchain installed by `atpkg install trust` is found
+    // automatically, which is the ordinary way to get one.
+    //
+    //   1. $TRUST_STAGE2_BIN — an explicit override for an unusual location. This is
+    //      a LOCATION knob, not a trust knob: it cannot change what anything trusts,
+    //      only where the compiler is found.
+    //   2. the atpkg store, resolved exactly as atpkg resolves it (so a configured
+    //      `[packages].prefix` — e.g. a root-owned system prefix — is honoured).
+    //   3. $HOME/trust/build/host/stage2/bin — a toolchain built from source with x.py.
+    let candidates = trust_stage2_candidates();
+    let mut tried = Vec::new();
+    for dir in candidates {
+        match fs::canonicalize(&dir) {
+            Ok(resolved) if resolved.join("trustc").is_file() => return Ok(resolved),
+            _ => tried.push(dir.display().to_string()),
         }
-    };
-    fs::canonicalize(&dir).map_err(|error| {
-        Error::new(format!(
-            "Trust stage2 tool dir not resolvable at {} ({error}) — build the toolchain \
-             (`python3 x.py build --stage 2` in $HOME/trust) or point TRUST_STAGE2_BIN at a \
-             stage2 bin dir",
-            dir.display()
-        ))
-    })
+    }
+    Err(Error::new(format!(
+        "no Trust toolchain found. Looked in: {}. Install one with `atpkg install trust`, \
+         build one with `python3 x.py build --stage 2` in $HOME/trust, or point \
+         TRUST_STAGE2_BIN at a stage2 bin dir",
+        tried.join(", ")
+    )))
 }
+
+/// The ordered places a Trust toolchain may live. Split out so the order is readable
+/// and testable without a filesystem.
+fn trust_stage2_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(explicit) = env::var_os("TRUST_STAGE2_BIN") {
+        out.push(PathBuf::from(explicit));
+    }
+    // The atpkg store, via atpkg's own config + prefix validation.
+    let home = aterm_types::dirs::home_dir();
+    let configured = atpkg::config::load().prefix_path(home.as_deref());
+    if let Some(layout) = atpkg::store::resolve(configured.as_deref()) {
+        out.push(layout.program_current("trust").join("bin"));
+    }
+    if let Ok(home) = env::var("HOME") {
+        out.push(Path::new(&home).join("trust/build/host/stage2/bin"));
+    }
+    out
+}
+
 
 /// The `targo` build driver from the stage2 tool dir. All native-lane builds and
 /// metadata queries go through THIS binary — never a PATH `cargo`, which since

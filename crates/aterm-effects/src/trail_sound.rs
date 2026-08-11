@@ -54,9 +54,15 @@
 //!   nine shipped palettes are pinned byte-identical to their pre-framework
 //!   (v0.56) rendering by the `v056_reference` proofs below.
 //! - **Kind-level gestures.** Gestures whose sound is style-agnostic (the
-//!   Kill swoosh, the curse-word Bonk) are designed ONCE before palette
-//!   dispatch, tinted at most by a per-palette anchor
-//!   ([`Palette::bonk_anchor_hz`]).
+//!   Kill swoosh, the curse-word Bonk, the cursor MOTIONS) are designed ONCE
+//!   before palette dispatch, tinted at most by a per-palette register
+//!   ([`Palette::anchor_hz`]).
+//! - **One gesture family.** Typing, deletion and the cursor motions are not
+//!   four sound designs: they are one voice moved along two axes — DIRECTION
+//!   (forward vs undoing, which signs both the pitch offset and the contour
+//!   bend) and SCALE (a character vs a word). The rule is stated and encoded
+//!   once, in [`gesture_shape`] + [`gesture_bend`]; palettes state timbre, not
+//!   intervals.
 //!
 //! The host owns policy: focus gating, reduced-motion gating (an intensity of
 //! zero simply means "push no events"), the user's `trail_sounds` toggle and
@@ -86,8 +92,12 @@ pub enum SoundKind {
     /// A glyph was typed and the cursor stepped one cell — the bread-and-
     /// butter event; each style's signature "key" sound.
     Typed,
-    /// Backspace / deletion — the Typed gesture mirrored (pitch falls or the
-    /// contour reverses), so editing "sounds like undoing".
+    /// Backspace / deletion — the Typed gesture INVERTED, by one rule shared
+    /// with the cursor motions ([`gesture_shape`]): the same voice a lattice
+    /// step below the note it removes, entered from above where a keystroke is
+    /// entered from below. Palettes add their own inversion of timbre on top
+    /// (Lumen's bloom dims, Laser's zap reverses, Fire's fibre cracks duller)
+    /// but no longer spell an interval of their own.
     Backspace,
     /// Cursor navigation (arrows, clicks) — the Typed gesture at a whisper:
     /// same timbre family, much quieter and shorter.
@@ -101,24 +111,25 @@ pub enum SoundKind {
     /// "brrrring!" — pinned byte-exact by
     /// `brrrring_of_rapid_line_feeds_is_pinned`.
     Jump,
-    /// A SMALL cursor move — a single-cell arrow. One soft, IN-KEY melody
-    /// tone a scale-step in the travel direction, so scrubbing through text
-    /// CONTINUES the tune rather than interrupting it. `dir` is +1 for a
-    /// rightward / upward move, -1 for left / down (the direction rides IN the
-    /// kind, so [`SoundEvent`] gains no new scalar and its non-finite filter is
+    /// A SMALL cursor move — a single-cell arrow: the family's CHARACTER-scale
+    /// motion. One soft, IN-KEY melody tone one lattice step in the travel
+    /// direction ([`gesture_shape`]), so scrubbing through text CONTINUES the
+    /// tune rather than interrupting it. `dir` is +1 for a rightward / upward
+    /// move, -1 for left / down (the direction rides IN the kind, so
+    /// [`SoundEvent`] gains no new scalar and its non-finite filter is
     /// untouched). Gap-thinned exactly like a keystroke (out of the always-
     /// admit set), and softer than one (kind-gain in the Navigation whisper
     /// band).
     Glide { dir: i8 },
     /// A FAST cursor run — a held arrow's coalesced echo or a multi-cell leap
-    /// (Ctrl-A/E, word motion). A short PRE-DELAYED run of in-key scale-tones
-    /// sweeping from the current degree outward `dir` per step — the aural
-    /// twin of the cursor sweeping across text, aligned to the same tone/key
-    /// as the melody. One event carries the whole run (delayed voices, no
-    /// scheduler — the arpeggio idiom), so it BYPASSES min-gap like [`Jump`]
-    /// (thinning it would silence the run mid-flight); its own inter-note
-    /// delays rate-limit it. The first note has `delay = 0`, so it speaks in
-    /// the first post-cue synth buffer.
+    /// (Ctrl-A/E, WORD MOTION): the family's WORD-scale motion, and exactly
+    /// that — a [`Glide`] repeated once per character crossed, landing
+    /// [`GESTURE_WORD_CHARS`] steps out ([`gesture_shape`]). Same voice, same
+    /// interval per step, more of them. One event carries the whole run
+    /// (delayed voices, no scheduler — the arpeggio idiom), so it BYPASSES
+    /// min-gap like [`Jump`] (thinning it would silence the run mid-flight);
+    /// its own inter-note delays rate-limit it. The first note has
+    /// `delay = 0`, so it speaks in the first post-cue synth buffer.
     Sweep { dir: i8 },
     /// The cursor LANDED — the aural twin of the rainbow kitty fast-jump STARBURST
     /// (`cursor_glow`'s `Starburst`, cued at the same edge under the same
@@ -386,11 +397,29 @@ const PHRASE_MAX: u8 = 8;
 /// governor's rate estimate decays over.
 const PHRASE_PAUSE_S: f32 = 0.6;
 
-/// Peak height of the raised-cosine CONTOUR ARC, in scale degrees: every
-/// phrase rises to a mid-phrase peak and falls back, so it has a SHAPE instead
-/// of a flat random drift. Added to the pitch register, never to the motif
-/// accumulator, so it colours the contour without compounding.
-const ARC_AMP: f32 = 2.0;
+/// Height of the phrase's CONTOUR ARC, in scale degrees: every phrase LIFTS
+/// through its middle and settles back for the cadence, so the line has a
+/// SHAPE instead of a flat random drift. Added to the pitch register, never to
+/// the motif accumulator, so it colours the contour without compounding.
+///
+/// TWO degrees, and the arc moves in ONE jump of that size rather than
+/// climbing a degree at a time. That is not a taste call — it is what stops
+/// the two pitch axes from cancelling. The motif walks in ±1 steps; when the
+/// arc also stepped by ±1 (`round(2·sin πf)`, the old law) the two annihilated
+/// exactly, and a note that should have moved played the same pitch again.
+/// Measured over a 12.5 s typing script that was 54 % of all consecutive
+/// notes: the "melody" was mostly a drone. A lift of a pentatonic THIRD is
+/// orthogonal to a step of a second — no motif delta can cancel it — and
+/// unisons fall to ~8 % with the contour left intact (mid-phrase notes still
+/// average +2.9 degrees over the phrase's ends).
+const ARC_LIFT: i32 = 2;
+
+/// The REPEAT-AND-VARY lift: the motif cell's SECOND pass sits a scale-degree
+/// higher. It rides the pitch register beside the arc — never the delta — so
+/// the cell's step pattern stays exactly periodic (the motif genuinely
+/// recurs, which is what a lag-4 interval autocorrelation reads) and the lift
+/// can never zero out a step the way `delta += 1` could.
+const MOTIF_VARY: i32 = 1;
 
 /// The bright LEAP at the arc peak, in scale degrees — the classic
 /// "leap-and-recover" that makes a line sing; the motif steps back on the
@@ -420,6 +449,24 @@ fn melody_span(tone: Tone) -> i32 {
     }
 }
 
+/// Fold a pitch register into `lo..=hi` by REFLECTION rather than clamping.
+///
+/// Clamping is a silent unison generator: consecutive notes whose registers
+/// both land past the ceiling play the SAME pitch, so a phrase that leans into
+/// the top of its register goes flat — the melody stops moving exactly where
+/// its contour is strongest. A reflection turns the excess into a step back
+/// DOWN the lattice, so every note is still a real move, still on the tone's
+/// table, and still inside its register. Modular (a triangle wave), so an
+/// arbitrarily far-out input is total and cheap rather than looping.
+fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
+    let span = hi - lo;
+    if span <= 0 {
+        return lo;
+    }
+    let m = (v - lo).rem_euclid(2 * span);
+    lo + if m <= span { m } else { 2 * span - m }
+}
+
 /// Per-tone LEAN added to the pitch register: Excited climbs (+1), Frustrated
 /// sinks (−1), the rest sit level (0) — a quiet directional bias on top of the
 /// arc.
@@ -431,17 +478,146 @@ fn melody_lean(tone: Tone) -> i32 {
     }
 }
 
-/// The register the STYLE-AGNOSTIC cursor-movement notes (Glide/Sweep) sing
-/// in — a warm mid anchor, the same one the kind-level Kill/Bonk voices use.
-/// The pitch is drawn through `melody_hz` at the melody's current degree, so
-/// the cursor note sits on the active tone's table exactly like the tune.
+/// The DEFAULT register the STYLE-AGNOSTIC cursor-movement notes (Glide/Sweep)
+/// sing in — a warm mid anchor. A palette that names its own melodic base
+/// ([`Palette::anchor_hz`]) moves the movement family into ITS register, so
+/// scrubbing and typing share an octave; this is the fallback for palettes
+/// that don't (and the kind-level Kill/Bonk register). The pitch is drawn
+/// through `melody_hz` at the melody's current degree, so the cursor note sits
+/// on the active tone's table exactly like the tune.
 const CURSOR_ANCHOR_HZ: f32 = 330.0;
 
-/// A cursor SWEEP is this many pre-delayed scale-tones (a tasteful run, not a
-/// machine-gun), spaced [`CURSOR_SWEEP_STEP_S`] apart with the first at
-/// `delay = 0` (first-buffer audible).
-const CURSOR_SWEEP_RUN: usize = 4;
+/// Spacing between the notes of a WORD-scale run, with the first at
+/// `delay = 0` (first-buffer audible) — the run's own rate limit.
 const CURSOR_SWEEP_STEP_S: f32 = 0.055;
+
+// ---------------------------------------------------------------------------
+// THE GESTURE FAMILY — ONE rule for typing, deletion and the word motions
+// ---------------------------------------------------------------------------
+//
+// WHAT WAS WRONG: the four per-character/per-word gestures were four unrelated
+// sound designs. A keystroke sat on the melody degree; every palette pushed
+// BACKSPACE down by whatever interval its author happened to like (−2 in
+// Lumen/Phaser/Comet, −3 in rainbow kitty, no offset at all in the other six);
+// a Glide played one bare sine step at a fixed 330 Hz anchor no matter which
+// register the typing was in; and a Sweep was four of that same sine. Nothing
+// tied a deletion to the keystroke it undoes, or a word motion to the
+// character motion it magnifies — so the edit vocabulary read as a bag of
+// noises rather than one voice doing different things.
+//
+// THE RULE. Every gesture in the family is THE SAME MOVE ON THE TEXT rendered
+// as the same move on the lattice, along two axes and nothing else:
+//
+//   DIRECTION (`dir`)  +1 = forward / creating, −1 = undoing / backward. It
+//     signs both the pitch OFFSET and the contour BEND: a forward gesture
+//     leans UP onto its note, its inverse leans DOWN onto it. A deletion is a
+//     keystroke played backwards, not a different instrument.
+//   SCALE (`notes`, `step`)  how much TEXT the gesture crosses. A CHARACTER
+//     gesture is one note, [`GESTURE_CHAR_STEP`] lattice degrees of travel. A
+//     WORD gesture is that same stride walked out over [`GESTURE_WORD_CHARS`]
+//     characters — same voice, same interval per character, more of them — so
+//     it LANDS exactly where a character move of word size would land.
+//
+//                  dir   notes   stride   lands at (from the melody degree)
+//     Typed        +1      1       0      the degree itself
+//     Backspace    −1      1       0      −1 step, entered from ABOVE
+//     Glide{dir}   dir     1       0      dir × 1 step
+//     Sweep{dir}   dir     4     dir×1    dir × 3 steps
+//
+// Encoded ONCE, in [`gesture_shape`] + [`gesture_bend`], and READ from the
+// three places a family degree is built: the shared `deg` in
+// [`TrailSynth::design_trail`] (so every palette's deletion mirrors by the
+// same interval — the per-palette offsets are gone), [`TrailSynth::design_cursor`]
+// (Glide/Sweep), and Phaser's hue-driven degree, which builds its own and so
+// must ask for the offset rather than spell one.
+
+/// One CHARACTER of travel, in lattice degrees.
+const GESTURE_CHAR_STEP: i32 = 1;
+
+/// What a WORD gesture is worth in characters — the ONE scale factor between
+/// a character motion and a word motion. Three lattice steps is a pentatonic
+/// sixth: plainly the same move, plainly bigger.
+const GESTURE_WORD_CHARS: i32 = 3;
+
+/// A WORD-scale run is one note per character crossed, endpoints included.
+const CURSOR_SWEEP_RUN: usize = GESTURE_WORD_CHARS as usize + 1;
+
+/// THE CONTOUR BEND — the family's articulation, one just WHOLE TONE (9/8).
+/// A voice enters one lattice step from its direction's side and settles onto
+/// its note over [`GESTURE_BEND_TAU`]. Two properties earn the ratio: it is
+/// [`PENTA`]'s own second degree, so even mid-scoop the voice is passing
+/// through a consonant lattice interval rather than smearing off it, and it is
+/// NOT the bonk's minor second (16/15), whose exclusive claim to "wrong" the
+/// module protects everywhere else.
+///
+/// The two directions read as a matched pair: a keystroke arrives from a step
+/// BELOW and settles up onto its note (the letter landing); a deletion starts
+/// on the note it is removing and slides a step DOWN off it (the letter
+/// leaving).
+const GESTURE_BEND: f32 = 1.125;
+/// Bend time constant — short enough to read as articulation, not portamento
+/// (a keystroke is ~135 ms, so the scoop is over inside the first tenth of it).
+const GESTURE_BEND_TAU: f32 = 0.012;
+
+/// The family geometry of one gesture: see the section comment above. Kinds
+/// outside the family (Jump, Kill, Land, Navigation) take the neutral shape —
+/// forward, one note, no offset — so callers never branch on membership.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct GestureShape {
+    /// +1 forward / creating, −1 undoing / backward.
+    dir: i8,
+    /// Notes in the gesture: 1 at character scale, [`CURSOR_SWEEP_RUN`] at
+    /// word scale.
+    notes: usize,
+    /// Lattice degrees between consecutive notes (0 for a single note).
+    step: i32,
+    /// Lattice degrees from the melody's current degree to the FIRST note.
+    offset: i32,
+}
+
+/// THE RULE, encoded. Every family degree in the engine comes from here.
+fn gesture_shape(kind: SoundKind) -> GestureShape {
+    match kind {
+        // Undoing a character: one step below the note it removes.
+        SoundKind::Backspace => GestureShape {
+            dir: -1,
+            notes: 1,
+            step: 0,
+            offset: -GESTURE_CHAR_STEP,
+        },
+        // A character of travel, in the travel direction.
+        SoundKind::Glide { dir } => GestureShape {
+            dir,
+            notes: 1,
+            step: 0,
+            offset: i32::from(dir) * GESTURE_CHAR_STEP,
+        },
+        // A WORD of travel: the character stride, walked out.
+        SoundKind::Sweep { dir } => GestureShape {
+            dir,
+            notes: CURSOR_SWEEP_RUN,
+            step: i32::from(dir) * GESTURE_CHAR_STEP,
+            offset: 0,
+        },
+        // Forward, character-scale, on the degree itself.
+        _ => GestureShape {
+            dir: 1,
+            notes: 1,
+            step: 0,
+            offset: 0,
+        },
+    }
+}
+
+/// The BEND applied: `(f0, f1)` for a partial that settles onto `f` from
+/// `dir`'s side. Forward enters from a step below, inverse from a step above.
+fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
+    if dir >= 0 {
+        (f / GESTURE_BEND, f)
+    } else {
+        (f * GESTURE_BEND, f)
+    }
+}
 
 /// The bonk's clash intervals, in just intonation like everything else: the
 /// minor second (16/15) rubs, the tritone (45/32) refuses to resolve. Neither
@@ -498,6 +674,11 @@ const BACKSPACE_KIND_GAIN: f32 = 0.85;
 ///
 /// Above the others in the family because a glide's whole voice is one bare
 /// sine pluck, intrinsically ~1 dB under a palette keystroke at equal gain.
+///
+/// UNCHANGED by the 2026-08-10 register move (the movement family now sings at
+/// each palette's own [`Palette::anchor_hz`] rather than a fixed 330 Hz):
+/// re-measured at -24.16 dBFS against -24.10 before, i.e. 0.06 dB — the tier
+/// is stated in absolute dBFS and it did not move.
 const GLIDE_KIND_GAIN: f32 = 0.78;
 /// TIER 0 — one per gesture, not one per character. No production path cues
 /// `Navigation` (`cursor_glow` splits every hinted move into Glide/Sweep);
@@ -505,7 +686,12 @@ const GLIDE_KIND_GAIN: f32 = 0.78;
 const NAVIGATION_KIND_GAIN: f32 = 0.68;
 /// TIER 0. The per-note taper in `design_cursor` drops the run's tail; this
 /// sets where its FIRST note lands.
-const SWEEP_KIND_GAIN: f32 = 0.73;
+///
+/// RE-FITTED 2026-08-10 (0.73 → 0.692) for the register move [`GLIDE_KIND_GAIN`]
+/// rode out unchanged: a word run's notes OVERLAP, so where a single glide's
+/// level was untouched a whole run gained 0.46 dB. Given back here, so rainbow
+/// kitty's Sweep measures -23.7 dBFS — its exact pre-move level.
+const SWEEP_KIND_GAIN: f32 = 0.692;
 /// TIER 3 — a kill is per-command and destroys a line, so it may not be the
 /// quietest thing in the engine. Most of the level correction lives in the
 /// swoosh's own voice gain rather than here, because the deficit is a VOICE
@@ -1276,14 +1462,18 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => 0.95,
             GlowStyle::Phaser => 0.94,
-            // RE-FITTED 2026-08-04 alongside the cuter voice. The brighter
-            // register, the 25 % pulse's restored second harmonic, the 0.52
-            // fundamental and the 2600 Hz corner together measured +2.06 dB
-            // against the mellow voice this trim was fitted for
-            // (`cargo run -p aterm-effects --example mix_meter`: -12.97 → -10.91
-            // dBFS at gain 1.0). A cuter keystroke must not also be a LOUDER
-            // one, so the trim gives that back exactly: 1.39 × 10^(-2.06/20).
-            GlowStyle::RainbowKitty => 1.097,
+            // RE-FITTED 2026-08-10 with the sung doop, on the SAME quantity the
+            // ladder is written in: `mix_meter`'s isolated PEAK. The retuned
+            // voice measured -21.60 dBFS at the host default volume; ×1.0715
+            // lands it on the -21.0 floor (verified: -21.00).
+            //
+            // The trim is deliberately NOT the knob for the clickiness the last
+            // pass introduced. A trim is one scalar: matching peak with it let
+            // RMS fall 3.5 dB and crest rise 3.6 dB, which is exactly how a
+            // voice gets sharper while the ladder keeps reporting success.
+            // Crest belongs to the VOICE (attack, decay, body) and is fixed
+            // there — see `RainbowKittyPalette::design`.
+            GlowStyle::RainbowKitty => 1.1151,
             GlowStyle::Sparkle => 1.27,
             GlowStyle::Fire => 0.88,
             GlowStyle::Laser => 0.77,
@@ -1550,9 +1740,34 @@ impl TrailSynth {
             self.phrase_len =
                 PHRASE_MIN + (self.rnd() * ((PHRASE_MAX - PHRASE_MIN + 1) as f32)) as u8;
             let span = melody_span(self.tone);
-            for i in 0..4 {
-                self.motif[i] = (self.rnd() * (2 * span + 1) as f32) as i8 - span as i8;
+            // THE MOTIF CELL — three drawn steps and a CLOSING one. Two
+            // properties are what make the line a tune instead of a scatter,
+            // and both were missing:
+            // - EVERY STEP MOVES. The old draw included 0, and a zero delta
+            //   plays the same pitch twice; worse, a ±1 delta cancels exactly
+            //   against the arc's own ±1, so the two most common cases both
+            //   produced a repeated note. Measured over a 12.5 s typing
+            //   script: 54 % of consecutive notes were UNISONS — the melody's
+            //   single loudest defect.
+            // - THE CELL CLOSES. The fourth step is whatever returns the cell
+            //   to where it began, so the second pass starts where the first
+            //   did instead of the accumulator walking into the register bound
+            //   (the other unison source: two saturated notes are one pitch,
+            //   and a saturated motif is no longer periodic).
+            // The draw COUNT is fixed (1 + 3) whatever the tone, so the rng
+            // stream stays phrase-periodic and the byte pins cross-check.
+            let mut sum = 0;
+            for i in 0..3 {
+                // 2·span NONZERO choices: −span..=−1 then 1..=span.
+                let k = (self.rnd() * (2 * span) as f32) as i32;
+                let d = if k < span { k - span } else { k - span + 1 };
+                self.motif[i] = d as i8;
+                sum += d;
             }
+            // The closing leap, held inside one step more than the cell's own
+            // span so the return home stays a consonant lattice interval (a
+            // pentatonic sixth at span 1) rather than a lurch.
+            self.motif[3] = (-sum).clamp(-(span + 1), span + 1) as i8;
             return;
         }
         // MOTIF STEP: the cell delta at this position drives the note. The cell
@@ -1564,22 +1779,25 @@ impl TrailSynth {
         if self.phrase_parity {
             delta = -delta;
         }
-        if self.phrase_pos == 4 {
-            delta += 1; // the cell returns a scale-degree higher: the "vary"
-        }
         if self.phrase_pos == self.phrase_len / 2 {
             delta += MELODY_LEAP;
         }
         self.phrase_step += delta;
-        // Raised-cosine CONTOUR ARC over the phrase (rise to a mid-phrase peak,
-        // fall back) plus the per-tone LEAN — both fold into the PITCH register,
-        // never the motif accumulator, so the cell's delta pattern stays exactly
-        // periodic (the motif genuinely recurs) while the line still has shape.
+        // The CONTOUR ARC (a lift of [`ARC_LIFT`] degrees through the middle of
+        // the phrase, settling back for the cadence), the repeat-and-vary lift
+        // on the cell's second pass, and the per-tone LEAN — all three fold
+        // into the PITCH register, never the motif accumulator, so the cell's
+        // delta pattern stays exactly periodic (the motif genuinely recurs)
+        // while the line still has shape.
         let frac = f32::from(self.phrase_pos) / f32::from(self.phrase_len);
-        let arc = (ARC_AMP * (core::f32::consts::PI * frac).sin()).round() as i32;
+        let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
+        let vary = if self.phrase_pos >= 4 { MOTIF_VARY } else { 0 };
         self.phrase_pos += 1;
-        self.walk =
-            (self.phrase_home + self.phrase_step + arc + melody_lean(self.tone)).clamp(lo, hi);
+        self.walk = fold_register(
+            self.phrase_home + self.phrase_step + arc + vary + melody_lean(self.tone),
+            lo,
+            hi,
+        );
     }
 
     /// The melody's pitch lattice under the CURRENT tone: `base` scaled to
@@ -1682,15 +1900,22 @@ impl TrailSynth {
         // zero whenever the cat is not singing, so the ordinary typed melody is
         // untouched and every neutral-path proof — including the v0.56 byte-pin
         // oracle, which has no such field — stays exact.
-        let deg = self.walk + col_off + i32::from(self.song_key);
+        //
+        // THE FAMILY OFFSET rides here, once, for every palette: a deletion is
+        // a keystroke one lattice step down, a character move is one step in
+        // the travel direction, a word move starts on the degree and strides
+        // out (see `gesture_shape`). Palettes no longer spell their own
+        // deletion interval — that is what made the edit vocabulary incoherent.
+        let shape = gesture_shape(kind);
+        let deg = self.walk + col_off + i32::from(self.song_key) + shape.offset;
 
         // CURSOR MOVEMENT (Glide/Sweep) is a style-agnostic, IN-KEY gesture
         // designed once here (like Kill/Bonk), before palette dispatch: it
         // plays relative to the melody's current degree on the active tone, so
         // scrubbing sits inside the tune. `g` already carries its soft
         // kind-gain, the heat warmth, and the flood duck.
-        if let SoundKind::Glide { dir } | SoundKind::Sweep { dir } = kind {
-            self.design_cursor(&ev, kind, dir, g);
+        if matches!(kind, SoundKind::Glide { .. } | SoundKind::Sweep { .. }) {
+            self.design_cursor(&ev, shape, deg, g);
             return;
         }
 
@@ -1749,67 +1974,77 @@ impl TrailSynth {
         palette_for(ev.voice, ev.style).design(self, &ev, kind, g, deg, col_off);
     }
 
-    /// The CURSOR-MOVEMENT gesture, aligned with the melody.
-    /// Style-agnostic and soft (a gentle sine pluck), pitched through
-    /// [`Self::melody_hz`] on the ACTIVE tone at the melody's CURRENT degree,
-    /// so it sits in the same key/scale as the tune the typing is playing:
+    /// The CURSOR-MOVEMENT gestures — the family's MOTION half, designed once
+    /// here from the SAME [`gesture_shape`] rule the typing and the deletion
+    /// obey, so a word motion is audibly a character motion at word scale and
+    /// both are audibly relatives of the keystroke:
     ///
-    /// - [`SoundKind::Glide`] — one tone a scale-step in the travel direction
-    ///   (`walk + dir`): moving through text CONTINUES the melody.
-    /// - [`SoundKind::Sweep`] — a short PRE-DELAYED run of
-    ///   [`CURSOR_SWEEP_RUN`] scale-tones stepping out from the current degree
-    ///   `dir` per note (the arpeggio idiom — delayed voices, no scheduler),
-    ///   gain tapering across the run. The FIRST note has `delay = 0`, so a
-    ///   Sweep always speaks in the first post-cue synth buffer.
+    /// - REGISTER — pitched through [`Self::melody_hz`] at the palette's own
+    ///   melodic base ([`Palette::anchor_hz`]), the register its keystroke
+    ///   lives in, so scrubbing sits in the typing's octave instead of a fixed
+    ///   330 Hz of its own.
+    /// - DEGREE — `deg` already carries the melody's current degree, the
+    ///   column nudge, the borrowed song key and the shape's offset, so a
+    ///   cursor note is in the tune's key exactly like a typed one.
+    /// - CONTOUR — [`gesture_bend`] on `dir`: forward moves lean up onto their
+    ///   note, backward moves lean down onto it. Same articulation as a
+    ///   keystroke and its deletion.
+    /// - SCALE — `shape.notes` tones striding `shape.step` degrees, pre-delayed
+    ///   [`CURSOR_SWEEP_STEP_S`] apart (the arpeggio idiom — delayed voices, no
+    ///   scheduler) and tapering, so a WORD move is one CHARACTER move walked
+    ///   out. The FIRST note has `delay = 0`, so any move speaks in the first
+    ///   post-cue synth buffer.
+    ///
+    /// The voice stays a soft sine pluck rather than borrowing the palette's
+    /// full timbre: motion is not authorship, and the loudness ladder puts the
+    /// whole movement family under the typing floor (TIER 0).
     ///
     /// `dir` rides in the kind (an enum payload, nothing for the non-finite
     /// filter to check), so [`SoundEvent`] carries no new scalar.
-    fn design_cursor(&mut self, ev: &SoundEvent, kind: SoundKind, dir: i8, g: f32) {
-        let mk = |f: f32| Voice {
-            dur: 0.18,
-            attack: 0.006,
-            decay: 0.08,
-            p: [
-                Partial {
-                    lvl: 0.5,
-                    f0: f,
-                    f1: f,
-                    ..Partial::default()
-                },
-                // A whisper of sub-octave body so the tone reads as warm, not
-                // as a beep.
-                Partial {
-                    lvl: 0.12,
-                    f0: f * 0.5,
-                    f1: f * 0.5,
-                    ..Partial::default()
-                },
-                Partial::default(),
-            ],
-            lp_cut: 2200.0,
-            ..Voice::default()
-        };
-        match kind {
-            SoundKind::Sweep { .. } => {
-                for i in 0..CURSOR_SWEEP_RUN {
-                    let deg = self.walk + i32::from(dir) * i as i32;
-                    let f = self.melody_hz(CURSOR_ANCHOR_HZ, deg);
-                    let mut v = mk(f);
-                    // First note immediate (first-buffer audible); the rest
-                    // trail behind at a steady spacing — the run's own rate
-                    // limit, so bypassing min-gap can't machine-gun.
-                    v.delay = i as f32 * CURSOR_SWEEP_STEP_S;
-                    // Taper across the run so it reads as a gesture that lands,
-                    // not a flat block of tones.
-                    let taper = 1.0 - 0.15 * i as f32;
-                    self.spawn(v, g * 0.45 * taper, ev.pan);
-                }
-            }
-            // Glide: a single in-key step in the travel direction.
-            _ => {
-                let f = self.melody_hz(CURSOR_ANCHOR_HZ, self.walk + i32::from(dir));
-                self.spawn(mk(f), g * 0.5, ev.pan);
-            }
+    fn design_cursor(&mut self, ev: &SoundEvent, shape: GestureShape, deg: i32, g: f32) {
+        let anchor = palette_for(ev.voice, ev.style).anchor_hz();
+        for i in 0..shape.notes {
+            let f = self.melody_hz(anchor, deg + shape.step * i as i32);
+            let (f0, f1) = gesture_bend(f, shape.dir);
+            let v = Voice {
+                // First note immediate; the rest trail behind at a steady
+                // spacing — the run's own rate limit, so bypassing min-gap
+                // can't machine-gun.
+                delay: i as f32 * CURSOR_SWEEP_STEP_S,
+                dur: 0.18,
+                attack: 0.006,
+                decay: 0.08,
+                p: [
+                    Partial {
+                        lvl: 0.5,
+                        f0,
+                        f1,
+                        glide: GESTURE_BEND_TAU,
+                        ..Partial::default()
+                    },
+                    // A whisper of sub-octave body so the tone reads as warm,
+                    // not as a beep.
+                    Partial {
+                        lvl: 0.12,
+                        f0: f0 * 0.5,
+                        f1: f1 * 0.5,
+                        glide: GESTURE_BEND_TAU,
+                        ..Partial::default()
+                    },
+                    Partial::default(),
+                ],
+                lp_cut: 2200.0,
+                ..Voice::default()
+            };
+            // A single-note move keeps the old character level; a run tapers
+            // across itself so it reads as a gesture that LANDS rather than a
+            // flat block of tones.
+            let level = if shape.notes == 1 {
+                0.5
+            } else {
+                0.45 * (1.0 - 0.15 * i as f32)
+            };
+            self.spawn(v, g * level, ev.pan);
         }
     }
 
@@ -1900,13 +2135,13 @@ impl TrailSynth {
     /// free to use NON-pentatonic intervals precisely because everything else
     /// in the engine is constrained consonant. Two voices: the clash (minor
     /// second + tritone against the melody's CURRENT walk degree, in the
-    /// active palette's own register via [`Palette::bonk_anchor_hz`]) over a
+    /// active palette's own register via [`Palette::anchor_hz`]) over a
     /// round low thump — cartoon "bonk", not alarm. Both are duck-exempt and
     /// arm the master duck so the melody makes way. Feel gates: kind-gain
     /// [`BONK_KIND_GAIN`] > 1, no bed feed, no walk step.
     fn design_bonk(&mut self, ev: SoundEvent, duck: f32) {
         let g = ev.gain * duck * (0.55 + 0.45 * ev.heat) * BONK_KIND_GAIN;
-        let root = penta(palette_for(ev.voice, ev.style).bonk_anchor_hz(), self.walk);
+        let root = penta(palette_for(ev.voice, ev.style).anchor_hz(), self.walk);
         let m2 = root * BONK_MINOR_SECOND;
         let tt = root * BONK_TRITONE;
         // The clash: both wrong notes sag onto their targets from ~a third
@@ -1991,9 +2226,18 @@ impl TrailSynth {
     /// fourth apart" the feature was written to end. Both arms now latch, off
     /// the same signature.
     fn latch_song_key(&mut self, sig: u32) {
-        // -2..=2 by construction (`celebration_root` is `sig % 5 - 2`), so the
-        // i8 narrowing is total.
-        self.song_key = celebration_root(sig) as i8;
+        // THE WHOLE SHIFT, not half of it. The riff transposes every sounding
+        // degree by `root + mode` (`design_celebration`), but this latch used
+        // to carry the ROOT alone — so "typing joins the song's key" was true
+        // only for the characters whose mode rotation happens to be 0, i.e.
+        // 33.7 % of printable ASCII; for the rest the typed note sat a
+        // rotation away from the song it was supposedly in. Reading the same
+        // two axes the riff reads is what makes the two layers provably agree.
+        //
+        // −3..=4 by construction (`celebration_root` is `sig % 5 − 2`,
+        // `celebration_mode` one of {0, 2, −1}), so the i8 narrowing is total
+        // and the register guard documented on `MODE_ROTATIONS` covers it.
+        self.song_key = (celebration_root(sig) + celebration_mode(sig)) as i8;
     }
 
     /// One BAR of the SING-ALONG sing-along riff — one bar of the eight-bar
@@ -2376,6 +2620,15 @@ impl TrailSynth {
             }
             if self.sing < 1e-4 {
                 self.sing = 0.0;
+                // THE KEY IS RELEASED WITH THE DUCK — the law `song_key`'s doc
+                // states ("exactly as live as the song is"). It used to be
+                // released ONLY in the `is_quiet()` early return above, which a
+                // typist never reaches: at ~9.5 cps or faster a voice is always
+                // live, so the borrowed transpose outlived the song for the
+                // rest of the session. Measured 3.5-6.0 s after the riff died,
+                // the typed register was still pinned by whichever key had been
+                // held — a 9.2-semitone spread across 'z'/'o'/'a'/'e'.
+                self.song_key = 0;
             }
         }
     }
@@ -2473,7 +2726,7 @@ impl TrailSynth {
         // same "wrong against the melody actually playing" logic as the
         // bonk anchor, reused for the opposite purpose (being RIGHT under
         // that melody).
-        let anchor = palette_for(self.bed_voice, self.bed_style).bonk_anchor_hz();
+        let anchor = palette_for(self.bed_voice, self.bed_style).anchor_hz();
         self.bed.var_t += dt;
         let (m, side) = match self.bed_variant {
             // Structurally unreachable (the caller dispatches `Current` to
@@ -2627,12 +2880,20 @@ trait Palette {
     /// level × gain into `lvl`.
     fn bed_sample(&self, s: &mut TrailSynth, dt: f32, lvl: f32, u1: f32, u2: f32) -> (f32, f32);
 
-    /// The register the curse BONK clashes in — each palette's own melodic
-    /// base, so the wrong note is wrong AGAINST the melody actually playing
-    /// rather than in some unrelated octave. Default: the Lumen mid register
-    /// (also right for unpitched palettes like Fire).
-    fn bonk_anchor_hz(&self) -> f32 {
-        330.0
+    /// THE PALETTE'S OWN MELODIC BASE — the register its keystroke lives in,
+    /// and the one register every style-agnostic gesture borrows so it speaks
+    /// in the same octave as the typing rather than in one of its own:
+    /// - the curse BONK clashes here, so the wrong note is wrong AGAINST the
+    ///   melody actually playing;
+    /// - the MOVEMENT family (Glide/Sweep, [`TrailSynth::design_cursor`]) sings
+    ///   here, so scrubbing is the typing's relative;
+    /// - the bed's tournament candidates stack their lattice here.
+    ///
+    /// Default: the Lumen mid register (also right for unpitched palettes like
+    /// Fire). Renamed from `bonk_anchor_hz` when the movement family joined the
+    /// bonk in reading it — one register per palette, named once.
+    fn anchor_hz(&self) -> f32 {
+        CURSOR_ANCHOR_HZ
     }
 }
 
@@ -2677,10 +2938,10 @@ impl Palette for LumenPalette {
         // LAMPLIGHT: each key BLOOMS — a warm mid tone easing gently UP onto
         // its note, a softly beating twin for width, a sub-octave glow, and a
         // breath of air. Backspace dims (the bloom drifts back down).
-        let f = s.melody_hz(
-            330.0,
-            deg + if kind == SoundKind::Backspace { -2 } else { 0 },
-        );
+        //
+        // `deg` already carries the family's deletion step (`gesture_shape`);
+        // this palette states the DIM, not the interval.
+        let f = s.melody_hz(330.0, deg);
         let (f0, f1v) = if kind == SoundKind::Backspace {
             (f, f * 0.94)
         } else {
@@ -2791,7 +3052,10 @@ impl Palette for PhaserPalette {
         // landing, an up-turned "hm?" on backspace, a two-note "ba-deep!"
         // on Jump.
         let hue_deg = (ev.hue * 5.0) as i32;
-        let d = hue_deg + col_off + if kind == SoundKind::Backspace { -2 } else { 0 };
+        // Phaser builds its OWN degree (the live hue drives it, not the melody
+        // walk), so it must ASK for the family's deletion step rather than
+        // spell an interval of its own — the rule has exactly one home.
+        let d = hue_deg + col_off + gesture_shape(kind).offset;
         let f = s.melody_hz(392.0, d);
         let (f0, f1v) = if kind == SoundKind::Backspace {
             (f, f * 1.12)
@@ -2916,7 +3180,7 @@ impl Palette for PhaserPalette {
         (b.lp1 * lvl * 0.05, 0.0)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         392.0
     }
 }
@@ -2937,48 +3201,86 @@ impl Palette for RainbowKittyPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // CUTE DOOPS (owner, 2026-08-04: "I want the typing noise to be a bit
-        // cuter, more like it was before").
+        // THE SUNG DOOP — "musical, lyrical and cute" (owner, 2026-08-10).
         //
-        // "Before" is precise: the founding voice (`c48b10e4`, restored by
-        // `92bf23c1` with the note "the original voices were the right ones")
-        // was C5 / 25 % pulse / 0.09 s / attack 0.001 / decay 0.045 / lp 2600.
-        // `45252f03` mellowed every one of those axes at once on a live-review
-        // brief ("more mellow… make the doop doop sound a bit longer") and the
-        // measured spectral centroid fell 3532 → 2587 Hz while the lowest
-        // content dropped 654 → 245 Hz — an octave and a fourth of added weight.
-        // That is the sound being asked to come back.
+        // WHAT WAS WRONG. `57ad9c7c` ("the doop is cute again") was briefed as
+        // "a BIT cuter" but measured as a FULL revert to the founding voice: at
+        // HEAD the keystroke sat within 1.3 % of `c48b10e4`'s spectral centroid
+        // (1692 Hz vs 1714) and 2.2 % of its share of energy over 2 kHz (0.262
+        // vs 0.268), while the version the owner asked to come back — the
+        // mellow G4 doop that shipped in v0.18.0 — measures 1010 Hz / 0.051.
+        // The two axes that commit kept for the July "more mellow" brief (dur
+        // 0.105, sub-octave 0.09) carry essentially none of the timbre.
         //
-        // This is "a BIT cuter", not a revert: the four axes that CARRY cuteness
-        // go home — the register (a perfect fourth up), the 25 % pulse's second
-        // harmonic (nasal and chirpy, where a 50 % square is hollow and organ-
-        // like), the 1.2 ms attack that puts the tick back on the front, and the
-        // 2600 Hz corner — while the two that carry the July brief keep half
-        // their ground: the note stays a shade longer than the original (0.105 /
-        // 0.052 against 0.09 / 0.045) and the sub-octave survives at HALF level
-        // rather than being deleted, so there is still body under the blip.
-        let base = 523.25; // C5 — the bright chip register
-        let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
-        let f = s.melody_hz(base, d);
-        let mk = |f: f32, delay: f32| Voice {
+        // Worse, its trim re-fit was done on the WRONG QUANTITY: `mix_meter`
+        // reports PEAK, so 1.39 → 1.097 equalised peak to within 0.1 dB while
+        // RMS fell 3.5 dB and CREST rose 3.6 dB (14.0 → 17.6). "Cuteness must
+        // not buy loudness" was enforced; what it bought instead was
+        // CLICKINESS, and nothing measured that. Sensory roughness in the
+        // 15-30 Hz band rose 38 % with it.
+        //
+        // WHAT THIS IS. Cute is not the same axis as bright, and neither is the
+        // same axis as sharp. Each knob was moved for one reason and measured:
+        // - REGISTER — back to G4, the register of the voice the owner picked
+        //   out by ear. What brightness the doop has now comes from a pulse's
+        //   harmonics under a soft corner, not from transposing the fundamental
+        //   up a fourth and hoping.
+        // - DUTY 0.375, between the founding 25 % chirp and the mellow 50 %
+        //   square. Duty is the loudest timbral lever a chip voice has: at
+        //   25 % the second harmonic is at full strength (nasal, cartoonish —
+        //   and the sharpest crest of the three), at 50 % it vanishes entirely
+        //   (hollow, organ-like). 0.375 keeps ~71 % of that harmonic, which is
+        //   audibly a chip voice, while its stronger fundamental is worth
+        //   ~1.3 dB of RMS against the same peak — i.e. the same loudness with
+        //   less of it in the transient.
+        // - THE ATTACK is 3.0 ms, not 1.2. A sub-2 ms attack on a narrow pulse
+        //   IS the click; at 3 ms the note still starts crisply but the
+        //   transient stops out-peaking its own body.
+        // - THE BODY comes back: dur 0.140 / decay 0.078 and a sub-octave at
+        //   0.18 (the mellow voice's weight, twice HEAD's). Peak is unchanged —
+        //   the ladder is a peak law — and RMS and crest are what move.
+        // - THE BEND is the new part, and the LYRICAL one: every doop SINGS
+        //   onto its note from a lattice step below (`gesture_bend`) instead of
+        //   starting dead on it. That tiny scoop is what turns a row of blips
+        //   into a row of little sung syllables — and it is the same
+        //   articulation, mirrored, that makes a deletion read as the keystroke
+        //   undone (see the gesture-family section).
+        //
+        // MEASURED over the 12.5 s typing script (`typing_voice_ab`, scenario
+        // `a-neutral`), against HEAD → this voice, with the v0.18.0 mellow
+        // reference in brackets:
+        //   spectral centroid  1692 → 963 Hz   [1010]
+        //   energy over 2 kHz  0.262 → 0.054   [0.051]
+        //   roughness 15-30 Hz 0.178 → 0.110   [0.129]
+        //   RMS                -35.5 → -32.3   [-32.1]
+        //   CREST              17.6 → 14.5 dB  [14.0]
+        // — inside the mellow voice's numbers on every axis, with the trim
+        // re-fitted to hold the ladder floor on PEAK exactly as before.
+        let base = 392.0; // G4 — the chip register the owner picked by ear
+        // `deg` already carries the family's deletion step; the palette states
+        // the TIMBRE, not the interval.
+        let (f0, f1) = gesture_bend(s.melody_hz(base, deg), gesture_shape(kind).dir);
+        let mk = |f0: f32, f1: f32, delay: f32| Voice {
             delay,
-            dur: 0.105,
-            attack: 0.0012,
-            decay: 0.052,
+            dur: 0.140,
+            attack: 0.0030,
+            decay: 0.078,
             p: [
                 Partial {
-                    lvl: 0.52,
-                    f0: f,
-                    f1: f,
-                    wave: Wave::Pulse { duty: 0.25 },
+                    lvl: 0.5,
+                    f0,
+                    f1,
+                    glide: GESTURE_BEND_TAU,
+                    wave: Wave::Pulse { duty: 0.375 },
                     ..Partial::default()
                 },
-                // Sub-octave sine: the warmth under the doop, at half the
-                // mellow pass's weight.
+                // Sub-octave sine: the warmth under the doop — the body that
+                // keeps the blip from reading as a tick.
                 Partial {
-                    lvl: 0.09,
-                    f0: f * 0.5,
-                    f1: f * 0.5,
+                    lvl: 0.18,
+                    f0: f0 * 0.5,
+                    f1: f1 * 0.5,
+                    glide: GESTURE_BEND_TAU,
                     ..Partial::default()
                 },
                 Partial::default(),
@@ -2986,12 +3288,18 @@ impl Palette for RainbowKittyPalette {
             lp_cut: 2600.0,
             ..Voice::default()
         };
-        s.spawn(mk(f, 0.0), g * 0.34, ev.pan);
+        s.spawn(mk(f0, f1, 0.0), g * 0.34, ev.pan);
         if kind == SoundKind::Jump {
-            // 1-3-5-8 run, 45 ms apart — the rainbow leaps.
-            s.spawn(mk(s.melody_hz(base, d + 2), 0.045), g * 0.3, ev.pan * 0.5);
-            s.spawn(mk(s.melody_hz(base, d + 3), 0.09), g * 0.27, ev.pan * 0.2);
-            s.spawn(mk(s.melody_hz(base, d + 5), 0.135), g * 0.24, -ev.pan * 0.3);
+            // 1-3-5-8 run, 45 ms apart — the rainbow leaps. Each note of the
+            // run sings onto its own degree, so the flourish is the keystroke's
+            // articulation repeated, not a different voice.
+            let mut leap = |step: i32, delay: f32, lvl: f32, pan: f32| {
+                let (a, b) = gesture_bend(s.melody_hz(base, deg + step), 1);
+                s.spawn(mk(a, b, delay), g * lvl, pan);
+            };
+            leap(2, 0.045, 0.3, ev.pan * 0.5);
+            leap(3, 0.09, 0.27, ev.pan * 0.2);
+            leap(5, 0.135, 0.24, -ev.pan * 0.3);
         }
     }
 
@@ -3007,14 +3315,15 @@ impl Palette for RainbowKittyPalette {
         (b.lp1 * lvl * 0.022, 0.0)
     }
 
-    /// Tracks the palette's own `base`. The bonk's clash is defined as an
+    /// Tracks the palette's own `base` (G4). The bonk's clash is defined as an
     /// interval AGAINST the voice it interrupts (`BONK_MINOR_SECOND` /
-    /// `BONK_TRITONE` against this anchor), so an anchor left behind at the old
-    /// register would stop clashing — the invariant
-    /// `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash` pins the
-    /// two moving together.
-    fn bonk_anchor_hz(&self) -> f32 {
-        523.25
+    /// `BONK_TRITONE` against this anchor), and the movement family sings in
+    /// this register too, so an anchor left behind at an old `base` would stop
+    /// clashing AND put scrubbing in a different octave from typing — the
+    /// invariant `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash`
+    /// pins the two moving together.
+    fn anchor_hz(&self) -> f32 {
+        392.0
     }
 }
 
@@ -3125,7 +3434,7 @@ impl Palette for SparklePalette {
         (sm * lvl * 0.022, sm * lvl * 0.006)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         523.25
     }
 }
@@ -3508,7 +3817,7 @@ impl Palette for LaserPalette {
         (b.lp1 * lvl * 0.5 * swell, 0.0)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         880.0
     }
 }
@@ -3649,7 +3958,7 @@ impl Palette for BeamPalette {
         (b.lp2 * lvl * 0.5 * breathe, b.lp1 * lvl * 0.03)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         330.0
     }
 }
@@ -3838,7 +4147,7 @@ impl Palette for WaterPalette {
         (b.lp2 * lvl * 0.5 * und, b.lp1 * lvl * 0.06)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         430.0
     }
 }
@@ -3866,9 +4175,9 @@ impl Palette for CometPalette {
         // Nothing clicks, nothing chimes. The excitement: rare SHOOTING
         // STARS off typed keys, and Jump = the full FLYBY — a doppler swoosh
         // with a scatter of SHORT crystal debris glints (icy, not churchy).
-        // Backspace drifts UP: it recedes.
-        let d = deg + if kind == SoundKind::Backspace { -2 } else { 0 };
-        let f = s.melody_hz(220.0, d); // A3 region — the void register
+        // Backspace drifts UP: it recedes. (The deletion's lattice STEP comes
+        // from `gesture_shape` via `deg`; this palette states the drift.)
+        let f = s.melody_hz(220.0, deg); // A3 region — the void register
         let (f0, f1v) = if kind == SoundKind::Backspace {
             (f * 0.97, f * 1.03)
         } else {
@@ -4047,7 +4356,7 @@ impl Palette for CometPalette {
         (sm * lvl * 0.055, sm * lvl * 0.014)
     }
 
-    fn bonk_anchor_hz(&self) -> f32 {
+    fn anchor_hz(&self) -> f32 {
         220.0
     }
 }
@@ -4061,7 +4370,7 @@ impl Palette for CometPalette {
 /// ([`SoundVoice::Mech`]) — no [`GlowStyle`] binds here, so the nine shipped
 /// style palettes keep their byte pins untouched. Unpitched by design: no
 /// lattice membership to prove, and the default 330 Hz bonk anchor is right
-/// (the doc on [`Palette::bonk_anchor_hz`] calls this out for unpitched
+/// (the doc on [`Palette::anchor_hz`] calls this out for unpitched
 /// palettes). The bed is structurally silent — a keyboard has no weather.
 struct MechPalette;
 
@@ -4315,6 +4624,136 @@ mod tests {
         GlowStyle::Water,
         GlowStyle::Comet,
     ];
+
+    /// Every gesture the host can cue, in the order the loudness ladder
+    /// names them. Shared by the touch-to-ear pins below so a new
+    /// [`SoundKind`] cannot land without an onset proof.
+    const KINDS: [SoundKind; 8] = [
+        SoundKind::Typed,
+        SoundKind::Backspace,
+        SoundKind::Glide { dir: 1 },
+        SoundKind::Navigation,
+        SoundKind::Sweep { dir: 1 },
+        SoundKind::Kill,
+        SoundKind::Jump,
+        SoundKind::Land,
+    ];
+
+    /// TOUCH-TO-EAR, THE SYNTH'S SHARE: exactly zero.
+    ///
+    /// The keystroke→sound budget is spent almost entirely OUTSIDE this file
+    /// — the host's AudioQueue holds `BUFFER_COUNT × BUFFER_FRAMES` of
+    /// already-rendered audio ahead of any cue — so the ONE thing the synth
+    /// owes the ear is that a cue is audible in the very first buffer rendered
+    /// after it, with nothing in front of it. The arpeggio idiom (flourishes
+    /// are pre-delayed voices, no scheduler) makes that easy to lose by
+    /// accident: give a palette's LEADING voice a `delay`, or design a
+    /// gesture whose first note is a grace note, and every keystroke in that
+    /// style silently gets slower with no test to say so. Four doc comments
+    /// asserted this contract; nothing enforced it.
+    ///
+    /// Both halves are needed. The delay check states the intent structurally
+    /// (`spawn` models pre-delay as a NEGATIVE onset time, so the earliest
+    /// live voice reads its own delay straight back); the render check proves
+    /// the intent survived into samples — a leading voice at `delay = 0` whose
+    /// envelope or gain leaves the buffer empty is just as late to the ear.
+    #[test]
+    fn every_gesture_speaks_in_its_first_post_cue_buffer() {
+        // The host's real block geometry (`trail_audio::BUFFER_FRAMES`).
+        const BLOCK: usize = 512;
+        // 0.33 ms. Three partials at independent random phases cannot all
+        // hold a zero crossing this long, so the window forgives phase luck
+        // while still failing any pre-delay worth a millisecond.
+        const HEAD: usize = 16;
+        for voice in [SoundVoice::Style, SoundVoice::Mech] {
+            for style in STYLES {
+                for kind in KINDS {
+                    let mut s = TrailSynth::new(48_000.0, 0x0A7E);
+                    // Bed OFF: this pins the GESTURE's onset. The bed is a
+                    // slew-limited swell with no onset to pin, and mixing it
+                    // in would let ambience mask a late note.
+                    let mut e = ev(style, kind);
+                    e.voice = voice;
+                    e.bed = false;
+                    s.push(e);
+                    let ctx = format!("{voice:?}/{style:?}/{kind:?}");
+                    assert!(s.live_voices() > 0, "{ctx}: cued but spawned nothing");
+                    let lead = s
+                        .voices
+                        .iter()
+                        .filter(|v| v.on)
+                        .map(|v| -v.t)
+                        .fold(f32::MAX, f32::min);
+                    assert_eq!(
+                        lead, 0.0,
+                        "{ctx}: the LEADING voice must be immediate — a pre-delay \
+                         here is keystroke latency no host can claw back"
+                    );
+                    let mut blk = vec![0.0f32; BLOCK * CHANNELS];
+                    s.render(&mut blk);
+                    assert!(
+                        blk[..HEAD * CHANNELS].iter().any(|x| *x != 0.0),
+                        "{ctx}: the first post-cue buffer must OPEN with signal"
+                    );
+                }
+            }
+        }
+    }
+
+    /// …and a PER-CHARACTER gesture's leading voice must RISE promptly, not
+    /// merely start at sample zero. A voice can be first-buffer audible and
+    /// still read as late if its envelope blooms: what the ear times is the
+    /// rise, and past some point the attack IS the latency.
+    ///
+    /// Pinned on the envelope constant rather than on rendered level, and
+    /// deliberately so. An exponential attack rises linearly at first, so a
+    /// "time to −20 dB of peak" threshold barely moves when `attack` grows —
+    /// it passes an eightfold slowdown unchanged. The knob is the honest
+    /// thing to bound.
+    ///
+    /// The budget is 16 ms against a measured worst case of 12 ms today
+    /// (Comet's bell and Sparkle's shimmer, both deliberate blooms): one step
+    /// of headroom to retune a palette, nowhere near enough to turn a click
+    /// into a fade-in.
+    ///
+    /// Per-character only. The TIER 3/4 gestures are punctuation — Kill's
+    /// swoosh is a 20 ms-attack noise fall BY DESIGN, and Jump's and Land's
+    /// peaks legitimately arrive in a later pre-delayed note. Their
+    /// promptness claim is the first-buffer pin above, which they do keep.
+    #[test]
+    fn a_per_character_gesture_rises_within_sixteen_milliseconds() {
+        const BUDGET_S: f32 = 0.016;
+        for voice in [SoundVoice::Style, SoundVoice::Mech] {
+            for style in STYLES {
+                for kind in [
+                    SoundKind::Typed,
+                    SoundKind::Backspace,
+                    SoundKind::Glide { dir: 1 },
+                ] {
+                    let mut s = TrailSynth::new(48_000.0, 0x0A7E);
+                    let mut e = ev(style, kind);
+                    e.voice = voice;
+                    e.bed = false;
+                    s.push(e);
+                    // The LEADING voice only (`t == 0.0` — pre-delayed
+                    // flourishes sit at a negative onset time and are free to
+                    // swell however the palette likes).
+                    let attack = s
+                        .voices
+                        .iter()
+                        .filter(|v| v.on && v.t == 0.0)
+                        .map(|v| v.attack)
+                        .fold(f32::MAX, f32::min);
+                    assert!(
+                        attack <= BUDGET_S,
+                        "{voice:?}/{style:?}/{kind:?}: leading attack {attack} s exceeds \
+                         the {BUDGET_S} s budget — past here the rise, not the delivery, \
+                         is what the ear waits on"
+                    );
+                }
+            }
+        }
+    }
 
     /// A fresh synth is quiet and renders exact zeros.
     #[test]
@@ -5055,20 +5494,28 @@ mod tests {
         // pending GUI patch lands — because the latch used to exist only on the
         // deprecated `RiffBar { key }` arm, and a fixture that reaches for the
         // shim would have gone on passing while the shipping path was mute.
-        // `sig = 4` is a root of +2 (`4 % 5 - 2`), the same key the legacy
-        // fixture used, so the transposition under test is unchanged.
+        // `sig = 4` is a root of +2 (`4 % 5 - 2`) and a mode rotation of +2
+        // (`MODE_ROTATIONS[4 % 3]`). The latched key must be the SUM — the same
+        // integer `design_celebration` shifts every sounding riff degree by —
+        // or the typing sits a rotation away from the song it is supposedly in
+        // (it did, for the 66 % of characters whose rotation is nonzero).
         const SIG_IN_KEY_TWO: u32 = 4;
+        let shift = celebration_root(SIG_IN_KEY_TWO) + celebration_mode(SIG_IN_KEY_TWO);
         assert_eq!(
-            celebration_root(SIG_IN_KEY_TWO),
-            2,
-            "fixture precondition: this signature's song IS in key +2"
+            (celebration_root(SIG_IN_KEY_TWO), shift),
+            (2, 4),
+            "fixture precondition: root +2, root+mode +4"
         );
         let mut singing = TrailSynth::new(48_000.0, 7);
         singing.push(SoundEvent {
             kind: SoundGesture::Celebration(CelebrationGesture::riff_bar(0, SIG_IN_KEY_TWO)),
             ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
         });
-        assert_eq!(singing.song_key, 2, "the riff latches its key");
+        assert_eq!(
+            i32::from(singing.song_key),
+            shift,
+            "the riff latches the key it actually transposes by (root + mode)"
+        );
         let mut after = TrailSynth::new(48_000.0, 7);
         after.song_key = 2;
         after.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
@@ -5096,6 +5543,34 @@ mod tests {
             neutral,
             "and the neutral typed melody is unchanged, note for note"
         );
+
+        // THE HAND-BACK MUST NOT DEPEND ON SILENCE. The release used to live
+        // only in the `is_quiet()` early return, which a typist never reaches:
+        // at ~9.5 cps or faster a voice is always live, so the borrowed key
+        // outlived the song for the rest of the session (measured 3.5-6.0 s
+        // after the last bar, the typed register was still pinned by whichever
+        // character had been held). Here the synth is kept AUDIBLE throughout
+        // by continuous typing, and the key must still come back with the
+        // sing duck.
+        let mut busy = TrailSynth::new(48_000.0, 7);
+        busy.push(SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::riff_bar(0, SIG_IN_KEY_TWO)),
+            ..ev(GlowStyle::RainbowKitty, SoundKind::Typed)
+        });
+        assert_ne!(busy.song_key, 0, "the song latched a key");
+        let mut blk = vec![0.0f32; 480 * CHANNELS]; // 10 ms
+        for i in 0..1_200 {
+            // 12 s of typing at ~20 cps: `is_quiet()` is never true.
+            if i % 5 == 0 {
+                busy.push(ev(GlowStyle::RainbowKitty, SoundKind::Typed));
+            }
+            busy.render(&mut blk);
+            assert!(!busy.is_quiet(), "the fixture never falls silent");
+        }
+        assert_eq!(
+            busy.song_key, 0,
+            "the borrowed key is released with the sing duck, not with silence"
+        );
     }
 
     /// The bonk is the one deliberately discordant voice: its clash partials
@@ -5106,10 +5581,10 @@ mod tests {
     fn bonk_is_discordant_against_the_walk_and_moves_nothing() {
         let mut s = TrailSynth::new(48_000.0, 33);
         let walk_before = s.walk;
-        // the rainbow kitty's bonk anchor (C5) at the current degree — the anchor tracks
-        // the palette's own melodic register, and moved with it when the typing
-        // voice went back to the bright chip register on 2026-08-04.
-        let root = penta(523.25, walk_before);
+        // The rainbow kitty's anchor (G4) at the current degree — one register
+        // per palette (`Palette::anchor_hz`), tracking its `base`, so it moved
+        // with the typing voice when the doop went back to G4 on 2026-08-10.
+        let root = penta(392.0, walk_before);
         s.push(bonk(GlowStyle::RainbowKitty));
         assert_eq!(s.walk, walk_before, "a bonk must not step the melody walk");
         assert_eq!(
@@ -5401,6 +5876,35 @@ mod tests {
         // operand is a constant, so this is a build failure, not a test failure.
         const {
             assert!((7.0 + CELEBRATION_SWING) * CELEBRATION_EIGHTH < CELEBRATION_BAR_SECONDS);
+        }
+    }
+
+    /// THE SECTION-REOPEN SEAM (the key-switch law's musical half): a
+    /// committed key switch re-enters the form at
+    /// `kitty_sing::section_reopen_bar`, pinned here against this module's
+    /// decode. The engine's form length IS the authored phrase length, and
+    /// every reopen target decodes to form slot 0 — a VERSE bar, so the new
+    /// key announces itself with its own walk instead of hiding behind the
+    /// shared chorus — strictly above the current bar, so the host's
+    /// per-bar latch always fires and the build/clap ramps (functions of
+    /// the pushed index) never fall back to the cold open mid-switch.
+    #[test]
+    fn the_section_reopen_lands_on_the_forms_verse_opening() {
+        assert_eq!(
+            crate::kitty_sing::SING_FORM_BARS,
+            CELEBRATION_PHRASE_BARS as u64,
+            "the engine's form length must be the authored phrase length"
+        );
+        assert!(
+            CELEBRATION_VERSE[0],
+            "form slot 0 must stay a verse bar — the reopen law depends on it"
+        );
+        for current in [0u64, 1, 5, 6, 7, 8, 9, 63, 64, 1000, u64::from(u16::MAX)] {
+            let target = crate::kitty_sing::section_reopen_bar(current);
+            assert!(target > current, "the reopened section outruns bar {current}");
+            let slot = (target % (CELEBRATION_PHRASE_BARS as u64)) as usize;
+            assert_eq!(slot, 0, "reopen from bar {current} landed mid-form");
+            assert!(CELEBRATION_VERSE[slot]);
         }
     }
 
@@ -6104,6 +6608,350 @@ mod tests {
         );
     }
 
+    /// Walk `n` typed notes of one tone and return the degree sequence — the
+    /// melody as integers, with no audio in the way.
+    fn walk_sequence(tone: Tone, seed: u32, n: usize) -> Vec<i32> {
+        let mut s = TrailSynth::new(48_000.0, seed);
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Keep every note admitted and in-phrase: no gap, no thinning.
+            s.since_voice = 1.0;
+            s.since_event = 0.0;
+            s.push(SoundEvent {
+                tone,
+                ..ev(GlowStyle::Lumen, SoundKind::Typed)
+            });
+            out.push(s.walk);
+        }
+        out
+    }
+
+    /// THE MELODY MOVES. A phrase generator whose steps cancel against its own
+    /// contour is a drone with extra state: before the arc was made orthogonal
+    /// to the motif (see [`ARC_LIFT`]) and zero deltas were removed from the
+    /// draw, 54 % of consecutive typed notes were the SAME PITCH — measured
+    /// over a 12.5 s script, and audible as the "scatter of pitches that never
+    /// goes anywhere" the owner heard. This pins the defect shut for every
+    /// tone: fewer than a quarter of steps may repeat, and the line must use a
+    /// real spread of its register.
+    #[test]
+    fn the_typed_line_moves_more_than_it_repeats() {
+        for tone in [
+            Tone::Technical,
+            Tone::Calm,
+            Tone::Excited,
+            Tone::Frustrated,
+            Tone::Playful,
+        ] {
+            let (lo, hi) = tone_register(tone);
+            for seed in [1u32, 0x5EED, 0xA11CE, 0xBEEF] {
+                let seq = walk_sequence(tone, seed, 400);
+                let steps = seq.windows(2).count();
+                let unison = seq.windows(2).filter(|w| w[0] == w[1]).count();
+                let pct = unison as f32 / steps as f32 * 100.0;
+                assert!(
+                    pct < 25.0,
+                    "{tone:?}/{seed:#x}: {pct:.1}% of the melody's steps repeat a pitch — \
+                     the line is droning, not singing"
+                );
+                let (mn, mx) = seq
+                    .iter()
+                    .fold((i32::MAX, i32::MIN), |(a, b), &d| (a.min(d), b.max(d)));
+                assert!(
+                    mn >= lo && mx <= hi,
+                    "{tone:?}: the walk left its register: {mn}..{mx} vs {lo}..{hi}"
+                );
+                assert!(
+                    mx - mn >= 4,
+                    "{tone:?}: the walk used only {} degrees of its register",
+                    mx - mn
+                );
+            }
+        }
+    }
+
+    /// THE CONTOUR ARC AND THE MOTIF ARE ORTHOGONAL — the property the whole
+    /// fix rests on. The motif walks in steps of [`melody_span`]; the arc moves
+    /// in ONE jump of [`ARC_LIFT`]. If a single arc move can equal a single
+    /// motif step the two cancel and the note repeats, which is exactly what
+    /// `round(2·sin)` (an arc that climbed ±1 at a time) did to every mood.
+    ///
+    /// PLAYFUL is the deliberate exception: skipping as wide as the arc IS its
+    /// character (`melody_span` 2, the whimsy knob), so for that one mood a
+    /// cancellation is possible on the ~3 of 7 transitions where the arc moves.
+    /// It is held instead by the empirical bound in
+    /// `the_typed_line_moves_more_than_it_repeats`, which covers every tone.
+    #[test]
+    fn the_contour_arc_cannot_cancel_a_motif_step() {
+        for tone in [
+            Tone::Technical,
+            Tone::Calm,
+            Tone::Excited,
+            Tone::Frustrated,
+            Tone::Playful,
+        ] {
+            if tone == Tone::Playful {
+                assert_eq!(melody_span(tone), ARC_LIFT, "the documented exception");
+                continue;
+            }
+            assert!(
+                ARC_LIFT > melody_span(tone),
+                "{tone:?}: an arc lift of {ARC_LIFT} is reachable by one motif step of \
+                 {} — the two can cancel into a unison",
+                melody_span(tone)
+            );
+        }
+        // And the arc really is a single move, not a climb: over any phrase
+        // length it takes exactly two values, 0 and ARC_LIFT.
+        for len in PHRASE_MIN..=PHRASE_MAX {
+            for pos in 0..len {
+                let frac = f32::from(pos) / f32::from(len);
+                let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
+                assert!(
+                    arc == 0 || arc == ARC_LIFT,
+                    "arc took an intermediate value {arc} at {pos}/{len}"
+                );
+            }
+        }
+    }
+
+    /// The REGISTER FOLD is total, in range, and — unlike the clamp it
+    /// replaced — never turns two different registers into one pitch.
+    #[test]
+    fn the_register_fold_is_total_and_never_flattens() {
+        for (lo, hi) in [(0, 7), (0, 6), (0, 8), (3, 3)] {
+            for v in -40..40 {
+                let f = fold_register(v, lo, hi);
+                assert!(f >= lo && f <= hi, "fold({v}) = {f} escaped {lo}..{hi}");
+            }
+        }
+        // A clamp maps every out-of-range value to one endpoint; a reflection
+        // keeps them distinct as long as they are within a span of each other.
+        assert_ne!(fold_register(8, 0, 7), fold_register(9, 0, 7));
+        assert_ne!(fold_register(-1, 0, 7), fold_register(-2, 0, 7));
+    }
+
+    // -- THE GESTURE FAMILY -------------------------------------------------
+
+    /// THE RULE, as a table. Direction signs the offset; scale sets the note
+    /// count and the stride; a WORD gesture lands exactly
+    /// [`GESTURE_WORD_CHARS`] character-steps out. Everything else in the
+    /// engine reads its family geometry from this one function, so this test
+    /// IS the specification.
+    #[test]
+    fn the_gesture_family_is_one_rule() {
+        let typed = gesture_shape(SoundKind::Typed);
+        assert_eq!(
+            (typed.dir, typed.notes, typed.step, typed.offset),
+            (1, 1, 0, 0),
+            "a keystroke is the reference: forward, one note, on the degree"
+        );
+        let back = gesture_shape(SoundKind::Backspace);
+        assert_eq!(
+            (back.dir, back.notes, back.step, back.offset),
+            (-1, 1, 0, -GESTURE_CHAR_STEP),
+            "a deletion is the keystroke inverted: one character DOWN"
+        );
+        for dir in [1i8, -1] {
+            let glide = gesture_shape(SoundKind::Glide { dir });
+            let sweep = gesture_shape(SoundKind::Sweep { dir });
+            assert_eq!(glide.dir, dir);
+            assert_eq!(sweep.dir, dir);
+            assert_eq!(glide.notes, 1, "a character motion is one note");
+            assert_eq!(
+                glide.offset,
+                i32::from(dir) * GESTURE_CHAR_STEP,
+                "a character motion travels one character"
+            );
+            // THE SCALE LAW: the word motion's LAST note lands where a
+            // character motion of word size would.
+            let word_travel = sweep.offset + sweep.step * (sweep.notes as i32 - 1);
+            assert_eq!(
+                word_travel,
+                i32::from(dir) * GESTURE_CHAR_STEP * GESTURE_WORD_CHARS,
+                "a word motion must land {GESTURE_WORD_CHARS} character-steps out"
+            );
+            assert_eq!(
+                sweep.step, glide.offset,
+                "and it must get there by REPEATING the character step, not by leaping"
+            );
+        }
+        // Gestures outside the family take the neutral shape, so no caller has
+        // to branch on membership.
+        for kind in [
+            SoundKind::Jump,
+            SoundKind::Kill,
+            SoundKind::Land,
+            SoundKind::Navigation,
+        ] {
+            let s = gesture_shape(kind);
+            assert_eq!((s.dir, s.notes, s.step, s.offset), (1, 1, 0, 0), "{kind:?}");
+        }
+        // The BEND is directional and exactly mirrored: forward arrives from
+        // below, inverse from above, both landing on the note.
+        let (up0, up1) = gesture_bend(440.0, 1);
+        let (dn0, dn1) = gesture_bend(440.0, -1);
+        assert_eq!((up1, dn1), (440.0, 440.0), "both land on the note");
+        assert!(up0 < 440.0 && dn0 > 440.0, "and enter from opposite sides");
+        assert!((up0 * GESTURE_BEND - 440.0).abs() < 1e-3);
+        assert!((dn0 / GESTURE_BEND - 440.0).abs() < 1e-3);
+    }
+
+    /// Spawn the family gesture `kind` from a SETTLED melody state and report
+    /// the synth (for its degree) plus its live voices' `(landing pitch, entry
+    /// pitch)` pairs — the loudest partial of each — ordered by pitch.
+    fn family_voices(style: GlowStyle, kind: SoundKind) -> (TrailSynth, Vec<(f32, f32)>) {
+        let mut s = TrailSynth::new(48_000.0, 0xFA_1117);
+        let mut buf = [0.0f32; 1024]; // 512 frames ≈ 10.7 ms
+        s.push(ev(style, SoundKind::Typed));
+        // ~270 ms of settling — under PHRASE_PAUSE_S, so the probe stays in the
+        // same phrase. Palettes whose voices run longer than that (Sparkle's
+        // 0.55 s chimes, Comet's drift) are handled by DIFFING the voice pool
+        // rather than by waiting: what is measured is what THIS gesture spawned.
+        for _ in 0..25 {
+            s.render(&mut buf);
+        }
+        let before: [bool; MAX_VOICES] = core::array::from_fn(|i| s.voices[i].on);
+        s.since_voice = 1.0;
+        s.push(ev(style, kind));
+        let mut out: Vec<(f32, f32)> = s
+            .voices
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| v.on && !before[*i])
+            .filter_map(|(_, v)| {
+                let p = v.p.iter().max_by(|a, b| a.lvl.total_cmp(&b.lvl))?;
+                (p.lvl > 0.0).then_some((p.f1, p.f0))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        (s, out)
+    }
+
+    /// A DELETION IS A KEYSTROKE INVERTED — the family's first claim, on the
+    /// owner's own palette. Same voice design, one lattice step down, and the
+    /// contour bend mirrored: the keystroke arrives from BELOW its note, the
+    /// deletion leaves from ABOVE it.
+    #[test]
+    fn a_deletion_is_the_keystroke_inverted() {
+        let (ts, typed) = family_voices(GlowStyle::RainbowKitty, SoundKind::Typed);
+        let (bs, back) = family_voices(GlowStyle::RainbowKitty, SoundKind::Backspace);
+        assert_eq!(typed.len(), 1, "a keystroke is one voice");
+        assert_eq!(back.len(), 1, "so is its deletion");
+        // Both advance the phrase identically, so they speak from one degree.
+        assert_eq!(ts.walk, bs.walk, "fixture: the two probes share a degree");
+        let (t_land, t_enter) = typed[0];
+        let (b_land, b_enter) = back[0];
+        assert!(
+            t_enter < t_land && b_enter > b_land,
+            "the bend must mirror: typed {t_enter}->{t_land}, deleted {b_enter}->{b_land}"
+        );
+        // Exactly one lattice step down, on the active table and in the
+        // palette's register.
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        let expect = ts.melody_hz(anchor, ts.walk - GESTURE_CHAR_STEP);
+        assert!(
+            (b_land - expect).abs() < 0.5,
+            "a deletion must sit exactly {GESTURE_CHAR_STEP} lattice step below the \
+             keystroke ({t_land} Hz): got {b_land}, expected {expect}"
+        );
+    }
+
+    /// EVERY PALETTE MIRRORS. The deletion interval used to be spelled per
+    /// palette — −2 in three of them, −3 in one, absent in six — so "a
+    /// deletion" meant something different in every style, and six styles said
+    /// nothing at all. The offset now rides the shared degree, so this holds
+    /// for the whole registry.
+    #[test]
+    fn every_palette_mirrors_a_deletion() {
+        for style in STYLES {
+            // FIRE is the one UNPITCHED palette: its keystroke is a high-Q
+            // noise crack with no lattice degree at all (`design` takes
+            // `_deg`), so it says "inverse" in TIMBRE — a duller, lower fibre —
+            // and there is no interval for the shared rule to move. Everything
+            // else is pitched and must mirror.
+            if style == GlowStyle::Fire {
+                continue;
+            }
+            let (_, typed) = family_voices(style, SoundKind::Typed);
+            let (_, back) = family_voices(style, SoundKind::Backspace);
+            assert!(!typed.is_empty() && !back.is_empty(), "{style:?} speaks");
+            assert_ne!(
+                typed[0].0, back[0].0,
+                "{style:?}: a deletion must not land on the note it removes"
+            );
+        }
+    }
+
+    /// A WORD MOTION IS A CHARACTER MOTION AT SCALE — the family's second
+    /// claim, measured on the rendered voices: the run's notes step by the
+    /// SAME interval a Glide travels, and its last note lands
+    /// [`GESTURE_WORD_CHARS`] of those steps out.
+    #[test]
+    fn a_word_motion_is_a_character_motion_at_scale() {
+        let anchor = palette_for(SoundVoice::Style, GlowStyle::RainbowKitty).anchor_hz();
+        for dir in [1i8, -1] {
+            let (gs, glide) = family_voices(GlowStyle::RainbowKitty, SoundKind::Glide { dir });
+            let (ss, sweep) = family_voices(GlowStyle::RainbowKitty, SoundKind::Sweep { dir });
+            assert_eq!(glide.len(), 1, "a character motion is one note");
+            assert_eq!(
+                sweep.len(),
+                CURSOR_SWEEP_RUN,
+                "a word motion is one note per character crossed"
+            );
+            // A cursor gesture does not step the phrase, so both probes speak
+            // from the melody's current degree (pan 0 ⇒ no column nudge).
+            assert_eq!(gs.walk, ss.walk, "fixture: one degree for both probes");
+            let step = i32::from(dir) * GESTURE_CHAR_STEP;
+            // The character motion lands ONE step out…
+            assert!(
+                (glide[0].0 - gs.melody_hz(anchor, gs.walk + step)).abs() < 0.5,
+                "dir {dir}: a character motion must land one step out"
+            );
+            // …and the word motion walks that SAME step, once per character.
+            let mut expect: Vec<f32> = (0..CURSOR_SWEEP_RUN)
+                .map(|i| ss.melody_hz(anchor, ss.walk + step * i as i32))
+                .collect();
+            expect.sort_by(f32::total_cmp);
+            for (got, want) in sweep.iter().map(|p| p.0).zip(expect) {
+                assert!(
+                    (got - want).abs() < 0.5,
+                    "dir {dir}: the run must be the character step repeated: {got} vs {want}"
+                );
+            }
+            // And it is audibly BIGGER than the character motion it scales.
+            let span = sweep[sweep.len() - 1].0 / sweep[0].0;
+            let one =
+                gs.melody_hz(anchor, gs.walk + GESTURE_CHAR_STEP) / gs.melody_hz(anchor, gs.walk);
+            assert!(
+                span > one * 1.05,
+                "dir {dir}: a word motion must travel further than a character one \
+                 ({span} vs {one})"
+            );
+        }
+    }
+
+    /// The movement family sings in the PALETTE'S register, not one of its
+    /// own: `Palette::anchor_hz` is the single register per style that the
+    /// keystroke, the bonk and the cursor voices all read.
+    #[test]
+    fn cursor_motion_sings_in_the_palettes_register() {
+        for style in [
+            GlowStyle::RainbowKitty,
+            GlowStyle::Sparkle,
+            GlowStyle::Lumen,
+        ] {
+            let anchor = palette_for(SoundVoice::Style, style).anchor_hz();
+            let (_, glide) = family_voices(style, SoundKind::Glide { dir: 1 });
+            let f = glide[0].0;
+            assert!(
+                f > anchor * 0.4 && f < anchor * 4.0,
+                "{style:?}: a cursor note at {f} Hz is not in its palette's \
+                 register (anchor {anchor})"
+            );
+        }
+    }
+
     // -- cursor-movement gesture proofs -------------------------------------
 
     /// Total spawned-voice energy proxy (Σ gl²+gr² over live voices) — a
@@ -6130,15 +6978,18 @@ mod tests {
             "a cursor glide must not step the phrase melody"
         );
         assert_eq!(s.live_voices(), 1, "a glide is a single tone");
+        // The note the glide LANDS on (`f1`): the family's contour bend enters
+        // it from a lattice step below (`gesture_bend`), so `f0` is the scoop,
+        // not the pitch.
         let f = s
             .voices
             .iter()
             .find(|v| v.on)
-            .map(|v| v.p[0].f0)
+            .map(|v| v.p[0].f1)
             .expect("a glide voice");
         // In-key: one scale-step up from the current degree, on the active
-        // (Technical ⇒ PENTA) table.
-        let expect = s.melody_hz(CURSOR_ANCHOR_HZ, walk + 1);
+        // (Technical ⇒ PENTA) table, in the palette's own register.
+        let expect = s.melody_hz(CURSOR_ANCHOR_HZ, walk + GESTURE_CHAR_STEP);
         assert!(
             (f - expect).abs() < 1.0,
             "glide pitch {f} must be the in-key step {expect}"
@@ -6349,26 +7200,32 @@ mod tests {
                     self.phrase_parity ^= true;
                     self.phrase_len =
                         PHRASE_MIN + (self.rnd() * ((PHRASE_MAX - PHRASE_MIN + 1) as f32)) as u8;
-                    for i in 0..4 {
-                        self.motif[i] = (self.rnd() * 3.0) as i8 - 1;
+                    // Three NONZERO drawn steps (span 1 ⇒ ±1) and a closing
+                    // one, verbatim with the production draw.
+                    let mut sum = 0;
+                    for i in 0..3 {
+                        let k = (self.rnd() * 2.0) as i32;
+                        let d = if k < 1 { k - 1 } else { k };
+                        self.motif[i] = d as i8;
+                        sum += d;
                     }
+                    self.motif[3] = (-sum).clamp(-2, 2) as i8;
                 } else {
                     let idx = (self.phrase_pos % 4) as usize;
                     let mut delta = i32::from(self.motif[idx]);
                     if self.phrase_parity {
                         delta = -delta;
                     }
-                    if self.phrase_pos == 4 {
-                        delta += 1;
-                    }
                     if self.phrase_pos == self.phrase_len / 2 {
                         delta += MELODY_LEAP;
                     }
                     self.phrase_step += delta;
                     let frac = f32::from(self.phrase_pos) / f32::from(self.phrase_len);
-                    let arc = (ARC_AMP * (core::f32::consts::PI * frac).sin()).round() as i32;
+                    let arc = ARC_LIFT * (core::f32::consts::PI * frac).sin().round() as i32;
+                    let vary = if self.phrase_pos >= 4 { MOTIF_VARY } else { 0 };
                     self.phrase_pos += 1;
-                    self.walk = (self.phrase_home + self.phrase_step + arc).clamp(0, 7);
+                    self.walk =
+                        fold_register(self.phrase_home + self.phrase_step + arc + vary, 0, 7);
                 }
                 self.design(style, kind, pan, heat, hue, gain, duck);
             }
@@ -6436,9 +7293,11 @@ mod tests {
                     SoundKind::Land => LAND_KIND_GAIN,
                 };
                 let g = g * kg;
-                // ±1 column nudge, as in production.
+                // ±1 column nudge and the gesture-family offset, as in
+                // production (`song_key` has no analogue here — the oracle
+                // never sings).
                 let col_off = (pan).round() as i32;
-                let deg = self.walk + col_off;
+                let deg = self.walk + col_off + gesture_shape(kind).offset;
 
                 // A kill is a style-tinted downward swoosh for every palette: soft
                 // noise falling through the style's register. Designed once here.
@@ -6475,10 +7334,7 @@ mod tests {
                     // LUMEN/CUSTOM — the design intent lives on
                     // `LumenPalette::design`; this arm is its frozen twin.
                     GlowStyle::Lumen | GlowStyle::Custom => {
-                        let f = penta(
-                            330.0,
-                            deg + if kind == SoundKind::Backspace { -2 } else { 0 },
-                        );
+                        let f = penta(330.0, deg);
                         let (f0, f1v) = if kind == SoundKind::Backspace {
                             (f, f * 0.94)
                         } else {
@@ -6559,8 +7415,7 @@ mod tests {
                     // PHASER — see `PhaserPalette::design`.
                     GlowStyle::Phaser => {
                         let hue_deg = (hue * 5.0) as i32;
-                        let d =
-                            hue_deg + col_off + if kind == SoundKind::Backspace { -2 } else { 0 };
+                        let d = hue_deg + col_off + gesture_shape(kind).offset;
                         let f = penta(392.0, d);
                         // The rounded settle: start a whisker sharp and relax onto
                         // the note. Backspace inverts it.
@@ -6648,28 +7503,28 @@ mod tests {
 
                     // RAINBOW KITTY — see `RainbowKittyPalette::design`.
                     GlowStyle::RainbowKitty => {
-                        let base = 523.25; // C5 — the bright chip register
-                        let d = deg + if kind == SoundKind::Backspace { -3 } else { 0 };
-                        let f = penta(base, d);
-                        let mk = |f: f32, delay: f32| Voice {
+                        let base = 392.0; // G4 — the chip register
+                        let (f0, f1) = gesture_bend(penta(base, deg), gesture_shape(kind).dir);
+                        let mk = |f0: f32, f1: f32, delay: f32| Voice {
                             delay,
-                            dur: 0.105,
-                            attack: 0.0012,
-                            decay: 0.052,
+                            dur: 0.140,
+                            attack: 0.0030,
+                            decay: 0.078,
                             p: [
                                 Partial {
-                                    lvl: 0.52,
-                                    f0: f,
-                                    f1: f,
-                                    wave: Wave::Pulse { duty: 0.25 },
+                                    lvl: 0.5,
+                                    f0,
+                                    f1,
+                                    glide: GESTURE_BEND_TAU,
+                                    wave: Wave::Pulse { duty: 0.375 },
                                     ..Partial::default()
                                 },
-                                // Sub-octave sine: the warmth under the doop, at
-                                // half the mellow pass's weight.
+                                // Sub-octave sine: the warmth under the doop.
                                 Partial {
-                                    lvl: 0.09,
-                                    f0: f * 0.5,
-                                    f1: f * 0.5,
+                                    lvl: 0.18,
+                                    f0: f0 * 0.5,
+                                    f1: f1 * 0.5,
+                                    glide: GESTURE_BEND_TAU,
                                     ..Partial::default()
                                 },
                                 Partial::default(),
@@ -6677,12 +7532,16 @@ mod tests {
                             lp_cut: 2600.0,
                             ..Voice::default()
                         };
-                        self.spawn(mk(f, 0.0), g * 0.34, pan);
+                        self.spawn(mk(f0, f1, 0.0), g * 0.34, pan);
                         if kind == SoundKind::Jump {
                             // 1-3-5-8 run, 45 ms apart — the rainbow leaps.
-                            self.spawn(mk(penta(base, d + 2), 0.045), g * 0.3, pan * 0.5);
-                            self.spawn(mk(penta(base, d + 3), 0.09), g * 0.27, pan * 0.2);
-                            self.spawn(mk(penta(base, d + 5), 0.135), g * 0.24, -pan * 0.3);
+                            let mut leap = |step: i32, delay: f32, lvl: f32, pan: f32| {
+                                let (a, b) = gesture_bend(penta(base, deg + step), 1);
+                                self.spawn(mk(a, b, delay), g * lvl, pan);
+                            };
+                            leap(2, 0.045, 0.3, pan * 0.5);
+                            leap(3, 0.09, 0.27, pan * 0.2);
+                            leap(5, 0.135, 0.24, -pan * 0.3);
                         }
                     }
 
@@ -7165,8 +8024,7 @@ mod tests {
 
                     // COMET — see `CometPalette::design`.
                     GlowStyle::Comet => {
-                        let d = deg + if kind == SoundKind::Backspace { -2 } else { 0 };
-                        let f = penta(220.0, d); // A3 region — the void register
+                        let f = penta(220.0, deg); // A3 region — the void register
                         let (f0, f1v) = if kind == SoundKind::Backspace {
                             (f * 0.97, f * 1.03)
                         } else {

@@ -90,6 +90,24 @@ fn prediction_visibility_requires_redraw(was_visible: bool, is_visible: bool) ->
 /// A policy that flips between the key and the drain (a resize starting inside
 /// that one frame) still orphans a credit, but only for the ledger's freshness
 /// window, after which it expires on its own.
+/// Everything the KEY-TIME typing click needs from App-level state to reach the
+/// synth without a render tick. Resolved before the window borrow (these are all
+/// `App` reads, the cue is taken under `&mut ws`) and only when
+/// [`keystroke_click_audible`] already said a click could sound, so a session
+/// with the synth off pays nothing for it.
+///
+/// `tone_melody` is the KNOB, not the verdict: the verdict lives on the window
+/// (`ws.tone_tracker`) and is resolved through the same `ToneTracker::effective`
+/// author the three drain seams use, so a disabled knob sounds bit-exactly like
+/// the pre-tone build here too.
+struct KeyClickSynth {
+    style: crate::cursor_glow::GlowStyle,
+    voice: aterm_effects::trail_sound::SoundVoice,
+    gain: f32,
+    bed: bool,
+    tone_melody: bool,
+}
+
 #[inline]
 fn keystroke_click_audible(
     worker_live: bool,
@@ -1847,6 +1865,19 @@ impl App {
                             .get(&wid)
                             .is_some_and(|ws| ws.resize_sound_quiet(input_now)),
                     );
+                    // …and the synth policy that click will carry, resolved on the
+                    // same App-level side of the window borrow and ONLY when a click
+                    // could actually sound. `click_audible` has already established
+                    // every mute term, so the gain IS the volume — the same value
+                    // `trail_sound_gain` resolves for the frame drain, whose focus
+                    // term a physical keypress satisfies by definition.
+                    let click_synth = click_audible.then(|| KeyClickSynth {
+                        style: self.glow_style(),
+                        voice: self.config.trail_sound_voice(),
+                        gain: self.config.trail_sound_volume(),
+                        bed: self.config.trail_sound_bed_or_default(),
+                        tone_melody: self.config.tone_melody_or_default(),
+                    });
                     // ONE term-lock scope for every press-path terminal touch: the
                     // viewport snap, the "typing deselects" clear, and the predictor's
                     // cursor/cols/alt sample. These were three separate acquisitions
@@ -1854,7 +1885,7 @@ impl App {
                     // independently behind the PTY reader's 8 KiB process() bouts
                     // during output floods. The redraw side-effects run AFTER the
                     // guard drops — never window calls under the term lock.
-                    let (scrolled, cleared, sample, is_alt, kitty_owns_keyboard) = {
+                    let (scrolled, cleared, sample, is_alt, kitty_owns_keyboard, term_cols) = {
                         let mut t = term_lock(&term);
                         let scrolled = if t.grid().display_offset() != 0 {
                             t.scroll_to_bottom();
@@ -1899,7 +1930,20 @@ impl App {
                         // Read once under the SAME lock for the PHOSPHOR PgUp/
                         // PgDn reading gate below (no second acquisition).
                         let is_alt = t.is_alternate_screen();
-                        (scrolled, cleared, sample, is_alt, kitty_owns_keyboard)
+                        // The width the KEY-TIME click normalizes its stereo pan
+                        // against — a free rider on a lock the press already holds,
+                        // and the same quantity the frame drain uses (the terminal
+                        // the keystroke actually went to). Unconditional and
+                        // scalar: the `sample` above is gated on the predictor.
+                        let term_cols = t.cols();
+                        (
+                            scrolled,
+                            cleared,
+                            sample,
+                            is_alt,
+                            kitty_owns_keyboard,
+                            term_cols,
+                        )
                     };
                     // Publish what this press learned so the matching key RELEASE can
                     // decide LOCK-FREE whether it has anything to encode. Without a
@@ -2053,21 +2097,54 @@ impl App {
                             // Backspace/Enter keep their OWN echo-time gestures
                             // (Backspace/Jump), which this seam does not touch.
                             //
-                            // The redraw is what DELIVERS the cue: cues reach the
-                            // synth only through the render tick's drain. That
-                            // drain runs ahead of the present early-out, so an
-                            // otherwise-unchanged frame still speaks and still
-                            // presents nothing; and with light alive the animator
-                            // is already requesting frames, so this coalesces
-                            // into one that was coming anyway. Requested only
-                            // when a cue was actually RECORDED — the engine
-                            // returns false whenever it is dark — so a session
-                            // with the aurora off never pays a frame for it.
-                            if click_audible
-                                && ws.cursor_glow.cue_keystroke(input_now)
-                                && let Some(w) = ws.os_window.as_ref()
-                            {
-                                w.request_redraw();
+                            // DELIVERED HERE, ON THE KEY THREAD. The cue used to
+                            // reach the synth only through the next render tick's
+                            // drain, which put the whole point of the seam behind
+                            // one frame of quantization: a click cued at the key
+                            // and played 0-16.7 ms later (and further on a loaded
+                            // frame) is a click that has already drifted off the
+                            // finger it belongs to — the ~20 ms attachment budget
+                            // spent on scheduling. The engine builds the cue
+                            // (silence law, backlog bound, column, timbre
+                            // prediction), we take it straight back and push it,
+                            // and the audio path from keypress to the synth's
+                            // queue no longer contains a frame at all.
+                            //
+                            // ONE construction, shared with the drain
+                            // (`trail_sound_event`), so the key-time click and an
+                            // echo-time click cannot become different instruments.
+                            //
+                            // The redraw stays the FALLBACK, not the courier: if
+                            // the cue cannot be taken back (a backlog the drain
+                            // still owns), ask for the frame that drains it, exactly
+                            // as before. Delivered clicks need no frame — the light
+                            // they belong to arrives with the echo's own damage.
+                            if click_audible && ws.cursor_glow.cue_keystroke(input_now) {
+                                let delivered =
+                                    match (click_synth.as_ref(), ws.cursor_glow.take_key_cue()) {
+                                        (Some(synth), Some(cue)) => {
+                                            let policy = crate::app_render::TrailSoundPolicy {
+                                                voice: synth.voice,
+                                                gain: Some(synth.gain),
+                                                tone: ws.tone_tracker.effective(synth.tone_melody),
+                                                bed: synth.bed,
+                                            };
+                                            self.trail_audio.push(
+                                                crate::app_render::trail_sound_event(
+                                                    &cue,
+                                                    synth.style,
+                                                    term_cols,
+                                                    &policy,
+                                                    synth.gain,
+                                                ),
+                                            );
+                                            true
+                                        }
+                                        _ => false,
+                                    };
+                                if !delivered && let Some(w) = ws.os_window.as_ref() {
+                                    w.request_redraw();
+                                }
                             }
                         } else if enter_like && typed_forward == Some(true) {
                             // A REAL Enter (deliberately NOT a typed hint — the

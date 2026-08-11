@@ -64,6 +64,7 @@ pub enum Cmd {
     Recover {
         version: String,
         owner: String,
+        release_credentials: Option<std::path::PathBuf>,
     },
     Verify {
         version: Option<String>,
@@ -127,12 +128,30 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     "recover requires --old-publisher-stopped, got {acknowledgement:?}"
                 ));
             }
-            if let Some(extra) = it.next() {
-                return Err(format!(
-                    "recover takes exactly a version, full claim SHA, and --old-publisher-stopped (got {extra:?})"
-                ));
+            // Recovery signs, so it accepts the one credentials flag — and nothing
+            // else. It used to refuse every extra argument, which was correct when
+            // the key was ambient and is wrong now that it must be named.
+            let mut release_credentials: Option<std::path::PathBuf> = None;
+            while let Some(arg) = it.next() {
+                if arg == "--release-credentials" {
+                    if release_credentials.is_some() {
+                        return Err("--release-credentials given twice".to_string());
+                    }
+                    release_credentials = Some(std::path::PathBuf::from(
+                        it.next().ok_or("--release-credentials needs a path")?,
+                    ));
+                } else {
+                    return Err(format!(
+                        "recover takes a version, full claim SHA, --old-publisher-stopped, \
+                         and optionally --release-credentials (got {arg:?})"
+                    ));
+                }
             }
-            Ok(Cmd::Recover { version, owner })
+            Ok(Cmd::Recover {
+                version,
+                owner,
+                release_credentials,
+            })
         }
         "verify" => {
             let version = it.next().map(normalize_version).transpose()?;
@@ -168,6 +187,16 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
+            // The ONE signing input. A path in the command, never an ambient file:
+            // "what signed this?" is answered by reading the command that ran.
+            "--release-credentials" => {
+                if opts.release_credentials.is_some() {
+                    return Err("--release-credentials given twice".to_string());
+                }
+                opts.release_credentials = Some(std::path::PathBuf::from(
+                    it.next().ok_or("--release-credentials needs a path")?,
+                ));
+            }
             "--abandon" => {
                 let v = it.next().ok_or("--abandon needs a version (vX.Y.Z)")?;
                 abandon = Some(normalize_version(v)?);
@@ -248,8 +277,20 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         } => verify::run_abandon(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
         Cmd::Status => verify::run_status(&repo_root()?),
-        Cmd::Recover { version, owner } => {
-            publish::run_recover_lost(&repo_root()?, &version, &owner, true)
+        Cmd::Recover {
+            version,
+            owner,
+            release_credentials,
+        } => {
+            // Recovery signs too, so it needs the SAME explicit credentials as a
+            // fresh cut. The old code could recover only because the material was
+            // ambient; with one flag, every signing entry point must name it.
+            let creds = release_credentials
+                .as_deref()
+                .map(crate::sign::ReleaseCredentials::load)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            publish::run_recover_lost(&repo_root()?, &version, &owner, true, creds.as_ref())
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),
         Cmd::Yank { build } => verify::run_yank(&repo_root()?, build),

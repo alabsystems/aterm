@@ -1514,7 +1514,10 @@ impl App {
                 cmd.args(std::env::args_os().skip(1))
                     .env("ATERM_UPDATED_FROM", build.to_string());
                 bind_expected_update_artifact(&mut cmd, apply_attempt.as_ref());
-                // Same headless re-injection as the unix exec path above.
+                // Same headless re-injection as the unix exec path above (and for
+                // the same reason: argv passes through verbatim, so the env
+                // channel — the flag's exact equivalent — is what survives an
+                // `-e` boundary).
                 if self.headless {
                     cmd.env("ATERM_HEADLESS", "1");
                 }
@@ -1627,6 +1630,16 @@ impl App {
                     .args(std::env::args_os().skip(1))
                     .env("ATERM_UPDATED_FROM", build.to_string());
                 bind_expected_update_artifact(&mut command, apply_attempt.as_ref());
+                // Headless survives the re-exec. The ENV channel, not the flag,
+                // is right here even though `--headless` is the canonical
+                // user-facing spelling: the successor inherits our argv verbatim
+                // (`args_os().skip(1)`), and argv may carry an `-e`/`--command`
+                // boundary that swallows every token after it — an appended flag
+                // would become part of the child's command line, and a prepended
+                // one would reorder a payload we must pass through unchanged.
+                // `$ATERM_HEADLESS=1` is an exact equivalent of the flag and is
+                // consumed once at the successor's boot, so this re-injection is
+                // the whole handoff and it leaks nowhere further.
                 if self.headless {
                     command.env("ATERM_HEADLESS", "1");
                 }
@@ -4011,7 +4024,10 @@ mod returned_handoff_completion_lane_tests {
 
         for (outcome, expected) in [
             (Outcome::AdoptionMismatch, Lane::Physical(Shape::Structural)),
-            (Outcome::PreparationFailed, Lane::Physical(Shape::Structural)),
+            (
+                Outcome::PreparationFailed,
+                Lane::Physical(Shape::Structural),
+            ),
             (Outcome::ChildDied, Lane::Physical(Shape::Structural)),
             (Outcome::TimedOut, Lane::Physical(Shape::Transient)),
             (Outcome::Rejected, Lane::Physical(Shape::Transient)),

@@ -2527,6 +2527,7 @@ fn cli_parses_the_whole_spec_5_surface() {
         cli::Cmd::Recover {
             version: "0.55.0".into(),
             owner: "a".repeat(40),
+            release_credentials: None,
         }
     );
     assert_eq!(
@@ -2653,7 +2654,24 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
         "extra",
     ])
     .unwrap_err();
-    assert!(extra.contains("exactly"), "{extra}");
+    // recover now ACCEPTS --release-credentials (it signs, so it needs the same
+    // explicit key as a fresh cut) but nothing else: an unknown argument is still
+    // refused, and the refusal names it.
+    assert!(extra.contains("extra"), "the refusal must name the argument: {extra}");
+    assert!(
+        extra.contains("--release-credentials"),
+        "and must say what IS accepted: {extra}"
+    );
+    // The one accepted flag parses.
+    parse(&[
+        "recover",
+        "v0.55.0",
+        &owner,
+        publish::RECOVERY_STOPPED_PROCESS_FLAG,
+        "--release-credentials",
+        "/tmp/creds.toml",
+    ])
+    .expect("recover accepts the credentials flag");
 
     // False must refuse before inspecting this deliberately nonexistent
     // repository. The boolean is an operator assertion, never a machine proof.
@@ -2662,6 +2680,7 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
         "0.55.0",
         &owner,
         false,
+        None,
     )
     .unwrap_err()
     .to_string();

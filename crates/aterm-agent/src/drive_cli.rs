@@ -227,7 +227,7 @@ fn run(opts: &Opts) -> Result<String, String> {
         return Err(format!(
             "cannot reach a target aterm over the control socket ({e}).\n  \
              • Is a host aterm running? Launch one headless:\n      \
-             ATERM_HEADLESS=1 aterm-gui &\n  \
+             aterm-gui --headless &\n  \
              • Point at its socket (it prints 'control socket listening at <PATH>'):\n      \
              export ATERM_CONTROL_SOCK=<PATH>   (or pass --socket <PATH>)\n  \
              • aterm-ctl resolved to: {}",

@@ -24,7 +24,8 @@
 //!   1. LOCK-SITE ENUMERATION — every acquisition site in the scanned crates
 //!      (`term_lock(`, `.lock()`, `.lock_or_recover()`, `.read()`, `.write()`,
 //!      `.try_lock()`, `.try_read()`, `.try_write()`), each resolved to a
-//!      lexical lock IDENTITY (the receiver/accessor name). Fail-honest: a
+//!      lexical lock IDENTITY (the receiver/accessor name; a `self`-rooted
+//!      chain takes the enclosing impl type's — `Spill::0`). Fail-honest: a
 //!      site whose identity cannot be resolved is reported as UNKNOWN and
 //!      counted, never silently dropped.
 //!   2. ACQUIRED-WHILE-HOLDING PAIRS — within each fn, an acquisition inside
@@ -65,11 +66,36 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         reached through different local names SPLITS (may under-report). Renaming
         a receiver changes its identity — the census trusts the field/static
         naming discipline; it is a tripwire, not a type-resolved proof.
-      - UNKNOWN, NEVER DROPPED: `self`-only, tuple-field (`self.0`), and
-        single-letter receivers are unresolvable; each is reported as
-        UNKNOWN@site and counted. An UNKNOWN is a unique node (it never unifies),
-        so it can appear in reported edges but can never close a cycle — the
-        UNKNOWN count is the census's standing honesty gap, printed every run.
+      - SELF RECEIVERS TAKE THE ENCLOSING IMPL TYPE: a receiver chain rooted at
+        `self` has no name of its own, so it borrows the type's — `self.lock()`
+        inside `impl Spill` => `Spill::self`; `self.0.lock()` => `Spill::0`;
+        `self.pair.1.read()` => `Spill::pair.1`. The qualification is what keeps
+        it honest: same-named fields on DIFFERENT types never merge
+        (`Spill::0` is not `Queue::0`), and — unlike an UNKNOWN — such a site
+        CAN close a cycle. Fail-closed wherever the type is not nameable: a
+        blanket `impl<T> .. for T`, a macro fragment, a structural type
+        (`&[T]`, a tuple), or one of the std lock/pointer wrappers (an
+        `impl .. for Mutex<T>` is the extension-trait shape, where `self` is
+        EVERY caller's mutex — one node for the whole process's mutexes would
+        invent cycles between locks that never meet). Those keep a unique
+        per-site node. The qualifier is the type NAME, so two types sharing a
+        name in different modules merge — the same lexical posture (and the
+        same over-report risk) the census already takes for two same-named
+        fields.
+      - SINGLE-LETTER ALIASES: a one-letter local is no identity, but a live
+        `let g = &self.spill;` binding whose RHS is a PURE PATH lends `g`
+        exactly what that path resolves to (`spill`) — the identity the field
+        spelling would already have produced, so the alias can add no merge
+        class the census did not already have. Any other RHS (a call, an
+        operator, a block) leaves the receiver UNKNOWN; a rebind or a block
+        close drops the alias.
+      - UNKNOWN, NEVER DROPPED: what stays unresolvable — a `self` chain with
+        no nameable enclosing impl type, a tuple field of a LOCAL (`pair.0`), a
+        bare single-letter local, a receiver that is a call result — is
+        reported as UNKNOWN@site and counted. An UNKNOWN is a unique node (it
+        never unifies), so it can appear in reported edges but can never close
+        a cycle — the UNKNOWN count is the census's standing honesty gap,
+        printed every run.
       - GUARD SCOPE is tracked lexically: a `let g = <acquire>` guard (through
         `unwrap`/`expect`/`unwrap_or_else` adapters only) lives to the end of its
         enclosing block (brace depth), honoring `drop(g)` and shadowing; an
@@ -732,6 +758,295 @@ fn logical_lines(body: &[String], start_line: usize) -> Vec<LogicalLine> {
 }
 
 // ---------------------------------------------------------------------------
+// Enclosing-impl resolution — the identity of a `self` receiver
+// ---------------------------------------------------------------------------
+
+/// Self types an `impl` block may NOT lend to a `self`-rooted lock identity.
+/// An `impl .. for Mutex<T>` (or `Arc<T>`, `Box<T>`, …) is the EXTENSION-TRAIT
+/// shape — the workspace's own `MutexExt::lock_or_recover` is one — where
+/// `self` is EVERY caller's lock: a `Mutex::self` node would collapse the
+/// whole process's mutexes into ONE identity and manufacture cycles between
+/// locks that never meet. Such sites keep their unique per-site node (UNKNOWN,
+/// or the audited vocabulary-interior category). Adding a name here only ever
+/// moves sites BACK to a per-site node, so the list is fail-closed on the
+/// merging side — the only side that can invent a deadlock.
+const UNQUALIFIABLE_SELF_TYPES: &[&str] = &[
+    "Arc",
+    "Box",
+    "Cell",
+    "Condvar",
+    "LazyLock",
+    "Mutex",
+    "OnceCell",
+    "OnceLock",
+    "Pin",
+    "Rc",
+    "RefCell",
+    "ReentrantLock",
+    "RwLock",
+    "UnsafeCell",
+    "Weak",
+];
+
+/// How many physical lines an `impl` header may span before the scan gives up
+/// on finding its `{` (a wrapped generic list plus a where-clause; rustfmt
+/// keeps these short). A line that never opens a block is not an impl header.
+const MAX_IMPL_HEADER_LINES: usize = 24;
+
+/// One `impl` block's line span and the SELF TYPE it implements — the name a
+/// `self` receiver inside it borrows (`impl Foo`, `impl<T> Foo<T>`,
+/// `impl Trait for Foo` => `Foo`).
+struct ImplSpan {
+    /// 1-based first line (the `impl` keyword).
+    start: usize,
+    /// 1-based last line (the block's closing brace).
+    end: usize,
+    /// `None` when the header names no type this census may use as a lock
+    /// identity (see [`impl_self_type`]). The span is recorded ANYWAY, so an
+    /// ENCLOSING impl can never claim these lines: the sites inside stay
+    /// UNKNOWN instead of inheriting a type that is not theirs.
+    ty: Option<String>,
+}
+
+/// Is `b` an identifier byte (for keyword-boundary checks)?
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Byte offsets of every occurrence of the keyword `word` at nesting depth 0
+/// of `s` (bounded by non-identifier bytes on both sides). `->` is stepped
+/// over: the `>` of a `Fn() -> T` bound must not close a generic list.
+fn top_level_words(s: &str, word: &str) -> Vec<usize> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'>') {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth -= 1,
+            _ => {}
+        }
+        // `is_char_boundary` first: `i` walks BYTES, and slicing into the
+        // middle of a multi-byte character panics (a build script must not).
+        if depth == 0
+            && s.is_char_boundary(i)
+            && s[i..].starts_with(word)
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && bytes.get(i + word.len()).is_none_or(|b| !is_ident_byte(*b))
+        {
+            out.push(i);
+            i += word.len();
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Byte offset of the `>` matching the `<` at byte 0 of `s`, if any (same
+/// `->` care as [`top_level_words`]).
+fn matching_angle(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'>') {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The comma-separated items of a generic parameter list, split at nesting
+/// depth 0.
+fn split_top_level(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && bytes.get(i + 1) == Some(&b'>') {
+            i += 2;
+            continue;
+        }
+        match bytes[i] {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// The base name of an impl's self type: `Foo<T>` => `Foo`;
+/// `std::sync::Mutex<T>` => `Mutex`; `&'a mut Foo` => `Foo`. `None` for
+/// anything this census must not turn into a lock identity — a generic
+/// PARAMETER of the impl (a blanket impl implements every type at once), an
+/// [`UNQUALIFIABLE_SELF_TYPES`] wrapper, a macro fragment (`$ty`), a
+/// structural type (`[T]`, `(A, B)`, `*mut T`), or a trait object.
+fn base_type_name(ty: &str, params: &BTreeSet<&str>) -> Option<String> {
+    let mut t = ty.trim();
+    // `&`, `&'a `, `&mut ` — a reference to the type is still the type. `dyn`
+    // is NOT peeled: a trait object names a trait, not one concrete lock.
+    while let Some(rest) = t.strip_prefix('&') {
+        let mut rest = rest.trim_start();
+        if let Some(lt) = rest.strip_prefix('\'') {
+            rest = lt
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, r)| r)
+                .trim_start();
+        }
+        t = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    }
+    let path: String = t
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+        .collect();
+    let name = path.rsplit("::").next().unwrap_or_default();
+    if !name.starts_with(|c: char| c.is_alphabetic() || c == '_')
+        || !name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    // A one-character type name is a generic parameter by universal
+    // convention. Even where the lexical parse missed the parameter list (a
+    // macro body, a wrapped header), refusing it costs this census nothing and
+    // forecloses the blanket-impl merge.
+    if name.chars().count() == 1
+        || params.contains(name)
+        || UNQUALIFIABLE_SELF_TYPES.contains(&name)
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// The nameable self type of an `impl` header (the text from `impl` up to the
+/// block's `{`): `impl Foo` / `impl<T> Foo<T>` / `impl Trait for Foo` =>
+/// `Foo`. `None` when the header names nothing this census may use as a lock
+/// identity — see [`base_type_name`]; the fail-closed direction leaves the
+/// block's `self` receivers UNKNOWN rather than merging them.
+fn impl_self_type(header: &str) -> Option<String> {
+    let h = header.trim_start();
+    let h = h.strip_prefix("unsafe ").unwrap_or(h).trim_start();
+    let h = h.strip_prefix("default ").unwrap_or(h).trim_start();
+    let mut rest = h.strip_prefix("impl")?;
+    let mut params: BTreeSet<&str> = BTreeSet::new();
+    if rest.starts_with('<') {
+        let close = matching_angle(rest)?;
+        for p in split_top_level(&rest[1..close]) {
+            let p = p.trim();
+            let p = p.strip_prefix("const ").unwrap_or(p).trim_start();
+            let name: &str = p
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() {
+                params.insert(name);
+            }
+        }
+        rest = &rest[close + 1..];
+    }
+    // A where-clause is not part of the self type — and cutting it first keeps
+    // its `for<'a>` HRTBs from being read as the trait-impl `for`.
+    let rest = match top_level_words(rest, "where").first() {
+        Some(&at) => &rest[..at],
+        None => rest,
+    };
+    // `impl Trait for SelfTy`: the self type follows the LAST top-level `for`.
+    let self_ty = match top_level_words(rest, "for").last() {
+        Some(&at) => &rest[at + "for".len()..],
+        None => rest,
+    };
+    base_type_name(self_ty, &params)
+}
+
+/// Every `impl` block in a file, with its line span and self type. Uses the
+/// same rustfmt closing-brace-at-item-indent invariant as the fn segmenter, so
+/// the two agree about where a block ends. Nested impls are recorded too — the
+/// lookup takes the INNERMOST span, so an impl inside a fn inside an impl
+/// cannot borrow the outer type.
+fn impl_spans(text: &str) -> Vec<ImplSpan> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, raw) in lines.iter().enumerate() {
+        let line = strip_line_comment(raw);
+        let head = line.trim_start();
+        let indent = line.len() - head.len();
+        let head = head.strip_prefix("unsafe ").unwrap_or(head).trim_start();
+        let head = head.strip_prefix("default ").unwrap_or(head).trim_start();
+        let Some(after) = head.strip_prefix("impl") else {
+            continue;
+        };
+        if !(after.starts_with('<') || after.starts_with(char::is_whitespace)) {
+            continue; // `implements_x()`, `impl_from!(..)` — not a block header.
+        }
+        // The header runs to the `{` that opens the block; rustfmt wraps a long
+        // generic list and a where-clause onto continuation lines.
+        let mut header = String::new();
+        let mut open = None;
+        for (k, l) in lines.iter().enumerate().skip(i).take(MAX_IMPL_HEADER_LINES) {
+            let l = strip_line_comment(l);
+            if let Some(b) = l.find('{') {
+                header.push_str(&l[..b]);
+                open = Some(k);
+                break;
+            }
+            header.push_str(l);
+            header.push(' ');
+        }
+        let Some(open) = open else {
+            continue;
+        };
+        let opener = strip_line_comment(lines[open]);
+        let end = if opener.matches('{').count() == opener.matches('}').count() {
+            open // `unsafe impl Send for Foo {}` — the whole block is one line.
+        } else {
+            // Fail-closed: an impl whose close cannot be found (a macro body
+            // that does not follow rustfmt's indentation) spans its header
+            // only, so no acquisition inherits a guessed type.
+            let close = format!("{}}}", " ".repeat(indent));
+            lines
+                .iter()
+                .enumerate()
+                .skip(open + 1)
+                .find(|(_, l)| **l == close)
+                .map_or(open, |(k, _)| k)
+        };
+        out.push(ImplSpan {
+            start: i + 1,
+            end: end + 1,
+            ty: impl_self_type(&header),
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Acquisition + identity resolution
 // ---------------------------------------------------------------------------
 
@@ -743,17 +1058,95 @@ struct RawAcq {
     identity: Option<String>,
 }
 
+/// Where an acquisition sits, for the identity refinements that need more
+/// than the line itself.
+struct SiteCtx<'a> {
+    /// The file's `impl` blocks (see [`impl_spans`]).
+    impls: &'a [ImplSpan],
+    /// 1-based physical line of the logical line being scanned.
+    lineno: usize,
+    /// Live single-letter aliases in this fn (see [`alias_target`]).
+    aliases: &'a BTreeMap<String, (i32, String)>,
+}
+
+impl SiteCtx<'_> {
+    /// The self type of the INNERMOST `impl` block covering this line, when it
+    /// is one this census may name.
+    fn impl_ty(&self) -> Option<&str> {
+        self.impls
+            .iter()
+            .filter(|s| s.start <= self.lineno && self.lineno <= s.end)
+            .max_by_key(|s| s.start)
+            .and_then(|s| s.ty.as_deref())
+    }
+}
+
+/// The receiver chain ending at `dot` rendered as the field path below `self`,
+/// when it is rooted THERE: `self.lock()` => `self`; `self.0.lock()` => `0`;
+/// `self.control.1.read()` => `control.1`. `None` for any other root — a
+/// LOCAL's tuple field (`pair.0`) is not this type's field, and qualifying it
+/// with the impl type would merge two unrelated locks.
+fn self_rooted_chain(line: &str, dot: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut segs: Vec<&str> = Vec::new();
+    let mut at = dot;
+    loop {
+        let seg = ident_ending_at(line, at)?;
+        let start = at - seg.len();
+        if seg == "self" {
+            if segs.is_empty() {
+                return Some("self".to_string());
+            }
+            segs.reverse();
+            return Some(segs.join("."));
+        }
+        if start == 0 || bytes[start - 1] != b'.' {
+            return None;
+        }
+        segs.push(seg);
+        at = start - 1;
+    }
+}
+
 /// Resolve the lexical identity of the receiver whose final `.` sits at byte
 /// `dot`. `store.read()` / `self.store.read()` => `store`; `proxies().write()`
-/// => `proxies` (the zero-arg accessor-fn idiom for statics); `self` /
-/// `self.0` / single-letter locals => None (UNKNOWN — honestly unresolvable).
-fn resolve_receiver(line: &str, dot: usize) -> Option<String> {
+/// => `proxies` (the zero-arg accessor-fn idiom for statics).
+///
+/// A receiver with no name of its own is REFINED rather than dropped: a chain
+/// rooted at `self` takes the enclosing impl type's name (`self.0.lock()` in
+/// `impl Spill` => `Spill::0`), and a single-letter local takes the identity
+/// of the path it aliases. Both refinements apply ONLY where the plain rule
+/// resolved nothing, so every identity the census mints today it still mints,
+/// unchanged.
+///
+/// What DOES change is unification — in the direction that can turn the gate
+/// RED, which is the point of the refinement rather than a side effect of it.
+/// An UNKNOWN is still graphed, as a per-site UNIQUE node (see
+/// [`AcqSite::node`]): seen, but unable to unify with anything, so it can
+/// never close a cycle. Naming two `self.0.lock()` sites inside one
+/// `impl Spill` collapses two unique nodes into one `Spill::0`, and a real
+/// ordering through that lock becomes visible for the first time.
+///
+/// (The draft this was salvaged from justified itself the opposite way — that
+/// it could "SPLIT a per-site UNKNOWN into a real node, never MERGE two nodes
+/// the graph keeps apart". That is backwards, and it is worth being exact
+/// about: this is sound because the sites it merges ARE one lock — the same
+/// field of the same type, under the same impl header — not because no merge
+/// occurs.)
+///
+/// What still cannot be named stays None (UNKNOWN — honestly unresolvable).
+fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String> {
     // `self.store?.read()` — the `?` is postfix error propagation, not part of
     // the receiver: it unwraps an Option/Result and the lock on the other side
     // is still the one `store` names. Without this the token before the dot is
     // `?`, no identifier is found, and a perfectly nameable lock is reported
     // UNKNOWN — which is the honesty gap widening for a punctuation mark rather
     // than for anything actually unresolvable.
+    //
+    // Stripped BEFORE the refinements below, not after: `self.store?.lock()`
+    // must reach `self_rooted_chain` at the receiver's real dot, or a `?` in
+    // the chain would send a nameable field back to UNKNOWN by the same
+    // punctuation accident this fix exists to close.
     let dot = {
         let bytes = line.as_bytes();
         let mut d = dot;
@@ -764,6 +1157,18 @@ fn resolve_receiver(line: &str, dot: usize) -> Option<String> {
     };
     if let Some(seg) = ident_ending_at(line, dot) {
         if seg == "self" || seg.chars().all(|c| c.is_ascii_digit()) || seg.len() == 1 {
+            if let Some(chain) = self_rooted_chain(line, dot)
+                && let Some(ty) = ctx.impl_ty()
+            {
+                // `Ty::self` / `Ty::0` can never collide with a plain receiver
+                // identity (no receiver name contains `::`) nor with a
+                // vendored `<crate>::<recv>` one: `self` and a tuple index are
+                // exactly what plain resolution refuses to return.
+                return Some(format!("{ty}::{chain}"));
+            }
+            if let Some((_, aliased)) = ctx.aliases.get(seg) {
+                return Some(aliased.clone());
+            }
             return None;
         }
         return Some(seg.to_string());
@@ -785,7 +1190,7 @@ fn resolve_receiver(line: &str, dot: usize) -> Option<String> {
 /// acquisitions of their declared identity (`term_lock`'s own interior
 /// `term.lock()` resolves to the same identity — one lock, one node). A helper
 /// name immediately preceded by `fn` is the definition, not an acquisition.
-fn acquisitions_on(line: &str) -> Vec<RawAcq> {
+fn acquisitions_on(line: &str, ctx: &SiteCtx<'_>) -> Vec<RawAcq> {
     let mut out = Vec::new();
     for h in GUARD_HELPERS {
         // Scan for the symbol's first byte and confirm with `starts_with`,
@@ -844,7 +1249,7 @@ fn acquisitions_on(line: &str) -> Vec<RawAcq> {
                     pos: dot,
                     kind: token,
                     blocking: *blocking,
-                    identity: resolve_receiver(line, dot),
+                    identity: resolve_receiver(line, dot, ctx),
                 });
             }
         }
@@ -967,6 +1372,44 @@ fn classify_line(line: &str) -> LineKind {
         return LineKind::Let(None); // destructuring pattern: anonymous binding.
     }
     LineKind::Other
+}
+
+/// Byte offset of a `let` statement's binding `=` — not a comparison or a
+/// compound assignment. `None` (fail-closed) for any other shape.
+fn binding_eq(line: &str) -> Option<usize> {
+    // Operator bytes that turn a following `=` into something other than a
+    // binding (`==`, `!=`, `<=`, `+=`, …).
+    const OPS: &[u8] = b"=!<>+-*/%&|^";
+    let bytes = line.as_bytes();
+    let at = line.find('=')?;
+    if bytes.get(at + 1) == Some(&b'=') || (at > 0 && OPS.contains(&bytes[at - 1])) {
+        return None;
+    }
+    Some(at)
+}
+
+/// The identity a `let` binding ALIASES, when its right-hand side is a PURE
+/// PATH (`&self.spill`, `self.0`, `&QUEUE`): exactly what that path would
+/// resolve to at an acquisition site, which is the identity the field spelling
+/// would already have produced — so an alias can introduce no identity, and no
+/// merge, the census could not already mint. Fail-closed: any RHS that is not
+/// a bare path — a call, an index, an operator, a block — yields None, and the
+/// aliased receiver stays UNKNOWN.
+fn alias_target(line: &str, ctx: &SiteCtx<'_>) -> Option<String> {
+    let eq = binding_eq(line)?;
+    let mut path = line[eq + 1..].trim().trim_end_matches(';').trim_end();
+    // A borrow of the path is the same lock.
+    while let Some(rest) = path.strip_prefix('&') {
+        let rest = rest.trim_start();
+        path = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    }
+    let pure_path = path
+        .bytes()
+        .all(|b| is_ident_byte(b) || b == b'.' || b == b':');
+    if path.is_empty() || !pure_path {
+        return None;
+    }
+    resolve_receiver(path, path.len(), ctx)
 }
 
 /// Callee names invoked on this logical line in the shapes the one-hop pass
@@ -1294,16 +1737,32 @@ struct LiveGuard {
     active: bool,
 }
 
+/// The FILE-level lexical facts a body scan needs beyond the body's own text.
+/// File-scoped, not body-scoped, because every one of them is DECLARED outside
+/// the fn that uses it.
+struct FileCtx<'a> {
+    /// Repo-relative path, for the site spans.
+    rel: &'a str,
+    /// `Some(prefix)` in vendored-identity mode: every resolved identity is
+    /// prefixed `prefix::…` so foreign receiver names can never merge across
+    /// the namespace boundary.
+    namespace: Option<&'static str>,
+    /// The file's `impl` blocks: the `impl Spill {` header that gives a `self`
+    /// receiver its identity sits ABOVE the fn, not inside it.
+    ///
+    /// This struct carried a `condvars` set when it was drafted. It does not
+    /// now: `1fd130e3` took corpus-wide field-TYPE resolution over the
+    /// per-file Condvar carve-out, and `FieldTypes` answers that question
+    /// better than a lexical `drained: Condvar,` scan of one file could.
+    impls: &'a [ImplSpan],
+}
+
 /// Scan one fn body. `sites` is the global site table (appended to).
-/// `namespace` is `Some(prefix)` in vendored-identity mode: every resolved
-/// identity is prefixed `prefix::…` so foreign receiver names can never merge
-/// across the namespace boundary.
 fn scan_fn(
     name: &str,
-    file_rel: &str,
     span: &str,
     body: &[String],
-    namespace: Option<&'static str>,
+    file: &FileCtx<'_>,
     sites: &mut Vec<AcqSite>,
 ) -> FnLockFacts {
     let start_line: usize = span
@@ -1315,7 +1774,7 @@ fn scan_fn(
     let mut facts = FnLockFacts {
         name: name.to_string(),
         span: span.to_string(),
-        namespace,
+        namespace: file.namespace,
         returns_guard: returns_guard(body),
         takes_self: takes_self(body),
         acq: Vec::new(),
@@ -1333,6 +1792,14 @@ fn scan_fn(
     // Locals lexically PROVEN to hold a raw pointer (same ledger discipline):
     // a zero-arg `.read()` on one of these is `core::ptr::read`, not RwLock.
     let mut ptr_vars: BTreeMap<String, (i32, String)> = BTreeMap::new();
+    // Single-letter locals that ALIAS a nameable receiver path (`let m =
+    // &self.spill;`): name -> (binding brace depth, the identity that path
+    // resolves to). A one-letter receiver has no identity of its own; the
+    // alias lends it the one the field spelling would already have produced
+    // (see [`alias_target`]). Same fail-closed ledger discipline as the two
+    // above: a rebind to anything that is not a pure path drops the alias, and
+    // a block close drops every alias bound inside it.
+    let mut alias_vars: BTreeMap<String, (i32, String)> = BTreeMap::new();
     // The signature region (def line through the body-opening line), for the
     // raw-pointer PARAM evidence (`input_ptr: &mut *const u8`).
     let sig_text: String = {
@@ -1369,7 +1836,14 @@ fn scan_fn(
         //    acquisition (receiver proven std::fs::File) is categorized but
         //    joins NO mutex edges — in either direction (rationale in the
         //    summary and the precision note).
-        let raw = acquisitions_on(line);
+        // The ctx borrows `alias_vars`; its last use is the call below, so the
+        // ledger is free to be updated again at 5c.
+        let ctx = SiteCtx {
+            impls: file.impls,
+            lineno: ll.lineno,
+            aliases: &alias_vars,
+        };
+        let raw = acquisitions_on(line, &ctx);
         let mut this_line: Vec<usize> = Vec::new();
         for r in &raw {
             let site_idx = sites.len();
@@ -1392,11 +1866,10 @@ fn scan_fn(
             let vocab = VOCABULARY_INTERIORS
                 .iter()
                 .find(|v| {
-                    r.identity.is_none()
-                        && advisory.is_none()
+                    advisory.is_none()
                         && raw_ptr.is_none()
                         && v.symbol == name
-                        && v.def_file == file_rel
+                        && v.def_file == file.rel
                         && r.kind.starts_with('.')
                         && ident_ending_at(line, r.pos) == Some("self")
                 })
@@ -1405,26 +1878,38 @@ fn scan_fn(
             if excerpt.len() < line.len() {
                 excerpt.push('…');
             }
-            // Vendored-identity mode: the identity lives in the crate's own
-            // namespace (categorized advisory/raw-ptr sites are excluded from
-            // the graph anyway and keep their local name in the listing).
-            let identity = match (namespace, &r.identity) {
-                (Some(ns), Some(id)) if advisory.is_none() && raw_ptr.is_none() => {
-                    Some(format!("{ns}::{id}"))
+            let identity = if vocab.is_some() {
+                // A registered vocabulary interior keeps its UNIQUE PER-SITE
+                // node whatever the receiver refinements produced: `self` there
+                // is EVERY caller's lock (the identity lives at the call
+                // sites), so any shared identity would merge locks that never
+                // meet. Belt and braces — such an impl's self type is an
+                // UNQUALIFIABLE_SELF_TYPES wrapper anyway — because the
+                // registry's fail-closed checks depend on this staying true.
+                None
+            } else {
+                // Vendored-identity mode: the identity lives in the crate's own
+                // namespace (categorized advisory/raw-ptr sites are excluded
+                // from the graph anyway and keep their local name in the
+                // listing).
+                match (file.namespace, &r.identity) {
+                    (Some(ns), Some(id)) if advisory.is_none() && raw_ptr.is_none() => {
+                        Some(format!("{ns}::{id}"))
+                    }
+                    _ => r.identity.clone(),
                 }
-                _ => r.identity.clone(),
             };
             sites.push(AcqSite {
                 identity,
                 kind: r.kind,
                 blocking: r.blocking,
-                span: format!("{file_rel}:{}", ll.lineno),
+                span: format!("{}:{}", file.rel, ll.lineno),
                 fn_name: name.to_string(),
                 excerpt,
                 advisory,
                 vocab,
                 raw_ptr,
-                namespace,
+                namespace: file.namespace,
             });
             facts.acq.push(site_idx);
             if r.blocking && sites[site_idx].graphed() {
@@ -1444,7 +1929,7 @@ fn scan_fn(
         if live.iter().any(|g| g.active) || !this_line.is_empty() {
             let (trusted, field_recv) = held_call_targets(line);
             for (pos, field, callee) in field_recv {
-                let call_span = format!("{file_rel}:{}", ll.lineno);
+                let call_span = format!("{}:{}", file.rel, ll.lineno);
                 for g in live.iter().filter(|g| g.active) {
                     facts.field_recv_calls.push((
                         g.site,
@@ -1465,7 +1950,7 @@ fn scan_fn(
                 }
             }
             for (pos, callee) in trusted {
-                let call_span = format!("{file_rel}:{}", ll.lineno);
+                let call_span = format!("{}:{}", file.rel, ll.lineno);
                 for g in live.iter().filter(|g| g.active) {
                     facts
                         .held_calls
@@ -1509,14 +1994,32 @@ fn scan_fn(
         //     never inherit stale File or raw-pointer evidence).
         if let LineKind::Let(Some(var)) = &kind {
             if is_file_binding_rhs(line) {
-                file_vars.insert(var.clone(), (depth, format!("{file_rel}:{}", ll.lineno)));
+                file_vars.insert(var.clone(), (depth, format!("{}:{}", file.rel, ll.lineno)));
             } else {
                 file_vars.remove(var);
             }
             if is_raw_ptr_binding_rhs(line) || rhs_extends_raw_ptr(line, &ptr_vars) {
-                ptr_vars.insert(var.clone(), (depth, format!("{file_rel}:{}", ll.lineno)));
+                ptr_vars.insert(var.clone(), (depth, format!("{}:{}", file.rel, ll.lineno)));
             } else {
                 ptr_vars.remove(var);
+            }
+            // 5c. The alias ledger, for SINGLE-LETTER bindings only. A longer
+            //     local name IS already an identity (`mx.lock()` => `mx`), and
+            //     re-pointing it here would MERGE two nodes the graph keeps
+            //     apart today — the one direction that can invent a cycle.
+            //     Refinement is for UNKNOWNs only.
+            if var.len() == 1 && var.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                let alias_ctx = SiteCtx {
+                    impls: file.impls,
+                    lineno: ll.lineno,
+                    aliases: &alias_vars,
+                };
+                let aliased = alias_target(line, &alias_ctx);
+                if let Some(id) = aliased {
+                    alias_vars.insert(var.clone(), (depth, id));
+                } else {
+                    alias_vars.remove(var);
+                }
             }
         }
         // 6. Block ends kill the guards bound inside them; a let-else guard
@@ -1526,6 +2029,7 @@ fn scan_fn(
         live.retain(|g| depth >= g.binding_depth);
         file_vars.retain(|_, (d, _)| depth >= *d);
         ptr_vars.retain(|_, (d, _)| depth >= *d);
+        alias_vars.retain(|_, (d, _)| depth >= *d);
         for g in &mut live {
             if depth == g.binding_depth {
                 g.active = true;
@@ -1627,10 +2131,16 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 .into_owned();
             let masked = mask_cfg_test_items(&text);
             field_types.harvest(&masked);
+            let impls = impl_spans(&masked);
+            let ctx = FileCtx {
+                rel: &rel,
+                namespace: None,
+                impls: &impls,
+            };
             let mut parsed = Vec::new();
             parse_source_fns(&masked, &rel, &mut parsed);
             for f in &parsed {
-                fns.push(scan_fn(&f.name, &rel, &f.span, &f.body, None, &mut sites));
+                fns.push(scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites));
             }
         }
     }
@@ -1671,6 +2181,12 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                 .to_string_lossy()
                 .into_owned();
             let masked = mask_cfg_test_items(&text);
+            let impls = impl_spans(&masked);
+            let ctx = FileCtx {
+                rel: &rel,
+                namespace: Some(v.namespace),
+                impls: &impls,
+            };
             let mut parsed = Vec::new();
             parse_source_fns(&masked, &rel, &mut parsed);
             match slice_idx {
@@ -1678,27 +2194,13 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
                     // Labeled platform slice: count, never graph.
                     let mut scratch: Vec<AcqSite> = Vec::new();
                     for f in &parsed {
-                        let _ = scan_fn(
-                            &f.name,
-                            &rel,
-                            &f.span,
-                            &f.body,
-                            Some(v.namespace),
-                            &mut scratch,
-                        );
+                        let _ = scan_fn(&f.name, &f.span, &f.body, &ctx, &mut scratch);
                     }
                     per_slice[i] += scratch.len();
                 }
                 None => {
                     for f in &parsed {
-                        fns.push(scan_fn(
-                            &f.name,
-                            &rel,
-                            &f.span,
-                            &f.body,
-                            Some(v.namespace),
-                            &mut sites,
-                        ));
+                        fns.push(scan_fn(&f.name, &f.span, &f.body, &ctx, &mut sites));
                     }
                 }
             }
@@ -2580,46 +3082,207 @@ mod tests {
     // Walker unit tests
     // ------------------------------------------------------------------
 
+    /// The aliases ledger of a fn that has bound none.
+    fn no_aliases() -> BTreeMap<String, (i32, String)> {
+        BTreeMap::new()
+    }
+
+    /// A site context outside any `impl` block, with no live aliases: the
+    /// walker's plain resolution, unrefined.
+    fn bare_ctx(aliases: &BTreeMap<String, (i32, String)>) -> SiteCtx<'_> {
+        SiteCtx {
+            impls: &[],
+            lineno: 1,
+            aliases,
+        }
+    }
+
     #[test]
     fn receiver_resolution_handles_fields_accessors_and_unknowns() {
-        let acqs = acquisitions_on("let g = self.store.read().unwrap();");
+        let aliases = no_aliases();
+        let ctx = bare_ctx(&aliases);
+        let acqs = acquisitions_on("let g = self.store.read().unwrap();", &ctx);
         assert_eq!(acqs.len(), 1);
         assert_eq!(acqs[0].identity.as_deref(), Some("store"));
-        let acqs = acquisitions_on("proxies().write().unwrap().insert(child, entry);");
+        let acqs = acquisitions_on("proxies().write().unwrap().insert(child, entry);", &ctx);
         assert_eq!(acqs[0].identity.as_deref(), Some("proxies"));
-        // `self.0` / single-letter receivers are UNKNOWN, not dropped.
-        let acqs = acquisitions_on("*self.0.lock().unwrap() = None;");
+        // Outside any nameable impl, `self.0` / single-letter receivers are
+        // UNKNOWN, not dropped.
+        let acqs = acquisitions_on("*self.0.lock().unwrap() = None;", &ctx);
         assert_eq!(acqs.len(), 1);
         assert!(acqs[0].identity.is_none());
-        let acqs = acquisitions_on("a.read().unwrap().clone()");
+        let acqs = acquisitions_on("a.read().unwrap().clone()", &ctx);
         assert!(acqs[0].identity.is_none());
         // term_lock is the registered helper, identity `term`; its def is not
         // an acquisition.
-        let acqs = acquisitions_on("let mut t = term_lock(&s.term);");
+        let acqs = acquisitions_on("let mut t = term_lock(&s.term);", &ctx);
         assert_eq!(acqs[0].identity.as_deref(), Some("term"));
-        assert!(acquisitions_on("pub(crate) fn term_lock(term: &Mutex<Terminal>) {").is_empty());
+        assert!(
+            acquisitions_on("pub(crate) fn term_lock(term: &Mutex<Terminal>) {", &ctx).is_empty()
+        );
+    }
+
+    #[test]
+    fn self_receivers_take_the_enclosing_impl_type() {
+        let impls = impl_spans("impl Spill {\n    fn f(&self) {\n        drop(0);\n    }\n}\n");
+        let aliases = no_aliases();
+        let ctx = SiteCtx {
+            impls: &impls,
+            lineno: 3,
+            aliases: &aliases,
+        };
+        // The three self-rooted shapes, each qualified by the impl type.
+        assert_eq!(
+            acquisitions_on("*self.0.lock().unwrap() = None;", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("Spill::0")
+        );
+        assert_eq!(
+            acquisitions_on("let g = self.lock().unwrap();", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("Spill::self")
+        );
+        assert_eq!(
+            acquisitions_on("let g = self.pair.1.read().unwrap();", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("Spill::pair.1")
+        );
+        // THE SEAM between the `?` rule and this refinement, and the reason
+        // the `?` strip runs FIRST: at the raw dot the token before it is `?`,
+        // `self_rooted_chain` finds no chain, and a field this impl can name
+        // falls back to UNKNOWN — the punctuation accident the `?` fix exists
+        // to close, reintroduced one layer up. Neither change's own tests
+        // cover the composition; this one does.
+        assert_eq!(
+            acquisitions_on("*self.0?.lock().unwrap() = None;", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("Spill::0")
+        );
+        assert_eq!(
+            acquisitions_on("let g = self.pair.1??.read().unwrap();", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("Spill::pair.1")
+        );
+        // A NAMED field keeps the plain identity it has always had: renaming
+        // those would split every existing edge in the graph.
+        assert_eq!(
+            acquisitions_on("let g = self.store.read().unwrap();", &ctx)[0]
+                .identity
+                .as_deref(),
+            Some("store")
+        );
+        // A LOCAL's tuple field is not this type's field — never qualified.
+        assert!(
+            acquisitions_on("let g = pair.0.lock().unwrap();", &ctx)[0]
+                .identity
+                .is_none()
+        );
+        // Outside the impl's line span the qualification is gone (fail-closed).
+        let outside = SiteCtx {
+            impls: &impls,
+            lineno: 99,
+            aliases: &aliases,
+        };
+        assert!(
+            acquisitions_on("*self.0.lock().unwrap() = None;", &outside)[0]
+                .identity
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn impl_headers_resolve_to_a_nameable_self_type_or_none() {
+        for (header, want) in [
+            ("impl Spill ", Some("Spill")),
+            ("impl<T> Spill<T> ", Some("Spill")),
+            ("impl fmt::Display for Spill ", Some("Spill")),
+            (
+                "impl<'a, T: Clone> Sink<'a> for Spill<'a, T> ",
+                Some("Spill"),
+            ),
+            (
+                "impl<K, V, S> IndexMap<K, V, S> where S: Hash, ",
+                Some("IndexMap"),
+            ),
+            ("unsafe impl Send for Spill ", Some("Spill")),
+            ("impl Sink for &'a mut Spill ", Some("Spill")),
+            // The shapes that must NEVER lend an identity — each one would
+            // merge locks that never meet.
+            ("impl<T> MutexExt<T> for Mutex<T> ", None), // the lock itself
+            ("impl<T> Ext for Arc<T> ", None),           // a transparent wrapper
+            ("impl<T> ToSmolStr for T ", None),          // a blanket impl
+            ("impl<F: Fn() -> u32, T> Ext for T ", None), // `->` must not close `<`
+            ("impl<T> UpdateSlice for &[T] ", None),     // a structural type
+            ("impl FfiErrorCode for $ty ", None),        // a macro fragment
+        ] {
+            assert_eq!(
+                impl_self_type(header).as_deref(),
+                want,
+                "impl header `{header}`"
+            );
+        }
+    }
+
+    #[test]
+    fn single_letter_receivers_take_the_path_they_alias() {
+        let aliases = no_aliases();
+        // A pure-path RHS lends its identity; anything else does not.
+        assert_eq!(
+            alias_target("let m = &self.spill;", &bare_ctx(&aliases)).as_deref(),
+            Some("spill")
+        );
+        assert_eq!(
+            alias_target("let q = &QUEUE;", &bare_ctx(&aliases)).as_deref(),
+            Some("QUEUE")
+        );
+        assert!(alias_target("let m = pick(a, b);", &bare_ctx(&aliases)).is_none());
+        assert!(alias_target("let m = self.spill.lock().unwrap();", &bare_ctx(&aliases)).is_none());
+        assert!(alias_target("let m = if x { &a } else { &b };", &bare_ctx(&aliases)).is_none());
+        // The aliased receiver then resolves exactly as the field spelling
+        // would have — no new identity, so no new merge class.
+        let mut aliases = no_aliases();
+        aliases.insert("m".to_string(), (0, "spill".to_string()));
+        assert_eq!(
+            acquisitions_on("let g = m.lock().unwrap();", &bare_ctx(&aliases))[0]
+                .identity
+                .as_deref(),
+            Some("spill")
+        );
     }
 
     #[test]
     fn guard_final_value_distinguishes_bound_guard_from_consumed_value() {
+        let aliases = no_aliases();
+        let ctx = bare_ctx(&aliases);
         // Bound guard: only poison adapters between the call and `;`.
         let line = "let g = store.read().unwrap_or_else(|p| p.into_inner());";
-        let acq = &acquisitions_on(line)[0];
+        let acq = &acquisitions_on(line, &ctx)[0];
         assert!(guard_is_final_value(line, acq));
         // Consumed within the statement: `.by_local(..)` follows the adapters.
         let line = "let gone = self.store.read().unwrap_or_else(|p| p.into_inner()).by_local(s);";
-        let acq = &acquisitions_on(line)[0];
+        let acq = &acquisitions_on(line, &ctx)[0];
         assert!(!guard_is_final_value(line, acq));
         // Helper call bound directly.
         let line = "let mut term = term_lock(&s.term);";
-        let acq = &acquisitions_on(line)[0];
+        let acq = &acquisitions_on(line, &ctx)[0];
         assert!(guard_is_final_value(line, acq));
     }
 
     #[test]
     fn literals_are_masked_before_token_scans() {
+        let aliases = no_aliases();
+        let ctx = bare_ctx(&aliases);
         assert!(
-            acquisitions_on(&mask_literals(r#"log!("call .lock() and term_lock(x)");"#)).is_empty()
+            acquisitions_on(
+                &mask_literals(r#"log!("call .lock() and term_lock(x)");"#),
+                &ctx
+            )
+            .is_empty()
         );
         let masked = mask_literals(r#"let b = matches!(c, '{');"#);
         assert_eq!(masked.matches('{').count(), 0);
@@ -2751,6 +3414,103 @@ mod tests {
             out.log
                 .contains("UNKNOWN@crates/aterm-gui/src/extra.rs:2 -> beta_lock"),
             "log:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn synthetic_tuple_field_abba_across_two_types_is_red() {
+        // THE COUNTERFACTUAL the impl-type qualification exists for. Both
+        // halves of this ABBA are spelled `self.0.lock()`. While such a
+        // receiver resolved to a per-site UNKNOWN node it could never unify,
+        // so this cycle — a real deadlock, one thread per method pair — was
+        // undetectable BY CONSTRUCTION. Qualified by the enclosing impl type
+        // the two nodes are `Alpha::0` and `Beta::0`, and the cycle closes.
+        let out = run_synth(
+            "selffieldabba",
+            "impl Alpha {\n    fn ab(&self) {\n        \
+             let g = self.0.lock().unwrap();\n        self.beta_step();\n    }\n    \
+             fn alpha_step(&self) {\n        self.0.lock().unwrap().push(1);\n    }\n}\n\
+             impl Beta {\n    fn ba(&self) {\n        \
+             let g = self.0.lock().unwrap();\n        self.alpha_step();\n    }\n    \
+             fn beta_step(&self) {\n        self.0.lock().unwrap().push(1);\n    }\n}\n",
+        );
+        assert!(!out.ok, "a `self.0` ABBA must be RED:\n{}", out.log);
+        assert!(
+            out.log.contains("EDGE Alpha::0 -> Beta::0")
+                && out.log.contains("EDGE Beta::0 -> Alpha::0"),
+            "both edges of the cycle must be named with their qualified \
+             identities:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("crates/aterm-gui/src/extra.rs:3")
+                && out.log.contains("crates/aterm-gui/src/extra.rs:16"),
+            "both sites of the cycle must be named:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("[via call to `beta_step`")
+                && out.log.contains("[via call to `alpha_step`"),
+            "the one-hop witness of each half must be named:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn synthetic_same_field_on_different_types_does_not_merge() {
+        // The other half of the ruling: the qualification must be at least as
+        // DISCRIMINATING as the UNKNOWN it replaces. `Alpha::0` and `Beta::0`
+        // are different locks; merging them into one `0` node would invent
+        // exactly the cycle this tree does not have (`0 -> shared_lock` and
+        // `shared_lock -> 0`), and a false cycle has no waiver channel to
+        // escape through — it can only be "repaired" by rewriting correct code.
+        let out = run_synth(
+            "selffieldnomerge",
+            "impl Alpha {\n    fn ab(&self) {\n        \
+             let g = self.0.lock().unwrap();\n        \
+             let h = shared_lock.lock().unwrap();\n    }\n}\n\
+             impl Beta {\n    fn ba(&self) {\n        \
+             let g = shared_lock.lock().unwrap();\n        \
+             let h = self.0.lock().unwrap();\n    }\n}\n",
+        );
+        assert!(
+            out.ok,
+            "same-named fields on DIFFERENT types must not merge into a \
+             cycle:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("Alpha::0 -> shared_lock")
+                && out.log.contains("shared_lock -> Beta::0"),
+            "both nestings must be tracked, under distinct identities:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("Alpha::0(1)") && out.log.contains("Beta::0(1)"),
+            "each type's field must be its own identity in the ledger:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
+    fn synthetic_unqualifiable_impl_types_keep_the_per_site_node() {
+        // Fail-closed the other way. A blanket `impl<T> .. for T` and an
+        // extension trait on the lock primitive itself both implement a whole
+        // FAMILY of types: `T::self` / `Mutex::self` would be one node for
+        // every lock in the process — the merge that manufactures cycles. Both
+        // stay UNKNOWN (seen, counted, unable to close a cycle).
+        let out = run_synth(
+            "blanketself",
+            "impl<T> Peek for T {\n    fn peek(&self) {\n        \
+             self.0.lock().unwrap().len();\n    }\n}\n\
+             impl<T> Ext for Mutex<T> {\n    fn twice(&self) {\n        \
+             self.lock().unwrap().len();\n    }\n}\n",
+        );
+        assert!(out.ok, "GREEN expected:\n{}", out.log);
+        assert!(
+            out.log.contains("2 UNKNOWN-identity site(s)"),
+            "neither shape may borrow a type name:\n{}",
             out.log
         );
     }
@@ -3259,8 +4019,18 @@ mod tests {
         // the other side is still `store`. Reporting it UNKNOWN would widen the
         // census's honesty gap for a punctuation mark, and UNKNOWN nodes never
         // unify, so a real ordering through this lock could not be seen.
-        let acqs =
-            acquisitions_on("let g = self.store?.read().unwrap_or_else(|p| p.into_inner());");
+        //
+        // Deliberately a `bare_ctx`: outside any impl, with no live aliases,
+        // the self/single-letter REFINEMENTS cannot fire, so the two UNKNOWN
+        // assertions below still test the `?` rule alone rather than silently
+        // becoming assertions about `impl_ty()`. The refinements have their
+        // own tests, and one of them pins `self.0?` UNDER an impl.
+        let aliases = no_aliases();
+        let ctx = bare_ctx(&aliases);
+        let acqs = acquisitions_on(
+            "let g = self.store?.read().unwrap_or_else(|p| p.into_inner());",
+            &ctx,
+        );
         assert_eq!(acqs.len(), 1);
         assert_eq!(
             acqs[0].identity.as_deref(),
@@ -3268,13 +4038,13 @@ mod tests {
             "a `?` before the acquisition dot must not erase the receiver"
         );
         // Chained `??` (Option<Result<_>>) resolves the same way.
-        let acqs = acquisitions_on("self.inner??.lock().unwrap();");
+        let acqs = acquisitions_on("self.inner??.lock().unwrap();", &ctx);
         assert_eq!(acqs[0].identity.as_deref(), Some("inner"));
         // And the genuinely unresolvable receivers stay UNKNOWN — the fix must
         // not become a way to invent names.
-        let acqs = acquisitions_on("*self.0?.lock().unwrap() = None;");
+        let acqs = acquisitions_on("*self.0?.lock().unwrap() = None;", &ctx);
         assert!(acqs[0].identity.is_none());
-        let acqs = acquisitions_on("a?.read().unwrap().clone()");
+        let acqs = acquisitions_on("a?.read().unwrap().clone()", &ctx);
         assert!(acqs[0].identity.is_none());
     }
 

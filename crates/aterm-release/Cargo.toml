@@ -22,6 +22,9 @@ aterm-types = { workspace = true }
 # so publisher and updater client agree by compilation, not by convention — the
 # publish-time byte round-trip through the CLIENT's parser is the bridge proof.
 aterm-update-core = { workspace = true }
+# The cutter builds with the toolchain atpkg installs, so it resolves the store the
+# same way atpkg does rather than guessing at a path.
+atpkg = { workspace = true }
 # Manifest emission, the dist/cut-state.toml resume journal, and the release.conf
 # key=value surface are all serde-derived TOML (derive comes with the workspace dep).
 serde = { workspace = true }

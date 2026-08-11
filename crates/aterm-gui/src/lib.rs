@@ -599,14 +599,57 @@ const SYNC_RELEASE_GRACE: Duration = Duration::from_millis(50);
 /// display can show (pure wasted CPU/GPU under `AutoNoVsync`).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_micros(8_000);
 
-/// Re-present cadence cap for the cursor aurora/trail animation: 60 fps (16.7 ms).
-/// The aurora decay needs no finer step, and the cap keeps a 120/144 Hz ProMotion
-/// panel from paying a full-refresh wake+present tail for the few hundred ms after
-/// every cursor move (the `.max(frame_interval)` floor alone would let it tick at
-/// the panel rate; a steady text screen still idles at 0% either way).
-/// Output is byte-identical regardless of cadence (the decay is time-based); only the
-/// number of intermediate frames changes.
+/// Re-present cadence for the cursor aurora/trail animation when the panel's
+/// real refresh is UNKNOWN: 60 fps (16.7 ms). Also the still-deliberate cap on
+/// the paths that are not chasing the panel — the offscreen video recorder and
+/// the rain/scroll-pill wakes, whose own engine periods are coarser anyway.
+///
+/// It used to be the cap on the cursor-effect train as well, on the ground that
+/// a 120/144 Hz panel should not pay a full-refresh wake+present tail for the
+/// few hundred ms after every cursor move. RESPONSIVENESS AUDIT overturned that
+/// for the effect train specifically: content presents at the panel rate, so a
+/// 60 fps effect train on ProMotion shows every second refresh a stale comet —
+/// a mean 8.3 ms of motion latency on the exact pixels the eye is tracking.
+/// [`effect_tick_interval`] now drives that train from the panel's ACTUAL
+/// refresh and this constant is its fallback. The extra wakes are bounded to
+/// BRISK light: the coarse paths (forge ember, vapor, the kill-hint poll) keep
+/// their own deadlines through `next_change_deadline`, and a steady text screen
+/// still idles at 0%.
+///
+/// Output is byte-identical regardless of cadence (every decay is time-based);
+/// only the number of intermediate frames changes.
 const AURORA_TICK_INTERVAL: Duration = Duration::from_micros(16_667);
+
+/// Fastest effect tick the scheduler will EVER arm (~240 fps). The panel period
+/// comes from the display server (`refresh_rate_millihertz`), so a driver that
+/// reports an implausible rate — or a VRR panel advertising its upper bound —
+/// cannot spin the effect train faster than any real display refreshes.
+const MIN_EFFECT_TICK_INTERVAL: Duration = Duration::from_micros(4_167);
+
+/// The cursor-effect tick period for one window: the panel's ACTUAL refresh
+/// period when the host knows it, else the 60 fps fallback.
+///
+/// `panel` is `WindowState::frame_interval` — sampled per window from the
+/// monitor it actually occupies (`refresh_frame_interval`, re-run on `Moved`
+/// and on focus), so a window dragged from a 120 Hz laptop panel to a 60 Hz
+/// external re-paces without a guess. `None` means the platform never reported
+/// a refresh for this window (headless, an offscreen target, a driver that
+/// declines): fall back to 60 fps rather than inventing a rate — deliberately
+/// NOT the app-wide `frame_interval`, which is a bulk-output pacing default
+/// (125 fps) and not a panel measurement.
+///
+/// scope-waiver: "app-wide" here names the value this fallback REFUSES, not
+/// anything this function owns. `effect_tick_interval` is a PURE function of
+/// its one argument, holds no state at all, and its answer is per WINDOW by
+/// construction — the caller passes that window's own `frame_interval`. No
+/// instance count can falsify the phrase, because the phrase is about the
+/// other quantity's cardinality and is the reason it was rejected.
+fn effect_tick_interval(panel: Option<Duration>) -> Duration {
+    match panel {
+        Some(period) => period.max(MIN_EFFECT_TICK_INTERVAL),
+        None => AURORA_TICK_INTERVAL,
+    }
+}
 
 /// Throttle for re-querying the panel's live EDR headroom
 /// (`maximumExtendedDynamicRangeColorComponentValue`) during the aurora present.
@@ -3991,9 +4034,7 @@ impl Drop for Session {
         // pid is free and may now name an unrelated process group. Everything
         // below this point that ends the READER (the wake pipe, the stop flag)
         // still runs — only the pid-addressed signals are skipped.
-        let already_reaped = self
-            .child_reaped
-            .load(std::sync::atomic::Ordering::Acquire);
+        let already_reaped = self.child_reaped.load(std::sync::atomic::Ordering::Acquire);
         if !already_reaped {
             aterm_pty::hangup(self.pid);
         }
@@ -11738,7 +11779,11 @@ impl ApplicationHandler<Wake> for App {
             // frame. Re-armed HERE, not in the post-present hook, exactly
             // because that early-out returns before the hook; cadence is the
             // window's frame interval clamped to <= 60fps
-            // (AURORA_TICK_INTERVAL), the same clamp the effect pumps use.
+            // (AURORA_TICK_INTERVAL). Deliberately NOT the panel-rate
+            // `effect_tick_interval` the live effect train now takes: a capture
+            // file is watched later, off this panel, so paying 120 frames a
+            // second of ring + PNG encode would double the artefact for
+            // cadence nobody will play it back at.
             let due_offscreen = self
                 .video_rec
                 .as_ref()
@@ -12439,9 +12484,12 @@ impl ApplicationHandler<Wake> for App {
             // LUMEN cursor aurora: while any light is alive on a
             // focused window, re-present so the comet/bloom/ring/sparks animate, then
             // disarm (→ pure `Wait`, 0% idle) the moment they decay to nothing. The
-            // cadence is capped at AURORA_TICK_INTERVAL (60fps) so a 120Hz ProMotion
-            // panel doesn't pay a 120fps wake/present tail for ~260ms after every
-            // cursor move — 60fps is smooth for a fade and halves that cost.
+            // cadence is the PANEL's own refresh ([`effect_tick_interval`]): the
+            // grid's content presents at the panel rate, so an effect train
+            // pinned to 60 fps hands a 120 Hz ProMotion panel the same comet
+            // twice and lands every second frame ~8.3 ms stale. Coarse-only
+            // effects still take their own deadlines below, so the extra wakes
+            // are confined to light that is actually MOVING.
             // M2 stream fade joins the same frame-paced wake: while any ink is
             // still drying (or the LAST present painted a tint that must be
             // settled to exact bytes), keep presenting; disarm the moment
@@ -12455,10 +12503,7 @@ impl ApplicationHandler<Wake> for App {
                 && !ws.is_split()
                 && (ws.fade_shown || ws.stream_fade.is_active(now));
             if ws.os_window.is_some() && ws.terminal_effect_frame_active(now, cursor_cat_motion) {
-                let aurora_interval = ws
-                    .frame_interval
-                    .unwrap_or(frame_interval)
-                    .max(AURORA_TICK_INTERVAL);
+                let aurora_interval = effect_tick_interval(ws.frame_interval);
                 // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember
                 // tail. If the ONLY live cursor effect is the glow's slowly-
                 // cooling ember (no moving light, no rainbow/cat/trail/deco, no
@@ -12654,8 +12699,10 @@ impl ApplicationHandler<Wake> for App {
             }
             // M1 scroll pill: ONE wake at the hold boundary while fully opaque
             // (the alpha is constant — no repaint churn), frame-paced during the
-            // fade ramp (capped at 60fps like the aurora), and `None` once faded
-            // — the self-disarm that returns the loop to pure `Wait`.
+            // fade ramp (floored at 60fps — a fade nobody is tracking with the
+            // eye needs no finer step, so it keeps the old clamp rather than
+            // the cursor train's panel rate), and `None` once faded — the
+            // self-disarm that returns the loop to pure `Wait`.
             {
                 let animated = pill_fade_full && ws.focused;
                 let iv = ws
@@ -14974,6 +15021,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         exec_command,
         cwd,
         hold,
+        headless: headless_flag,
     } = parse_cli(argv);
     // Diagnostics first, before any thread spawns: without a logger every
     // aterm_log record — including containment_audit denials — is discarded.
@@ -15165,7 +15213,42 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // thread below).
     // Read and cleared in ONE critical section (`aterm_log::env::take`), so the
     // flag cannot be observed twice nor survive into a child session.
-    let headless = aterm_log::env::take("ATERM_HEADLESS").is_some();
+    //
+    // `--headless` and `$ATERM_HEADLESS` are ONE mechanism, not two: the flag set
+    // the variable back in `parse_cli`, so both land here. `headless_flag` only
+    // records WHICH spelling was used, for the announcement below.
+    //
+    // The announcement is the point. A harness that arms headless and then waits
+    // for a control socket has exactly two failure modes — the socket never binds,
+    // or the mode never armed — and they are indistinguishable from an empty log.
+    // So an armed launch SAYS it is headless and names what armed it, and a
+    // `$ATERM_HEADLESS` that does NOT arm the mode (`0`/`off`/empty) says THAT
+    // instead of starting a window behind a script that will never see a socket.
+    let headless_env = aterm_log::env::take("ATERM_HEADLESS");
+    let headless = match cli::headless_arming(
+        headless_flag,
+        headless_env
+            .as_ref()
+            .map(|v| v.to_string_lossy())
+            .as_deref(),
+    ) {
+        cli::HeadlessArming::Armed(source) => {
+            eprintln!(
+                "aterm-gui: headless mode (armed by {}): no window; engine + control socket only",
+                source.as_str()
+            );
+            true
+        }
+        cli::HeadlessArming::Refused(value) => {
+            eprintln!(
+                "aterm-gui: $ATERM_HEADLESS=\"{value}\" does NOT arm headless mode \
+                 (0/off/empty disable it) — starting WINDOWED. Pass --headless (or set \
+                 ATERM_HEADLESS=1) if a window was not what you meant."
+            );
+            false
+        }
+        cli::HeadlessArming::Windowed => false,
+    };
     // Every process-environment mutation is now complete. Start the modern
     // Commit channel's parent-liveness watcher before any session/helper spawn:
     // parent EOF at preproof, ProofReady, or pre-Commit fail-stops this
@@ -15525,7 +15608,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // even on an empty var — that one needs a script-side fix and is tracked
     // in the changelog.)
     if integrate {
-        env_add.push((crate::app_kitty::SHELL_INTEGRATION_LOADED_GUARD.to_string(), String::new()));
+        env_add.push((
+            crate::app_kitty::SHELL_INTEGRATION_LOADED_GUARD.to_string(),
+            String::new(),
+        ));
     }
     // SEC-1 + OS-sandbox actuator: gate the single spawn seam on the containment
     // decision. The mode was resolved once at startup (`init_mode_from_env`, see
@@ -27808,6 +27894,86 @@ mod recursion_provision_tests {
             None,
         );
         assert_eq!(n, 0);
+    }
+}
+
+#[cfg(test)]
+mod effect_cadence_tests {
+    //! RESPONSIVENESS: the cursor-effect train follows the PANEL, not a fixed
+    //! 60 fps. These pin [`super::effect_tick_interval`] — the one seam that
+    //! turns a per-window refresh sample into the animation cadence.
+    use super::{AURORA_TICK_INTERVAL, MIN_EFFECT_TICK_INTERVAL, effect_tick_interval};
+    use std::time::Duration;
+
+    /// A reported panel period IS the cadence. The regression this replaces:
+    /// `panel.max(AURORA_TICK_INTERVAL)` floored every fast panel back to
+    /// 60 fps, so a 120 Hz ProMotion display animated the comet on every SECOND
+    /// refresh — a mean 8.3 ms of motion latency against content that presents
+    /// at the panel rate.
+    #[test]
+    fn a_fast_panel_drives_the_effect_train_at_its_own_refresh() {
+        let promotion = Duration::from_nanos(1_000_000_000_000 / 120_000); // 120 Hz
+        assert_eq!(
+            effect_tick_interval(Some(promotion)),
+            promotion,
+            "120 Hz panel ⇒ 120 Hz effect train"
+        );
+        // The pre-fix expression, stated as the negative control: it disagrees
+        // exactly here, and by the full 8.3 ms this change buys back.
+        let capped = promotion.max(AURORA_TICK_INTERVAL);
+        assert_eq!(
+            capped, AURORA_TICK_INTERVAL,
+            "control: the old clamp really did throw the panel rate away"
+        );
+        assert_eq!(
+            capped - effect_tick_interval(Some(promotion)),
+            Duration::from_nanos(8_333_667),
+            "…which is the per-frame latency the effect train was adding"
+        );
+        // 144 Hz too — nothing here is hard-coded to one panel.
+        let hz144 = Duration::from_nanos(1_000_000_000_000 / 144_000);
+        assert_eq!(effect_tick_interval(Some(hz144)), hz144);
+    }
+
+    /// A SLOW panel keeps its own (slower) period — the `.max` did that
+    /// already, and dropping the clamp must not start over-driving a 30 Hz
+    /// display at 60 fps.
+    #[test]
+    fn a_slow_panel_is_not_over_driven() {
+        let hz30 = Duration::from_nanos(1_000_000_000_000 / 30_000);
+        assert!(
+            hz30 > AURORA_TICK_INTERVAL,
+            "precondition: slower than 60 Hz"
+        );
+        assert_eq!(effect_tick_interval(Some(hz30)), hz30);
+    }
+
+    /// NO GUESSING. An unknown refresh (headless, an offscreen target, a driver
+    /// that declines to report) falls back to 60 fps — never to the app-wide
+    /// bulk-output pacing default, which is a 125 fps coalescing floor and not a
+    /// panel measurement.
+    #[test]
+    fn an_unknown_refresh_falls_back_to_sixty_and_never_to_the_output_pace() {
+        assert_eq!(effect_tick_interval(None), AURORA_TICK_INTERVAL);
+        assert_ne!(
+            effect_tick_interval(None),
+            super::MIN_FRAME_INTERVAL,
+            "the output-pacing floor is not a refresh rate"
+        );
+    }
+
+    /// A driver lie (or a VRR panel advertising its ceiling) cannot spin the
+    /// train faster than any real display refreshes.
+    #[test]
+    fn an_implausible_refresh_is_floored() {
+        assert_eq!(
+            effect_tick_interval(Some(Duration::from_micros(100))), // "10 kHz"
+            MIN_EFFECT_TICK_INTERVAL
+        );
+        assert_eq!(
+            effect_tick_interval(Some(Duration::ZERO)),
+            MIN_EFFECT_TICK_INTERVAL
+        );
     }
 }
 

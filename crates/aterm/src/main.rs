@@ -162,6 +162,14 @@ fn main() -> ExitCode {
             )
         }) || std::env::var_os("ATERM_HEADLESS").is_some()
             || !stdin_is_terminal());
+    // NOTE on the `ATERM_HEADLESS` arm above: PRESENCE, deliberately — not the
+    // enabling-value test `aterm_gui::cli` applies to the same variable. The
+    // window library owns the headless decision and ANNOUNCES it, including the
+    // refusal when the value is `0`/`off`/empty. Routing a merely-present
+    // variable here to the window mode is what lets that announcement be
+    // printed at all; testing the value here would send `ATERM_HEADLESS=0` into
+    // the SESSION, where nothing would ever mention it — the silent outcome
+    // this whole path exists to prevent.
     let mode_args: Vec<OsString> = rest
         .iter()
         .enumerate()

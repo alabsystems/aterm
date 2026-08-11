@@ -3,7 +3,7 @@
 
 //! The two smokes: the AI-first spine, and the pacing gate.
 //!
-//! 5) HEADLESS CONTROL-SOCKET SMOKE. Launch `aterm-gui` in `$ATERM_HEADLESS` mode
+//! 5) HEADLESS CONTROL-SOCKET SMOKE. Launch `aterm-gui --headless`
 //!    (binds the socket, no window), then drive one round trip with `aterm-ctl`:
 //!    `cursor` must answer `OK …`. Both binaries come from the just-built
 //!    workspace; the whole thing is sandboxed under a throwaway `$XDG_RUNTIME_DIR`
@@ -188,8 +188,11 @@ fn bring_up(
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);
+    // Headless via the FLAG — the canonical arming ($ATERM_HEADLESS is an exact
+    // equivalent, but a flag is visible in the spawn line and cannot be lost to
+    // an env-inheritance rule between here and exec).
     if headless {
-        cmd.env("ATERM_HEADLESS", "1");
+        cmd.arg("--headless");
     }
     match cmd.spawn() {
         Ok(c) => sb.child = Some(c),

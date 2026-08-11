@@ -70,10 +70,6 @@ pub struct BuildPlan {
     /// `--arm64-only`: skip the x86_64 slice (single-arch pass-through
     /// instead of lipo). The universal build is the default (spec decision 18).
     pub arm64_only: bool,
-    /// Extra env for every cargo child: the release.conf compile pins
-    /// (ATERM_PKG_ROOTKEY / ATERM_UPDATE_PUBKEY / ATERM_EXPECTED_TEAM_ID →
-    /// `option_env!` in atpkg / aterm-update), from `sign::ReleaseConf::env_pins`.
-    pub extra_env: Vec<(String, String)>,
     /// Exact lowercase SHA-256 fingerprint that every independently-built and
     /// final shipped architecture slice must embed for its compiled updater
     /// key. `None` exists only for unsigned development/rehearsal fixtures.
@@ -362,11 +358,11 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     cmd.env("CARGO_PROFILE_RELEASE_DEBUG", "1");
     cmd.env("CARGO_PROFILE_RELEASE_STRIP", "false");
 
-    // release.conf compile pins (updater Tier SIG / atpkg trust root / Tier
-    // APPLE) — reach option_env! in the child build on BOTH lanes.
-    for (k, v) in &plan.extra_env {
-        cmd.env(k, v);
-    }
+    // NO trust anchors are injected into the child build. They used to arrive here
+    // from ~/.aterm/release.conf so `option_env!` could bake them in, which made what
+    // a binary trusts a property of the shell that compiled it. They are committed
+    // constants now (`aterm_update_core::pins`) and the child compiles them in
+    // directly; exporting them would recreate a second, disagreeing source.
 
     // Lane env. Native slice: NOTHING beyond the driver itself — the resolved
     // targo supplies trustc and .cargo/config.toml (which targo reads, same

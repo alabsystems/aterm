@@ -294,6 +294,41 @@ const LOAF_AFTER: f32 = 2.8;
 const INK_PAD: f32 = 0.30;
 /// Clearance (cells) kept between a re-anchored footprint and the ink it fled.
 const INK_GAP: f32 = 0.35;
+/// Ceiling (cells) on how far the ink law may move a station — a **step
+/// aside**, roughly one body width and a half.
+///
+/// OWNER, 2026-08-10: "the cursor kitty gets pushed around in the text when
+/// editing in the middle of the text." Exactly so, and the mechanism is this
+/// law without a ceiling. `ink_spans` knows only a row's FIRST and END
+/// column, so the only blank stand it can ever name for a caret sitting
+/// inside a sentence is past the end of that sentence — measured, a caret at
+/// column 12 stationed the pet at 31.35. Insert a character there and `end`
+/// grows by one, so the station grows by one, and the cat is shoved a full
+/// cell right per keystroke by text it is nowhere near. It is not following
+/// the caret at all; it is riding the end of the line.
+///
+/// Past this distance the law yields and the pet keeps the plain station —
+/// standing over the words, which reads as a cat sitting on the line you are
+/// writing, not as a cat that left. That is the principle the walled-shut
+/// case already states ("the answer to 'no blank ground here' is never
+/// 'teleport somewhere else entirely'"), extended from *no blank ground* to
+/// *no blank ground NEARBY*.
+///
+/// End-of-line typing — the common case — is untouched: there the station
+/// sits right of the caret on genuinely blank cells, so `ink_overlaps` is
+/// false and the law never runs.
+const INK_EVICT_MAX: f32 = 4.0;
+/// Speed (cells/sec) of a step-aside eviction. Grounded poses return before
+/// the chase, so their eviction is its own tiny follower rather than a cut —
+/// a sleeper slides out from under an arriving line over ~a third of a second
+/// instead of popping there between two frames. Only SHORT evictions glide:
+/// a pet left behind entirely (gauntlet F1 — the wake atop "printf", the
+/// droop skulking on a failed command) is re-anchored outright, because
+/// walking it back would be a different animal from re-staging a pose.
+const INK_EVICT_SPEED: f32 = 12.0;
+/// Slop (cells) allowed when reading a line WRAP off the caret delta — a
+/// double-width glyph at the margin wraps from `cols - 2`.
+const WRAP_SLOP: f32 = 2.0;
 /// PERK-AND-WATCH (gauntlet F5): how far (rows) the live output edge may run
 /// from the watcher's feet before it hops to hug the newest line again — the
 /// hysteresis that keeps a fast stream from strobing the pursuit.
@@ -569,6 +604,102 @@ const POUNCE_RANGE: f32 = 20.0;
 /// The post-pounce flourish: a frolic beat on the landing before the chase
 /// ladder walks the pet home (earning content per cell, as ever).
 const POINTER_PLAY_HOLD: f32 = 0.9;
+
+// ── POINTER PURSUIT (wave 3) ────────────────────────────────────────────────
+// Owner, 2026-08-10: "the kitty should chase the mouse cursor, but 'home
+// base' and the primary focus is the typing cursor." The dash pounce answers
+// a FLICK; the pursuit answers a TEASE — a toy moving at real-but-under-dash
+// speed near a playful cat earns a RUNNING chase on the existing follower
+// controller. Work outranks play at every door: entry needs caret quiet, and
+// any caret-travel latch drops the chase mid-stride.
+
+/// How far (column-equivalents; rows count double) the teasing toy may be.
+const PURSUIT_RANGE: f32 = 24.0;
+/// The teasing band's floor, cells/s: slower is the stakeout's business,
+/// [`DASH_SPEED`] and past belongs to the pounce.
+const PURSUIT_MIN_SPEED: f32 = 8.0;
+/// Attention needed before the cat commits paws — the gaze tier watches for
+/// free; a chase costs dignity.
+const PURSUIT_HEAT: f32 = 0.6;
+/// The caret must have been quiet this long. Home base outranks the toy.
+const PURSUIT_QUIET: f32 = 1.0;
+/// Stamina: a chase this long without a catch breaks off — and grooms.
+const PURSUIT_MAX_T: f32 = 5.0;
+/// Cooldown after a break-off or a catch before the next chase can begin.
+const PURSUIT_COOL: f32 = 6.0;
+/// Row hysteresis while pursuing ([`WATCH_HUG_ROWS`]' law, the toy's
+/// edition): the chase hops rows only when the toy clearly changed lines.
+const PURSUIT_HUG_ROWS: f32 = 2.0;
+/// THE CATCH: within this reach of a slowed toy the chase ends in the bat
+/// visit (the swipe-at-the-toy the peek machinery already knows how to do).
+const PURSUIT_CATCH: f32 = 2.5;
+/// THE STAKEOUT: a creeping toy inside this range pins a settled cat into
+/// the hunting crouch; the strike stays the dash pounce's to make.
+const STALK_RANGE: f32 = 12.0;
+/// The creep band's floor, cells/s — under this the pointer is parked, not
+/// prey (creeps never build gaze heat, so the stakeout gates on the band
+/// directly).
+const STALK_MIN_SPEED: f32 = 1.0;
+/// The stakeout's patience: a crouch this long without a strike stands
+/// down (with a short cool so the same creep cannot re-pin it instantly).
+const STAKEOUT_MAX: f32 = 6.0;
+/// Post-chase dignity: the groom hold after a break-off (cats groom when
+/// embarrassed; an owed groom is consumed at the next arrival).
+const GROOM_HOLD: f32 = 1.2;
+/// A peek beyond [`BAT_RANGE`] but inside this earns the LOOK tier: the pet
+/// perks and faces the head — noticing from afar, never abandoning the
+/// caret for scenery.
+const LOOK_RANGE: f32 = 24.0;
+/// The look's TTL — the same honesty as [`BAT_TTL`]: a peek the pet's work
+/// outlasted is not news any more.
+const LOOK_TTL: f32 = 1.5;
+
+// ── wave 4: motion comedy (owner, 2026-08-10: variations in how it moves,
+// and funny actions when the cursor runs forward and backward quickly) ──────
+
+/// THE TENNIS WATCH: a SECOND frolic earned within this window of the
+/// last one sits the cat down to watch the rally — the facing ping-pongs
+/// with every caret move until the rally lapses.
+const TENNIS_AFTER: f32 = 2.0;
+/// The rally is over this long after its last hit; the watch stands down.
+const TENNIS_LAPSE: f32 = 1.2;
+/// THE SCRAMBLE: past this chase speed (cells/s) the gallop is a scramble —
+/// every few strides one paw slips (a one-beat squash and a dust puff).
+const STUMBLE_SPEED: f32 = 20.0;
+/// The slip's squash beat, seconds.
+const STUMBLE_DUR: f32 = 0.12;
+/// THE DRIFT-BRAKE: an arrival that closed at least this many columns at a
+/// gallop overshoots by [`BRAKE_OVERSHOOT`] and trots back — the zoomie's
+/// signature failure to stop.
+const BRAKE_DIST: f32 = 12.0;
+const BRAKE_OVERSHOOT: f32 = 2.0;
+/// THE SKIP: a content cat's walk bobs one stride in four — a skip, not a
+/// march.
+const SKIP_CONTENT: f32 = 0.6;
+
+// ── wave 4b: the bored-cat vignettes (owner: bat the cursor, roll around,
+// playfully attack the cursor) ──────────────────────────────────────────────
+
+/// Boredom's window opens here — after the groom, well before sleep — and a
+/// content cat in it demands attention from the nearest thing that blinks:
+/// your cursor.
+const BORED_AFTER: f32 = 8.0;
+/// The window closes early enough that a cat winding down to sleep is left
+/// alone to do it.
+const BORED_UNTIL: f32 = SLEEP_AFTER - 4.0;
+/// One vignette per cooldown: a treat, not a tic.
+const BORED_COOL: f32 = 24.0;
+/// THE WRIGGLE: seconds of rolling around on its back (the roll is faked
+/// with the sleep/loaf frames flip-flopping — a true roll cycle is authored
+/// art, queued for the rig).
+const WRIGGLE_DUR: f32 = 2.2;
+/// The wriggle's flip-flop beat.
+const WRIGGLE_BEAT: f32 = 0.35;
+/// HIDE-BEHIND-WORDS: how far (cols) the pet will walk to duck behind a
+/// word on its own row.
+const HIDE_RANGE: f32 = 10.0;
+/// How long it lurks back there before strolling home.
+const HIDE_DWELL: f32 = 3.5;
 /// One pounce per dash: the trigger re-arms only after the pointer heat has
 /// decayed under this — a long drag cannot machine-gun the cat.
 const POUNCE_REARM: f32 = 0.1;
@@ -707,7 +838,7 @@ pub struct PetMoteSprite {
 struct Mote {
     kind: PetMoteKind,
     /// `PetBrain::clock` at spawn, and how long it lives.
-    born: f32,
+    born: f64,
     life: f32,
     /// Birth anchor (fractional cells) and horizontal drift direction.
     col: f32,
@@ -837,6 +968,10 @@ pub struct PetFrame {
     /// can render faster than the body swell (audio, a glow pulse) has the real
     /// signal rather than the animation's stand-in.
     pub purr: f32,
+    /// HIDE-BEHIND-WORDS (wave 4c): draw the pet UNDER the glyphs this
+    /// frame — the word in front stays readable, the cat peers out from
+    /// behind it (the ink law's under-exception).
+    pub under_ink: bool,
     /// The pet's mote lane, resolved for this frame (dust, z's, notes) —
     /// `None`-padded, bounded, allocation-free. Rides the frame so both host
     /// render paths carry it with zero extra plumbing.
@@ -980,7 +1115,7 @@ pub struct PetBrain {
     /// Gait phase in cycles, advanced by DISTANCE travelled.
     stride: f32,
     /// Free-running seconds, for the time-driven idle animations only.
-    clock: f32,
+    clock: f64,
 
     /// The caret cell as of the previous tick — the pet's own move sensor.
     last_caret: Option<(u16, u16)>,
@@ -1113,6 +1248,53 @@ pub struct PetBrain {
     /// waits its turn and the TTL retires it honestly.
     pending_bat: Option<(f32, f32)>,
     bat_at: Option<Instant>,
+    /// POINTER PURSUIT (wave 3): `Some(elapsed)` while the chase is live —
+    /// a MODE steering the follower controller at the toy, not a one-shot
+    /// latch. Cleared by caret work, the toy leaving, a catch, or stamina.
+    pursuit_t: Option<f32>,
+    /// Seconds until the next chase may begin (a break-off or catch arms it;
+    /// caret work arms a short one so typing truly ends the game).
+    pursuit_cool: f32,
+    /// The break-off owes a groom — consumed at the next arrival (dignity).
+    groom_owed: bool,
+    /// THE STAKEOUT (wave 3): the current Crouch is the hunting crouch at a
+    /// creeping toy, held while the toy stays slow and near — never the
+    /// launch coil (the holds ladder checks this flag first).
+    stakeout: bool,
+    /// Seconds the current stakeout has held — its patience clock.
+    stakeout_t: f32,
+    /// THE LOOK (wave 3): a far peek's head column, waiting for the ground —
+    /// the perk-and-face tier of the word-cat reaction. TTL-retired like the
+    /// bat's latch.
+    pending_look: Option<f32>,
+    look_at: Option<Instant>,
+    /// Serial-parity variety for the NEAR peek visit: odd visits greet (the
+    /// playbow alternation) instead of swiping — set at note time from the
+    /// mote serial, the wave-1 variation law.
+    bat_greet: bool,
+    /// THE TENNIS WATCH (wave 4): sitting out a caret rally, facing flipped
+    /// per move; the clock is the last rally hit (lapses at TENNIS_LAPSE).
+    tennis: bool,
+    tennis_last: f64,
+    /// When (brain clock) the last frolic fired — TENNIS_AFTER's anchor.
+    last_frolic: f64,
+    /// One-beat stumble squash remaining (the scramble's slipping paw).
+    stumble_t: f32,
+    /// Columns closed since the current chase leg began — the drift-brake's
+    /// odometer, reset at every arrival.
+    leg_dist: f32,
+    /// The overshoot is live: the pet blew past its station on purpose and
+    /// is trotting back.
+    braking: bool,
+    /// Boredom cooldown (wave 4b): seconds until the next vignette may fire.
+    bored_cool: f32,
+    /// HIDE-BEHIND-WORDS (wave 4c): the walk target behind a word's ink,
+    /// then the crouched hide itself with its dwell clock.
+    hide_to: Option<f32>,
+    hiding: bool,
+    hide_t: f32,
+    /// Seconds left of rolling around on its back (0 = not wriggling).
+    wriggle_t: f32,
     /// IDLE MICRO-LIFE (wave 2): seconds remaining in the ear-twitch bob,
     /// which ear (by mote-serial parity at arm time), and the burst level
     /// of the previous tick (the pulse's edge detector).
@@ -1163,7 +1345,7 @@ pub struct PetBrain {
     /// parked pair was parked — the [`HANDOFF_DEBOUNCE`] anchor. Restamped
     /// whenever the park changes, cleared when it dissolves or lands, and
     /// re-stamped by a cancelled walk so the theater retries later.
-    handoff_parked_clock: Option<f32>,
+    handoff_parked_clock: Option<f64>,
     /// The walk-out is under way toward this edge column: the chase target
     /// is overridden until the pet arrives there (walk/run only — the
     /// standing-gap pounce doors stay shut for the whole trip).
@@ -1245,6 +1427,25 @@ impl Default for PetBrain {
             swipe: false,
             pending_bat: None,
             bat_at: None,
+            pursuit_t: None,
+            pursuit_cool: 0.0,
+            groom_owed: false,
+            stakeout: false,
+            stakeout_t: 0.0,
+            pending_look: None,
+            look_at: None,
+            bat_greet: false,
+            tennis: false,
+            tennis_last: 0.0,
+            last_frolic: -1.0e9,
+            stumble_t: 0.0,
+            leg_dist: 0.0,
+            braking: false,
+            bored_cool: 0.0,
+            wriggle_t: 0.0,
+            hide_to: None,
+            hiding: false,
+            hide_t: 0.0,
             twitch_t: 0.0,
             twitch_up: false,
             last_burst: false,
@@ -1367,7 +1568,11 @@ impl PetBrain {
     /// default of 0 keeps today's authored-box anchor, and [`LEAD_MAX`] stays
     /// conservative for the same reason.
     pub fn set_body_left_px(&mut self, px: f32) {
-        self.body_left_px = px.max(0.0);
+        // NaN.max(0.0) is NaN — a non-finite inset keeps the last good one
+        // (codex review, 2026-08-10).
+        if px.is_finite() {
+            self.body_left_px = px.max(0.0);
+        }
     }
 
     /// THE INK SEAM (gauntlet F1/F5/F8): the host's per-frame ink probe.
@@ -1431,7 +1636,11 @@ impl PetBrain {
     /// beside the row's ink — right of its end, or left of its start when
     /// that is closer — viewport-clamped. A row walled shut on both sides
     /// keeps the plain want: the answer to "no blank ground here" is never
-    /// "teleport somewhere else entirely".
+    /// "teleport somewhere else entirely". Neither is the answer to "no blank
+    /// ground within reach" — a stand further than [`INK_EVICT_MAX`] from the
+    /// want is refused for the same reason, and that is what keeps a caret
+    /// editing mid-sentence from riding the cat along on the end of the line —
+    /// see [`Self::ink_stand`], the ladder that owns that ordering.
     fn ink_safe_col(&self, want: f32, row: f32, width: f32, cols: u16) -> f32 {
         if !self.ink_overlaps(want, row, width) {
             return want;
@@ -1450,13 +1659,122 @@ impl PetBrain {
         }
     }
 
-    /// The chase target with the ink law folded in: [`Self::station_now`]
-    /// nudged to blank cells on the caret's row. The chase, the evictions and
-    /// the arrived test all read THIS one station, so they can never fight
-    /// each other over where the pet belongs.
-    fn station_safe(&self, caret: (u16, u16), cols: u16, width: f32, cell_w: u16) -> f32 {
+    /// Where a stand at `want` on `row` actually goes — the **ink ladder**,
+    /// tried in order of how little it asks of the cat:
+    ///
+    /// 1. `want` is already on blank cells. Ordinary end-of-line typing lives
+    ///    here and never reads the rest of this function.
+    /// 2. A NEAR blank stand on the same row ([`INK_EVICT_MAX`]) — a step
+    ///    aside, the cheapest correction there is.
+    /// 3. The same column one row DOWN, else one row UP. The mid-line editing
+    ///    answer, and the one the owner was missing: a caret inside a sentence
+    ///    has no blank ground beside it, but the line under it is almost
+    ///    always empty, and a cat sitting one line off beside your cursor is
+    ///    still WITH you.
+    /// 4. The far stand beside this row's ink — the original F1 law, which
+    ///    also carries its own walled-shut fallback (stand on the words; the
+    ///    answer to "nowhere to stand" was never "leave"). Reached only when
+    ///    the neighbouring rows are inked too, i.e. a screen full of text,
+    ///    where "beside the paragraph" really is the best ground on offer.
+    ///
+    /// Rule 3 is what the owner's report bought (2026-08-10: "the cursor kitty
+    /// gets pushed around in the text when editing in the middle of the
+    /// text"). Before it, rule 4 fired for every mid-line edit and parked the
+    /// cat past the END of the sentence — measured, a caret at column 12
+    /// stationed the pet at 31.35 — and because inserting a character grows
+    /// that end, the cat was shoved a cell right per keystroke by text it was
+    /// nowhere near. Rules 1, 2 and 4 are the behaviour that shipped; 3 only
+    /// ever runs where 4 used to give an answer that bad.
+    fn ink_stand(&self, want: f32, row: f32, width: f32, cols: u16, rows: u16) -> (f32, f32) {
+        if !self.ink_overlaps(want, row, width) {
+            return (want, row);
+        }
+        let beside = self.ink_safe_col(want, row, width, cols);
+        if (beside - want).abs() <= INK_EVICT_MAX {
+            return (beside, row);
+        }
+        // Down first: the row under the caret is the one the stream has not
+        // reached yet, so it is blank far more often than the row above — and
+        // a cat below the line never covers the line.
+        for r in [row + 1.0, row - 1.0] {
+            if r >= 0.0 && r < f32::from(rows) && !self.ink_overlaps(want, r, width) {
+                return (want, r);
+            }
+        }
+        (beside, row)
+    }
+
+    /// A grounded pose's step aside: `from` moved toward `to`, at most
+    /// [`INK_EVICT_SPEED`] cells this frame — but only while the whole trip
+    /// is a step aside. A displacement past [`INK_EVICT_MAX`] is the F1
+    /// re-anchor (a pose left behind by output, re-staged where the caret
+    /// now is) and lands outright: gliding it would be a grounded pose
+    /// sliding across the screen on its belly, which is a worse lie than the
+    /// cut it replaced.
+    fn evict_toward(from: f32, to: f32, dt: f32) -> f32 {
+        let delta = to - from;
+        if delta.abs() > INK_EVICT_MAX {
+            return to;
+        }
+        let step = INK_EVICT_SPEED * dt.max(0.0);
+        if delta.abs() <= step {
+            to
+        } else {
+            from + delta.signum() * step
+        }
+    }
+
+    /// The caret's move in TEXT cells, not grid cells: a line WRAP is ONE
+    /// character however it looks on the grid.
+    ///
+    /// Typing past the right margin moves the caret from `(r, cols-1)` to
+    /// `(r+1, 0)` — one row down and nearly the full width LEFT — and
+    /// backspacing over that seam moves it back the other way. Read
+    /// literally, those are the two largest single moves a caret can make on
+    /// a wide window, so both cleared [`POUNCE_JUMP`] *and* the
+    /// screen-crossing [`BIG_JUMP_COLS`] bar: every wrap fired a
+    /// gather-and-bound, and a held backspace over a wrapped line fired one
+    /// per seam. What the author did was type — or delete — one character.
+    ///
+    /// A wrap is the only move that crosses exactly one row boundary while
+    /// travelling nearly the whole width the OTHER way, so it is identifiable
+    /// from the delta alone. Fold the row back into the column and the answer
+    /// is the ±1 the text really moved; the row is then zero, which also
+    /// hands a backspace-over-wrap to the retreat arm that a literal
+    /// `dr == -1` used to route past. Everything else — a real row jump, a
+    /// click, a scroll — keeps its literal delta, because folding those would
+    /// invent a column move nobody made.
+    fn caret_delta(prev: (u16, u16), now: (u16, u16), cols: u16) -> (f32, f32) {
+        let dr = f32::from(now.0) - f32::from(prev.0);
+        let dc = f32::from(now.1) - f32::from(prev.1);
+        let w = f32::from(cols);
+        // The bar is never below POUNCE_JUMP: a delta too small to be
+        // mistaken for a jump has nothing to be rescued from, and a narrow
+        // pane must not start reading ordinary moves as seams.
+        let bar = (w - WRAP_SLOP).max(POUNCE_JUMP);
+        if dr.abs() == 1.0 && dc.signum() != dr.signum() && dc.abs() >= bar {
+            (0.0, dc + dr * w)
+        } else {
+            (dr, dc)
+        }
+    }
+
+    /// The chase target with the ink law folded in: [`Self::station_now`] run
+    /// through the [`Self::ink_stand`] ladder, which is why it answers with a
+    /// ROW as well as a column — rule 3 can seat the cat one line off the
+    /// caret's. The chase, the evictions and the arrived test all read THIS
+    /// one stand, so they can never fight each other over where the pet
+    /// belongs.
+    fn station_safe(
+        &self,
+        caret: (u16, u16),
+        cols: u16,
+        rows: u16,
+        width: f32,
+        cell_w: u16,
+    ) -> (f32, f32) {
         let want = self.station_now(caret.1, cols, width, cell_w);
-        self.ink_safe_col(want, f32::from(caret.0), width, cols)
+        self.ink_stand(want, f32::from(caret.0), width, cols, rows)
     }
 
     /// The live output edge as a row coordinate — `None` until the host
@@ -1560,14 +1878,32 @@ impl PetBrain {
     /// consumption waits for the ground below every caret intent, and
     /// [`BAT_TTL`] retires a peek the work outlasted.
     pub fn note_peek(&mut self, now: Instant, col: f32, row: f32) {
+        // Non-finite coordinates never latch: NaN compares false with every
+        // range gate below, so it would slip straight into the flight target
+        // and poison the pose state (codex review, 2026-08-10).
+        if !col.is_finite() || !row.is_finite() {
+            return;
+        }
         let dc = (col - self.col).abs();
         let dr = (row - self.row).abs();
         // Rows count double: cells are ~half as wide as tall, so the range
         // is judged in column-equivalents (a deterministic pane-geometry
         // fact, not a tuning surface).
-        if dc.max(dr * 2.0) > BAT_RANGE {
+        let range = dc.max(dr * 2.0);
+        if range > BAT_RANGE {
+            // THE LOOK tier (wave 3): out of paw reach but near enough to
+            // notice — latch the perk-and-face, never a trip. Beyond
+            // LOOK_RANGE the peek is scenery.
+            if range <= LOOK_RANGE {
+                self.pending_look = Some(col);
+                self.look_at = Some(now);
+            }
             return;
         }
+        // The NEAR visit varies by serial parity (the wave-1 variation law):
+        // even swipes, odd greets with the playbow alternation.
+        self.bat_greet = !self.mote_serial.is_multiple_of(2);
+        self.mote_serial = self.mote_serial.wrapping_add(1);
         self.pending_bat = Some((col, row));
         self.bat_at = Some(now);
     }
@@ -1592,9 +1928,14 @@ impl PetBrain {
         };
         let dt = elapsed.min(0.10);
         self.last_now = Some(sense.now);
-        self.clock += elapsed;
+        self.clock += f64::from(elapsed);
 
         let width = art_cols(sense.cell_w, sense.cell_h);
+        // Sampled BEFORE either fade arm moves it: "was the pet off the glass
+        // when this frame began?" is the question the first-sighting seed
+        // below has to ask, and by the time it runs the fade-in has already
+        // lifted a true first sighting off zero.
+        let was_invisible = self.alpha <= 0.0;
         let Some((cr, cc)) = sense.caret else {
             // No caret: settle, fade out, hold position — and FORGET where the
             // caret was. Keeping it would make the next sighting diff against a
@@ -1641,6 +1982,15 @@ impl PetBrain {
             // And the play state: no audience, no toys (dropped, not
             // parked, the wave-1 rule).
             self.clear_play();
+            // A hide mid-flight drops the WHOLE trip, second bound and
+            // landing recovery included: a stranded `bound2` latch used to
+            // dress the next ordinary landing in the touch-land coil and
+            // then relaunch a screen-crossing bound at a target from before
+            // the hide (review, 2026-08-10).
+            self.bound2 = None;
+            self.land_t = 0.0;
+            self.land_span = 0.0;
+            self.skid_dir = 0.0;
             // A hidden caret retires the handoff theater outright: the
             // park-until-hidden fallback right above IS the landing now.
             self.handoff_out = None;
@@ -1653,6 +2003,14 @@ impl PetBrain {
             // No caret, no gaze: a hidden cursor is not a thing to look at.
             self.sit_front = false;
             self.peek = false;
+            // The wave-4 comedy dies with the audience too.
+            self.tennis = false;
+            self.stumble_t = 0.0;
+            self.braking = false;
+            self.leg_dist = 0.0;
+            self.wriggle_t = 0.0;
+            self.hide_to = None;
+            self.hiding = false;
             self.enter_settled(dt);
             return self.emit(sense, width);
         };
@@ -1680,11 +2038,28 @@ impl PetBrain {
         if prev.is_none() {
             // Seed the wall side from the lead-free base rule (v̂ is zero on a
             // fresh sighting, so `station_now` agrees with `station` exactly).
-            // Ink-safe from the first frame: a caret that reappears mid-line
-            // must not materialise the cat on top of the line.
             self.wall_side = f32::from(cc) + STATION_LEAD + width > f32::from(sense.cols);
-            self.col = self.station_safe((cr, cc), sense.cols, width, sense.cell_w);
-            self.row = f32::from(cr);
+            // …but only MATERIALISE a pet that is actually off the glass.
+            //
+            // `last_caret` is cleared by the no-caret arm above, and the host
+            // feeds `caret: None` for a single frame on any scrollback scroll
+            // or DECTCEM hide — so a fully-drawn cat routinely arrives here
+            // with the fade-out having barely started. Hard-assigning then is
+            // the teleport the owner reported: measured, `(col 31.30, row 20)
+            // → (col 4.00, row 8)` between two frames at alpha 241/255. A cat
+            // the eye can still see has to WALK; the chase below already
+            // aims at this exact station, and the move sensor stays quiet
+            // (`prev` is `None`, so nothing reads as a jump) which is what
+            // keeps the walk from also firing a fright.
+            //
+            // Ink-safe either way: a caret that reappears mid-line must not
+            // materialise the cat on top of the line.
+            if was_invisible {
+                let (c, r) =
+                    self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
+                self.col = c;
+                self.row = r;
+            }
         }
         self.last_caret = Some((cr, cc));
 
@@ -1692,9 +2067,8 @@ impl PetBrain {
         let moved = prev.is_some_and(|(pr, pc)| pr != cr || pc != cc);
         let mut move_dc = 0.0f32;
         if moved {
-            let (pr, pc) = prev.expect("moved implies a previous caret");
-            let dc = f32::from(cc) - f32::from(pc);
-            let dr = f32::from(cr) - f32::from(pr);
+            let pcell = prev.expect("moved implies a previous caret");
+            let (dr, dc) = Self::caret_delta(pcell, (cr, cc), sense.cols);
             move_dc = dc;
             let was_asleep = self.action == PetAction::Sleep;
             self.on_move(dr, dc, f32::from(cc), sense.cols, sense.reduced_motion);
@@ -1789,10 +2163,9 @@ impl PetBrain {
         // The wave-1 latch TTLs, on the injected clock (never dt, which is
         // motion-clamped): a bell that outlived its window mid-flight
         // expires unconsumed; a pet expires two seconds after the LAST click.
-        if self
-            .pending_bell
-            .is_some_and(|at| sense.now.saturating_duration_since(at).as_secs_f32() > BELL_LATCH_TTL)
-        {
+        if self.pending_bell.is_some_and(|at| {
+            sense.now.saturating_duration_since(at).as_secs_f32() > BELL_LATCH_TTL
+        }) {
             self.pending_bell = None;
         }
         if self
@@ -1810,6 +2183,15 @@ impl PetBrain {
         {
             self.pending_bat = None;
             self.bat_at = None;
+        }
+        // The look's TTL (wave 3): the far tier retires with the same
+        // honesty — old scenery earns no double-take.
+        if self
+            .look_at
+            .is_some_and(|at| sense.now.saturating_duration_since(at).as_secs_f32() > LOOK_TTL)
+        {
+            self.pending_look = None;
+            self.look_at = None;
         }
         // PERK-AND-WATCH heat (wave 2): pure per-tick bookkeeping, integrated
         // unconditionally (like the flinch envelope) so a burst that lands
@@ -1835,6 +2217,8 @@ impl PetBrain {
         let burst_edge = sense.output_burst && !self.last_burst;
         self.last_burst = sense.output_burst;
         self.twitch_t = (self.twitch_t - dt).max(0.0);
+        self.stumble_t = (self.stumble_t - dt).max(0.0);
+        self.bored_cool = (self.bored_cool - dt).max(0.0);
         if burst_edge
             && self.twitch_t <= 0.0
             && self.watch_heat < WATCH_GATE
@@ -1850,7 +2234,11 @@ impl PetBrain {
         // matures near a happy cat) the pounce LATCH. Bookkeeping only;
         // consumption waits for the ground like every other intent.
         match sense.pointer {
-            Some((px, py)) => {
+            // A non-finite pointer is treated as NO pointer (codex review,
+            // 2026-08-10): NaN would flow through the velocity EMAs into the
+            // pounce aim and the chase target, and no clamp downstream can
+            // recover a poisoned coordinate.
+            Some((px, py)) if px.is_finite() && py.is_finite() => {
                 if let Some((lx, ly)) = self.last_pointer
                     && dt > 1e-4
                 {
@@ -1894,10 +2282,66 @@ impl PetBrain {
                         py + self.pointer_vy * LEAD_TIME,
                     ));
                 }
+                // POINTER PURSUIT (wave 3): the tease band. Entry, stamina,
+                // and the catch all live HERE in the sensor; the steering is
+                // a target override below (the follower controller does the
+                // running — no new motion vocabulary).
+                self.pursuit_cool = (self.pursuit_cool - dt).max(0.0);
+                let dist = (px - (self.col + width * 0.5))
+                    .abs()
+                    .max((py - self.row).abs() * 2.0);
+                match self.pursuit_t {
+                    None => {
+                        if self.pursuit_cool <= 0.0
+                            && self.pointer_heat >= PURSUIT_HEAT
+                            && (PURSUIT_MIN_SPEED..DASH_SPEED).contains(&speed)
+                            && dist <= PURSUIT_RANGE
+                            && dist > PURSUIT_CATCH
+                            && self.content >= PLAY_CONTENT
+                            && self.quiet >= PURSUIT_QUIET
+                            && self.flight.is_none()
+                            && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
+                        {
+                            self.pursuit_t = Some(0.0);
+                        }
+                    }
+                    Some(t) => {
+                        let t = t + dt;
+                        self.pursuit_t = Some(t);
+                        if self.quiet < PURSUIT_QUIET {
+                            // Typing resumed mid-stride: the game is over,
+                            // home base calls (the travel latch also clears
+                            // this — two doors, one law).
+                            self.pursuit_t = None;
+                            self.pursuit_cool = self.pursuit_cool.max(1.0);
+                        } else if speed < PURSUIT_MIN_SPEED * 0.5 && dist <= PURSUIT_CATCH {
+                            // THE CATCH: the toy slowed inside paw reach —
+                            // the chase ends in the bat visit (the swipe the
+                            // peek machinery already owns), with the greet
+                            // parity for variety.
+                            self.pursuit_t = None;
+                            self.pursuit_cool = PURSUIT_COOL;
+                            self.bat_greet = !self.mote_serial.is_multiple_of(2);
+                            self.mote_serial = self.mote_serial.wrapping_add(1);
+                            self.pending_bat = Some((px, py));
+                            self.bat_at = Some(sense.now);
+                        } else if t > PURSUIT_MAX_T || dist > PURSUIT_RANGE * 1.5 {
+                            // Stamina spent, or the toy left the yard: break
+                            // off with dignity — the groom is owed, the walk
+                            // home is the ordinary chase.
+                            self.pursuit_t = None;
+                            self.pursuit_cool = PURSUIT_COOL;
+                            self.groom_owed = true;
+                        }
+                    }
+                }
             }
-            None => {
-                // Outside the pane the pointer does not exist: heat clears
-                // (the gaze parks) and a latched pounce dies with its toy.
+            _ => {
+                // Outside the pane the pointer does not exist (and a
+                // non-finite pointer is treated the same): heat clears
+                // (the gaze parks) and a latched pounce dies with its toy —
+                // and so do the chase and the stakeout (wave 3): no toy, no
+                // game, no cooldown owed.
                 self.last_pointer = None;
                 self.pointer_vx = 0.0;
                 self.pointer_vy = 0.0;
@@ -1905,6 +2349,10 @@ impl PetBrain {
                 self.pointer_heat = 0.0;
                 self.dash_t = 0.0;
                 self.pending_pointer_pounce = None;
+                self.pursuit_t = None;
+                // The stakeout flag is NOT cleared here: the hold arm owns
+                // the stand-down (an orphaned hunting crouch would fall
+                // through to the launch coil — the phantom leap).
             }
         }
 
@@ -1914,8 +2362,12 @@ impl PetBrain {
         if self.flight.is_none() && self.update_wall(cc, sense.cols, width) {
             self.pending_wall_transit = true;
         }
-        let target = self.station_safe((cr, cc), sense.cols, width, sense.cell_w);
-        let target_row = f32::from(cr);
+        // The stand carries its own row: the ink ladder's rule 3 seats the cat
+        // one line off the caret when the caret's own line has no ground near
+        // it, and the row hop below is what makes that read as a cat stepping
+        // down rather than a cat blinking somewhere else.
+        let (target, target_row) =
+            self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
 
         // BREED HANDOFF (wave 2): the walk-out owns the chase target while
         // it lasts — straight out along the current row to the chosen edge.
@@ -1978,12 +2430,27 @@ impl PetBrain {
             let watching = self.action == PetAction::Perk
                 && self.watch_heat >= WATCH_GATE
                 && !self.watch_spent;
-            if watching {
-                self.col = self.ink_safe_col(self.col, self.row, width, sense.cols);
+            let (safe, safe_row) = if watching {
+                // A live watcher re-stations inside its OWN row — the hug
+                // below owns its row choice, so the ladder's row rules are
+                // not its to take.
+                (
+                    self.ink_safe_col(self.col, self.row, width, sense.cols),
+                    self.row,
+                )
             } else {
-                self.col = self.station_safe((cr, cc), sense.cols, width, sense.cell_w);
-                self.row = f32::from(cr);
-                if self.action == PetAction::Droop {
+                self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
+            };
+            let moved_off = (safe - self.col).abs() > f32::EPSILON;
+            self.col = Self::evict_toward(self.col, safe, dt);
+            if !watching {
+                self.row = safe_row;
+                // Grief replays where it can be READ — but only once the
+                // pose has ground to replay ON. Restarting the clock when
+                // the law has nowhere to send the pet (a row walled shut on
+                // both sides, its neighbours inked) would pin the droop
+                // forever.
+                if self.action == PetAction::Droop && moved_off {
                     self.action_t = 0.0;
                 }
             }
@@ -2025,6 +2492,51 @@ impl PetBrain {
             (target, target_row)
         };
 
+        // ── POINTER PURSUIT steering (wave 3) ──────────────────────────────
+        // While the chase is live the follower's target IS the toy (lead-
+        // corrected, centered) — the same controller, gains and gait laws
+        // that follow the caret. Ranked below every travel latch: a caret
+        // intent landing this tick reclaims the target before a paw moves.
+        let (target, target_row) = if self.pursuit_t.is_some()
+            && !self.pending_pounce
+            && !self.pending_big_jump
+            && !handoff_walking
+            && self.flight.is_none()
+            && let Some((px, py)) = self.last_pointer
+        {
+            let col = (px + self.pointer_vx * LEAD_TIME - width * 0.5)
+                .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+            let row = if (py - self.row).abs() >= PURSUIT_HUG_ROWS {
+                py.round()
+                    .clamp(0.0, f32::from(sense.rows.saturating_sub(1)))
+            } else {
+                self.row
+            };
+            (col, row)
+        } else {
+            (target, target_row)
+        };
+
+        // ── HIDE-BEHIND-WORDS walk (wave 4c): the target is the spot behind
+        // the word; arrival drops into the crouched hide. Any travel latch
+        // clears the trip (the play-clear below).
+        let (target, target_row) = if let Some(dest) = self.hide_to
+            && !self.pending_pounce
+            && !self.pending_big_jump
+            && !handoff_walking
+            && self.flight.is_none()
+        {
+            if (dest - self.col).abs() <= ARRIVED {
+                self.hide_to = None;
+                self.hiding = true;
+                self.hide_t = HIDE_DWELL;
+                self.set_action(PetAction::Crouch);
+            }
+            (dest, self.row)
+        } else {
+            (target, target_row)
+        };
+
         // ── flight owns the position while it lasts ────────────────────────
         if let Some(mut f) = self.flight {
             // The ONE mid-air re-aim: a large caret move while airborne
@@ -2039,8 +2551,22 @@ impl PetBrain {
                 } else {
                     0.0
                 };
-                f.to_col = (self.station_safe((cr, cc), sense.cols, width, sense.cell_w) + predict)
-                    .clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                // Column only: an in-flight re-aim keeps the row it launched
+                // at, because the arc's shape, its landing recovery and any
+                // second bound were all cut against that row. A ladder row
+                // the flight did not take is picked up by the eviction one
+                // tick after the paws are down.
+                let aim = self
+                    .station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
+                    .0;
+                f.to_col = (aim + predict).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                // A re-aimed FIRST bound orphans its second: the split was
+                // computed against the old target, and keeping it would land
+                // the cat at the new station only to bound all the way back
+                // to a caret that no longer exists (review, 2026-08-10).
+                // The show degrades to one bound — a re-aim already is the
+                // exceptional path.
+                self.bound2 = None;
             }
             f.t += dt;
             let u = (f.t / f.dur).clamp(0.0, 1.0);
@@ -2113,16 +2639,19 @@ impl PetBrain {
                         return self.emit(sense, width);
                     }
                     PlayLand::BatSwipe { col, row } => {
-                        // Face the head, swipe (the bat pose held for
-                        // BAT_HOLD), and puff the contact dust at the peek
-                        // cell itself — the head's DUCK is already the
-                        // companion-yield law's job, not ours.
+                        // Face the head — then SWIPE or GREET by the serial
+                        // parity latched at note time (wave 3): the swipe
+                        // pins the bat pose and puffs contact dust; the
+                        // greet leaves the playbow alternation to play, no
+                        // contact (a bow is not a hit).
                         self.facing_left = col < self.col + width * 0.5;
                         self.play_frolic = true;
-                        self.swipe = true;
+                        self.swipe = !self.bat_greet;
                         self.play_hold = BAT_HOLD;
                         self.set_action(PetAction::Frolic);
-                        self.spawn_bat_dust(col, row);
+                        if !self.bat_greet {
+                            self.spawn_bat_dust(col, row);
+                        }
                         return self.emit(sense, width);
                     }
                 }
@@ -2155,6 +2684,100 @@ impl PetBrain {
                 self.hop_crouch = false;
                 self.begin_flight(target, target_row, true, sense.cols, width);
                 return self.emit(sense, width);
+            }
+            PetAction::Loaf if self.wriggle_t > 0.0 => {
+                // THE WRIGGLE (wave 4b): rolling around on its back — held
+                // here, drawn by `emit` (frame flip-flop + belly bob), and
+                // finished with the waking stretch like any nap would be.
+                self.wriggle_t = (self.wriggle_t - dt).max(0.0);
+                self.speed = 0.0;
+                if self.wriggle_t <= 0.0 {
+                    self.set_action(PetAction::Waking);
+                }
+                return self.emit(sense, width);
+            }
+            PetAction::Sit if self.tennis => {
+                // THE TENNIS WATCH holds the sit while the rally lives; the
+                // facing already tracks each hit in `on_move`. The rally
+                // lapsing (or the caret going quiet enough to sleep) stands
+                // the watch down into the ordinary settle.
+                if (self.clock - self.tennis_last) as f32 <= TENNIS_LAPSE {
+                    self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+                self.tennis = false;
+            }
+            PetAction::Crouch if self.hiding => {
+                // THE HIDE (wave 4c): lurking behind the word — drawn under
+                // the glyphs (PetFrame::under_ink), dwelling its beat, then
+                // strolling home. Any caret work cleared it long before this
+                // arm (the travel clear); the dwell is the only exit here.
+                self.hide_t -= dt;
+                if self.hide_t > 0.0 {
+                    self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+                self.hiding = false;
+                self.set_action_keep(PetAction::Stand);
+                return self.emit(sense, width);
+            }
+            PetAction::Crouch if self.stakeout => {
+                // THE STAKEOUT (wave 3): the hunting crouch at a creeping
+                // toy — held while the toy stays slow and near, INCLUDING a
+                // toy that stops dead (a cat freezes at stopped prey), up to
+                // its own patience. A latched dash pounce converts the
+                // stakeout into the strike (the same play flight the pounce
+                // always was); anything else lapsing stands the cat back up,
+                // never the launch coil.
+                if let Some((ac, ar)) = self.pending_pointer_pounce.take() {
+                    self.stakeout = false;
+                    let to_col =
+                        (ac - width * 0.5).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                    let to_row = ar.clamp(0.0, f32::from(sense.rows.saturating_sub(1)));
+                    self.play_to = Some((to_col, to_row));
+                    self.play_land = Some(PlayLand::PointerFrolic);
+                    return self.emit(sense, width);
+                }
+                self.stakeout_t += dt;
+                // A toy speeding out of the creep band HANDS OFF: the chase
+                // (or the dash) takes it from here — standing down without a
+                // cool so the sensor may bite this very second.
+                if self.pursuit_t.is_some() || self.pointer_speed >= PURSUIT_MIN_SPEED {
+                    self.stakeout = false;
+                    self.set_action_keep(PetAction::Stand);
+                    return self.emit(sense, width);
+                }
+                let live = match self.last_pointer {
+                    Some((px, py)) => {
+                        let dist = (px - (self.col + width * 0.5))
+                            .abs()
+                            .max((py - self.row).abs() * 2.0);
+                        self.facing_left = px < self.col + width * 0.5;
+                        dist <= STALK_RANGE * 1.25 && self.stakeout_t < STAKEOUT_MAX
+                    }
+                    None => false,
+                };
+                if live {
+                    self.speed = 0.0;
+                    return self.emit(sense, width);
+                }
+                // Patience spent (or the toy left): stand down with a short
+                // cool so the same creep cannot re-pin the crouch instantly.
+                self.stakeout = false;
+                self.pursuit_cool = self.pursuit_cool.max(2.0);
+                self.set_action_keep(PetAction::Stand);
+                return self.emit(sense, width);
+            }
+            PetAction::Groom if self.groom_owed && self.action_t < GROOM_HOLD => {
+                // Post-chase dignity (wave 3): the break-off's groom holds
+                // its beat, then the ladder resumes — the walk home already
+                // happened; this is the sitting-down-and-pretending-that-
+                // was-on-purpose part.
+                self.speed = 0.0;
+                return self.emit(sense, width);
+            }
+            PetAction::Groom if self.groom_owed => {
+                self.groom_owed = false;
             }
             PetAction::Crouch if self.action_t >= CROUCH_DUR => {
                 if let Some((tc, tr)) = self.play_to.take() {
@@ -2257,7 +2880,9 @@ impl PetBrain {
         // already perked perks first, and the gather begins when that hold
         // has played out.
         if (self.pending_big_jump
-            || (!handoff_walking && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
+            || (!handoff_walking
+                && self.pursuit_t.is_none()
+                && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
             && gap.abs() > ARRIVED
         {
             // On ink the notice is SKIPPED outright (gauntlet F1): the perk
@@ -2310,7 +2935,11 @@ impl PetBrain {
         // so it outlives any hold it landed during) or a standing gap that has
         // simply become too big to run down. Both are consumed here, after every
         // hold, which is what keeps a leap from silently degrading into a walk.
-        if (self.pending_pounce || (!handoff_walking && gap.abs() >= POUNCE_GAP))
+        // A live pursuit keeps the standing-gap doors SHUT: a chase runs on
+        // paws (that is what makes it a chase) — only a latched caret intent
+        // may still fly.
+        if (self.pending_pounce
+            || (!handoff_walking && self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
             && gap.abs() > ARRIVED
         {
             self.pending_pounce = false;
@@ -2346,10 +2975,27 @@ impl PetBrain {
         self.stride = (self.stride + travelled / stride_cells).rem_euclid(1024.0);
         self.content = (self.content + travelled * CONTENT_PER_CELL).min(1.0);
 
-        // Overshoot guard: a follower must never oscillate around its station.
+        // Overshoot guard: a follower must never oscillate around its station
+        // — EXCEPT the drift-brake (wave 4): a long gallop that crosses its
+        // station blows past it by BRAKE_OVERSHOOT on purpose, flips to face
+        // its mistake, and trots back. Once per leg; the guard owns every
+        // other crossing.
         if (target - self.col).signum() != gap.signum() {
-            self.col = target;
-            self.speed *= 0.25;
+            if !self.braking
+                && self.pursuit_t.is_none()
+                && self.leg_dist >= BRAKE_DIST
+                && self.speed.abs() > RUN_SPEED
+                && self.content >= SKIP_CONTENT
+            {
+                self.braking = true;
+                self.col = target + BRAKE_OVERSHOOT * gap.signum();
+                self.speed *= 0.15;
+                self.stumble_t = STUMBLE_DUR;
+                self.spawn_dust(width);
+            } else {
+                self.col = target;
+                self.speed *= 0.25;
+            }
         }
 
         if self.speed.abs() > FLIP_SPEED {
@@ -2358,6 +3004,10 @@ impl PetBrain {
 
         let arrived = (target - self.col).abs() <= ARRIVED && self.speed.abs() < FLIP_SPEED;
         if arrived {
+            // The chase leg is over: the drift-brake's odometer rewinds and
+            // a live overshoot is done trotting back (wave 4).
+            self.leg_dist = 0.0;
+            self.braking = false;
             // BREED HANDOFF: arriving at the EDGE begins the fade — the
             // walk-in home ends here too, and the doors reopen.
             if self.handoff_out.take().is_some() {
@@ -2381,6 +3031,19 @@ impl PetBrain {
             if self.consume_bat(&sense, width) {
                 return self.emit(sense, width);
             }
+            // THE LOOK (wave 3): the far peek's tier — perk and face the
+            // head, never travel. Below the bat (a reachable toy beats
+            // scenery), above pointer play.
+            if let Some(lx) = self.pending_look.take() {
+                self.look_at = None;
+                if !matches!(self.action, PetAction::Sleep | PetAction::Waking) {
+                    self.facing_left = lx < self.col + width * 0.5;
+                    if self.action.settled() && self.action != PetAction::Perk {
+                        self.set_action(PetAction::Perk);
+                    }
+                    return self.emit(sense, width);
+                }
+            }
             // POINTER PLAY (wave 2): a latched dash pounce, below every
             // event stimulus (the caret's ladder never even reaches here
             // while work is pending — work outranks play by construction).
@@ -2398,13 +3061,26 @@ impl PetBrain {
                 && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
                 && self
                     .handoff_parked_clock
-                    .is_some_and(|at| self.clock - at >= HANDOFF_DEBOUNCE)
+                    .is_some_and(|at| self.clock - at >= f64::from(HANDOFF_DEBOUNCE))
             {
                 // The nearest edge ON THE PET'S SIDE of the caret: the
                 // exit never walks through your cursor.
                 let limit = (f32::from(sense.cols) - width).max(0.0);
-                let edge = if self.col >= f32::from(cc) { limit } else { 0.0 };
+                let edge = if self.col >= f32::from(cc) {
+                    limit
+                } else {
+                    0.0
+                };
                 self.handoff_out = Some(edge);
+                return self.emit(sense, width);
+            }
+            // Post-chase dignity (wave 3): an owed groom is consumed on the
+            // ground below every toy and above the ambient watch — the
+            // break-off already walked home; the groom is the arrival.
+            if self.groom_owed && !matches!(self.action, PetAction::Sleep | PetAction::Waking) {
+                if self.action != PetAction::Groom {
+                    self.set_action(PetAction::Groom);
+                }
                 return self.emit(sense, width);
             }
             // PERK-AND-WATCH (wave 2): an ambient hold, ranked below every
@@ -2412,6 +3088,87 @@ impl PetBrain {
             // ladder it borrows the ground from.
             if self.consume_watch(dt, cc) {
                 return self.emit(sense, width);
+            }
+            // THE BORED-CAT VIGNETTES (wave 4b): a content cat in boredom's
+            // window — past the groom, shy of sleep — demands attention.
+            // The serial deals the act: bat the cursor, ATTACK the cursor
+            // (two swipes), or roll around on its back. One per cooldown,
+            // never during a game, never over a live toy.
+            if self.bored_cool <= 0.0
+                && self.wriggle_t <= 0.0
+                && !self.tennis
+                && self.pursuit_t.is_none()
+                && !self.stakeout
+                && self.pointer_heat <= 0.0
+                && self.quiet >= BORED_AFTER
+                && self.quiet < BORED_UNTIL
+                && self.content >= PLAY_CONTENT
+                && self.action.settled()
+                && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
+            {
+                self.bored_cool = BORED_COOL;
+                let deal = self.mote_serial % 4;
+                self.mote_serial = self.mote_serial.wrapping_add(1);
+                // HIDE (deal 3): duck behind a word on this row, if one is
+                // near enough — otherwise the deal falls back to the bat.
+                if deal == 3
+                    && let Some((first, end)) = self.ink_span(self.row)
+                    && end - first >= 2.0
+                {
+                    let dest = (end - width * 0.7).max(first - width * 0.3);
+                    if (dest - self.col).abs() <= HIDE_RANGE {
+                        self.hide_to = Some(dest);
+                        return self.emit(sense, width);
+                    }
+                }
+                if deal == 2 {
+                    // ROLL AROUND: flop over and wriggle (the emit fakes the
+                    // roll with the sleep/loaf frames flip-flopping).
+                    self.wriggle_t = WRIGGLE_DUR;
+                    self.set_action(PetAction::Loaf);
+                } else {
+                    // BAT (deal 0) or double-swipe ATTACK (deal 1) at the
+                    // cursor: face it, swipe, puff the contact dust at the
+                    // caret cell itself — playful, the claws are in.
+                    self.facing_left = f32::from(cc) < self.col + width * 0.5;
+                    self.play_frolic = true;
+                    self.swipe = true;
+                    self.play_hold = BAT_HOLD * if deal == 1 { 2.0 } else { 1.0 };
+                    self.set_action(PetAction::Frolic);
+                    self.spawn_bat_dust(f32::from(cc), self.row);
+                }
+                return self.emit(sense, width);
+            }
+            // THE STAKEOUT (wave 3): a creeping toy nearby pins the hunting
+            // crouch — ambient like the watch, below it (a live stream is
+            // closer to work), above the settle ladder. Gated on the SLOW
+            // band directly, not on heat: heat only rises above the gaze
+            // threshold (~6.7 cells/s), and a creep never gets there — that
+            // is exactly what makes it a creep.
+            if !self.stakeout
+                && self.pursuit_t.is_none()
+                && self.pursuit_cool <= 0.0
+                && self.quiet >= PURSUIT_QUIET
+                && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
+                && let Some((px, py)) = self.last_pointer
+            {
+                let dist = (px - (self.col + width * 0.5))
+                    .abs()
+                    .max((py - self.row).abs() * 2.0);
+                if dist <= STALK_RANGE
+                    && dist > PURSUIT_CATCH
+                    && self.pointer_speed >= STALK_MIN_SPEED
+                    && self.pointer_speed < PURSUIT_MIN_SPEED
+                    && self.content >= PLAY_CONTENT
+                {
+                    self.stakeout = true;
+                    self.stakeout_t = 0.0;
+                    self.hop_crouch = false;
+                    self.big_gather = false;
+                    self.facing_left = px < self.col + width * 0.5;
+                    self.set_action(PetAction::Crouch);
+                    return self.emit(sense, width);
+                }
             }
             self.content = (self.content - CONTENT_DECAY * dt).max(0.0);
             self.enter_settled(dt);
@@ -2432,7 +3189,15 @@ impl PetBrain {
             // pet's left (wall-side eye contact looks the other way), and
             // never on a first sighting (a re-materialisation lands exactly
             // at the station, the regression that pins it).
-            if prev.is_some() && self.action == PetAction::Sit && self.sit_front && self.facing_left
+            // Only when the gaze is the CARET's: while pointer attention is
+            // live, `sit_front`/`facing_left` describe the TOY, and scooting
+            // by caret math against a pointer gaze teleported the pet across
+            // the caret in a loop (review, 2026-08-10).
+            if prev.is_some()
+                && self.action == PetAction::Sit
+                && self.sit_front
+                && self.facing_left
+                && self.pointer_heat <= 0.0
             {
                 let clear = (f32::from(cc) + STATION_LEAD + PECK_CLEAR)
                     .min((f32::from(sense.cols) - width).max(0.0));
@@ -2443,10 +3208,24 @@ impl PetBrain {
             self.tend_motes(width);
         } else {
             self.content = (self.content - CONTENT_MOVING_DECAY * dt).max(0.0);
+            self.leg_dist += travelled;
             let fast = match self.action {
                 PetAction::Run => self.speed.abs() > RUN_SPEED - GAIT_HYST,
                 _ => self.speed.abs() > RUN_SPEED + GAIT_HYST,
             };
+            // THE SCRAMBLE (wave 4): past STUMBLE_SPEED the gallop loses a
+            // paw every few strides — a one-beat squash and a puff, keyed on
+            // the stride odometer crossing a whole number (deterministic,
+            // serial-scattered), never two beats in a row.
+            if fast
+                && self.speed.abs() > STUMBLE_SPEED
+                && self.stumble_t <= 0.0
+                && self.stride.fract() < travelled / RUN_STRIDE_CELLS
+                && (self.stride as u32).wrapping_add(u32::from(self.mote_serial)) % 5 == 0
+            {
+                self.stumble_t = STUMBLE_DUR;
+                self.spawn_dust(width);
+            }
             self.set_action_keep(if fast {
                 PetAction::Run
             } else {
@@ -2494,6 +3273,23 @@ impl PetBrain {
         // v̂'s impulse half (the decay lives in `tick`): this move's columns,
         // spread over the EMA window.
         self.vhat = (self.vhat + dc / VEL_TAU).clamp(-VEL_MAX, VEL_MAX);
+
+        // THE TENNIS WATCH (wave 4), ABOVE the whole reaction ladder: while
+        // the watch holds, a rally hit is a rally hit — not a fright, not a
+        // frolic, not a travel intent. Facing follows the ball; the rally
+        // clock re-stamps; only a REAL jump breaks the spell and falls
+        // through to the ordinary sensors.
+        if self.tennis {
+            if dc.abs() >= POUNCE_JUMP {
+                self.tennis = false;
+            } else {
+                self.tennis_last = self.clock;
+                if dc.abs() > 0.0 {
+                    self.facing_left = dc < 0.0;
+                }
+                return;
+            }
+        }
 
         // BREED HANDOFF (wave 2): any real caret move — jump OR retreat, a
         // fright is work too — cancels a walk-out in progress. Checked
@@ -2551,7 +3347,19 @@ impl PetBrain {
 
         if self.reversals >= FROLIC_REVERSALS && self.action != PetAction::Frolic {
             self.reversals = 0;
-            self.set_action(PetAction::Frolic);
+            // Fool me twice (wave 4): a SECOND frolic earned within
+            // TENNIS_AFTER of the last one means the rally is not stopping —
+            // the cat gives up participating, sits down and WATCHES, facing
+            // ping-ponging with every hit until the rally lapses.
+            if (self.clock - self.last_frolic) as f32 <= TENNIS_AFTER {
+                self.tennis = true;
+                self.tennis_last = self.clock;
+                self.sit_front = true;
+                self.set_action(PetAction::Sit);
+            } else {
+                self.last_frolic = self.clock;
+                self.set_action(PetAction::Frolic);
+            }
             return;
         }
 
@@ -2573,10 +3381,21 @@ impl PetBrain {
             // The caret is work, the pointer is play: a travel latch CLEARS
             // every pending play intent (wave 2) — the un-launched play
             // crouch re-aims at the station, and a play flight already in
-            // the air lands into work instead of the flourish.
+            // the air lands into work instead of the flourish. The wave-3
+            // games end the same way: chase dropped mid-stride (a short
+            // cooldown so typing truly ends it), stakeout stood down, the
+            // far look and the owed groom forgotten — work first.
             self.pending_pointer_pounce = None;
             self.play_to = None;
             self.play_land = None;
+            self.pursuit_t = None;
+            self.pursuit_cool = self.pursuit_cool.max(1.0);
+            self.stakeout = false;
+            self.pending_look = None;
+            self.look_at = None;
+            self.groom_owed = false;
+            self.hide_to = None;
+            self.hiding = false;
             // The SCREEN-CROSSING latch, two of its three doors: (a) one move
             // covering max(BIG_JUMP_COLS, BIG_JUMP_COLS_FRAC·cols) is a jump
             // across the screen whatever the resulting gap; (c) a settled cat
@@ -3025,6 +3844,13 @@ impl PetBrain {
         self.swipe = false;
         self.pending_bat = None;
         self.bat_at = None;
+        // The wave-3 games drop with the rest of play (no cooldown owed:
+        // a hidden or reduced pet was not beaten by the toy).
+        self.pursuit_t = None;
+        self.stakeout = false;
+        self.pending_look = None;
+        self.look_at = None;
+        self.groom_owed = false;
     }
 
     /// THE WORD-CAT BAT (wave 2): consume a noted peek, on the ground —
@@ -3094,8 +3920,7 @@ impl PetBrain {
         }
         // Land CENTERED on the toy: the aim is a pointer cell, the pet's
         // `col` is its left edge.
-        let to_col =
-            (ac - width * 0.5).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+        let to_col = (ac - width * 0.5).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
         let to_row = ar.clamp(0.0, f32::from(sense.rows.saturating_sub(1)));
         self.play_to = Some((to_col, to_row));
         self.play_land = Some(PlayLand::PointerFrolic);
@@ -3209,7 +4034,7 @@ impl PetBrain {
         // out-of-bounds surface to the one array whose bound is the loop.
         for (i, slot) in out.iter_mut().enumerate() {
             let Some(m) = self.motes[i] else { continue };
-            let u = (clock - m.born) / m.life.max(0.01);
+            let u = ((clock - m.born) as f32) / m.life.max(0.01);
             if !(0.0..1.0).contains(&u) {
                 self.motes[i] = None;
                 continue;
@@ -3333,7 +4158,8 @@ impl PetBrain {
                 PetGlyphId::PetSleep0
             }
             PetAction::Sleep => {
-                let s = (TAU * self.clock / BREATH_PERIOD).sin();
+                let t = (self.clock % f64::from(BREATH_PERIOD)) as f32;
+                let s = (TAU * t / BREATH_PERIOD).sin();
                 scale_y += s * BREATH_DEPTH;
                 scale_x -= s * BREATH_DEPTH * 0.5;
                 if s >= 0.0 {
@@ -3376,6 +4202,21 @@ impl PetBrain {
                     PetGlyphId::PetSit
                 }
             }
+            PetAction::Loaf if self.wriggle_t > 0.0 => {
+                // THE WRIGGLE (wave 4b): rolling around on its back — the
+                // sleep and loaf silhouettes flip-flop on the beat, the
+                // facing swaps with them, and the belly bobs. The roll is
+                // faked from authored frames; a true roll cycle is rig work,
+                // queued for the art pipeline.
+                let beat = ((WRIGGLE_DUR - self.wriggle_t) / WRIGGLE_BEAT) as u32;
+                let u = (WRIGGLE_DUR - self.wriggle_t) * 9.0;
+                scale_y *= 1.0 + 0.06 * u.sin();
+                if beat.is_multiple_of(2) {
+                    PetGlyphId::PetSleep0
+                } else {
+                    PetGlyphId::PetLoaf
+                }
+            }
             PetAction::Loaf => {
                 // The melt: the loaf's first beats ease down from the sit's
                 // height, through the same envelope plumbing as every other
@@ -3403,7 +4244,8 @@ impl PetBrain {
             PetAction::Purr => {
                 // A purr entered straight off the fold eases in the same way.
                 let fold = (1.0 - (self.quiet - SIT_AFTER) / SIT_FOLD).clamp(0.0, 1.0);
-                let s = (TAU * PURR_HZ * self.clock).sin();
+                let t = (self.clock % f64::from(1.0 / PURR_HZ)) as f32;
+                let s = (TAU * PURR_HZ * t).sin();
                 scale_y += s * PURR_DEPTH - 0.05 * fold;
                 scale_x += 0.03 * fold - s * PURR_DEPTH * 0.6;
                 PetGlyphId::PetPurr
@@ -3526,6 +4368,23 @@ impl PetBrain {
             scale_y *= 1.0 - q;
             scale_x *= 1.0 + q * 0.6;
         }
+        // THE SCRAMBLE's slipping paw (wave 4): one squashed beat over the
+        // gallop (or the drift-brake's plant), same envelope family as the
+        // flinch.
+        if self.stumble_t > 0.0 {
+            let q = 0.18 * (self.stumble_t / STUMBLE_DUR).clamp(0.0, 1.0);
+            scale_y *= 1.0 - q;
+            scale_x *= 1.0 + q * 0.7;
+        }
+        // THE SKIP (wave 4): a content walk bobs one stride in four — the
+        // bob rides the stride phase (pure function of ground covered, the
+        // gait's own clock), so it lands on the same paws every cycle.
+        if self.action == PetAction::Walk && self.content >= SKIP_CONTENT {
+            let whole = self.stride.rem_euclid(4.0);
+            if whole < 1.0 {
+                lift += 0.07 * (whole * core::f32::consts::PI).sin().max(0.0);
+            }
+        }
 
         // IDLE MICRO-LIFE (wave 2): the ear-twitch stand-in — a 2% head-
         // scale bob over the settled pose (the flinch envelope's precedent),
@@ -3547,6 +4406,7 @@ impl PetBrain {
             scale_x,
             scale_y,
             purr,
+            under_ink: self.hiding,
             motes: self.resolve_motes(),
         }
     }
@@ -3662,12 +4522,15 @@ impl PetBrain {
         {
             return true;
         }
-        // The wave-2 watch: live heat needs ticks to hold the perk and to
-        // decay back to zero — but a SPENT watch is a parked sitter under a
-        // stream whose own redraws do any remaining bookkeeping, so it must
-        // not pin the lane (the [`WATCH_MAX`] cap is what makes an unbounded
-        // stream cost a bounded stare).
-        if self.watch_heat > 0.0 && !self.watch_spent {
+        // The wave-2 watch: live heat needs ticks to hold the perk AND to
+        // decay back to zero — spent or not (codex review, 2026-08-10): a
+        // spent watch that released the lane with heat still above the gate
+        // could never decay under it, so `watch_spent` never re-armed and no
+        // LATER stream was ever watched again. Keeping the lane for the
+        // decay is bounded by construction: heat ≤ 1.0 falls at
+        // [`WATCH_FALL`]/s once the stream ends — under a second of ticks —
+        // and during the stream its own redraws pay for the bookkeeping.
+        if self.watch_heat > 0.0 {
             return true;
         }
         // The wave-2 play envelopes: live pointer attention decays to zero
@@ -3679,6 +4542,23 @@ impl PetBrain {
             || self.play_to.is_some()
             || self.play_land.is_some()
             || self.pending_bat.is_some()
+            // The wave-3 games: a live chase runs, a stakeout holds a pose
+            // that must re-check its toy, a latched look and an owed groom
+            // wait for the ground — all finite (stamina, heat decay, TTL,
+            // one hold each).
+            || self.pursuit_t.is_some()
+            || self.stakeout
+            || self.pending_look.is_some()
+            || self.groom_owed
+            // The wave-4 envelopes: a rally watch must tick to lapse, a
+            // stumble to un-squash, a brake to trot home, a wriggle to roll
+            // out — all finite.
+            || self.tennis
+            || self.stumble_t > 0.0
+            || self.braking
+            || self.wriggle_t > 0.0
+            || self.hide_to.is_some()
+            || self.hiding
         {
             return true;
         }
@@ -4344,6 +5224,7 @@ mod tests {
             scale_x: 1.0,
             scale_y: 1.0,
             purr: 0.0,
+            under_ink: false,
             motes: [None; PET_MOTES_MAX],
         };
         for _ in 0..80 {
@@ -5244,7 +6125,11 @@ mod tests {
         let mut pet = PetBrain::default();
         // A fresh pet materializes asleep; let the fade complete.
         let (mut t, f) = idle(&mut pet, start, (4, 10), 1.0);
-        assert_eq!(f.action, PetAction::Sleep, "fixture: an untouched window naps");
+        assert_eq!(
+            f.action,
+            PetAction::Sleep,
+            "fixture: an untouched window naps"
+        );
         pet.note_bell(t);
         t += Duration::from_millis(16);
         let f = pet.tick(sense(t, Some((4, 10))));
@@ -5421,10 +6306,7 @@ mod tests {
                     PetGlyphId::PetLoaf,
                     "the droop borrows the loaf until the flat-ears frame lands"
                 );
-                assert!(
-                    f.motes.iter().all(Option::is_none),
-                    "grief floats NOTHING"
-                );
+                assert!(f.motes.iter().all(Option::is_none), "grief floats NOTHING");
             }
         }
         assert!(saw_droop, "a failure must droop");
@@ -5626,7 +6508,10 @@ mod tests {
         }
         assert!(landed, "fixture: the pounce must land");
         assert!(!purr_mid_air, "a pet mid-flight waits for the ground");
-        assert!(purr_after_land, "and is honored on landing (inside its TTL)");
+        assert!(
+            purr_after_land,
+            "and is honored on landing (inside its TTL)"
+        );
     }
 
     #[test]
@@ -5806,6 +6691,10 @@ mod tests {
         let t = awake(&mut pet, start, 4, 12);
         let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.3);
         // A word-cat head lands 7 columns away, same row: a toy in reach.
+        // An EVEN serial deals the SWIPE (wave 3's greet parity — the odd
+        // half of the visits playbow instead; see
+        // `near_peek_alternates_swipe_and_greeting`).
+        pet.mote_serial = 0;
         pet.note_peek(t, 22.0, 4.0);
         assert!(pet.pending_bat.is_some(), "in range: the bat latches");
         let (mut crouched, mut leapt, mut swiped, mut dusted) = (false, false, false, false);
@@ -5849,7 +6738,10 @@ mod tests {
         let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.3);
         // 40 columns away: scenery, not a toy — the note never latches.
         pet.note_peek(t, 55.0, 4.0);
-        assert!(pet.pending_bat.is_none(), "a far peek is ignored at note time");
+        assert!(
+            pet.pending_bat.is_none(),
+            "a far peek is ignored at note time"
+        );
         for _ in 0..80 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some((4, 14))));
@@ -5903,9 +6795,7 @@ mod tests {
             if f.action == PetAction::Land && first_land.is_none() {
                 first_land = Some(f.col);
             }
-            if f.action == PetAction::Frolic
-                && f.pose == PetGlyphId::PetBat
-                && first_land.is_some()
+            if f.action == PetAction::Frolic && f.pose == PetGlyphId::PetBat && first_land.is_some()
             {
                 swiped_after_land = true;
             }
@@ -6188,7 +7078,11 @@ mod tests {
         let mut pet = PetBrain::default();
         let t = awake(&mut pet, start, 4, 12);
         let (mut t, f) = idle(&mut pet, t, (4, 14), 0.1);
-        assert_eq!(f.pose, PetGlyphId::PetSitFront, "fixture: eye contact at rest");
+        assert_eq!(
+            f.pose,
+            PetGlyphId::PetSitFront,
+            "fixture: eye contact at rest"
+        );
         // The pointer wanders on the pet's RIGHT (behind the leftward gaze),
         // fast enough to matter: ~12 cells/s of gentle circling.
         let mut px = 40.0f32;
@@ -6274,7 +7168,10 @@ mod tests {
         let (t, leapt, _) = dash(&mut pet, t, (4, 44), 90.0, 20.0);
         assert!(leapt, "fixture: the pounce fired");
         // The toy stops; the flourish plays; the chase ladder walks home.
-        let (_, f) = idle(&mut pet, t, (4, 44), 6.0);
+        // Sampled BEFORE boredom's window opens (wave 4b: a content cat at
+        // BORED_AFTER of quiet starts demanding attention from the cursor,
+        // which is its own pin below).
+        let (t, f) = idle(&mut pet, t, (4, 44), 3.5);
         let w = art_cols(10, 20);
         let station = PetBrain::station(44, 100, w);
         assert!(
@@ -6283,6 +7180,19 @@ mod tests {
             f.col
         );
         assert!(f.action.settled(), "and settled, got {:?}", f.action);
+        // And then boredom: the same content cat, left alone long enough,
+        // turns on the cursor — a bat, an attack, or the wriggle (the
+        // serial deals it). The vignette is finite and re-settles.
+        let mut t = t;
+        let mut acted = false;
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 44))));
+            acted |= matches!(f.action, PetAction::Frolic | PetAction::Loaf)
+                || pet.wriggle_t > 0.0;
+        }
+        assert!(acted, "a bored content cat demands attention");
+        assert!(pet.bored_cool > 0.0, "and pays the cooldown for it");
     }
 
     #[test]
@@ -6295,7 +7205,11 @@ mod tests {
         pet.pending_pointer_pounce = Some((60.0, 4.0));
         t += Duration::from_millis(16);
         let f = ptick(&mut pet, t, (4, 44), Some((60.0, 4.0)));
-        assert_eq!(f.action, PetAction::Crouch, "fixture: the play crouch began");
+        assert_eq!(
+            f.action,
+            PetAction::Crouch,
+            "fixture: the play crouch began"
+        );
         // ...interrupted by REAL work: a word jump mid-play.
         let mut frolicked = false;
         for _ in 0..250 {
@@ -6515,6 +7429,225 @@ mod tests {
         );
     }
 
+    /// THE OWNER'S REPORT, 2026-08-10: "the cursor kitty gets pushed around
+    /// in the text when editing in the middle of the text."
+    ///
+    /// The mechanism, isolated: the caret does not move at all, and only the
+    /// row's ink END grows — which is exactly what inserting a character
+    /// mid-sentence does to every column to its right. Under the old law the
+    /// station WAS `end + INK_GAP`, so the cat was towed a full cell right per
+    /// keystroke by text it was nowhere near. The ladder's rule 3 seats it
+    /// beside the caret on the blank row below instead, and a growing end is
+    /// then none of its business.
+    #[test]
+    fn a_growing_line_never_tows_the_cat_along_behind_it() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 4, 12);
+        // Row 4 is a sentence; the rows around it are blank, as they are at
+        // any prompt you are editing.
+        let mut spans = vec![(0u16, 0u16); 8];
+        spans[4] = (0, 30);
+        pet.sense_ink(0, &spans, Some(4));
+        let (t2, settled) = idle(&mut pet, t, (4, 12), 1.2);
+        t = t2;
+        assert!(
+            settled.col < 20.0,
+            "the cat stations beside the CARET, not past the end of the line \
+             (col {}, line ends at 30)",
+            settled.col
+        );
+        assert!(
+            (settled.row - 5.0).abs() < 0.01,
+            "and it takes the blank row under the sentence, got row {}",
+            settled.row
+        );
+
+        // Now insert three characters ahead of the caret: the end marches,
+        // the caret does not.
+        let anchor = settled.col;
+        for end in [31u16, 32, 33] {
+            spans[4] = (0, end);
+            pet.sense_ink(0, &spans, Some(4));
+            let (t3, f) = idle(&mut pet, t, (4, 12), 0.5);
+            t = t3;
+            assert!(
+                (f.col - anchor).abs() < 0.5,
+                "a longer line must not move a cat whose caret stood still \
+                 (col {} vs {anchor} when the line reached {end})",
+                f.col
+            );
+        }
+    }
+
+    /// The ladder's rule 4 is still there: with the neighbouring rows inked
+    /// too — a screen full of text — there is no blank row to step down to,
+    /// and standing beside the paragraph really is the best ground on offer.
+    /// This is the clause `event_pose_retargets_off_ink` and
+    /// `the_sleeper_follows_the_prompt` exercise from the pose side; here it
+    /// is read straight off the ladder so the ORDER of the two rules is
+    /// pinned, not just their endpoints.
+    #[test]
+    fn the_ink_ladder_prefers_a_blank_row_to_a_distant_stand() {
+        let mut pet = PetBrain::default();
+        let w = art_cols(10, 20);
+        let mut spans = vec![(0u16, 0u16); 8];
+        spans[4] = (0, 30);
+        pet.sense_ink(0, &spans, Some(4));
+        // Rule 3: one row down, same column.
+        assert_eq!(
+            pet.ink_stand(13.0, 4.0, w, 100, 30),
+            (13.0, 5.0),
+            "a blank row below beats a stand 17 cells away"
+        );
+        // Rule 2 is still ahead of it: ink that ends just past the want is a
+        // step aside, not a reason to change rows.
+        spans[4] = (0, 14);
+        pet.sense_ink(0, &spans, Some(4));
+        assert_eq!(
+            pet.ink_stand(13.0, 4.0, w, 100, 30),
+            (14.0 + INK_GAP, 4.0),
+            "a near stand is cheaper than a row change"
+        );
+        // Rule 4: every row inked, so there is nowhere to step down to.
+        let spans = vec![(0u16, 30u16); 8];
+        pet.sense_ink(0, &spans, Some(4));
+        assert_eq!(
+            pet.ink_stand(13.0, 4.0, w, 100, 30),
+            (30.0 + INK_GAP, 4.0),
+            "a full screen still evicts beside the paragraph"
+        );
+        // Rule 1 is untouched by all of it.
+        assert_eq!(
+            pet.ink_stand(40.0, 4.0, w, 100, 30),
+            (40.0, 4.0),
+            "blank ground under the want is answered first and alone"
+        );
+    }
+
+    /// A line WRAP is one character. Read literally off the grid it is the
+    /// biggest move a caret can make, and it used to clear both the pounce
+    /// bar and the screen-crossing bar — so typing past the right margin, or
+    /// backspacing over the seam, fired a gather-and-bound every time.
+    #[test]
+    fn a_wrap_is_one_character_not_a_screen_crossing_jump() {
+        // Forward: the caret falls off the right margin onto the next row.
+        assert_eq!(
+            PetBrain::caret_delta((5, 99), (6, 0), 100),
+            (0.0, 1.0),
+            "typing past the margin moved the text on by one"
+        );
+        // Backward over the same seam — and the row folds to zero, which is
+        // what hands it to the retreat arm instead of the jump ladder.
+        assert_eq!(
+            PetBrain::caret_delta((6, 0), (5, 99), 100),
+            (0.0, -1.0),
+            "backspacing over the seam deleted one"
+        );
+        // A double-width glyph wraps from cols - 2; WRAP_SLOP covers it.
+        assert_eq!(PetBrain::caret_delta((5, 98), (6, 0), 100), (0.0, 2.0));
+        // NEGATIVE CONTROLS — everything else keeps its literal delta.
+        assert_eq!(
+            PetBrain::caret_delta((10, 5), (2, 70), 100),
+            (-8.0, 65.0),
+            "a real row jump is not a seam"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((5, 2), (6, 70), 100),
+            (1.0, 68.0),
+            "down AND right is not a wrap in either direction"
+        );
+        assert_eq!(
+            PetBrain::caret_delta((5, 16), (6, 1), 20),
+            (1.0, -15.0),
+            "a 15-cell move in a 20-wide pane is a jump, not a seam"
+        );
+    }
+
+    /// The same seam, driven through the whole brain: a wrap must not launch
+    /// the screen-crossing show.
+    #[test]
+    fn typing_past_the_margin_does_not_launch_a_bound() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = type_run(&mut pet, start, 5, 95, 4, 0.05).0;
+        // …and the next keystroke wraps.
+        t += Duration::from_millis(50);
+        let f = pet.tick(sense(t, Some((6, 0))));
+        assert!(
+            !pet.pending_big_jump && !pet.pending_pounce,
+            "a wrap latched travel: big={} pounce={}",
+            pet.pending_big_jump,
+            pet.pending_pounce
+        );
+        assert_ne!(f.action, PetAction::Crouch, "and nothing gathered to leap");
+    }
+
+    /// A caret that blinks out for ONE frame — a scrollback scroll, a DECTCEM
+    /// hide — used to teleport a fully-drawn cat: the no-caret arm forgets
+    /// `last_caret`, and the first-sighting seed then hard-assigned position
+    /// with no regard for whether the pet was still on the glass. Measured on
+    /// the real brain: `(col 31.30, row 20) → (col 4.00, row 8)` between two
+    /// frames, at alpha 241/255.
+    #[test]
+    fn a_one_frame_caret_hide_never_teleports_a_visible_cat() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 20, 60);
+        let (t2, before) = idle(&mut pet, t, (20, 60), 0.5);
+        t = t2;
+        assert!(before.alpha > 200, "fixture: a cat plainly on the glass");
+
+        // One frame with the cursor hidden…
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, None));
+        // …and it comes back somewhere else entirely.
+        t += Duration::from_millis(16);
+        let after = pet.tick(sense(t, Some((8, 4))));
+        assert!(
+            after.alpha > 150,
+            "one hidden frame must not erase the cat (alpha {})",
+            after.alpha
+        );
+        assert!(
+            (after.col - before.col).abs() < 1.0 && (after.row - before.row).abs() < 1.0,
+            "a cat the eye can still see has to travel, not blink: \
+             ({}, {}) → ({}, {})",
+            before.col,
+            before.row,
+            after.col,
+            after.row
+        );
+    }
+
+    /// The step aside is a little follower, not a cut — but only while it IS
+    /// a step aside. The F1 re-anchor (a pose left behind by output, re-staged
+    /// where the caret now is) still lands outright, because sliding a
+    /// grounded pose across the screen on its belly is a worse lie than the
+    /// cut it replaced.
+    #[test]
+    fn a_step_aside_glides_and_a_re_anchor_lands() {
+        let dt = 1.0 / 60.0;
+        let step = INK_EVICT_SPEED * dt;
+        let mid = PetBrain::evict_toward(10.0, 13.0, dt);
+        assert!(
+            (mid - (10.0 + step)).abs() < 1e-4,
+            "a 3-cell sidestep is rationed, got {mid}"
+        );
+        assert!(
+            (PetBrain::evict_toward(10.0, 10.05, dt) - 10.05).abs() < 1e-6,
+            "and never overshoots the last fraction of a cell"
+        );
+        assert!(
+            (PetBrain::evict_toward(10.0, 40.0, dt) - 40.0).abs() < 1e-6,
+            "a re-anchor past INK_EVICT_MAX lands in one frame"
+        );
+        assert!(
+            (PetBrain::evict_toward(40.0, 10.0, dt) - 10.0).abs() < 1e-6,
+            "in either direction"
+        );
+    }
+
     /// F4a: the grief window. From the failure's note to the end of the
     /// droop the brain reports `grieving()`, and no celebratory mote ever
     /// shares the glass with it — the host reads the window to hush the
@@ -6693,11 +7826,15 @@ mod tests {
              (right {rightward:?}, left {leftward:?})"
         );
         assert!(
-            rightward.iter().all(|&(p, face)| p == PetGlyphId::PetCrouch && !face),
+            rightward
+                .iter()
+                .all(|&(p, face)| p == PetGlyphId::PetCrouch && !face),
             "rightward touch: the coil, facing right — got {rightward:?}"
         );
         assert!(
-            leftward.iter().all(|&(p, face)| p == PetGlyphId::PetCrouch && face),
+            leftward
+                .iter()
+                .all(|&(p, face)| p == PetGlyphId::PetCrouch && face),
             "leftward touch: the SAME coil, mirrored — got {leftward:?}"
         );
     }
@@ -6801,5 +7938,330 @@ mod tests {
                 assert_eq!(a.fp(), b.fp(), "empty map ⇒ identical frames");
             }
         }
+    }
+
+    // ── wave 3: the chase, the stakeout, and the word-cat tiers ────────────
+
+    /// A toy teasing at under-dash speed earns a RUNNING chase: the pet
+    /// leaves its station on paws (never the flight doors), closes on the
+    /// pointer, and — when the toy never lets itself be caught — breaks off
+    /// at stamina, owes the groom of dignity, and walks home.
+    #[test]
+    fn tease_earns_a_running_chase_then_dignity() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        // The toy circles ~12 cols right of the pet: amplitude 8, ~2.5 rad/s
+        // — mean speed well inside [PURSUIT_MIN_SPEED, DASH_SPEED).
+        let base = pet.col + 12.0;
+        let mut chased = false;
+        let mut ran = false;
+        let mut phase = 0.0f32;
+        for _ in 0..700 {
+            t += Duration::from_millis(16);
+            phase += 0.04;
+            let px = base + 8.0 * phase.sin();
+            let f = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
+            if pet.pursuit_t.is_some() {
+                chased = true;
+                if matches!(f.action, PetAction::Walk | PetAction::Run) {
+                    ran = true;
+                }
+                assert!(
+                    pet.flight.is_none(),
+                    "a chase runs on paws: the standing-gap doors stay shut"
+                );
+            }
+        }
+        assert!(chased, "the tease must bait a chase");
+        assert!(ran, "and the chase must actually run");
+        // 700 ticks = 11.2 s of toy time: stamina (5 s) has broken the chase
+        // even if the stakeout phase ate the opening seconds.
+        assert!(pet.pursuit_t.is_none(), "stamina breaks the chase off");
+        assert!(
+            pet.pursuit_cool > 0.0,
+            "and the cooldown guards the pet's dignity"
+        );
+        // The groom lands on the next arrival (or already played): run the
+        // toy away and let the pet come home.
+        let mut groomed = pet.action == PetAction::Groom;
+        for _ in 0..500 {
+            t += Duration::from_millis(16);
+            let f = ptick(&mut pet, t, (4, 44), None);
+            groomed |= f.action == PetAction::Groom;
+        }
+        assert!(groomed, "the break-off owes the groom of dignity");
+        assert!(!pet.groom_owed, "and the debt is paid, not pinned");
+    }
+
+    /// THE HOME-BASE LAW: one keystroke ends the game mid-stride. The chase
+    /// drops, a fresh chase is cooldown-blocked while typing is recent, and
+    /// the pet answers the caret.
+    #[test]
+    fn typing_aborts_the_chase_instantly() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        let base = pet.col + 12.0;
+        let mut phase = 0.0f32;
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            phase += 0.04;
+            let px = base + 8.0 * phase.sin();
+            let _ = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
+            if pet.pursuit_t.is_some() {
+                break;
+            }
+        }
+        assert!(pet.pursuit_t.is_some(), "fixture: the chase is live");
+        // The caret moves: work reclaims the cat this very tick.
+        t += Duration::from_millis(16);
+        let _ = ptick(&mut pet, t, (4, 52), Some((base, 4.0)));
+        assert!(pet.pursuit_t.is_none(), "typing ends the game instantly");
+        // And the toy cannot re-bait while the keyboard is warm: quiet is
+        // under PURSUIT_QUIET for the next second whatever the pointer does.
+        for _ in 0..30 {
+            t += Duration::from_millis(16);
+            phase += 0.04;
+            let px = base + 8.0 * phase.sin();
+            let _ = ptick(&mut pet, t, (4, 52), Some((px, 4.0)));
+            assert!(
+                pet.pursuit_t.is_none(),
+                "the chase stays down while typing is recent"
+            );
+        }
+    }
+
+    /// A CREEPING toy nearby pins the hunting crouch — the stakeout — and a
+    /// vanished toy stands the cat back down, never launching the coil.
+    #[test]
+    fn creeping_toy_pins_the_stakeout() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        // Creep at ~3 cells/s, 8 cols away: enough heat to matter, far too
+        // slow for the chase or the dash.
+        let mut px = pet.col + 8.0;
+        let mut staked = false;
+        for k in 0..300 {
+            t += Duration::from_millis(16);
+            px += if k % 40 < 20 { 0.05 } else { -0.05 };
+            let f = ptick(&mut pet, t, (4, 44), Some((px, 4.0)));
+            if pet.stakeout {
+                staked = true;
+                assert_eq!(
+                    f.action,
+                    PetAction::Crouch,
+                    "the stakeout is the hunting crouch"
+                );
+            }
+        }
+        assert!(staked, "a creeping toy must pin the stakeout");
+        // The toy vanishes: the cat stands down — no coil, no launch.
+        t += Duration::from_millis(16);
+        let f = ptick(&mut pet, t, (4, 44), None);
+        assert!(!pet.stakeout, "no toy, no stakeout");
+        assert_ne!(f.action, PetAction::Leap, "and never a phantom launch");
+    }
+
+    /// THE LOOK TIER: a peek beyond bat reach but inside LOOK_RANGE earns a
+    /// perk and a turned face — never a trip.
+    #[test]
+    fn far_peek_gets_a_look_not_a_trip() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 12);
+        let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.4);
+        let col0 = pet.col;
+        // 15 column-equivalents to the right: past BAT_RANGE, inside LOOK.
+        pet.note_peek(t, col0 + 15.0, 4.0);
+        assert!(pet.pending_bat.is_none(), "out of paw reach: no visit");
+        assert!(pet.pending_look.is_some(), "but well worth a look");
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((4, 14))));
+        assert_eq!(f.action, PetAction::Perk, "the look is the double-take");
+        assert!(!pet.facing_left, "faced toward the peek");
+        assert!(
+            (pet.col - col0).abs() < 0.5,
+            "and the paws never left the station"
+        );
+    }
+
+    /// NEAR-visit variety: the serial parity dealt at note time alternates
+    /// the swipe and the playbow greeting.
+    #[test]
+    fn near_peek_alternates_swipe_and_greeting() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 12);
+        let (t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.4);
+        pet.mote_serial = 0; // even: the swipe
+        pet.note_peek(t, pet.col + 4.0, 4.0);
+        assert!(!pet.bat_greet, "even serial swipes");
+        pet.pending_bat = None;
+        pet.mote_serial = 1; // odd: the greeting
+        pet.note_peek(t, pet.col + 4.0, 4.0);
+        assert!(pet.bat_greet, "odd serial greets with the playbow");
+    }
+
+    /// Codex review, 2026-08-10: non-finite coordinates never reach the
+    /// pose state — a NaN pointer is no pointer, a NaN peek never latches.
+    #[test]
+    fn non_finite_inputs_never_poison_the_pose() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 12);
+        let (mut t, _) = idle(&mut pet, t, (4, 14), 0.5);
+        pet.note_peek(t, f32::NAN, 4.0);
+        assert!(pet.pending_bat.is_none() && pet.pending_look.is_none());
+        for _ in 0..20 {
+            t += Duration::from_millis(16);
+            let f = ptick(&mut pet, t, (4, 14), Some((f32::NAN, f32::INFINITY)));
+            assert!(f.col.is_finite(), "the pose stays finite");
+        }
+        assert_eq!(pet.pointer_heat, 0.0, "a NaN pointer is no pointer");
+        pet.set_body_left_px(f32::NAN);
+        assert!(pet.body_left_px.is_finite());
+    }
+
+    /// THE TENNIS WATCH (wave 4): a rally that outlives the frolic sits the
+    /// cat down to watch — facing ping-pongs with the caret — and the rally
+    /// lapsing stands it back down.
+    #[test]
+    fn a_long_rally_earns_the_tennis_watch() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        // Rally: the caret ping-pongs 3 columns either side, every 150 ms.
+        let (mut col, mut right) = (44i32, true);
+        let mut watched = false;
+        let (mut faced_left, mut faced_right) = (false, false);
+        for _ in 0..60 {
+            t += Duration::from_millis(150);
+            right = !right;
+            col += if right { 3 } else { -3 };
+            let f = pet.tick(sense(t, Some((4, col as u16))));
+            if pet.tennis {
+                watched = true;
+                assert_eq!(f.action, PetAction::Sit, "the watch sits");
+                faced_left |= pet.facing_left;
+                faced_right |= !pet.facing_left;
+            }
+        }
+        assert!(watched, "a sustained rally must earn the watch");
+        assert!(
+            faced_left && faced_right,
+            "and the facing follows the ball both ways"
+        );
+        // The rally ends: the watch lapses back into the ordinary settle.
+        let (_, _) = idle(&mut pet, t, (4, col as u16), TENNIS_LAPSE + 0.5);
+        assert!(!pet.tennis, "the rally over, the watch stands down");
+    }
+
+    /// THE DRIFT-BRAKE (wave 4): a long gallop overshoots its station on
+    /// purpose and trots back; the follower still ends AT the station.
+    #[test]
+    fn a_long_gallop_overshoots_then_trots_back() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        let from = pet.col;
+        // One big caret jump far to the right of a warmed cat: the chase
+        // leg is long and fast enough to earn the brake — but under the
+        // big-jump door, so it stays a run.
+        let target_col = 84u16;
+        let mut overshot = false;
+        let mut max_col = from;
+        for _ in 0..600 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((4, target_col))));
+            max_col = max_col.max(pet.col);
+            if pet.braking {
+                overshot = true;
+            }
+        }
+        let station = PetBrain::station(target_col, 100, art_cols(10, 20));
+        // The brake is content- and distance-gated; when it fires the paws
+        // must still come to rest at the station.
+        if overshot {
+            assert!(
+                max_col > station + 0.5,
+                "the brake means actually blowing past the station"
+            );
+        }
+        assert!(
+            (pet.col - station).abs() <= ARRIVED + 0.6,
+            "however the leg ended, home is home (got {} want {station})",
+            pet.col
+        );
+    }
+
+    /// HIDE-BEHIND-WORDS (wave 4c): a bored cat with a word in reach ducks
+    /// behind it — drawn UNDER the glyphs while it lurks — then strolls
+    /// home and surfaces.
+    #[test]
+    fn a_bored_cat_hides_behind_a_word_and_comes_back() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = warm_settled(&mut pet, start);
+        // A word on the pet's row, a few columns left of its station.
+        let mut spans = [(0u16, 0u16); 12];
+        let word_row = pet.row as usize;
+        spans[word_row] = (34, 42);
+        let mut hid = false;
+        let mut under = false;
+        for _ in 0..900 {
+            t += Duration::from_millis(16);
+            pet.sense_ink(0, &spans, None);
+            if !pet.hiding && pet.hide_to.is_none() {
+                // Pin the deal against serial drift (twitches and motes
+                // advance it between here and boredom's window opening), and
+                // keep the cat CONTENT: boredom is an energetic state — the
+                // content gate means a cold idle drains into sleep instead,
+                // so the fixture stands in for the play that would normally
+                // precede a bored window.
+                pet.mote_serial = 3;
+                pet.content = pet.content.max(0.9);
+            }
+            let f = pet.tick(sense(t, Some((4, 44))));
+            if pet.hiding {
+                hid = true;
+                under |= f.under_ink;
+            }
+        }
+        assert!(hid, "the deal must send the cat behind the word");
+        assert!(under, "and back there it draws UNDER the glyphs");
+        assert!(!pet.hiding, "the dwell ends the lurk");
+        // Home again, over the ink like always.
+        let (_, f) = idle(&mut pet, t, (4, 44), 2.0);
+        assert!(!f.under_ink, "surfaced on the walk home");
+    }
+
+    /// Codex review, 2026-08-10: a spent watch must still get the ticks to
+    /// decay its heat under the gate, or no LATER stream is ever watched.
+    #[test]
+    fn a_spent_watch_rearms_once_the_stream_ends() {
+        let mut pet = PetBrain {
+            watch_heat: 1.0,
+            watch_spent: true,
+            alpha: 1.0,
+            ..PetBrain::default()
+        };
+        assert!(
+            pet.needs_frames(),
+            "live heat keeps the lane so the decay can run"
+        );
+        let start = Instant::now();
+        let mut t = start;
+        let _ = pet.tick(sense(t, Some((4, 14))));
+        for _ in 0..80 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((4, 14))));
+        }
+        assert!(
+            pet.watch_heat < WATCH_GATE,
+            "the heat decayed under the gate"
+        );
+        assert!(!pet.watch_spent, "and the next stream earns a fresh stare");
     }
 }

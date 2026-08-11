@@ -7,12 +7,86 @@
 //! var so the existing env > config > default precedence funnel is reused.
 
 /// Parsed CLI: the `-e` command to run instead of `$SHELL` (if any), the
-/// `--working-directory` to start it in (if any), and whether to `--hold` the
-/// window open after the command exits.
+/// `--working-directory` to start it in (if any), whether to `--hold` the
+/// window open after the command exits, and whether `--headless` was passed.
 pub(crate) struct Cli {
     pub(crate) exec_command: Option<Vec<String>>,
     pub(crate) cwd: Option<String>,
     pub(crate) hold: bool,
+    /// `--headless` appeared on the command line. The flag ALSO sets
+    /// `$ATERM_HEADLESS=1` (the shared funnel every other knob uses), so this
+    /// field is not what arms the mode — it only records the SOURCE, so the
+    /// startup announcement can name the flag rather than the environment.
+    pub(crate) headless: bool,
+}
+
+/// Whether this launch runs headless, and — because a misread of this decision
+/// costs a full misdiagnosis (a harness that hangs on a socket that never
+/// appears) — WHY, in words the startup announcement can print.
+///
+/// Headless has exactly ONE meaning and TWO equivalent ways to ask for it: the
+/// `--headless` flag and `$ATERM_HEADLESS`. The flag is the canonical spelling
+/// and simply sets the env var ([`flag_env`]), so both arrive at the single read
+/// site in `main` through the same funnel every other `ATERM_*` knob uses.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeadlessArming {
+    /// No window is ever created: engine + PTY + control socket only.
+    /// The payload names the source for the stderr announcement.
+    Armed(HeadlessSource),
+    /// Windowed, and nothing asked otherwise — the ordinary interactive launch.
+    Windowed,
+    /// `$ATERM_HEADLESS` is SET, but to a DISABLING value (`0`, `off`, or
+    /// empty), and no `--headless` flag came with it. The launch is windowed.
+    ///
+    /// This case exists to be LOUD. A script that exports the variable and then
+    /// waits for a control socket is one typo away from waiting forever, so the
+    /// binary says on stderr that the variable it set did not arm the mode,
+    /// rather than starting a window and hanging in silence. The payload is the
+    /// rejected value, echoed back so the diagnostic names the real input.
+    Refused(String),
+}
+
+/// Which of the two equivalent spellings armed headless mode.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HeadlessSource {
+    /// `--headless` on the command line.
+    Flag,
+    /// `$ATERM_HEADLESS` set to an enabling value.
+    Env,
+}
+
+impl HeadlessSource {
+    /// How the announcement spells this source.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            HeadlessSource::Flag => "--headless",
+            HeadlessSource::Env => "$ATERM_HEADLESS",
+        }
+    }
+}
+
+/// Decide headless mode from the `--headless` flag and the VALUE of
+/// `$ATERM_HEADLESS` (`None` = unset). Pure, so the whole truth table is a unit
+/// test rather than a launch experiment.
+///
+/// The flag wins outright (it overwrites the variable on its way in, so `flag >
+/// env` holds even here). Otherwise the variable follows the same enabling
+/// convention as its sibling `$ATERM_NO_CONTROL_SOCK` — `0`, `off`
+/// (case-insensitive), and empty DISABLE; any other value enables — instead of
+/// bare presence. Presence semantics made `ATERM_HEADLESS=0` mean *headless*,
+/// which is the one reading no caller has ever intended.
+#[must_use]
+pub(crate) fn headless_arming(flag: bool, env: Option<&str>) -> HeadlessArming {
+    if flag {
+        return HeadlessArming::Armed(HeadlessSource::Flag);
+    }
+    match env {
+        None => HeadlessArming::Windowed,
+        Some(v) if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") => {
+            HeadlessArming::Refused(v.to_string())
+        }
+        Some(_) => HeadlessArming::Armed(HeadlessSource::Env),
+    }
 }
 
 /// The `--help` text. A clean OPTIONS section where every user-facing flag shows
@@ -58,7 +132,9 @@ const HELP_HEAD: &str = concat!(
     "                                   disable).               [env: ATERM_CONTROL_SOCK]\n",
     "        --no-control-sock          Disable the control socket.\n",
     "                                       [env: ATERM_NO_CONTROL_SOCK]\n",
-    "        --headless                 No window; engine + control socket only.\n",
+    "        --headless                 No window; engine + control socket only. Exactly\n",
+    "                                   equivalent to the env var; either way the launch\n",
+    "                                   announces the mode on stderr.\n",
     "                                       [env: ATERM_HEADLESS]\n",
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
@@ -140,7 +216,10 @@ const HELP_TAIL: &str = concat!(
     "    ATERM_CONTAINMENT_MODE=<m> master|user|safety|containment (fail-closed).\n",
     "    ATERM_CONTROL_SOCK=<path>  Control socket path (0/off disables it).\n",
     "    ATERM_NO_CONTROL_SOCK=1    Disable the control socket.\n",
-    "    ATERM_HEADLESS=1           No window; engine + control socket only.\n",
+    "    ATERM_HEADLESS=1           No window; engine + control socket only — the exact\n",
+    "                               equivalent of --headless. 0/off/empty do NOT arm it\n",
+    "                               (and say so on stderr rather than starting a window\n",
+    "                               under a script that is waiting for a socket).\n",
     "    ATERM_SHELL_INTEGRATION=1  OSC 133/633 command marks (ON by default; this is a no-op).\n",
     "    ATERM_NO_SHELL_INTEGRATION=1  Disable shell-integration marks (default is on).\n",
     "    ATERM_NO_PROCEDURAL_GLYPHS=1  Disable procedural box/Powerline glyphs.\n",
@@ -517,6 +596,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     let mut args = argv.into_iter().map(|a| a.to_string_lossy().into_owned());
     let mut cwd: Option<String> = None;
     let mut hold = false;
+    let mut headless = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -697,7 +777,14 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 );
             }
             "--no-control-sock" => flag_env("ATERM_NO_CONTROL_SOCK", "1"),
-            "--headless" => flag_env("ATERM_HEADLESS", "1"),
+            // --headless: no window, engine + control socket only. Sets the env
+            // var like every other knob (so the single read site in `main` is
+            // unchanged and `flag > env` falls out of the overwrite), and records
+            // the SOURCE so the startup announcement can name the flag.
+            "--headless" => {
+                flag_env("ATERM_HEADLESS", "1");
+                headless = true;
+            }
             "--columns" => {
                 let v = flag_value("--columns", &mut args);
                 if valid_initial_dimension_flag(&v, 20, 500) {
@@ -735,6 +822,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                     exec_command: Some(cmd),
                     cwd,
                     hold,
+                    headless,
                 };
             }
             other => {
@@ -747,6 +835,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
         exec_command: None,
         cwd,
         hold,
+        headless,
     }
 }
 
@@ -779,6 +868,85 @@ mod tests {
                 "{flag} must be advertised in the help text"
             );
         }
+    }
+
+    /// `--headless` and `$ATERM_HEADLESS` are ONE mechanism with two spellings.
+    /// The flag wins outright (it overwrites the variable on the way in), and a
+    /// bare enabling value arms the same mode by the same funnel.
+    #[test]
+    fn headless_flag_and_env_are_the_same_mechanism() {
+        use super::{HeadlessArming as A, HeadlessSource as S, headless_arming};
+        // The flag arms it, whatever the environment says — including the
+        // disabling values, which it overwrote.
+        for env in [None, Some("1"), Some("0"), Some("off"), Some("")] {
+            assert_eq!(headless_arming(true, env), A::Armed(S::Flag), "{env:?}");
+        }
+        // The variable alone arms exactly the same mode.
+        for env in ["1", "yes", "true", "headless"] {
+            assert_eq!(headless_arming(false, Some(env)), A::Armed(S::Env), "{env}");
+        }
+    }
+
+    /// The failure mode must never be silent. A variable set to a DISABLING
+    /// value is a refusal the binary reports, not a windowed launch nobody
+    /// mentions — that combination is what costs a harness its whole run.
+    #[test]
+    fn headless_env_refusal_is_reported_not_silent() {
+        use super::{HeadlessArming as A, headless_arming};
+        for env in ["0", "off", "OFF", "Off", ""] {
+            assert_eq!(
+                headless_arming(false, Some(env)),
+                A::Refused(env.to_string()),
+                "ATERM_HEADLESS={env} must be REFUSED (and thus announced), not \
+                 silently windowed"
+            );
+        }
+        // An unset variable is the ordinary interactive launch: windowed, and
+        // nothing to announce (nobody asked for headless).
+        assert_eq!(headless_arming(false, None), A::Windowed);
+    }
+
+    /// `--headless` must reach `main` by BOTH channels: the env var (the shared
+    /// flag > env > config > default funnel every knob uses) and the `Cli` field
+    /// that names the source for the startup announcement.
+    #[test]
+    fn headless_flag_sets_the_env_var_and_records_its_source() {
+        // No `env::scoped_*` wrapper here: `parse_cli` writes through the same
+        // module, and that lock is not reentrant (documented on `scoped`). The
+        // variable is instead restored by hand at the end of the test.
+        let cli = super::parse_cli(vec![std::ffi::OsString::from("--headless")]);
+        assert!(cli.headless, "the flag must record itself as the source");
+        assert_eq!(
+            aterm_log::env::read("ATERM_HEADLESS").as_deref(),
+            Some(std::ffi::OsStr::new("1")),
+            "the flag must also set the env var the single read site consumes"
+        );
+        // And the two channels agree on the outcome.
+        assert_eq!(
+            super::headless_arming(cli.headless, Some("1")),
+            super::HeadlessArming::Armed(super::HeadlessSource::Flag)
+        );
+        aterm_log::env::unset("ATERM_HEADLESS");
+    }
+
+    #[test]
+    fn help_documents_headless_as_flag_and_env_equivalents() {
+        assert!(
+            HELP_HEAD.contains("--headless"),
+            "--headless must be advertised in the help text"
+        );
+        assert!(
+            HELP_HEAD.contains("[env: ATERM_HEADLESS]"),
+            "--help must name the env var as the flag's equivalent"
+        );
+        assert!(
+            super::HELP_TAIL.contains("ATERM_HEADLESS=1"),
+            "the ENVIRONMENT section must document ATERM_HEADLESS"
+        );
+        assert!(
+            super::HELP_TAIL.contains("0/off/empty do NOT arm it"),
+            "--help must document the values that do NOT arm headless mode"
+        );
     }
 
     #[test]

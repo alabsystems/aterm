@@ -547,8 +547,9 @@ HOW TO USE IT
   to settle, and returns the settled screen — closing the paste/Enter race so one CLI can
   drive another as if a human were at the keyboard. `subscribe ... events` is event-driven:
   you pull a full screen/image only when an event says something changed, so watching five
-  or fifty sessions costs almost nothing until it matters. Headless works too (set
-  ATERM_HEADLESS=1 for an engine + control socket with no window). Discoverability is
+  or fifty sessions costs almost nothing until it matters. Headless works too (pass
+  --headless, or the exactly equivalent ATERM_HEADLESS=1, for an engine + control socket
+  with no window; either way the launch names the mode on stderr). Discoverability is
   OPT-IN: launch the window with ATERM_AI_HINT=1 to inject a single dim line above the
   first prompt announcing the terminal is AI-introspectable and drivable with aterm-ctl
   (off by default — a transparent terminal injects nothing into your screen).

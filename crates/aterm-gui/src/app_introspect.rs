@@ -9036,8 +9036,8 @@ mod encode_worker_tests {
         let geom = |app: &App| crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
             cell_h: cell_h as u16,
-            rows: app.windows[&wid].rows as u16,
-            cols: app.windows[&wid].cols as u16,
+            rows: app.windows[&wid].rows,
+            cols: app.windows[&wid].cols,
         };
         let toy_rect = |app: &App, at: Instant| {
             app.windows[&wid]
@@ -9146,8 +9146,8 @@ mod encode_worker_tests {
             let geom = crate::word_decorations::EffectGeom {
                 cell_w: cell_w as u16,
                 cell_h: cell_h as u16,
-                rows: app.windows[&wid].rows as u16,
-                cols: app.windows[&wid].cols as u16,
+                rows: app.windows[&wid].rows,
+                cols: app.windows[&wid].cols,
             };
             app.windows[&wid]
                 .word_decos

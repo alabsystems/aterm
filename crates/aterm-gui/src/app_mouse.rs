@@ -1298,6 +1298,22 @@ impl App {
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_cursor_px = (x, y);
+            // POINTER PURSUIT (wave 3): the brain is its own motion sensor,
+            // but it only senses on a TICK — and with the frame lane
+            // released, mouse motion alone never produced one, so the pet
+            // could not see a toy waved at it until an unrelated repaint.
+            // One requested frame per motion event (coalesced by the
+            // windowing system) lets the brain sample the pointer; if the
+            // motion is real its own heat re-arms `needs_frames` and the
+            // effects cadence takes over from there. Gated on the pet
+            // actually being on glass — `pet_hit_rect` is Some exactly when
+            // a visible pet was drawn last frame — so a petless window pays
+            // nothing.
+            if ws.pet_hit_rect.is_some()
+                && let Some(w) = ws.os_window.as_ref()
+            {
+                w.request_redraw();
+            }
         }
         self.track_strip_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
