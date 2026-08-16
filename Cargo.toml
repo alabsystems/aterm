@@ -22,6 +22,19 @@ expose = ["aterm"] # THE one command — window + session + every verb IN ONE BI
 # aterm-fleet, aterm-drive, aterm-gui, aterm-cli) beside it — dispatched by
 # argv[0] — so nothing else lands in `bundle` as a separate binary.
 bundle = []
+# THE PACKAGE-INDEX ACCOUNT: the GitHub owner atpkg's signed index + program
+# releases are published under — the compiled-in default behind atpkg's account
+# resolution (env ATPKG_ACCOUNT > `[packages].account` config > this). Its OWN
+# key on purpose: `[workspace.package] repository` is the PRIVATE staging repo
+# (a default-configured, tokenless install 404s there — no index is ever
+# reachable), and `update_channel` above is the APP-update knob the
+# ACCOUNT-BOUND index trust (§8) must never follow. crates/aterm-update-core's
+# build.rs stamps this into ATERM_ATPKG_INDEX_OWNER (falling back to the
+# `repository` owner when the key is absent); atpkg's `resolve_account` reads
+# that constant. Repointing it is a HOST change, never a trust change — the
+# index verifies against the same pinned root key (`aterm-update-core::pins`)
+# wherever it is hosted.
+account = "alabsystems"
 
 # THE UPDATE CHANNEL shipped binaries read, as ONE tracked `OWNER/REPO` slug.
 #
@@ -55,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -167,6 +180,10 @@ aterm-update-core = { path = "crates/aterm-update-core" }
 # The toolchain package manager (Settings ▸ Packages reads its status/link state
 # in-process; the network verbs still run only via the co-located `atpkg` binary).
 atpkg = { path = "crates/atpkg" }
+# The owner-side provisioning/signing engine — a LIBRARY here so `cargo ship
+# provision` can drive the join ceremony in-process (one /dev/tty phrase prompt,
+# no second binary). Never shipped to clients; POSIX-only (#![cfg(unix)]).
+atpkg-keys = { path = "crates/atpkg-keys" }
 aterm-sixel = { path = "crates/aterm-sixel" }
 # The main-loop completeness census (L0 whole-Mac-freeze class): ONE shared
 # implementation consumed by `xtask gate mainloop` (manual verb) AND
@@ -187,7 +204,7 @@ unsafe_op_in_unsafe_fn = "deny"
 # harnesses; `aterm_ffi_catch_unwind!` also expands a `#[cfg(kani)]` arm). Declaring
 # the union here keeps `unexpected_cfgs` honest in every crate from one place — an
 # undeclared cfg name still warns; an unused-but-declared one is harmless.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)', 'cfg(fuzzing)', 'cfg(trust_verify)', 'cfg(clean_islands)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

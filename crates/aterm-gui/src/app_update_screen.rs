@@ -179,29 +179,22 @@ impl App {
         // But silent was the wrong other extreme, and it is what the owner actually
         // hit: a staged build sat unapplied across two releases while `update
         // status` reported `failing=0 failing_applies=0` and advised a relaunch,
-        // because the refusal reached this arm and stopped here. "Nothing is wrong"
-        // and "we declined, here is why" are different answers and the file could
-        // only say the first. `record_apply_refusal` is the separate, non-streak
-        // slot for the second; it is expiry-bound to the RUNNING build, since a
-        // successful in-session apply execs away and never returns to clear it.
+        // because the refusal reached this function and stopped here. "Nothing is
+        // wrong" and "we declined, here is why" are different answers and the file
+        // could only say the first. `record_apply_refusal` is the separate,
+        // non-streak slot for the second; it is expiry-bound to the RUNNING build,
+        // since a successful in-session apply execs away and never returns to clear
+        // it. Which outcome is which — and why nothing here can record a SUCCESS —
+        // is [`apply_ledger_verdict`].
         let current_build = self.native_updater_service.snapshot().current_build;
-        match &outcome {
-            crate::native_app::UpdateOutcome::Failed { message } => {
-                aterm_update::record_apply_failure(current_build, message);
+        match apply_ledger_verdict(&outcome) {
+            ApplyLedgerVerdict::Failed(message) => {
+                aterm_update::record_apply_failure(current_build, &message);
             }
-            crate::native_app::UpdateOutcome::Accepted => {
-                aterm_update::record_apply_success(current_build);
+            ApplyLedgerVerdict::Refused(reason) => {
+                aterm_update::record_apply_refusal(current_build, &reason);
             }
-            crate::native_app::UpdateOutcome::Blocked { reasons } => {
-                aterm_update::record_apply_refusal(current_build, &reasons.join(" · "));
-            }
-            crate::native_app::UpdateOutcome::Deferred { reason } => {
-                aterm_update::record_apply_refusal(current_build, reason);
-            }
-            // Installed-but-needs-relaunch is neither a refusal nor a completion:
-            // the bytes ARE in place and the next launch runs them, which the
-            // status line already reports from the staged marker.
-            crate::native_app::UpdateOutcome::InstalledNeedsRelaunch { .. } => {}
+            ApplyLedgerVerdict::Silent => {}
         }
         match outcome {
             crate::native_app::UpdateOutcome::Accepted => {
@@ -333,20 +326,47 @@ impl App {
         }
     }
 
-    /// If the CLICKABLE "Update ready" notice pill is showing and the window-px point
-    /// `(x, y)` lands on it, APPLY the update (one click — the pill says "Update ready";
-    /// clicking it IS the upgrade) + clear the notice, and return `true` (the click is
-    /// consumed). With nothing actually staged the same call falls back to the details
-    /// overlay. Reads the SAME geometry the painter uses
-    /// ([`crate::notice::notice_rect`]), so the hit region matches the pixels. `false`
-    /// when there is no clickable notice or the point misses it (the click flows on).
+    /// Route a left press that landed on the notice card. A press on the CLICKABLE
+    /// "Update ready" card APPLIES the update (one click — the card says "Update ready";
+    /// clicking it IS the upgrade); a press on any OTHER card dismisses it. Either way the
+    /// card goes away and the click is CONSUMED (`true`). With nothing actually staged the
+    /// apply falls back to the details overlay.
+    ///
+    /// Two gates keep this from firing on a card the user cannot see:
+    ///
+    /// * The card must be ON GLASS IN THIS WINDOW
+    ///   ([`crate::WindowState::notice_is_on_glass`]). `self.notice` is App-global and the
+    ///   paint-only cards share ONE composited slot, so without this a window whose card
+    ///   was suppressed — serious mode, a zero-column window, a rejected paint rect — or
+    ///   one where the level-up flourish still owns the slot, hit-tested a rectangle of
+    ///   empty screen, and a click there silently re-execed the app.
+    /// * The card must still be legible ([`crate::notice::CLICK_MIN_ALPHA`]). The exit
+    ///   tail runs to nothing, and a target you cannot see is a trap.
+    ///
+    /// DISMISSING A NON-ACTIONABLE CARD IS NOT A COURTESY, IT IS A ROUTING FIX. This runs
+    /// BEFORE the tab-strip and terminal mouse paths, so a press the card visually caught
+    /// used to fall straight through a status card into whatever was underneath — with an
+    /// in-grid tab strip under the old placement, that could CLOSE A TAB.
+    ///
+    /// Reads the SAME geometry the painter uses ([`crate::notice::notice_rect`]) — same
+    /// `now`, same motion amplitude, same reserved chrome rows — so the hit region is the
+    /// pixels. `false` when there is no visible card or the point misses it (the click
+    /// flows on).
     pub(crate) fn notice_click(&mut self, wid: crate::WindowId, x: f64, y: f64) -> bool {
-        let Some(n) = self.notice.as_ref().filter(|n| n.is_update_ready()) else {
+        let Some(n) = self.notice.as_ref() else {
             return false;
         };
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
+        if !ws.notice_is_on_glass() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if n.alpha(now) < crate::notice::CLICK_MIN_ALPHA {
+            return false;
+        }
+        let actionable = n.is_update_ready();
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as f32;
         let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
@@ -357,17 +377,38 @@ impl App {
             cols: ws.cols as usize,
             panel_rows: 0,
         };
-        let (rx, ry, rw, rh) = crate::notice::notice_rect(n, &geom);
+        // The SAME (now, motion, reserved chrome) the painter used, so the hit region
+        // tracks the card through its slide instead of lagging behind the pixels.
+        let motion = self
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::NoticePill);
+        let (rx, ry, rw, rh) =
+            crate::notice::notice_rect(n, &geom, now, motion, self.notice_clear_rows());
         let (x, y) = self.window_to_frame(wid, x, y);
         let (px, py) = (x as f32 - pad, y as f32 - top);
         if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
-            // Dismiss the pill and UPGRADE (one click; details-overlay fallback when
-            // nothing is actually staged) — see `apply_update_or_details`.
             self.notice = None;
-            self.apply_update_or_details();
+            if actionable {
+                // UPGRADE (one click; details-overlay fallback when nothing is actually
+                // staged) — see `apply_update_or_details`.
+                self.apply_update_or_details();
+            }
+            self.request_redraw_all_windows();
             true
         } else {
             false
+        }
+    }
+
+    /// The in-grid chrome rows the notice card must sit BELOW: the tab strip owns the
+    /// first `tab_strip_rows` rows of the terminal area, and the card is not allowed to
+    /// cover chrome the user clicks. One accessor so the painter and the hit test cannot
+    /// disagree about where the card is.
+    pub(crate) fn notice_clear_rows(&self) -> f32 {
+        if self.tab_strip_enabled() {
+            f32::from(self.tab_strip_rows)
+        } else {
+            0.0
         }
     }
 
@@ -471,8 +512,57 @@ impl App {
     }
 }
 
+/// What one apply outcome must write to the DURABLE health ledger.
+///
+/// Split out of [`App::surface_update_apply_outcome`]'s UI reaction because the write
+/// itself is unobservable from this crate — `aterm_update::record_apply_*` resolve
+/// `HOME` and rewrite `Updates/health.toml` — so the routing is the only part a unit
+/// test can hold still. The streak arithmetic behind each verdict is `aterm-update`'s
+/// (`Health::record_apply_failure` / `record_apply_success`).
+#[derive(Debug, PartialEq, Eq)]
+enum ApplyLedgerVerdict {
+    /// The apply was ATTEMPTED and the staged build did not become the running
+    /// build. Advances the apply streak — the one that escalates to the
+    /// "aterm auto-update is failing" notification.
+    Failed(String),
+    /// Refused before it could become a failure. Fills the standing-explanation
+    /// slot and touches no streak: a terminal that happened to be busy must not
+    /// manufacture an escalation.
+    Refused(String),
+    /// Nothing durable to say yet.
+    Silent,
+}
+
+/// Route one apply outcome to its ledger verdict.
+///
+/// `Accepted` IS DELIBERATELY SILENT: it means the apply worker was started, or that
+/// we joined an in-flight/`Applying` request — never that an apply completed, because
+/// a successful one execs away and never returns here (`app_native.rs`: "A successful
+/// replacement never returns"). Recording success on it was the bug that made the
+/// ledger blind: every manual/control click WIPED the streak (and the standing refusal
+/// with it) seconds before the asynchronous `Failed` arrived, so the apply streak was
+/// capped at 1, `PERSISTENT_AFTER = 3` was unreachable on those lanes, and one
+/// troubleshooting click could erase a background streak that had already climbed.
+/// The apply lane is cleared at the ONE place success is provable — a boot sentinel
+/// armed for the build that is now running, in `aterm-update`'s `confirm_boot_health`.
+///
+/// `InstalledNeedsRelaunch` is likewise silent, but for the opposite reason: it is
+/// neither a refusal nor a pending attempt — the bytes ARE in place and the next
+/// launch runs them, which the status line already reports from the staged marker.
+fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
+    match outcome {
+        UpdateOutcome::Failed { message } => ApplyLedgerVerdict::Failed(message.clone()),
+        UpdateOutcome::Blocked { reasons } => ApplyLedgerVerdict::Refused(reasons.join(" · ")),
+        UpdateOutcome::Deferred { reason } => ApplyLedgerVerdict::Refused(reason.clone()),
+        UpdateOutcome::Accepted | UpdateOutcome::InstalledNeedsRelaunch { .. } => {
+            ApplyLedgerVerdict::Silent
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{ApplyLedgerVerdict, apply_ledger_verdict};
     use crate::App;
     use crate::WindowId;
     use crate::native_app::{AppViewState, UpdateOutcome};
@@ -791,6 +881,78 @@ mod tests {
         app.notice = None;
         app.surface_update_apply_outcome("automatic", failed(), false);
         assert_eq!(pill(&app), "↑ Update paused — see Version menu");
+    }
+
+    /// SUBMISSION IS NOT COMPLETION, AND THE LEDGER MUST BE ABLE TO ESCALATE.
+    ///
+    /// The apply streak exists to reach `PERSISTENT_AFTER = 3` and say "aterm
+    /// auto-update is failing". It could not: `Accepted` — the worker was merely
+    /// STARTED, or an in-flight/`Applying` request was joined — recorded an apply
+    /// SUCCESS, which zeroes the streak and clears the standing refusal. Every
+    /// manual/control cycle was therefore wipe-then-set, capped at 1, and a single
+    /// troubleshooting click erased a background streak that had already climbed.
+    ///
+    /// So the assertion is the whole cycle a person actually performs, three times
+    /// over: click apply (`Accepted`), the asynchronous handoff fails a second later
+    /// (`Failed`). Exactly three streak writes must come out of it and NOTHING may
+    /// clear the lane — there is no verdict here that can, because the only place an
+    /// apply is provable is a boot sentinel armed for the build that is now running
+    /// (`aterm-update`'s `confirm_boot_health`), which this process cannot observe.
+    #[test]
+    fn a_submitted_then_failed_apply_writes_one_streak_increment_and_never_a_clear() {
+        let failed = |reason: &str| UpdateOutcome::Failed {
+            message: reason.to_string(),
+        };
+        let mut streak_writes = 0_u32;
+        for attempt in 0..3 {
+            let reason = format!("ChildDied (attempt {attempt})");
+            for outcome in [UpdateOutcome::Accepted, failed(&reason)] {
+                match apply_ledger_verdict(&outcome) {
+                    ApplyLedgerVerdict::Failed(message) => {
+                        assert_eq!(message, reason, "the typed outcome reaches the ledger");
+                        streak_writes += 1;
+                    }
+                    // A refusal would be wrong here (it fills the non-streak slot) and
+                    // a silent `Accepted` is the point of the fix.
+                    other => assert_eq!(
+                        other,
+                        ApplyLedgerVerdict::Silent,
+                        "only a real failure may touch the streak"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            streak_writes, 3,
+            "three failed applies must be three increments, or the escalation \
+             threshold is unreachable on the lanes a person uses"
+        );
+
+        // The neighbours this must not disturb: a refusal still records its standing
+        // explanation without touching the streak, and installed-but-needs-relaunch
+        // says nothing durable (the bytes are in place; the staged marker reports it).
+        assert_eq!(
+            apply_ledger_verdict(&UpdateOutcome::Blocked {
+                reasons: vec![
+                    "Checkpoint Drafts: 1 document(s)".to_string(),
+                    "busy".to_string()
+                ],
+            }),
+            ApplyLedgerVerdict::Refused("Checkpoint Drafts: 1 document(s) · busy".to_string())
+        );
+        assert_eq!(
+            apply_ledger_verdict(&UpdateOutcome::Deferred {
+                reason: "the terminal is busy".to_string(),
+            }),
+            ApplyLedgerVerdict::Refused("the terminal is busy".to_string())
+        );
+        assert_eq!(
+            apply_ledger_verdict(&UpdateOutcome::InstalledNeedsRelaunch {
+                build: 7,
+                message: "relaunch once".to_string(),
+            }),
+            ApplyLedgerVerdict::Silent
+        );
     }
 
     #[test]

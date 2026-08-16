@@ -33,18 +33,21 @@ mod gates;
 #[path = "../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
+#[path = "../src/machines.rs"]
+#[allow(dead_code)]
+mod machines;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
 #[path = "../src/mirror.rs"]
 #[allow(dead_code)]
 mod mirror;
+#[path = "../src/provision.rs"]
+#[allow(dead_code)]
+mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -184,6 +187,7 @@ fn journal() -> Journal {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
+        signature_machine_id: None,
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
@@ -1375,7 +1379,10 @@ fn a_committed_pin_makes_a_keyless_cut_fail_closed_before_any_claim() {
         .to_string();
     assert!(error.contains(CHANNEL_PIN), "{error}");
     assert!(error.contains("aterm-update-core::pins"), "{error}");
-    assert!(error.contains("no signing material was supplied"), "{error}");
+    assert!(
+        error.contains("no signing material was supplied"),
+        "{error}"
+    );
     assert!(
         error.contains("may not cut for a pinned channel"),
         "{error}"
@@ -2512,6 +2519,14 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(parse(&[]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["--help"]).unwrap(), cli::Cmd::Help);
     assert_eq!(parse(&["status"]).unwrap(), cli::Cmd::Status);
+    assert_eq!(
+        parse(&["provision", "--id", "m2"]).unwrap(),
+        cli::Cmd::Provision { id: "m2".into() }
+    );
+    assert!(
+        cli::USAGE.contains("provision --id"),
+        "help must document the one-command machine provisioning verb"
+    );
     assert!(
         cli::USAGE.contains(publish::RECOVERY_STOPPED_PROCESS_FLAG),
         "help must name the mandatory stopped-publisher acknowledgement"
@@ -2587,6 +2602,10 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
     for (args, needle) in [
         (vec!["frobnicate"], "unknown command"),
         (vec!["cut", "--frobnicate"], "unknown cut flag"),
+        (vec!["provision"], "--id"),
+        (vec!["provision", "--id"], "needs a machine id"),
+        (vec!["provision", "--frobnicate", "m2"], "unknown provision flag"),
+        (vec!["provision", "--id", "m2", "--id", "m3"], "--id given twice"),
         // --set-version now REQUIRES the canonical three-component form;
         // the retired two-component spelling is just another malformed one.
         (vec!["cut", "--set-version", "0.26"], "MAJOR.MINOR.PATCH"),
@@ -2643,6 +2662,53 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
     }
 }
 
+/// THE PRE-ROSTER ACKNOWLEDGEMENT IS A COMMAND-LINE FLAG, and it behaves like one.
+///
+/// It exists because the cutter cannot know whether any client older than the machine
+/// roster is still in the field, and publishing under a rostered key that no such client
+/// carries wedges every one of them permanently. So it is asserted per cut, on the
+/// command, exactly like `--old-publisher-stopped` — never inferred, never remembered in
+/// a file, and never silently ignored.
+///
+/// Kills the mutation "accept it on a resume too": a resume does not re-ask the question
+/// (it continues a cut under a key it cannot change), so accepting the flag there would
+/// take an acknowledgement and do nothing with it.
+#[test]
+fn the_pre_roster_stranding_flag_is_explicit_per_cut_and_never_silently_ignored() {
+    let cli::Cmd::Cut { opts, .. } =
+        parse(&["cut", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap()
+    else {
+        panic!("expected Cut");
+    };
+    assert!(opts.strand_pre_roster_clients);
+
+    // Absent by default — the fail-closed state, and the one every ordinary cut is in.
+    let cli::Cmd::Cut { opts, .. } = parse(&["cut"]).unwrap() else {
+        panic!("expected Cut");
+    };
+    assert!(!opts.strand_pre_roster_clients);
+
+    // A RESUME may not carry it: the journal already fixed the key, and the flag would
+    // be accepted and ignored. Refusing is the honest answer.
+    let err = parse(&["cut", "--resume", publish::PRE_ROSTER_STRANDING_FLAG]).unwrap_err();
+    assert!(err.contains("--resume combines with no other cut flag"), "{err}");
+    let err = parse(&[
+        "cut",
+        "--abandon",
+        "v0.26.0",
+        publish::PRE_ROSTER_STRANDING_FLAG,
+    ])
+    .unwrap_err();
+    assert!(err.contains("--abandon combines with no other"), "{err}");
+
+    // The operator can find out what it means without reading the source.
+    assert!(
+        cli::USAGE.contains(publish::PRE_ROSTER_STRANDING_FLAG),
+        "an acknowledgement nobody can discover is not one"
+    );
+    assert!(cli::USAGE.contains("never update again"), "{}", cli::USAGE);
+}
+
 #[test]
 fn recovery_requires_and_labels_the_external_stop_precondition() {
     let owner = "a".repeat(40);
@@ -2657,7 +2723,10 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
     // recover now ACCEPTS --release-credentials (it signs, so it needs the same
     // explicit key as a fresh cut) but nothing else: an unknown argument is still
     // refused, and the refusal names it.
-    assert!(extra.contains("extra"), "the refusal must name the argument: {extra}");
+    assert!(
+        extra.contains("extra"),
+        "the refusal must name the argument: {extra}"
+    );
     assert!(
         extra.contains("--release-credentials"),
         "and must say what IS accepted: {extra}"

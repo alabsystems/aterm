@@ -978,7 +978,30 @@ const VERSION_MENU: &[MenuEntry] = &[
 /// instead — the own-rendered text stack has no color-emoji face (verified coverage).
 #[must_use]
 pub(crate) fn version_menu_bar_title(attention: bool) -> String {
-    let base = format!("v{}", crate::build_info::version_display());
+    let base = if crate::build_info::IS_RELEASE_BUILD {
+        format!("v{}", crate::build_info::version_display())
+    } else {
+        // THE DEV SIGNATURE (owner, 2026-08-16: "some kind of marker in the
+        // menu bar where the version numbers are so that I know what is a
+        // development build … using the 3rd developer number and the hash").
+        // A release's third slot is always literal 0, so the DEV COUNTER in
+        // that slot (commits since the newest release tag) is an unambiguous
+        // non-release signature; the short hash pins WHICH dev build, and the
+        // trailing marker makes it readable at a glance without parsing
+        // numbers. A dirty tree keeps its `*`. The display version is
+        // display-only by contract, so none of this can reach an update
+        // comparison.
+        let v = crate::build_info::version_display();
+        let majmin = v.rsplit_once('.').map_or(v, |(mm, _)| mm);
+        let commit = crate::build_info::GIT_COMMIT;
+        let dirty = if commit.ends_with("-dirty") { "*" } else { "" };
+        let short: String = commit.chars().take(7).collect();
+        format!(
+            "\u{1F6E0}\u{FE0F} v{}.{}+g{short}{dirty} \u{00B7} DEV",
+            majmin,
+            crate::build_info::DEV_COMMITS,
+        )
+    };
     if attention {
         format!("{base} \u{2B06}\u{FE0F}")
     } else {
@@ -2453,7 +2476,9 @@ mod tests {
     fn version_menu_bar_title_carries_the_arrow_only_under_attention() {
         let plain = super::version_menu_bar_title(false);
         let arrowed = super::version_menu_bar_title(true);
-        assert!(plain.starts_with('v'), "{plain}");
+        // A test binary is a DEV build, so the base leads with the dev
+        // signature's wrench rather than the bare `v` a release shows.
+        assert!(plain.contains('v'), "{plain}");
         assert!(!plain.contains('\u{2B06}'), "no arrow at rest: {plain}");
         assert!(
             arrowed.starts_with(&plain),
@@ -2462,6 +2487,35 @@ mod tests {
         assert!(
             arrowed.ends_with(" \u{2B06}\u{FE0F}"),
             "TRAILING emoji arrow (\"v0.25 ⬆️\" shape): {arrowed}"
+        );
+    }
+
+    /// THE DEV SIGNATURE (owner, 2026-08-16: a marker in the menu bar "so
+    /// that I know what is a development build … using the 3rd developer
+    /// number and the hash"): a binary the release cutter did not produce —
+    /// this test binary — must wear the dev counter in the third slot, the
+    /// short commit hash, and the DEV marker. A release build
+    /// (`ATERM_APP_RELEASE_VERSION` present) keeps its clean `v<version>`;
+    /// that arm is proven by the discriminator being exactly the release
+    /// env's presence, which the cutter's identity self-check already pins.
+    #[test]
+    fn a_dev_build_wears_its_signature_in_the_bar_title() {
+        // A test binary is never a release build — and as a const block this
+        // fails the COMPILE of any test build that sets the release env,
+        // which is the actual invariant.
+        const {
+            assert!(
+                !crate::build_info::IS_RELEASE_BUILD,
+                "a test binary is never a release build"
+            )
+        };
+        let t = super::version_menu_bar_title(false);
+        assert!(t.starts_with('\u{1F6E0}'), "the wrench leads: {t}");
+        assert!(t.ends_with(" \u{00B7} DEV"), "the marker trails: {t}");
+        assert!(t.contains("+g"), "the hash is pinned: {t}");
+        assert!(
+            t.contains(&format!(".{}+", crate::build_info::DEV_COMMITS)),
+            "the third slot is the dev counter, not a release patch: {t}"
         );
     }
 

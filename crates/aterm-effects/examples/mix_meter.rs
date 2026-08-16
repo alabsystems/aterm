@@ -26,11 +26,11 @@
 //! judged independently of the user's volume knob.
 
 use aterm_effects::cursor_glow::GlowStyle;
+use aterm_effects::tone::Tone;
 use aterm_effects::trail_sound::{
     CHANNELS, CelebrationGesture, SoundEvent, SoundGesture, SoundKind, SoundVoice, TrailSynth,
     WordGesture,
 };
-use aterm_effects::tone::Tone;
 
 const SR: f32 = 48_000.0;
 /// The host's shipped `trail_sound_volume` default.
@@ -99,7 +99,10 @@ fn main() {
     ];
 
     println!("MIX METER — {style:?} @ {SR} Hz, Tone::Technical, heat 0.5, pan 0\n");
-    println!("{:<12} {:>12} {:>12}   vs Typed", "gesture", "@vol 0.40", "@gain 1.0");
+    println!(
+        "{:<12} {:>12} {:>12}   vs Typed",
+        "gesture", "@vol 0.40", "@gain 1.0"
+    );
     println!("{}", "-".repeat(56));
 
     let typed_ref = peak_of(

@@ -41,6 +41,20 @@ pub const BUILD_TIME: &str = env!("ATERM_BUILD_TIME");
 /// `CFBundleVersion`.
 pub const BUILD_NUMBER: &str = env!("ATERM_BUILD_NUMBER");
 
+/// Commits since the newest release tag at build time ("0" when git or the
+/// tag was unavailable) — the menu bar's DEV COUNTER: the third slot of a dev
+/// build's displayed version (owner, 2026-08-16; a release's third slot is
+/// always literal 0, so a nonzero counter can never be mistaken for one).
+pub const DEV_COMMITS: &str = env!("ATERM_DEV_COMMITS");
+
+/// Whether the release cutter produced this binary. The cutter supplies
+/// `ATERM_APP_RELEASE_VERSION` on both architecture builds and it is
+/// deliberately absent from every ordinary build, so its presence at compile
+/// time IS the release/dev discriminator — the same fact `APP_VERSION`'s
+/// selection already keys on, exposed as a bool for display surfaces (the
+/// menu bar's DEV signature).
+pub const IS_RELEASE_BUILD: bool = option_env!("ATERM_APP_RELEASE_VERSION").is_some();
+
 /// Full first line of the producing compiler's `-vV`, e.g.
 /// `rustc 1.96.0 (ac68faa20 2026-05-25) (Homebrew)` or
 /// `rustc 1.99.0-dev (2b118046a 2026-07-29) (trustc)` — trustc leads with the

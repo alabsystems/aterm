@@ -48,12 +48,17 @@ pub enum Class {
     Canine,
     /// The orca / cetacean family — drawn as the randomized "splash" of water droplets.
     Orca,
-    /// The ambient animal-word family (monkey / camel / penguin / …): ordinary
-    /// English animal nouns, each entry tagged with a `species` id that names
-    /// the authored sprite the renderer peeks beside the word. Entries ride
-    /// `ambiguous = true` by design: animal nouns ARE ordinary prose, so they
-    /// defer at the live caret (no fire inside `been` while typing past `bee`)
-    /// and stay out of the fold-collision gate's unambiguous set.
+    /// The ambient animal-word family (monkey / camel / penguin / …): animal
+    /// nouns, each entry tagged with a `species` id that names the authored
+    /// sprite the renderer peeks beside the word. The ENGLISH (and other
+    /// Latin-script) entries ride `ambiguous = true` by design: animal nouns
+    /// ARE ordinary prose, so they defer at the live caret (no fire inside
+    /// `been` while typing past `bee`) and stay out of the fold-collision
+    /// gate's unambiguous set. The zh/ja/ko/hi/th multilingual entries
+    /// (2026-08-10) load plain instead — the feline/canine CJK precedent —
+    /// with lone-ideograph forms gated behind
+    /// [`ScanOptions::cjk_single_char`]; see the lexicon's
+    /// animal-multilingual group header for the full load laws.
     Animal,
     /// Hype / emphasis words — drawn as the animated-ink shimmer only (no
     /// sprite overlay). The builtin lexicon ships NO emphasis forms: the class
@@ -243,8 +248,16 @@ pub struct ScanOptions<'a> {
     /// common English substring-of-intent; longer forms (`cats`, `kitty`,
     /// `gato`, …) are always eligible.
     pub allow_bare_cat: bool,
-    /// Decorate a lone CJK cat ideograph (`猫`) anywhere, even inside an
+    /// Decorate a lone single-character CJK surface anywhere, even inside an
     /// un-listed compound. Off by default (high false-positive rate).
+    ///
+    /// This gate is CLASS-AGNOSTIC: it began life as the lone-`猫` opt-in,
+    /// but the scanner drops EVERY 1-char CJK hit without it — the dog
+    /// ideographs (`犬`/`狗`) and, since the 2026-08-10 menagerie expansion,
+    /// the animal roster's lone han/kana/hangul forms (`象`/`馬`/`鳥`/`새`/
+    /// `곰`/…) all ride this same knob. One opt-in, one blast radius: most
+    /// lone CJK animal characters are heavy homographs (ko `말` = horse AND
+    /// speech, `새` = bird AND new), which is exactly why they are gated.
     pub cjk_single_char: bool,
     /// Folded surfaces to never decorate (the user's `ignore_words` / global
     /// `deny`, already folded by the caller via [`fold`]). A plain `HashSet` so

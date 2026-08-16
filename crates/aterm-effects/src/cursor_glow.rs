@@ -102,6 +102,30 @@ impl GlowStyle {
             .any(|o| s.eq_ignore_ascii_case(o))
     }
 
+    /// Whether this style string asks for the pet companion drawn as a **dog**
+    /// ([`crate::kitty_pet::PetSpecies::Dog`]).
+    ///
+    /// The kitty-pet predicate's twin, and the same reasoning: the dog is a
+    /// SPECIES of the pet, not an eleventh trail. It resolves to
+    /// [`GlowStyle::RainbowKitty`] like the cat pet does, so the ribbon, the
+    /// starfield, the chip melody and the sound palette are untouched — the
+    /// only thing that changes is which animal walks in front of the caret.
+    #[must_use]
+    pub fn style_names_dog_pet(s: &str) -> bool {
+        let s = s.trim();
+        ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"]
+            .iter()
+            .any(|o| s.eq_ignore_ascii_case(o))
+    }
+
+    /// Whether this style string asks for the full-body pet at all, in any
+    /// species. The one predicate the render path should ask; use
+    /// [`Self::style_names_dog_pet`] afterwards only to pick the skin.
+    #[must_use]
+    pub fn style_names_any_pet(s: &str) -> bool {
+        Self::style_names_kitty_pet(s) || Self::style_names_dog_pet(s)
+    }
+
     pub fn parse(s: &str) -> Self {
         // Case-insensitive WITHOUT allocating (called every redraw via `glow_config`):
         // `eq_ignore_ascii_case` instead of a `to_ascii_lowercase()` heap alloc per frame.
@@ -131,6 +155,12 @@ impl GlowStyle {
             "rainbow kitty pet",
             "kitty pet",
             "pet kitty",
+            // …and the DOG spellings for the same reason again: a different
+            // species of the same companion, riding the same trail.
+            "rainbow dog pet",
+            "dog pet",
+            "pet dog",
+            "rainbow puppy pet",
         ]) {
             Self::RainbowKitty
         } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
@@ -398,6 +428,24 @@ pub(crate) const OVER_INK_COV_CAP: f32 = 48.0;
 /// number so the three emitters cannot drift apart; the starburst's
 /// deliberate exemption from [`OVER_INK_COV_CAP`] is argued at its use site.
 const RAINBOW_TRANSIENT_COV_CAP: f32 = 118.0;
+
+/// THE JUMP'S OWN ROOF. [`RAINBOW_TRANSIENT_COV_CAP`] is the BASE a graded jump
+/// multiplies (`× 1 + RAINBOW_JUMP_BRIGHT_GAIN × grade`), never a clamp — which
+/// the shipped build already exceeded, silently and without a stated bound. This
+/// is that bound, written down.
+///
+/// 160 rather than a round 255 because the number has to be argued: at 118 the
+/// certified transient read was taken; a full-grade jump at intensity 1.0 asked
+/// for 151 before the 2026-08-11 brightening and asks for 177 after, and 160 is
+/// the honest ceiling that lets a fling be visibly brighter while keeping the
+/// streak inside the same order the certification was measured at. It binds only
+/// the largest flings at full intensity; at the shipping 0.7 intensity nothing
+/// reaches it.
+///
+/// It is a JUMP ceiling, not a family one: the ZOOM streak is a ~0.5 s transient
+/// on a deliberate gesture the user is watching, which is exactly the case the
+/// starburst's own exemption from [`OVER_INK_COV_CAP`] is argued for beside it.
+const RAINBOW_JUMP_COV_CEIL: f32 = 160.0;
 
 /// PER-POSITION additive budget for the ribbon bed, indexed by gradient position
 /// (0 = red top … 1 = violet bottom).
@@ -1497,7 +1545,59 @@ const RAINBOW_WAKE_SEG_CAP: usize = 160;
 /// Segment length in device pixels (as a fraction of the cell, floored at 2 px).
 /// Small enough that the exponential reads as smooth, large enough that a full
 /// plume is a few dozen quads.
-const RAINBOW_WAKE_SEG: f32 = 0.30;
+///
+/// 2026-08-15 ("perfectly smooth"): 0.30 → 0.25. Worst case stays bounded: the
+/// smallest shipping cell (cw 9) already truncated to the 2 px floor at 0.30,
+/// so its segment count is unchanged (124 ≤ [`RAINBOW_WAKE_SEG_CAP`]); at cw 12
+/// the walk goes 92 → 110 segments, still comfortably under the cap.
+const RAINBOW_WAKE_SEG: f32 = 0.25;
+/// THE WAKE'S OWN SPATIAL RATE along the sweep — deliberately faster than the
+/// rail's [`RAINBOW_LIGHT_RAIL_SPREAD`] (0.045). The rail is a long-lived band
+/// across a whole line; the wake is at most [`RAINBOW_WAKE_LEN_MAX`] ×
+/// [`RAINBOW_WAKE_EXTENT`] cells and usually far shorter, and at the rail's
+/// rate a resting 4.5-cell plume sits inside ONE band — reviewed as "a short
+/// wake can be entirely red or indigo", the exact monochrome failure the
+/// redesign exists to kill. At 0.15 a band is 1⁄(5 × 0.15) ≈ 1.33 columns, so
+/// any resting-length window shows at least three distinct anchors — the
+/// minimum-diversity invariant, pinned by
+/// `any_resting_wake_length_shows_at_least_three_bands`.
+const RAINBOW_WAKE_SWEEP_SPREAD: f32 = 0.15;
+/// Boundary CROSSFADE half-width, in fractions of one band bin. Nearest-anchor
+/// quantization alone would step hard at every bin edge — visible both as a
+/// spatial seam and, because the sweep rides the phase clock, as a temporal
+/// pop on a stationary column (~every 0.56 s at full momentum). Blending the
+/// outer 0.16 of each bin toward its neighbour makes the law continuous in
+/// BOTH column and phase while leaving the middle 68 % of every band flat —
+/// still six nameable colours, never a gradient.
+const RAINBOW_WAKE_BAND_BLEND: f32 = 0.16;
+/// PER-BAND COVERAGE COMPENSATION — equal scalar coverage is not equal
+/// perceived light: the six anchors' Rec.709 lumas span 0.21 (red) to 0.93
+/// (yellow), so an uncompensated plume reads as bright yellow-green patches
+/// with dim red/indigo gaps. √(0.5⁄luma) shaped, bounded well under
+/// [`RAINBOW_WAKE_COMPOSITE_CAP`]⁄[`RAINBOW_WAKE_COV`]. Order matches
+/// [`RAINBOW_BANDS`]: red, orange, yellow, green, azure, indigo.
+///
+/// RED IS DELIBERATELY BARELY BOOSTED (1.10, not its √-law 1.53): additive
+/// light COMPOSITES over the ground, and the shipped dark grounds are
+/// blue-tinted (Nord bg 0x2E3440) — red pushed toward the clamp saturates
+/// its own channel while the ground's G/B leak through, and the eye reads
+/// PINK. The visual judge caught exactly this on iteration 2 ("saturated
+/// magenta/pink plume stretch … pale salmon-white nucleus"): the magenta the
+/// owner banned was being re-manufactured by the compensation itself.
+/// Indigo tolerates more (its own blue swallows the leak).
+const RAINBOW_WAKE_LUMA_COMP: [f32; 6] = [1.10, 0.88, 0.78, 0.84, 1.00, 1.12];
+/// The shock ring's own coverage scale under the per-column law. Under the
+/// distance ramp the ring sampled mid-plume (`s × 0.5`) and could never land
+/// on a saturated end band; per-column it can, and a full-strength two-cell
+/// indigo ring reads as a purple impact dominating the mark (review finding).
+/// The first answer — blending a third toward WHITE — was worse than the
+/// problem: over the red band the whitened flash is literally pink, at
+/// exactly the newest-keystroke position (the visual judge, iteration 3:
+/// "hot-magenta patch directly left of the … head"). Desaturation
+/// manufactures the banned family; BRIGHTNESS is the safe tamer. The ring
+/// keeps its band's pure colour at ~3/4 coverage — a coloured ripple, never
+/// a colour statement.
+const RAINBOW_WAKE_SHOCK_SCALE: f32 = 0.72;
 /// Steady-plume weight versus per-keystroke PULSE weight. The plume is the
 /// continuous body; the pulses are the cadence riding on it.
 const RAINBOW_WAKE_BASE: f32 = 0.62;
@@ -1624,11 +1724,20 @@ const RAINBOW_WAKE_FADE_OUT: f32 = 0.22;
 /// body, fading out over the hot half. Real comets have one, and CONTRAST WITHIN
 /// the effect is what reads as incandescent: a flat-coverage rect reads as a bar
 /// however bright it is.
-const RAINBOW_WAKE_FIL_STRIDE: usize = 2;
-const RAINBOW_WAKE_FIL_GAIN: f32 = 0.34;
+/// 2026-08-15 ("perfectly smooth"): stride 2 → 1 with the gain rebalanced
+/// 0.34 → 0.20 so the total filament energy is preserved — every-other-segment
+/// sampling read as a dotted nucleus on close inspection; every segment at
+/// lower gain is one unbroken thread.
+const RAINBOW_WAKE_FIL_STRIDE: usize = 1;
+const RAINBOW_WAKE_FIL_GAIN: f32 = 0.20;
 const RAINBOW_WAKE_FIL_FRAC: f32 = 0.38;
 const RAINBOW_WAKE_FIL_FADE: f32 = 1.6;
-const RAINBOW_WAKE_FIL_WHITE: f32 = 0.55;
+/// 2026-08-15 ("uses a magenta palette"): 0.55 → 0.30 → 0.25. At 0.55 the
+/// nucleus over the red band was literally (255, 140, 140) — pink — at the
+/// brightest spot of the whole mark; at 0.30 the judge still read a "pale
+/// salmon-white nucleus" over red on the blue-tinted Nord ground. At 0.25
+/// the incandescent read survives while red stays red.
+const RAINBOW_WAKE_FIL_WHITE: f32 = 0.25;
 /// THE AURA — a long, flat, dim glow lying in the leading under the streak:
 /// atmosphere, where the bloom is a rim. Halos are ELLIPTICAL and `halo_weight`
 /// zeroes as soon as the VERTICAL term alone reaches 256, so a wide horizontal
@@ -1656,25 +1765,69 @@ const RAINBOW_WAKE_SHOCK_GROW: f32 = 1.6;
 const RAINBOW_WAKE_SHOCK_RY: f32 = 1.6;
 const RAINBOW_WAKE_SHOCK_MAX: usize = 6;
 
-/// The wake's colour at `s` (0 at the nozzle → 1 at the tail): THE RAINBOW
-/// itself — literally [`RAINBOW_BANDS`] through [`rainbow_gradient_of`], the same six
-/// anchors the ribbon is built from.
+/// The wake's colour at a COLUMN: THE RAINBOW itself — the ribbon's own
+/// `bands`, nearest-anchor quantized along the family's reflected sweep at the
+/// wake's own spatial rate, with a narrow crossfade at the bin edges. Returns
+/// the colour and its per-band luma compensation (see
+/// [`RAINBOW_WAKE_LUMA_COMP`]), both blended across a boundary.
 ///
-/// OWNER, 2026-07-29: "it needs to match the nyan rainbow theme." It did not: the
-/// plume ran its own bespoke white-gold → yellow → orange → red → violet HEAT
-/// table, chosen so luminance fell monotonically and the exhaust read as cooling.
-/// That is a lovely idea about a rocket and the wrong idea about Nyan Cat — beside
-/// the actual ribbon it read as a different effect that happened to share a
-/// nozzle. Sampling the ribbon's own spectrum makes the plume unmistakably the
-/// same light as the trail it feeds.
+/// OWNER, 2026-08-15: "the color underline uses a magenta palette … that's not
+/// the correct color pallet. Redesign the underline." No magenta anchor exists
+/// anywhere in the family — the read was manufactured by the DISTANCE ramp
+/// this law replaces: the ramp span clamped at 1.0 while the walk ran to 2.5·L,
+/// handing indigo 35 % of every plume while `e^(−d/L)` concentrated the light
+/// in the red head — a bright red-pink head on a long violet tail IS the
+/// magenta family. Hue was also a function of distance-behind-the-nozzle, so
+/// the whole spectrum crawled leftward as you typed. Resolving per COLUMN
+/// (the light rail's own law, the "one sweep" every other mark on this line
+/// already reads) pins each column's colour to the glass: the rainbow is a
+/// place, and typing moves you across it.
 ///
-/// The cooling READ is not lost, because it never lived in the hue: brightness
-/// falloff is carried entirely by [`rainbow_wake_body`]'s `e^(-d/L)` coverage
-/// envelope, which is also what makes the plume drive forward. Hue and intensity
-/// were always separate; only the hue changed.
+/// The LINEAGE this law completes — both prior rulings still bind: 2026-07-29
+/// "it needs to match the nyan rainbow theme" retired the bespoke heat table
+/// for the ribbon's own anchors; 2026-08-11 "align the rainbow colour palettes
+/// between the underline and cursor trail" retired the continuous lerp for the
+/// six-anchor quantization and fed the momentum-rotated `bands` through both
+/// marks. This ruling retires the last divergence — the coordinate. The
+/// cooling READ never lived in the hue: brightness falloff is carried entirely
+/// by [`rainbow_wake_body`]'s `e^(−d/L)` coverage envelope, exactly as before.
+///
+/// Three review findings shaped the law (external design review, 2026-08-15):
+/// nearest-anchor `round(5t)` rather than `floor(6t)`, so the reflection's
+/// endpoint half-bins fold to interior width instead of doubling red/indigo
+/// at every fold; the wake gets its own spatial rate because at the rail's
+/// 0.045 a resting-length plume is monochrome ([`RAINBOW_WAKE_SWEEP_SPREAD`]);
+/// and the position argument is f32 — a left-clipped segment resolves a
+/// negative column through `rem_euclid`, never a `u16` cast.
 #[inline]
-fn rainbow_wake_ramp(s: f32) -> u32 {
-    rainbow_gradient_of(&RAINBOW_BANDS, s.clamp(0.0, 1.0))
+fn rainbow_wake_band_at(bands: &[u32; 6], colx: f32, phase: f32) -> (u32, f32) {
+    let t = rainbow_sweep_reflect(
+        colx * RAINBOW_WAKE_SWEEP_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW,
+    );
+    let u = t * 5.0;
+    let i = u.round();
+    let frac = u - i; // signed distance to the nearest anchor centre, −0.5..0.5
+    let idx = (i as usize).min(5);
+    let c = bands[idx];
+    let comp = RAINBOW_WAKE_LUMA_COMP[idx];
+    let d = frac.abs();
+    let edge = 0.5 - RAINBOW_WAKE_BAND_BLEND;
+    if d <= edge {
+        return (c, comp);
+    }
+    let j = if frac > 0.0 {
+        (idx + 1).min(5)
+    } else {
+        idx.saturating_sub(1)
+    };
+    // 0 at the flat body's edge → 0.5 exactly ON the boundary, so the two
+    // sides of every boundary meet at the same mix: continuous in column and
+    // in phase.
+    let k = ((d - edge) / RAINBOW_WAKE_BAND_BLEND).clamp(0.0, 1.0) * 0.5;
+    (
+        lerp_rgb(c, bands[j], k),
+        comp + (RAINBOW_WAKE_LUMA_COMP[j] - comp) * k,
+    )
 }
 
 /// The plume's steady body at `d` cells behind the nozzle for a plume of length
@@ -2537,17 +2690,28 @@ struct RainbowState {
     /// thinking pause already pruned the tail's original sparks. Reset on any
     /// non-typing move so a jump never resurrects ribbon patches elsewhere.
     tail: [Option<(u16, u16)>; 3],
-    /// Rolling ring of the most recent COMMITTED-PRESS instants
-    /// ([`CursorGlow::note_typed`]), newest overwrites oldest. The press BUDGET
-    /// behind two anti-stray gates (the owner: "a stray piece of trail
-    /// appear without text"): a multi-cell typed-coalesce must be backed by
-    /// at least as many recent presses as cells it sweeps (vim's normal-mode
-    /// `w` is ONE press echoing as a multi-cell hop — it must not paint the
-    /// skimmed word), and the terminus dissolve requires a press recent
-    /// enough that the ribbon is plausibly still VISIBLE (the eased momentum
-    /// proxy outlives the visible ribbon by seconds). Deliberately survives
-    /// both wipes: it is an input LEDGER, not light.
-    type_press_ring: [Option<Instant>; CursorGlow::RAINBOW_TYPED_SWEEP_MAX],
+    /// Rolling ring of the most recent COMMITTED presses as `(instant, CELL
+    /// CREDITS)` ([`CursorGlow::note_typed_cells`]), newest overwrites oldest.
+    /// The press BUDGET behind two anti-stray gates (the owner: "a stray
+    /// piece of trail appear without text"): a multi-cell typed-coalesce must
+    /// be backed by at least as many recent CELL CREDITS as cells it sweeps,
+    /// and the terminus dissolve requires a press recent enough that the
+    /// ribbon is plausibly still VISIBLE (the eased momentum proxy outlives
+    /// the visible ribbon by seconds).
+    ///
+    /// CREDITS, not a count (2026-08-15, "the rainbow in typing still has
+    /// some gaps"): one press of a WIDE glyph advances two columns and an IME
+    /// commit of N glyphs is ONE event advancing N+ columns — priced at one
+    /// press each, their echoes were structurally refused and fell to
+    /// landing-only lays, a multi-cell dark notch after every CJK character.
+    /// The HOST prices the credit at the input boundary (it alone knows the
+    /// committed text's cells), so the budget still counts nothing a PTY can
+    /// fake: vim's normal-mode `w` over existing wide text is still ONE
+    /// credit echoing as a multi-cell hop, still refused. Admitted coalesces
+    /// SPEND their credits ([`CursorGlow::spend_typed_credits`]), so one
+    /// pool can never fund a second stray move. Deliberately survives both
+    /// wipes: it is an input LEDGER, not light.
+    type_press_ring: [Option<(Instant, u8)>; CursorGlow::RAINBOW_TYPED_SWEEP_MAX],
     /// Next write slot in [`Self::type_press_ring`].
     type_press_head: usize,
     /// Live rainbow kitty finger-lift RETRACT: `(started, ribbon cells at start)`. Set
@@ -2623,6 +2787,17 @@ struct RainbowState {
     /// cold — where the iridescence amplitude is zero anyway). Pure function of
     /// injected clocks; wrapped to a bounded ring so it never loses fp precision.
     phase: f32,
+    /// WAKE FOLD CARRY (owner, 2026-08-15: "the rainbow streak … has some
+    /// gaps"): `(folded_at, visible_len_cells)` stashed by a positively
+    /// classified typed WRAP. The wake's throttle scan counts only nozzle-row
+    /// pops, so every wrap restarted the underline from `LEN_MIN` — a visible
+    /// death at each line end. This carries the plume's LENGTH as one scalar
+    /// across the fold, decaying over [`FRESH_INK_LIFE_S`]; deliberately NOT
+    /// old-row geometry — a scalar cannot paint stale rows (the review's
+    /// verdict on the two-leg design), it only stretches a plume the new
+    /// row's own pops already anchor. Cleared by any non-typing move and by
+    /// every transient teardown.
+    wake_fold_carry: Option<(Instant, f32)>,
 }
 
 impl RainbowState {
@@ -2640,6 +2815,7 @@ impl RainbowState {
         self.ink_pops.clear();
         self.wake_head = None;
         self.wake_at = None;
+        self.wake_fold_carry = None;
         // The anti-stray PRESS WITNESS itself. Stale evidence must not let the
         // first move after a master-off/on cycle celebrate on typing that
         // happened before the effect was ever switched off.
@@ -3830,11 +4006,22 @@ impl CursorGlow {
     /// (a multiplier on the momentum-derived thickness, so a hot fling is
     /// still fatter than a cold one at the same distance).
     const RAINBOW_JUMP_FAT_GAIN: f32 = 0.85;
-    /// …and how much brighter. Deliberately smaller than the fat gain: the
-    /// head coverage already sits near [`RAINBOW_TRANSIENT_COV_CAP`], so most
-    /// of "brighter" has to be bought as AREA (a fatter band beam and a wider
-    /// nucleus) rather than as coverage that would only clamp.
-    const RAINBOW_JUMP_BRIGHT_GAIN: f32 = 0.28;
+    /// …and how much brighter.
+    ///
+    /// 0.28 → 0.50 (owner, 2026-08-11: "make the streak when jumping the cursor
+    /// brighter"). The old doc argued this had to stay the small term of the
+    /// pair because "head coverage already sits near
+    /// [`RAINBOW_TRANSIENT_COV_CAP`], so most of brighter has to be bought as
+    /// AREA … rather than as coverage that would only clamp". That was wrong on
+    /// its own terms: nothing clamped `head_cov` at the transient cap — the cap
+    /// is the BASE the gain multiplies — so the coverage was never clamping, it
+    /// was simply never asked for. What actually kept the streak dim is the
+    /// per-segment taper (see `SEG` in `emit_rainbow_jumps`), which ran 80 % of
+    /// the streak's LENGTH at 12–55 % of the head.
+    ///
+    /// Bounded by [`RAINBOW_JUMP_COV_CEIL`], so "brighter" is a number with a
+    /// roof rather than an open multiply.
+    const RAINBOW_JUMP_BRIGHT_GAIN: f32 = 0.50;
 
     // ── THE RAINBOW GLITTER SUPERNOVA ──────────────────────────────────────
     //
@@ -3940,7 +4127,24 @@ impl CursorGlow {
     /// meant to garnish. Two keeps the trail's twinkle present at a real fling
     /// without turning the landing into a field of crosses; the earning ramp
     /// steepened to match (`dist/5 → dist/12` at the spawn site).
-    const RAINBOW_BURST_SPARKLES: usize = 2;
+    ///
+    /// …AND 2 → 6, with the ramp back to `dist/5` (owner, 2026-08-11: "add the
+    /// white sparkles from the cursor trail to the cursor impact animation").
+    /// The 9 → 2 cut was made when this population was UNCONDITIONALLY a 4-point
+    /// plus, and it was the right cut for that population. It is no longer that
+    /// population: the silhouette is DEALT at the emit site
+    /// ([`crate::effect_util::star_accent`], 1-in-16), so the overwhelming
+    /// majority of these are the trail's ROUND WHITE STARDUST MOTES — precisely
+    /// the "white sparkles" being asked for — and a cross is the rare accent.
+    ///
+    /// The arithmetic the cut's own reasoning implies: at 2 the expected crosses
+    /// per landing are 0.125, so seven landings in eight showed the impact with
+    /// no trail twinkle in it at all, which is the complaint. At 6 the expected
+    /// crosses are 0.375 — still under HALF of the ONE cross the pre-deal
+    /// two-plus landing threw unconditionally, so the "too extreme" bar is not
+    /// merely respected, it is beaten — while six white motes make the trail's
+    /// own starfield unmistakably present at the impact.
+    const RAINBOW_BURST_SPARKLES: usize = 6;
     /// Twinkle stars scattered at a dissolving ribbon TERMINUS (Feature A). A
     /// small handful — enough to MELT the end, never a cloud. Count-capped by
     /// [`Self::MAX_PARTICLES`] like every other spawn.
@@ -4272,12 +4476,21 @@ impl CursorGlow {
     /// ~1/rate seconds to travel head→tail flat-out, and stalls when cold.
     const RAINBOW_PHASE_RATE: f32 = 0.85;
     /// Momentum hue-rotation amplitude for the ribbon's iridescent SPECTRUM
-    /// (turns at full spine): the six anchor hues rotate gently (±~23°) around
-    /// the colour wheel as the swing travels along the ribbon, so a hot ribbon
-    /// shimmers through neighbouring rainbows (rose-reds, teal-greens,
-    /// violet-blues) — the "dynamic range" dial. A cold ribbon keeps the exact
-    /// fixed [`RAINBOW_BANDS`] bytes (the crisp-flat contract).
-    const RAINBOW_HUE_SWING: f32 = 0.065;
+    /// (turns at full spine): the six anchor hues rotate gently around the
+    /// colour wheel as the swing travels along the ribbon, so a hot ribbon
+    /// shimmers through neighbouring rainbows — the "dynamic range" dial. A
+    /// cold ribbon keeps the exact fixed [`RAINBOW_BANDS`] bytes (the
+    /// crisp-flat contract).
+    ///
+    /// 2026-08-15: 0.065 → 0.040 (±23.4° → ±14.4°). The wheel gap between the
+    /// two END anchors through magenta is only 105°, and at ±23° the swing
+    /// pushed red to 336.6° — raspberry — in column-coherent word-length runs
+    /// at exactly the speed the ribbon is most on screen. Both the external
+    /// design review and the visual judge called the result "wine/magenta
+    /// upper stretches" on a mark whose owner ruling is that magenta is NOT
+    /// the palette. ±14.4° keeps the shimmer (worst red is 345.6°, still
+    /// red) and cannot reach the magenta family from either end.
+    const RAINBOW_HUE_SWING: f32 = 0.040;
     /// Radians of travelling-wave phase per unit of `rainbow.phase` (the
     /// INTEGRATED, momentum-proportional spine clock). Chosen as 2π·1728/1024
     /// so the phase ring's 1024 wrap lands on a whole number of wave cycles —
@@ -4745,8 +4958,20 @@ impl CursorGlow {
     /// `spawn`). The hint — never move shape alone — is the classifier, so
     /// hosts/tests that never arm it are byte-identical.
     pub fn note_typed(&mut self, now: Instant) {
+        self.note_typed_cells(now, 1);
+    }
+
+    /// [`Self::note_typed`] with the committed text's CELL WIDTH: the host
+    /// prices a wide glyph at 2 and an IME commit at its summed cells, so the
+    /// coalesce press budget stops structurally refusing CJK typing (see the
+    /// [`RainbowState::type_press_ring`] doc). Clamped to the sweep max — a
+    /// single event can never bank more credit than one observed move can
+    /// spend. Everything a plain keyboard produces goes through the 1-cell
+    /// [`Self::note_typed`] wrapper unchanged.
+    pub fn note_typed_cells(&mut self, now: Instant, cells: u16) {
         self.type_hint = Some(now);
-        self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some(now);
+        let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
+        self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some((now, credits));
         self.rainbow.type_press_head =
             (self.rainbow.type_press_head + 1) % Self::RAINBOW_TYPED_SWEEP_MAX;
     }
@@ -4792,16 +5017,86 @@ impl CursorGlow {
         self.reflow_hint.is_some()
     }
 
-    /// How many committed presses landed within the trailing `window`
+    /// How many committed CELL CREDITS landed within the trailing `window`
     /// seconds — the press BUDGET consumed by the anti-stray gates (see
     /// [`RainbowState::type_press_ring`]). Capacity-bounded by the ring; reads only.
-    fn typed_presses_within(&self, now: Instant, window: f32) -> usize {
+    fn typed_credits_within(&self, now: Instant, window: f32) -> usize {
         self.rainbow
             .type_press_ring
             .iter()
             .flatten()
-            .filter(|t| now.saturating_duration_since(**t).as_secs_f32() <= window)
-            .count()
+            .filter(|(t, _)| now.saturating_duration_since(*t).as_secs_f32() <= window)
+            .map(|(_, c)| *c as usize)
+            .sum()
+    }
+
+    /// The plume LENGTH `row`'s live pops currently gauge — the wake
+    /// emitter's own speedometer (distance the hand covered ÷ the time it
+    /// took, times persist), evaluated at spawn time for the FOLD CARRY.
+    /// Returns 0 when the row holds no live pop.
+    fn wake_len_of_row(&self, now: Instant, row: u16, persist: f32) -> f32 {
+        let mut newest = f32::MAX;
+        let mut oldest = 0.0f32;
+        let (mut ncol, mut ocol) = (0u16, 0u16);
+        for p in &self.rainbow.ink_pops {
+            if p.row != row {
+                continue;
+            }
+            let age = now.saturating_duration_since(p.born).as_secs_f32();
+            if age >= FRESH_INK_LIFE_S {
+                continue;
+            }
+            if age < newest {
+                newest = age;
+                ncol = p.col;
+            }
+            if age >= oldest {
+                oldest = age;
+                ocol = p.col;
+            }
+        }
+        if newest >= FRESH_INK_LIFE_S {
+            return 0.0;
+        }
+        let travelled = ncol.saturating_sub(ocol) as f32;
+        let elapsed = oldest - newest;
+        let speed = if elapsed > 1e-3 {
+            (travelled / elapsed).max(0.0)
+        } else {
+            0.0
+        };
+        (RAINBOW_WAKE_LEN_MIN + speed * persist.max(0.0)).min(RAINBOW_WAKE_LEN_MAX)
+    }
+
+    /// SPEND an admitted coalesce's credits, oldest-first: the presses that
+    /// produced this echo are the ones consumed, so one pool of real typing
+    /// can never fund a SECOND multi-cell echo (a scroll-by that happens to
+    /// land inside the window buys nothing — its cells were already paid to
+    /// the move they belong to).
+    fn spend_typed_credits(&mut self, now: Instant, mut cells: usize) {
+        while cells > 0 {
+            let mut oldest: Option<(usize, Instant)> = None;
+            for (i, slot) in self.rainbow.type_press_ring.iter().enumerate() {
+                if let Some((t, c)) = slot
+                    && *c > 0
+                    && now.saturating_duration_since(*t).as_secs_f32()
+                        <= Self::RAINBOW_COALESCE_PRESS_WINDOW
+                    && oldest.is_none_or(|(_, ot)| *t < ot)
+                {
+                    oldest = Some((i, *t));
+                }
+            }
+            let Some((i, _)) = oldest else { break };
+            let Some((_, c)) = &mut self.rainbow.type_press_ring[i] else {
+                break;
+            };
+            let take = (*c as usize).min(cells);
+            *c -= take as u8;
+            cells -= take;
+            if *c == 0 {
+                self.rainbow.type_press_ring[i] = None;
+            }
+        }
     }
 
     /// REDUCED-MOTION arm for the FRESH-INK pop (see the `reduced_motion`
@@ -6901,15 +7196,33 @@ impl CursorGlow {
             && dc_abs >= 2
             && dc_abs as usize <= Self::RAINBOW_TYPED_SWEEP_MAX
             && (!self.ctx_alt || blink_fresh)
-            // PRESS BUDGET (anti-stray): N swept cells must be
-            // backed by ≥N recent presses — batched echoes really deliver N
-            // glyphs from N keys, while vim's normal-mode `w` is ONE press
+            // PRESS BUDGET (anti-stray): N swept cells must be backed by ≥N
+            // recent CELL CREDITS — batched echoes really deliver N cells
+            // from real presses (a wide glyph's press is worth its 2 cells,
+            // an IME commit its summed cells — the host prices them at the
+            // input boundary), while vim's normal-mode `w` is ONE credit
             // echoing as a multi-cell hop (and its statusline repaint can
             // read as blink_fresh, defeating the alt-screen discriminator
-            // alone). One press must never paint a ribbon over a word the
+            // alone). One credit must never paint a ribbon over a word the
             // user only skimmed.
-            && self.typed_presses_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW)
+            && self.typed_credits_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW)
                 >= dc_abs as usize;
+        // An admitted coalesce SPENDS what funded it: the same pool can never
+        // pay for a second stray multi-cell echo inside the window.
+        if rainbow_coalesce {
+            self.spend_typed_credits(now, dc_abs as usize);
+        }
+        // WAKE FOLD CARRY: a positively classified typed WRAP stashes the old
+        // row's plume length so the underline hands its energy across the
+        // fold instead of dying at every line end (see the field doc). Only
+        // `shape_wrap` — a re-anchor is a repaint, not a fold — and only a
+        // plume that had grown past resting is worth carrying.
+        if shape_wrap && matches!(cfg.style, GlowStyle::RainbowKitty) {
+            let carried = self.wake_len_of_row(now, pr, cfg.wake_persist_s);
+            if carried > RAINBOW_WAKE_LEN_MIN {
+                self.rainbow.wake_fold_carry = Some((now, carried));
+            }
+        }
         // Honour BOTH coalesce paths: `rainbow_coalesce` collapses a late-observed
         // RAINBOW KITTY rainbow echo, `echo_run` the same for PHASER/non-rainbow-kitty (they are
         // mutually exclusive by style — `echo_run` excludes rainbow kitty), and `wrap`
@@ -6920,6 +7233,12 @@ impl CursorGlow {
             raw_dist
         };
         let typing = dist <= 1.0;
+        // A non-typing move ORPHANS the carry: a jump/nav landing must never
+        // inherit a folded plume's energy (the same law as the wake's own
+        // orphan guard).
+        if !typing {
+            self.rainbow.wake_fold_carry = None;
+        }
         let fire = matches!(cfg.style, GlowStyle::Fire);
         // EMBERFORGE momentum direction: only a FORWARD advance (one column
         // right on the same row — a typed glyph's echo) earns heat/coal.
@@ -11905,7 +12224,7 @@ impl CursorGlow {
         // (`cold_cursor_jump_scatters_no_terminus`). The BEAM still draws
         // cold; only its debris is earned.
         if self.reduced_motion
-            || self.typed_presses_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) == 0
+            || self.typed_credits_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) == 0
         {
             return;
         }
@@ -11972,7 +12291,7 @@ impl CursorGlow {
         // jump) and drops the case where nothing has been typed at all.
         // Navigation keys are not typed presses, so idle recall is silent.
         if dist >= Self::RAINBOW_BURST_MIN_DIST
-            && self.typed_presses_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) > 0
+            && self.typed_credits_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) > 0
         {
             if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
                 self.rainbow.bursts.remove(0);
@@ -12006,11 +12325,19 @@ impl CursorGlow {
             // interleaved with the colour stars (see `emit_rainbow_starburst`).
             // Zero on a short hop for the same anti-noise reason the star floor
             // exists: sparkles are the celebration, and a two-cell hop is not
-            // one. The ramp steepened `dist/5 → dist/12` with the sparkle
-            // rebalance (the plus is an accent now): the first plus arrives
-            // only at a real leap (~12 cells), the second at a genuine fling —
-            // see [`Self::RAINBOW_BURST_SPARKLES`].
-            let sparkles = ((dist / 12.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
+            // one.
+            //
+            // BACK TO `dist/5` from `dist/12` (owner, 2026-08-11: the impact
+            // should carry the trail's white sparkles). The steep ramp was the
+            // other half of the 9 → 2 cut, and it compounded with it: at
+            // `dist/12` a 20-cell leap — a real word-motion fling — earned ONE
+            // sparkle, which the 1-in-16 silhouette deal then drew as a single
+            // round mote fifteen times out of sixteen. `dist/5` earns four
+            // there and saturates at a screen-crossing 30, so the impact is
+            // dressed in proportion to the jump exactly as its colour stars and
+            // its reach already are — see [`Self::RAINBOW_BURST_SPARKLES`] for
+            // why a bigger count is not a return to a field of crosses.
+            let sparkles = ((dist / 5.0) as usize).min(Self::RAINBOW_BURST_SPARKLES) as u8;
             self.rainbow.bursts.push(Starburst {
                 cx: landing.0,
                 cy: landing.1,
@@ -12987,8 +13314,8 @@ impl CursorGlow {
             } else {
                 1.0
             };
-            let head_cov =
-                (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity * bright).clamp(0.0, 255.0);
+            let head_cov = (RAINBOW_TRANSIENT_COV_CAP * fade * cfg.intensity * bright)
+                .clamp(0.0, RAINBOW_JUMP_COV_CEIL);
             if head_cov < 1.0 {
                 continue;
             }
@@ -13084,18 +13411,37 @@ impl CursorGlow {
             // TAPER — constant thickness reads as a highlight, not speed: the
             // streak is drawn in three chained segments — a slim dim
             // tail, a mid, and a thick bright head wedge — per band.
+            //
+            // THE COVERAGE COLUMN IS WHERE THE STREAK'S BRIGHTNESS ACTUALLY
+            // LIVES, and it is the thing the "make it brighter" dials never
+            // touched. Measured off a captured Home-fling on the default dark
+            // theme at the shipping 0.7 intensity: mid-streak the red band lifted
+            // the (26,27,38) ground by ~30/255 — a 12 % wash, on the one gesture
+            // in this family the user is deliberately watching. The head wedge
+            // was fine; it is only 20 % of the length, and 0.12/0.55 across the
+            // other 80 % is what the eye was reading.
+            //
+            // 0.12 → 0.34 and 0.55 → 0.78 (owner, 2026-08-11: "make the streak
+            // when jumping the cursor brighter"). The TAPER SURVIVES — the tail
+            // is still barely a third of the head and the ordering is untouched,
+            // so the streak still reads as a meteor with a dying tail rather
+            // than a drawn rule — but the tail is now visible light instead of a
+            // hint. Every value stays under 1.0, i.e. under the head, i.e. under
+            // [`RAINBOW_JUMP_COV_CEIL`] by construction.
+            //
+            // Coverage-graded strides (the meteor-aura / COMET_LAYERS
+            // pattern): the dim tail haze reads identically in 3 px slabs,
+            // the mid takes 2 px (3 px staircases on diagonals — the
+            // LASER_LAYERS lesson), and only the bright head wedge pays
+            // for 1 px sampling. That keeps a cross-window jump at ~3.15L
+            // slabs rather than ~6L, so RAINBOW_JUMP_CAP live streaks cannot
+            // saturate MAX_QUADS on their own and starve the landing
+            // crown/ring/particles behind them. UNTOUCHED by the brightening:
+            // the quad budget is a different argument from the coverage one.
             const SEG: [(f32, f32, f32, f32, usize); 3] = [
                 // (start_t, end_t, thickness ×, coverage ×, major-axis step px)
-                // Coverage-graded strides (the meteor-aura / COMET_LAYERS
-                // pattern): the dim tail haze reads identically in 3 px slabs,
-                // the mid takes 2 px (3 px staircases on diagonals — the
-                // LASER_LAYERS lesson), and only the bright head wedge pays
-                // for 1 px sampling. That keeps a cross-window jump at ~3.15L
-                // slabs rather than ~6L, so RAINBOW_JUMP_CAP live streaks cannot
-                // saturate MAX_QUADS on their own and starve the landing
-                // crown/ring/particles behind them.
-                (0.0, 0.45, 0.45, 0.12, 3),
-                (0.45, 0.8, 0.75, 0.55, 2),
+                (0.0, 0.45, 0.45, 0.34, 3),
+                (0.45, 0.8, 0.75, 0.78, 2),
                 (0.8, 1.0, 1.0, 1.0, 1),
             ];
             for (band, &color) in RAINBOW_BANDS.iter().enumerate() {
@@ -13117,7 +13463,13 @@ impl CursorGlow {
                     };
                     let off0 = off + wave(t0);
                     let off1 = off + wave(t1);
-                    let c0 = (head_cov * covx * 0.6) as u8;
+                    // The WITHIN-segment ramp: each chained segment darkens
+                    // toward its own tail end so the three joins read as one
+                    // continuous gradient rather than three bars. 0.6 → 0.78
+                    // with the coverage column above — at 0.6 the tail segment's
+                    // far end ran at 7 % of the head, which is below the point
+                    // where a band's hue is nameable at all.
+                    let c0 = (head_cov * covx * 0.78) as u8;
                     let c1 = (head_cov * covx) as u8;
                     if c1 == 0 {
                         continue;
@@ -13413,30 +13765,15 @@ impl CursorGlow {
         // slabs (`rainbow_slab_at`), which cost no light at all.
         const RAINBOW_FEATHER: f32 = 0.18;
         let hot = self.rainbow.disp >= 0.005;
-        // MOMENTUM IRIDESCENT SPECTRUM — the "dynamic range" dial: at speed
-        // the six anchor hues rotate gently around the wheel, the swing
-        // travelling along the ribbon with the specular phase, so a hot
-        // ribbon shimmers through neighbouring rainbows instead of freezing
-        // on six constants. Rides the eased spine exactly like the shimmer
-        // and glint: a COLD ribbon keeps the fixed RAINBOW_BANDS bytes (the
-        // crisp-flat contract), and hue rotation preserves saturation and
-        // value, so the text-safety coverage math is untouched.
-        let bands = if hot {
-            let swing = Self::RAINBOW_HUE_SWING * self.rainbow.disp;
-            let hue_off = swing
-                * (self.rainbow.phase * 2.2 + s.col as f32 * 0.16 + s.row as f32 * 0.37).sin();
-            if hue_off.abs() < 0.001 {
-                RAINBOW_BANDS
-            } else {
-                let mut b = RAINBOW_BANDS;
-                for (c, &hsv) in b.iter_mut().zip(RAINBOW_BANDS_HSV.iter()) {
-                    *c = rotate_hue(hsv, hue_off);
-                }
-                b
-            }
-        } else {
-            RAINBOW_BANDS
-        };
+        // MOMENTUM IRIDESCENT SPECTRUM — see [`rainbow_momentum_bands`], which
+        // is this expression, lifted so the wake plume under the line resolves
+        // the SAME six anchors at the same cell instead of its own.
+        let bands = rainbow_momentum_bands(
+            s.col as f32,
+            s.row as f32,
+            self.rainbow.phase,
+            self.rainbow.disp,
+        );
         let strips: i32 = if hot {
             (geom.cw.div_ceil(4) as i32).clamp(1, 3)
         } else {
@@ -14550,11 +14887,19 @@ impl CursorGlow {
     /// (so the plume's LENGTH is the speedometer), and each live keystroke
     /// contributes a travelling gaussian `pulse` — distinct puffs at a
     /// hunt-and-peck rhythm, one merged plume at speed. Thickness tapers from
-    /// [`RAINBOW_WAKE_H_HEAD`] to [`RAINBOW_WAKE_H_TAIL`] and colour runs the
-    /// [`rainbow_wake_ramp`] heat ramp, so the form reads as a comet rather than a
+    /// [`RAINBOW_WAKE_H_HEAD`] to [`RAINBOW_WAKE_H_TAIL`] and colour steps the
+    /// [`rainbow_wake_ramp`] band ramp, so the form reads as a comet rather than a
     /// rule and as the ribbon's own light cooling rather than a second unrelated
-    /// glow. Nothing in it is quantised to the cell grid — cell-quantised marks
-    /// read as UI chrome, not as light.
+    /// glow.
+    ///
+    /// Its GEOMETRY is quantised to nothing — position, thickness and brightness
+    /// are continuous functions of horizontal position, because cell-quantised
+    /// marks read as UI chrome, not as light. Its COLOUR is deliberately the
+    /// opposite: six flat bands along the ramp, and a momentum rotation resolved
+    /// once per COLUMN, because that is what the ribbon's own body does and the
+    /// two marks have to be one palette (see [`rainbow_wake_ramp`]). Neither
+    /// quantisation is visible as a step in the form — the band boundaries fall
+    /// at sixths of the plume's length, nowhere near a cell edge.
     ///
     /// LEGIBILITY IS STRUCTURAL, not budgeted. The plume is at most
     /// [`RAINBOW_WAKE_H_HEAD`] of a cell thick and centred exactly on the ROW
@@ -14684,6 +15029,25 @@ impl CursorGlow {
             };
             (RAINBOW_WAKE_LEN_MIN + speed * persist).min(RAINBOW_WAKE_LEN_MAX)
         };
+        // FOLD CARRY: a typed wrap hands the old row's plume length across
+        // the fold (see [`RainbowState::wake_fold_carry`]) — the underline
+        // keeps its earned energy at a line end instead of restarting as a
+        // resting nub. Max, not sum: as the new row's own speedometer catches
+        // up, its natural length takes over seamlessly; meanwhile the carry
+        // decays to nothing inside one pop life. Reduced motion keeps its
+        // frozen resting length — nothing may grow or move there.
+        let len = if self.reduced_motion {
+            len
+        } else if let Some((at, clen)) = self.rainbow.wake_fold_carry {
+            let age = now.saturating_duration_since(at).as_secs_f32();
+            if age < FRESH_INK_LIFE_S {
+                len.max(clen * (1.0 - age / FRESH_INK_LIFE_S))
+            } else {
+                len
+            }
+        } else {
+            len
+        };
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let head_px = geom.origin_x as f32 + head_col * cwf;
         // The plume's spine: the ROW BOUNDARY under the typed row — the middle
@@ -14749,6 +15113,18 @@ impl CursorGlow {
         let mut segs = 0usize;
         let mut x = head_px as i32 - seg;
         let left_bound = geom.fx_left();
+        // THE RIBBON'S SPECTRUM, MEMOIZED PER COLUMN. Every coloured layer below
+        // (core, filament, bloom, aura, shock ring) reads the same six anchors
+        // the ribbon cell directly above this segment reads — same column, same
+        // row, same phase, so the underline and the trail are one palette rather
+        // than two (see [`rainbow_wake_ramp`]).
+        //
+        // Memoized because [`RAINBOW_WAKE_SEG`] is 0.30 of a cell: ~3.3 segments
+        // share every column, and the rotation is an HSV round trip per anchor.
+        // The memo makes the plume's spectrum cost O(columns), which is the same
+        // order the ribbon already pays, instead of O(segments).
+        let mut band_col = i32::MIN;
+        let mut bands = RAINBOW_BANDS;
         while x + seg > left_bound && segs < RAINBOW_WAKE_SEG_CAP {
             if out.len() >= Self::MAX_QUADS {
                 break;
@@ -14799,16 +15175,22 @@ impl CursorGlow {
                 continue;
             }
             // Thickness taper (cells → device px, floored so the plume never
-            // disappears into sub-pixel nothing) and the heat ramp position.
+            // disappears into sub-pixel nothing) and the taper position along
+            // the visible reach. `s` shapes THICKNESS and the filament fade
+            // only — colour resolves per column, not per distance.
             let s = (d / (len * RAINBOW_WAKE_RAMP_SPAN)).clamp(0.0, 1.0);
             // BEAT SWELL: a keystroke does not merely brighten its stretch of
             // plume, it PUNCHES it. `beat` is 0 under reduced motion (the pulse
             // ring is left empty there), so the thickness is a frozen constant.
             let swell = RAINBOW_WAKE_BEAT_FLOOR + (1.0 - RAINBOW_WAKE_BEAT_FLOOR) * beat;
-            let th = ((RAINBOW_WAKE_H_HEAD + (RAINBOW_WAKE_H_TAIL - RAINBOW_WAKE_H_HEAD) * s)
+            // Kept fractional to the edge rounding below: truncating to whole
+            // px here made the cross-section jump a pixel whenever the swell
+            // breathed across an integer — one of the visible "not perfectly
+            // smooth" steps (2026-08-15).
+            let thf = ((RAINBOW_WAKE_H_HEAD + (RAINBOW_WAKE_H_TAIL - RAINBOW_WAKE_H_HEAD) * s)
                 * swell
                 * chf)
-                .max(2.0) as i32;
+                .max(2.0);
             // TAIL MELT: the walk stops at `reach_px`, where the body is still
             // visible — a cut, not a fade. Melt the last `RAINBOW_WAKE_FADE_OUT` of
             // the reach to exactly zero, which is what the `RAINBOW_WAKE_EXTENT`
@@ -14821,15 +15203,65 @@ impl CursorGlow {
             let cxf = x as f32 + seg as f32 * 0.5;
             if cov >= 1.0 {
                 if cfg.dark_theme {
-                    push_rect(
-                        out,
-                        geom,
-                        x,
-                        (spine_y - th as f32 * 0.5).round() as i32,
-                        seg,
-                        th,
-                        premul_rgb(rainbow_wake_ramp(s), cov as u8),
-                    );
+                    // The COLUMN at this segment's CENTRE, kept fractional:
+                    // the sweep resolves at f32 (a left-clipped segment's
+                    // negative column folds through `rem_euclid`, never a
+                    // truncating cast), while the momentum ROTATION memoizes
+                    // per integer column exactly as before — the HSV round
+                    // trips stay O(columns).
+                    let colx = (cxf - f32::from(geom.origin_x)) / cwf;
+                    let col = colx.floor() as i32;
+                    if col != band_col {
+                        band_col = col;
+                        bands = rainbow_momentum_bands(
+                            col as f32,
+                            f32::from(hrow),
+                            self.rainbow.phase,
+                            self.rainbow.disp,
+                        );
+                    }
+                    // The column's colour and its luma compensation, folded
+                    // into the coverage BEFORE the shared-headroom ledger so
+                    // the composite-cap accounting stays exact per pixel.
+                    let (band_rgb, comp) =
+                        rainbow_wake_band_at(&bands, colx, self.rainbow.phase);
+                    let cov = (cov * comp).min(255.0);
+                    // Independent edge rounding: the top and bottom edges
+                    // each round to their own pixel, so a breathing thickness
+                    // grows one edge at a time instead of the whole rect
+                    // re-centering with a visible hop.
+                    let y0 = (spine_y - thf * 0.5).round() as i32;
+                    let y1 = ((spine_y + thf * 0.5).round() as i32).max(y0 + 2);
+                    let th = y1 - y0;
+                    // The compensation can price a bright band's segment under
+                    // one count; below a byte there is nothing to draw (the
+                    // layered gains all self-skip the same way).
+                    if cov >= 1.0 {
+                        push_rect(out, geom, x, y0, seg, th, premul_rgb(band_rgb, cov as u8));
+                    }
+                    // SUB-PIXEL HEAD CAP: the nozzle eases in f32 but a rect
+                    // starts on an integer edge, so the head advanced in
+                    // whole-pixel pops. One 1-px rect on the fractional strip
+                    // ahead of the newest segment, weighted by the covered
+                    // fraction, is the antialiasing that makes the head GLIDE
+                    // (2026-08-15, "perfectly smooth"). Different pixels from
+                    // every walked segment, so the headroom ledger is
+                    // untouched.
+                    if segs == 0 {
+                        let hfrac = head_px - head_px.floor();
+                        let capc = cov * hfrac;
+                        if capc >= 1.0 {
+                            push_rect(
+                                out,
+                                geom,
+                                head_px as i32,
+                                y0,
+                                1,
+                                th,
+                                premul_rgb(band_rgb, capc as u8),
+                            );
+                        }
+                    }
                     // ONE SHARED HEADROOM. Core, filament, bloom, aura and shock
                     // ring composite on the SAME pixels, so each claims only what
                     // the ceiling has left: `cov + spent <= COMPOSITE_CAP` is true
@@ -14844,20 +15276,18 @@ impl CursorGlow {
                         let fil = (cov * RAINBOW_WAKE_FIL_GAIN * fil_k)
                             .min((RAINBOW_WAKE_COMPOSITE_CAP - cov - spent).max(0.0));
                         if fil >= 1.0 {
-                            let fth = ((th as f32 * RAINBOW_WAKE_FIL_FRAC).round() as i32).max(1);
+                            let fthf = (thf * RAINBOW_WAKE_FIL_FRAC).max(1.0);
+                            let fy0 = (spine_y - fthf * 0.5).round() as i32;
+                            let fy1 = ((spine_y + fthf * 0.5).round() as i32).max(fy0 + 1);
                             push_rect(
                                 out,
                                 geom,
                                 x,
-                                (spine_y - fth as f32 * 0.5).round() as i32,
+                                fy0,
                                 seg,
-                                fth,
+                                fy1 - fy0,
                                 premul_rgb(
-                                    lerp_rgb(
-                                        rainbow_wake_ramp(s),
-                                        0x00FF_FFFF,
-                                        RAINBOW_WAKE_FIL_WHITE,
-                                    ),
+                                    lerp_rgb(band_rgb, 0x00FF_FFFF, RAINBOW_WAKE_FIL_WHITE),
                                     fil as u8,
                                 ),
                             );
@@ -14882,8 +15312,8 @@ impl CursorGlow {
                                 seg as f32
                                     * RAINBOW_WAKE_BLOOM_STRIDE as f32
                                     * RAINBOW_WAKE_BLOOM_RX,
-                                th as f32 * 1.35,
-                                premul_rgb(rainbow_wake_ramp(s), bcov as u8),
+                                thf * 1.35,
+                                premul_rgb(band_rgb, bcov as u8),
                             );
                             spent += bcov;
                         }
@@ -14903,8 +15333,8 @@ impl CursorGlow {
                                 cxf,
                                 spine_y,
                                 seg as f32 * RAINBOW_WAKE_AURA_STRIDE as f32 * RAINBOW_WAKE_AURA_RX,
-                                (th as f32 * RAINBOW_WAKE_AURA_RY).min(ry_safe),
-                                premul_rgb(rainbow_wake_ramp(s), acov as u8),
+                                (thf * RAINBOW_WAKE_AURA_RY).min(ry_safe),
+                                premul_rgb(band_rgb, acov as u8),
                             );
                             spent += acov;
                         }
@@ -14930,7 +15360,10 @@ impl CursorGlow {
                                 .min((head_px - cxf).max(seg as f32)),
                             (chf * RAINBOW_WAKE_H_HEAD * (0.9 + RAINBOW_WAKE_SHOCK_RY * e))
                                 .min(ry_safe),
-                            premul_rgb(rainbow_wake_ramp(s * 0.5), scov as u8),
+                            // The band's PURE colour at reduced coverage (see
+                            // [`RAINBOW_WAKE_SHOCK_SCALE`]): whitening this
+                            // flash pinked the red band at the head.
+                            premul_rgb(band_rgb, (scov * RAINBOW_WAKE_SHOCK_SCALE) as u8),
                         );
                         spent += scov;
                     }
@@ -14967,7 +15400,7 @@ impl CursorGlow {
                             cxf,
                             spine_y,
                             seg as f32 * 0.95,
-                            (th as f32 * 0.62).min(ry_safe),
+                            (thf * 0.62).min(ry_safe),
                             rainbow_wake_veil(alpha as u8),
                             FRESH_INK_LIGHT_VEIL_PEAK,
                         );
@@ -16878,6 +17311,39 @@ fn rainbow_gradient_of(bands: &[u32; 6], t: f32) -> u32 {
 fn rotate_hue(hsv: (f32, f32, f32), turns: f32) -> u32 {
     let (h, s, v) = hsv;
     crate::color_math::hsv2rgb(h + turns * 360.0, s, v)
+}
+
+/// THE FAMILY'S SPECTRUM AT ONE CELL — [`RAINBOW_BANDS`] under the MOMENTUM
+/// IRIDESCENCE, the "dynamic range" dial: at speed the six anchor hues rotate
+/// gently around the wheel, the swing travelling along the ribbon with the
+/// specular phase, so a hot trail shimmers through neighbouring rainbows instead
+/// of freezing on six constants.
+///
+/// A COLD trail (`disp < 0.005`) returns the fixed anchors, which is the
+/// crisp-flat contract; hue rotation preserves saturation and value, so the
+/// text-safety coverage math is untouched either way.
+///
+/// Extracted from the ribbon body so the plume UNDER the line can ask the same
+/// question at the same `(col, row)` and get the bit-identical answer — the
+/// "align the palettes" ask. It is the array-valued twin of
+/// [`rainbow_band_at`]: that one resolves the light rail's per-column sweep, this
+/// one resolves the whole six-anchor set a dark-theme mark stacks or steps
+/// through.
+#[inline]
+fn rainbow_momentum_bands(col: f32, row: f32, phase: f32, disp: f32) -> [u32; 6] {
+    if disp < 0.005 {
+        return RAINBOW_BANDS;
+    }
+    let swing = CursorGlow::RAINBOW_HUE_SWING * disp;
+    let hue_off = swing * (phase * 2.2 + col * 0.16 + row * 0.37).sin();
+    if hue_off.abs() < 0.001 {
+        return RAINBOW_BANDS;
+    }
+    let mut b = RAINBOW_BANDS;
+    for (c, &hsv) in b.iter_mut().zip(RAINBOW_BANDS_HSV.iter()) {
+        *c = rotate_hue(hsv, hue_off);
+    }
+    b
 }
 
 /// SIX FLAT SLABS — the ribbon body's colour law (owner, 2026-08-04: the trail
@@ -23002,6 +23468,58 @@ mod tests {
         );
     }
 
+    /// WIDTH-CREDIT PRICING (owner, 2026-08-15: "the rainbow in typing still
+    /// has some gaps"): ONE press of a WIDE glyph advances two columns — its
+    /// echo must coalesce on that single press's 2-cell credit and sweep the
+    /// continuation cell, instead of being refused into a landing-only lay (a
+    /// dark notch after every CJK character). The other two thirds keep the
+    /// anti-stray law: the same hop on a single 1-cell credit is still a
+    /// skimming motion, still refused; and an admitted coalesce SPENDS its
+    /// credits, so the pool that paid for one echo can never fund a second.
+    #[test]
+    fn a_wide_glyphs_single_press_sweeps_its_continuation_cell() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        // THE TYPED WIDE GLYPH: one press, priced at its two cells.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t = Instant::now();
+        glow.tick(Some((3, 4)), t, &c, g, &mut out);
+        glow.note_typed_cells(t + Duration::from_millis(5), 2);
+        glow.tick(Some((3, 6)), t + Duration::from_millis(20), &c, g, &mut out);
+        let live: Vec<u16> = glow
+            .sparks
+            .iter()
+            .filter(|s| s.typing && s.row == 3)
+            .map(|s| s.col)
+            .collect();
+        assert!(
+            live.contains(&5) && live.contains(&6),
+            "the wide glyph's continuation and landing are typing sparks: {live:?}"
+        );
+        // THE POOL IS SPENT: with the 2-cell credit consumed by the admitted
+        // coalesce, an immediate second 2-cell hop (the hint still fresh) has
+        // nothing to pay with — refused, no typing sparks laid past it.
+        glow.tick(Some((3, 8)), t + Duration::from_millis(40), &c, g, &mut out);
+        assert!(
+            !glow.sparks.iter().any(|s| s.typing && s.row == 3 && s.col == 7),
+            "spent credits must not fund a second multi-cell echo"
+        );
+        // THE CONTROL: the same 2-cell hop on a single 1-cell credit is a
+        // skim (vim `w` over existing wide text) — the continuation cell is
+        // never painted as typing.
+        let mut skim = CursorGlow::default();
+        let mut out2 = Vec::new();
+        let t2 = Instant::now();
+        skim.tick(Some((3, 4)), t2, &c, g, &mut out2);
+        skim.note_typed(t2 + Duration::from_millis(5));
+        skim.tick(Some((3, 6)), t2 + Duration::from_millis(20), &c, g, &mut out2);
+        assert!(
+            !skim.sparks.iter().any(|s| s.typing && s.row == 3 && s.col == 5),
+            "one 1-cell credit must not paint a skimmed continuation cell"
+        );
+    }
+
     /// CONTINUITY LAW: whatever mix of single advances and batched hops typing
     /// arrives as, the live typing sparks on the row form ONE contiguous run —
     /// no interior holes, ever.
@@ -23755,11 +24273,30 @@ mod tests {
         };
         // Both the ZOOM streak and the ribbon ride the under-ink stream; the
         // priority ordering is observable there.
+        //
+        // THE RIBBON PROBE IS COLUMN-BOUNDED, NOT JUST ROW-BOUNDED. This read
+        // "row 0" alone and called that the ribbon, on the note above that row 0
+        // is where the abandoned ribbon lives. Row 0 is ALSO where this jump
+        // STARTS — the streak's tail is pinned to the origin cell (0, 10) and
+        // retracts from there — so the row-0 band always held streak quads too;
+        // they merely used to be too dim to clear the `spectrum` floor
+        // (`hi > 24`) at the old 0.12 tail coverage. Brightening the tail
+        // (owner, 2026-08-11) lifted them over it and the proxy started reading
+        // the streak's own tail as "the ribbon", failing a property that had not
+        // regressed.
+        //
+        // The typed run occupies cells 2..=10 and the streak can only travel
+        // RIGHT and DOWN from cell 10, so a column bound left of the origin
+        // separates them structurally rather than by brightness — with a full
+        // cell of margin for the perpendicular band offsets.
+        let ribbon_only_x = 9 * g.cw as u16;
         let under = glow.under_quads();
         let last_zoom = under
             .iter()
             .rposition(|q| (1..=3).contains(&q.row) && spectrum(q.color));
-        let first_ribbon = under.iter().position(|q| q.row == 0 && spectrum(q.color));
+        let first_ribbon = under
+            .iter()
+            .position(|q| q.row == 0 && q.x < ribbon_only_x && spectrum(q.color));
         let (Some(last_zoom), Some(first_ribbon)) = (last_zoom, first_ribbon) else {
             panic!("jump frame carries both the ZOOM streak and the live ribbon");
         };
@@ -27962,7 +28499,7 @@ mod tests {
         arm_rainbow_witnesses(&mut blipped, t0, 2, 5);
         blipped.sparks.clear(); // exactly what the zero-amplitude path does
         assert!(
-            blipped.typed_presses_within(t0, CursorGlow::RAINBOW_TERMINUS_RIBBON_WINDOW) > 0
+            blipped.typed_credits_within(t0, CursorGlow::RAINBOW_TERMINUS_RIBBON_WINDOW) > 0
                 && blipped.rainbow.disp >= CursorGlow::RAINBOW_TERMINUS_MIN_DISP,
             "precondition: both retired proxies are still armed after the blip"
         );
@@ -32303,43 +32840,158 @@ halo = "add"
         assert!(rainbow_wake_body(4.0, 6.0) > rainbow_wake_body(4.0, 2.0));
     }
 
-    /// The wake IS the ribbon's rainbow — not a lookalike. Every sample equals
-    /// [`rainbow_gradient_of`] over [`RAINBOW_BANDS`], so the plume and the trail it
-    /// feeds can never drift apart: change the ribbon's anchors and the wake
-    /// follows, by construction rather than by a second table someone has to
-    /// remember to edit.
+    /// The wake IS the ribbon's rainbow, resolved per COLUMN (owner,
+    /// 2026-08-15: "the color underline uses a magenta palette … Redesign the
+    /// underline"; lineage 2026-08-11 "align the rainbow colour palettes
+    /// between the underline and cursor trail"). The law under pin:
     ///
-    /// Deliberately NOT a monotone-luminance assertion. The previous ramp was a
-    /// bespoke cooling table and this test pinned it hot-to-cold; the rainbow is
-    /// not monotone in luminance (yellow outshines red) and must not be forced to
-    /// be. The cooling READ lives in `rainbow_wake_body`'s coverage envelope, which
-    /// `wake_body_is_monotone_and_length_scaled` pins separately — hue and
-    /// intensity were always independent.
+    /// - the FLAT BODY of every band is an anchor EXACTLY — the plume is drawn
+    ///   out of the trail's six colours, not a lookalike gradient;
+    /// - all six anchors appear across a line — no band is unreachable;
+    /// - MINIMUM DIVERSITY: no resting-length window of glass is monochrome —
+    ///   the review's "a short wake can be entirely red or indigo" failure is
+    ///   structurally impossible at [`RAINBOW_WAKE_SWEEP_SPREAD`];
+    /// - the law is CONTINUOUS in column (the boundary crossfade), so neither
+    ///   a spatial seam nor — because phase enters the same argument — a
+    ///   temporal pop can render;
+    /// - a left-clipped segment's NEGATIVE column resolves through the fold,
+    ///   never through a truncating cast (review finding);
+    /// - the luma compensation stays inside the composite budget:
+    ///   `max(comp) × RAINBOW_WAKE_COV < RAINBOW_WAKE_COMPOSITE_CAP`, so the
+    ///   headroom ledger's assert can never trip on a compensated segment.
     #[test]
     fn rainbow_wake_ramp_is_the_ribbon_rainbow() {
-        for i in 0..=100 {
-            let s = i as f32 / 100.0;
+        let anchors: std::collections::BTreeSet<u32> = RAINBOW_BANDS.iter().copied().collect();
+        // FLAT-BODY EXACTNESS + full coverage across one line at a few phases.
+        for phase in [0.0f32, 1.7, 4.5, 7.25] {
+            let mut seen = std::collections::BTreeSet::new();
+            for c in 0..240 {
+                let colx = c as f32 * 0.5;
+                let (rgb, comp) = rainbow_wake_band_at(&RAINBOW_BANDS, colx, phase);
+                assert!(
+                    (0.75..=1.26).contains(&comp),
+                    "comp out of range at col {colx}: {comp}"
+                );
+                if anchors.contains(&rgb) {
+                    seen.insert(rgb);
+                }
+            }
             assert_eq!(
-                rainbow_wake_ramp(s),
-                rainbow_gradient_of(&RAINBOW_BANDS, s),
-                "the wake samples the ribbon's own spectrum at s={s}"
+                seen, anchors,
+                "every anchor must appear on a line (phase {phase})"
             );
         }
-        // The endpoints ARE the rainbow's endpoints.
-        assert_eq!(rainbow_wake_ramp(0.0), RAINBOW_BANDS[0], "nozzle = red");
-        assert_eq!(rainbow_wake_ramp(1.0), RAINBOW_BANDS[5], "tail = violet");
-        // Clamped outside [0,1] — no wraparound colour at the extremes.
-        assert_eq!(rainbow_wake_ramp(-1.0), rainbow_wake_ramp(0.0));
-        assert_eq!(rainbow_wake_ramp(2.0), rainbow_wake_ramp(1.0));
-        // And it is a SPECTRUM, not a tint: the plume passes through every band.
-        let distinct = (0..=100)
-            .map(|i| rainbow_wake_ramp(i as f32 / 100.0))
-            .collect::<std::collections::BTreeSet<_>>();
+        // MINIMUM DIVERSITY over every resting-length window. The resting
+        // plume shows RAINBOW_WAKE_LEN_MIN × RAINBOW_WAKE_EXTENT = 4.5 cells.
+        let window = RAINBOW_WAKE_LEN_MIN * RAINBOW_WAKE_EXTENT;
+        for p in 0..24 {
+            let phase = p as f32 * 0.37;
+            for start in 0..160 {
+                let x0 = start as f32 * 0.73;
+                let mut distinct = std::collections::BTreeSet::new();
+                for i in 0..=18 {
+                    let colx = x0 + window * (i as f32 / 18.0);
+                    distinct.insert(rainbow_wake_band_at(&RAINBOW_BANDS, colx, phase).0);
+                }
+                assert!(
+                    distinct.len() >= 3,
+                    "a {window}-cell wake at col {x0} phase {phase} shows only \
+                     {} colours — monochrome plumes are the defect this law kills",
+                    distinct.len()
+                );
+            }
+        }
+        // CONTINUITY: fine column steps never step the colour hard. The widest
+        // adjacent-anchor channel gap (red→orange green channel, 153) across
+        // the crossfade's ≈0.43-column width bounds a 0.05-column step at ~18
+        // counts; 40 is the generous ceiling that still forbids the old
+        // floor-quantizer's 153-count cliff.
+        for p in 0..8 {
+            let phase = p as f32 * 0.9;
+            let mut prev = rainbow_wake_band_at(&RAINBOW_BANDS, 0.0, phase).0;
+            for i in 1..=1200 {
+                let colx = i as f32 * 0.05;
+                let cur = rainbow_wake_band_at(&RAINBOW_BANDS, colx, phase).0;
+                let dmax = prev
+                    .to_be_bytes()
+                    .iter()
+                    .zip(cur.to_be_bytes().iter())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    dmax < 40,
+                    "hard colour step ({dmax} counts) at col {colx} phase {phase}"
+                );
+                prev = cur;
+            }
+        }
+        // NEGATIVE COLUMNS fold, never truncate: the value at −x equals the
+        // reflected fold's value, and never panics.
+        for i in 0..40 {
+            let colx = -(i as f32) * 0.31;
+            let (rgb, comp) = rainbow_wake_band_at(&RAINBOW_BANDS, colx, 2.2);
+            assert!(comp.is_finite() && rgb <= 0x00FF_FFFF);
+        }
+        // The compensation table stays inside the composite budget.
+        let max_comp = RAINBOW_WAKE_LUMA_COMP.iter().copied().fold(0.0f32, f32::max);
         assert!(
-            distinct.len() > 40,
-            "a rainbow plume is many colours, got {}",
-            distinct.len()
+            max_comp * RAINBOW_WAKE_COV < RAINBOW_WAKE_COMPOSITE_CAP,
+            "luma compensation must never out-price the composite ceiling"
         );
+    }
+
+    /// THE UNDERLINE AND THE TRAIL BREATHE TOGETHER. The plume resolves its
+    /// anchors through [`rainbow_momentum_bands`] at the SAME `(col, row, phase,
+    /// disp)` the ribbon cell above it resolves, so the momentum hue swing can
+    /// never rotate one without the other — the second half of the palette
+    /// alignment, and the half that only shows at speed, which is the only time
+    /// both marks are on screen at once.
+    #[test]
+    fn wake_and_ribbon_resolve_one_momentum_spectrum() {
+        // COLD is the crisp-flat contract on both sides: the fixed anchors.
+        assert_eq!(rainbow_momentum_bands(12.0, 3.0, 4.5, 0.0), RAINBOW_BANDS);
+        assert_eq!(rainbow_momentum_bands(12.0, 3.0, 4.5, 0.004), RAINBOW_BANDS);
+        // HOT: same cell, same clock ⇒ bit-identical spectra, and one that has
+        // actually moved off the anchors.
+        let hot = rainbow_momentum_bands(12.0, 3.0, 4.5, 1.0);
+        assert_eq!(hot, rainbow_momentum_bands(12.0, 3.0, 4.5, 1.0));
+        assert_ne!(hot, RAINBOW_BANDS, "full spine must rotate the spectrum");
+        // The swing is BOUNDED by its own dial — a rotated rainbow is still
+        // recognizably the rainbow, never a different one.
+        for c in 0..64u16 {
+            for r in 0..8u16 {
+                let b = rainbow_momentum_bands(f32::from(c), f32::from(r), 7.25, 1.0);
+                for (i, (&got, &want)) in b.iter().zip(RAINBOW_BANDS.iter()).enumerate() {
+                    let (gh, _, _) = crate::color_math::rgb2hsv(got);
+                    let (wh, _, _) = crate::color_math::rgb2hsv(want);
+                    let d = (gh - wh).abs().min(360.0 - (gh - wh).abs());
+                    assert!(
+                        d <= CursorGlow::RAINBOW_HUE_SWING * 360.0 + 1.0,
+                        "band {i} swung {d}° at col {c} row {r}"
+                    );
+                }
+            }
+        }
+        // …and the WAKE reads these same rotated bands — the binding the old
+        // version of this test lacked (review finding: it compared the helper
+        // with itself). Every flat-body sample at a hot spine is literally a
+        // member of the rotated set the ribbon cell above resolves.
+        for c in 0..80 {
+            let colx = c as f32 * 0.4;
+            let b = rainbow_momentum_bands(colx.floor(), 3.0, 4.5, 1.0);
+            let t = rainbow_sweep_reflect(
+                colx * RAINBOW_WAKE_SWEEP_SPREAD + 4.5 * RAINBOW_LIGHT_RAIL_FLOW,
+            );
+            let u = t * 5.0;
+            if (u - u.round()).abs() <= 0.5 - RAINBOW_WAKE_BAND_BLEND {
+                let (rgb, _) = rainbow_wake_band_at(&b, colx, 4.5);
+                assert!(
+                    b.contains(&rgb),
+                    "flat-body wake colour must be a rotated ribbon anchor (col {colx})"
+                );
+            }
+        }
     }
 
     /// THE LEGIBILITY PROOF, and the reason the whole retune exists: the plume
@@ -32458,10 +33110,14 @@ halo = "add"
         let (quads, _) = wake_of(&glow, now, &c, g);
         assert!(!quads.is_empty(), "a hot run leaves a plume");
         let head_px = (glow.rainbow.wake_head.unwrap().1 * g.cw as f32) as i32;
-        // Nothing ahead of the nozzle.
+        // Nothing ahead of the nozzle — except the 1-px SUB-PIXEL HEAD CAP,
+        // the antialiased leading edge: the one pixel that CONTAINS the f32
+        // nozzle, drawn at the fraction of it the plume actually covers
+        // (2026-08-15, "perfectly smooth"). Anything wider or further out is
+        // still light running ahead of the hand.
         for q in &quads {
             assert!(
-                (q.x as i32) < head_px,
+                (q.x as i32) < head_px || (q.w == 1 && q.x as i32 == head_px),
                 "plume light ran ahead of the cursor: {q:?} (head {head_px})"
             );
         }
@@ -32491,9 +33147,11 @@ halo = "add"
             reach - spans[0].0 >= 3 * g.cw as i32,
             "a hot run's plume spans several cells"
         );
-        // BRIGHTEST AT THE NOZZLE, falling off backward. Measure the core
-        // coverage (the ramp's r byte is 0xFF over the hot half, so the emitted
-        // red byte IS the coverage there) in three buckets by distance.
+        // BRIGHTEST AT THE NOZZLE, falling off backward. Coverage is read as
+        // the MAX CHANNEL of the premultiplied colour: under the per-column
+        // law a segment may be any band (a green or azure column has a near-
+        // zero red byte at full coverage), so the red-byte accounting the old
+        // distance ramp licensed would misread them as dim (review finding).
         let bucket = |lo: i32, hi: i32| -> u32 {
             quads
                 .iter()
@@ -32501,7 +33159,11 @@ halo = "add"
                     let d = head_px - q.x as i32;
                     d >= lo * g.cw as i32 && d < hi * g.cw as i32
                 })
-                .map(|q| (q.color >> 16) & 0xff)
+                .map(|q| {
+                    ((q.color >> 16) & 0xff)
+                        .max((q.color >> 8) & 0xff)
+                        .max(q.color & 0xff)
+                })
                 .max()
                 .unwrap_or(0)
         };
@@ -32509,6 +33171,82 @@ halo = "add"
         assert!(
             near > mid && mid > far,
             "the plume cools and dims backward (near {near}, mid {mid}, far {far})"
+        );
+    }
+
+    /// THE FOLD CARRY (owner, 2026-08-15: "the rainbow streak … has some
+    /// gaps"): a hot typed WRAP stashes the plume's earned length and the
+    /// first new-row plume runs at it — the underline hands its energy across
+    /// the line end instead of dying to a resting nub. A lone keystroke's
+    /// wrap has nothing worth carrying, and a navigation landing ORPHANS the
+    /// carry — folded energy must never dress a jump.
+    #[test]
+    fn a_typed_wrap_carries_the_wakes_length_and_a_jump_orphans_it() {
+        let g = geom();
+        let c = rainbow_pop_cfg();
+        // HOT: a fast run to the right edge, then the fold.
+        let mut hot = CursorGlow::default();
+        let t0 = Instant::now();
+        let end = type_run(
+            &mut hot,
+            TypeRun {
+                row: 2,
+                from: 26,
+                keys: 12,
+                gap_ms: 45,
+            },
+            &c,
+            g,
+            t0,
+        );
+        let mut out = Vec::new();
+        hot.tick(Some((3, 1)), end + Duration::from_millis(25), &c, g, &mut out);
+        let carried = hot.rainbow.wake_fold_carry;
+        assert!(
+            carried.is_some_and(|(_, l)| l > RAINBOW_WAKE_LEN_MIN),
+            "a hot typed wrap stashes its earned length: {carried:?}"
+        );
+        // The FIRST new-row keystroke — the exact moment the pre-carry wake
+        // restarted as a nub — now draws at the carried length.
+        hot.note_typed(end + Duration::from_millis(40));
+        hot.tick(Some((3, 2)), end + Duration::from_millis(45), &c, g, &mut out);
+        let (quads, _) = wake_of(&hot, end + Duration::from_millis(60), &c, g);
+        assert!(!quads.is_empty(), "the folded wake survives the line end");
+        // COLD: a lone keystroke's wrap carries nothing (resting is resting).
+        let mut cold = CursorGlow::default();
+        let t1 = Instant::now();
+        let mut o1 = Vec::new();
+        cold.tick(Some((2, 38)), t1, &c, g, &mut o1);
+        cold.note_typed(t1 + Duration::from_millis(5));
+        cold.tick(Some((3, 1)), t1 + Duration::from_millis(30), &c, g, &mut o1);
+        assert!(
+            cold.rainbow
+                .wake_fold_carry
+                .is_none_or(|(_, l)| l <= RAINBOW_WAKE_LEN_MIN),
+            "a resting wrap has nothing worth carrying"
+        );
+        // ORPHAN: a navigation landing clears the carry.
+        let mut nav = CursorGlow::default();
+        let t2 = Instant::now();
+        let e2 = type_run(
+            &mut nav,
+            TypeRun {
+                row: 2,
+                from: 26,
+                keys: 12,
+                gap_ms: 45,
+            },
+            &c,
+            g,
+            t2,
+        );
+        let mut o2 = Vec::new();
+        nav.tick(Some((3, 1)), e2 + Duration::from_millis(25), &c, g, &mut o2);
+        assert!(nav.rainbow.wake_fold_carry.is_some());
+        nav.tick(Some((7, 30)), e2 + Duration::from_millis(60), &c, g, &mut o2);
+        assert!(
+            nav.rainbow.wake_fold_carry.is_none(),
+            "a jump must orphan the folded energy"
         );
     }
 

@@ -20,6 +20,22 @@ LIGHT = "#FFFFFF"
 NOSE = "#B0637A"
 BLUSH = "#F2A9B4"
 
+# ── the DOG skin ───────────────────────────────────────────────────────────
+# The pet dog is not a second rig. It is the SAME rig — same torso, same limb
+# chains, same gait, same registration — wearing a different head. Owner,
+# 2026-08-11: "make a dog like the walking cat … you can use the same code".
+# So every pose in `poses.py` is emitted twice, and the species switch below
+# changes only the four things that actually separate a dog's head from a
+# cat's at 16 px: the ears hang instead of standing, the muzzle projects into
+# a snout, the nose is a big dark button on the end of it, and there are no
+# whiskers. The tabby goes with them — bars belong to a tabby, not a dog.
+#
+# Every branch is keyed off `Pose.species`, which DEFAULTS to "cat", so the
+# 29 checked-in cat TOMLs regenerate byte-identical. That is the invariant to
+# preserve when touching anything in this file: `pet_glyphs_gen_matches_assets`
+# is what notices if it breaks.
+DOG_NOSE = "#2B2530"  # a dog's nose is a dark button, not a cat's pink triangle
+
 S = 4.0               # outline half-width added to every coat part
 
 
@@ -29,6 +45,12 @@ class Pose:
     positive swings toward +x (the direction the cat faces)."""
     ident: str
     note: str
+
+    # Which animal wears this pose. "cat" (the default) reproduces the
+    # original rig exactly; "dog" swaps the head skin — see the DOG SKIN note
+    # at the top of this file. Body, limbs, gait and registration are shared,
+    # which is the whole point: the dog walks with the cat's walk.
+    species: str = "cat"
 
     # torso
     bx: float = 90.0
@@ -65,7 +87,7 @@ class Pose:
 
     # face
     eyes: str = "open"       # open | happy | closed | squint | halflid | wide | wink
-    mouth: str = "smile"     # smile | open | flat | fang
+    mouth: str = "smile"     # smile | open | flat | oof | none
     blush: bool = True
     gaze: tuple = (0.0, 0.0)
 
@@ -94,6 +116,14 @@ class Pose:
     # far cheek (the loaf's dome, the peek's shoulder), the same strokes paint
     # ON the coat and read as scratches — so those poses turn the fan off.
     whisker_far: bool = True
+    # The NEAR whisker fan. Its roots sit ~3.6 viewbox units under the near
+    # eye's lower edge — under a pixel apart once the pose is baked at the
+    # ship's 34 px art height, so on a head that also tips the eye down toward
+    # them (the sleeping loaf's `hrot`) the fan, the eye and the head outline
+    # rasterise into ONE black clot where the eye should be. A pose that
+    # cannot afford that spends the near fan: at 34 px the ears, the loaf and
+    # the closed arcs carry the cat, and no viewer misses four strokes.
+    whisker_near: bool = True
     # Where the tabby back bars ride. "torso" is the default topline; a pose
     # whose head covers the torso's top (the peek's over-the-shoulder seat)
     # moves them to the haunch's crown instead of wearing them on its cheek.
@@ -107,6 +137,30 @@ class Pose:
     # authored facing right and the engine mirrors the whole sprite
     # (kitty_pet's flip_x), so the yaw flips with the body for free.
     yaw: float = 0.0
+    # ── two art-director fixes that used to live ONLY in the emitted TOML ────
+    #
+    # Both land from 8cf4b4a4 ("final kitty pass"), and both were hand-edited
+    # into the GENERATED files instead of into this rig — so poses.py and the
+    # checked-in art disagreed, and any full regen silently reverted them. That
+    # trap has now cost something real: the dog roster was minted from the
+    # unfixed rig, so `pet_dog_bat` shipped the identical hole. As rig fields
+    # BOTH species get the fix and a regen reproduces the art byte-for-byte.
+    #
+    # (dx, dy, sx, sy) applied to the FAR eye only. `pet_leap_descend` read
+    # ONE-EYED at ship size: authored at its rise sibling's size, the far eye
+    # drowned against the muzzle boundary. Grown ~25% and nudged clear it sits
+    # at 0.77 of the near eye's width, clearing the face LOD's 0.70 compression
+    # threshold outright. It rides `eye_centres`/`eye_scales`, so the iris,
+    # pupil and catch-light follow the eye they belong to — the re-anchoring
+    # the hand fix had to do three layers at a time, by hand.
+    far_eye: tuple = ()
+    # (cx, cy, rx, ry) of a coat blob painted with the coat, under the face.
+    # `pet_bat` had a D-shaped HOLE: the raised hind leg's loop encloses a
+    # counter, and a counter inside a coat-filled silhouette shows the terminal
+    # background THROUGH the animal — a hole, not a marking. Filling it in the
+    # coat leaves the leg reading by its own outline. Authored in
+    # pre-registration coordinates, like every other geometry in this file.
+    belly: tuple = ()
 
 
 def lerp(a, b, t):
@@ -257,16 +311,75 @@ def ear_tri(p: Pose, side, inset=0.0, flat_scale=1.0):
     return catmull_closed([a, mid_a, (tx, ty), mid_b, b], tension=0.10)
 
 
+def ear_drop(p: Pose, side, inset=0.0, flat_scale=1.0):
+    """The DOG ear: a long rounded lobe HANGING down the side of the skull.
+
+    Same contract as [`ear_tri`] — `side` = +1 near / -1 far, larger `inset`
+    shrinks the lobe (the outline pass insets negative, the inner-ear pass
+    insets positive) — so the three ear passes below are species-agnostic.
+
+    The cat's ear is a triangle whose tip pushes AWAY from the skull; a dog's
+    swings down past the jaw instead, which is the single cue that carries the
+    species at 16 px. The pose's authored `ear_near`/`ear_far` sweep still
+    tilts the lobe (a perked pose lifts it) and `ear_flat` still pins it, but
+    pinning a hanging ear presses it BACK along the neck rather than flattening
+    it onto the crown, so both sides rotate the same way.
+    """
+    if p.front:
+        base_a = 62.0 * side
+    else:
+        base_a = 58.0 * side + (10.0 if side > 0 else -4.0)
+        base_a += (4.0 if side > 0 else -6.0) * p.yaw
+    sweep = (p.ear_near if side > 0 else p.ear_far)
+    # The lobe roots slightly deeper into the skull than the cat's triangle:
+    # a hanging ear is attached along a seam, not balanced on a point.
+    th = math.radians(base_a - 90.0 + p.hrot)
+    bx = p.hx + math.cos(th) * (p.hr - 6.0) * p.hsx
+    by = p.hy + math.sin(th) * (p.hr - 6.0) * p.hsy
+    # the far ear foreshortens with the yaw, exactly like the cat's
+    ear_k = 1.0 if (p.front or side > 0) else lerp(1.0, 0.82, p.yaw)
+    w = (15.5 - inset * 0.55) * flat_scale * ear_k
+    h = (27.0 - inset) * flat_scale * (1.0 if ear_k == 1.0 else lerp(1.0, 0.90, p.yaw))
+    # DROOP is what makes it a dog: ~82 degrees of swing past the ear's root
+    # angle lands the tip below the jaw on both sides.
+    tip_a = base_a + side * 82.0 + sweep + p.ear_flat * 26.0
+    tth = math.radians(tip_a - 90.0 + p.hrot)
+    dx, dy = math.cos(tth), math.sin(tth)
+    px, py = -math.sin(tth), math.cos(tth)
+
+    def at(along, across):
+        return (bx + dx * h * along + px * w * across,
+                by + dy * h * along + py * w * across)
+
+    # A teardrop hanging from its narrow end: the root is the width of the
+    # seam, the belly swells below it, and the tip rounds off.
+    return catmull_closed([
+        at(0.0, 0.46), at(0.42, 0.60), at(0.82, 0.40), at(1.0, 0.0),
+        at(0.82, -0.40), at(0.42, -0.52), at(0.0, -0.46),
+    ], tension=0.12)
+
+
+def ear_shape(p: Pose, side, inset=0.0, flat_scale=1.0):
+    """Dispatch one ear to its species' builder."""
+    if p.species == "dog":
+        return ear_drop(p, side, inset=inset, flat_scale=flat_scale)
+    return ear_tri(p, side, inset=inset, flat_scale=flat_scale)
+
+
 def ears_paths(p: Pose):
     coat, out = [], []
     for side in (-1, 1):
-        out.append(ear_tri(p, side, inset=-S * 0.9))
-        coat.append(ear_tri(p, side))
+        out.append(ear_shape(p, side, inset=-S * 0.9))
+        coat.append(ear_shape(p, side))
     return coat, out
 
 
 def inner_ear_paths(p: Pose):
-    return [ear_tri(p, -1, inset=9.0), ear_tri(p, 1, inset=9.0)]
+    # The dog's inner lobe insets harder: on a hanging ear only the upper
+    # inside shows, so a cat-sized inner shape would paint pink over the whole
+    # flap and read as a tongue.
+    inset = 13.0 if p.species == "dog" else 9.0
+    return [ear_shape(p, -1, inset=inset), ear_shape(p, 1, inset=inset)]
 
 
 def tail_pts(p: Pose):
@@ -277,7 +390,9 @@ def tail_pts(p: Pose):
 
 def tail_paths(p: Pose):
     pts = tail_pts(p)
-    t = p.tail_thick
+    # A dog's tail is a thicker, blunter club than a cat's tapering whip — and
+    # with the tabby rings gone it is the tail's OUTLINE that has to carry it.
+    t = p.tail_thick * (1.18 if p.species == "dog" else 1.0)
     radii = [t, t * 0.92, t * 0.84, t * 0.76, t * 0.66]
     core = limb(pts, radii, smooth=True)
     out = limb(pts, [r + S for r in radii], smooth=True)
@@ -321,9 +436,43 @@ def muzzle_dx(p: Pose):
 
 
 def muzzle_paths(p: Pose):
+    if p.species == "dog":
+        return dog_muzzle_paths(p)
     cx, cy = face_anchor(p, muzzle_dx(p), 0.38)
     return [blob(cx, cy, [(0, 13.5), (50, 15.5), (95, 17.0), (140, 14.5),
                           (180, 12.0), (220, 14.5), (265, 17.0), (310, 15.5)])]
+
+
+def dog_snout_dx(p: Pose):
+    """How far the DOG's muzzle group sits ahead of the cat's.
+
+    MODEST ON PURPOSE. The muzzle layer carries no outline of its own — it is
+    a cream patch painted ON the head's coat — so anything it does past the
+    skull's edge reads as a sticker stuck to the face rather than a snout. The
+    projection therefore has a hard budget: `dx * hr` plus the muzzle's +x
+    spoke must stay inside `hr`. What actually sells the snout at ship size is
+    the muzzle's SHAPE (long toward +x, shallow above) and the dark nose on
+    its leading edge, not raw offset.
+    """
+    return muzzle_dx(p) + (0.0 if p.front else lerp(0.08, 0.12, p.yaw))
+
+
+def dog_muzzle_paths(p: Pose):
+    """The snout: the cat's round muzzle drawn out along the facing axis.
+
+    Blob angles run clockwise from 12 o'clock, so 90 is the +x (facing) side —
+    that is the spoke that grows, while the 0 (crown) spoke shrinks. Shallower
+    on top and longer ahead is the whole difference between a cat's round
+    cheek-pad and a dog's muzzle; keeping the total mass similar is what keeps
+    it inside the skull.
+    """
+    if p.front:
+        cx, cy = face_anchor(p, dog_snout_dx(p), 0.46)
+        return [blob(cx, cy, [(0, 11.0), (45, 14.0), (90, 15.5), (135, 16.5),
+                              (180, 17.0), (225, 16.5), (270, 15.5), (315, 14.0)])]
+    cx, cy = face_anchor(p, dog_snout_dx(p), 0.44)
+    return [blob(cx, cy, [(0, 11.0), (45, 15.5), (90, 20.0), (135, 17.0),
+                          (180, 13.5), (225, 12.0), (270, 11.0), (315, 10.0)])]
 
 
 def eye_centres(p: Pose):
@@ -337,6 +486,9 @@ def eye_centres(p: Pose):
     # on a turned head, and the lift keeps the nose out of the near eye.
     near = face_anchor(p, lerp(0.46, 0.48, p.yaw), lerp(0.02, -0.04, p.yaw))
     far = face_anchor(p, lerp(-0.33, -0.16, p.yaw), lerp(0.04, -0.01, p.yaw))
+    if p.far_eye:
+        dx, dy, _, _ = p.far_eye
+        far = (far[0] + dx, far[1] + dy)
     return near, far
 
 
@@ -349,6 +501,9 @@ def eye_scales(p: Pose):
         return rn, rn, rn
     fw = lerp(0.884, 0.62, p.yaw)   # 7.6/8.6 at rest
     fh = lerp(0.884, 0.80, p.yaw)
+    if p.far_eye:
+        _, _, sx, sy = p.far_eye
+        return rn, rn * fw * sx, rn * fh * sy
     return rn, rn * fw, rn * fh
 
 
@@ -458,6 +613,22 @@ def catchlight_paths(p: Pose):
 
 
 def nose_paths(p: Pose):
+    if p.species == "dog":
+        # A dark button on the END of the snout, not a triangle on its top.
+        # Rounded and deliberately oversized: it is the only dark mass on the
+        # face besides the eyes, so it is what survives the face LOD and tells
+        # you which end of the animal you are looking at.
+        # BELOW THE EYE LINE, ALWAYS. The nose is the one face layer painted
+        # AFTER the eyes, so it is the only one that can collide with them —
+        # and the eyes reach ~0.32 head radii below centre, so the nose rides
+        # at 0.58 where it clears them outright and still sits well inside the
+        # muzzle it belongs to.
+        if p.front:
+            cx, cy = face_anchor(p, dog_snout_dx(p), 0.56)
+        else:
+            cx, cy = face_anchor(p, dog_snout_dx(p) + lerp(0.28, 0.34, p.yaw), 0.58)
+        return [blob(cx, cy, [(0, 5.4), (55, 7.2), (110, 6.6), (180, 5.6),
+                              (250, 6.6), (305, 7.2)])]
     # the nose slides DOWN the muzzle as the head yaws — with the eyes lifted
     # and the muzzle pushed forward, this is what keeps the pink triangle from
     # clipping the near eye's lower lid
@@ -469,10 +640,38 @@ def nose_paths(p: Pose):
 def mouth_paths(p: Pose):
     # anchored at the MUZZLE CENTRE, not its top edge — a smile hung off the
     # nose line pulls the corners up against the cheeks and reads as a grimace
-    cx, cy = face_anchor(p, muzzle_dx(p), 0.38)
+    if p.species == "dog":
+        # Hung off the DOG's nose, which sits lower and further forward than
+        # the cat's — anchoring on the cat's line would park the smile beside
+        # the snout instead of under it.
+        cx, cy = face_anchor(
+            p,
+            dog_snout_dx(p) + (0.0 if p.front else lerp(0.28, 0.34, p.yaw)),
+            # 0.62 lands the omega's top stroke exactly on the nose's lower
+            # edge and its lowest ink a clear step inside the chin — further
+            # down and the smile hangs off the jaw onto the coat.
+            0.62,
+        )
+    else:
+        cx, cy = face_anchor(p, muzzle_dx(p), 0.38)
+    if p.mouth == "none":
+        # No mouth at all. For the sleeping loaf: with ^ ^ eyes, ANY dark
+        # stroke down here adds back the horizontal-bar mass that made the
+        # face read awake, and at 24-36 px it lands within a pixel of the
+        # nose and clots the muzzle. A bare muzzle under the arcs is the
+        # cuter and the more legible read. Species-blind on purpose: the
+        # dog's sleeping loaf wants the bare muzzle for the same reason.
+        return []
     if p.mouth == "open":
         return [blob(cx, cy + 8.0, [(0, 5.4), (60, 6.8), (120, 7.0), (180, 6.8),
                                     (240, 7.0), (300, 6.8)])]
+    if p.mouth == "oof":
+        # The landing's grunt: a small round "oof", ~60% of the open mouth.
+        # The full open blob smears the whole muzzle to a black clot at
+        # 24-36 px (the 0.19.0 gauntlet's F6 residue); this one keeps a
+        # readable muzzle at ship size while the face still says impact.
+        return [blob(cx, cy + 7.4, [(0, 3.2), (60, 4.0), (120, 4.2), (180, 4.0),
+                                    (240, 4.2), (300, 4.0)])]
     if p.mouth == "flat":
         return [limb([(cx - 6.0, cy + 6.0), (cx + 6.0, cy + 6.0)], [1.6, 1.6])]
     # the kawaii omega: two filled strokes hanging off the nose
@@ -486,6 +685,10 @@ def mouth_paths(p: Pose):
 
 
 def whisker_paths(p: Pose):
+    # Dogs have whiskers in life and never in drawings of dogs: the fan is a
+    # CAT cue, and leaving it on undoes everything the ears and snout just did.
+    if p.species == "dog":
+        return []
     out = []
     if p.front:
         # face-on: rooted at the cheek edges BELOW the huge eyes and swept
@@ -503,6 +706,8 @@ def whisker_paths(p: Pose):
         rows = ((-0.03, -13.0, 27.0), (0.11, 7.0, 29.0))
     if not p.whisker_far:
         fans = tuple(f for f in fans if f[0] > 0)
+    if not p.whisker_near:
+        fans = tuple(f for f in fans if f[0] < 0)
     for side, base_dx, scale, droot in fans:
         for dy, sweep, ln0 in rows:
             ln = ln0 * scale
@@ -535,6 +740,13 @@ def blush_paths(p: Pose):
 
 def pattern_paths(p: Pose):
     """Tabby: three back bars plus two tail rings, riding the torso."""
+    # The tabby is a CAT marking — bars down the back and rings on the tail
+    # are the third thing (after ears and snout) that would keep saying "cat"
+    # on a dog. A plain coat is also the honest read: the recolorable coat is
+    # the user's chosen trail colour, and an unbroken field of it is what the
+    # dog cameo's breeds already do.
+    if p.species == "dog":
+        return []
     out = []
     if p.front:
         # face-on, the back bars would paint across the face (pattern layers
@@ -606,6 +818,12 @@ def build(p: Pose):
 
     outline = tl_out + far_out + h_out + t_out + near_out + e_out + hd_out
     coat = tl_coat + far_coat + h_coat + t_coat + near_coat + e_coat + hd_coat
+    if p.belly:
+        # LAST in the coat list, and coat-only: it fills a counter the limbs
+        # already enclose, so it must not carry an outline of its own — an
+        # outlined patch would draw a seam across the belly it is hiding.
+        bx, by, brx, bry = p.belly
+        coat.append(ellipse(bx, by, brx, bry))
 
     layers = [
         ("outline", INK, "fixed", outline),
@@ -617,7 +835,7 @@ def build(p: Pose):
         ("iris", IRIS, "iris", iris_paths(p)),
         ("detail", PUPIL, "fixed", pupil_paths(p)),
         ("catch_light", LIGHT, "fixed", catchlight_paths(p)),
-        ("nose", NOSE, "fixed", nose_paths(p)),
+        ("nose", DOG_NOSE if p.species == "dog" else NOSE, "fixed", nose_paths(p)),
         ("mouth", EYE, "fixed", mouth_paths(p)),
         ("whisker", INK, "fixed", whisker_paths(p)),
         ("blush", BLUSH, "fixed", blush_paths(p)),

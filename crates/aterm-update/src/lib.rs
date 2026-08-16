@@ -189,10 +189,11 @@ static REQUIRED_TEAM_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new(
 ///
 /// # Why this exists, and why it can only tighten
 ///
-/// aterm ships ad-hoc signed with no Team ID, so [`PINNED_TEAM_ID`] is empty and
-/// [`verify::verify_bundle_policy`] runs the structural `codesign --verify` only —
-/// notarization is never consulted. That is the deliberate default and it is what
-/// makes an unsigned dev/self-hosted build updatable at all.
+/// Shipped aterm pins the real Team ID (Tier APPLE armed 2026-08-15), so
+/// [`PINNED_TEAM_ID`] is non-empty and this call is a no-op there. It exists for
+/// FORKS and self-hosted builds compiled with an empty pin: their default is the
+/// structural `codesign --verify` only (what makes an unsigned build updatable at
+/// all), and this lets such a deployment opt into Developer-ID enforcement.
 ///
 /// The gap it left was that the STRICTER posture was only reachable by rebuilding
 /// with `ATERM_EXPECTED_TEAM_ID` baked in. Once there is a Developer ID to require,
@@ -239,7 +240,7 @@ pub fn effective_team_id() -> &'static str {
 /// signed channel), baked in from `ATERM_UPDATE_PUBKEY` at build time. Empty (the
 /// default) disables signature checking; when set, every release manifest MUST carry a
 /// valid `aterm-appcast.toml.sig` verifying against it (mint the keypair with
-/// `atpkg-keys keygen`, keep the secret offline / in CI secrets). See [`sig`].
+/// `atpkg-keys setup`/`join` — the machine key; the secret never leaves its machine). See [`sig`].
 /// The CURRENT signing key. Verification must accept ANY key in
 /// [`aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS`] so a rotation does not strand
 /// clients; this constant names only the key new releases are signed with.
@@ -252,6 +253,15 @@ pub const PINNED_UPDATE_PUBKEY: &str = aterm_update_core::pins::update_channel_s
 /// anchor reached the artifact. Keeping them separate is deliberate: the embedded
 /// `__aterm_upin` record must name exactly one key, while a client must accept
 /// several or a rotation strands it.
+///
+/// # Only while the paper master is UNPINNED
+///
+/// This keyset is what authorizes a release in a build whose
+/// `pins::PAPER_MASTER_PUBKEYS` is empty — which is every build shipped so far. Arm the
+/// master and the master-signed machine roster becomes the sole authority
+/// (`github::fetch_authoritative_release`); this slice then survives as the allowance
+/// held by clients that predate the roster, which is a fact about THEM and is enforced
+/// at the producer, not here.
 pub const PINNED_UPDATE_PUBKEYS: &[&str] = aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS;
 
 /// SHA-256 of the raw 32-byte Ed25519 update key, for shipping introspection.
@@ -423,7 +433,7 @@ pub fn record_apply_failure(current_build: u64, reason: &str) {
     let Some(staging) = paths::Staging::resolve() else {
         return;
     };
-    health::Health::record_apply_failure(&staging.health(), reason);
+    health::Health::record_apply_failure(&staging.health(), current_build, reason);
     status::record(
         &staging,
         current_build,
@@ -1791,38 +1801,28 @@ mod commit_match_tests {
 
 #[cfg(test)]
 mod team_pin_tests {
-    /// The runtime opt-in must be ONE-WAY. With an empty compiled pin the default
-    /// is structural-only (which is what lets aterm's own ad-hoc-signed releases
-    /// update at all), a blank setting changes nothing, and a real Team ID raises
-    /// the bar. Crucially, nothing here can ever LOWER a compiled-in pin — a
-    /// settings file must not be a verification bypass.
+    /// The runtime opt-in must be ONE-WAY, and a compiled pin is ABSOLUTE. This tree
+    /// pins the real Team ID (Tier APPLE armed 2026-08-15, replacing the ad-hoc-era
+    /// version of this test), so the pin decides and every runtime call — blank,
+    /// different, anything — is a no-op: a settings file must not be a verification
+    /// bypass, and it also must not be able to swap the team a build was armed with.
     #[test]
     fn the_runtime_team_requirement_can_only_tighten() {
-        // These builds are ad-hoc: no Team ID is baked in, which is precisely why
-        // the shipped updater applies unnotarized bundles.
-        assert!(
-            super::PINNED_TEAM_ID.is_empty(),
-            "aterm ships ad-hoc; a non-empty compiled pin changes this test's meaning"
+        assert_eq!(
+            super::PINNED_TEAM_ID,
+            "A66A9P66Z7",
+            "Tier APPLE is armed; an empty pin changes this test's meaning"
         );
-        assert_eq!(super::effective_team_id(), "", "default is structural-only");
+        assert_eq!(super::effective_team_id(), "A66A9P66Z7", "the pin decides");
 
-        // Blank/absent settings are inert.
+        // Every runtime call is inert against a compiled pin.
         super::set_required_team_id(None);
         super::set_required_team_id(Some("   "));
-        assert_eq!(super::effective_team_id(), "");
-
-        // A real value raises the anchor.
-        super::set_required_team_id(Some("ABCDE12345"));
-        assert_eq!(super::effective_team_id(), "ABCDE12345");
-
-        // And it cannot subsequently be loosened or swapped mid-session.
-        super::set_required_team_id(None);
-        super::set_required_team_id(Some(""));
         super::set_required_team_id(Some("ZZZZZ99999"));
         assert_eq!(
             super::effective_team_id(),
-            "ABCDE12345",
-            "a later call must not relax or replace an installed requirement"
+            "A66A9P66Z7",
+            "a settings file can neither relax nor replace a compiled pin"
         );
     }
 }

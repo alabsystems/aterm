@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! **aterm-uds** — the portable stream type behind the aterm introspection
-//! CONTROL SOCKET, plus the three small platform helpers the control channel
-//! needs (the `latest` alias, CSPRNG bytes, pid liveness).
+//! CONTROL SOCKET, plus the small platform helpers the control channel needs
+//! (the `latest` alias, CSPRNG bytes, pid liveness, and — Unix only —
+//! `SCM_RIGHTS` descriptor passing with the peer pid that authenticates it).
 //!
 //! On Unix, [`CtlStream`]/[`CtlListener`] are **pure type aliases** to
 //! [`std::os::unix::net::UnixStream`]/[`UnixListener`], so every Unix call
@@ -27,7 +28,9 @@
 //! * there is no peer-uid primitive (`SO_PEERCRED`/`getpeereid` have no
 //!   AF_UNIX-on-Windows analog); callers keep the mandatory per-launch token
 //!   and must disclose the reduced posture (they do — one-line startup
-//!   notice in `aterm-gui`).
+//!   notice in `aterm-gui`). For the same reason afunix carries no ancillary
+//!   data at all, so [`fdpass`]'s descriptor transport refuses there rather
+//!   than emulating anything.
 
 // Under the Trust verifier, register the `trust` tool namespace so the
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-out on the FFI CSPRNG wrapper
@@ -47,6 +50,7 @@ pub mod win;
 #[cfg(windows)]
 pub use win::{CtlListener, CtlStream};
 
+pub mod fdpass;
 pub mod latest;
 pub mod process;
 pub mod rand;

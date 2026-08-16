@@ -379,7 +379,9 @@ fn probe_gh_cli() -> Probe {
     match probe_raw(&String::from_utf8_lossy(&out.stdout), "gh auth token") {
         Probe::Supplied(t) => Probe::Supplied(t),
         Probe::Rejected(why) => Probe::Rejected(why),
-        Probe::Absent => Probe::Rejected("`gh` is installed but has no token — run `gh auth login`"),
+        Probe::Absent => {
+            Probe::Rejected("`gh` is installed but has no token — run `gh auth login`")
+        }
     }
 }
 
@@ -844,16 +846,28 @@ mod tests {
         // how far the chain ran. This is the property that makes the diagnostic
         // trustworthy: it describes the executed chain, not a second copy of it.
         let dir = support("diag");
-        let d = diagnose(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO);
+        let d = diagnose(
+            &dir,
+            crate::source::DEFAULT_OWNER,
+            crate::source::DEFAULT_REPO,
+        );
         // The DEFAULT (public) channel: one rung. Use a deliberately non-default
         // slug where the full chain is the subject.
-        let r = resolve_with_source(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO);
+        let r = resolve_with_source(
+            &dir,
+            crate::source::DEFAULT_OWNER,
+            crate::source::DEFAULT_REPO,
+        );
         assert_eq!(d.resolved, r.as_ref().map(|(_, s)| *s));
         assert_eq!(d.is_provisioned(), r.is_some());
         // …and the single-walk combinator agrees with both, so the caller that must
         // explain a failure never has to walk (and re-spawn `security`/`gh`) twice.
         match (
-            resolve_or_diagnose(&dir, crate::source::DEFAULT_OWNER, crate::source::DEFAULT_REPO),
+            resolve_or_diagnose(
+                &dir,
+                crate::source::DEFAULT_OWNER,
+                crate::source::DEFAULT_REPO,
+            ),
             &r,
         ) {
             (Ok((_, source)), Some((_, expected))) => assert_eq!(source, *expected),
@@ -893,11 +907,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The gate is per-TARGET, not global. atpkg reads its signed index from the
-    /// PRIVATE publish account, so it must still get the full ambient chain even
-    /// though the app's default update channel is public. Gating on "is the update
-    /// channel overridden?" instead of "which repo is this token for?" silently
-    /// starved atpkg of the 0600 file token.
+    /// The gate is per-TARGET, not global. atpkg resolves its token against the
+    /// PRIVATE publish account (`resolve_pkg_token` — the credential that lets an
+    /// operator/staging machine reach a private index host), so it must still get
+    /// the full ambient chain even though the app's default update channel is
+    /// public. Gating on "is the update channel overridden?" instead of "which
+    /// repo is this token for?" silently starved atpkg of the 0600 file token.
     #[test]
     fn private_publish_account_still_gets_the_full_chain() {
         assert!(

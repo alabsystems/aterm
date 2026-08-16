@@ -4785,10 +4785,10 @@ impl App {
                     // own idle-preference deadline: the retry that CROSSES
                     // `apply_by` is the one allowed to land, so it must not be
                     // scheduled after it.
-                    WaitReason::Activity => crate::automatic_update_activity_retry_at(
-                        std::time::Instant::now(),
-                    )
-                    .min(intent.apply_by),
+                    WaitReason::Activity => {
+                        crate::automatic_update_activity_retry_at(std::time::Instant::now())
+                            .min(intent.apply_by)
+                    }
                     WaitReason::WorkActive | WaitReason::StagePending => {
                         now + std::time::Duration::from_secs(2)
                     }
@@ -5043,7 +5043,8 @@ impl App {
                     retry_at: schedule.retry_at(),
                 });
                 let wait_secs = |at: std::time::Instant| {
-                    at.saturating_duration_since(std::time::Instant::now()).as_secs()
+                    at.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
                 };
                 match schedule {
                     PhysicalFailureSchedule::Retry(at) => aterm_log::info!(
@@ -5417,23 +5418,21 @@ impl App {
         } else {
             crate::app_tabs::ClosePreflightVisibility::Interactive
         };
-        let (readiness, safety_token) =
-            match self.prepare_all_native_shutdown(
-                crate::native_app::CloseScope::Relaunch,
-                visibility,
-            ) {
-                Ok(true) => self.native_update_close_preflight(),
-                Ok(false) => (
-                    ClosePreflight::Blocked(vec![
-                        "Review or discard unsaved native-app work before relaunching".to_string(),
-                    ]),
-                    None,
-                ),
-                Err(message) => {
-                    shutdown_error = Some(message.clone());
-                    (ClosePreflight::Blocked(vec![message]), None)
-                }
-            };
+        let (readiness, safety_token) = match self
+            .prepare_all_native_shutdown(crate::native_app::CloseScope::Relaunch, visibility)
+        {
+            Ok(true) => self.native_update_close_preflight(),
+            Ok(false) => (
+                ClosePreflight::Blocked(vec![
+                    "Review or discard unsaved native-app work before relaunching".to_string(),
+                ]),
+                None,
+            ),
+            Err(message) => {
+                shutdown_error = Some(message.clone());
+                (ClosePreflight::Blocked(vec![message]), None)
+            }
+        };
         match self
             .native_updater_service
             .finish_apply_preflight(ticket, readiness)
@@ -5667,7 +5666,9 @@ impl App {
         const JUST_SPENT: std::time::Duration = std::time::Duration::from_secs(5);
 
         self.auto_apply_physical_retry
-            .filter(|retry| retry.build == staged_build && retry.last_attempt.elapsed() < JUST_SPENT)
+            .filter(|retry| {
+                retry.build == staged_build && retry.last_attempt.elapsed() < JUST_SPENT
+            })
             .is_none_or(|retry| retry.cycles <= 1)
     }
 
@@ -8280,7 +8281,11 @@ mod tests {
                     let secs = at.saturating_duration_since(now).as_secs();
                     // Real `Instant`s, so name the SCHEDULE each delay came from
                     // rather than asserting to the second.
-                    if secs >= 1000 { "retry-1800" } else { "retry-600" }
+                    if secs >= 1000 {
+                        "retry-1800"
+                    } else {
+                        "retry-600"
+                    }
                 }
                 PhysicalFailureSchedule::StandDown(_) => "stand-down",
                 PhysicalFailureSchedule::Converged => "converged",
@@ -9204,7 +9209,9 @@ mod tests {
                 "round {round}: THE NAG. The user was already told once; telling \
                  them again on a two-hour schedule is the regression this test exists \
                  for (got {:?})",
-                app.notice.as_ref().map(crate::notice::TransientNotice::text)
+                app.notice
+                    .as_ref()
+                    .map(crate::notice::TransientNotice::text)
             );
             // THE OTHER HALF OF THE NAG, and the half no `notice` assertion can
             // ever see: the pill is one-shot, but the tab switch / focus theft /

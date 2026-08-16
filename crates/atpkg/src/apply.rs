@@ -158,29 +158,15 @@ pub fn transact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sig::{VerifiedBytes, verify_index_with};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
-
-    const ROOT_SEED: [u8; 32] = [7u8; 32];
-
-    fn verified_index(body: &str) -> VerifiedBytes {
-        let kp = Ed25519KeyPair::from_seed_unchecked(&ROOT_SEED).unwrap();
-        let raw = body.as_bytes().to_vec();
-        let sig = kp.sign(&raw).as_ref().to_vec();
-        let pk = STANDARD.encode(kp.public_key().as_ref());
-        verify_index_with(&pk, raw, &sig).unwrap()
-    }
+    use crate::sig::testkit;
 
     fn index_with_groups() -> Index {
         let body = r#"
-schema = 1
+schema = 2
 index_build = 41
 valid_until = "2026-07-05T12:00:00Z"
-[keys]
-release_key_id = "rk"
-release_key_pubkey = "AAAA"
+machine_id = "m3"
+roster_seq = 3
 [programs.trust]
 repo = "trust"
 coherence_group = "rustc"
@@ -190,7 +176,9 @@ coherence_group = "rustc"
 [programs.ny]
 repo = "ny"
 "#;
-        crate::manifest::parse_index(&verified_index(body)).unwrap()
+        // Machine-signed through the real roster chain: `VerifiedBytes` still has no
+        // public constructor, so a fixture index must be signed like a published one.
+        crate::manifest::parse_index(&testkit::machine_signed(body.as_bytes().to_vec())).unwrap()
     }
 
     fn channel(pins: &[(&str, u64)]) -> Channel {

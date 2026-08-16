@@ -428,7 +428,7 @@ pub fn resolve_and_admit(requests: &[String]) -> Batch {
 fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limits) -> Batch {
     let need_catalog = requests.iter().take(limits.max_requests).any(|request| {
         !request.trim().contains(['/', '\\'])
-            && crate::game_font_for_family(request.trim()).is_none()
+            && crate::display_face_for_family(request.trim()).is_none()
     });
     let mut catalog = if need_catalog {
         Catalog::scan(dirs, limits)
@@ -446,10 +446,10 @@ fn resolve_and_admit_in_dirs(requests: &[String], dirs: &[PathBuf], limits: Limi
         .cloned()
         .zip(paths)
         .map(|(requested, result)| {
-            // The `game:` scheme resolves to embedded bytes ahead of the system
+            // The `display:` scheme resolves to embedded bytes ahead of the system
             // catalogue — the exact interception `from_system_with_family`
             // performs at startup, so the two paths cannot disagree.
-            let result = match crate::game_font_for_family(requested.trim()) {
+            let result = match crate::display_face_for_family(requested.trim()) {
                 Some(bytes) => Ok(AdmittedFont {
                     path: requested.trim().to_string(),
                     bytes: Arc::new(bytes.to_vec()),

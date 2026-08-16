@@ -1170,42 +1170,40 @@ impl App {
         .line())
     }
 
-    /// Summon the typed-"kitty" cameo (detector: [`crate::kitty_summon`]).
+    /// Record a typed-"kitty" completion in the Kitty Log (detector:
+    /// [`crate::kitty_summon`]).
     ///
-    /// PRESENTATION reuses the terminal's existing cat machinery wholesale:
-    /// the cursor companion's guaranteed bounded hello
-    /// ([`crate::kitty_cursor::CursorCat::on_collect`]) — the same peeking-head
-    /// appearance near the cursor a collection discovery gets. No new
-    /// renderer, no new art rolls: the cameo wears the CURRENT collected
-    /// companion identity (or the default peeking head over a fresh ledger),
-    /// draws for EVERY trail style (`collection_hello` bypasses the
-    /// Rainbow kitty-style gate in `redraw_window`), pauses while the window cannot
-    /// present it, renders as the one static held pose under reduced motion,
-    /// and is inert with the sparkle-words master off OR the
-    /// `[sparkle_words.feline]` family off — every gate the ambient
-    /// sightings already respect.
+    /// THERE IS NO PRESENTATION HERE ANY MORE, and that is the point. Owner,
+    /// 2026-08-12: *"there are now two cats that seem to appear when I type
+    /// 'cat'? I want the cat just like in the main text"* — and, on where it
+    /// sat, *"it needs to appear in the center of the word, not to the top
+    /// right"*. Typing a feline word echoes it onto the grid, and the SCREEN
+    /// SCANNER already answers that word with the ambient peeking cat, centred
+    /// on the word span (`word_decorations::cat_geometry_for`). Between
+    /// 0.19.0 and now this path ALSO summoned a standalone cameo anchored on
+    /// the caret cell — the tail of the word, one row up — so one keystroke
+    /// produced two cats, and the one that outlived the other was the
+    /// off-centre one. The cameo is deleted; the cat in the text is the cat.
     ///
-    /// LOGGING records ONE synthetic sighting through the Kitty Log's
-    /// ordinary `(session, ident)` episode/dedupe rules. The registry's
-    /// shown-type keys are CI-pinned for ledger compatibility
-    /// (`kitty_registry` pins them; a new key would orphan persisted rows),
-    /// so there is deliberately NO distinct "summoned" marker: the cameo logs
-    /// as the `head_peek` type it visually is, in the same aggregation cell
-    /// ambient on-screen "kitty" word-cats land in (langs resolved from the
-    /// live lexicon's own "kitty" entry — the file stays bounded by the
-    /// vocabulary, no new row shape).
+    /// What is left is the LEDGER, which was always a separate tier: ONE
+    /// synthetic sighting through the Kitty Log's ordinary `(session, ident)`
+    /// episode/dedupe rules. The registry's shown-type keys are CI-pinned for
+    /// ledger compatibility (`kitty_registry` pins them; a new key would orphan
+    /// persisted rows), so there is deliberately NO distinct "summoned" marker:
+    /// a typed summon logs as the `head_peek` type it visually is, in the same
+    /// aggregation cell ambient on-screen "kitty" word-cats land in (langs
+    /// resolved from the live lexicon's own "kitty" entry — the file stays
+    /// bounded by the vocabulary, no new row shape).
     ///
-    /// `record` is the LEDGER tier: `false` when the Kitty Log's cooldown has
-    /// not elapsed. The cameo draws either way — typing the word is a direct
-    /// request, and answering it only sometimes reads as broken. See
-    /// `kitty_summon`.
-    fn summon_typed_kitty(
-        &mut self,
-        wid: WindowId,
-        session: u64,
-        now: std::time::Instant,
-        record: bool,
-    ) {
+    /// Inert with the sparkle-words master off OR the `[sparkle_words.feline]`
+    /// family off — every gate the ambient sightings already respect.
+    ///
+    /// CALLED ONLY WHEN THE LEDGER CLOCK GRANTED
+    /// ([`crate::kitty_summon::TypedHit::records`]). The cooldown skips this
+    /// whole function rather than entering it and dropping the row: no lexicon
+    /// scan, no ident minted, no `observe`, so a rate-limited completion costs
+    /// nothing. See `kitty_summon`.
+    fn record_typed_kitty(&mut self, wid: WindowId, session: u64, now: std::time::Instant) {
         use aterm_effects::kitty_registry::{
             KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
         };
@@ -1221,13 +1219,11 @@ impl App {
         // `sparkle` Some) but silences every ambient cat — the scanner drops
         // `Class::Feline` matches before they can render or log, so an
         // ambient Kitty Log sighting is impossible under that config. The
-        // typed summon must mirror that exactly: family off ⇒ fully inert —
-        // no cameo (the `collection_hello` render gate checks only the
-        // master, so the cut must happen HERE, before `on_collect` arms it)
-        // and no ledger row (`feline.log` gates HOW sightings record;
-        // `feline.enabled` gates WHETHER cats exist at all — otherwise the
-        // ledger's aggregation cells accumulate synthetic sightings of a
-        // category the user's config can never produce ambiently).
+        // typed summon must mirror that exactly: family off ⇒ no ledger row
+        // (`feline.log` gates HOW sightings record; `feline.enabled` gates
+        // WHETHER cats exist at all — otherwise the ledger's aggregation cells
+        // accumulate synthetic sightings of a category the user's config can
+        // never produce ambiently).
         if !rs.cfg.feline {
             return;
         }
@@ -1241,129 +1237,56 @@ impl App {
             .unwrap_or_else(|| aterm_effects::kitty_registry::KittyLook::for_session(session))
             .normalized();
         // Displayed-trait bits mirror the word renderer's recorder exactly:
-        // only the overlay accessories the hello actually draws are counted.
+        // only the overlay accessories a drawn cat actually carries are counted.
         let traits = match look.accessory {
             Some(aterm_effects::cat_glyphs_gen::CatGlyphId::AccBow) => TRAIT_BOW,
             Some(aterm_effects::cat_glyphs_gen::CatGlyphId::AccCrown) => TRAIT_CROWN,
             _ => 0,
         };
-        // LEDGER TIER. Skipped wholesale inside the cooldown: no lexicon scan,
-        // no ident minted, no `observe` — the rate limit costs nothing rather
-        // than doing the work and dropping it. The CAMEO below runs either way.
-        let discovered = if record {
-            // The same language chips an on-screen "kitty" earns, from the SAME
-            // lexicon build the drain will resolve codes against. A lexicon that
-            // somehow lost the word degrades to the empty set ("unknown") rather
-            // than skipping the record.
-            let langs = rs
-                .lexicon
-                .scan("kitty", &aterm_lexicon::ScanOptions::default())
-                .into_iter()
-                .find(|m| matches!(m.class, aterm_lexicon::Class::Feline))
-                .map_or(aterm_lexicon::LangSet::EMPTY, |m| m.langs);
-            // Fresh `(session, ident)` per RECORDED summon: the App-wide sequence
-            // keeps two windows sharing one session from minting colliding
-            // episodes, and the tag namespaces summons away from the word
-            // renderer's position-bearing occurrence idents. Only bumped when a
-            // row is actually minted, so the namespace stays dense.
-            let ident = next_kitty_summon_ident(
-                &mut self.kitty_summon_seq,
-                crate::kitty_summon::TYPED_SUMMON_IDENT_TAG,
-            );
-            let sighting = KittySighting {
-                kitty_type: KittyType::HeadPeek,
-                magic: KittyMagic::None,
-                shown_as: KittyShownAs::Cat,
-                langs,
-                traits,
-                look,
-                ident,
-            };
-            // `kitty_log_on = false` drains-and-drops here exactly as at the
-            // render drain: the cameo still shows, nothing is recorded.
-            let enabled = self.kitty_log_enabled();
-            self.kitty_log
-                .observe(session, [sighting], &rs.lexicon, now, enabled)
-        } else {
-            None
+        // The same language chips an on-screen "kitty" earns, from the SAME
+        // lexicon build the drain will resolve codes against. A lexicon that
+        // somehow lost the word degrades to the empty set ("unknown") rather
+        // than skipping the record.
+        let langs = rs
+            .lexicon
+            .scan("kitty", &aterm_lexicon::ScanOptions::default())
+            .into_iter()
+            .find(|m| matches!(m.class, aterm_lexicon::Class::Feline))
+            .map_or(aterm_lexicon::LangSet::EMPTY, |m| m.langs);
+        // Fresh `(session, ident)` per RECORDED summon: the App-wide sequence
+        // keeps two windows sharing one session from minting colliding
+        // episodes, and the tag namespaces summons away from the word
+        // renderer's position-bearing occurrence idents. Only bumped when a
+        // row is actually minted, so the namespace stays dense.
+        let ident = next_kitty_summon_ident(
+            &mut self.kitty_summon_seq,
+            crate::kitty_summon::TYPED_SUMMON_IDENT_TAG,
+        );
+        let sighting = KittySighting {
+            kitty_type: KittyType::HeadPeek,
+            magic: KittyMagic::None,
+            shown_as: KittyShownAs::Cat,
+            langs,
+            traits,
+            look,
+            ident,
         };
-        // THE CAT THE CAMEO WEARS. A first-ever sighting is a genuine
-        // discovery, so the toy that appears IS the cat that was just
-        // unlocked; otherwise it wears the identity already resolved above
-        // (the collected companion, or this session's own kitty). Either way
-        // the COMPANION's identity is untouched here — the host's per-frame
-        // `companion_precedence` sync owns that, and it already promotes a
-        // fresh discovery on the very next frame.
-        let cameo_look = discovered.unwrap_or(look);
-        // WHERE THE TOY APPEARS: the caret cell the completing keystroke left
-        // behind. Read here, latched by the engine, and never re-read — the
-        // cameo belongs to the place the word was typed, not to the caret,
-        // which walks on with the next keystroke.
-        //
-        // Read from `session` — the pane the keystroke actually went to — not
-        // from the window's front mirror: in a split those are the same pane
-        // today, but the anchor CELL and the pane it is scoped to must agree by
-        // construction, not by coincidence.
-        //
-        // THE ECHO HAS NOT LANDED YET, and that is fine. This runs on the input
-        // path, so the completing keystroke has been written to the PTY but the
-        // shell's echo of it has not been parsed back into the grid — the
-        // cursor read here is up to a few cells behind where it will settle.
-        // Neither consumer cares at that resolution: the toy is drawn AHEAD of
-        // the anchor cell (a cell either way is invisible), and the veto tests
-        // `caret_on_span`, which spans the whole token plus one — the very
-        // token the detector just completed. Waiting for the echo would mean
-        // deferring the summon to the next rescan, which is a frame of latency
-        // on the one effect whose whole point is answering the keystroke.
-        //
-        // Scrolled-back views have no live input caret (the same rule the word
-        // scanner uses), so the anchor falls back to the terminal's cursor cell
-        // as reported; a scrolled-back user is not typing anyway.
-        let anchor = self.pool.get(session).map(|st| {
-            let t = term_lock(&st.term);
-            let c = t.cursor();
-            (c.row, c.col)
-        });
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            // OWNER RULING, 2026-08-09: "When I type 'kitty' I do not want that
-            // to make the CURSOR kitty appear. I want THE kitty to appear."
-            //
-            // This used to route the typed word into the cursor companion's
-            // bounded hello (`on_collect` for a discovery, `on_summon`
-            // otherwise) — which answered the keystroke by waking the animal
-            // that already lives on the cursor. It now summons the standalone
-            // CAMEO ([`aterm_effects::kitty_cameo`]): a free-floating sprite
-            // anchored where the word was typed, and it NEVER wakes the
-            // companion.
-            //
-            // OWNER REGRESSION RULING, 2026-08-10: the cameo is TEXT-SIZED —
-            // 0.19.0 drew it at ~4 cells ("AHH! the kitty that appears when I
-            // type 'Kitty' is huge! go back to the old text kitty!"), and it
-            // now wears the ambient word-cat's own head law ("like how it
-            // appears in the regular text"). What distinguishes it from the
-            // escort is its anchor and identity, not its bulk.
-            //
-            // The ledger tier above is unchanged and still runs first: a cameo
-            // is a VIEW, so it writes no collectible row of its own, and the
-            // `record` cooldown governs the row, never the appearance.
-            if let Some(cell) = anchor {
-                // Pane-scoped: `session` is the `bind_pane` key the composed
-                // renderer uses, so the anchor cell can only veto inside the
-                // pane it belongs to. An unsplit window binds no pane and the
-                // scope check is a no-op there.
-                ws.word_decos
-                    .summon_cameo(now, cell, cameo_look, Some(session));
-            }
-            // A no-echo prompt (password read) repaints nothing on its own —
-            // one explicit wake lets the cameo's first frame present (full
-            // motion then owns the cadence through
-            // `WordDecorations::is_active_in`; reduced motion arms its single
-            // erase deadline via `cameo_static_deadline_in`). Both of those are
-            // scoped to the toy's owning session being VISIBLE, so the lane it
-            // takes here is released the moment the user switches away.
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
-            }
+        // `kitty_log_on = false` drains-and-drops here exactly as at the render
+        // drain: the ambient cat still shows, nothing is recorded.
+        let enabled = self.kitty_log_enabled();
+        let discovered = self
+            .kitty_log
+            .observe(session, [sighting], &rs.lexicon, now, enabled);
+        // A FIRST-EVER sighting repoints the COMPANION — the host's per-frame
+        // `companion_precedence` sync owns that, and it promotes the fresh
+        // discovery on the very next frame. An idle prompt draws no next frame
+        // on its own, so one explicit wake is owed; nothing else here changes a
+        // pixel, so nothing else asks for one.
+        if discovered.is_some()
+            && let Some(ws) = self.windows.get_mut(&wid)
+            && let Some(w) = ws.os_window.as_ref()
+        {
+            w.request_redraw();
         }
     }
 
@@ -1375,7 +1298,7 @@ impl App {
             KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType,
         };
         // EFFECTS MASTER GATE, then the FELINE SUB-GATE — the exact pair
-        // `summon_typed_kitty` documents: nothing can draw ⇒ nothing may log,
+        // `record_typed_kitty` documents: nothing can draw ⇒ nothing may log,
         // and `feline.enabled = false` means cats do not exist, so a synthetic
         // row for a category the config can never produce would poison the
         // ledger.
@@ -1431,12 +1354,14 @@ impl App {
     ///
     /// EXPRESSION ONLY. Neither family touches `look`, the flight lifetime, or
     /// typing momentum — the session's kitty keeps its identity through every
-    /// reaction. The feline arm is handled by `summon_typed_kitty`'s
-    /// `on_summon` (which also wakes a hidden companion, because typing the
-    /// word must make a kitty appear); this adds the profanity wince, whose
-    /// screen-side twin is `word_decorations`'s `CurseCue`. A curse typed into
-    /// a NO-ECHO prompt never reaches that scanner, so the input path owes the
-    /// reaction independently.
+    /// reaction. The FELINE arm is deliberately silent here: a typed feline
+    /// word is answered by the ambient word-cat the echoed word grows, and the
+    /// companion is not something typing a word may wake (owner, 2026-08-09:
+    /// *"When I type 'kitty' I do not want that to make the CURSOR kitty
+    /// appear"*). What is left is the profanity wince, whose screen-side twin
+    /// is `word_decorations`'s `CurseCue`. A curse typed into a NO-ECHO prompt
+    /// never reaches that scanner, so the input path owes the reaction
+    /// independently.
     fn react_typed_word(
         &mut self,
         wid: WindowId,
@@ -1499,9 +1424,59 @@ impl App {
         // renderers only present it while that session fronts their pane.
         ws.dog_cameo_session = Some(session);
         // The summon must present even mid-idle (a no-echo prompt draws no
-        // frames on its own) — same first-frame law as the kitty cameo.
+        // frames on its own) — the summon must present even mid-idle.
         if let Some(w) = ws.os_window.as_ref() {
             w.request_redraw();
+        }
+    }
+
+    /// ROBI's typed feed: a rolling lowercase 8-char tail — the literal
+    /// `robi`/`robot` NAME matcher (no lexicon class, he answers to his
+    /// name). Robi is a permanent resident born by the render path; typing
+    /// his name POKES him — his cycle restarts at the greeting (hustle over,
+    /// jumping jacks, a fresh tip within seconds), exactly like clicking him
+    /// in Nitro Keyboard. Gated like the render path (config, motion,
+    /// serious) so a poke can never resurrect a policy-hidden robot.
+    pub(crate) fn feed_robi_typed(&mut self, wid: WindowId, now: std::time::Instant, typed: &[char]) {
+        if typed.is_empty() || !self.config.robi_or_default() {
+            return;
+        }
+        if !self
+            .motion_policy(true)
+            .animate(crate::motion::MotionEffect::Robi)
+            || !self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::Robi)
+        {
+            return;
+        }
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        for &c in typed {
+            for lc in c.to_lowercase() {
+                ws.robi_tail.push(lc);
+            }
+            while ws.robi_tail.chars().count() > 8 {
+                let first_len = ws.robi_tail.chars().next().map_or(0, char::len_utf8);
+                ws.robi_tail.drain(..first_len);
+            }
+        }
+        if ws.robi_tail.ends_with("robi") || ws.robi_tail.ends_with("robot") {
+            // Clear the tail so holding the last key can't re-poke per press.
+            ws.robi_tail.clear();
+            // Calling him by name is the resurrection path from a click
+            // dismiss: the latch clears here and ONLY here, so a dismissed
+            // Robi stays gone until asked for (never resurrected by a mere
+            // config touch or focus change).
+            ws.robi_dismissed = false;
+            ws.robi_shows += 1;
+            ws.robi_show.start(now, ws.robi_shows);
+            ws.robi_tip_posted = None;
+            // First-frame law: the greeting must present even mid-idle.
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
         }
     }
 
@@ -2079,7 +2054,25 @@ impl App {
                             ws.cursor_glow.note_newline_break(input_now);
                         }
                         if typed_forward == Some(true) && (!enter_like || shift_enter_insert) {
-                            ws.cursor_glow.note_typed(input_now);
+                            // WIDTH-CREDIT PRICING (2026-08-15, "the rainbow
+                            // in typing still has some gaps"): the glow
+                            // engine's anti-stray press budget counts CELLS,
+                            // and only the host knows them — a wide CJK glyph
+                            // is one press advancing two columns, a committed
+                            // IME run is ONE event advancing its summed
+                            // width. Priced at 1 each, their echoes were
+                            // structurally refused into landing-only lays — a
+                            // dark notch after every wide character. Nothing
+                            // here trusts the PTY: the credit comes from the
+                            // committed text itself.
+                            let typed_cells: u16 = ime
+                                .map(|t| aterm_grapheme::str_width(t) as u16)
+                                .or_else(|| {
+                                    typed.map(|c| aterm_grapheme::char_width(c) as u16)
+                                })
+                                .unwrap_or(1)
+                                .max(1);
+                            ws.cursor_glow.note_typed_cells(input_now, typed_cells);
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
                             // audio): past ~20 ms a click stops feeling attached
@@ -2466,9 +2459,9 @@ impl App {
                             ws.word_decos.note_typed_edit(wire_at, Some(session));
                         }
                     }
-                    // TYPED-"kitty" CAMEO (the terminal twin of the Settings
-                    // §L.4 cameo): feed this classified PRESS to the
-                    // per-window detector. PRINTED characters — bare
+                    // TYPED-WORD DETECTOR (feline / profanity / canine): feed
+                    // this classified PRESS to the per-window detector.
+                    // PRINTED characters — bare
                     // Character/Space plus committed IME Text, the same set
                     // `typed_forward` calls forward — feed the rolling window;
                     // a plain Backspace pops one letter (typo tolerance); and
@@ -2485,6 +2478,10 @@ impl App {
                     // indistinguishability invariant forbids a `src` branch).
                     // O(1) per key: a bounded 8-slot window + 5-char suffix
                     // compare, so the hottest typing path pays scalar work.
+                    // ROBI's typed feed rides the same classified press (see
+                    // `feed_robi_typed` below): PTY output and pastes can
+                    // never summon him, exactly like the cats.
+                    let mut robi_typed: Vec<char> = Vec::new();
                     let summoned = {
                         let cosmetic_press = CosmeticFeedPress {
                             brk,
@@ -2519,7 +2516,7 @@ impl App {
                         }
                         // SING-ALONG feed (`aterm_effects::kitty_sing`)
                         // — the SAME classified press, the same typed-
-                        // provenance law as the cameo/tone feeds beside it:
+                        // provenance law as the detector/tone feeds beside it:
                         // PTY output, `cat`, and pastes can never arm the
                         // celebration, and the detector is Source-agnostic
                         // like everything on this path. PRINTED characters
@@ -2551,7 +2548,7 @@ impl App {
                         match (self.windows.get_mut(&wid), lexicon) {
                             (Some(ws), lexicon) => {
                                 // `merge` fold across one IME commit: a granted
-                                // record outranks a cooldown-only cameo, and
+                                // record outranks a cooldown-suppressed one, and
                                 // both family reactions are kept
                                 // (`TypedHit::default()` is `merge`'s
                                 // identity). Sparkle words off ⇒ no vocabulary,
@@ -2564,6 +2561,7 @@ impl App {
                                     |kitty| kitty.note_break(),
                                     |kitty| kitty.note_backspace(session),
                                     |kitty, c| {
+                                        robi_typed.push(c);
                                         if let Some(lx) = lexicon.as_ref() {
                                             fired = fired.merge(
                                                 kitty.note_char(input_now, session, c, lx, &opts),
@@ -2576,10 +2574,12 @@ impl App {
                             (None, _) => crate::kitty_summon::TypedHit::default(),
                         }
                     };
-                    // The cameo is owed on EVERY completion; only the ledger row
-                    // is rate-limited (see `kitty_summon`'s two-tier note).
-                    if summoned.summon.shows_cameo() {
-                        self.summon_typed_kitty(wid, session, input_now, summoned.summon.records());
+                    // The LEDGER row is what the cooldown rate-limits; the
+                    // completion itself is unconditional (see `kitty_summon`'s
+                    // two-tier note). The cat the user sees is the ambient
+                    // word-cat the echoed word grows, not anything summoned here.
+                    if summoned.records {
+                        self.record_typed_kitty(wid, session, input_now);
                     }
                     // COMPANION REACTIONS (multilingual, via the lexicon scan
                     // above). Expression only — the session's kitty never changes
@@ -2593,6 +2593,8 @@ impl App {
                     if summoned.canine {
                         self.summon_typed_dog(wid, session, input_now);
                     }
+                    // ROBI: the literal name-matcher (the resident's poke).
+                    self.feed_robi_typed(wid, input_now, &robi_typed);
                 }
                 outcome
             }
@@ -10438,13 +10440,14 @@ mod vi_dispatch_tests {
     }
 }
 
-/// TYPED-"kitty" cameo plumbing (task: typing the word at the prompt summons
-/// a kitty in the terminal). The detector's own laws (once-per-completion,
+/// TYPED-WORD SUMMON plumbing. The detector's own laws (once-per-completion,
 /// cooldown without restamp, backspace tolerance, session keying) are proven
 /// in `crate::kitty_summon`; this module binds the App seams: the press path
-/// feeds ONLY typed keys (never screen bytes), a granted summon reaches the
-/// cursor companion's hello and the Kitty Log's ordinary episode rules, and
-/// the effects master gate keeps everything inert when nothing could draw.
+/// feeds ONLY typed keys (never screen bytes), a granted feline completion
+/// reaches the Kitty Log's ordinary episode rules and NOTHING else (the cat the
+/// user sees is the ambient word-cat the echoed word grows), the canine arm
+/// pops its visiting dog, and the effects master gate keeps everything inert
+/// when nothing could draw.
 #[cfg(test)]
 mod typed_kitty_summon_tests {
     use crate::input::{InputEvent, Source};
@@ -10496,10 +10499,10 @@ mod typed_kitty_summon_tests {
     /// echo-correlated momentum seam must not forward the decisive pulse while
     /// `cursor_trail = false`, and the exact glass/capture predicate must not
     /// draw that ordinary branch. Enabling the master proves the fixture is
-    /// capable of arming. A typed/collection hello remains independently
-    /// presentable with the master off.
+    /// capable of arming. A COLLECTION hello remains independently presentable
+    /// with the master off.
     #[test]
-    fn cursor_trail_master_owns_ordinary_kitty_but_not_typed_hello() {
+    fn cursor_trail_master_owns_ordinary_kitty_but_not_the_collection_hello() {
         let model = cursor_cat_model();
         let wid = WindowId(0);
 
@@ -10573,27 +10576,33 @@ mod typed_kitty_summon_tests {
         assert_eq!(on_spec[&"ordinary_armed"], 1);
         assert_eq!(on_spec[&"ordinary_visible"], 1);
 
-        // TYPED SUMMONS ARE NOT THE COMPANION AT ALL (owner, 2026-08-09). They
-        // present the standalone CAMEO, which carries the same independence the
-        // bounded hello used to: it stays visible with the trail owner off and
-        // with reduced animation, because its emitters take no trail-style gate
-        // — and now it additionally leaves the companion untouched, which the
-        // hello could not claim.
+        // THE COLLECTION HELLO IS INDEPENDENT OF THE TRAIL MASTER — the model's
+        // `Collect` arm, in the real engine. A discovery is the terminal telling
+        // you it found a new cat, so it shows even for a user who runs with no
+        // cursor trail at all; the ORDINARY earned flight above is the thing the
+        // master owns. (A typed feline word touches neither: it is answered by
+        // the ambient word-cat the echoed word grows.)
         let session = off_app.front_terminal(wid).unwrap().session;
         let hello_at = Instant::now();
-        off_app.summon_typed_kitty(wid, session, hello_at, true);
-        let cameo_visible = off_app.windows[&wid]
-            .word_decos
-            .cameo_frame(hello_at)
-            .is_some_and(|f| f.alpha > 0);
-        assert!(cameo_visible, "the toy shows with the trail master OFF");
-        assert!(
-            !off_app.windows[&wid].cursor_cat.is_active(),
-            "and the trail's own companion stayed asleep"
-        );
+        {
+            let look = aterm_effects::kitty_registry::KittyLook::for_session(session);
+            let ws = off_app.windows.get_mut(&wid).expect("window 0");
+            ws.cursor_cat.on_collect(hello_at, look);
+            ws.cursor_cat.set_collection_presentable(hello_at, true);
+        }
+        // Sampled INSIDE the hello's fade-in (0.35 s) and well inside its
+        // 2.8 s discovery hold: at the summoning instant itself the fade is at
+        // t = 0, which is alpha 0 for every cat and would measure nothing.
+        let hello_visible = {
+            let ws = off_app.windows.get_mut(&wid).expect("window 0");
+            let f = ws.cursor_cat.frame(hello_at + Duration::from_millis(200));
+            assert!(f.collection_hello, "PRECONDITION: this frame IS the hello");
+            f.alpha > 0
+        };
+        assert!(hello_visible, "the hello shows with the trail master OFF");
         assert!(model.fire("Collect", &mut off_spec));
         assert_eq!(off_spec[&"trail_master"], 0);
-        assert_eq!(off_spec[&"visible"], i64::from(cameo_visible));
+        assert_eq!(off_spec[&"visible"], i64::from(hello_visible));
         assert!(model.check_invariant("HelloIndependentOfTrailMaster", &off_spec));
     }
 
@@ -10610,7 +10619,9 @@ mod typed_kitty_summon_tests {
 
         type_word(&mut app, wid, "dog ");
         assert!(
-            !app.windows[&wid].dog_cameo.active(std::time::Instant::now()),
+            !app.windows[&wid]
+                .dog_cameo
+                .active(std::time::Instant::now()),
             "no dog before the typed-a-lot gate opens"
         );
 
@@ -10853,12 +10864,18 @@ mod typed_kitty_summon_tests {
         }
     }
 
-    /// Typing `kitty` summons THE STANDALONE CAMEO — never the cursor
-    /// companion (owner, 2026-08-09) — and logs EXACTLY one episode as the type
+    /// Typing `kitty` NEVER WAKES AN ANIMAL ON THE INPUT PATH (owner,
+    /// 2026-08-09: *"When I type 'kitty' I do not want that to make the CURSOR
+    /// kitty appear"*; owner, 2026-08-12: *"there are now two cats that seem to
+    /// appear when I type 'cat'? I want the cat just like in the main text"*).
+    ///
+    /// The word echoes onto the grid and the SCREEN SCANNER answers it with the
+    /// one ambient word-cat, centred on the word span — that is the whole
+    /// presentation. All this path does is log EXACTLY one episode as the type
     /// it visually is (`head_peek`, ordinary magic); the consumed completion's
     /// tail adds nothing.
     #[test]
-    fn typing_kitty_summons_the_cameo_and_never_the_companion() {
+    fn typing_kitty_logs_one_episode_and_wakes_no_companion() {
         let mut app = App::headless_for_test();
         app.recompute_sparkle();
         assert!(
@@ -10868,19 +10885,11 @@ mod typed_kitty_summon_tests {
         let wid = WindowId(0);
         let now = std::time::Instant::now();
         assert!(!app.windows[&wid].cursor_cat.is_active());
-        assert!(
-            !app.windows[&wid].word_decos.cameo_live(now, None),
-            "precondition: nothing is on glass before the word is typed"
-        );
 
         type_word(&mut app, wid, "kitty");
         assert!(
-            app.windows[&wid].word_decos.cameo_live(now, None),
-            "the typed word summons THE kitty"
-        );
-        assert!(
             !app.windows[&wid].cursor_cat.is_active(),
-            "and it must NOT wake the CURSOR kitty"
+            "the typed word must NOT wake the CURSOR kitty"
         );
         assert!(
             app.windows[&wid].cursor_cat.static_deadline(now).is_none(),
@@ -10908,8 +10917,8 @@ mod typed_kitty_summon_tests {
 
     /// SCREEN CONTENT NEVER SUMMONS: a PTY payload full of "kitty" (the
     /// `cat somefile` case) reaches the terminal grid, not the detector —
-    /// no cameo, no typed-summon log entry. (On-screen occurrences remain
-    /// the ambient word-cat renderer's separate, unchanged domain.)
+    /// no typed-summon log entry. (On-screen occurrences remain the ambient
+    /// word-cat renderer's separate, unchanged domain.)
     #[test]
     fn screen_output_of_kitty_never_summons() {
         let mut app = App::headless_for_test();
@@ -10959,8 +10968,8 @@ mod typed_kitty_summon_tests {
 
     /// The rate limit holds on the real input path: back-to-back completions
     /// land inside [`crate::kitty_summon::TYPED_SUMMON_COOLDOWN`], so
-    /// kitty-spam yields one LEDGER episode, not a flood (the CAMEO itself is not
-    /// rate-limited — see `kitty_summon`'s two tiers).
+    /// kitty-spam yields one LEDGER episode, not a flood. The COMPLETION itself
+    /// is not rate-limited — see `kitty_summon`'s two tiers.
     #[test]
     fn kitty_spam_is_rate_limited_to_one_episode() {
         let mut app = App::headless_for_test();
@@ -10999,7 +11008,7 @@ mod typed_kitty_summon_tests {
 
     /// EFFECTS MASTER GATE: with sparkle words unresolved (off) nothing could
     /// draw a cat, so the summon is wholly inert — no hello, no log entry —
-    /// exactly like the ambient sightings the cameo mirrors.
+    /// exactly like the ambient sightings it mirrors.
     #[test]
     fn summon_is_inert_with_sparkle_words_off() {
         let mut app = App::headless_for_test();
@@ -11013,8 +11022,8 @@ mod typed_kitty_summon_tests {
     /// FELINE SUB-GATE: `[sparkle_words.feline] enabled = false` disables every
     /// ambient cat decoration — and with it every ambient Kitty Log sighting —
     /// while the OTHER families keep the sparkle master resolved ON. The typed
-    /// summon must be equally inert under that config: no cameo, and no ledger
-    /// row, since a `head_peek` episode would land in a category the user's
+    /// summon must be equally inert under that config: no ledger row, since a
+    /// `head_peek` episode would land in a category the user's
     /// config can never produce ambiently. Gating on the master alone is not
     /// enough.
     #[test]
@@ -11045,14 +11054,8 @@ mod typed_kitty_summon_tests {
         let wid = WindowId(0);
         type_word(&mut app, wid, "kitty");
         assert!(
-            !app.windows[&wid]
-                .word_decos
-                .cameo_live(std::time::Instant::now(), None),
-            "feline off: no cameo may arm"
-        );
-        assert!(
             !app.windows[&wid].cursor_cat.is_active(),
-            "feline off: and certainly no companion either"
+            "feline off: no companion may wake"
         );
         assert_eq!(
             app.kitty_log.log().sightings,
@@ -11071,49 +11074,15 @@ mod typed_kitty_summon_tests {
         let wid = WindowId(0);
         let session = app.front_terminal(wid).unwrap().session;
         let now = std::time::Instant::now();
-        app.summon_typed_kitty(wid, session, now, true);
+        app.record_typed_kitty(wid, session, now);
         assert_eq!(app.kitty_log.log().sightings, 1);
-        assert!(app.windows[&wid].word_decos.cameo_live(now, None));
         // Bypassing the detector's cooldown on purpose: this seam proves the
         // ident sequence, not the rate limit (the detector owns that proof).
-        app.summon_typed_kitty(wid, session, now, true);
+        app.record_typed_kitty(wid, session, now);
         assert_eq!(
             app.kitty_log.log().sightings,
             2,
             "a reused ident would have been absorbed by the ring for RING_TTL"
-        );
-    }
-
-    /// THE TWO TIERS AT THE APP SEAM. A ledger-suppressed summon
-    /// (`record = false`) must still present the cameo, and must not touch the
-    /// log — not the sighting count, not the ident sequence.
-    #[test]
-    fn a_ledger_suppressed_summon_still_shows_the_cameo() {
-        let mut app = App::headless_for_test();
-        app.recompute_sparkle();
-        let wid = WindowId(0);
-        let session = app.front_terminal(wid).unwrap().session;
-        let now = std::time::Instant::now();
-
-        let seq_before = app.kitty_summon_seq;
-        app.summon_typed_kitty(wid, session, now, false);
-
-        assert!(
-            app.windows[&wid].word_decos.cameo_live(now, None),
-            "the cat must come when called, cooldown or not"
-        );
-        assert!(
-            !app.windows[&wid].cursor_cat.is_active(),
-            "and the cooldown tier still never routes through the companion"
-        );
-        assert_eq!(
-            app.kitty_log.log().sightings,
-            0,
-            "the ledger tier stayed closed"
-        );
-        assert_eq!(
-            app.kitty_summon_seq, seq_before,
-            "a suppressed record must not consume an ident"
         );
     }
 }
@@ -11304,7 +11273,7 @@ mod favourite_session_kitty_tests {
 /// keying, the note ring) are proven in `aterm_effects::kitty_sing`; this
 /// module binds the App seam: the press path feeds ONLY typed keys —
 /// screen bytes can never arm the celebration — and the release keys
-/// release through the same classified press the cameo/tone feeds ride.
+/// release through the same classified press the detector/tone feeds ride.
 #[cfg(test)]
 mod full_kitty_sing_seam_tests {
     use crate::input::{InputEvent, Source};

@@ -266,9 +266,9 @@ fn resolve_candidate_face(
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    // The `game:` scheme resolves to embedded bytes, never a file read — the
+    // The `display:` scheme resolves to embedded bytes, never a file read — the
     // same interception every other resolution path performs.
-    let resolved = if let Some(bytes) = aterm_render::game_font_for_family(family.trim()) {
+    let resolved = if let Some(bytes) = aterm_render::display_face_for_family(family.trim()) {
         Ok(ResolvedCandidateFace {
             path: family.trim().to_string(),
             bytes: aterm_render::intern_font_bytes(bytes.to_vec()),

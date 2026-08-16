@@ -35,11 +35,20 @@ const PLANT_TOL: f32 = 4.5;
 /// mid-arc by definition (rise serves flight u < 0.25, descend u > 0.6, never
 /// the endpoints where lift returns to zero), so like the gallop's suspension
 /// frames they carry authored clearance.
+/// Listed per SPECIES rather than derived by stripping a prefix: the roster is
+/// authored data, and a test that computes the expected answer from the same
+/// naming rule the data uses would stop being an independent check.
 const AIRBORNE: &[&str] = &[
     "pet_leap_descend",
     "pet_leap_rise",
     "pet_run_1",
     "pet_run_3",
+    // The dog roster is the same pose sheet re-skinned (`art/pet/poses.py`),
+    // so exactly the same four frames are off the floor.
+    "pet_dog_leap_descend",
+    "pet_dog_leap_rise",
+    "pet_dog_run_1",
+    "pet_dog_run_3",
 ];
 
 /// Layer ceiling — the hero budget from `docs/CAT_ART.md`, which the pet roster

@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn no_commandline_and_no_block_claim_nothing() {
         let mut slot = AppKittySlot::default();
-        assert!(slot.resolve(Some(&block(BlockState::Executing, None))).is_none());
+        assert!(
+            slot.resolve(Some(&block(BlockState::Executing, None)))
+                .is_none()
+        );
         assert!(slot.resolve(None).is_none());
     }
 
@@ -195,7 +198,10 @@ mod tests {
         let mut slot = AppKittySlot::default();
         let executing = block(BlockState::Executing, None);
         assert!(slot.resolve(Some(&executing)).is_none());
-        assert!(slot.resolve(Some(&executing)).is_none(), "stable across frames");
+        assert!(
+            slot.resolve(Some(&executing)).is_none(),
+            "stable across frames"
+        );
 
         let late_e = block(BlockState::Executing, Some("codex exec"));
         let ident = slot.resolve(Some(&late_e)).expect("late 633;E re-resolves");

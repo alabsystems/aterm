@@ -83,8 +83,10 @@ pub(crate) struct Config {
     /// Cursor MOTION TRAIL — the "streaming trailer" effect. DEFAULT ON and
     /// exactly idle at rest; set `cursor_trail = false` to opt out.
     pub(crate) cursor_trail: Option<bool>,
-    /// Trail STYLE: `rainbow kitty` (DEFAULT — a momentum-driven banded rainbow
-    /// ribbon), `phaser` (a full-spectrum additive hue sweep along the
+    /// Trail STYLE: `rainbow kitty pet` (DEFAULT — that momentum-driven banded
+    /// rainbow ribbon with the full-body cat that walks, runs and pounces along
+    /// the line), `rainbow kitty` (the same ribbon under the flying kitty head),
+    /// `phaser` (a full-spectrum additive hue sweep along the
     /// swept path), `comet` (the cadence-comet: a directional fading comet of
     /// `TrailCell`s that ignites longer/hotter with fast sustained typing, wrapped in
     /// the additive light crown), `lumen` (the additive light crown only — comet +
@@ -92,7 +94,7 @@ pub(crate) struct Config {
     /// (phaser comet + spark particles), `fire` (rising embers), `laser` (white-hot
     /// beam), `water`, `beam` (a bloom-free beam-only crown, no trail body), or `off`.
     /// (`nyan rainbow`, `nyan` and `rainbow` are back-compat aliases for
-    /// `rainbow kitty`.)
+    /// `rainbow kitty`; `kitty pet`/`pet kitty` for `rainbow kitty pet`.)
     pub(crate) cursor_trail_style: Option<String>,
     /// Trail Pack manifests — user-generated cursor trails as data (design
     /// `docs/trail-packs.md`). Each entry is a path to a `*.toml` Trail Pack
@@ -144,6 +146,20 @@ pub(crate) struct Config {
     /// melody to today's neutral constitution and stops the classifier from
     /// ever running.
     pub(crate) tone_melody: Option<bool>,
+    /// ROBI THE HELPER ROBOT (`robi`, default ON — user-facing features ship
+    /// enabled; this is an opt-OUT). A little white robot with a cyan visor
+    /// (ported from the user's Nitro Keyboard game) lives on the glass as a
+    /// PERMANENT RESIDENT, cycling forever through his rounds: he walks along
+    /// the row being typed, does jumping jacks while sharing a
+    /// getting-started tip, extends a ladder up past the grid, climbs it,
+    /// swings across the tab bar like monkey bars while sharing a deeper tip
+    /// (aterm features, shell tricks, Claude Code tricks), drops, and rests —
+    /// then goes around again. His tips render as a speech bubble above his
+    /// head (the transient-notice pill, anchored to him). Typing `robi` or
+    /// `robot` restarts his rounds at the greeting. His idle stands are
+    /// static, so a resting Robi costs zero repaints. Hidden only under
+    /// reduced motion, serious mode, or `false` — never by focus or time.
+    pub(crate) robi: Option<bool>,
     /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
     /// ship enabled; this is an opt-OUT).
     ///
@@ -339,16 +355,24 @@ pub(crate) struct Config {
     /// `$ATERM_FONT` then the built-in [`FONT_CANDIDATES`], so an unset / unknown
     /// family is byte-identical to before.
     pub(crate) font_family: Option<String>,
-    /// GAME-TITLE font (`game_font`): one of the bundled game-title faces by id
-    /// (`"roblox"`, `"minecraft"`, `"zelda"`, `"mariokart"`, `"animal-crossing"`
-    /// — [`aterm_render::GAME_FONTS`]). When set it OUTRANKS `font_family`: the
+    /// DISPLAY FACE (`display_font`): one of the bundled display faces by id
+    /// (`"pixel"`, `"chunky"`, `"engraved"`, `"bubble"` —
+    /// [`aterm_render::DISPLAY_FACES`]). When set it OUTRANKS `font_family`: the
     /// whole terminal renders in that face (resolved as the virtual family
-    /// `game:<id>` from embedded bytes, never the filesystem). Unset = the
+    /// `display:<id>` from embedded bytes, never the filesystem). Unset = the
     /// normal font selection, byte-identical to before this key existed. The
-    /// Settings "Game Fonts" page drives this as five mutually-exclusive
+    /// Settings "Display Faces" page drives this as mutually-exclusive
     /// toggles (all off ⇒ the key is cleared). Hot-reloadable. `$ATERM_FONT`
     /// still outranks it (env > config, the one precedence law).
-    pub(crate) game_font: Option<String>,
+    ///
+    /// `game_font` is the DEPRECATED spelling and stays a serde alias: deleting
+    /// a shipped key would turn every config that carries it into a complaint
+    /// about a line the user wrote correctly at the time. Legacy VALUES
+    /// (`minecraft`, …) resolve the same way — see
+    /// [`aterm_render::DISPLAY_FACE_LEGACY_IDS`] and
+    /// [`warn_deprecated_display_font_spelling`].
+    #[serde(alias = "game_font")]
+    pub(crate) display_font: Option<String>,
     /// REAL BOLD face for SGR-bold cells (W6, ghostty's `font-family-bold`): a
     /// family name or file path, resolved like `font_family` and injected via the
     /// renderer's `set_bold_font` seam — a true heavier weight instead of the
@@ -2175,10 +2199,11 @@ pub(crate) struct UpdateConfig {
     pub(crate) auto_apply: Option<bool>,
     /// OPT IN to Apple Developer-ID + notarization enforcement for self-updates.
     ///
-    /// Absent (the default) means the shipped posture: aterm's own releases are
-    /// ad-hoc signed with no Team ID, so the updater runs the structural
-    /// `codesign --verify` and never consults notarization. That is what lets an
-    /// unsigned dev or self-hosted build update at all, and it is deliberate —
+    /// Shipped aterm compiles the real Team ID in (Tier APPLE armed 2026-08-15),
+    /// which always wins; this setting matters only to forks/self-hosted builds
+    /// with an empty compiled pin, where absent means the structural
+    /// `codesign --verify` only. That is what lets an unsigned build update, and
+    /// it is deliberate —
     /// authenticity in that tier comes from the channel plus the manifest SHA-256
     /// (and the Ed25519 manifest signature when one is configured).
     ///
@@ -2586,6 +2611,11 @@ impl Config {
         self.tone_melody.unwrap_or(true)
     }
 
+    /// Robi the helper robot on/off (`robi`, default ON — see the field doc).
+    pub(crate) fn robi_or_default(&self) -> bool {
+        self.robi.unwrap_or(true)
+    }
+
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
     /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
@@ -2739,30 +2769,37 @@ impl Config {
             .map(|c| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b))
     }
 
-    /// The PRIMARY-FONT REQUEST with the game-font override applied: a valid
-    /// `game_font` selection wins as the virtual family `game:<id>` — or, for
-    /// a MIX of 2..=3 `+`-joined ids, `game:<id>+<id>[+<id>]` (every character
-    /// then deterministically picks one face of the mix). Otherwise the plain
-    /// `font_family` passes through verbatim. Unknown/duplicate ids are
-    /// DROPPED (and `"off"` never counts), so a typo can never blank the
+    /// The PRIMARY-FONT REQUEST with the display-face override applied: a valid
+    /// `display_font` selection wins as the virtual family `display:<id>` — or,
+    /// for a MIX of 2..=3 `+`-joined ids, `display:<id>+<id>[+<id>]` (every
+    /// character then deterministically picks one face of the mix). Otherwise
+    /// the plain `font_family` passes through verbatim. Unknown/duplicate ids
+    /// are DROPPED (and `"off"` never counts), so a typo can never blank the
     /// terminal; more than three keeps the first three (the toggles cap there
     /// anyway). Every font resolution site (startup, catalog worker,
     /// diagnostics) funnels through this so the toggles can never half-apply.
+    ///
+    /// Legacy ids are CANONICALIZED here rather than special-cased downstream:
+    /// `minecraft` becomes `pixel`, so one config value produces one virtual
+    /// family and every consumer sees the same spelling. `mariokart` — the one
+    /// retired id with no successor — canonicalizes to nothing and therefore
+    /// falls through to `font_family`, which is the documented migration: a
+    /// config that was valid yesterday warns and loads, it does not fail.
     pub(crate) fn font_family_request(&self) -> Option<String> {
-        let game = self.game_font.as_deref().and_then(|raw| {
-            let mut ids: Vec<&str> = Vec::new();
-            for id in raw.split('+').map(str::trim) {
-                if aterm_render::game_font_bytes(id).is_some()
+        let display = self.display_font.as_deref().and_then(|raw| {
+            let mut ids: Vec<&'static str> = Vec::new();
+            for id in raw.split('+') {
+                if let Some(id) = aterm_render::display_face_canonical_id(id)
                     && !ids.contains(&id)
-                    && ids.len() < aterm_render::GAME_FONT_MIX_MAX
+                    && ids.len() < aterm_render::DISPLAY_FACE_MIX_MAX
                 {
                     ids.push(id);
                 }
             }
             (!ids.is_empty())
-                .then(|| format!("{}{}", aterm_render::GAME_FONT_SCHEME, ids.join("+")))
+                .then(|| format!("{}{}", aterm_render::DISPLAY_FACE_SCHEME, ids.join("+")))
         });
-        game.or_else(|| self.font_family.clone())
+        display.or_else(|| self.font_family.clone())
     }
 
     /// The selected-tab color override as `[r, g, b]`, if `active_tab_color` is
@@ -2788,9 +2825,9 @@ impl Config {
     /// classify it with `eq_ignore_ascii_case` / a case-insensitive `GlowStyle::parse`
     /// instead of paying a `to_ascii_lowercase` heap allocation on every frame.
     pub(crate) fn cursor_trail_style_raw(&self) -> &str {
-        // Default: the RAINBOW KITTY ribbon (the banded rainbow whose blinking block
-        // twinkles like a little star — the effect the owner made the default), read
-        // from the single definition in `prefs` rather than re-typed here, so a rename
+        // Default: the RAINBOW KITTY PET (the banded rainbow ribbon trailed by the
+        // walking cat — the companion the owner runs), read from the single
+        // definition in `prefs` rather than re-typed here, so a rename
         // of the style cannot leave this resolver pointing at a dead spelling.
         // `glow_config`/`trail_config` split the layers.
         self.cursor_trail_style
@@ -4576,6 +4613,66 @@ fn warn_deprecated_font_env_aliases_once() {
     });
 }
 
+/// Deprecation notice (once per process) for the PRE-RENAME display-face
+/// spellings — the `game_font` key and the game-named ids (`minecraft`, …).
+///
+/// Both keep working, which is the whole point: a key or value that was correct
+/// when it was written must not become a config error later. But the user is
+/// told the new spelling, because the old one is the one they will keep copying
+/// out of old notes otherwise.
+///
+/// `mariokart` gets its own sentence. It is the one retired id with NO
+/// successor — its face shipped a `name` table still reading "Typeface © (your
+/// company)", so there was nothing to relicense and nothing to promote in its
+/// place. Silence would leave the user staring at their ordinary font with no
+/// idea why the setting stopped taking.
+///
+/// Reads the RAW config text, not the parsed struct, because `#[serde(alias)]`
+/// is exactly the machinery that erases which spelling was on disk.
+fn warn_deprecated_display_font_spelling(source: &str, config: &Config) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let legacy_key = source.lines().any(|line| {
+            line.split('=')
+                .next()
+                .is_some_and(|key| key.trim() == crate::prefs::LEGACY_EDIT_DISPLAY_FONT)
+        });
+        if legacy_key {
+            eprintln!(
+                "aterm-gui: `{legacy}` is deprecated; rename it to `{current}` \
+                 (the old key still works — the faces are now named for the \
+                 letterform rather than a game)",
+                legacy = crate::prefs::LEGACY_EDIT_DISPLAY_FONT,
+                current = crate::prefs::EDIT_DISPLAY_FONT,
+            );
+        }
+        for id in config
+            .display_font
+            .iter()
+            .flat_map(|raw| raw.split('+'))
+            .map(str::trim)
+        {
+            match aterm_render::DISPLAY_FACE_LEGACY_IDS
+                .iter()
+                .find(|(legacy, _)| *legacy == id)
+            {
+                Some((_, Some(current))) => eprintln!(
+                    "aterm-gui: `{key} = \"{id}\"` is deprecated; write \"{current}\" \
+                     instead (same face, named for its letterform)",
+                    key = crate::prefs::EDIT_DISPLAY_FONT,
+                ),
+                Some((_, None)) => eprintln!(
+                    "aterm-gui: `{key} = \"{id}\"` names a face aterm no longer ships \
+                     — it carried no redistribution licence and has no substitute; \
+                     your primary font is used instead",
+                    key = crate::prefs::EDIT_DISPLAY_FONT,
+                ),
+                None => {}
+            }
+        }
+    });
+}
+
 /// M5 honest fallback (once per process): `background_opacity < 1.0` requests
 /// translucent glass. The GPU backend composites it for real (PostMultiplied
 /// swapchain over an `NSVisualEffectView`), but the CPU softbuffer surface is
@@ -4927,8 +5024,9 @@ fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Stri
     let properties = NSDictionary::<NSBitmapImageRepPropertyKey, objc2::runtime::AnyObject>::new();
     // PNG standardizes the rep's implementation-defined channel order and
     // premultiplication into straight RGBA before Rust reads it.
-    let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties) }
-        .ok_or_else(|| "could not re-encode the decoded image".to_string())?;
+    let png =
+        unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties) }
+            .ok_or_else(|| "could not re-encode the decoded image".to_string())?;
     let png_len = png.length();
     let mut png_bytes = vec![0_u8; png_len];
     if png_len != 0 {
@@ -5480,10 +5578,12 @@ pub(crate) fn load_config() -> Config {
                 return Config::default();
             }
         };
-    toml::from_str(&observation.text).unwrap_or_else(|e| {
+    let config: Config = toml::from_str(&observation.text).unwrap_or_else(|e| {
         eprintln!("aterm-gui: ignoring invalid config {}: {e}", path.display());
         Config::default()
-    })
+    });
+    warn_deprecated_display_font_spelling(&observation.text, &config);
+    config
 }
 
 /// Resolve the glyph size in physical px with the canonical precedence
@@ -8461,8 +8561,8 @@ copy_on_select = true
 #[cfg(test)]
 mod descriptive_title_config_tests {
 
-    /// The TYPING-WAKE dial's config contract (Settings ▸ Cursor & Motion ▸
-    /// "Typing wake"): an absent key takes the engine's own default, `0` is a
+    /// The TYPING-WAKE dial's config contract (Settings ▸ Cursor Kitty ▸ Rainbow
+    /// wake ▸ "Typing wake"): an absent key takes the engine's own default, `0` is a
     /// real OFF setting rather than a failure, an absurd value clamps instead of
     /// escaping, and the whole `u64` domain maps into the closed range — there
     /// is nothing a config file can write here that reaches the engine unbounded.
@@ -9500,6 +9600,13 @@ mod cfg_engine_tests {
         assert!(Config::default().tone_melody_or_default());
         assert!(cfg("tone_melody = true").tone_melody_or_default());
         assert!(!cfg("tone_melody = false").tone_melody_or_default());
+    }
+
+    #[test]
+    fn robi_defaults_on_and_round_trips() {
+        assert!(Config::default().robi_or_default());
+        assert!(cfg("robi = true").robi_or_default());
+        assert!(!cfg("robi = false").robi_or_default());
     }
 
     /// The ambient-bed knob: shipped DISABLED (owner: the drone is opt-in;

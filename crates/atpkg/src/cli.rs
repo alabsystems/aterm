@@ -5,15 +5,51 @@
 //!
 //! The local read/maintenance verbs (`which`/`list`/`uninstall`) and `doctor` are wired
 //! here over the tested library (`crate::ops`, `crate::store`); the network-driven verbs
-//! (`install`/`update`/`sync`/`rollback`, plus the `install --default-set` bootstrap)
+//! (`install`/`update`/`rollback`, plus the `install --default-set` bootstrap)
 //! compose the same tested primitives with the GitHub/dir fetch. Every network verb reads
 //! the `[packages]` table of the SAME `aterm.toml` the GUI owns ([`crate::config`]) —
-//! account/channel/include/exclude/links — with env always winning over config. With no
-//! `ATERM_PKG_ROOTKEY` pinned at build time the manager is INERT and says so.
+//! account/channel/include/exclude/links — with env always winning over config. The
+//! verification anchor is the COMMITTED paper-master keyset [`crate::PKG_TRUST_ANCHORS`]
+//! (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`) — the SAME root the app updater uses
+//! — and nothing else: no env var or build-time
+//! variable can supply or swap it (see [`effective_anchor`]); a tree whose master keyset
+//! is empty — which is this tree — builds a manager that is INERT and says so.
 
 use std::process::ExitCode;
 
 use crate::flow::now_unix;
+
+/// Every verb the dispatch below accepts, in the order the unknown-verb hint
+/// prints them.
+///
+/// Kept as DATA, and checked against the `match` by
+/// [`tests::verb_hint_matches_dispatch`], because the hint has drifted from
+/// reality twice: `sync` (deleted in `a43193f4`) and `seed` (deleted in
+/// `ba832933`) were both still advertised here long after they stopped
+/// dispatching — so a user who followed the suggestion got the very error
+/// that printed it. A hand-maintained help string cannot be trusted to track
+/// a match arm; a test can.
+const VERBS: &[&str] = &[
+    "doctor",
+    "which",
+    "list",
+    "uninstall",
+    "tree-root",
+    "verify-index",
+    "verify-pkg",
+    "install",
+    "update",
+    "rollback",
+    "pin",
+    "unpin",
+    "gc",
+    "verify",
+    "link",
+    "unlink",
+    "refresh",
+    "run",
+    "relocate",
+];
 
 /// The whole package-manager CLI as a callable: `argv[1..]` in, exit code
 /// out. Served in-process by the ONE `aterm` binary (`aterm pkg …` / the
@@ -27,11 +63,18 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let verb = args.first().map(String::as_str);
     // THE single-writer-per-store gate ([`crate::lock`]): every store-MUTATING verb
     // TRY-acquires the store-wide `store.lock` here — at the ONE dispatch edge, so
-    // internal verb re-routing (`sync` → update-all, `update <p>` → install) can
+    // internal verb re-routing (`update <p>` → install) can
     // never double-acquire — and holds it for the whole verb. Contention is a loud
     // exit-1 refusal naming the lock path (the GUI Packages page surfaces the child
     // stderr; the 6-hour loop just retries next pass). Read-only verbs skip this
     // entirely and never need the lock.
+    // The conventional help spellings land on the help surface with exit 0, not the
+    // unknown-verb error path — `atpkg` rides PATH as an argv0 alias, so `--help` is
+    // the first thing a shell (or an AI) tries. Handled BEFORE the verb match so the
+    // dispatch-coherence test's arm extraction sees only real verbs.
+    if matches!(verb, Some("help" | "-h" | "--help")) {
+        return cmd_help();
+    }
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock() {
             Ok(guard) => guard,
@@ -46,9 +89,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("list") => cmd_list(),
         Some("uninstall") => return cmd_uninstall(args.get(1)),
         Some("tree-root") => return cmd_tree_root(args.get(1)),
-        Some("verify-index") => return cmd_verify_index(args.get(1), args.get(2), args.get(3)),
+        Some("verify-index") => return cmd_verify_index(args.get(1..).unwrap_or(&[])),
+        Some("verify-pkg") => return cmd_verify_pkg(args.get(1..).unwrap_or(&[])),
         Some("install") => return cmd_install(args.get(1)),
-        Some("seed") => return cmd_seed(&args[1..]),
         Some("update") => return cmd_update(args.get(1)),
         Some("rollback") => return cmd_rollback(args.get(1)),
         Some("pin") => return cmd_pin(args.get(1), true),
@@ -61,15 +104,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("run") => return cmd_run(&args[1..]),
         Some("relocate") => return cmd_relocate(&args[1..]),
         Some(other) => {
-            eprintln!(
-                "atpkg: unknown verb '{other}' (try: doctor, which, list, run, uninstall, \
-                 install, seed, update, sync, rollback, pin, unpin, gc, verify, link, unlink, \
-                 refresh, tree-root, verify-index, relocate)"
-            );
+            eprintln!("atpkg: unknown verb '{other}' (try: {})", VERBS.join(", "));
             return ExitCode::from(2);
         }
         None => status(),
     }
+    ExitCode::SUCCESS
+}
+
+/// `atpkg help` / `-h` / `--help` — the conventional help surface: usage plus the ONE
+/// advertised verb roster ([`VERBS`]), exit 0. The full manual is `aterm help pkg`;
+/// this stays a summary so the two never fork.
+fn cmd_help() -> ExitCode {
+    println!("atpkg — the aterm toolchain package manager");
+    println!("usage: atpkg <verb> [args…]");
+    println!("verbs: {}", VERBS.join(", "));
+    println!("full manual: aterm help pkg");
     ExitCode::SUCCESS
 }
 
@@ -97,7 +147,7 @@ fn layout() -> Option<crate::store::Layout> {
 /// Whether `verb` MUTATES the store and must therefore hold the store-wide
 /// single-writer lock ([`crate::lock`]) for its whole run. The mutators are every
 /// verb that stages/activates/discards builds or rewrites shims (`install` — incl.
-/// `--default-set` —, `seed`, `update`, `sync`, `rollback`, `uninstall`, `gc`), every
+/// `--default-set` —, `update`, `rollback`, `uninstall`, `gc`), every
 /// link-mutating verb (`link`, `unlink`, `refresh` — which also covers the
 /// `[packages.links]` reconciliation the network verbs run), and `pin`/`unpin`:
 /// pins are LOCAL state files, but they gate the coherence-group transaction and
@@ -109,7 +159,6 @@ fn verb_mutates_store(verb: &str) -> bool {
     matches!(
         verb,
         "install"
-            | "seed"
             | "update"
             | "rollback"
             | "uninstall"
@@ -143,12 +192,9 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
 fn status() {
     if manager_enabled() {
         let anchor = "root key pinned";
-        println!(
-            "atpkg: enabled ({anchor}). Verbs: doctor, which, list, run, uninstall, \
-             install, seed, update, sync, rollback, pin, unpin, gc, verify, link, unlink, refresh."
-        );
+        println!("atpkg: enabled ({anchor}). Verbs: {}.", VERBS.join(", "));
     } else {
-        println!("atpkg: disabled (no root key pinned or overridden) -- inert");
+        println!("atpkg: disabled (no root key pinned) -- inert");
     }
 }
 
@@ -210,15 +256,6 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     let Some(target) = crate::which(&layout, tool) else {
-        // A batteries-included companion mid-build reports PROGRESS, not "not installed" —
-        // the eager-early-typing user hits this exactly when the promise matters most.
-        if let Some(entry) = companion_installing(&layout, tool) {
-            eprintln!(
-                "atpkg: {tool} is still installing (attempt {}) — run `aterm pkg status` to watch",
-                entry.attempts
-            );
-            return ExitCode::from(75); // EX_TEMPFAIL — try again shortly
-        }
         eprintln!("atpkg: {tool} is not installed (try: atpkg install {tool})");
         return ExitCode::from(127);
     };
@@ -232,238 +269,6 @@ fn cmd_run(rest: &[String]) -> ExitCode {
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("atpkg: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
-}
-
-/// The ledger entry for the companion that exposes `tool`, IF that companion is currently
-/// building — so `atpkg run <tool>` (thus `aterm <tool>`) can report progress mid-build.
-fn companion_installing(
-    layout: &crate::store::Layout,
-    tool: &str,
-) -> Option<crate::seed::LedgerEntry> {
-    let manifest = crate::companions::load().ok()?;
-    let comp = manifest
-        .companions
-        .iter()
-        .find(|c| c.expose.iter().any(|e| e == tool))?;
-    let ledger = crate::seed::Ledger::read(layout);
-    ledger
-        .companions
-        .get(&comp.name)
-        .filter(|e| e.state == "building")
-        .cloned()
-}
-
-/// `atpkg seed [--force]` — the SOURCE-BUILD (keyless) batteries-included lane: reconcile the
-/// compiled-in companions manifest (`docs/COMPANION-TOOLS.md`, starting with `ay`) by building
-/// each missing/repinned companion from its pinned public source into the store and shimming
-/// it. Complementary to the SIGNED `atpkg install --default-set` bootstrap (§11): a companion
-/// already installed by either lane is skipped (idempotent — running both is safe). Source-
-/// build is DEFAULT-OFF (opt-in `ATPKG_SOURCE_BUILD=1`) and runs even when the manager is inert
-/// (its trust basis is the owner manifest + the pinned commit, not the signed index). Store
-/// mutation is serialized by the store-wide lock held at the dispatch edge (`seed` is in
-/// `verb_mutates_store`). `--force` ignores the per-commit retry cap.
-fn cmd_seed(rest: &[String]) -> ExitCode {
-    let force = rest.iter().any(|a| a == "--force" || a == "-f");
-    let Some(layout) = layout() else {
-        return ExitCode::from(1);
-    };
-    // 2a — the SIGNED bundled-seed lane (§9.1/§11): a release cut may seal a
-    // signed seed registry beside this executable; fill the store from it —
-    // zero network, zero toolchain — through the UNCHANGED root-key +
-    // freshness + floor + sha256 + tree_root gates. Consent is the same
-    // coarse [packages].auto_install switch that gates the network bootstrap;
-    // without it the seed is announced (status + a stable stdout marker the
-    // GUI surfaces), never extracted. Runs before the source lane so a
-    // batteries-included box never source-builds what it already carries.
-    let mut prebuilt_failed = 0u32;
-    // The seed is a BOOTSTRAP source (see `resolve_fetcher`): once the store
-    // holds anything, updates belong to the network + cache path, so the lane
-    // is skipped entirely rather than resolving an index it will not use.
-    let bootstrap = crate::active_builds(&layout).is_empty();
-    if let Some(seed_dir) = crate::bundled_seed_dir().filter(|_| bootstrap) {
-        if !crate::manager_enabled() {
-            println!(
-                "atpkg: bundled seed present ({}) but no root key is pinned — prebuilt lane skipped (fail-closed)",
-                seed_dir.display()
-            );
-        } else {
-            let cfg = crate::config::cached();
-            // The chain (network when reachable + this seed) so a fresher
-            // published index outranks stale sealed pins even at seed time.
-            let fetcher = resolve_fetcher(&layout);
-            if cfg.auto_install() {
-                let before = crate::active_builds(&layout);
-                prebuilt_failed =
-                    install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
-                // New shims must reach interactive shells without a relaunch.
-                crate::hooks::refresh(&layout);
-                let after = crate::active_builds(&layout);
-                let mut new: Vec<String> = after
-                    .keys()
-                    .filter(|k| !before.contains_key(k.as_str()))
-                    .cloned()
-                    .collect();
-                if !new.is_empty() {
-                    new.sort();
-                    // The stable marker the GUI parses — change it and the
-                    // first-run notice goes blind (crates/aterm-gui,
-                    // spawn_pkg_update_check).
-                    println!("atpkg: seed-installed: {}", new.join(", "));
-                }
-            } else {
-                announce_pending_seed(&layout, &*fetcher, cfg, &seed_dir);
-            }
-        }
-    }
-    let manifest = match crate::companions::load() {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("atpkg: companions manifest invalid: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let mut log = |line: &str| println!("atpkg: {line}");
-    let results = crate::seed::reconcile_source(&layout, &manifest, force, &mut log);
-
-    let mut failed = 0u32;
-    let mut ready = 0u32;
-    for r in &results {
-        match r.state.as_str() {
-            "ready" | "reused" => {
-                ready += 1;
-                println!("atpkg: {} {} — {}", r.name, r.state, r.detail);
-            }
-            "failed" => {
-                failed += 1;
-                eprintln!("atpkg: {} FAILED — {}", r.name, r.detail);
-            }
-            _ => println!("atpkg: {} skipped — {}", r.name, r.detail),
-        }
-    }
-    println!(
-        "atpkg: seed complete ({ready} ready, {failed} failed, {} companion(s) considered)",
-        results.len()
-    );
-    if failed > 0 || prebuilt_failed > 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
-}
-
-/// Retire the `*seed*` pending-consent row (the offer was taken, or nothing is
-/// installable here). `record_status` MERGES the program map, so a row nobody
-/// removes lives forever — Settings ▸ Packages would keep advertising an offer
-/// the user already accepted.
-fn clear_seed_status(layout: &crate::store::Layout) {
-    let Some(mut status) = crate::status::read(layout) else {
-        return;
-    };
-    if status.programs.remove("*seed*").is_none() {
-        return;
-    }
-    status.updated_at = now_rfc3339();
-    status.outcome = "bundled seed: nothing pending".to_string();
-    let _ = crate::status::write(layout, &status);
-}
-
-/// The consent-pending half of the bundled-seed lane (§11): resolve the ONE
-/// verified index through the chain, count the channel-pinned installable
-/// members not yet installed, and say so — a stable stdout marker line
-/// (`seed-pending: …`, what the GUI's launch-time seed run parses for the
-/// first-run notice) plus a `status.toml` entry so Settings ▸ Packages shows
-/// the same truth. Announcement only: nothing is downloaded or extracted, and
-/// a failure to resolve the index here is itself only announced (the seed is
-/// an offer, not an obligation).
-fn announce_pending_seed(
-    layout: &crate::store::Layout,
-    fetcher: &dyn crate::flow::Fetcher,
-    cfg: &crate::config::PackagesConfig,
-    seed_dir: &std::path::Path,
-) {
-    let floor = crate::sig::Floor::new(layout.floor()).current();
-    let index = match crate::resolve_verified_index(
-        fetcher,
-        layout,
-        &effective_root_key(),
-        floor,
-        now_unix(),
-    ) {
-        Ok(i) => i,
-        Err(e) => {
-            println!(
-                "atpkg: bundled seed present ({}) but its index did not verify: {e}",
-                seed_dir.display()
-            );
-            return;
-        }
-    };
-    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
-        println!(
-            "atpkg: bundled seed present ({}) but names no '{}' channel — nothing to offer",
-            seed_dir.display(),
-            cfg.channel()
-        );
-        return;
-    };
-    let installed = crate::active_builds(layout);
-    let wanted = index.installable(cfg.include(), cfg.exclude());
-    let mut missing: Vec<String> = Vec::new();
-    for group in crate::plan_groups(&index, ch) {
-        for m in &group.members {
-            if wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()) {
-                missing.push(m.clone());
-            }
-        }
-    }
-    // A program with no artifact for THIS triple can never be installed here
-    // (`install_default_set` clean-skips it, §6), so offering it would be a
-    // pill and a status row the user can never satisfy. Narrow to what the
-    // seed can actually lay down on this machine.
-    // Reuses the §11 bootstrap prescan (`group_missing_triple`) one member at a
-    // time: `Some(_)` means that program's pinned manifest carries no artifact
-    // for this triple, exactly the clean-skip `install_default_set` would take.
-    let triple = current_triple();
-    missing.retain(|program| {
-        crate::flow::group_missing_triple(
-            fetcher,
-            &index,
-            cfg.channel(),
-            triple,
-            std::slice::from_ref(program),
-        )
-        .is_none()
-    });
-    if missing.is_empty() {
-        // Nothing left to offer: retire any stale pending-consent row so the
-        // Packages page cannot keep showing an offer that is already taken
-        // (record_status MERGES the program map, so an untouched row lingers
-        // forever — adversarial review 2026-07-30).
-        clear_seed_status(layout);
-        return;
-    }
-    missing.sort();
-    let list = missing.join(", ");
-    // The stable marker the GUI parses — change it and the first-run notice
-    // goes blind (crates/aterm-gui, spawn_pkg_update_check).
-    println!(
-        "atpkg: seed-pending: {} program(s) ready to install from the bundled seed: {list} \
-         (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg install --default-set`)",
-        missing.len()
-    );
-    // Value-first so the offer survives the Packages card's truncation width
-    // (UX review 2026-07-30: "bundled seed offers: ay · 2026-…" truncated the
-    // payload away); the page's own "Install ALab toolset" button is the act.
-    record_status(
-        layout,
-        "*seed*",
-        crate::ProgramStatus {
-            installed_build: None,
-            state: format!("pending-consent: {list}"),
-            tree_root: String::new(),
-        },
-        format!("ALab toolchain ready: {list} — Install ALab toolset below"),
-    );
 }
 
 /// `atpkg relocate <stage-root> [--sign <id>] [--advisory]` — PRODUCER-side
@@ -587,13 +392,23 @@ fn print_gc_abstentions(verb: &str, report: &crate::gc::GcReport) {
 }
 
 /// `atpkg gc` — reclaim superseded store builds (per program: keep the live build plus one
-/// rollback target, discard the rest). No network.
+/// rollback target, discard the rest), and sweep what an interrupted install left behind. No
+/// network.
+///
+/// The three outcomes are printed on separate lines because they are different claims about
+/// where the disk went: a RECLAIM retired a build that really was installed; a SWEEP removed a
+/// tree (or its stage scratch) that never finished installing and that, until it was swept, no
+/// verb in the manager could even name. Folding the sweep into "reclaimed" would report a leak
+/// as routine housekeeping — and the leak being unreportable is the whole reason it grew.
 fn cmd_gc() -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
     let report = crate::gc::run(&layout);
-    if report.reclaimed.is_empty() {
+    if report.reclaimed.is_empty()
+        && report.swept_partial.is_empty()
+        && report.swept_scratch.is_empty()
+    {
         println!("atpkg gc: nothing to reclaim");
     } else {
         for (p, builds) in &report.reclaimed {
@@ -607,8 +422,35 @@ fn cmd_gc() -> ExitCode {
             );
         }
     }
+    print_gc_sweeps("gc", &report);
     print_gc_abstentions("gc", &report);
     ExitCode::SUCCESS
+}
+
+/// Disclose what a GC pass SWEPT — the trees and stage scratch an interrupted install left
+/// behind.
+///
+/// A shared helper for the same reason [`print_gc_abstentions`] is one: `gc::run` is not
+/// only reached through `atpkg gc`. It also runs after an install, after an update, and
+/// after a grouped update, and those three passes delete exactly as much as the explicit
+/// verb does. A sweep that prints only under `atpkg gc` means the common case — the pass
+/// that happens automatically — removes gigabytes and says nothing, which is the same
+/// silence that let the leak grow in the first place.
+fn print_gc_sweeps(verb: &str, report: &crate::gc::GcReport) {
+    for (p, builds) in &report.swept_partial {
+        println!(
+            "atpkg {verb}: swept interrupted {p} install(s), build(s) {} — never installed, \
+             so until now nothing in the manager could name them",
+            builds
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (p, names) in &report.swept_scratch {
+        println!("atpkg {verb}: swept {p} stage scratch {}", names.join(", "));
+    }
 }
 
 /// `atpkg tree-root <dir>` — print the SHA-256 tree_root of an extracted directory, the
@@ -649,11 +491,24 @@ fn current_triple() -> &'static str {
     {
         "aarch64-unknown-linux-gnu"
     }
+    // Windows arms: without these a Windows build reports "unknown" and can
+    // never select ANY artifact — the one-binary Windows packaging lane
+    // (apps/aterm-win) ships a client that clean-skips every install.
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    {
+        "x86_64-pc-windows-msvc"
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+    {
+        "aarch64-pc-windows-msvc"
+    }
     #[cfg(not(any(
         all(target_arch = "aarch64", target_os = "macos"),
         all(target_arch = "x86_64", target_os = "macos"),
         all(target_arch = "x86_64", target_os = "linux"),
         all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "x86_64", target_os = "windows"),
+        all(target_arch = "aarch64", target_os = "windows"),
     )))]
     {
         "unknown"
@@ -668,7 +523,12 @@ fn current_triple() -> &'static str {
 /// so the two round-trip. Empty string on a pre-epoch (or exactly-epoch) clock.
 fn now_rfc3339() -> String {
     let secs = now_unix();
-    if secs <= 0 {
+    // Both ends are "the clock is unusable", and both must yield an EMPTY stamp rather than
+    // a formatted lie. `now_unix` returns `i64::MAX` when the clock cannot be read at all —
+    // the fail-CLOSED sentinel the freshness gates need — and formatting that would stamp
+    // `status.toml` with a year in the hundreds of billions, which doctor's
+    // "publishing looks frozen" check would then read as a perfectly fresh record.
+    if secs <= 0 || secs == i64::MAX {
         return String::new();
     }
     // secs > 0, so the cast is lossless.
@@ -736,6 +596,53 @@ fn pick_pkg_token(
     }
 }
 
+/// Whether a fetch destination engages the FULL credential chain in
+/// `aterm-update-core`'s token walk. Spelled with the SAME constants as
+/// `token.rs::needs_ambient_credential` (the crate-private gate inside
+/// `resolve_with_source`) so the pick below can never disagree with what the
+/// walk will actually do: only the compiled-in public channel slug is anonymous
+/// by construction; anything else may be private and runs every rung.
+fn engages_credential_chain(owner: &str, repo: &str) -> bool {
+    owner != aterm_update_core::DEFAULT_OWNER || repo != aterm_update_core::DEFAULT_REPO
+}
+
+/// The ONE `owner/repo` the credential chain is keyed to, chosen over EVERY
+/// destination this process's fetcher will actually reach — the resolved index
+/// slug plus every `[packages.links]` fetch-override slug — not just the index.
+///
+/// `GithubFetcher` presents a single token to all of its destinations
+/// (`net.rs`: an override is "a possibly-private repo, reached with the same
+/// token"), so keying the chain to the index alone starved the links lane: on
+/// the compiled default account the index slug IS the public channel, the
+/// chain's gate short-circuits to the `$ATERM_UPDATE_TOKEN` rung only, and a
+/// `[packages.links] prog = "someorg/private-repo"` fetch went out anonymous —
+/// 404 on a machine whose keychain/0600-file/`gh auth` credential worked the
+/// round before (adversarial review 2026-08-11). Picking the FIRST
+/// chain-engaging destination is equivalent to resolving per fetch: the walk's
+/// rung order does not vary by slug once the gate opens, so one chain-engaging
+/// slug yields the same token any of them would.
+///
+/// Order: the index slug when it engages the chain (a repointed account governs
+/// every non-overridden fetch), else the first chain-engaging override slug
+/// (BTreeMap order — deterministic), else the index slug so the compiled
+/// public default stays anonymous by construction.
+fn credential_destination(
+    index_owner: &str,
+    index_repo: &str,
+    overrides: &std::collections::BTreeMap<String, String>,
+) -> (String, String) {
+    if !engages_credential_chain(index_owner, index_repo) {
+        for slug in overrides.values() {
+            if let Some((o, r)) = slug.split_once('/')
+                && engages_credential_chain(o, r)
+            {
+                return (o.to_string(), r.to_string());
+            }
+        }
+    }
+    (index_owner.to_string(), index_repo.to_string())
+}
+
 /// Resolve the GitHub token for the network verbs: `$ATPKG_TOKEN` first (the
 /// dedicated override), then `aterm-update-core`'s full per-machine chain
 /// (`$ATERM_UPDATE_TOKEN` → keychain → 0600 file → `$GITHUB_TOKEN` → `$GH_TOKEN`
@@ -750,14 +657,22 @@ pub(crate) fn resolve_pkg_token(layout: &crate::store::Layout) -> (String, Optio
             .parent()
             .unwrap_or(&layout.prefix)
             .to_path_buf();
-        // atpkg's signed index lives in the PRIVATE publish account, never the public
-        // update channel, so it always needs the full credential chain.
-        aterm_update_core::token::resolve_with_source(
-            &support,
-            aterm_update_core::PUBLISH_OWNER,
-            aterm_update_core::PUBLISH_REPO,
-        )
-        .map(|(t, src)| (t, src.to_string()))
+        // The credential chain is keyed to where the fetches actually go — ALL
+        // of them, via [`credential_destination`]: the resolved index slug PLUS
+        // the `[packages.links]` fetch overrides, because the fetcher presents
+        // this one token to every destination. On the compiled default with no
+        // overrides the chain's own gate keeps the lookup anonymous by
+        // construction (no ambient PAT is gathered for the public channel); a
+        // repointed account (`[packages].account`/`ATPKG_ACCOUNT`) OR any
+        // links override to a non-default repo consults the full chain, so a
+        // private per-program override still reaches the keychain / 0600-file /
+        // ambient rungs.
+        let cfg = crate::config::cached();
+        let index = crate::resolve_account(cfg.account());
+        let (owner, repo) =
+            credential_destination(&index.owner, &index.repo, &crate::repo_overrides(cfg));
+        aterm_update_core::token::resolve_with_source(&support, &owner, &repo)
+            .map(|(t, src)| (t, src.to_string()))
     })
 }
 
@@ -805,30 +720,70 @@ fn resolve_fetcher(layout: &crate::store::Layout) -> Box<dyn crate::flow::Fetche
     //     `Ok`, so `flow::resolve_candidates`' §14 last-good-index cache
     //     fallback (its `Err` arm) could never fire, and the seed-only set
     //     then OVERWROTE that cache under the chain's source id.
-    // Restricting the chain to an EMPTY store keeps the batteries-included
-    // promise exactly where it is real — the first run, where there is no
-    // floor to roll back and no cache to mask — and leaves every subsequent
-    // update to the network + cache path that predates this feature.
-    let seeded_bootstrap = crate::bundled_seed_dir()
-        .filter(|_| crate::active_builds(layout).is_empty())
-        .map(|seed| Box::new(crate::DirFetcher::new(seed)) as Box<dyn crate::flow::Fetcher>);
-    match seeded_bootstrap {
-        Some(seed) => Box::new(crate::ChainFetcher::new(github, seed)),
-        None => github,
+    // The signed network registry is the only source. A co-located bundled seed
+    // used to be chained in ahead of it for a first run on an empty store; that
+    // offline lane is gone, so there is one way to get bytes.
+    github
+}
+
+/// The trust anchor the network verbs verify under: the committed paper-master keyset
+/// ([`crate::PKG_TRUST_ANCHORS`]) plus this store's durable `roster_seq` ratchet, and
+/// nothing else.
+///
+/// There used to be an `ATPKG_ROOTKEY_OVERRIDE` here that swapped WHICH root key anchored
+/// verification "without a rebuild". It is gone. However carefully it was scoped, it let
+/// ambient process state decide what the package manager trusted — an unpinned build
+/// could be handed an anchor by an environment variable. Trusting a mirror or a second
+/// owner account is now a committed change to `aterm_update_core::pins`, visible in a
+/// diff like any other trust decision.
+///
+/// The roster floor is read HERE, per call, rather than snapshotted once at process
+/// start: a verb that ratchets the floor mid-pass (the default-set bootstrap installs
+/// several programs in a row) must not have a later step verify under a stale, lower
+/// ratchet than the one it just advanced.
+fn effective_anchor(layout: &crate::store::Layout) -> crate::Anchor {
+    crate::Anchor::pinned(crate::sig::Floor::new(layout.roster_floor()).current())
+}
+
+/// This store's durable `index_build` high-water AND the roster generation that recorded
+/// it (§8 gate 3) — one value, because a floor a MACHINE set must not outlive the
+/// generation that revoked that machine. See [`crate::sig::BuildFloor`].
+fn build_floor(layout: &crate::store::Layout) -> crate::sig::BuildFloor {
+    crate::sig::BuildFloor {
+        index_build: crate::sig::Floor::new(layout.floor()).current(),
+        roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
     }
 }
 
-/// The root public key the network verbs verify under: the committed anchor
-/// [`crate::PINNED_PKG_ROOTKEY`], and nothing else.
+/// Advance the durable ratchets after a successful resolve. Best-effort, exactly as the
+/// single floor advance always was — a failed write never turns a completed install into
+/// an error.
 ///
-/// There used to be an `ATPKG_ROOTKEY_OVERRIDE` here that swapped WHICH root key
-/// anchored verification "without a rebuild". It is gone. However carefully it was
-/// scoped, it let ambient process state decide what the package manager trusted —
-/// an unpinned build could be handed an anchor by an environment variable. Trusting
-/// a mirror or a second owner account is now a committed change to
-/// `aterm_update_core::pins`, visible in a diff like any other trust decision.
-fn effective_root_key() -> String {
-    crate::PINNED_PKG_ROOTKEY.to_string()
+/// # Which ratchet turns where, and why they are not the same call
+///
+/// The `roster_seq` high-water is NOT advanced here as its authoritative write: it turns on
+/// OBSERVATION, inside `flow::verify_select_fresh`, the instant a generation is admitted —
+/// because a client that merely SAW a revocation must refuse the pre-revocation roster even
+/// if it went on to install nothing. Repeating it here is belt-and-braces over an idempotent
+/// monotonic write (this seq was admitted in the same pass), not the defence itself.
+///
+/// The `index_build` floor is the one this function really owns, and it is written
+/// GENERATION-AWARE: a strictly newer master-signed generation RE-BASES it (possibly
+/// downward) instead of ratcheting it. Without that, one rostered machine publishing
+/// `index_build = u64::MAX` would raise a monotonic floor above everything the owner can
+/// ever publish — including the index carrying that machine's revocation — and no republish
+/// could recover the store. Only the paper master can mint a generation, so only the paper
+/// master can pull that lever.
+fn advance_floors(layout: &crate::store::Layout, index_build: u64, roster_seq: u64) {
+    let generation = crate::sig::Floor::new(layout.floor_generation());
+    let build = crate::sig::Floor::new(layout.floor());
+    if roster_seq > generation.current() {
+        build.rebase(index_build);
+    } else {
+        let _ = build.check_and_record(index_build);
+    }
+    let _ = generation.check_and_record(roster_seq);
+    crate::flow::observe_roster_generation(layout, roster_seq);
 }
 
 /// Whether the manager may act on the network verbs: a committed root anchor to
@@ -875,7 +830,7 @@ fn do_install(
     // staged-but-never-activated build equal to the pin must not make this report
     // up-to-date while the user keeps running the older active build (#19).
     let installed = crate::active_builds(layout).get(program).copied();
-    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let floor = build_floor(layout);
     let req = crate::InstallRequest {
         channel,
         program,
@@ -885,7 +840,7 @@ fn do_install(
     let result = crate::install(
         fetcher,
         layout,
-        &effective_root_key(),
+        &effective_anchor(layout),
         &req,
         floor,
         now_unix(),
@@ -893,7 +848,7 @@ fn do_install(
     match &result {
         Ok(r) => {
             // Advance the durable high-water floor to the index we just trusted (§8 gate 3).
-            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(r.index_build);
+            advance_floors(layout, r.index_build, r.roster_seq);
             let outcome = if r.already_current {
                 format!("up to date ({program} build {})", r.build)
             } else {
@@ -970,7 +925,7 @@ fn cmd_install(program: Option<&String>) -> ExitCode {
         return cmd_install_default_set();
     }
     if !manager_enabled() {
-        eprintln!("atpkg: disabled (no root key pinned or overridden) — refusing to install");
+        eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
         return ExitCode::from(1);
     }
     let Some(layout) = layout() else {
@@ -1053,26 +1008,26 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
         return ExitCode::from(2);
     };
     if !manager_enabled() {
-        eprintln!("atpkg: disabled (no root key pinned or overridden) — cannot roll back");
+        eprintln!("atpkg: disabled (no paper master pinned) — cannot roll back");
         return ExitCode::from(1);
     }
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let floor = build_floor(&layout);
     let fetcher = resolve_fetcher(&layout);
     match crate::flow::rollback(
         &*fetcher,
         &layout,
-        &effective_root_key(),
+        &effective_anchor(&layout),
         crate::config::cached().channel(),
         program,
         floor,
         now_unix(),
     ) {
         Ok(r) => {
-            // Advance the durable floor to the index we just trusted (§8 gate 3).
-            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(r.index_build);
+            // Advance both durable ratchets to what we just trusted (§8 gate 3).
+            advance_floors(&layout, r.index_build, r.roster_seq);
             record_status(
                 &layout,
                 program,
@@ -1105,7 +1060,7 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
 }
 
 /// `atpkg pin <program>` / `atpkg unpin <program>` — freeze (or release) a program against
-/// `update`/`sync`. A pin is purely LOCAL upgrade-suppression state (no index/network); it is
+/// `update`. A pin is purely LOCAL upgrade-suppression state (no index/network); it is
 /// consulted strictly AFTER the floor/yank gate, so it can never resurrect a tombstoned or
 /// below-floor build.
 fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
@@ -1127,7 +1082,7 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
             println!(
                 "atpkg: {program} {}",
                 if pinned {
-                    "pinned (held against update/sync)"
+                    "pinned (held against update)"
                 } else {
                     "unpinned"
                 }
@@ -1162,7 +1117,7 @@ fn cmd_update(program: Option<&String>) -> ExitCode {
 /// store instead of no-opping forever. GC runs once after the whole apply.
 fn cmd_update_all() -> ExitCode {
     if !manager_enabled() {
-        eprintln!("atpkg: disabled (no root key pinned or overridden) — nothing to update");
+        eprintln!("atpkg: disabled (no root key pinned) — nothing to update");
         return ExitCode::from(1);
     }
     let Some(layout) = layout() else {
@@ -1183,11 +1138,11 @@ fn cmd_update_all() -> ExitCode {
     let fetcher = resolve_fetcher(&layout);
     let mut failures = 0u32;
     if !installed.is_empty() {
-        let floor = crate::sig::Floor::new(layout.floor()).current();
+        let floor = build_floor(&layout);
         let report = match crate::apply_channel(
             &*fetcher,
             &layout,
-            &effective_root_key(),
+            &effective_anchor(&layout),
             cfg.channel(),
             current_triple(),
             &installed,
@@ -1211,7 +1166,7 @@ fn cmd_update_all() -> ExitCode {
             }
         };
         // Advance the durable anti-rollback floor to the index we just trusted (§8 gate 3).
-        let _ = crate::sig::Floor::new(layout.floor()).check_and_record(report.index_build);
+        advance_floors(&layout, report.index_build, report.roster_seq);
         failures = report_channel_apply(&layout, &installed, &report);
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
@@ -1221,13 +1176,14 @@ fn cmd_update_all() -> ExitCode {
     // default-set members not yet installed (include/exclude-narrowed; linked/yanked
     // members skip; per-program failures are loud but never block the rest).
     if cfg.auto_install() {
-        failures += install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
+        failures += install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
     // done). Best-effort; never fails the update. This verb sweeps the WHOLE prefix, so an
     // abstention here is about a program it did try to keep current — reported, or the disk
     // grows after every update with nothing on screen ever mentioning it.
     let report = crate::gc::run(&layout);
+    print_gc_sweeps("update", &report);
     print_gc_abstentions("update", &report);
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
     crate::hooks::refresh(&layout);
@@ -1260,12 +1216,12 @@ fn cmd_update_all() -> ExitCode {
 fn install_default_set(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
-    root_key: &str,
+    anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     now: i64,
 ) -> u32 {
-    let floor = crate::sig::Floor::new(layout.floor()).current();
-    let index = match crate::resolve_verified_index(fetcher, layout, root_key, floor, now) {
+    let floor = build_floor(layout);
+    let index = match crate::resolve_verified_index(fetcher, layout, anchor, floor, now) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("atpkg: default-set bootstrap: cannot resolve the signed index: {e}");
@@ -1341,7 +1297,7 @@ fn install_default_set(
             // An ungrouped member can move alone (§7) — see [`bootstrap_singleton`].
             None => {
                 failures +=
-                    bootstrap_singleton(layout, fetcher, root_key, cfg, &group.members[0], now);
+                    bootstrap_singleton(layout, fetcher, anchor, cfg, &group.members[0], now);
             }
         }
     }
@@ -1377,7 +1333,7 @@ fn install_default_set(
 fn bootstrap_group(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
-    index: &crate::Index,
+    index: &crate::TrustedIndex,
     cfg: &crate::config::PackagesConfig,
     g: &str,
     group: &crate::Group,
@@ -1426,7 +1382,7 @@ fn bootstrap_group(
         Ok((crate::TxnOutcome::Applied(_), applied)) => {
             // Advance the durable floor to the ONE index the whole group
             // trusted (§8 gate 3).
-            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(index.index_build);
+            advance_floors(layout, index.index_build, index.roster_seq());
             for (m, a) in &applied {
                 record_status(
                     layout,
@@ -1505,23 +1461,23 @@ fn bootstrap_group(
 fn bootstrap_singleton(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
-    root_key: &str,
+    anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     program: &str,
     now: i64,
 ) -> u32 {
-    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let floor = build_floor(layout);
     let req = crate::InstallRequest {
         channel: cfg.channel(),
         program,
         triple: current_triple(),
         installed: None,
     };
-    match crate::install(fetcher, layout, root_key, &req, floor, now) {
+    match crate::install(fetcher, layout, anchor, &req, floor, now) {
         Ok(r) => {
             // Advance the durable floor to the index this install trusted
             // (§8 gate 3).
-            let _ = crate::sig::Floor::new(layout.floor()).check_and_record(r.index_build);
+            advance_floors(layout, r.index_build, r.roster_seq);
             record_installed_deps(layout, program, &r.dependencies);
             record_status(
                 layout,
@@ -1585,7 +1541,7 @@ fn record_bootstrap_error(layout: &crate::store::Layout, program: &str, e: &crat
 /// the consent). Exit 1 iff any member hard-failed; skips are honest and free.
 fn cmd_install_default_set() -> ExitCode {
     if !manager_enabled() {
-        eprintln!("atpkg: disabled (no root key pinned or overridden) — refusing to install");
+        eprintln!("atpkg: disabled (no root key pinned) — refusing to install");
         return ExitCode::from(1);
     }
     let Some(layout) = layout() else {
@@ -1594,11 +1550,12 @@ fn cmd_install_default_set() -> ExitCode {
     let cfg = crate::config::cached();
     reconcile_links(&layout, cfg);
     let fetcher = resolve_fetcher(&layout);
-    let failures = install_default_set(&layout, &*fetcher, &effective_root_key(), cfg, now_unix());
+    let failures = install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
     // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
     // its disclosure of what the pass abstained on, for the same reason: this verb walks the
     // whole prefix, so a skip here is not about a program the user never mentioned.
     let report = crate::gc::run(&layout);
+    print_gc_sweeps("install-default-set", &report);
     print_gc_abstentions("install-default-set", &report);
     crate::hooks::refresh(&layout);
     if failures == 0 {
@@ -1620,7 +1577,7 @@ fn cmd_install_default_set() -> ExitCode {
 ///
 /// The foreign-link refusal is check-then-act (`linked_checkout` read →
 /// `crate::link` overwrite) — sound only because every caller is a store-MUTATING
-/// verb (`install`, `install --default-set`, `update`, `sync`) already holding the
+/// verb (`install`, `install --default-set`, `update`) already holding the
 /// store-wide single-writer lock ([`crate::lock`]) from the [`main_entry`] dispatch
 /// edge, so no second process can slip a link in between the read and the write.
 /// Keep it that way: never call this from a lock-free (read-only) verb.
@@ -1695,7 +1652,6 @@ fn default_link_bins(program: &str) -> Vec<std::path::PathBuf> {
     ))]
 }
 
-
 /// `atpkg update <program>` — update ONE program (§11 tuple-split fix). A coherence-GROUP
 /// member is routed through the transactional [`crate::flow::apply_program`] so its whole
 /// tuple stages/flips/rolls-back atomically and can never move alone; an ungrouped program
@@ -1718,11 +1674,12 @@ fn cmd_update_one(program: &String) -> ExitCode {
         return cmd_install(Some(program));
     }
     let cur = installed.get(program).copied();
-    let floor = crate::sig::Floor::new(layout.floor()).current();
+    let floor = build_floor(&layout);
     let fetcher = resolve_fetcher(&layout);
     let plan = match crate::flow::plan_update(
         &*fetcher,
-        &effective_root_key(),
+        &layout,
+        &effective_anchor(&layout),
         cfg.channel(),
         program,
         cur,
@@ -1742,7 +1699,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         let report = match crate::flow::apply_program(
             &*fetcher,
             &layout,
-            &effective_root_key(),
+            &effective_anchor(&layout),
             cfg.channel(),
             current_triple(),
             program,
@@ -1756,7 +1713,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        let _ = crate::sig::Floor::new(layout.floor()).check_and_record(report.index_build);
+        advance_floors(&layout, report.index_build, report.roster_seq);
         let failures = report_channel_apply(&layout, &installed, &report);
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
@@ -1765,6 +1722,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // shell-hook refresh) as `cmd_update_all` and `do_install`, which the ungrouped
         // path below reaches through `cmd_install`. Best-effort; never fails the update.
         let gc = crate::gc::run(&layout);
+        print_gc_sweeps("update", &gc);
         print_gc_abstentions("update", &gc);
         crate::hooks::refresh(&layout);
         return if failures == 0 {
@@ -1911,30 +1869,103 @@ fn report_channel_apply(
     failures
 }
 
-/// `atpkg verify-index <pubkey-b64> <index.toml> <index.toml.sig>` — verify a signed index
-/// over its exact bytes with the SAME verifier the client uses (§8). For operators and the
-/// publish pipeline's self-check; exit 0 iff the signature is valid under the given root key.
-fn cmd_verify_index(
-    pubkey: Option<&String>,
-    index: Option<&String>,
-    sig: Option<&String>,
-) -> ExitCode {
-    let (Some(pubkey), Some(index), Some(sig)) = (pubkey, index, sig) else {
-        eprintln!("usage: atpkg verify-index <pubkey-b64> <index.toml> <index.toml.sig>");
+/// `atpkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig> <roster.toml>
+/// <roster.toml.sig>` — run the WHOLE client chain over files on disk, for operators and
+/// the publish pipeline's self-check. Exit 0 iff a machine the given paper master's roster
+/// authorizes signed that index and the index's own attribution agrees.
+///
+/// It takes the MASTER key rather than an index key because that is the only key the
+/// client pins: checking `index.toml` against "some public key" would prove nothing a
+/// client would act on. The roster floor is 0 (this verb has no store to ratchet) and the
+/// clock is the real one, so a lapsed roster fails here exactly as it would on a user's
+/// machine — which is the point of a pipeline self-check.
+fn cmd_verify_index(args: &[String]) -> ExitCode {
+    let [master, index, sig, roster, roster_sig] = args else {
+        eprintln!(
+            "usage: atpkg verify-index <master-pubkey-b64> <index.toml> <index.toml.sig> \
+             <aterm-machines.toml> <aterm-machines.toml.sig>"
+        );
         return ExitCode::from(2);
     };
-    let (Ok(raw), Ok(sig_bytes)) = (std::fs::read(index), std::fs::read(sig)) else {
-        eprintln!("atpkg: cannot read the index or signature file");
+    let (Ok(raw), Ok(sig_bytes), Ok(roster_bytes), Ok(roster_sig_bytes)) = (
+        std::fs::read(index),
+        std::fs::read(sig),
+        std::fs::read(roster),
+        std::fs::read(roster_sig),
+    ) else {
+        eprintln!("atpkg: cannot read the index, the roster, or one of their signatures");
         return ExitCode::from(1);
     };
-    match crate::verify_index_with(pubkey, raw, &sig_bytes) {
-        Ok(_) => {
-            println!("OK: index signature valid under the given root key");
+    let anchor = crate::Anchor::of(vec![master.clone()], 0);
+    let Ok(admitted) = crate::admit_roster(&anchor, roster_bytes, &roster_sig_bytes, now_unix())
+    else {
+        // Opaque on purpose — no verification oracle (§8).
+        eprintln!("FAIL: the roster did not verify under that master, or is stale");
+        return ExitCode::from(1);
+    };
+    match admitted.authorize_index(raw, &sig_bytes) {
+        Ok((idx, _)) => {
+            println!(
+                "OK: index build {} signed by machine {} under roster seq {}",
+                idx.index_build,
+                idx.attribution().machine_id,
+                idx.roster_seq()
+            );
             ExitCode::SUCCESS
         }
         Err(_) => {
-            // Opaque on purpose — no verification oracle (§8).
-            eprintln!("FAIL: index signature did not verify");
+            eprintln!("FAIL: no machine on that roster signed this index");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `atpkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> <aterm-machines.toml>
+/// <aterm-machines.toml.sig>` — prove a package manifest was signed by a machine the
+/// given paper master's roster authorizes. The pkg sibling of [`cmd_verify_index`], and
+/// it exists for the same operator: the mirror re-verifies every document it republishes
+/// with the client's own chain, and before this verb it had no way to do that for
+/// `pkg-*.toml` short of hand-rolling Ed25519 in shell — so it shipped with an honest
+/// comment saying pkg manifests were NOT crypto-verified. That comment collapses to one
+/// call to this.
+///
+/// Same authority rule as the index (`TrustedRoster::authorize_bytes`): any listed,
+/// unrevoked, unexpired machine on the admitted generation. No attribution bind, because
+/// a pkg manifest carries none — the ID printed comes from the signature that verified.
+fn cmd_verify_pkg(args: &[String]) -> ExitCode {
+    let [master, pkg, sig, roster, roster_sig] = args else {
+        eprintln!(
+            "usage: atpkg verify-pkg <master-pubkey-b64> <pkg-*.toml> <pkg.sig> \
+             <aterm-machines.toml> <aterm-machines.toml.sig>"
+        );
+        return ExitCode::from(2);
+    };
+    let (Ok(raw), Ok(sig_bytes), Ok(roster_bytes), Ok(roster_sig_bytes)) = (
+        std::fs::read(pkg),
+        std::fs::read(sig),
+        std::fs::read(roster),
+        std::fs::read(roster_sig),
+    ) else {
+        eprintln!("atpkg: cannot read the manifest, the roster, or one of their signatures");
+        return ExitCode::from(1);
+    };
+    let anchor = crate::Anchor::of(vec![master.clone()], 0);
+    let Ok(admitted) = crate::admit_roster(&anchor, roster_bytes, &roster_sig_bytes, now_unix())
+    else {
+        // Opaque on purpose — no verification oracle (§8).
+        eprintln!("FAIL: the roster did not verify under that master, or is stale");
+        return ExitCode::from(1);
+    };
+    match admitted.authorize_bytes(raw, &sig_bytes) {
+        Ok((_, who)) => {
+            println!(
+                "OK: manifest signed by machine {} under roster seq {}",
+                who.machine_id, who.roster_seq
+            );
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("FAIL: no machine on that roster signed this manifest");
             ExitCode::from(1)
         }
     }
@@ -1959,31 +1990,11 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
     let mut bad = 0u32;
     for (name, o) in &outcomes {
         use crate::verify::VerifyOutcome::{
-            BuildMismatch, Drift, Match, NoSignedRoot, NotInstalled, SourceBuilt, Unreadable,
-            WiredSysroot,
+            BuildMismatch, Drift, Match, NoSignedRoot, NotInstalled, Unreadable, WiredSysroot,
         };
         match o {
             Match { build } => {
                 println!("atpkg: {name} build {build} OK (matches signed tree_root)")
-            }
-            SourceBuilt {
-                build,
-                commit,
-                intact,
-            } => {
-                if *intact {
-                    println!(
-                        "atpkg: {name} build {build} OK (SOURCE-BUILT from {}, lower-assurance: \
-                         trust basis = manifest + pinned commit, NOT owner-signed)",
-                        commit.get(..12).unwrap_or(commit)
-                    );
-                } else {
-                    bad += 1;
-                    eprintln!(
-                        "atpkg: {name} build {build} DRIFT — source-built tree no longer matches its \
-                         recorded self-tree-root"
-                    );
-                }
             }
             WiredSysroot { build } => println!(
                 "atpkg: {name} build {build} OK (rustup-linked sysroot bundle; verified at install, \
@@ -2135,6 +2146,44 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    /// [`VERBS`] must name EXACTLY the verbs `main_entry`'s match dispatches —
+    /// no more (advertising a verb that no longer exists) and no fewer (a
+    /// working verb the hint never mentions).
+    ///
+    /// Derived from this file's own source rather than from a second hand-kept
+    /// list, because a second list is the thing that rotted. `sync` and `seed`
+    /// were each advertised for months after deletion; both would have failed
+    /// this the day their arm was removed.
+    #[test]
+    fn verb_hint_matches_dispatch() {
+        let src = include_str!("cli.rs");
+        // The dispatch arms, in source order: `        Some("<verb>") =>`.
+        let dispatched: Vec<&str> = src
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Some(\""))
+            .filter_map(|rest| rest.split_once("\")"))
+            .filter(|(_, tail)| tail.trim_start().starts_with("=>"))
+            .map(|(verb, _)| verb)
+            .collect();
+
+        // Non-vacuity: if the extraction ever stops matching the source shape it
+        // would silently compare two empty lists and pass.
+        assert!(
+            dispatched.len() > 10,
+            "extracted only {} arm(s) — the scraper stopped matching the match block, \
+             so this test was about to pass vacuously: {dispatched:?}",
+            dispatched.len()
+        );
+
+        assert_eq!(
+            dispatched, VERBS,
+            "the unknown-verb hint and the dispatch table disagree.\n  \
+             dispatched: {dispatched:?}\n  advertised: {VERBS:?}\n\
+             A verb in `advertised` but not `dispatched` tells the user to run \
+             something that only reprints this error."
+        );
+    }
+
     fn temp_layout(label: &str) -> crate::store::Layout {
         let p = std::env::temp_dir().join(format!("atpkg-main-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -2191,7 +2240,6 @@ mod tests {
     fn store_lock_verb_roster_is_exact() {
         for mutator in [
             "install",
-            "seed",
             "update",
             "rollback",
             "uninstall",
@@ -2215,7 +2263,11 @@ mod tests {
             "verify",
             "tree-root",
             "verify-index",
+            "verify-pkg",
             "relocate",
+            "help",
+            "-h",
+            "--help",
         ] {
             assert!(
                 !verb_mutates_store(read_only),
@@ -2247,21 +2299,26 @@ mod tests {
     ///
     /// `ATPKG_ROOTKEY_OVERRIDE` used to swap which root key anchored verification,
     /// and could supply one to a build that had none — an environment variable
-    /// deciding trust. The anchor is now the committed constant and only that, so
-    /// setting the old variable must change nothing.
+    /// deciding trust. The anchor is now the committed paper-master keyset and only
+    /// that, so setting the old variable must change nothing.
     #[test]
     fn no_environment_variable_can_supply_the_verification_anchor() {
         // NO `set_var` HERE, deliberately. The claim is that the anchor is a
         // COMPILED constant and the variable is not consulted at all — and
-        // `effective_root_key` reads no environment, which is the property
-        // under test. Mutating the process-global environment to demonstrate
-        // that would race every other test in this binary (cargo runs them on
-        // threads) to prove something the source already settles, and the lint
-        // that flags it is right.
+        // `effective_anchor` reads no environment (only the store's own durable
+        // roster floor), which is the property under test. Mutating the
+        // process-global environment to demonstrate that would race every other
+        // test in this binary (cargo runs them on threads) to prove something the
+        // source already settles, and the lint that flags it is right.
+        let layout = temp_layout("anchor");
         assert_eq!(
-            effective_root_key(),
-            crate::PINNED_PKG_ROOTKEY,
-            "the committed anchor is the only anchor"
+            effective_anchor(&layout).is_armed(),
+            !crate::PKG_TRUST_ANCHORS.is_empty(),
+            "the committed keyset is the only thing that arms the manager"
+        );
+        assert!(
+            effective_anchor(&layout).is_armed(),
+            "and in THIS tree it is armed (2026-08-15), so the CLI's anchor is live"
         );
         // NON-VACUITY: the reader must contain no env lookup at all, so this
         // cannot pass by the variable merely being unset in this process.
@@ -2269,22 +2326,101 @@ mod tests {
             !include_str!("cli.rs").contains("ATPKG_ROOTKEY_OVERRIDE\""),
             "no env-var lookup may reach the anchor"
         );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// Enablement follows the COMPILED anchor and the opt-out, and nothing else.
+    /// Enablement follows the COMPILED keyset and the opt-out, and nothing else.
     /// `ATPKG_DISABLE` may only ever subtract authority — a kill switch that can
     /// turn the manager off is safe; one that could turn it on was not, which is
     /// why the root-key override is gone.
     #[test]
     fn enablement_follows_the_compiled_anchor_and_the_kill_switch_only() {
         // No compiled anchor ⇒ inert. There is no longer any way to supply one
-        // at runtime, so this state can only be changed by a commit.
-        assert!(!crate::manager_enabled_with("", false));
-        // A compiled anchor ⇒ enabled.
-        assert!(!crate::manager_enabled_with("PINNED_KEY", true));
-        assert!(crate::manager_enabled_with("PINNED_KEY", false));
-        // The opt-out wins even with a valid anchor present.
-        assert!(!crate::manager_enabled_with("PINNED_KEY", true));
+        // at runtime, so this state can only be changed by a commit. THIS is the
+        // shipped state: `PKG_TRUST_ANCHORS` is empty.
+        assert!(!crate::manager_enabled_with(&[], false));
+        assert!(!crate::manager_enabled_with(&[], true));
+        // A compiled keyset ⇒ enabled...
+        assert!(crate::manager_enabled_with(&["PINNED_KEY"], false));
+        // ...and the opt-out wins even with a valid keyset present.
+        assert!(!crate::manager_enabled_with(&["PINNED_KEY"], true));
+    }
+
+    /// The two durable ratchets advance TOGETHER and INDEPENDENTLY: an index build and a
+    /// roster generation are different counters over different documents, and folding
+    /// them into one high-water would let either one's advance refuse the other's
+    /// perfectly current document.
+    #[test]
+    fn advance_floors_ratchets_both_counters_separately() {
+        let layout = temp_layout("floors");
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+        advance_floors(&layout, 41, 3);
+        assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 41);
+        assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 3);
+        // An index republish that does NOT bump the roster leaves the roster floor put,
+        // so the generation still in use is not ratcheted out from under the client.
+        advance_floors(&layout, 42, 3);
+        assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 42);
+        assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 3);
+        // A revocation bumps the roster without re-cutting the index — symmetrically.
+        advance_floors(&layout, 42, 4);
+        assert_eq!(crate::sig::Floor::new(layout.floor()).current(), 42);
+        assert_eq!(crate::sig::Floor::new(layout.roster_floor()).current(), 4);
+        // And the anchor the CLI builds carries the roster floor it just recorded.
+        assert_eq!(effective_anchor(&layout).roster_floor, 4);
+        // NON-VACUITY: they are genuinely separate files.
+        assert_ne!(layout.floor(), layout.roster_floor());
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A BUILD FLOOR ONE MACHINE DROVE OUT OF REACH IS RE-BASED BY THE NEXT GENERATION.
+    ///
+    /// `index_build` sits inside MACHINE-signed bytes, so any rostered machine can set it to
+    /// the u64 ceiling and — under a purely monotonic ratchet — put the store permanently
+    /// above every index the owner will ever publish, including the one that revokes that
+    /// machine. Bricked AND unrevocable, by a tier the roster exists to be able to revoke.
+    ///
+    /// So the floor is scoped to the generation that recorded it: a strictly newer
+    /// master-signed generation re-bases it. Only the paper master can mint a generation, so
+    /// this lever is the master's alone.
+    ///
+    /// MUTATION: replace the `roster_seq > generation.current()` arm in `advance_floors`
+    /// with the plain `check_and_record` and the rescue assertion fails with the floor still
+    /// at `u64::MAX`.
+    #[test]
+    fn a_newer_generation_rebases_a_floor_a_machine_drove_out_of_reach() {
+        let layout = temp_layout("floor-poison");
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        // A machine on generation 3 publishes the TOML integer ceiling.
+        advance_floors(&layout, u64::MAX, 3);
+        assert_eq!(build_floor(&layout).index_build, u64::MAX);
+        assert_eq!(build_floor(&layout).roster_seq, 3);
+        // PRECONDITION: within that same generation the floor is immovable — this really is
+        // the trap, not a floor that would have relaxed on its own.
+        advance_floors(&layout, 101, 3);
+        assert_eq!(
+            build_floor(&layout).index_build,
+            u64::MAX,
+            "same generation ⇒ monotonic, exactly as before"
+        );
+
+        // The owner revokes that machine and republishes at a sane build under generation 4.
+        advance_floors(&layout, 101, 4);
+        assert_eq!(
+            build_floor(&layout),
+            crate::sig::BuildFloor {
+                index_build: 101,
+                roster_seq: 4
+            },
+            "a newer master-signed generation re-bases the floor it inherited"
+        );
+        // ...and from there it ratchets again, so the rescue is one step, not a hole.
+        advance_floors(&layout, 100, 4);
+        assert_eq!(build_floor(&layout).index_build, 101);
+        let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
     // ---- token chain precedence (pure split — no env mutation, no subprocess) ----
@@ -2322,6 +2458,100 @@ mod tests {
         assert_eq!(src, None);
     }
 
+    /// The chain-engagement predicate mirrors `token.rs::needs_ambient_credential`
+    /// by construction (same constants); pin the behavior at both poles so the
+    /// mirror can never silently drift: ONLY the compiled public channel slug is
+    /// anonymous by construction, any other owner OR repo runs the full chain.
+    #[test]
+    fn only_the_public_channel_slug_skips_the_credential_chain() {
+        assert!(
+            !engages_credential_chain(
+                aterm_update_core::DEFAULT_OWNER,
+                aterm_update_core::DEFAULT_REPO
+            ),
+            "the compiled public channel needs no ambient credential"
+        );
+        assert!(
+            engages_credential_chain("someone-else", aterm_update_core::DEFAULT_REPO),
+            "a foreign owner engages the full chain"
+        );
+        assert!(
+            engages_credential_chain(aterm_update_core::DEFAULT_OWNER, "some-other-repo"),
+            "a foreign repo engages the full chain"
+        );
+        // NON-VACUITY for the destination tests below: the compiled index default
+        // IS the public channel slug, so the default account resolves to the
+        // anonymous-by-construction destination.
+        assert!(!engages_credential_chain(
+            aterm_update_core::ATPKG_INDEX_OWNER,
+            crate::manifest::INDEX_REPO
+        ));
+    }
+
+    /// REGRESSION (adversarial review 2026-08-11): keying the credential chain to
+    /// the index destination ALONE starved the `[packages.links]` lane — on the
+    /// compiled default account the index slug is the public channel, so the
+    /// chain's gate short-circuited and a links override to a private repo went
+    /// out anonymous (404 on a machine whose keychain / 0600-file / `gh auth`
+    /// credential had worked the round before). The pick must range over EVERY
+    /// destination the fetcher reaches: index slug + all override slugs.
+    #[test]
+    fn credential_destination_covers_index_and_links_overrides() {
+        use std::collections::BTreeMap;
+        let (default_owner, default_repo) = (
+            aterm_update_core::ATPKG_INDEX_OWNER,
+            crate::manifest::INDEX_REPO,
+        );
+        // Default account + no overrides → the public channel slug: the chain
+        // stays anonymous by construction (the LIVE registry's proven install
+        // lane — no ambient PAT is ever gathered for it).
+        let dest = credential_destination(default_owner, default_repo, &BTreeMap::new());
+        assert_eq!(dest, (default_owner.to_string(), default_repo.to_string()));
+        assert!(
+            !engages_credential_chain(&dest.0, &dest.1),
+            "default + no overrides must stay anonymous by construction"
+        );
+        // Default account + a links override to a possibly-private repo → the
+        // OVERRIDE slug, which engages the full chain (the regression case).
+        let mut overrides = BTreeMap::new();
+        overrides.insert("myprog".to_string(), "someorg/private-repo".to_string());
+        let dest = credential_destination(default_owner, default_repo, &overrides);
+        assert_eq!(
+            dest,
+            ("someorg".to_string(), "private-repo".to_string()),
+            "a links override must key the chain to the override's slug"
+        );
+        assert!(
+            engages_credential_chain(&dest.0, &dest.1),
+            "the links-override destination must engage the full chain"
+        );
+        // An override that IS the public channel slug engages nothing — the pick
+        // falls back to the (equally public) index slug: still anonymous.
+        let mut public_override = BTreeMap::new();
+        public_override.insert(
+            "myprog".to_string(),
+            format!("{default_owner}/{default_repo}"),
+        );
+        let dest = credential_destination(default_owner, default_repo, &public_override);
+        assert!(
+            !engages_credential_chain(&dest.0, &dest.1),
+            "a public-slug override must not conjure a credential lookup"
+        );
+        // Repointed account → the INDEX slug engages the chain and wins even with
+        // overrides present: a repoint governs every non-overridden fetch, so it
+        // is the destination the one shared token must serve first.
+        let dest = credential_destination("my-private-org", default_repo, &overrides);
+        assert_eq!(
+            dest,
+            ("my-private-org".to_string(), default_repo.to_string()),
+            "a repointed account keys the chain to the index slug"
+        );
+        assert!(
+            engages_credential_chain(&dest.0, &dest.1),
+            "the repointed-account destination must engage the full chain"
+        );
+    }
+
     // ---- [packages.links] reconciliation + the auto-install bootstrap ----
     // Signed-fixture helpers mirroring flow.rs's (a real USTAR+zstd archive, a
     // root-signed index, release-signed pkg manifests) but laid out as a DIR
@@ -2333,8 +2563,36 @@ mod tests {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
-    const ROOT_SEED: [u8; 32] = [7u8; 32];
-    const RELEASE_SEED: [u8; 32] = [1u8; 32];
+    use crate::sig::testkit;
+
+    /// The synthetic paper master and the one machine it rosters — the SAME fixture the
+    /// whole crate signs with, so a CLI test cannot accidentally prove something under a
+    /// trust shape no other layer uses.
+    const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
+    const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
+
+    /// The anchor the dir-registry tests resolve under: armed with the synthetic master,
+    /// roster floor 0.
+    fn test_anchor() -> crate::Anchor {
+        crate::Anchor::of(vec![pk(&ROOT_SEED)], 0)
+    }
+
+    /// Publish the master-signed roster beside a `dir:` registry's index. Without it the
+    /// DirFetcher yields no candidate at all — a registry is index PLUS the generation
+    /// that authorized its signer, never one without the other.
+    fn write_roster(dir: &Path) {
+        let (bytes, sig) = testkit::published_roster();
+        std::fs::write(
+            dir.join(aterm_update_core::roster::ROSTER_ASSET),
+            bytes.as_slice(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(aterm_update_core::roster::ROSTER_SIG_ASSET),
+            sig.as_slice(),
+        )
+        .unwrap();
+    }
 
     fn kp(seed: &[u8; 32]) -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(seed).unwrap()
@@ -2397,7 +2655,7 @@ mod tests {
         let root = crate::tree::tree_root(&probe).unwrap();
         let _ = std::fs::remove_dir_all(&probe);
         let body = format!(
-            "schema = 1\nprogram = \"{prog}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
+            "schema = 2\nprogram = \"{prog}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
              exposes = [\"{prog}\"]\n\
              [[artifact]]\ntarget = \"{triple}\"\nkind = \"binary\"\n\
              asset = \"{prog}-{build}.tar.zst\"\nsha256 = \"{sha}\"\ntree_root = \"{root}\"\n\
@@ -2418,21 +2676,30 @@ mod tests {
     /// (pin YANKED — must never install), `lk` (installable, dev-linked in
     /// the tests) — plus real signed pkgs/archives for the non-yanked members.
     fn write_registry(dir: &Path, channel: &str) {
+        write_registry_at(dir, channel, 41);
+    }
+
+    /// As [`write_registry`], with an explicit `index_build` (the seed-admission tests
+    /// need a sealed index strictly above / equal to the durable floor).
+    fn write_registry_at(dir: &Path, channel: &str, index_build: u64) {
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
+            "schema = 2\nindex_build = {index_build}\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+             machine_id = \"{id}\"\nroster_seq = {seq}\n\
              [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n\
              [programs.zz]\nrepo = \"zz\"\n[programs.lk]\nrepo = \"lk\"\n\
              [[channels]]\nname = \"{channel}\"\nchannel_build = 1\nmin_build = 0\n\
              yanked = [\"zz@5\"]\npin = {{ ay = 18, ny = 7, zz = 5, lk = 3 }}\n",
-            rk = pk(&RELEASE_SEED)
+            id = testkit::MACHINE_ID,
+            seq = testkit::SEQ
         );
         std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
+        // The index is MACHINE-signed now; only the roster is signed by the master.
         std::fs::write(
             dir.join("index.toml.sig"),
-            sign(&ROOT_SEED, index_body.as_bytes()),
+            sign(&RELEASE_SEED, index_body.as_bytes()),
         )
         .unwrap();
+        write_roster(dir);
         write_pkg(dir, "ay", 18);
         write_pkg(dir, "ny", 7);
         write_pkg(dir, "lk", 3);
@@ -2464,7 +2731,7 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(failures, 0, "skips are never failures");
         let active = crate::active_builds(&layout);
         assert_eq!(
@@ -2480,7 +2747,7 @@ mod tests {
             "the dev link survives untouched"
         );
         // Idempotence: a second pass finds ay installed and re-installs nothing.
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(failures, 0);
         assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
         // The durable floor advanced to the trusted index (§8 gate 3).
@@ -2501,14 +2768,14 @@ mod tests {
         // channel is one loud pass-level failure, nothing installs.
         let layout = temp_layout("channel-default");
         let cfg = crate::config::PackagesConfig::default();
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert!(failures > 0, "a missing channel is loud, not silent");
         assert!(crate::active_builds(&layout).is_empty());
         let _ = std::fs::remove_dir_all(&layout.prefix);
         // channel = "nightly" threads through and installs.
         let layout = temp_layout("channel-nightly");
         let cfg = crate::config::parse_packages("[packages]\nchannel = \"nightly\"\n");
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(failures, 0);
         assert_eq!(
             crate::active_builds(&layout).get("ay").copied(),
@@ -2525,21 +2792,24 @@ mod tests {
     /// fails and the group transaction must abort WHOLE (never a split tuple).
     fn write_group_registry(dir: &Path, channel: &str, write_tb_pkg: bool) {
         let index_body = format!(
-            "schema = 1\nindex_build = 51\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
+            "schema = 2\nindex_build = 51\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+             machine_id = \"{id}\"\nroster_seq = {seq}\n\
              [programs.ay]\nrepo = \"ay\"\n\
              [programs.ta]\nrepo = \"ta\"\ncoherence_group = \"rustc\"\n\
              [programs.tb]\nrepo = \"tb\"\ncoherence_group = \"rustc\"\n\
              [[channels]]\nname = \"{channel}\"\nchannel_build = 1\nmin_build = 0\n\
              pin = {{ ay = 18, ta = 4, tb = 6 }}\n",
-            rk = pk(&RELEASE_SEED)
+            id = testkit::MACHINE_ID,
+            seq = testkit::SEQ
         );
         std::fs::write(dir.join("index.toml"), index_body.as_bytes()).unwrap();
+        // The index is MACHINE-signed now; only the roster is signed by the master.
         std::fs::write(
             dir.join("index.toml.sig"),
-            sign(&ROOT_SEED, index_body.as_bytes()),
+            sign(&RELEASE_SEED, index_body.as_bytes()),
         )
         .unwrap();
+        write_roster(dir);
         write_pkg(dir, "ay", 18);
         write_pkg(dir, "ta", 4);
         if write_tb_pkg {
@@ -2557,7 +2827,7 @@ mod tests {
         let layout = temp_layout("group-ok");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(failures, 0);
         let active = crate::active_builds(&layout);
         assert_eq!(active.get("ta").copied(), Some(4), "tuple member installed");
@@ -2579,7 +2849,7 @@ mod tests {
         let layout = temp_layout("group-abort");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(failures, 1, "one failure for the aborted group");
         let active = crate::active_builds(&layout);
         assert!(
@@ -2616,7 +2886,7 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(
             failures, 0,
             "a config-narrowed tuple is a diagnostic, not a failure"
@@ -2647,7 +2917,7 @@ mod tests {
         let cfg =
             crate::config::parse_packages("[packages.links]\nghost = \"alabsystems/ghost\"\n");
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &pk(&ROOT_SEED), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
         assert_eq!(
             failures, 0,
             "the refusal is a loud diagnostic, not a loop failure"

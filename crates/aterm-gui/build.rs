@@ -96,6 +96,20 @@ fn main() {
     };
     println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
 
+    // THE DEV COUNTER (owner, 2026-08-16: dev builds are identified by "the
+    // 3rd developer number and the hash", never by advancing the version):
+    // commits since the newest release tag, baked so the menu bar can show
+    // `v0.21.<N>+g<sha> · DEV` for a development build while a release shows
+    // its clean `v0.21.0`. Releases keep the third slot at literal 0, so a
+    // nonzero third component is an unambiguous dev signature. "0" when git
+    // or the tag is unavailable (a source-tarball build still marks DEV via
+    // the release-env discriminator; only the counter degrades).
+    let dev_commits = run("git", &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"])
+        .and_then(|tag| run("git", &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"]))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "0".into());
+    println!("cargo:rustc-env=ATERM_DEV_COMMITS={dev_commits}");
+
     // Monotonic build number, epoch-scale (seconds). The updater's "apply only if
     // greater" ordering lives in this metadata, independent of the app/source
     // display version. A dev build derives it from HEAD's committer Unix epoch:

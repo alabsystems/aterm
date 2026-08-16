@@ -121,7 +121,11 @@ impl ToneTracker {
     /// seam that forgets it (pinned by
     /// `every_trail_sound_policy_takes_its_tone_from_the_tracker`).
     pub(crate) fn effective(&self, tone_melody: bool) -> Tone {
-        if tone_melody { self.tone } else { Tone::Technical }
+        if tone_melody {
+            self.tone
+        } else {
+            Tone::Technical
+        }
     }
 
     /// Chars currently in the window. The COUNT only — never the text: the

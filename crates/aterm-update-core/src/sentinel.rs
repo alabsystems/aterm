@@ -99,7 +99,18 @@ impl Sentinel {
         matches!(self.read_state(), Some((b, attempts)) if b == running_build && attempts >= max_attempts)
     }
 
-    /// Atomic write of `"<build> <attempts>"` via a `0600` temp + rename.
+    /// Atomic AND durable write of `"<build> <attempts>"` via a `0600` temp + rename.
+    ///
+    /// The fsyncs are not ceremony: this file is the transaction commit marker for a
+    /// swap, and the crash it protects against is precisely the crash that would eat
+    /// an unflushed payload. Rename alone only orders METADATA — a committed inode
+    /// whose extents were never written back reads as zeros, `read_state` parses that
+    /// as `None`, and the whole count/budget/revert path is skipped: the machine
+    /// crash-loops forever on the bad build with the retained old bundle sitting right
+    /// there unused. `token::write_private_file` already ends in `sync_all` for far
+    /// less critical state; the one file whose loss disables rollback must not be the
+    /// one that skips it. Cost is irrelevant at this frequency (once per apply, plus
+    /// once per launch of an unconfirmed trial) — it is an 11-byte file.
     // Skip: the audited atomic write-then-rename (the update-atpkg brick-fix):
     // OpenOptions+rename are DELIBERATELY path-based inside the 0700 private
     // dir; the hardened lane's direntry-identity contracts are the capability
@@ -119,8 +130,36 @@ impl Sentinel {
             }
             let mut f = opts.open(&tmp)?;
             write!(f, "{build} {attempts}")?;
+            // Inside the braces: the payload must be on stable storage BEFORE the handle
+            // drops and before the rename below publishes the name.
+            //
+            // A REFUSAL is not a failure. On Apple targets `File::sync_all` is a bare
+            // `fcntl(F_FULLFSYNC)` with no fsync fallback, and some filesystems the
+            // staging root can live on (a network home, some FUSE volumes) answer it
+            // ENOTSUP/EINVAL. Propagating that would fail `arm()` on every apply — the
+            // updater would silently Defer forever on that class of machine, in exchange
+            // for a durability guarantee the volume cannot provide anyway. So an
+            // "unsupported" answer degrades to the old, non-durable behaviour and a REAL
+            // I/O error (ENOSPC, EIO) still aborts the apply rather than swapping in a
+            // build whose rollback authority was never written. Same reasoning as the
+            // directory sync below.
+            match f.sync_all() {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Unsupported | io::ErrorKind::InvalidInput
+                    ) => {}
+                Err(e) => return Err(e),
+            }
         }
-        std::fs::rename(&tmp, &self.path)
+        std::fs::rename(&tmp, &self.path)?;
+        // Best-effort ONLY: on macOS `sync_all` on a directory fd is `F_FULLFSYNC`,
+        // which some filesystems answer with ENOTSUP/EINVAL. Propagating that would
+        // fail `arm()`, which Defers the entire update apply — a regression strictly
+        // worse than the durability gap this closes.
+        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+        Ok(())
     }
 }
 

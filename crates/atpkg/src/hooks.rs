@@ -9,10 +9,15 @@
 //! This is the ONLY thing that puts the atpkg-managed `bin/` on an interactive shell's PATH,
 //! and it **APPENDS** it (append-not-prepend, mirroring [`crate::store::append_bin_to_path`])
 //! so a managed tool can never shadow system `sudo`/`ssh`/`git` even on the interactive PATH.
-//! `~/.aterm/shell.d` is OUTSIDE the managed prefix and is sourced by every login shell, so
-//! [`refresh`] hardens both `~/.aterm` and `~/.aterm/shell.d` with `ensure_private_dir`
-//! (symlink-refusing, `0700`, fail-closed) BEFORE writing, and each file is written `0600`
-//! via temp + rename. Entirely best-effort: a hook write NEVER fails an install.
+//! REACH: `~/.aterm/shell.d` is sourced by aterm's own shell integration
+//! (`aterm-shell-integration`'s zsh/bash/fish/ps1 scripts) — i.e. by shells running INSIDE
+//! an aterm session, NOT by every login shell. Nothing writes a source line into
+//! `~/.zshrc`/`~/.bashrc`, so a Terminal.app/ssh/CI shell reaches managed tools only via
+//! `aterm <tool>` / `atpkg run` (or the manual rc-file line `atpkg doctor` prints).
+//! `~/.aterm/shell.d` is OUTSIDE the managed prefix, so [`refresh`] hardens both `~/.aterm`
+//! and `~/.aterm/shell.d` with `ensure_private_dir` (symlink-refusing, `0700`, fail-closed)
+//! BEFORE writing, and each file is written `0600` via temp + rename. Entirely best-effort:
+//! a hook write NEVER fails an install.
 
 use std::fs;
 use std::io;

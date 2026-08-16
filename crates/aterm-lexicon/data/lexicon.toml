@@ -1552,6 +1552,9 @@ notes    = "سگ = dog; توله / توله سگ = puppy; سگ کوچولو = li
 # un-gates them for everyone. Homograph law: profanity > feline > orca >
 # animal, so cat/kitty keep the cat and orca keeps its splash. One surface ->
 # one species, pinned by animal_surface_species_are_unique.
+# (2026-08-10: the ambiguous=true law above is the ENGLISH group's — the
+# animal-multilingual group at the end of this file extends the roster to
+# zh/ja/ko/hi/th/vi/id under its own load laws; see that header.)
 
 [[entry]]
 class    = "animal"
@@ -2135,3 +2138,3204 @@ species  = "peacock"
 forms    = ["peacock", "peacocks"]
 cjk      = false
 ambiguous= true
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "turkey"
+forms    = ["turkey", "turkeys"]
+cjk      = false
+ambiguous= true
+notes    = "The bird, and unavoidably the country: matching folds case away, so 'Turkey' (the republic) summons the fan-tailed head. Deliberate (the kuma-precedent judgment): the collision is cross-DOMAIN rather than cross-language, so a language gate would just silence the bird for every default user — and the owner asked for this word by name. Cute-over-precision; the sprite is harmless either way. Live-caret deferral rides the class-wide ambiguous=true."
+
+[[entry]]
+class    = "animal"
+lang     = "en"
+mode     = "forms"
+species  = "bird"
+forms    = ["bird", "birds", "birdie", "birdies"]
+cjk      = false
+ambiguous= true
+notes    = "Generic avian, with its OWN authored songbird head (decision: new art rather than aliasing into parrot/sparrow — 'bird' is the highest-frequency avian word and deserves a species-neutral sprite; every specific bird word keeps its specific head). 'birdie' doubles as the golf term — same deliberate call as bear/seal/bat."
+
+
+# ===================== group: animal-multilingual (2026-08-10) =====================
+# The menagerie's zh / ja / ko (+ hi / th / vi / id) expansion. Owner verbatim:
+# "these need to work for Chinese and Korean and Japanese and other asian
+# languages." Laws, extending the animal group's:
+#
+#  * Multi-character CJK compounds load PLAIN (ambiguous = false) — the
+#    feline/canine CJK precedent: they are not ordinary Latin prose, so the
+#    class's live-caret-deferral rationale does not apply, and a language gate
+#    would leave them silent for every default (languages = ["en"]) user,
+#    which is exactly the bug this group fixes.
+#  * SINGLE-character han/kana/hangul forms are listed but ride the scanner's
+#    class-agnostic `cjk_single_char` opt-in (the scanner drops 1-char CJK
+#    hits without it, for every class): a lone ideograph fires anywhere the
+#    character appears, including inside un-listed compounds, and most are
+#    real homographs (말 = horse AND speech, 새 = bird AND new, 象 sits inside
+#    印象/对象). Notes call out the worst offenders.
+#  * Latin-script languages here (vi, id) stay ambiguous = true like the en
+#    group: their folded surfaces are typable mid-English-word (caret
+#    deferral) and several fold into other languages' ordinary words, so they
+#    load only for users who list the language. Devanagari (hi) loads plain
+#    per the canine hi precedent: a spaced script that cannot appear
+#    mid-English-typing and cannot fold-collide with ASCII.
+#  * In-language homograph bombs get the kuma treatment (an ambiguous = true
+#    sibling entry) when the collision is open-ended, or an exceptions.toml
+#    suppression when the bomb list is small and finite (カメラ for カメ,
+#    오리지널 for 오리). A species with no clean form in a language is SKIPPED,
+#    never force-fitted; skips are recorded in the surviving entry's notes.
+#  * One surface -> one species still holds across languages (獅子 is the lion
+#    for zh AND ja: same species, language sets union).
+#
+# Not expanded here: cat and dog words are Class::Feline / Class::Canine and
+# already speak zh/ja/ko (th/lo/km cats too); this group is the OTHER 67 heads.
+
+# ---- zh: Mandarin (Hans + Hant surfaces in one entry, the feline precedent) ----
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "monkey"
+forms    = ["猴子", "小猴子", "猴"]
+cjk      = true
+ambiguous= false
+notes    = "猴子 = monkey, 小猴子 = little monkey. Lone 猴 rides the cjk_single_char opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "camel"
+forms    = ["骆驼", "駱駝"]
+cjk      = true
+ambiguous= false
+notes    = "骆驼/駱駝 = camel (Hans/Hant)."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "elephant"
+forms    = ["大象", "象"]
+cjk      = true
+ambiguous= false
+notes    = "大象 = elephant. Lone 象 also means 'appearance' and sits inside 印象/对象 — the opt-in accepts that noise; 象 unions with the ja entry."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["长颈鹿", "長頸鹿"]
+cjk      = true
+ambiguous= false
+notes    = "长颈鹿/長頸鹿 = giraffe ('long-neck deer'); the deer inside never fires separately — the longer compound wins the munch."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "lion"
+forms    = ["狮子", "獅子"]
+cjk      = true
+ambiguous= false
+notes    = "狮子/獅子 = lion. 獅子 doubles as the ja reading shishi — same species, sets union."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "tiger"
+forms    = ["老虎", "虎"]
+cjk      = true
+ambiguous= false
+notes    = "老虎 = tiger. 老虎机 (slot machine) drawing a tiger is accepted-cute. Lone 虎 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "bear"
+forms    = ["小熊", "熊"]
+cjk      = true
+ambiguous= false
+notes    = "小熊 = bear cub / teddy. Lone 熊 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "panda"
+forms    = ["熊猫", "熊貓", "貓熊", "大熊猫", "大熊貓"]
+cjk      = true
+ambiguous= false
+notes    = "PROMOTED from exceptions.toml (2026-08-10): 熊猫/貓熊 were suppressions protecting the cat ideograph; a positive panda match does that job better — the longer compound wins the maximal munch, so the 猫 inside still never sparkles, and the panda head appears instead of silence. 熊猫眼 (dark circles) firing a panda is accepted-cute."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "koala"
+forms    = ["考拉", "无尾熊", "無尾熊"]
+cjk      = true
+ambiguous= false
+notes    = "考拉 = koala (mainland loan); 无尾熊/無尾熊 ('tailless bear') is the Taiwan term."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "kangaroo"
+forms    = ["袋鼠"]
+cjk      = true
+ambiguous= false
+notes    = "袋鼠 = kangaroo ('pouch rat' — the rat inside never fires; longer compound wins)."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "zebra"
+forms    = ["斑马", "斑馬"]
+cjk      = true
+ambiguous= false
+notes    = "斑马/斑馬 = zebra."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "horse"
+forms    = ["小马", "小馬", "马", "馬"]
+cjk      = true
+ambiguous= false
+notes    = "小马/小馬 = pony (rides the horse sprite, like en 'pony'). Lone 马/馬 rides the opt-in — 马 is also the surname Mǎ and lives inside 马上 ('immediately'); a horse head on Mr. Ma is the opt-in's documented cost. 馬 unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "cow"
+forms    = ["奶牛", "牛"]
+cjk      = true
+ambiguous= false
+notes    = "奶牛 = dairy cow. Lone 牛 (also slang 'awesome') rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "pig"
+forms    = ["小猪", "小豬", "猪", "豬"]
+cjk      = true
+ambiguous= false
+notes    = "小猪/小豬 = piglet. Lone 猪/豬 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "sheep"
+forms    = ["绵羊", "綿羊", "小羊", "羊"]
+cjk      = true
+ambiguous= false
+notes    = "绵羊/綿羊 = sheep, 小羊 = lamb. Lone 羊 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "goat"
+forms    = ["山羊"]
+cjk      = true
+ambiguous= false
+notes    = "山羊 = goat; also the ja kanji for yagi — same species either way."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "donkey"
+forms    = ["驴子", "驢子", "驴", "驢"]
+cjk      = true
+ambiguous= false
+notes    = "驴子/驢子 = donkey. Lone 驴/驢 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["兔子", "小兔子", "兔"]
+cjk      = true
+ambiguous= false
+notes    = "兔子 = rabbit, 小兔子 = bunny. Lone 兔 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "mouse"
+forms    = ["老鼠", "鼠"]
+cjk      = true
+ambiguous= false
+notes    = "老鼠 = mouse/rat. Lone 鼠 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "hamster"
+forms    = ["仓鼠", "倉鼠"]
+cjk      = true
+ambiguous= false
+notes    = "仓鼠/倉鼠 = hamster ('granary rat')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["松鼠"]
+cjk      = true
+ambiguous= false
+notes    = "松鼠 = squirrel ('pine rat')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "hedgehog"
+forms    = ["刺猬", "刺蝟"]
+cjk      = true
+ambiguous= false
+notes    = "刺猬/刺蝟 = hedgehog."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "fox"
+forms    = ["狐狸", "狐"]
+cjk      = true
+ambiguous= false
+notes    = "狐狸 = fox. Lone 狐 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "wolf"
+forms    = ["大灰狼", "狼"]
+cjk      = true
+ambiguous= false
+notes    = "大灰狼 = the Big Bad Wolf (nursery staple). Lone 狼 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "deer"
+forms    = ["小鹿", "鹿"]
+cjk      = true
+ambiguous= false
+notes    = "小鹿 = fawn. Lone 鹿 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "moose"
+forms    = ["驼鹿", "駝鹿"]
+cjk      = true
+ambiguous= false
+notes    = "驼鹿/駝鹿 = moose ('camel deer')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "raccoon"
+forms    = ["浣熊"]
+cjk      = true
+ambiguous= false
+notes    = "浣熊 = raccoon ('washing bear')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "otter"
+forms    = ["水獭", "水獺"]
+cjk      = true
+ambiguous= false
+notes    = "水獭/水獺 = otter."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "seal"
+forms    = ["海豹"]
+cjk      = true
+ambiguous= false
+notes    = "海豹 = seal ('sea leopard'); also the ja kanji reading — same species."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "penguin"
+forms    = ["企鹅", "企鵝"]
+cjk      = true
+ambiguous= false
+notes    = "企鹅/企鵝 = penguin ('standing goose')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "owl"
+forms    = ["猫头鹰", "貓頭鷹"]
+cjk      = true
+ambiguous= false
+notes    = "猫头鹰/貓頭鷹 = owl ('cat-head eagle'). Contains the cat ideograph: the longer owl compound wins the munch, so under the lone-猫 opt-in an owl now reads as an owl instead of sparkling as a cat."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "eagle"
+forms    = ["老鹰", "老鷹", "鹰", "鷹"]
+cjk      = true
+ambiguous= false
+notes    = "老鹰/老鷹 = eagle/hawk. Lone 鹰/鷹 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "duck"
+forms    = ["鸭子", "鴨子", "鸭", "鴨"]
+cjk      = true
+ambiguous= false
+notes    = "鸭子/鴨子 = duck. Lone 鸭/鴨 rides the opt-in; 鴨 unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "chicken"
+forms    = ["小鸡", "小雞", "鸡", "雞"]
+cjk      = true
+ambiguous= false
+notes    = "小鸡/小雞 = chick. Lone 鸡/雞 rides the opt-in (it sits inside 鸡蛋 and many food words — which are, in fairness, chicken)."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "goose"
+forms    = ["大白鹅", "鹅", "鵝"]
+cjk      = true
+ambiguous= false
+notes    = "大白鹅 = the big white goose (nursery staple). Lone 鹅/鵝 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "swan"
+forms    = ["天鹅", "天鵝"]
+cjk      = true
+ambiguous= false
+notes    = "天鹅/天鵝 = swan ('sky goose'). 天鹅绒 (velvet, lit. swan down) drawing a swan is accepted-cute."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "parrot"
+forms    = ["鹦鹉", "鸚鵡"]
+cjk      = true
+ambiguous= false
+notes    = "鹦鹉/鸚鵡 = parrot."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "flamingo"
+forms    = ["火烈鸟", "火烈鳥", "紅鶴"]
+cjk      = true
+ambiguous= false
+notes    = "火烈鸟/火烈鳥 = flamingo ('fire-fierce bird', mainland); 紅鶴 ('red crane') is the Taiwan/ja term."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "frog"
+forms    = ["青蛙", "蛙"]
+cjk      = true
+ambiguous= false
+notes    = "青蛙 = frog. Lone 蛙 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "turtle"
+forms    = ["乌龟", "烏龜", "龟", "龜"]
+cjk      = true
+ambiguous= false
+notes    = "乌龟/烏龜 = turtle/tortoise. Lone 龟/龜 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "snake"
+forms    = ["蛇"]
+cjk      = true
+ambiguous= false
+notes    = "蛇 = snake — single ideograph only (小蛇 is not idiomatic enough to earn a slot), so zh snakes appear only under the cjk_single_char opt-in. Unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "lizard"
+forms    = ["蜥蜴"]
+cjk      = true
+ambiguous= false
+notes    = "蜥蜴 = lizard."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["鳄鱼", "鱷魚"]
+cjk      = true
+ambiguous= false
+notes    = "鳄鱼/鱷魚 = crocodile/alligator."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "shark"
+forms    = ["鲨鱼", "鯊魚"]
+cjk      = true
+ambiguous= false
+notes    = "鲨鱼/鯊魚 = shark."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "whale"
+forms    = ["鲸鱼", "鯨魚", "鲸", "鯨"]
+cjk      = true
+ambiguous= false
+notes    = "鲸鱼/鯨魚 = whale. Lone 鲸/鯨 rides the opt-in; 鯨 unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "dolphin"
+forms    = ["海豚"]
+cjk      = true
+ambiguous= false
+notes    = "海豚 = dolphin ('sea pig'); the same compound is the ja word — sets union."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "fish"
+forms    = ["小鱼", "小魚", "鱼", "魚"]
+cjk      = true
+ambiguous= false
+notes    = "小鱼/小魚 = little fish. Lone 鱼/魚 rides the opt-in; 魚 unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "octopus"
+forms    = ["章鱼", "章魚"]
+cjk      = true
+ambiguous= false
+notes    = "章鱼/章魚 = octopus."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "crab"
+forms    = ["螃蟹", "蟹"]
+cjk      = true
+ambiguous= false
+notes    = "螃蟹 = crab. Lone 蟹 rides the opt-in and unions with ja."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "lobster"
+forms    = ["龙虾", "龍蝦"]
+cjk      = true
+ambiguous= false
+notes    = "龙虾/龍蝦 = lobster ('dragon shrimp')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "jellyfish"
+forms    = ["水母"]
+cjk      = true
+ambiguous= false
+notes    = "水母 = jellyfish ('water mother')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "bee"
+forms    = ["蜜蜂"]
+cjk      = true
+ambiguous= false
+notes    = "蜜蜂 = honeybee."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["蝴蝶"]
+cjk      = true
+ambiguous= false
+notes    = "蝴蝶 = butterfly."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "ladybug"
+forms    = ["瓢虫", "瓢蟲"]
+cjk      = true
+ambiguous= false
+notes    = "瓢虫/瓢蟲 = ladybug ('gourd bug')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "spider"
+forms    = ["蜘蛛"]
+cjk      = true
+ambiguous= false
+notes    = "蜘蛛 = spider; same compound in ja — sets union."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "snail"
+forms    = ["蜗牛", "蝸牛"]
+cjk      = true
+ambiguous= false
+notes    = "蜗牛/蝸牛 = snail ('spiral ox')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "bat"
+forms    = ["蝙蝠"]
+cjk      = true
+ambiguous= false
+notes    = "蝙蝠 = bat."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "gorilla"
+forms    = ["大猩猩"]
+cjk      = true
+ambiguous= false
+notes    = "大猩猩 = gorilla. Bare 猩猩 skipped — it names orangutans/apes generically, a wrong-species claim."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "hippo"
+forms    = ["河马", "河馬"]
+cjk      = true
+ambiguous= false
+notes    = "河马/河馬 = hippo ('river horse'); 河馬 doubles as the ja kanji — sets union."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "rhino"
+forms    = ["犀牛"]
+cjk      = true
+ambiguous= false
+notes    = "犀牛 = rhinoceros."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "sloth"
+forms    = ["树懒", "樹懶"]
+cjk      = true
+ambiguous= false
+notes    = "树懒/樹懶 = sloth ('tree lazy')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "cheetah"
+forms    = ["猎豹", "獵豹"]
+cjk      = true
+ambiguous= false
+notes    = "猎豹/獵豹 = cheetah ('hunting leopard')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["恐龙", "恐龍"]
+cjk      = true
+ambiguous= false
+notes    = "恐龙/恐龍 = dinosaur ('terror dragon')."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "peacock"
+forms    = ["孔雀"]
+cjk      = true
+ambiguous= false
+notes    = "孔雀 = peacock; the same compound is the ja kanji — sets union."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "turkey"
+forms    = ["火鸡", "火雞"]
+cjk      = true
+ambiguous= false
+notes    = "火鸡/火雞 = turkey ('fire chicken'). No country collision in Chinese (土耳其 is the republic) — the zh turkey is cleaner than the English one."
+
+[[entry]]
+class    = "animal"
+lang     = "zh"
+mode     = "forms"
+species  = "bird"
+forms    = ["小鸟", "小鳥", "鸟", "鳥"]
+cjk      = true
+ambiguous= false
+notes    = "小鸟/小鳥 = little bird (the generic cute avian). Lone 鸟 doubles as a mild vulgarism (diǎo) — it rides the opt-in regardless; 鳥 unions with ja."
+
+# ---- ja: Japanese (kanji + katakana + hiragana where conventional). The
+# ---- recurring skip reason is the maximal-munch prefix bomb: a katakana
+# ---- animal that prefixes everyday terminal vocabulary (トラ→トラブル,
+# ---- リス→リスト, サイ→サイズ) never ships; a small finite bomb list gets an
+# ---- exceptions.toml suppression instead (カメ→カメラ). ----
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "monkey"
+forms    = ["サル", "猿"]
+cjk      = true
+ambiguous= false
+notes    = "サル = monkey; サルベージ/サルモネラ/サルサ suppressed in exceptions.toml (finite bomb list; マサル-type names drawing a monkey are accepted-cute). さる hiragana skipped (去る 'to leave'). Lone 猿 rides the cjk_single_char opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "camel"
+forms    = ["ラクダ"]
+cjk      = true
+ambiguous= false
+notes    = "ラクダ = camel."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "elephant"
+forms    = ["ゾウ", "象"]
+cjk      = true
+ambiguous= false
+notes    = "ゾウ = elephant. ぞう hiragana skipped (雑巾/増/蔵 readings). 象 unions with zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["キリン", "きりん"]
+cjk      = true
+ambiguous= false
+notes    = "キリン = giraffe; also the beer brand and the mythical 麒麟 — giraffe-dominant in animal text, accepted."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "lion"
+forms    = ["ライオン"]
+cjk      = true
+ambiguous= false
+notes    = "ライオン = lion; 獅子 lives on the zh entry (same species, ja readers included via the shared surface)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "tiger"
+forms    = ["タイガー", "虎"]
+cjk      = true
+ambiguous= false
+notes    = "虎 rides the opt-in and unions with zh. トラ SKIPPED — it prefixes トラック/トラブル/トランプ, everyday terminal vocabulary; no finite exception list would hold."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "bear"
+forms    = ["クマ", "熊"]
+cjk      = true
+ambiguous= false
+notes    = "クマ = bear; also 'dark under-eye circles' — in-language homograph accepted (cute-over-precision); アクマ (悪魔) suppressed in exceptions.toml, クマモト stays a bear on purpose (ask their mascot). 熊 rides the opt-in, unions zh. Hiragana くま rides the ambiguous sibling below."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "bear"
+forms    = ["くま"]
+cjk      = true
+ambiguous= true
+notes    = "The kuma treatment, at home: hiragana くま sits at the head of ordinary prose (くまなく 'thoroughly', くまで 'rake' — both suppressed in exceptions.toml) and doubles as 隈. Language-gated so only users who list ja opt into the noise; クマ/熊 above load plain."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "panda"
+forms    = ["パンダ"]
+cjk      = true
+ambiguous= false
+notes    = "パンダ = panda (the ja 熊猫 kanji lives on the zh panda entry and matches for ja readers via the shared surface)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "koala"
+forms    = ["コアラ"]
+cjk      = true
+ambiguous= false
+notes    = "コアラ = koala."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "kangaroo"
+forms    = ["カンガルー"]
+cjk      = true
+ambiguous= false
+notes    = "カンガルー = kangaroo."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "zebra"
+forms    = ["シマウマ"]
+cjk      = true
+ambiguous= false
+notes    = "シマウマ = zebra ('stripe horse'). しまうま hiragana SKIPPED — it hides inside ordinary grammar (…してしまうまでは… contains しまうま)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "horse"
+forms    = ["ポニー", "馬"]
+cjk      = true
+ambiguous= false
+notes    = "ポニー rides the horse sprite like en 'pony'. ウマ/うま skipped (ウマい/うまい 'tasty'). 馬 rides the opt-in, unions zh-Hant."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "cow"
+forms    = ["ウシ", "牛"]
+cjk      = true
+ambiguous= false
+notes    = "ウシ = cow. うし hiragana skipped (うしろ 'behind'). ウシガエル (bullfrog) drawing a cow is accepted-cute. 牛 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "pig"
+forms    = ["ブタ", "子豚", "豚"]
+cjk      = true
+ambiguous= false
+notes    = "ブタ = pig, 子豚 = piglet. ぶた hiragana skipped (舞台 as kana). 豚 rides the opt-in — it sits inside 豚骨/豚カツ, which are, in fairness, pig."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "sheep"
+forms    = ["ヒツジ", "ひつじ", "羊"]
+cjk      = true
+ambiguous= false
+notes    = "ヒツジ/ひつじ = sheep (the counting-sheep kana is genuinely typed). 羊 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "goat"
+forms    = ["ヤギ", "やぎ"]
+cjk      = true
+ambiguous= false
+notes    = "ヤギ/やぎ = goat (やぎ座 drawing a goat is correct). The 山羊 kanji lives on the zh goat entry — same species."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "donkey"
+forms    = ["ロバ"]
+cjk      = true
+ambiguous= false
+notes    = "ロバ = donkey. ロバート (Robert) and ロバスト (robust — an engineering staple) suppressed in exceptions.toml."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["ウサギ", "うさぎ", "兎"]
+cjk      = true
+ambiguous= false
+notes    = "ウサギ/うさぎ = rabbit. Lone 兎 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "mouse"
+forms    = ["ネズミ", "ねずみ", "鼠"]
+cjk      = true
+ambiguous= false
+notes    = "ネズミ/ねずみ = mouse. 鼠 rides the opt-in, unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "hamster"
+forms    = ["ハムスター"]
+cjk      = true
+ambiguous= false
+notes    = "ハムスター = hamster."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["栗鼠"]
+cjk      = true
+ambiguous= false
+notes    = "栗鼠 = squirrel — the rare kanji, kept BECAUSE it is unambiguous. リス/りす SKIPPED: リス prefixes リスト/リスク/リスナー/リストラ, the everyday vocabulary of a terminal; no finite exception list would hold (the トラ judgment)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "hedgehog"
+forms    = ["ハリネズミ"]
+cjk      = true
+ambiguous= false
+notes    = "ハリネズミ = hedgehog ('needle mouse')."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "fox"
+forms    = ["キツネ", "きつね", "狐"]
+cjk      = true
+ambiguous= false
+notes    = "キツネ/きつね = fox (きつねうどん drawing a fox is the correct amount of whimsy). 狐 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "wolf"
+forms    = ["オオカミ", "おおかみ", "狼"]
+cjk      = true
+ambiguous= false
+notes    = "オオカミ/おおかみ = wolf. 狼 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "deer"
+forms    = ["シカ", "鹿"]
+cjk      = true
+ambiguous= false
+notes    = "シカ = deer; シカゴ (Chicago) and シカト (the cold shoulder) suppressed in exceptions.toml. しか hiragana SKIPPED — it is the particle/しかし/しかも, unfixable. 鹿 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "moose"
+forms    = ["ヘラジカ"]
+cjk      = true
+ambiguous= false
+notes    = "ヘラジカ = moose ('spatula deer')."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "raccoon"
+forms    = ["アライグマ"]
+cjk      = true
+ambiguous= false
+notes    = "アライグマ = raccoon ('washing bear'). タヌキ deliberately absent — a tanuki is a raccoon-dog, not a raccoon; no forced bad form."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "otter"
+forms    = ["カワウソ"]
+cjk      = true
+ambiguous= false
+notes    = "カワウソ = otter."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "seal"
+forms    = ["アザラシ"]
+cjk      = true
+ambiguous= false
+notes    = "アザラシ = seal (the 海豹 kanji lives on the zh seal entry — same species)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "penguin"
+forms    = ["ペンギン"]
+cjk      = true
+ambiguous= false
+notes    = "ペンギン = penguin."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "owl"
+forms    = ["フクロウ", "ふくろう", "梟"]
+cjk      = true
+ambiguous= false
+notes    = "フクロウ/ふくろう = owl (the ふくろ 'bag' near-miss is one kana short and never matches the whole key). Lone 梟 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "eagle"
+forms    = ["鷲"]
+cjk      = true
+ambiguous= false
+notes    = "鷲 = eagle, opt-in only. ワシ SKIPPED — dialect first-person わし plus ワシントン; the katakana is unshippable."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "duck"
+forms    = ["アヒル", "鴨"]
+cjk      = true
+ambiguous= false
+notes    = "アヒル = domestic duck. カモ SKIPPED (カモン/カモミール/カモフラージュ own the prefix; かも is the sentence-final particle). 鴨 rides the opt-in, unions zh-Hant."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "chicken"
+forms    = ["ニワトリ", "にわとり", "ひよこ", "ヒヨコ", "鶏"]
+cjk      = true
+ambiguous= false
+notes    = "ニワトリ/にわとり = chicken; ひよこ/ヒヨコ = chick. 鶏 (shinjitai) rides the opt-in — inside 鶏肉/鶏ガラ it is, in fairness, chicken."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "goose"
+forms    = ["ガチョウ", "がちょう"]
+cjk      = true
+ambiguous= false
+notes    = "ガチョウ/がちょう = goose."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "swan"
+forms    = ["白鳥", "ハクチョウ"]
+cjk      = true
+ambiguous= false
+notes    = "白鳥/ハクチョウ = swan. 白鳥 is also the surname Shiratori — a swan on Ms. Shiratori is harmless, accepted."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "parrot"
+forms    = ["オウム", "インコ"]
+cjk      = true
+ambiguous= false
+notes    = "オウム = (large) parrot, インコ = parakeet — both ride the parrot head. Suppressed in exceptions.toml: オウム真理教 (the cult — a parrot there would be grim) and the インコー stub (kills インコース and インコーナー in one line)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "flamingo"
+forms    = ["フラミンゴ"]
+cjk      = true
+ambiguous= false
+notes    = "フラミンゴ = flamingo."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "frog"
+forms    = ["カエル", "蛙"]
+cjk      = true
+ambiguous= false
+notes    = "カエル = frog (katakana is the animal convention). かえる hiragana SKIPPED — it is 帰る/変える/買える in kana. 蛙 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "turtle"
+forms    = ["カメ", "亀"]
+cjk      = true
+ambiguous= false
+notes    = "カメ = turtle; カメラ/カメレオン/ワカメ/カメオ suppressed in exceptions.toml (finite bomb list). かめ hiragana SKIPPED — つかめ ('grab it!') and わかめ contain it. Lone 亀 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "snake"
+forms    = ["ヘビ", "蛇"]
+cjk      = true
+ambiguous= false
+notes    = "ヘビ = snake; ヘビー and ヘビメタ suppressed in exceptions.toml. へび hiragana SKIPPED — the へ particle glues onto b-words (…へびっくり). 蛇 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "lizard"
+forms    = ["トカゲ"]
+cjk      = true
+ambiguous= false
+notes    = "トカゲ = lizard. とかげ hiragana SKIPPED — the quotative とか glues onto げ-words (…とかげんき); open-ended."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["ワニ"]
+cjk      = true
+ambiguous= false
+notes    = "ワニ = crocodile (ワニス is rare enough to accept unsuppressed). わに hiragana SKIPPED — かわに (川に) contains it."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "shark"
+forms    = ["サメ", "鮫"]
+cjk      = true
+ambiguous= false
+notes    = "サメ = shark. さめ hiragana skipped (冷め/覚め verb stems). Lone 鮫 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "whale"
+forms    = ["クジラ", "くじら", "鯨"]
+cjk      = true
+ambiguous= false
+notes    = "クジラ/くじら = whale. 鯨 rides the opt-in, unions zh-Hant."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "dolphin"
+forms    = ["イルカ", "海豚"]
+cjk      = true
+ambiguous= false
+notes    = "イルカ = dolphin. いるか hiragana SKIPPED — it is literally the question いるか? ('you there?'), ubiquitous in chat. 海豚 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "fish"
+forms    = ["さかな", "魚"]
+cjk      = true
+ambiguous= false
+notes    = "さかな = fish (the kana word is genuinely typed; さかなや drawing a fish is right); まさかな ('surely not…') suppressed in exceptions.toml. 魚 rides the opt-in, unions zh-Hant."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "octopus"
+forms    = ["タコ"]
+cjk      = true
+ambiguous= false
+notes    = "タコ = octopus; タコス suppressed in exceptions.toml. たこ hiragana SKIPPED — …したこと/やったこと (た + こと) is everywhere; no exception list would hold. The kite/callus homographs on タコ are accepted-cute."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "crab"
+forms    = ["カニ", "蟹"]
+cjk      = true
+ambiguous= false
+notes    = "カニ = crab; メカニ suppressed in exceptions.toml (one stub kills メカニズム/メカニック/メカニカル). かに hiragana SKIPPED — どこかに and たしかに contain it. 蟹 unions zh."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "lobster"
+forms    = ["ロブスター"]
+cjk      = true
+ambiguous= false
+notes    = "ロブスター = lobster (伊勢エビ is its own dish-grade species, skipped)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "jellyfish"
+forms    = ["クラゲ", "くらげ"]
+cjk      = true
+ambiguous= false
+notes    = "クラゲ/くらげ = jellyfish; きくらげ (the mushroom) suppressed in exceptions.toml."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "bee"
+forms    = ["ミツバチ", "みつばち", "ハチ", "蜂"]
+cjk      = true
+ambiguous= false
+notes    = "ミツバチ/みつばち = honeybee; ハチ = bee/wasp — ハチ公 (the dog!) and the ハチャ stub (kills ハチャメチャ) suppressed in exceptions.toml; ハチミツ drawing a bee is right. はち hiragana skipped (the numeral 8). 蜂 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["チョウチョ", "ちょうちょ", "蝶"]
+cjk      = true
+ambiguous= false
+notes    = "チョウチョ/ちょうちょ = butterfly. Bare チョウ skipped (超/町/長 as katakana). 蝶 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "ladybug"
+forms    = ["テントウムシ", "てんとうむし"]
+cjk      = true
+ambiguous= false
+notes    = "テントウムシ/てんとうむし = ladybug ('sun-lord bug')."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "spider"
+forms    = ["クモ"]
+cjk      = true
+ambiguous= false
+notes    = "クモ = spider; クモ膜 (arachnoid, medical) suppressed in exceptions.toml. くも hiragana SKIPPED — it is 雲 'cloud' at least as often. 蜘蛛 lives on the zh entry, same species."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "snail"
+forms    = ["カタツムリ", "かたつむり"]
+cjk      = true
+ambiguous= false
+notes    = "カタツムリ/かたつむり = snail."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "bat"
+forms    = ["コウモリ"]
+cjk      = true
+ambiguous= false
+notes    = "コウモリ = bat. こうもり hiragana SKIPPED — けっこうもりだくさん contains it; こう is too productive."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "gorilla"
+forms    = ["ゴリラ"]
+cjk      = true
+ambiguous= false
+notes    = "ゴリラ = gorilla."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "hippo"
+forms    = ["河馬"]
+cjk      = true
+ambiguous= false
+notes    = "河馬 = hippo (rare kanji, kept BECAUSE it is unambiguous; unions zh-Hant). カバ SKIPPED — it prefixes カバー and カバン, everyday words; no finite exception list would hold."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "rhino"
+forms    = ["犀"]
+cjk      = true
+ambiguous= false
+notes    = "犀 = rhino, opt-in only. サイ SKIPPED — サイズ/サイト/サイン are terminal bread-and-butter (the トラ judgment)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "sloth"
+forms    = ["ナマケモノ", "なまけもの"]
+cjk      = true
+ambiguous= false
+notes    = "ナマケモノ/なまけもの = sloth — literally 'the lazy one'; the homograph IS the animal's name, so calling someone なまけもの and getting a sloth is the feature, not a bug."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "cheetah"
+forms    = ["チーター"]
+cjk      = true
+ambiguous= false
+notes    = "チーター = cheetah."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["恐竜", "きょうりゅう"]
+cjk      = true
+ambiguous= false
+notes    = "恐竜/きょうりゅう = dinosaur (the kana spelling is kids'-book standard; the whole key must be present, so きょう 'today' alone never fires it)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "peacock"
+forms    = ["クジャク"]
+cjk      = true
+ambiguous= false
+notes    = "クジャク = peacock (孔雀 kanji lives on the zh entry — same species, shared surface)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "turkey"
+forms    = ["七面鳥", "シチメンチョウ", "しちめんちょう"]
+cjk      = true
+ambiguous= false
+notes    = "七面鳥 = turkey ('seven-faced bird') + both kana spellings. No country collision in Japanese (トルコ is the republic)."
+
+[[entry]]
+class    = "animal"
+lang     = "ja"
+mode     = "forms"
+species  = "bird"
+forms    = ["小鳥", "ことり", "鳥"]
+cjk      = true
+ambiguous= false
+notes    = "小鳥/ことり = little bird, the generic cute avian. とり/トリ SKIPPED — とりあえず and トリック/トリガー/トリミング own those prefixes (取り- is productive; no finite exception list). 鳥 rides the opt-in, unions zh-Hant."
+
+# ---- ko: Korean (hangul; the engine scans hangul as a no-space run, so
+# ---- particles attach cleanly — 원숭이가 still matches 원숭이). Korean's
+# ---- single-SYLLABLE animal names (말/새/소/곰/닭/뱀/게/벌/양/쥐) are all
+# ---- heavy homographs; every one rides the cjk_single_char opt-in, which is
+# ---- the entire reason the roster keeps them at all. ko moose skipped:
+# ---- 말코손바닥사슴 is a 7-syllable zoological compound nobody types. ----
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "monkey"
+forms    = ["원숭이"]
+cjk      = true
+ambiguous= false
+notes    = "원숭이 = monkey."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "camel"
+forms    = ["낙타"]
+cjk      = true
+ambiguous= false
+notes    = "낙타 = camel."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "elephant"
+forms    = ["코끼리"]
+cjk      = true
+ambiguous= false
+notes    = "코끼리 = elephant."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["기린"]
+cjk      = true
+ambiguous= false
+notes    = "기린 = giraffe (also the mythical qilin/beer brand — giraffe-dominant, accepted)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "lion"
+forms    = ["사자"]
+cjk      = true
+ambiguous= false
+notes    = "사자 = lion; 사자성어 (the four-character-idiom word that literally starts with 'lion') is suppressed in exceptions.toml. The 使者 'envoy' homograph is accepted — a lion on a messenger is harmless."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "tiger"
+forms    = ["호랑이"]
+cjk      = true
+ambiguous= false
+notes    = "호랑이 = tiger. Single-syllable 범 skipped — it prefixes 범인/범위/범죄, everyday vocabulary."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "bear"
+forms    = ["곰돌이", "곰"]
+cjk      = true
+ambiguous= false
+notes    = "곰돌이 = teddy/bear-cub (childspeak). Lone 곰 rides the opt-in; under it 곰팡이 (mold) grows a bear head — the opt-in's documented cost."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "panda"
+forms    = ["판다"]
+cjk      = true
+ambiguous= true
+notes    = "The kuma treatment: 판다 = panda AND the everyday verb form '(he/she) sells' (팔다 → 판다) — an open-ended in-language collision no exception list can hold. Language-gated: loads only for users who list ko. (팬더, the loan variant, is nonstandard enough to skip.)"
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "koala"
+forms    = ["코알라"]
+cjk      = true
+ambiguous= false
+notes    = "코알라 = koala."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "kangaroo"
+forms    = ["캥거루"]
+cjk      = true
+ambiguous= false
+notes    = "캥거루 = kangaroo."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "zebra"
+forms    = ["얼룩말"]
+cjk      = true
+ambiguous= false
+notes    = "얼룩말 = zebra ('spot horse')."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "horse"
+forms    = ["조랑말", "말"]
+cjk      = true
+ambiguous= false
+notes    = "조랑말 = pony (rides the horse sprite). Lone 말 = horse AND speech/word — the opt-in is the guard."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "cow"
+forms    = ["젖소", "송아지", "소"]
+cjk      = true
+ambiguous= false
+notes    = "젖소 = dairy cow, 송아지 = calf. Lone 소 (also 'small-'/'place' hanja readings) rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "pig"
+forms    = ["돼지", "아기돼지"]
+cjk      = true
+ambiguous= false
+notes    = "돼지 = pig, 아기돼지 = piglet. The beloved 되지/돼지 misspelling meme (…하면 돼지!) drawing a pig is accepted — arguably the feature working as intended."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "sheep"
+forms    = ["양"]
+cjk      = true
+ambiguous= false
+notes    = "양 = sheep AND quantity AND Ms. — no clean multi-syllable ovine exists, so ko sheep appear only under the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "goat"
+forms    = ["염소"]
+cjk      = true
+ambiguous= false
+notes    = "염소 = goat AND chlorine. Accepted plain (kuma-adjacent judgment, the other way): chemistry text drawing a goat is cute-over-precision, and the goat sense dominates prose."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "donkey"
+forms    = ["당나귀"]
+cjk      = true
+ambiguous= false
+notes    = "당나귀 = donkey."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["토끼"]
+cjk      = true
+ambiguous= false
+notes    = "토끼 = rabbit."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "mouse"
+forms    = ["생쥐", "쥐"]
+cjk      = true
+ambiguous= false
+notes    = "생쥐 = (house) mouse. Lone 쥐 rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "hamster"
+forms    = ["햄스터"]
+cjk      = true
+ambiguous= false
+notes    = "햄스터 = hamster."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["다람쥐"]
+cjk      = true
+ambiguous= false
+notes    = "다람쥐 = squirrel."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "hedgehog"
+forms    = ["고슴도치"]
+cjk      = true
+ambiguous= false
+notes    = "고슴도치 = hedgehog."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "fox"
+forms    = ["여우"]
+cjk      = true
+ambiguous= false
+notes    = "여우 = fox (also 'foxy person' — same metaphor as English, accepted)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "wolf"
+forms    = ["늑대"]
+cjk      = true
+ambiguous= false
+notes    = "늑대 = wolf (also 'wolfish man' — same metaphor, accepted)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "deer"
+forms    = ["사슴"]
+cjk      = true
+ambiguous= false
+notes    = "사슴 = deer."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "raccoon"
+forms    = ["라쿤"]
+cjk      = true
+ambiguous= false
+notes    = "라쿤 = raccoon (loan). 너구리 skipped — it names the raccoon DOG (and a noodle brand); wrong species, no forced fit."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "otter"
+forms    = ["수달"]
+cjk      = true
+ambiguous= false
+notes    = "수달 = otter."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "seal"
+forms    = ["물개", "바다표범"]
+cjk      = true
+ambiguous= false
+notes    = "물개 = fur seal (the everyday word), 바다표범 = true seal ('sea leopard')."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "penguin"
+forms    = ["펭귄"]
+cjk      = true
+ambiguous= false
+notes    = "펭귄 = penguin."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "owl"
+forms    = ["부엉이", "올빼미"]
+cjk      = true
+ambiguous= false
+notes    = "부엉이 = horned owl, 올빼미 = owl (also 'night owl' person — accepted); both ride the owl head."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "eagle"
+forms    = ["독수리"]
+cjk      = true
+ambiguous= false
+notes    = "독수리 = eagle/vulture — the everyday raptor word rides the eagle head."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "duck"
+forms    = ["오리"]
+cjk      = true
+ambiguous= false
+notes    = "오리 = duck. The finite prefix bombs are suppressed in exceptions.toml: 오리지널, 오리엔탈, 오리엔테이션, 오리무중, 오리온. The verb 오리다 ('cut out') drawing a duck is rare enough to accept."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "chicken"
+forms    = ["병아리", "닭"]
+cjk      = true
+ambiguous= false
+notes    = "병아리 = chick. Lone 닭 rides the opt-in; under it 닭갈비/닭고기 grow a chicken head — which is, in fairness, chicken."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "goose"
+forms    = ["거위"]
+cjk      = true
+ambiguous= false
+notes    = "거위 = goose."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "swan"
+forms    = ["백조"]
+cjk      = true
+ambiguous= false
+notes    = "백조 = swan (also the 'gracefully unemployed' slang — accepted, the metaphor is the swan)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "parrot"
+forms    = ["앵무새"]
+cjk      = true
+ambiguous= false
+notes    = "앵무새 = parrot."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "flamingo"
+forms    = ["홍학", "플라밍고"]
+cjk      = true
+ambiguous= false
+notes    = "홍학 ('red crane') and the 플라밍고 loan both = flamingo."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "frog"
+forms    = ["개구리"]
+cjk      = true
+ambiguous= false
+notes    = "개구리 = frog."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "turtle"
+forms    = ["거북이"]
+cjk      = true
+ambiguous= false
+notes    = "거북이 = turtle. Bare 거북 SKIPPED — 거북하다 ('to feel awkward') and its whole conjugation family contain it; the -이 form is what people type for the animal anyway."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "snake"
+forms    = ["뱀"]
+cjk      = true
+ambiguous= false
+notes    = "뱀 = snake — single syllable, rides the opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "lizard"
+forms    = ["도마뱀"]
+cjk      = true
+ambiguous= false
+notes    = "도마뱀 = lizard ('cutting-board snake'); the longer compound wins the munch over lone 뱀."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["악어"]
+cjk      = true
+ambiguous= false
+notes    = "악어 = crocodile/alligator."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "shark"
+forms    = ["상어"]
+cjk      = true
+ambiguous= false
+notes    = "상어 = shark."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "whale"
+forms    = ["고래"]
+cjk      = true
+ambiguous= false
+notes    = "고래 = whale. 고래고래 (yelling at the top of one's lungs) drawing two whales is accepted-cute."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "dolphin"
+forms    = ["돌고래"]
+cjk      = true
+ambiguous= false
+notes    = "돌고래 = dolphin ('stone whale'); the longer compound wins the munch over 고래."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "fish"
+forms    = ["물고기"]
+cjk      = true
+ambiguous= false
+notes    = "물고기 = fish (the animal). 생선 (fish as food) deliberately skipped — a head on the sashimi menu is the wrong register."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "octopus"
+forms    = ["문어", "낙지"]
+cjk      = true
+ambiguous= false
+notes    = "문어 = octopus (문어체, the 文語 'literary style' homograph compound, is suppressed in exceptions.toml); 낙지 = small octopus, same head."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "crab"
+forms    = ["꽃게", "게"]
+cjk      = true
+ambiguous= false
+notes    = "꽃게 = blue crab. Lone 게 is one of the most common Korean grammar syllables — the opt-in is the guard, and even then it is noisy; documented cost."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "lobster"
+forms    = ["랍스터", "바닷가재"]
+cjk      = true
+ambiguous= false
+notes    = "랍스터 (loan) and 바닷가재 ('sea crayfish') = lobster."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "jellyfish"
+forms    = ["해파리"]
+cjk      = true
+ambiguous= false
+notes    = "해파리 = jellyfish."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "bee"
+forms    = ["꿀벌", "벌"]
+cjk      = true
+ambiguous= false
+notes    = "꿀벌 = honeybee. Lone 벌 = bee AND punishment — the opt-in is the guard."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["나비"]
+cjk      = true
+ambiguous= false
+notes    = "나비 = butterfly (also the classic cat name — the butterfly stays the butterfly)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "ladybug"
+forms    = ["무당벌레"]
+cjk      = true
+ambiguous= false
+notes    = "무당벌레 = ladybug ('shaman bug')."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "spider"
+forms    = ["거미"]
+cjk      = true
+ambiguous= false
+notes    = "거미 = spider (거미줄, the web, drawing a spider is right)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "snail"
+forms    = ["달팽이"]
+cjk      = true
+ambiguous= false
+notes    = "달팽이 = snail."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "bat"
+forms    = ["박쥐"]
+cjk      = true
+ambiguous= false
+notes    = "박쥐 = bat ('gourd mouse'); wins the munch over lone 쥐."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "gorilla"
+forms    = ["고릴라"]
+cjk      = true
+ambiguous= false
+notes    = "고릴라 = gorilla."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "hippo"
+forms    = ["하마"]
+cjk      = true
+ambiguous= false
+notes    = "하마 = hippo. 하마터면 ('very nearly…') is suppressed in exceptions.toml — the one common prefix bomb."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "rhino"
+forms    = ["코뿔소"]
+cjk      = true
+ambiguous= false
+notes    = "코뿔소 = rhino ('nose-horn cow'); wins the munch over lone 소."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "sloth"
+forms    = ["나무늘보"]
+cjk      = true
+ambiguous= false
+notes    = "나무늘보 = sloth ('tree slowpoke')."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "cheetah"
+forms    = ["치타"]
+cjk      = true
+ambiguous= false
+notes    = "치타 = cheetah."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["공룡"]
+cjk      = true
+ambiguous= false
+notes    = "공룡 = dinosaur."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "peacock"
+forms    = ["공작새"]
+cjk      = true
+ambiguous= false
+notes    = "공작새 = peacock ('gongjak bird' — the disambiguated compound). Bare 공작 SKIPPED: 工作 (operation/craftwork) and 公爵 (duke) own that spelling in running text."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "turkey"
+forms    = ["칠면조"]
+cjk      = true
+ambiguous= false
+notes    = "칠면조 = turkey ('seven-faced bird', the shared CJK etymology). No country collision in Korean (터키/튀르키예 is the republic)."
+
+[[entry]]
+class    = "animal"
+lang     = "ko"
+mode     = "forms"
+species  = "bird"
+forms    = ["아기새", "새"]
+cjk      = true
+ambiguous= false
+notes    = "아기새 = baby bird (childspeak). Lone 새 = bird AND 'new' — the opt-in is the guard; Korean has no clean multi-syllable generic bird word."
+
+# ---- hi: Hindi (Devanagari). Loads plain per the canine hi precedent: a
+# ---- spaced script that cannot appear mid-English-typing and cannot
+# ---- fold-collide with ASCII. Romanized forms deliberately absent — the
+# ---- profanity-class romanization precedent covers words people genuinely
+# ---- type in Latin script, and Hindi speakers reach for the English animal
+# ---- word in that situation. बिल्ली (cat) and कुत्ता (dog) live in their
+# ---- own classes. ----
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "elephant"
+forms    = ["हाथी"]
+cjk      = false
+ambiguous= false
+notes    = "हाथी = elephant."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "lion"
+forms    = ["शेर"]
+cjk      = false
+ambiguous= false
+notes    = "शेर = lion (colloquially also 'tiger', and a name element — the lion head is the right default for the bravery metaphor)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "tiger"
+forms    = ["बाघ"]
+cjk      = false
+ambiguous= false
+notes    = "बाघ = tiger."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "monkey"
+forms    = ["बंदर", "बन्दर"]
+cjk      = false
+ambiguous= false
+notes    = "बंदर/बन्दर = monkey (anusvara and conjunct spellings both typed)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "horse"
+forms    = ["घोड़ा", "घोड़े"]
+cjk      = false
+ambiguous= false
+notes    = "घोड़ा = horse, घोड़े = horses/oblique."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "cow"
+forms    = ["गाय"]
+cjk      = false
+ambiguous= false
+notes    = "गाय = cow."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["खरगोश"]
+cjk      = false
+ambiguous= false
+notes    = "खरगोश = rabbit."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "bird"
+forms    = ["चिड़िया", "पक्षी"]
+cjk      = false
+ambiguous= false
+notes    = "चिड़िया (colloquial) and पक्षी (formal) = bird."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "bear"
+forms    = ["भालू"]
+cjk      = false
+ambiguous= false
+notes    = "भालू = bear."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "deer"
+forms    = ["हिरण", "हिरन"]
+cjk      = false
+ambiguous= false
+notes    = "हिरण/हिरन = deer (both spellings typed)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "fish"
+forms    = ["मछली"]
+cjk      = false
+ambiguous= false
+notes    = "मछली = fish."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "snake"
+forms    = ["साँप", "सांप"]
+cjk      = false
+ambiguous= false
+notes    = "साँप/सांप = snake (candrabindu and anusvara spellings)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "chicken"
+forms    = ["मुर्गी", "मुर्गा"]
+cjk      = false
+ambiguous= false
+notes    = "मुर्गी = hen, मुर्गा = rooster."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "duck"
+forms    = ["बत्तख", "बतख"]
+cjk      = false
+ambiguous= false
+notes    = "बत्तख/बतख = duck."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "camel"
+forms    = ["ऊँट", "ऊंट"]
+cjk      = false
+ambiguous= false
+notes    = "ऊँट/ऊंट = camel."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "donkey"
+forms    = ["गधा", "गधे"]
+cjk      = false
+ambiguous= false
+notes    = "गधा = donkey (also 'fool' — the insult is the donkey metaphor, feature not bug)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "pig"
+forms    = ["सूअर"]
+cjk      = false
+ambiguous= false
+notes    = "सूअर = pig."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "sheep"
+forms    = ["भेड़"]
+cjk      = false
+ambiguous= false
+notes    = "भेड़ = sheep. Whole-word matching keeps it clear of भेड़िया below."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "goat"
+forms    = ["बकरी", "बकरा"]
+cjk      = false
+ambiguous= false
+notes    = "बकरी (f) / बकरा (m) = goat."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "mouse"
+forms    = ["चूहा", "चूहे"]
+cjk      = false
+ambiguous= false
+notes    = "चूहा = mouse/rat."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["गिलहरी"]
+cjk      = false
+ambiguous= false
+notes    = "गिलहरी = squirrel."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "fox"
+forms    = ["लोमड़ी"]
+cjk      = false
+ambiguous= false
+notes    = "लोमड़ी = fox."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "wolf"
+forms    = ["भेड़िया"]
+cjk      = false
+ambiguous= false
+notes    = "भेड़िया = wolf ('the sheep-ish one', etymologically — the wolf keeps its own head)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["मगरमच्छ"]
+cjk      = false
+ambiguous= false
+notes    = "मगरमच्छ = crocodile. Bare मगर SKIPPED — it is the everyday conjunction 'but' far more often than the mugger crocodile; a croc on every objection is noise, not whimsy."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "peacock"
+forms    = ["मोर"]
+cjk      = false
+ambiguous= false
+notes    = "मोर = peacock (the national bird gets its head)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "parrot"
+forms    = ["तोता"]
+cjk      = false
+ambiguous= false
+notes    = "तोता = parrot."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "owl"
+forms    = ["उल्लू"]
+cjk      = false
+ambiguous= false
+notes    = "उल्लू = owl; also THE 'fool' insult (उल्लू बनाना) — the insult is the owl metaphor, so the owl head is the joke landing correctly."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "frog"
+forms    = ["मेंढक"]
+cjk      = false
+ambiguous= false
+notes    = "मेंढक = frog."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "turtle"
+forms    = ["कछुआ"]
+cjk      = false
+ambiguous= false
+notes    = "कछुआ = turtle/tortoise."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["तितली"]
+cjk      = false
+ambiguous= false
+notes    = "तितली = butterfly."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "spider"
+forms    = ["मकड़ी"]
+cjk      = false
+ambiguous= false
+notes    = "मकड़ी = spider."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "bee"
+forms    = ["मधुमक्खी"]
+cjk      = false
+ambiguous= false
+notes    = "मधुमक्खी = honeybee."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "swan"
+forms    = ["हंस"]
+cjk      = false
+ambiguous= true
+notes    = "हंस = swan (classical hamsa), assigned the swan head — but bare हंस is ALSO the laugh stem in everyday compound verbs (हंस पड़ा, हंस दिया), an open-ended in-language collision. The kuma treatment: loads only for users who list hi."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["जिराफ़", "जिराफ"]
+cjk      = false
+ambiguous= false
+notes    = "जिराफ़/जिराफ = giraffe (loan, with and without nuqta)."
+
+[[entry]]
+class    = "animal"
+lang     = "hi"
+mode     = "forms"
+species  = "turkey"
+forms    = ["टर्की"]
+cjk      = false
+ambiguous= false
+notes    = "टर्की = turkey — bird and country, same as the English surface; same deliberate plain-load call as the en turkey entry."
+
+# ---- th: Thai (no-space script, cjk=true — the feline th precedent). Curated
+# ---- to the words with clean munch behavior; skips: ปู (crab — also
+# ---- grandfather/to pave), หมึก (octopus — also INK, of all things), นาก
+# ---- (otter — also common name). Dogs/cats live in their own classes. ----
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "elephant"
+forms    = ["ช้าง"]
+cjk      = true
+ambiguous= false
+notes    = "ช้าง = elephant (the national animal gets its head)."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "horse"
+forms    = ["ม้า"]
+cjk      = true
+ambiguous= false
+notes    = "ม้า = horse; ม้านั่ง (bench, lit. 'sitting horse') suppressed in exceptions.toml."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "bird"
+forms    = ["นก"]
+cjk      = true
+ambiguous= false
+notes    = "นก = bird. Longer roster compounds (นกฮูก owl, นกแก้ว parrot) win the munch and keep their own heads."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "owl"
+forms    = ["นกฮูก"]
+cjk      = true
+ambiguous= false
+notes    = "นกฮูก = owl ('hoot bird'); wins the munch over นก."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "parrot"
+forms    = ["นกแก้ว"]
+cjk      = true
+ambiguous= false
+notes    = "นกแก้ว = parrot ('glass bird'); wins the munch over นก."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "chicken"
+forms    = ["ไก่"]
+cjk      = true
+ambiguous= false
+notes    = "ไก่ = chicken. ไก่ย่าง (grilled chicken) drawing a chicken is, in fairness, chicken. ไก่งวง (turkey) wins the munch and keeps the turkey head."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "turkey"
+forms    = ["ไก่งวง"]
+cjk      = true
+ambiguous= false
+notes    = "ไก่งวง = turkey ('trunk chicken'); wins the munch over ไก่. No country collision (ตุรกี is the republic)."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "duck"
+forms    = ["เป็ด"]
+cjk      = true
+ambiguous= false
+notes    = "เป็ด = duck."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "fish"
+forms    = ["ปลา"]
+cjk      = true
+ambiguous= false
+notes    = "ปลา = fish; ปลาย ('end/tip') suppressed in exceptions.toml — one stub kills ปลายทาง/ปลายปี and friends. ปลาวาฬ (whale) and ปลาหมึก (squid/octopus) are listed on their own species and win the munch."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "whale"
+forms    = ["วาฬ", "ปลาวาฬ"]
+cjk      = true
+ambiguous= false
+notes    = "วาฬ/ปลาวาฬ = whale; the compound wins the munch so the fish head never steals it."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "octopus"
+forms    = ["ปลาหมึก"]
+cjk      = true
+ambiguous= false
+notes    = "ปลาหมึก = squid/octopus colloquially — assigned the octopus head. Bare หมึก SKIPPED: it also means INK, which a terminal is full of."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "snake"
+forms    = ["งู"]
+cjk      = true
+ambiguous= false
+notes    = "งู = snake (งูเห่า, the cobra, drawing a snake is right)."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "bear"
+forms    = ["หมี"]
+cjk      = true
+ambiguous= false
+notes    = "หมี = bear."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "monkey"
+forms    = ["ลิง"]
+cjk      = true
+ambiguous= false
+notes    = "ลิง = monkey; the loanword bombs ลิงก์/ลิงค์ ('link' — terminal bread-and-butter) are suppressed in exceptions.toml."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "turtle"
+forms    = ["เต่า"]
+cjk      = true
+ambiguous= false
+notes    = "เต่า = turtle."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["กระต่าย"]
+cjk      = true
+ambiguous= false
+notes    = "กระต่าย = rabbit."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "frog"
+forms    = ["กบ"]
+cjk      = true
+ambiguous= false
+notes    = "กบ = frog; กบฏ (rebellion) suppressed in exceptions.toml — one finite bomb."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "penguin"
+forms    = ["เพนกวิน"]
+cjk      = true
+ambiguous= false
+notes    = "เพนกวิน = penguin."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "butterfly"
+forms    = ["ผีเสื้อ"]
+cjk      = true
+ambiguous= false
+notes    = "ผีเสื้อ = butterfly ('shirt ghost'). The เสื้อ inside carries a tone mark เสือ (tiger) lacks — no collision."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "tiger"
+forms    = ["เสือ"]
+cjk      = true
+ambiguous= false
+notes    = "เสือ = tiger; distinct from เสื้อ (shirt) by the tone mark, and ผีเสื้อ (butterfly) never contains the bare-tiger spelling."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "lion"
+forms    = ["สิงโต"]
+cjk      = true
+ambiguous= false
+notes    = "สิงโต = lion."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["ยีราฟ"]
+cjk      = true
+ambiguous= false
+notes    = "ยีราฟ = giraffe."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "hippo"
+forms    = ["ฮิปโป"]
+cjk      = true
+ambiguous= false
+notes    = "ฮิปโป = hippo (the colloquial loan; ฮิปโปโปเตมัส munches down to it)."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["ไดโนเสาร์"]
+cjk      = true
+ambiguous= false
+notes    = "ไดโนเสาร์ = dinosaur."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "pig"
+forms    = ["หมู"]
+cjk      = true
+ambiguous= false
+notes    = "หมู = pig; also slang 'easy' — a pig on 'easy peasy' is accepted whimsy."
+
+[[entry]]
+class    = "animal"
+lang     = "th"
+mode     = "forms"
+species  = "cow"
+forms    = ["วัว"]
+cjk      = true
+ambiguous= false
+notes    = "วัว = cow."
+
+# ---- vi: Vietnamese (Latin, spaced). fold.rs strips the Latin-1/Extended-A
+# ---- accents (ó/ù/è → o/u/e) but KEEPS Latin Extended Additional (ấ/ị/ộ/ự
+# ---- survive), so only some surfaces land on bare ASCII — each entry's note
+# ---- says which. ambiguous=true like the en group: these load for users who
+# ---- list vi. Skipped as unsalvageable after folding: khỉ (monkey → 'khi',
+# ---- the vi word for 'when'), cáo (fox → 'cao', 'tall'), hổ/cọp (tiger →
+# ---- 'ho'/'cop'), gà (chicken → 'ga', 'station'), cá (fish → 'ca'), chim
+# ---- (bird — the anatomy slang), and all multiword forms (con voi, sư tử,
+# ---- cá sấu — spaced surfaces never match; the canine vi entry's documented
+# ---- limitation). ----
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "elephant"
+forms    = ["voi"]
+cjk      = false
+ambiguous= true
+notes    = "voi = elephant (folds clean; 'con voi' would never match — multiword)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "bear"
+forms    = ["gấu"]
+cjk      = false
+ambiguous= true
+notes    = "gấu = bear (ấ is Latin Extended Additional, which fold.rs keeps — no ASCII fold); also the internet slang for boyfriend/girlfriend — a bear head on your significant other is the correct energy."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "duck"
+forms    = ["vịt"]
+cjk      = false
+ambiguous= true
+notes    = "vịt = duck (ị survives the fold — no ASCII collision)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "turtle"
+forms    = ["rùa"]
+cjk      = false
+ambiguous= true
+notes    = "rùa = turtle (folds to 'rua'; also 'slow as a turtle' — the metaphor is the turtle)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "mouse"
+forms    = ["chuột"]
+cjk      = false
+ambiguous= true
+notes    = "chuột = mouse — the animal AND the pointing device, same deliberate call as the en entry (ộ survives the fold)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["thỏ"]
+cjk      = false
+ambiguous= true
+notes    = "thỏ = rabbit (ỏ survives the fold; the vi gate is for the class's caret-deferral law, not a fold collision)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "pig"
+forms    = ["heo"]
+cjk      = false
+ambiguous= true
+notes    = "heo = pig (southern; lợn folds to 'lon', a vulgar near-miss — skipped)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "cow"
+forms    = ["bò"]
+cjk      = false
+ambiguous= true
+notes    = "bò = cow (folds to 'bo'; also the verb 'to crawl' — accepted for opted-in users, the same in-language whimsy as en bear/seal)."
+
+[[entry]]
+class    = "animal"
+lang     = "vi"
+mode     = "forms"
+species  = "horse"
+forms    = ["ngựa"]
+cjk      = false
+ambiguous= true
+notes    = "ngựa = horse (ự survives the fold)."
+
+# ---- id: Indonesian (Latin, spaced). ambiguous=true like the en group: these
+# ---- load for users who list id (several are ordinary English-adjacent
+# ---- folds, and a few are in-language double entendres the opt-in makes
+# ---- consensual). Skipped: babi (pig — profanity-adjacent slur usage, the
+# ---- anjing lesson), paus (whale — also 'pope'), and every hyphenated
+# ---- reduplication (kupu-kupu, laba-laba, lumba-lumba, ubur-ubur,
+# ---- kura-kura, berang-berang — hyphens never tokenize as one word). ----
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "elephant"
+forms    = ["gajah"]
+cjk      = false
+ambiguous= true
+notes    = "gajah = elephant."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "tiger"
+forms    = ["harimau"]
+cjk      = false
+ambiguous= true
+notes    = "harimau = tiger."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "lion"
+forms    = ["singa"]
+cjk      = false
+ambiguous= true
+notes    = "singa = lion (yes, as in Singapura)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "monkey"
+forms    = ["monyet"]
+cjk      = false
+ambiguous= true
+notes    = "monyet = monkey (also an exclamation — a monkey head on it is the joke landing)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "horse"
+forms    = ["kuda"]
+cjk      = false
+ambiguous= true
+notes    = "kuda = horse."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "cow"
+forms    = ["sapi"]
+cjk      = false
+ambiguous= true
+notes    = "sapi = cow."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "goat"
+forms    = ["kambing"]
+cjk      = false
+ambiguous= true
+notes    = "kambing = goat (kambing hitam, the scapegoat, gets a goat — correct)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "sheep"
+forms    = ["domba"]
+cjk      = false
+ambiguous= true
+notes    = "domba = sheep."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "rabbit"
+forms    = ["kelinci"]
+cjk      = false
+ambiguous= true
+notes    = "kelinci = rabbit."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "mouse"
+forms    = ["tikus"]
+cjk      = false
+ambiguous= true
+notes    = "tikus = mouse/rat (also 'corrupt official' in headlines — accepted)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "bird"
+forms    = ["burung"]
+cjk      = false
+ambiguous= true
+notes    = "burung = bird — THE generic bird word; also the well-known anatomical euphemism, which the id opt-in makes a consensual joke (the class's cute-over-precision judgment, applied with consent)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "chicken"
+forms    = ["ayam"]
+cjk      = false
+ambiguous= true
+notes    = "ayam = chicken (the slang senses exist; the chicken head is the neutral read and the opt-in is consent)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "duck"
+forms    = ["bebek"]
+cjk      = false
+ambiguous= true
+notes    = "bebek = duck."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "goose"
+forms    = ["angsa"]
+cjk      = false
+ambiguous= true
+notes    = "angsa = goose/swan — assigned the goose head (angsa putih leans swan, but the bare word is the barnyard bird)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "fish"
+forms    = ["ikan"]
+cjk      = false
+ambiguous= true
+notes    = "ikan = fish."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "snake"
+forms    = ["ular"]
+cjk      = false
+ambiguous= true
+notes    = "ular = snake."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "crocodile"
+forms    = ["buaya"]
+cjk      = false
+ambiguous= true
+notes    = "buaya = crocodile; buaya darat ('land crocodile', the womanizer) drawing a croc is the idiom's own joke."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "turtle"
+forms    = ["penyu"]
+cjk      = false
+ambiguous= true
+notes    = "penyu = sea turtle (kura-kura is hyphenated and can never match — documented reduplication limitation)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "frog"
+forms    = ["katak", "kodok"]
+cjk      = false
+ambiguous= true
+notes    = "katak/kodok = frog (both registers typed)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "bee"
+forms    = ["lebah"]
+cjk      = false
+ambiguous= true
+notes    = "lebah = bee."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "bear"
+forms    = ["beruang"]
+cjk      = false
+ambiguous= true
+notes    = "beruang = bear — and famously parses as ber-uang, 'moneyed'. A bear head on the wealthy is Indonesia's own kuma joke; loads with the id opt-in."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "giraffe"
+forms    = ["jerapah"]
+cjk      = false
+ambiguous= true
+notes    = "jerapah = giraffe."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "camel"
+forms    = ["unta"]
+cjk      = false
+ambiguous= true
+notes    = "unta = camel."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "donkey"
+forms    = ["keledai"]
+cjk      = false
+ambiguous= true
+notes    = "keledai = donkey."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "wolf"
+forms    = ["serigala"]
+cjk      = false
+ambiguous= true
+notes    = "serigala = wolf."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "fox"
+forms    = ["rubah"]
+cjk      = false
+ambiguous= true
+notes    = "rubah = fox; NB also the informal spelling of ubah 'to change' in 'merubah' — whole-word 'rubah' alone is overwhelmingly the fox for opted-in users."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "deer"
+forms    = ["rusa"]
+cjk      = false
+ambiguous= true
+notes    = "rusa = deer (also an English dictionary word for the same deer — the id gate keeps it scoped anyway)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "rhino"
+forms    = ["badak"]
+cjk      = false
+ambiguous= true
+notes    = "badak = rhino (berkulit badak, 'rhino-skinned' = thick-skinned — the head is the idiom)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "peacock"
+forms    = ["merak"]
+cjk      = false
+ambiguous= true
+notes    = "merak = peacock."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "turkey"
+forms    = ["kalkun"]
+cjk      = false
+ambiguous= true
+notes    = "kalkun = turkey (from Dutch kalkoen; no country collision — Turki is the republic)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "crab"
+forms    = ["kepiting"]
+cjk      = false
+ambiguous= true
+notes    = "kepiting = crab."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "octopus"
+forms    = ["gurita"]
+cjk      = false
+ambiguous= true
+notes    = "gurita = octopus."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "snail"
+forms    = ["siput"]
+cjk      = false
+ambiguous= true
+notes    = "siput = snail."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "bat"
+forms    = ["kelelawar"]
+cjk      = false
+ambiguous= true
+notes    = "kelelawar = bat."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "squirrel"
+forms    = ["tupai"]
+cjk      = false
+ambiguous= true
+notes    = "tupai = squirrel."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "hedgehog"
+forms    = ["landak"]
+cjk      = false
+ambiguous= true
+notes    = "landak = porcupine, and colloquially the hedgehog too (landak susu) — the hedgehog head is the closest roster read; documented loose mapping."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "shark"
+forms    = ["hiu"]
+cjk      = false
+ambiguous= true
+notes    = "hiu = shark."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "lizard"
+forms    = ["cicak", "cecak"]
+cjk      = false
+ambiguous= true
+notes    = "cicak/cecak = house gecko — the lizard head's gecko alias already covers this in en; same species here."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "ladybug"
+forms    = ["kepik"]
+cjk      = false
+ambiguous= true
+notes    = "kepik = ladybug."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "dinosaur"
+forms    = ["dinosaurus"]
+cjk      = false
+ambiguous= true
+notes    = "dinosaurus = dinosaur (the id spelling; bare 'dino' already rides the en entry)."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "sloth"
+forms    = ["kungkang"]
+cjk      = false
+ambiguous= true
+notes    = "kungkang = sloth."
+
+[[entry]]
+class    = "animal"
+lang     = "id"
+mode     = "forms"
+species  = "cheetah"
+forms    = ["citah"]
+cjk      = false
+ambiguous= true
+notes    = "citah = cheetah."

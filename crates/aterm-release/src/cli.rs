@@ -5,7 +5,8 @@
 //! third-party arg crate — same rule as `aterm-ctl`) for the whole command
 //! surface: `cut [--dry-run] [--resume] [--abandon vX.Y.Z]
 //! [--set-version X.Y.Z]
-//! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]`,
+//! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
+//! [--strand-pre-roster-clients]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
 //! `verify [vX.Y.Z]`, `yank <build>`.
 
@@ -19,7 +20,7 @@ pub const USAGE: &str = "aterm-release — the `cargo ship` release cutter
 USAGE
   cargo ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
-                 [--arm64-only]
+                 [--arm64-only] [--strand-pre-roster-clients]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
@@ -36,6 +37,27 @@ USAGE
         --rehearse O/R     full real cut published to the scratch repo O/R
                            (provisional number, no ledger push, no tag)
         --arm64-only       ship a single-arch build (explicit opt-out)
+        --strand-pre-roster-clients
+                           OPERATOR ASSERTION, only meaningful once the paper
+                           master is armed: no client running a build older than
+                           the machine roster is left in the field, so this cut
+                           may be signed by a rostered key that is in no shipped
+                           UPDATE_CHANNEL_PUBKEYS. Such clients verify under
+                           their own compiled-in keyset and have no fallback to
+                           an older release: they do not miss this update, they
+                           never update again.
+
+  cargo ship provision --id <machine-id>
+                           make THIS machine a publisher in one command: seed
+                           the newest master-signed roster pair from the channel
+                           release into dist/, run the join ceremony in-process
+                           (the paper phrase, typed once on the terminal, is the
+                           only input), then audit the rest of the publishing
+                           stack — Apple identity, notary credential, gh auth,
+                           channel token — naming the exact remedy for anything
+                           missing. Idempotent: on a provisioned machine it
+                           audits instead of minting. Ends in a READY TO CUT
+                           verdict.
 
   cargo ship status        version · ledger tail · dangling claims · newest
                            published build
@@ -59,6 +81,9 @@ pub enum Cmd {
     Cut {
         opts: publish::CutOptions,
         abandon: Option<String>,
+    },
+    Provision {
+        id: String,
     },
     Status,
     Recover {
@@ -105,6 +130,29 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
     match cmd {
         "help" | "--help" | "-h" => Ok(Cmd::Help),
         "cut" => parse_cut(&mut it),
+        "provision" => {
+            let mut id: Option<String> = None;
+            while let Some(flag) = it.next() {
+                match flag {
+                    "--id" => {
+                        if id.is_some() {
+                            return Err("--id given twice".to_string());
+                        }
+                        id = Some(
+                            it.next()
+                                .ok_or("--id needs a machine id (e.g. m2)")?
+                                .to_string(),
+                        );
+                    }
+                    other => return Err(format!("unknown provision flag {other:?}")),
+                }
+            }
+            let id = id.ok_or(
+                "provision needs --id <machine-id> — the roster name this machine signs \
+                 under (e.g. cargo ship provision --id m2)",
+            )?;
+            Ok(Cmd::Provision { id })
+        }
         "status" => {
             if let Some(extra) = it.next() {
                 return Err(format!("status takes no arguments (got {extra:?})"));
@@ -187,6 +235,9 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
+            // An ACKNOWLEDGEMENT, not a parameter — see publish::PreRosterClients
+            // for why it is on the command line and not in the credentials profile.
+            publish::PRE_ROSTER_STRANDING_FLAG => opts.strand_pre_roster_clients = true,
             // The ONE signing input. A path in the command, never an ambient file:
             // "what signed this?" is answered by reading the command that ran.
             "--release-credentials" => {
@@ -232,16 +283,23 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.resume
             || opts.gate
             || opts.arm64_only
+            || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
     {
         return Err("--abandon combines with no other cut flag".to_string());
     }
+    // `--strand-pre-roster-clients` is in this list for a reason worth stating: a
+    // resume does not re-ask the question. It continues a cut that answered it at
+    // pre-claim, under a key `revalidate_ctx_signature_policy` refuses to let change,
+    // so the flag would be silently ignored here — and silently ignoring an
+    // acknowledgement is the one thing an acknowledgement may never do.
     if opts.resume
         && (opts.dry_run
             || opts.gate
             || opts.arm64_only
+            || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
             || opts.min_build.is_some()
             || opts.rehearse.is_some())
@@ -276,20 +334,21 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
+        Cmd::Provision { id } => crate::provision::run_provision(&repo_root()?, &id),
         Cmd::Status => verify::run_status(&repo_root()?),
         Cmd::Recover {
             version,
             owner,
             release_credentials,
         } => {
-            // Recovery signs too, so it needs the SAME explicit credentials as a
-            // fresh cut. The old code could recover only because the material was
-            // ambient; with one flag, every signing entry point must name it.
-            let creds = release_credentials
-                .as_deref()
-                .map(crate::sign::ReleaseCredentials::load)
-                .transpose()
-                .map_err(|e| e.to_string())?;
+            // Recovery signs too, so it resolves credentials the SAME one-path way
+            // as a fresh cut: the flag when given, else this machine's provisioned
+            // identity. Different resolution here would mean a cut and its recovery
+            // could sign as different machines.
+            let creds = crate::sign::ReleaseCredentials::resolve(
+                release_credentials.as_deref(),
+                &repo_root()?,
+            )?;
             publish::run_recover_lost(&repo_root()?, &version, &owner, true, creds.as_ref())
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),

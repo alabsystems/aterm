@@ -110,9 +110,9 @@ pub(crate) use macos::native_strip_container;
 #[cfg(target_os = "macos")]
 pub use macos::{
     ToolbarHandle, begin_tab_rename, can_present_tab_rename, end_tab_rename,
-    install_window_toolbar, read_tab_chrome,
-    read_tab_menus, rename_editor_edit, rename_editor_text, set_active_tab_color, set_strip_dark,
-    set_update_available, set_window_tabs,
+    install_window_toolbar, read_tab_chrome, read_tab_menus, rename_editor_edit,
+    rename_editor_text, set_active_tab_color, set_strip_dark, set_update_available,
+    set_window_tabs,
 };
 
 #[cfg(not(target_os = "macos"))]

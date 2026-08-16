@@ -128,11 +128,28 @@ SETTLED = [
 ]
 
 # ── sleep: a curled loaf that breathes ────────────────────────────────────
+#
+# The face is `happy` + `none`, NOT `closed` + `flat` (owner, from a ship-size
+# screenshot: "the eyes still look open"). `closed` draws `_lid()`, which is
+# fat by contract — a thin lid rasterizes to nothing at 1x — and a fat
+# DOWNWARD arc at 24-36 px collapses into a solid dark bar tilted at the outer
+# corner, i.e. exactly the silhouette of a narrowed, scowling OPEN eye. The
+# `flat` mouth put a second dark bar under it and finished the glare.
+# `_arc_eye()`'s upward ^ carries the same ink (so it survives the same
+# rasteriser — purr and groom already prove it at 1x) in a shape no open eye
+# has, and dropping the mouth lets the ^ ^ pair and the z's carry the read.
 SLEEP_BASE = dict(
     curl=True, hide_legs=True, show_far_legs=False,
     bx=104.0, by=88.0, brx=46.0, bry=26.0,
     hx=150.0, hy=76.0, hr=27.0, hrot=20.0,
-    eyes="closed", mouth="flat", ear_flat=0.30,
+    eyes="happy", mouth="none", ear_flat=0.30,
+    # Both whisker fans are spent here, and for the two reasons the rig
+    # already names. The FAR fan lands entirely on the curled torso's dome —
+    # the loaf case `whisker_far` was written for, strokes on coat reading as
+    # scratches. The NEAR fan roots under an eye this pose has tipped down
+    # toward them, and clotted eye + fan + outline into the black smear that
+    # survived even after the lids became arcs.
+    whisker_far=False, whisker_near=False,
     tail_root=(62.0, 76.0),
     tail=(150.0, 115.0, 95.0, 78.0), tail_len=13.0, tail_thick=8.5,
 )
@@ -163,7 +180,10 @@ REACTIVE = [
     D("pet_land", "Pounce, landing: braced forelegs, the whole cat compressed.",
       yaw=1.0,
       by=72.0, brx=44.0, bry=20.0, brot=-6.0, hy=50.0, hx=156.0,
-      eyes="squint", mouth="open", ear_flat=0.5,
+      # The "oof" mouth (pet/update session's F6 brief, folded into the
+      # roll-cycle regen): the full open blob smeared the muzzle black at
+      # ship size.
+      eyes="squint", mouth="oof", ear_flat=0.5,
       fl_near=leg(22.0, 6.0, 17.0, 13.0), fl_far=leg(14.0, -2.0, 17.0, 13.0),
       hl_near=leg(-32.0, 10.0, 17.0, 13.0), hl_far=leg(-24.0, 4.0, 17.0, 13.0),
       tail=(-96.0, -114.0, -134.0, -152.0), tail_len=14.5),
@@ -186,7 +206,10 @@ REACTIVE = [
          "brot": -20.0, "hx": 142.0, "hy": 39.0,
          "fl_near": leg(112.0, 116.0, 22.0, 18.0),
          "fl_far": leg(46.0, 26.0, 21.0, 17.0),
-         "tail": (92.0, 108.0, 142.0, 184.0)}),
+         "tail": (92.0, 108.0, 142.0, 184.0),
+         # fills the counter the reared hind leg's loop encloses — see
+         # `Pose.belly`. Pre-registration coords.
+         "belly": (139.0, 108.6, 11.5, 13.5)}),
     D("pet_stretch", "Stretch: the long wake-up, forelegs out, back scooped, yawning.",
       yaw=0.6,
       by=72.0, brx=48.0, bry=19.0, brot=-16.0, hy=76.0, hx=162.0, hrot=16.0,
@@ -287,6 +310,9 @@ FLIGHT = [
       ear_flat=0.35, eyes="wide", mouth="smile", gaze=(1.5, 2.0),
       fl_near=leg(28.0, 8.0, 20.0, 16.0), fl_far=leg(20.0, 2.0, 20.0, 16.0),
       hl_near=leg(-62.0, -80.0, 16.0, 12.0), hl_far=leg(-52.0, -70.0, 16.0, 12.0),
+      # the far eye grown clear of the muzzle boundary so the descent stops
+      # reading one-eyed at ship size — see `Pose.far_eye`
+      far_eye=(-1.1, -2.4, 1.238, 1.143),
       tail=(-125.0, -140.0, -155.0, -170.0), tail_len=14.5),
 ]
 
@@ -345,7 +371,64 @@ LOW = [
       tail=(-62.0, -82.0, -100.0, -114.0), tail_len=8.5, tail_thick=7.5),
 ]
 
-POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW
+# ── the roll: belly-up wriggling, the bored cat's third act ────────────────
+# The whole trick is `brot` near 180: the torso blob's chest-arch rotates to
+# the floor and the tucked belly line faces the sky, the hip/shoulder roots
+# ride to the TOP of the mass (rot_about), and the tabby bars land on the
+# grounded back — all for free from the rig's own math. Loose folded legs
+# paw at the air; the head lies on the floor beside the body, cheek down.
+# The brain cycles 0 → 1 → 2 → 1 at wiggle rate, flip_x giving the
+# left-right of the squirm.
+ROLL = [
+    D("pet_roll_0", "Roll, flop: hip over, shoulders following, paws folding skyward.",
+      by=84.0, bx=96.0, brx=40.0, bry=24.0, brot=150.0,
+      hx=150.0, hy=76.0, hr=27.0, hrot=-18.0,
+      eyes="happy", mouth="smile", ear_flat=0.30, whisker_far=False,
+      fl_near=leg(150.0, -175.0, 15.0, 11.0), fl_far=leg(162.0, -160.0, 13.0, 10.0),
+      hl_near=leg(-160.0, 172.0, 16.0, 12.0), hl_far=leg(-172.0, 158.0, 14.0, 11.0),
+      tail_root=(58.0, 96.0),
+      tail=(-95.0, -82.0, -70.0, -58.0), tail_len=12.0, tail_thick=8.0),
+    D("pet_roll_1", "Roll, belly-up: flat on the back, paws loose in the air, bliss.",
+      by=86.0, bx=96.0, brx=41.0, bry=25.0, brot=180.0,
+      hx=152.0, hy=84.0, hr=27.0, hrot=-30.0,
+      eyes="happy", mouth="open", ear_flat=0.40, whisker_far=False,
+      fl_near=leg(174.0, -150.0, 16.0, 12.0), fl_far=leg(-172.0, 146.0, 14.0, 10.0),
+      hl_near=leg(-178.0, 154.0, 17.0, 12.0), hl_far=leg(170.0, -148.0, 15.0, 11.0),
+      tail_root=(56.0, 100.0),
+      tail=(-88.0, -98.0, -108.0, -96.0), tail_len=12.5, tail_thick=8.0),
+    D("pet_roll_2", "Roll, over-twist: hips past vertical, the squirm's far side.",
+      by=84.0, bx=96.0, brx=40.0, bry=24.0, brot=210.0,
+      hx=150.0, hy=80.0, hr=27.0, hrot=-40.0,
+      eyes="happy", mouth="smile", ear_flat=0.35, whisker_far=False,
+      fl_near=leg(-166.0, 168.0, 15.0, 11.0), fl_far=leg(-152.0, 178.0, 13.0, 10.0),
+      hl_near=leg(168.0, -158.0, 16.0, 12.0), hl_far=leg(155.0, -170.0, 14.0, 11.0),
+      tail_root=(58.0, 96.0),
+      tail=(-100.0, -112.0, -122.0, -110.0), tail_len=12.0, tail_thick=8.0),
+]
+
+CAT_POSES = [STAND] + WALK + RUN + SETTLED + SLEEP + REACTIVE + ADDRESS + FLIGHT + LOW + ROLL
+
+# THE DOG IS THE SAME POSE SHEET, RE-SKINNED. Owner, 2026-08-11: "make a dog
+# like the walking cat … you can use the same code." Taking that literally is
+# also the right engineering: a dog roster authored independently would drift
+# out of gait sync with the cat's, and every behaviour in `kitty_pet` — the
+# walk cycle's four beats, the settle ladder, the leap's three frames — is
+# written against THESE pose idents. Deriving the dog by `replace` guarantees
+# the two rosters stay frame-for-frame parallel forever, so the brain can pick
+# a cat pose and the species swaps the sprite underneath it.
+#
+# The ident prefix is `pet_dog_` so the shared codegen (`gen_pet_glyphs` reads
+# every TOML in this directory) mints `PetGlyphId::PetDogWalk0` beside
+# `PetWalk0` — one roster, one baker, one drift test.
+DOG_POSES = [
+    replace(p,
+            ident=p.ident.replace("pet_", "pet_dog_", 1),
+            species="dog",
+            note=p.note + " (dog)")
+    for p in CAT_POSES
+]
+
+POSES = CAT_POSES + DOG_POSES
 
 
 if __name__ == "__main__":
@@ -361,9 +444,12 @@ if __name__ == "__main__":
         ok = x0 >= 0 and y0 >= 0 and x1 <= VB_W and y1 <= VB_H
         bad += 0 if ok else 1
         cmds = sum(text.count(c) for c in ("M ", "L ", "C ", " Z"))
-        print(f"{'ok ' if ok else 'OOB'} {p.ident:16s} "
+        print(f"{'ok ' if ok else 'OOB'} {p.ident:20s} "
               f"({x0:6.1f},{y0:6.1f})-({x1:6.1f},{y1:6.1f}) "
               f"layers={text.count('[[layer]]'):2d} cmds={cmds:3d}")
     with open(os.path.join(out, "sheet.toml"), "w") as fh:
-        fh.write(sheet(POSES, cols=5))
-    print(f"{len(POSES)} poses, {bad} out of box; sheet.toml written")
+        fh.write(sheet(CAT_POSES, cols=5))
+    with open(os.path.join(out, "dog_sheet.toml"), "w") as fh:
+        fh.write(sheet(DOG_POSES, cols=5, ident="pet_dog_sheet"))
+    print(f"{len(POSES)} poses ({len(CAT_POSES)} cat + {len(DOG_POSES)} dog), "
+          f"{bad} out of box; sheets written")

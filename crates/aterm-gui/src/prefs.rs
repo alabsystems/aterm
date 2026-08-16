@@ -37,10 +37,18 @@ use crate::app_config::{
 /// followed by a reload round-trips through serde (see [`crate::app_config::Config`]).
 pub(crate) const EDIT_FONT_PX: &str = "font_px";
 pub(crate) const EDIT_FONT_FAMILY: &str = "font_family";
-/// The bundled game-title face selector (`game_font`) — one of
-/// [`GAME_FONT_OPTIONS`], cleared = the normal font selection. Driven by the
-/// Settings "Game Fonts" page's mutually-exclusive toggles.
-pub(crate) const EDIT_GAME_FONT: &str = "game_font";
+/// The bundled display-face selector (`display_font`) — one of
+/// [`DISPLAY_FONT_OPTIONS`], cleared = the normal font selection. Driven by the
+/// Settings "Display Faces" page's mutually-exclusive toggles.
+pub(crate) const EDIT_DISPLAY_FONT: &str = "display_font";
+
+/// The DEPRECATED spelling of [`EDIT_DISPLAY_FONT`]. It is still parsed (a
+/// `#[serde(alias)]` on `Config::display_font`), still accepted by the config
+/// language, and still writable by hand — a key that shipped cannot be deleted
+/// without turning correct old configs into complaints. Settings writes the
+/// current spelling; this constant exists so every surface that has to
+/// RECOGNIZE the old one names it from one place.
+pub(crate) const LEGACY_EDIT_DISPLAY_FONT: &str = "game_font";
 // W6 per-style fonts + TOML fallback chain.
 pub(crate) const EDIT_FONT_FAMILY_BOLD: &str = "font_family_bold";
 pub(crate) const EDIT_FONT_FAMILY_ITALIC: &str = "font_family_italic";
@@ -61,6 +69,9 @@ pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
 /// `aterm_effects::tone` classifier); OFF pins today's neutral melody and
 /// stops the classifier entirely.
 pub(crate) const EDIT_TONE_MELODY: &str = "tone_melody";
+/// Robi the helper robot (`Config::robi`, default ON): the chrome-walking
+/// tip-sharing robot show (see `app_config`'s field doc).
+pub(crate) const EDIT_ROBI: &str = "robi";
 /// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF — the owner
 /// dislikes the drone): ON re-enables the continuous per-style background
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
@@ -233,21 +244,47 @@ pub(crate) const EDIT_TAB_STRIP_ROWS: &str = "tab_strip_rows";
 /// today's translucent system pill ("Transparent white" on the Tab Color page).
 pub(crate) const EDIT_ACTIVE_TAB_COLOR: &str = "active_tab_color";
 
-/// The `game_font` Enum options: `"off"` (the default font — what clearing the
-/// key also means) followed by the bundled ids in the toggles' display order.
-/// The id tail is pinned against [`aterm_render::GAME_FONTS`] by test so the
-/// registry, the resolver, and the toggles can never disagree about the set;
-/// `"off"` exists so the plain popup control (Compact / search results) can
-/// turn the game font off without a separate reset affordance —
+/// The `display_font` Enum options: `"off"` (the default font — what clearing
+/// the key also means) followed by the bundled ids in the toggles' display
+/// order. The id tail is pinned against [`aterm_render::DISPLAY_FACES`] by test
+/// so the registry, the resolver, and the toggles can never disagree about the
+/// set; `"off"` exists so the plain popup control (Compact / search results) can
+/// turn the display face off without a separate reset affordance —
 /// `font_family_request` treats it exactly like an unset key.
-pub(crate) const GAME_FONT_OPTIONS: &[&str] = &[
-    "off",
+///
+/// The retired game ids are deliberately NOT here: this list is what Settings
+/// OFFERS, and offering `minecraft` again would re-create the name the rename
+/// removed. They remain ACCEPTED — see
+/// [`aterm_render::DISPLAY_FACE_LEGACY_IDS`] and the config language's
+/// deprecation diagnostic — so a hand-written config keeps loading.
+pub(crate) const DISPLAY_FONT_OPTIONS: &[&str] = &["off", "chunky", "pixel", "engraved", "bubble"];
+
+/// The pre-rename `display_font` ids, in registry order. ACCEPTED everywhere a
+/// value is validated (the config language, the TOML writer) and OFFERED
+/// nowhere, so a hand-written config keeps loading without Settings ever
+/// re-suggesting a game's name. Pinned against
+/// [`aterm_render::DISPLAY_FACE_LEGACY_IDS`] by test.
+///
+/// Includes `mariokart`, whose face was deleted outright: a value that was
+/// valid yesterday must not become a config-language complaint today. It
+/// resolves to nothing, so the primary font is used — see
+/// `Config::font_family_request`.
+pub(crate) const LEGACY_DISPLAY_FONT_IDS: &[&str] = &[
     "roblox",
     "minecraft",
     "zelda",
     "mariokart",
     "animal-crossing",
 ];
+
+/// Whether one `display_font` id is accepted: a current registry id, or one of
+/// the [`LEGACY_DISPLAY_FONT_IDS`]. `"off"` is deliberately NOT accepted here —
+/// this answers "does this name a face", and an off-mix is just a cleared key.
+#[must_use]
+pub(crate) fn display_font_id_is_accepted(id: &str) -> bool {
+    let id = id.trim();
+    aterm_render::display_face_canonical_id(id).is_some() || LEGACY_DISPLAY_FONT_IDS.contains(&id)
+}
 /// Smart-title controls. These names deliberately match the public `aterm.toml`
 /// schema exactly; in particular, credentials are represented only by a FILE PATH.
 /// The Settings surface deliberately defines no separate raw-token value.
@@ -891,20 +928,22 @@ pub(crate) const VISUAL_PREVIEW_KEYS: &[&str] = &[
     EDIT_STEM_GAMMA,
     EDIT_FONT_WEIGHT,
     EDIT_FONT_VARIATION,
-    // Cursor & Motion (20)
+    // Cursor Kitty (3) — the cat's own page; every one previews through the
+    // SAME cursor scene as the Cursor & Motion block below it.
+    EDIT_CURSOR_TRAIL_STYLE,
+    EDIT_CURSOR_TRAIL_WAKE_MS,
+    EDIT_CURSOR_NYAN_SPRITE,
+    // Cursor & Motion (17)
     EDIT_CURSOR_STYLE,
     EDIT_CURSOR_BLINK,
     EDIT_CURSOR_TRAIL,
-    EDIT_CURSOR_TRAIL_STYLE,
     EDIT_CURSOR_TRAIL_MS,
     EDIT_CURSOR_TRAIL_LENGTH,
-    EDIT_CURSOR_TRAIL_WAKE_MS,
     EDIT_CURSOR_TRAIL_INTENSITY,
     EDIT_CURSOR_TRAIL_RADIUS,
     EDIT_CURSOR_TRAIL_RING,
     EDIT_CURSOR_TRAIL_COLOR,
     EDIT_CURSOR_TRAIL_ACCENT,
-    EDIT_CURSOR_NYAN_SPRITE,
     EDIT_CURSOR_TRAIL_BLOOM,
     EDIT_CURSOR_TRAIL_BLOOM_STRENGTH,
     EDIT_CURSOR_TRAIL_BLOOM_RADIUS,
@@ -948,11 +987,11 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // A process-wide suppression policy, not a single preview-scene property.
     // Its shipping gates are exercised by the app/render conformance tests.
     EDIT_SERIOUS_MODE,
-    // The game-font toggle re-renders the WHOLE terminal in the chosen face on
+    // The display-face toggle re-renders the WHOLE terminal in the chosen face on
     // save (hot-reload) — the grid itself is the truthful preview; a workbench
     // specimen projection joins the preview-matrix campaign with the other
     // font-identity rows.
-    EDIT_GAME_FONT,
+    EDIT_DISPLAY_FONT,
     // A native-toolbar-pill (window chrome) fact like the deferred chrome knobs:
     // the strip the user is looking at recolors on save; the workbench scene
     // draws no native toolbar to project it into.
@@ -962,6 +1001,10 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_TONE_MELODY,
     EDIT_TRAIL_SOUND_BED,
     EDIT_TRAIL_SOUND_STYLE,
+    // A live full-screen show (walk-in, ladder, monkey bars) previewed by the
+    // effect itself, not the Settings workbench scene — the decorative-table
+    // rationale (`sparkle_words.*`) for a single top-level key.
+    EDIT_ROBI,
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
@@ -973,7 +1016,7 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_BACKGROUND_OPACITY,
     EDIT_BACKGROUND_MATERIAL,
     // The wallpaper recolors the LIVE grid on save (the same truthful-preview
-    // rationale as the game fonts); the dim and glyph tint ride the same
+    // rationale as the display faces); the dim and glyph tint ride the same
     // repaint. A workbench backdrop projection joins the preview-matrix
     // campaign.
     EDIT_WALLPAPER,
@@ -1017,22 +1060,26 @@ const DEFAULT_SCROLLBACK_LINES: usize = 100_000;
 /// cursor). The placeholder hint for the cursor-style row.
 const DEFAULT_CURSOR_STYLE: &str = "block";
 
-/// The default `cursor_trail_style` when unset — the RAINBOW KITTY ribbon (the banded
-/// rainbow whose blinking block twinkles like a little star; the effect the owner
-/// made the default), under its canonical spelling. The name has changed twice: the
-/// original single-word `nyan` became the two-word `nyan rainbow`, which is now
-/// `rainbow kitty` (the owner's name for it — it says what you SEE). Every historical
-/// spelling still resolves here via [`CURSOR_TRAIL_STYLE_ALIASES`], so old configs
-/// keep working. The placeholder hint for the row.
+/// The default `cursor_trail_style` when unset — the RAINBOW KITTY PET: the same
+/// banded rainbow ribbon, trailed by the full-body cat that WALKS, runs and pounces
+/// along the line instead of the flying head (the owner's own machine has run this
+/// spelling for weeks, and shipping anything else made the default a stranger to the
+/// product). The name has changed three times: the original single-word `nyan` became
+/// the two-word `nyan rainbow`, then `rainbow kitty` (the owner's name for the ribbon —
+/// it says what you SEE), and the default now names the PET companion on top of it.
+/// Every historical spelling still resolves via [`CURSOR_TRAIL_STYLE_ALIASES`], so old
+/// configs keep working — and a config that says `rainbow kitty` explicitly still gets
+/// the flying head, untouched. The placeholder hint for the row.
 ///
 /// This is the SINGLE definition of the default: `app_config`, `native_settings` and
 /// `settings_preview` read it rather than re-typing the literal, so the next rename is
 /// one line.
-pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty";
+pub(crate) const DEFAULT_CURSOR_TRAIL_STYLE: &str = "rainbow kitty pet";
 
 /// The selectable values for `cursor_trail_style`: the additive `phaser` sweep (a
-/// full-spectrum hue streak), `rainbow kitty` (the DEFAULT — the banded rainbow
-/// ribbon), the native cadence-`comet` (a directional fading comet under the light
+/// full-spectrum hue streak), `rainbow kitty` (the banded rainbow ribbon under the
+/// flying head), `rainbow kitty pet` (the DEFAULT — that ribbon with the walking cat),
+/// the native cadence-`comet` (a directional fading comet under the light
 /// crown), the other additive LUMEN-wake looks
 /// (lumen / sparkle / fire / laser / water), the `beam` style (a clean steady TUBE of
 /// cool light that powers down — promoted from a bloom-free preset to its own
@@ -1046,10 +1093,16 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "phaser",
     "rainbow kitty",
     // The same banded-ribbon trail, with the full-body PET companion instead of
-    // the flying kitty (`GlowStyle::style_names_kitty_pet`). A first-class
-    // option rather than an alias: it is a real choice the picker must offer,
-    // even though both spellings resolve to one `GlowStyle`.
+    // the flying kitty (`GlowStyle::style_names_kitty_pet`) — and the SHIPPED
+    // DEFAULT ([`DEFAULT_CURSOR_TRAIL_STYLE`]). A first-class option rather than
+    // an alias: it is a real choice the picker must offer, even though both
+    // spellings resolve to one `GlowStyle`.
     "rainbow kitty pet",
+    // The same banded-ribbon trail and the same full-body pet, drawn as a DOG
+    // (`PetSpecies::Dog`). A first-class option beside the kitty pet for the
+    // same reason that one is: it is a real choice the picker must offer, and
+    // all three spellings still resolve to one `GlowStyle`.
+    "rainbow dog pet",
     "comet",
     "lumen",
     "sparkle",
@@ -1111,6 +1164,9 @@ pub(crate) const CURSOR_TRAIL_STYLE_ALIASES: &[(&str, &str)] = &[
     ("rainbow", "rainbow kitty"),
     ("kitty pet", "rainbow kitty pet"),
     ("pet kitty", "rainbow kitty pet"),
+    ("dog pet", "rainbow dog pet"),
+    ("pet dog", "rainbow dog pet"),
+    ("rainbow puppy pet", "rainbow dog pet"),
     ("sparkles", "sparkle"),
     ("phaser-sparkle", "sparkle"),
     ("rainbow-sparkle", "sparkle"),
@@ -1236,8 +1292,8 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT | EDIT_ACTIVE_TAB_COLOR => {
             EditKind::Color
         }
-        EDIT_GAME_FONT => EditKind::Enum {
-            options: GAME_FONT_OPTIONS,
+        EDIT_DISPLAY_FONT => EditKind::Enum {
+            options: DISPLAY_FONT_OPTIONS,
         },
         EDIT_TITLE_SUMMARY_PROVIDER => EditKind::Enum {
             options: TITLE_SUMMARY_PROVIDERS,
@@ -1287,6 +1343,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_CURSOR_TRAIL
         | EDIT_TRAIL_SOUNDS
         | EDIT_TONE_MELODY
+        | EDIT_ROBI
         | EDIT_TRAIL_SOUND_BED
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND
@@ -1815,26 +1872,45 @@ fn typed_item(key: &str, raw: &str) -> Result<toml_edit::Item, PrefsEditError> {
                     .is_some_and(|id| !id.trim().is_empty())
             {
                 Value::from(trimmed)
-            } else if key == EDIT_GAME_FONT && trimmed.contains('+') {
-                // The `game_font` row ALSO accepts a MIX — 2..=3 distinct
-                // bundled ids joined by `+` ("minecraft+zelda"), authored by
+            } else if key == EDIT_DISPLAY_FONT && trimmed.contains('+') {
+                // The `display_font` row ALSO accepts a MIX — 2..=3 distinct
+                // bundled ids joined by `+` ("pixel+engraved"), authored by
                 // the Text & Fonts toggles. Each part must be a real bundled
                 // id (never "off" — an off mix is just a cleared key); the
-                // canonical form is the trimmed parts re-joined in order.
-                let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+                // canonical form is the CANONICALIZED parts re-joined in order,
+                // so a legacy spelling is rewritten to the current one on save
+                // rather than being copied back into the file.
+                let parts: Vec<&str> = trimmed
+                    .split('+')
+                    .map(|part| {
+                        aterm_render::display_face_canonical_id(part).unwrap_or(part.trim())
+                    })
+                    .collect();
                 let distinct = parts
                     .iter()
                     .all(|part| parts.iter().filter(|other| other == &part).count() == 1);
                 if parts.len() < 2
-                    || parts.len() > aterm_render::GAME_FONT_MIX_MAX
+                    || parts.len() > aterm_render::DISPLAY_FACE_MIX_MAX
                     || !distinct
                     || parts
                         .iter()
-                        .any(|part| aterm_render::game_font_bytes(part).is_none())
+                        .any(|part| aterm_render::display_face_bytes(part).is_none())
                 {
                     return Err(bad());
                 }
                 Value::from(parts.join("+"))
+            } else if key == EDIT_DISPLAY_FONT
+                && let Some(canon) = aterm_render::display_face_canonical_id(trimmed)
+            {
+                // A legacy id is AUTHORED as its current spelling, so saving a
+                // pre-rename config migrates the value instead of copying the
+                // old name back into the file. `mariokart` has no canonical
+                // form and therefore falls through to the options check below
+                // and is rejected: the WRITER is the authoring path, and
+                // authoring a face aterm no longer ships should fail loudly.
+                // The LOADING path still accepts it — see
+                // `LEGACY_DISPLAY_FONT_IDS`.
+                Value::from(canon)
             } else {
                 let canon = options
                     .iter()
@@ -2022,6 +2098,14 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
 pub(crate) enum Section {
     Appearance,
     Cursor,
+    /// The CURSOR KITTY's own pane (owner ask, 2026-08-10: "fix the settings and
+    /// add a page for this"). The companion that walks the line is the shipped
+    /// default now ([`DEFAULT_CURSOR_TRAIL_STYLE`]), and it was reachable only
+    /// through a ten-option popup buried in a page that also owns bloom radius
+    /// and the whole Sound menu. This section holds the keys that belong to the
+    /// CAT and nothing else: which companion you get, how long its rainbow wake
+    /// runs, and the sprite art it wears.
+    CursorKitty,
     Typography,
     /// Window sizing, tabs, smart titles, and chrome.
     Window,
@@ -2044,9 +2128,10 @@ pub(crate) enum Section {
 
 impl Section {
     /// Display order of the section headers (top → bottom).
-    pub(crate) const ORDER: [Section; 10] = [
+    pub(crate) const ORDER: [Section; 11] = [
         Section::Appearance,
         Section::Cursor,
+        Section::CursorKitty,
         Section::Typography,
         Section::Window,
         Section::Input,
@@ -2062,6 +2147,7 @@ impl Section {
         match self {
             Section::Appearance => "Appearance",
             Section::Cursor => "Cursor",
+            Section::CursorKitty => "Cursor Kitty",
             Section::Typography => "Typography",
             Section::Window => "Window & Tabs",
             Section::Input => "Input",
@@ -2114,6 +2200,23 @@ pub(crate) fn section_of(key: &str) -> Section {
     }
     if key.starts_with("sparkle_words.") || key.starts_with("matrix_rain.") {
         return Section::Appearance;
+    }
+    // Robi the helper robot is a screen decoration like the two tables above.
+    if key == EDIT_ROBI {
+        return Section::Appearance;
+    }
+    // THE CURSOR KITTY'S OWN PANE, ahead of the generic cursor arms below: these
+    // three keys answer to the CAT, not to the trail engine. `cursor_trail_style`
+    // is the choice between the walking pet (the shipped default), the flying
+    // head, another look entirely, and off; `cursor_trail_wake_ms` is documented
+    // in `app_config` as the rainbow-kitty wake specifically; `cursor_nyan_sprite`
+    // is the kitty's ART (it is Manual-only, so it never paints a row here — it
+    // rides this section for Search/Modified grouping and the preview registry).
+    if matches!(
+        key,
+        EDIT_CURSOR_TRAIL_STYLE | EDIT_CURSOR_TRAIL_WAKE_MS | EDIT_CURSOR_NYAN_SPRITE
+    ) {
+        return Section::CursorKitty;
     }
     match key {
         EDIT_THEME | EDIT_WINDOW_THEME | EDIT_WINDOW_COLORSPACE => Section::Appearance,
@@ -2175,7 +2278,6 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_TRAIL
-        | EDIT_CURSOR_TRAIL_STYLE
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
@@ -2184,11 +2286,9 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
-        | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_CURSOR_FIRE_SHIMMER
         | EDIT_HDR_GLOW
         | EDIT_CURSOR_GLOW_SDR_BOOST
-        | EDIT_CURSOR_NYAN_SPRITE
         | EDIT_MOTION
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
@@ -2201,7 +2301,7 @@ pub(crate) fn section_of(key: &str) -> Section {
         EDIT_SHELL | EDIT_SHELL_ARGS => Section::Terminal,
         EDIT_FONT_PX
         | EDIT_FONT_FAMILY
-        | EDIT_GAME_FONT
+        | EDIT_DISPLAY_FONT
         | EDIT_LIGATURES
         | EDIT_LINE_HEIGHT
         | EDIT_ADJUST_BASELINE
@@ -2246,6 +2346,20 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     if matches!(key, EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT) {
         return ("Trail color", 4);
     }
+    // The Cursor Kitty pane. "Companion" is the picker's own caption — the page
+    // paints that row as its showcase card (the key is a Top Setting, so the
+    // ordinary registry never draws it), and this entry only orders it first in
+    // Search and Modified. "Rainbow wake" is the one group box the page paints;
+    // "Kitty art" is Manual-only for the same reason and likewise never paints.
+    if key == EDIT_CURSOR_TRAIL_STYLE {
+        return ("Companion", 0);
+    }
+    if key == EDIT_CURSOR_TRAIL_WAKE_MS {
+        return ("Rainbow wake", 1);
+    }
+    if key == EDIT_CURSOR_NYAN_SPRITE {
+        return ("Kitty art", 2);
+    }
     if COLOR_KEYS.contains(&key) {
         return ("Colors", 1);
     }
@@ -2266,6 +2380,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
     if key.starts_with("matrix_rain.") {
         return ("Matrix rain", 5);
     }
+    if key == EDIT_ROBI {
+        return ("Robi the robot", 6);
+    }
     match key {
         EDIT_THEME | EDIT_WINDOW_THEME | EDIT_WINDOW_COLORSPACE => ("Theme", 0),
         // The indexed ANSI palette edits beside the individual colour wells.
@@ -2284,21 +2401,16 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_SERIOUS_MODE => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
-        | EDIT_CURSOR_TRAIL_STYLE
         | EDIT_CURSOR_TRAIL_MS
         | EDIT_CURSOR_TRAIL_LENGTH
         | EDIT_CURSOR_TRAIL_INTENSITY
         | EDIT_CURSOR_TRAIL_RADIUS
-        | EDIT_CURSOR_TRAIL_WAKE_MS
         | EDIT_CURSOR_TRAIL_RING => ("Trail effect", 1),
         EDIT_MOTION | EDIT_LOAD_ADAPTIVE_MOTION => ("Motion", 3),
         // The extended trail surface rides the same box, after the basics
         // (colour identity and the GPU light knobs get their own boxes below).
         // The sound rows left for the "Sound" menu box above.
         EDIT_CURSOR_TRAIL_PACKS => ("Trail effect", 1),
-        // Colour identity: the overrides route via the early COLOR-KEYS return;
-        // the custom sprite art rides beside them.
-        EDIT_CURSOR_NYAN_SPRITE => ("Trail color", 4),
         EDIT_CURSOR_TRAIL_BLOOM
         | EDIT_CURSOR_TRAIL_BLOOM_STRENGTH
         | EDIT_CURSOR_TRAIL_BLOOM_RADIUS
@@ -2311,7 +2423,7 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // which faces / how glyphs join / where lines sit / how stems rasterize.
         EDIT_FONT_FAMILY
         | EDIT_FONT_PX
-        | EDIT_GAME_FONT
+        | EDIT_DISPLAY_FONT
         | EDIT_FONT_FAMILY_BOLD
         | EDIT_FONT_FAMILY_ITALIC
         | EDIT_FONT_FAMILY_BOLD_ITALIC
@@ -2442,6 +2554,22 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         // (`advanced_group_footnotes_are_native_semantic_and_fit_responsive_layouts`).
         "Sound" => {
             "Music effects in Top Settings is the master switch for the synth voices; Volume scales them. Neither reaches the terminal bell's system alert sound."
+        }
+        // The Cursor Kitty box's consequence copy states the two facts its one
+        // row cannot. (a) `0` is a real, useful value — it hides the plume and
+        // KEEPS the cat, which a bare 0..1500 slider reads as "off" — see
+        // `cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`.
+        // (b) The dial is a rainbow-style dial: `GlowConfig::wake_persist_s`
+        // only reaches the rainbow ribbon's wake, so on `comet`/`fire`/`beam`
+        // it moves nothing. The upstream gates (Serious Mode, Reduced motion,
+        // an unfocused window, `cursor_trail = false`) each already carry a
+        // per-row `motion_suppression` disclosure, so they are not repeated.
+        // BUDGETED to five wrapped lines at 2× Dynamic Type on a 320pt page:
+        // one row plus a six-line footnote overflowed its own group box there
+        // (`advanced_group_footnotes_…`), and a footnote that paints past the
+        // page is worse than a shorter one.
+        "Rainbow wake" => {
+            "How much recent typing shows as a plume; 0 hides the plume and keeps the cat. Rainbow styles only."
         }
         "Trail color" => {
             "Blank colors follow the active terminal theme; Nyan uses its built-in sprite."
@@ -2761,12 +2889,26 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         // Discovery aliases for the riff: a user hunting it will type what they
         // HEAR ("song", "loud"), not the internal gesture name.
         EDIT_TRAIL_SOUND_RIFF => &[
-            "riff", "sing", "song", "celebration", "music", "loud", "sound", "sfx",
+            "riff",
+            "sing",
+            "song",
+            "celebration",
+            "music",
+            "loud",
+            "sound",
+            "sfx",
         ],
         // Likewise the bell: "beep" and "alert" are what the sound is called
         // outside this codebase.
         EDIT_BELL_SOUND => &[
-            "bell", "beep", "alert", "bel", "audible", "sound", "sfx", "notification",
+            "bell",
+            "beep",
+            "alert",
+            "bel",
+            "audible",
+            "sound",
+            "sfx",
+            "notification",
         ],
         EDIT_TRAIL_SOUND_STYLE => &[
             "mechanical",
@@ -2880,6 +3022,9 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_FONT_VARIATION => &["variable", "axes", "wght", "opsz", "variation"],
         EDIT_FONT_WEIGHT => &["weight", "wght", "variable", "light", "bold", "thin"],
         EDIT_MOTION => &["motion", "reduce", "animation", "accessibility", "a11y"],
+        EDIT_ROBI => &[
+            "robi", "robot", "helper", "tips", "monkey", "bars", "ladder", "show",
+        ],
         EDIT_SERIOUS_MODE => &[
             "serious",
             "focus",
@@ -3103,7 +3248,7 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
 /// control still tells the user what is in effect — fixing the all-rows-blank confusion.
 pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     let font_family = configured_str(cfg.font_family.as_deref());
-    let game_font = configured_str(cfg.game_font.as_deref());
+    let display_font = configured_str(cfg.display_font.as_deref());
     let active_tab_color = configured_str(cfg.active_tab_color.as_deref());
     let font_family_bold = configured_str(cfg.font_family_bold.as_deref());
     let font_family_italic = configured_str(cfg.font_family_italic.as_deref());
@@ -3176,15 +3321,15 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             },
         },
         EditField {
-            label: "Game font",
-            key: EDIT_GAME_FONT,
+            label: "Display face",
+            key: EDIT_DISPLAY_FONT,
             kind: EditKind::Enum {
-                options: GAME_FONT_OPTIONS,
+                options: DISPLAY_FONT_OPTIONS,
             },
-            placeholder: game_font
+            placeholder: display_font
                 .clone()
                 .unwrap_or_else(|| "off (default font)".to_string()),
-            seed: game_font,
+            seed: display_font,
         },
         EditField {
             label: "Bold font family",
@@ -4261,6 +4406,17 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
+            // Robi the helper robot: the chrome-walking, tip-sharing
+            // RESIDENT (walks the typed row, jumping jacks, ladder, tab-bar
+            // monkey bars — forever). Default ON; reduced motion and serious
+            // mode hide him without touching this preference.
+            label: "Robi the helper robot",
+            key: EDIT_ROBI,
+            kind: EditKind::Bool,
+            seed: Some(cfg.robi_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
             label: "Background material",
             key: EDIT_BACKGROUND_MATERIAL,
             kind: EditKind::Enum {
@@ -4627,6 +4783,9 @@ mod trail_style_tests {
             // literally the same code. `GlowStyle::style_names_kitty_pet` is
             // what separates them, and its own pin is below.
             "rainbow kitty pet" => GlowStyle::RainbowKitty,
+            // …and the dog pet, for the same reason: a species of the pet, not
+            // a trail of its own.
+            "rainbow dog pet" => GlowStyle::RainbowKitty,
             "sparkle" => GlowStyle::Sparkle,
             "fire" => GlowStyle::Fire,
             "laser" => GlowStyle::Laser,
@@ -4644,11 +4803,11 @@ mod trail_style_tests {
     }
 
     /// The pet's twin pin: exactly one canonical style (and its documented
-    /// aliases) selects the full-body companion, and every other spelling —
-    /// including the plain `rainbow kitty` it shares a `GlowStyle` with — does
-    /// not. Without this, the two rainbow-kitty entries would be
-    /// indistinguishable to the picker and the draw path could never disagree
-    /// with the trail.
+    /// aliases) selects the full-body CAT companion, and every other spelling —
+    /// including the plain `rainbow kitty` it shares a `GlowStyle` with, and
+    /// the dog pet it shares the pet machinery with — does not. Without this,
+    /// the three rainbow-kitty entries would be indistinguishable to the picker
+    /// and the draw path could never disagree with the trail.
     #[test]
     fn exactly_one_trail_style_selects_the_full_body_pet() {
         for &s in CURSOR_TRAIL_STYLES {
@@ -4668,6 +4827,88 @@ mod trail_style_tests {
             assert!(
                 !GlowStyle::style_names_kitty_pet(other),
                 "{other:?} must NOT select the pet"
+            );
+        }
+        // The cat predicate must not claim the dog's spellings — they share the
+        // pet machinery, so a leak here would draw a cat for `rainbow dog pet`.
+        for dog in ["rainbow dog pet", "dog pet", "pet dog", "rainbow puppy pet"] {
+            assert!(
+                !GlowStyle::style_names_kitty_pet(dog),
+                "{dog:?} is the DOG pet, not the kitty pet"
+            );
+        }
+    }
+
+    /// The DOG pet's pin, the exact mirror of the kitty pet's above: one
+    /// canonical style plus its documented aliases selects the dog skin, the
+    /// cat pet does not, and `style_names_any_pet` is the union — which is the
+    /// predicate the draw path asks, so it must cover both and nothing else.
+    #[test]
+    fn exactly_one_trail_style_selects_the_dog_pet() {
+        for &s in CURSOR_TRAIL_STYLES {
+            assert_eq!(
+                GlowStyle::style_names_dog_pet(s),
+                s == "rainbow dog pet",
+                "style {s:?}"
+            );
+            assert_eq!(
+                GlowStyle::style_names_any_pet(s),
+                s == "rainbow dog pet" || s == "rainbow kitty pet",
+                "any-pet union, style {s:?}"
+            );
+        }
+        for alias in ["dog pet", "pet dog", "rainbow puppy pet", "  Dog Pet  "] {
+            assert!(
+                GlowStyle::style_names_dog_pet(alias),
+                "documented alias {alias:?} must select the dog pet"
+            );
+        }
+        for other in ["rainbow", "dog", "puppy", "rainbowdogpet", "rainbow kitty pet"] {
+            assert!(
+                !GlowStyle::style_names_dog_pet(other),
+                "{other:?} must NOT select the dog pet"
+            );
+        }
+    }
+
+    /// THE SHIPPED DEFAULT IS THE WALKING CAT (owner ruling, 2026-08-10: "what
+    /// we have on this machine should be the default", where that machine's
+    /// `aterm.toml` reads `cursor_trail_style = "rainbow kitty pet"`).
+    ///
+    /// This proves the DESTINATION, not the constant: an unset config resolves
+    /// through `Config::cursor_trail_style_raw` into a spelling that (a) is a
+    /// real picker option, (b) satisfies the engine's own pet predicate — the
+    /// single seam `app_render::trail_is_kitty_pet` asks before drawing the
+    /// full-body companion instead of the flying head — and (c) still lands on
+    /// the rainbow ribbon. Pinning only `DEFAULT_CURSOR_TRAIL_STYLE == "…"`
+    /// would pass for a typo the engine silently disables.
+    #[test]
+    fn the_unset_default_is_the_full_body_pet_all_the_way_to_the_draw_seam() {
+        let unset = crate::app_config::Config::default();
+        let raw = unset.cursor_trail_style_raw();
+        assert_eq!(raw, super::DEFAULT_CURSOR_TRAIL_STYLE);
+        assert!(
+            CURSOR_TRAIL_STYLES.contains(&raw),
+            "the default must be a selectable option, got {raw:?}"
+        );
+        assert!(
+            GlowStyle::style_names_kitty_pet(raw),
+            "an unset config must draw the WALKING pet, not the flying head"
+        );
+        assert_eq!(
+            GlowStyle::parse(raw),
+            GlowStyle::RainbowKitty,
+            "the pet still rides the rainbow ribbon"
+        );
+        // The flying head is not gone — it is one explicit line of config away,
+        // and every historical spelling still selects it.
+        assert!(!GlowStyle::style_names_kitty_pet("rainbow kitty"));
+        for legacy in ["nyan", "nyan rainbow", "rainbow"] {
+            assert!(
+                !GlowStyle::style_names_kitty_pet(
+                    super::cursor_trail_style_canonical(legacy).expect("documented alias")
+                ),
+                "{legacy:?} must keep resolving to the flying head"
             );
         }
     }
@@ -4841,6 +5082,11 @@ mod edit_tests {
                     super::Section::Appearance
                         | super::Section::Typography
                         | super::Section::Cursor
+                        // The Cursor Kitty pane is a VISUAL section like its
+                        // Cursor & Motion sibling — it shares that page's live
+                        // cursor scene — so its three keys owe the same
+                        // projection-or-documented-exemption proof.
+                        | super::Section::CursorKitty
                         | super::Section::Window
                 )
             })
@@ -4877,7 +5123,10 @@ mod edit_tests {
         for (section, count) in [
             (super::Section::Appearance, 11),
             (super::Section::Typography, 22),
-            (super::Section::Cursor, 21),
+            // 21 → 18 + 3: the trail-style picker, the rainbow wake dial and the
+            // custom sprite moved to the cat's own pane. Same 58 total.
+            (super::Section::Cursor, 18),
+            (super::Section::CursorKitty, 3),
             (super::Section::Window, 4),
         ] {
             assert_eq!(
@@ -5653,7 +5902,7 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(f(EDIT_CURSOR_TRAIL_STYLE).seed, None);
         assert_eq!(
             f(EDIT_CURSOR_TRAIL_STYLE).placeholder,
-            "rainbow kitty (default)",
+            format!("{} (default)", super::DEFAULT_CURSOR_TRAIL_STYLE),
             "style placeholder shows the effective default"
         );
         assert!(
@@ -5709,7 +5958,14 @@ listen = \"127.0.0.1:7777\" # local only
                 .iter()
                 .find(|field| field.key == key)
                 .unwrap_or_else(|| panic!("missing native Settings row for {key}"));
-            assert_eq!(super::section_of(key), super::Section::Cursor, "{key}");
+            // The sprite art followed the cat to its own pane on 2026-08-10;
+            // everything else here still tunes the trail engine.
+            let expected_section = if key == super::EDIT_CURSOR_NYAN_SPRITE {
+                super::Section::CursorKitty
+            } else {
+                super::Section::Cursor
+            };
+            assert_eq!(super::section_of(key), expected_section, "{key}");
             assert_eq!(field.kind, super::edit_kind(key), "{key} kind drift");
         }
     }
@@ -7130,27 +7386,27 @@ enabled = true
         assert!(range_of(super::EDIT_WINDOW_PADDING_TOP).is_some());
     }
 
-    /// FONT-GAME: the registry's `game_font` option list is EXACTLY the bundled
-    /// face registry (ids and order), so the settings toggles, the Enum
-    /// validation, and the `game:` resolver can never disagree; and the two new
+    /// FONT-DISPLAY: the registry's `display_font` option list is EXACTLY the
+    /// bundled face registry (ids and order), so the settings toggles, the Enum
+    /// validation, and the `display:` resolver can never disagree; and the two
     /// keys round-trip through the real TOML writer with their typed validation
-    /// (a bad game id / a non-hex tab color is rejected, never written).
+    /// (a bad face id / a non-hex tab color is rejected, never written).
     #[test]
-    fn game_font_and_tab_color_registry_rows_are_wired() {
-        let bundled: Vec<&str> = aterm_render::GAME_FONTS.iter().map(|f| f.id).collect();
+    fn display_font_and_tab_color_registry_rows_are_wired() {
+        let bundled: Vec<&str> = aterm_render::DISPLAY_FACES.iter().map(|f| f.id).collect();
         assert_eq!(
-            super::GAME_FONT_OPTIONS.first(),
+            super::DISPLAY_FONT_OPTIONS.first(),
             Some(&"off"),
             "the popup's explicit off state leads the option list"
         );
         assert_eq!(
-            &super::GAME_FONT_OPTIONS[1..],
+            &super::DISPLAY_FONT_OPTIONS[1..],
             bundled.as_slice(),
-            "GAME_FONT_OPTIONS' id tail must mirror aterm_render::GAME_FONTS"
+            "DISPLAY_FONT_OPTIONS' id tail must mirror aterm_render::DISPLAY_FACES"
         );
         // "off" behaves exactly like an unset key in the resolver.
         let off = Config {
-            game_font: Some("off".to_string()),
+            display_font: Some("off".to_string()),
             font_family: Some("Menlo".to_string()),
             ..Config::default()
         };
@@ -7159,36 +7415,39 @@ enabled = true
         let out = apply_prefs_edits(
             "",
             &[
-                (super::EDIT_GAME_FONT, set("minecraft")),
+                (super::EDIT_DISPLAY_FONT, set("pixel")),
                 (super::EDIT_ACTIVE_TAB_COLOR, set("#FF00AA")),
             ],
         )
         .unwrap();
         let c: Config = toml::from_str(&out).unwrap();
-        assert_eq!(c.game_font.as_deref(), Some("minecraft"));
+        assert_eq!(c.display_font.as_deref(), Some("pixel"));
         assert_eq!(c.active_tab_color.as_deref(), Some("#FF00AA"));
         assert_eq!(c.active_tab_color_rgb(), Some([0xFF, 0x00, 0xAA]));
-        assert_eq!(c.font_family_request().as_deref(), Some("game:minecraft"));
+        assert_eq!(c.font_family_request().as_deref(), Some("display:pixel"));
         // A MIX round-trips through the writer in canonical joined form, and
-        // the resolver canonicalizes it into the `game:` mix family.
-        let out =
-            apply_prefs_edits("", &[(super::EDIT_GAME_FONT, set(" minecraft + zelda "))]).unwrap();
+        // the resolver canonicalizes it into the `display:` mix family.
+        let out = apply_prefs_edits("", &[(super::EDIT_DISPLAY_FONT, set(" pixel + engraved "))])
+            .unwrap();
         let mixed: Config = toml::from_str(&out).unwrap();
-        assert_eq!(mixed.game_font.as_deref(), Some("minecraft+zelda"));
+        assert_eq!(mixed.display_font.as_deref(), Some("pixel+engraved"));
         assert_eq!(
             mixed.font_family_request().as_deref(),
-            Some("game:minecraft+zelda")
+            Some("display:pixel+engraved")
         );
-        // Unknown game id / bad mixes / non-hex color: rejected by the writer.
+        // Unknown face id / bad mixes / non-hex color: rejected by the writer.
         for bad in [
             "doom",
-            "minecraft+doom",
-            "zelda+zelda",
-            "roblox+minecraft+zelda+mariokart",
+            "pixel+doom",
+            "engraved+engraved",
+            "chunky+pixel+engraved+bubble",
+            // A legacy alias may not smuggle a duplicate past the distinctness
+            // check by wearing its old name.
+            "pixel+minecraft",
         ] {
             assert!(
                 matches!(
-                    apply_prefs_edits("", &[(super::EDIT_GAME_FONT, set(bad))]).unwrap_err(),
+                    apply_prefs_edits("", &[(super::EDIT_DISPLAY_FONT, set(bad))]).unwrap_err(),
                     PrefsEditError::BadValue { .. }
                 ),
                 "{bad} must be rejected"
@@ -7198,13 +7457,99 @@ enabled = true
             apply_prefs_edits("", &[(super::EDIT_ACTIVE_TAB_COLOR, set("pink"))]).unwrap_err(),
             PrefsEditError::BadValue { .. }
         ));
-        // Clearing the game font restores the plain family passthrough.
+        // Clearing the display face restores the plain family passthrough.
         let mut cleared = c.clone();
-        cleared.game_font = None;
+        cleared.display_font = None;
         assert_eq!(cleared.font_family_request(), cleared.font_family);
         // A typo'd id that somehow reaches config falls back fail-open.
         let mut typo = c;
-        typo.game_font = Some("dooom".to_string());
+        typo.display_font = Some("dooom".to_string());
         assert_eq!(typo.font_family_request(), typo.font_family);
+    }
+
+    /// MIGRATION: a config written before the rename keeps working, and keeps
+    /// working the SAME way. This is the promise the deprecated spellings exist
+    /// to keep — deleting a shipped key or id would turn a file that was valid
+    /// yesterday into a complaint about a line the user typed correctly.
+    ///
+    /// The one id with no successor (`mariokart`, whose face carried no
+    /// redistribution grant and had no substitute) falls back to the primary
+    /// font instead of erroring, for the same reason.
+    #[test]
+    fn the_pre_rename_key_and_ids_still_load_and_resolve() {
+        // The accepted-alias list is the renderer's retirement table, exactly —
+        // a face retired in one place and forgotten in the other is how a
+        // still-valid config becomes an error.
+        let from_registry: Vec<&str> = aterm_render::DISPLAY_FACE_LEGACY_IDS
+            .iter()
+            .map(|(legacy, _)| *legacy)
+            .collect();
+        assert_eq!(
+            super::LEGACY_DISPLAY_FONT_IDS,
+            from_registry.as_slice(),
+            "LEGACY_DISPLAY_FONT_IDS must mirror aterm_render::DISPLAY_FACE_LEGACY_IDS"
+        );
+        for id in super::LEGACY_DISPLAY_FONT_IDS {
+            assert!(
+                super::display_font_id_is_accepted(id),
+                "{id} must still be accepted"
+            );
+            assert!(
+                !super::DISPLAY_FONT_OPTIONS.contains(id),
+                "{id} must not be OFFERED again by Settings"
+            );
+        }
+
+        // The legacy KEY parses into the current field (serde alias).
+        let legacy: Config = toml::from_str("game_font = \"minecraft\"\n").unwrap();
+        assert_eq!(legacy.display_font.as_deref(), Some("minecraft"));
+        // …and resolves to the RENAMED face, under the renamed scheme.
+        assert_eq!(
+            legacy.font_family_request().as_deref(),
+            Some("display:pixel")
+        );
+        for (old, new) in [
+            ("roblox", "display:chunky"),
+            ("minecraft", "display:pixel"),
+            ("zelda", "display:engraved"),
+            ("animal-crossing", "display:bubble"),
+        ] {
+            let cfg = Config {
+                display_font: Some(old.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(
+                cfg.font_family_request().as_deref(),
+                Some(new),
+                "{old} must resolve to {new}"
+            );
+        }
+        // The deleted face: falls back to the primary font, never an error.
+        let gone = Config {
+            display_font: Some("mariokart".to_string()),
+            font_family: Some("Menlo".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(gone.font_family_request().as_deref(), Some("Menlo"));
+        // A legacy MIX canonicalizes to current ids, and mixing a face with its
+        // own old name is still one face twice — rejected, not silently doubled.
+        let mixed = Config {
+            display_font: Some("minecraft+zelda".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            mixed.font_family_request().as_deref(),
+            Some("display:pixel+engraved")
+        );
+        let doubled = Config {
+            display_font: Some("pixel+minecraft".to_string()),
+            font_family: Some("Menlo".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            doubled.font_family_request().as_deref(),
+            Some("display:pixel"),
+            "the duplicate is dropped, not counted twice"
+        );
     }
 }

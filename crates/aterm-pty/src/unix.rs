@@ -960,8 +960,8 @@ fn exec_status_fifo_path() -> io::Result<CString> {
     let mut rnd = [0u8; 8];
     // SAFETY: `getentropy` fills exactly the 8-byte buffer it is given (its
     // documented limit is 256 bytes) and returns 0 on success.
-    let entropy_ok = unsafe { libc::getentropy(rnd.as_mut_ptr().cast::<libc::c_void>(), rnd.len()) }
-        == 0;
+    let entropy_ok =
+        unsafe { libc::getentropy(rnd.as_mut_ptr().cast::<libc::c_void>(), rnd.len()) } == 0;
     let unpredictable = if entropy_ok {
         u64::from_ne_bytes(rnd)
     } else {
@@ -972,7 +972,9 @@ fn exec_status_fifo_path() -> io::Result<CString> {
     // SAFETY: `getpid` reads process state and takes no arguments.
     let pid = unsafe { libc::getpid() };
     let seq = NEXT.fetch_add(1, Ordering::Relaxed);
-    path.extend_from_slice(format!("aterm-xstatus-{pid:x}-{seq:x}-{unpredictable:016x}").as_bytes());
+    path.extend_from_slice(
+        format!("aterm-xstatus-{pid:x}-{seq:x}-{unpredictable:016x}").as_bytes(),
+    );
     CString::new(path).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1057,7 +1059,10 @@ fn fifo_ends_are_one_private_object(rd: libc::c_int, wr: libc::c_int) -> bool {
 fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
     // A collision means our random name already existed; a couple of retries
     // costs nothing and makes the (astronomically unlikely) case non-fatal.
-    let mut last = io::Error::new(io::ErrorKind::AlreadyExists, "exec-status fifo path collision");
+    let mut last = io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "exec-status fifo path collision",
+    );
     for _attempt in 0..4 {
         let path = exec_status_fifo_path()?;
         // (1) create the name.
@@ -1321,13 +1326,7 @@ fn wait_readable_briefly(fd: libc::c_int, slice: std::time::Duration) {
                 tv_sec: slice.as_secs() as libc::time_t,
                 tv_usec: libc::suseconds_t::from(slice.subsec_micros() as i32),
             };
-            libc::select(
-                fd + 1,
-                &mut set,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                &mut tv,
-            );
+            libc::select(fd + 1, &mut set, ptr::null_mut(), ptr::null_mut(), &mut tv);
         }
         return;
     }
@@ -5816,7 +5815,17 @@ mod tests {
         let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
         let exec: Vec<String> = vec!["/bin/sleep".into(), "5".into()];
         let master = spawn_shell(
-            24, 80, &spawn_cap, &sandbox_cap, &[], None, None, None, Some(&exec), None, None,
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None,
+            None,
+            None,
+            Some(&exec),
+            None,
+            None,
         )
         .expect("sleep must spawn");
 

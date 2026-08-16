@@ -7,12 +7,14 @@
 //! Two TOML document types, each verified as exact raw bytes by [`crate::sig`] before
 //! a single byte reaches a parser here:
 //!
-//! * [`Index`] — the root-signed `index.toml`: the freshness anchor, the `[keys]`
-//!   release-key delegation, the **allow-list** of installable programs, and the
-//!   channels. A repo NOT named in `[programs]` is unreachable **by construction**
-//!   (R4) — private-config repos are excluded because they are never named.
-//! * [`PkgManifest`] — a release-key-signed `pkg-<program>-<build>.toml`: the
-//!   per-triple artifact table, the `exposes` shim list, and the honest `[cost]`.
+//! * [`Index`] — the MACHINE-signed `index.toml`: the freshness anchor, the attribution
+//!   pair (`machine_id` / `roster_seq`) that binds it to the roster generation which
+//!   authorized it, the **allow-list** of installable programs, and the channels. A repo
+//!   NOT named in `[programs]` is unreachable **by construction** (R4) — private-config
+//!   repos are excluded because they are never named.
+//! * [`PkgManifest`] — a `pkg-<program>-<build>.toml` signed by a machine on that same
+//!   roster: the per-triple artifact table, the `exposes` shim list, and the honest
+//!   `[cost]`.
 //!
 //! Every parse *entry point* here ([`parse_index`] / [`parse_pkg`]) takes
 //! `&`[`VerifiedBytes`] (which has no public constructor), so the crate's own parse path
@@ -30,12 +32,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::sig::{Delegation, Reject, VerifiedBytes};
+use crate::sig::{Reject, VerifiedBytes};
 
 /// The highest manifest `schema` this build understands. A document declaring a higher
 /// schema is from a newer format we cannot safely interpret, so it is **rejected** (the
 /// client stays put) rather than misread — mirrors `aterm-update`'s `SUPPORTED_SCHEMA`.
-pub const SUPPORTED_SCHEMA: u32 = 1;
+///
+/// # Why this went 1 → 2
+///
+/// Schema 1's `index.toml` carried a `[keys]` table naming the rotatable release key that
+/// signed each `pkg-*.toml`: the index WAS the delegation. Under the single root that
+/// authority moved to the master-signed machine roster, so `[keys]` is retired and two
+/// attribution fields (`machine_id`, `roster_seq`) take its place.
+///
+/// The bump is not decoration. It is what makes the transition legible in both
+/// directions:
+///
+/// * a schema-1 client meeting a schema-2 index refuses it here (`Reject::Schema`) and
+///   says "newer format" rather than parsing a document whose `[keys]` absence it would
+///   read as malformed — and it would have refused anyway, because a machine-signed index
+///   cannot verify under its retired root key;
+/// * a schema-2 client meeting a schema-1 index parses it (1 ≤ 2) but refuses it at the
+///   attribution bind, because a schema-1 index carries no `machine_id`
+///   ([`Reject::Unattributed`]) — and, again, would already have failed the signature.
+///
+/// Both directions fail CLOSED, twice over. See `docs/ATPKG-KEY-MANAGEMENT.md` for what
+/// an already-installed client does about it (short answer: reinstall, accepted).
+pub const SUPPORTED_SCHEMA: u32 = 2;
 
 /// The default repository the signed index lives on, under the configurable account:
 /// `github.com/<account>/aterm` (§5). The index is a small signed release asset on the
@@ -60,8 +83,25 @@ pub struct Index {
     /// RFC3339 freshness deadline; the client refuses this index at/after it (§8). The
     /// freshness comparison itself is done by the caller via [`crate::sig::check_freshness`].
     pub valid_until: String,
-    /// `[keys]` — the rotatable release-key delegation the root index authorizes.
-    pub keys: Keys,
+    /// WHICH MACHINE on the roster cut this index — the attribution half of the id bind
+    /// ([`aterm_update_core::roster::Attribution::bind`]).
+    ///
+    /// It sits INSIDE the signed bytes, which is what makes the bind free and two-way: a
+    /// genuine m3 signature cannot be relabelled m11 (the bytes, and so the signature,
+    /// would change), and a thief holding m11's key cannot claim `machine_id = "m3"`
+    /// (the roster maps m3 to m3's key, and the verification ran against m11's).
+    ///
+    /// `Option` because serde must be able to PARSE a document that lacks it — a schema-1
+    /// index, or a hand-written one. Absent is a REFUSAL under an armed anchor
+    /// ([`crate::sig::Reject::Unattributed`]), never a pass: an index nobody can be held
+    /// to is not an index this client installs from.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// The roster generation that authorized the machine which signed this index. Bound
+    /// to the roster actually used, so an old roster cannot be paired with a new index
+    /// (nor a new roster with an old index). Absent ⇒ [`crate::sig::Reject::SeqMismatch`].
+    #[serde(default)]
+    pub roster_seq: Option<u64>,
     /// `[programs.<name>]` — the open-ended allow-list. The map key is the program name
     /// (`exposes`/install identity); the value names its repo + policy + optional group.
     #[serde(default)]
@@ -72,18 +112,12 @@ pub struct Index {
     pub channels: Vec<Channel>,
 }
 
-/// `[keys]` — the index's release-key delegation. A real TOML parse means a duplicate
-/// key in this table is a hard error (fail-closed), not a silent last-wins.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Keys {
-    /// The rotatable key's identifier (`rk-2026-06`).
-    pub release_key_id: String,
-    /// The release key's base64 Ed25519 public key (32 raw bytes).
-    pub release_key_pubkey: String,
-    /// Belt-and-suspenders revocation deny-list: a key id here is refused before crypto.
-    #[serde(default)]
-    pub revoked_release_keys: Vec<String>,
-}
+// `[keys]` — the schema-1 release-key delegation — is GONE, along with the `Keys` struct
+// and `Index::delegation()` that fed `sig::verify_pkg`. The roster now supplies both the
+// grant and the deny for `pkg-*.toml`, which is the whole "one root, one revocation
+// story" decision; see `crate::sig`. Unknown top-level tables are ignored, so a producer
+// that still emits `[keys]` during the changeover is not refused for it — the table is
+// simply no longer read by anything, and carries no authority.
 
 /// One `[programs.<name>]` entry: where the program's release manifests live and how it
 /// may be installed.
@@ -128,17 +162,6 @@ pub struct Channel {
 }
 
 impl Index {
-    /// The release-key [`Delegation`] this (root-verified) index authorizes — the seam
-    /// the per-`pkg.toml` verify ([`crate::sig::verify_pkg`]) consumes.
-    #[must_use]
-    pub fn delegation(&self) -> Delegation {
-        Delegation {
-            release_key_id: self.keys.release_key_id.clone(),
-            release_key_pubkey_b64: self.keys.release_key_pubkey.clone(),
-            revoked_release_keys: self.keys.revoked_release_keys.clone(),
-        }
-    }
-
     /// The named program, **iff** the verified index names it. `None` ⇒ the repo is
     /// unreachable (R4): private-config repos, half-finished repos, anything unlisted is
     /// never named, so this is exclusion *by construction*, not by heuristic.
@@ -294,7 +317,15 @@ impl PkgManifest {
 /// substitution — the signature was checked over these exact bytes), real `toml` parse,
 /// then the [`SUPPORTED_SCHEMA`] reject-newer gate. Any failure is a fail-closed
 /// [`Reject`]; the caller treats every variant as "refuse, install nothing".
-pub fn parse_index(verified: &VerifiedBytes) -> Result<Index, Reject> {
+///
+/// `pub(crate)`, deliberately, and narrowing it was a fix rather than tidiness: an
+/// `Index` carries self-declared attribution (`machine_id`/`roster_seq`) that is only
+/// trustworthy after `TrustedRoster::authorize_index` runs the id↔key bind over it. A
+/// public parse entry would let an out-of-crate caller pair `authorize_bytes` with this
+/// and read an UNBOUND `machine_id` — signed by one fleet machine, labelled as another.
+/// Keeping the parse crate-private makes `authorize_index` the only way to obtain a
+/// parsed `Index` from outside, so the bind cannot be skipped by construction.
+pub(crate) fn parse_index(verified: &VerifiedBytes) -> Result<Index, Reject> {
     let idx: Index = parse_toml(verified)?;
     if idx.schema > SUPPORTED_SCHEMA {
         return Err(Reject::Schema);
@@ -331,51 +362,30 @@ thread_local! {
     static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sig::{verify_index_with, verify_pkg};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use crate::sig::testkit;
 
-    const ROOT_SEED: [u8; 32] = [7u8; 32];
-    const RELEASE_SEED: [u8; 32] = [1u8; 32];
-
-    fn keypair(seed: &[u8; 32]) -> Ed25519KeyPair {
-        Ed25519KeyPair::from_seed_unchecked(seed).expect("valid 32-byte seed")
-    }
-    fn pubkey_b64(kp: &Ed25519KeyPair) -> String {
-        STANDARD.encode(kp.public_key().as_ref())
-    }
-
-    /// Root-sign `body` and return its [`VerifiedBytes`] (parsing cannot run on raw
-    /// bytes — that does not type-check), so `parse_index` runs on genuinely-verified input.
+    /// `body`, machine-signed and taken through the REAL roster chain, so `parse_index` /
+    /// `parse_pkg` run on genuinely-verified input. (Parsing raw bytes does not
+    /// type-check, which is the compile-time half of the guarantee and needs no test.)
     fn verified(body: &str) -> VerifiedBytes {
-        let root = keypair(&ROOT_SEED);
-        let raw = body.as_bytes().to_vec();
-        let sig = root.sign(&raw).as_ref().to_vec();
-        verify_index_with(&pubkey_b64(&root), raw, &sig).expect("root verifies index")
-    }
-
-    fn release_pk() -> String {
-        pubkey_b64(&keypair(&RELEASE_SEED))
+        testkit::machine_signed(body.as_bytes().to_vec())
     }
 
     /// A complete, realistic index naming three programs (and deliberately NOT naming a
-    /// private-config repo like `dotfiles`).
+    /// private-config repo like `dotfiles`), attributed to the test roster's machine.
     fn full_index() -> String {
         format!(
             r#"
-schema = 1
+schema = 2
 index_build = 41
 generated_at = "2026-06-28T12:00:00Z"
 valid_until = "2026-07-05T12:00:00Z"
-
-[keys]
-release_key_id = "rk-2026-06"
-release_key_pubkey = "{pk}"
-revoked_release_keys = ["rk-2026-05"]
+machine_id = "{id}"
+roster_seq = {seq}
 
 [programs.ay]
 repo = "ay"
@@ -401,20 +411,19 @@ pin = {{ aterm = 1234, trust = 4821, ay = 18 }}
 nightly = "nightly-2025-12-03"
 trust_mc_rev = "0.67.0"
 "#,
-            pk = release_pk()
+            id = testkit::MACHINE_ID,
+            seq = testkit::SEQ
         )
     }
 
     #[test]
-    fn parses_a_full_index_and_extracts_delegation() {
+    fn parses_a_full_index_and_its_attribution() {
         let idx = parse_index(&verified(&full_index())).expect("valid index parses");
         assert_eq!(idx.index_build, 41);
         assert_eq!(idx.valid_until, "2026-07-05T12:00:00Z");
-        // Delegation comes from [keys], usable by verify_pkg.
-        let d = idx.delegation();
-        assert_eq!(d.release_key_id, "rk-2026-06");
-        assert_eq!(d.release_key_pubkey_b64, release_pk());
-        assert_eq!(d.revoked_release_keys, vec!["rk-2026-05".to_string()]);
+        // The attribution pair that replaced `[keys]` — what the roster bind checks.
+        assert_eq!(idx.machine_id.as_deref(), Some(testkit::MACHINE_ID));
+        assert_eq!(idx.roster_seq, Some(testkit::SEQ));
         // Programs, channels, pin, meta all parsed.
         assert_eq!(
             idx.program("trust").unwrap().coherence_group.as_deref(),
@@ -429,11 +438,22 @@ trust_mc_rev = "0.67.0"
             ch.meta.get("nightly").map(String::as_str),
             Some("nightly-2025-12-03")
         );
-        // The delegation actually verifies a release-signed pkg.
-        let release = keypair(&RELEASE_SEED);
-        let pkg = b"schema = 1\nprogram = \"ay\"\nbuild_number = 18\n";
-        let sig = release.sign(pkg).as_ref().to_vec();
-        assert!(verify_pkg(pkg.to_vec(), &sig, &d).is_ok());
+    }
+
+    /// A LEFTOVER `[keys]` table carries no authority any more: it parses (unknown tables
+    /// are ignored, so a producer mid-changeover is not refused for emitting it) and there
+    /// is no API that can read a release key out of an index. The delegation tier is gone,
+    /// not merely unused — this test would not compile if `Index::delegation` still
+    /// existed and something called it.
+    #[test]
+    fn a_leftover_keys_table_is_ignored_and_grants_nothing() {
+        let mut body = full_index();
+        body.push_str("\n[keys]\nrelease_key_id = \"rk-2026-06\"\nrelease_key_pubkey = \"AAAA\"\n");
+        let idx = parse_index(&verified(&body)).expect("an ignored table is not a refusal");
+        assert_eq!(idx.index_build, 41, "the rest of the index still reads");
+        // The only authority over a pkg manifest is the roster generation, reached
+        // through `TrustedIndex::verify_pkg` — never anything inside these bytes.
+        assert_eq!(idx.machine_id.as_deref(), Some(testkit::MACHINE_ID));
     }
 
     // R4: a private-config repo (never named in the index) is unreachable BY CONSTRUCTION.
@@ -488,77 +508,70 @@ trust_mc_rev = "0.67.0"
     // reject-newer: a schema beyond this build is refused (the client stays put).
     #[test]
     fn rejects_newer_schema() {
-        let body = full_index().replace("schema = 1", "schema = 99");
+        let body = full_index().replace("schema = 2", "schema = 99");
         assert_eq!(parse_index(&verified(&body)).unwrap_err(), Reject::Schema);
+        // And the CURRENT schema is accepted — so the gate is the number, not the fixture.
+        assert!(parse_index(&verified(&full_index())).is_ok());
+    }
+
+    /// A schema-1 index — the shape the retired delegation tier published — still PARSES
+    /// (1 ≤ SUPPORTED_SCHEMA) but carries no attribution, so the roster bind refuses it.
+    /// Both halves matter: the parse proves this is not an accidental format break, and
+    /// the missing attribution proves an old-shape index installs nothing.
+    #[test]
+    fn a_schema_one_index_parses_but_carries_no_attribution() {
+        let body = "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                    [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"AAAA\"\n";
+        let idx = parse_index(&verified(body)).expect("an older schema is not a parse failure");
+        assert_eq!(idx.machine_id, None);
+        assert_eq!(idx.roster_seq, None);
+        // The bind is what refuses it; `sig`'s tests prove that direction end to end.
     }
 
     // A malformed / incomplete index (missing a required field) fails closed.
     #[test]
     fn malformed_index_fails_closed() {
         // Missing index_build (required) → Malformed, not a default-0 silent accept.
-        let body = format!(
-            "schema = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n[keys]\n\
-             release_key_id = \"rk\"\nrelease_key_pubkey = \"{}\"\n",
-            release_pk()
-        );
-        assert_eq!(
-            parse_index(&verified(&body)).unwrap_err(),
-            Reject::Malformed
-        );
+        let body = "schema = 2\nvalid_until = \"2026-07-05T12:00:00Z\"\n";
+        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
     }
 
-    // A real TOML parser rejects a DUPLICATE key in [keys] (the line-scanner had to
-    // hand-defend this; toml gives it for free) → fail closed.
+    // A real TOML parser rejects a DUPLICATE key (the Phase-1 line-scanner had to
+    // hand-defend this; toml gives it for free) → fail closed. `machine_id` is the one
+    // that matters now: a last-wins parser would let a second copy re-attribute the index.
     #[test]
-    fn duplicate_key_in_keys_table_fails_closed() {
-        let pk = release_pk();
-        let body = format!(
-            "schema = 1\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{pk}\"\n\
-             release_key_pubkey = \"{pk}\"\n"
-        );
-        assert_eq!(
-            parse_index(&verified(&body)).unwrap_err(),
-            Reject::Malformed
-        );
+    fn duplicate_attribution_key_fails_closed() {
+        let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                    machine_id = \"m3\"\nmachine_id = \"m11\"\nroster_seq = 3\n";
+        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
     }
 
-    // Table scoping is intrinsic to the real parser: a `release_key_pubkey` in a SIBLING
-    // table cannot shadow the genuine [keys] delegation (it lands in an ignored table).
+    // Table scoping is intrinsic to the real parser: a `machine_id` in a SIBLING table
+    // cannot shadow the genuine top-level attribution (it lands in an ignored table).
     #[test]
-    fn sibling_table_cannot_hijack_delegation() {
-        let good = release_pk();
-        let body = format!(
-            "schema = 1\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{good}\"\n\
-             [meta]\nrelease_key_pubkey = \"AAAA\"\n"
-        );
-        let idx = parse_index(&verified(&body)).expect("parses; [meta] ignored");
-        assert_eq!(idx.delegation().release_key_pubkey_b64, good);
+    fn sibling_table_cannot_hijack_the_attribution() {
+        let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                    machine_id = \"m3\"\nroster_seq = 3\n\
+                    [meta]\nmachine_id = \"m11\"\nroster_seq = 9\n";
+        let idx = parse_index(&verified(body)).expect("parses; [meta] ignored");
+        assert_eq!(idx.machine_id.as_deref(), Some("m3"));
+        assert_eq!(idx.roster_seq, Some(3));
     }
 
-    // A multiline `revoked_release_keys` array — which the Phase-1 line-scanner had to
-    // fail closed on — is valid TOML and now parses correctly.
+    // A wrong-typed attribution is a hard parse failure, never a silent default: a
+    // `roster_seq` that is a string cannot become "absent" and slide into the bind.
     #[test]
-    fn multiline_revoked_array_parses() {
-        let pk = release_pk();
-        let body = format!(
-            "schema = 1\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{pk}\"\n\
-             revoked_release_keys = [\n  \"rk-old\",\n  \"rk-older\",\n]\n"
-        );
-        let idx = parse_index(&verified(&body)).expect("multiline array is valid TOML");
-        assert_eq!(
-            idx.delegation().revoked_release_keys,
-            vec!["rk-old".to_string(), "rk-older".to_string()]
-        );
+    fn wrongly_typed_attribution_fails_closed() {
+        let body = "schema = 2\nindex_build = 1\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
+                    machine_id = \"m3\"\nroster_seq = \"3\"\n";
+        assert_eq!(parse_index(&verified(body)).unwrap_err(), Reject::Malformed);
     }
 
     // pkg-*.toml: per-triple artifact selection + reject-newer + clean missing-triple skip.
     #[test]
     fn parses_pkg_manifest_and_selects_artifact() {
         let body = r#"
-schema = 1
+schema = 2
 program = "trust"
 version = "1.96.0-dev"
 build_number = 4821
@@ -588,34 +601,31 @@ build_seconds = 0
         assert!(m.artifact_for("x86_64-unknown-linux-gnu").is_none());
     }
 
-    // The parser NEVER runs on unverified bytes: a tampered index fails verify, so there
-    // is no VerifiedBytes to parse, and PARSE_CALLS stays flat. (The compile-time half —
+    // The parser NEVER runs on unverified bytes: a tampered pkg fails verify, so there is
+    // no VerifiedBytes to parse, and PARSE_CALLS stays flat. (The compile-time half —
     // parse_index(raw_bytes) does not type-check — needs no test.)
     #[test]
     fn parser_never_runs_on_failed_verify() {
         PARSE_CALLS.with(|c| c.set(0));
-        let root = keypair(&ROOT_SEED);
-        let body = full_index();
-        let mut sig = root.sign(body.as_bytes()).as_ref().to_vec();
+        let roster = testkit::trusted_roster();
+        let body = full_index().into_bytes();
+        let mut sig = testkit::sign(&testkit::MACHINE_SEED, &body);
         sig[0] ^= 0x01; // tamper
-        assert!(verify_index_with(&pubkey_b64(&root), body.into_bytes(), &sig).is_err());
+        assert!(roster.authorize_bytes(body.clone(), &sig).is_err());
         assert_eq!(
             PARSE_CALLS.with(std::cell::Cell::get),
             0,
             "no parse may run when verification fails"
         );
+        // The same holds for a signature by a key NO machine on the roster holds — the
+        // case the delegation tier used to answer and the roster answers now.
+        let outsider = testkit::sign(&testkit::OUTSIDER_SEED, &body);
+        assert!(roster.authorize_bytes(body, &outsider).is_err());
+        assert_eq!(PARSE_CALLS.with(std::cell::Cell::get), 0);
         // Positive control: a good signature verifies, and only then does the parser run.
         let vb = verified(&full_index());
         let _ = parse_index(&vb).unwrap();
         assert!(PARSE_CALLS.with(std::cell::Cell::get) >= 1);
-    }
-
-    /// Root-sign RAW bytes (which may be invalid UTF-8) into [`VerifiedBytes`], so the
-    /// strict-`from_utf8` arm can be exercised over genuinely-verified, non-UTF-8 input.
-    fn verified_raw(raw: Vec<u8>) -> VerifiedBytes {
-        let root = keypair(&ROOT_SEED);
-        let sig = root.sign(&raw).as_ref().to_vec();
-        verify_index_with(&pubkey_b64(&root), raw, &sig).expect("root verifies raw bytes")
     }
 
     // STRICT, never-lossy UTF-8: a signed index containing an invalid-UTF-8 byte is
@@ -624,11 +634,11 @@ build_seconds = 0
     // from_utf8 arm (not the signature).
     #[test]
     fn strict_utf8_rejects_invalid_bytes_in_signed_index() {
-        let mut raw = b"schema = 1\nindex_build = 1\n".to_vec();
+        let mut raw = b"schema = 2\nindex_build = 1\n".to_vec();
         raw.push(0xFF); // not valid UTF-8
         raw.extend_from_slice(b"\nvalid_until = \"2026-07-05T12:00:00Z\"\n");
         assert_eq!(
-            parse_index(&verified_raw(raw)).unwrap_err(),
+            parse_index(&testkit::machine_signed(raw)).unwrap_err(),
             Reject::Malformed
         );
     }
@@ -640,7 +650,7 @@ build_seconds = 0
         let newer = "schema = 99\nprogram = \"ay\"\nbuild_number = 1\n";
         assert_eq!(parse_pkg(&verified(newer)).unwrap_err(), Reject::Schema);
         // Missing build_number (required) → Malformed, not a default-0 silent accept.
-        let missing = "schema = 1\nprogram = \"ay\"\n";
+        let missing = "schema = 2\nprogram = \"ay\"\n";
         assert_eq!(
             parse_pkg(&verified(missing)).unwrap_err(),
             Reject::Malformed
@@ -649,10 +659,12 @@ build_seconds = 0
 
     // The signed `program` field binds the manifest to a program (§4.2 anti-replay): a
     // pkg legitimately signed for "ay" must be refused when fetched as some other program.
+    // This bind is UNCHANGED by the single-root move — it is the pkg tier's id bind, and
+    // it is what the roster's `machine_id` bind is for the index.
     #[test]
     fn pkg_program_field_binds_identity() {
         let m = parse_pkg(&verified(
-            "schema = 1\nprogram = \"ay\"\nbuild_number = 18\n",
+            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\n",
         ))
         .unwrap();
         assert!(m.is_for("ay"));
@@ -666,12 +678,12 @@ build_seconds = 0
     #[test]
     fn parses_requires_field() {
         let with = parse_pkg(&verified(
-            "schema = 1\nprogram = \"ay\"\nbuild_number = 18\nrequires = [\"ny\"]\n",
+            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\nrequires = [\"ny\"]\n",
         ))
         .unwrap();
         assert_eq!(with.requires, vec!["ny".to_string()]);
         let without = parse_pkg(&verified(
-            "schema = 1\nprogram = \"ay\"\nbuild_number = 18\n",
+            "schema = 2\nprogram = \"ay\"\nbuild_number = 18\n",
         ))
         .unwrap();
         assert!(

@@ -252,7 +252,18 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
 
     // Arm the celebration drive. It pins momentum but cannot itself summon.
     let before_begin = spec.clone();
-    cat.set_singing(t0, 1.0, 0.0);
+    cat.set_singing(
+        t0,
+        aterm_effects::kitty_cursor::SingSync {
+            drive: 1.0,
+            beat: 0.0,
+            energy: 0.30,
+            class: 0,
+            landing: false,
+            fill: false,
+            bow: 0.0,
+        },
+    );
     let begun = cat_projection(true, 0, &cat);
     assert_exact_step(&model, &mut spec, begun.clone(), "BeginSing");
     assert_tiered_step(
@@ -271,7 +282,18 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
         let at = t0 + Duration::from_millis(u64::from(i) * 40);
         let prev = spec.clone();
         cat.on_key(at, true);
-        cat.set_singing(at, 1.0, i as f32 * 0.1);
+        cat.set_singing(
+            at,
+            aterm_effects::kitty_cursor::SingSync {
+                drive: 1.0,
+                beat: i as f32 * 0.1,
+                energy: 0.30,
+                class: 0,
+                landing: false,
+                fill: false,
+                bow: 0.0,
+            },
+        );
         let post = cat_projection(true, i, &cat);
 
         if i == 10 {

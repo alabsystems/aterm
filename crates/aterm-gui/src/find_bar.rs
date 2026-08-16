@@ -4,7 +4,7 @@
 //! The Cmd-F FIND PANEL: a pinned chrome BAND painted over the terminal grid
 //! (directly below the tab strip) while find mode is active (`WindowState.search`).
 //! Before this the find state was surfaced ONLY in the window title + the
-//! current-match selection highlight (FIND-1 in `docs/V1_READINESS_FINDINGS.md`), so
+//! current-match selection highlight (the FIND-1 readiness finding), so
 //! pressing ⌘F looked like it did nothing — the search engine was wired, but
 //! INVISIBLE. Then it was one cramped row, which read as terminal output rather than
 //! as UI. It is now a [`FIND_BAR_ROWS`]-row panel:

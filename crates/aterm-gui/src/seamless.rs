@@ -28,7 +28,7 @@ use aterm_session::{LaunchNonce, SessionId};
 use sha2::{Digest, Sha256};
 
 const ENV_MANIFEST: &str = "ATERM_SEAMLESS_MANIFEST";
-const ENV_FDS: &str = "ATERM_SEAMLESS_FDS";
+pub(crate) const ENV_FDS: &str = "ATERM_SEAMLESS_FDS";
 const ENV_NONCE: &str = "ATERM_SEAMLESS_NONCE";
 const ENV_LAYOUT: &str = "ATERM_SEAMLESS_LAYOUT";
 const ENV_TARGET: &str = "ATERM_SEAMLESS_TARGET";
@@ -73,13 +73,34 @@ const MAX_HANDOFF_HISTORY_LINES: u32 = 256;
 pub(crate) fn max_handoff_history_lines() -> u32 {
     MAX_HANDOFF_HISTORY_LINES
 }
-const MAX_HANDOFF_AGGREGATE_GRID_CELLS: u64 = 128 * 1024;
+
+/// Ceiling on DECODED grid cells summed across every session in one handoff.
+/// [`admit_checkpoint_dimensions`] charges it at all four seams — UI pre-capture,
+/// outgoing digest, outgoing write, incoming decode — so splitting it per-seam
+/// would let them disagree about what a pool costs.
+///
+/// This was 128 Ki cells, and that number was the bug. A `Cell` is 8 bytes
+/// (compile-time asserted in `aterm-grid`), so the ceiling was ONE MEBIBYTE of
+/// decoded cells for the whole application, sitting beside a 256 MiB encoded-byte
+/// cap (`MAX_HANDOFF_AGGREGATE_GRID_BYTES`) — three orders of magnitude tighter
+/// than the bound it was meant to complement. Each session costs
+/// `cols * (2 * rows + history)` and the pool is every tab and pane of every
+/// window, so an ordinary desk (a dozen panes at 49x110) exceeded it and the
+/// in-session update deterministically refused to apply, forever, on that machine.
+///
+/// 4 Mi cells is 32 MiB of decoded cells: still an order of magnitude inside the
+/// encoded caps that bound the wire independently, while `MAX_HANDOFF_GRID_CELLS`
+/// still refuses a single absurd geometry and `MAX_HANDOFF_SESSIONS` still bounds
+/// cardinality. Raising it is only half the fix — the other half lives in the
+/// producer (`app_update_handoff`), which now reserves every session's mandatory
+/// visible+alt cells before any session may spend the aggregate on optional
+/// scrollback, so a later session can never find the budget already gone.
+const MAX_HANDOFF_AGGREGATE_GRID_CELLS: u64 = 4 * 1024 * 1024;
 const READY_WIRE_MAGIC: &[u8; 4] = b"ASR1";
 const COMMIT_WIRE_MAGIC: &[u8; 4] = b"ASC1";
 pub(crate) const READY_WIRE_LEN: usize = 4 + 4 + 32;
 
-/// Whether an env set is the ONE legal handoff shape: manifest + fds + nonce +
-/// layout + ready + commit, all present.
+/// Whether an env set is one of the TWO legal handoff shapes.
 ///
 /// This used to answer with a three-variant `HandoffProtocolShape` whose other
 /// two variants described the v0.52/v0.53 bridge. When that bridge was deleted
@@ -87,15 +108,55 @@ pub(crate) const READY_WIRE_LEN: usize = 4 + 4 + 32;
 /// DISAGREE: a legacy-shaped env set was still judged recognizable authority
 /// (so its descriptors were preserved for the exec image) and was then refused
 /// on arrival. One notion of "a legal handoff", in one place, is the point.
-fn handoff_is_modern_overlap(
+///
+/// There are now two, and they are DISJOINT by construction:
+///
+/// * INHERITED (the fork lane): manifest + nonce + layout, plus the three
+///   descriptor channels named by fd NUMBER — `fds`, `ready`, `commit`.
+/// * OUT OF BAND (the LaunchServices lane): manifest + nonce + layout, plus a
+///   rendezvous socket and a claim secret, and NONE of the fd-number channels.
+///
+/// The negative clauses are load-bearing rather than tidy. A LaunchServices
+/// launch inherits no descriptors at all, so an fd NUMBER arriving in an
+/// out-of-band environment cannot name what the outgoing process meant — it
+/// names whatever happens to sit at that index in a table LaunchServices built.
+/// Refusing the mixture is what stops a successor from adopting a stranger's
+/// descriptor as a terminal master.
+/// Which handoff env names are PRESENT. A named set rather than eight positional
+/// booleans: the shape rule below reads every one of them, and at eight
+/// same-typed parameters a transposed pair is both easy to write and invisible
+/// at the call site — while the thing being described really is one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffEnvPresence {
     manifest: bool,
     fds: bool,
     nonce: bool,
     layout: bool,
     ready: bool,
     commit: bool,
-) -> bool {
-    manifest && fds && nonce && layout && ready && commit
+    rendezvous: bool,
+    claim: bool,
+}
+
+fn handoff_is_modern_overlap(present: HandoffEnvPresence) -> bool {
+    let HandoffEnvPresence {
+        manifest,
+        fds,
+        nonce,
+        layout,
+        ready,
+        commit,
+        rendezvous,
+        claim,
+    } = present;
+    if !(manifest && nonce && layout) {
+        return false;
+    }
+    let inherited = fds && ready && commit && !rendezvous && !claim;
+    // macOS-only because the launcher is: on every other platform the out-of-band
+    // shape can only be a forgery or a bug, and is refused as one.
+    let out_of_band = cfg!(target_os = "macos") && rendezvous && claim && !fds && !ready && !commit;
+    inherited || out_of_band
 }
 
 /// One adopted session's identity in the handoff protocol: the pool-local
@@ -179,6 +240,16 @@ impl AdoptionProof {
 /// below is what happened the last time an input to this digest drifted between
 /// two builds, and it is why the fd term survives the B4 section below.
 ///
+/// That sentence was, until now, only a sentence: every test here compared this
+/// function against ITSELF, so a reviewer who changed a hashed byte for some
+/// unrelated reason would have found the suite entirely green and the field
+/// entirely broken. `the_v1_adoption_digest_is_frozen_to_this_exact_vector`
+/// below is the tripwire — one hardcoded 32-byte expectation for one fixed
+/// input, which is what makes an edit to this function a red test instead of a
+/// fleet-wide update outage. It pins the domain string, the field order, the
+/// length prefixes, the sort, and [`normalize_commit`]'s truncation and
+/// case-folding, because all of those are hashed bytes too.
+///
 /// WHAT THE FD TERM ACTUALLY PROVES. A descriptor number is not a property of a
 /// PTY; it is the slot the PTY occupies in one process's descriptor table. Both
 /// sides compute the same value only because `fork`+`execve` copies that table
@@ -207,16 +278,42 @@ impl AdoptionProof {
 /// i.e. root. The "descriptor's ordinal in the parent-declared transfer order"
 /// sketched in `tests/handoff_launchd_job.rs` is transport-portable but as
 /// content-free as the number: it names a slot, so it detects a permutation and
-/// never a substitution.
+/// never a substitution. It is fine as ADDRESSING — which received descriptor
+/// is which `local_id` — and useless as proof.
 ///
-/// It is not landed here because it IS the frozen-wire change above. It needs a
-/// version advertisement, and [`outgoing_parent_env`] is the seam that already
-/// has one (`run_handoff_worker` applies its pairs wholesale): a parent that
-/// advertises v2 demands v2 exactly when its authorized `target_build` is at
-/// least its own build, and a child emits v2 only when the advertisement is
-/// present. That covers old-parent/new-child and new-parent/old-child in a
-/// single release — but the acceptance half lives in `app_update_handoff`, so
-/// the swap cannot be made from this file alone.
+/// The two halves of that paragraph a running kernel can settle are now settled
+/// in the gate rather than by a note about what somebody once observed:
+/// `the_replacement_proof_term_distinguishes_masters_and_survives_dup` opens
+/// three real masters at once, asserts three DISTINCT minors, and asserts `dup`
+/// preserves each — the substitution half and the same-open-file-description
+/// half. The `SCM_RIGHTS` half stays an observation until there is fd-passing
+/// code to assert it against; it follows from the same open file description,
+/// but this file does not get to claim what it cannot run.
+///
+/// It is not landed here because it IS the frozen-wire change above. The plan
+/// used to be a version ADVERTISEMENT through [`outgoing_parent_env`] — parent
+/// advertises v2 when its authorized `target_build` is at least its own build,
+/// child emits v2 only when advertised. That is retired, and the reason is worth
+/// keeping: an advertisement is a second thing that can be mis-gated, and the
+/// cost of mis-gating THIS one is not one broken machine but `AdoptionMismatch`
+/// on every parent in the field, which `finish_update_handoff` latches
+/// manual-only. It also buys nothing, because the TRANSPORT already decides the
+/// term with no negotiation at all: a parent can only put descriptors out of
+/// band if it has out-of-band transport code, and a parent already in the field
+/// does not — it sends `ATERM_SEAMLESS_FDS` and is answered in v1, exactly as
+/// today. Presence of the transport IS the version, which makes "no parent in
+/// the field can ever be shown v2" a structural fact instead of an argument
+/// about gating. What has not changed is that the swap cannot be made from this
+/// file alone: the transport that selects the term lives in
+/// `app_update_handoff`, and the term follows it.
+///
+/// The advertisement did carry one guard worth keeping, and retiring it must not
+/// drop it: "presence of the transport IS the version" settles old-parent /
+/// new-child and says nothing about new-parent / old-child. So the guard moves to
+/// the transport CHOICE — a parent selects the out-of-band lane only when its
+/// authorized `target_build` is at least its own build (`job.target_build` is
+/// already in scope in `run_handoff_worker`), and forks otherwise, so an older
+/// successor is never handed descriptors it has no code to receive.
 #[must_use]
 pub(crate) fn adoption_proof(
     nonce: &str,
@@ -668,6 +765,40 @@ pub(crate) fn admit_checkpoint_dimensions(
     Some(cap)
 }
 
+/// What one session's MANDATORY carry costs the aggregate: its visible grid plus
+/// the alt grid the producer conservatively reserves — exactly what
+/// `admit_checkpoint_dimensions(used, rows, cols, 0, true)` charges.
+///
+/// Named separately because the producer must be able to price a WHOLE POOL
+/// before charging any of it. `admit_checkpoint_dimensions` cannot answer that:
+/// it is transactional per session and knows nothing about the sessions still
+/// queued behind the one it is admitting.
+#[must_use]
+pub(crate) fn mandatory_checkpoint_cells(rows: u16, cols: u16) -> u64 {
+    u64::from(rows)
+        .saturating_mul(u64::from(cols))
+        .saturating_mul(2)
+}
+
+/// The same pricing for the producer's capture-BYTE budget: twice
+/// `dimension_grid_cap`, which is exactly what the capture loop charges per
+/// admitted session (twice, because the alt grid is reserved conservatively for
+/// the same reason `has_alt` is `true` at the pre-capture admission). `None` for
+/// a geometry `dimension_grid_cap` refuses outright.
+#[must_use]
+pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32) -> Option<u64> {
+    dimension_grid_cap(rows, cols, history)?.checked_mul(2)
+}
+
+/// The process-wide aggregate cell ceiling, so the producer can price a whole
+/// pool against the same number `admit_checkpoint_dimensions` enforces. See
+/// `MAX_HANDOFF_AGGREGATE_GRID_CELLS` for why one shared constant, never a
+/// per-seam copy.
+#[must_use]
+pub(crate) fn max_handoff_aggregate_grid_cells() -> u64 {
+    MAX_HANDOFF_AGGREGATE_GRID_CELLS
+}
+
 fn checkpoint_grid_is_canonical(bytes: &[u8], rows: u16, cols: u16, history: u32) -> bool {
     // A materialized grid cell holds at most one 256-byte grapheme unit. Bound
     // content and full record framing from the authenticated column count before
@@ -1112,8 +1243,16 @@ pub(crate) fn discard_outgoing(nonce: &str) {
 /// carried window is painted — exit under me". Its own env var (never the
 /// `ATERM_SEAMLESS_FDS` wire: it is not a session, and it must FAIL the
 /// `fd_is_tty` backstop by design).
-const ENV_READY_FD: &str = "ATERM_HANDOFF_READY_FD";
-const ENV_COMMIT_FD: &str = "ATERM_HANDOFF_COMMIT_FD";
+pub(crate) const ENV_READY_FD: &str = "ATERM_HANDOFF_READY_FD";
+pub(crate) const ENV_COMMIT_FD: &str = "ATERM_HANDOFF_COMMIT_FD";
+/// OUT-OF-BAND LANE: the single-use rendezvous socket the outgoing process bound
+/// BEFORE it launched this successor. Its PRESENCE is the lane — there is no
+/// version byte anywhere, because a parent can only publish this name if it has
+/// out-of-band transport code, which is what makes "no parent already in the
+/// field can ever be shown the new shape" structural rather than argued.
+pub(crate) const ENV_RENDEZVOUS: &str = "ATERM_HANDOFF_RENDEZVOUS";
+/// The secret that admits exactly one dialer to that rendezvous.
+pub(crate) const ENV_CLAIM: &str = "ATERM_HANDOFF_CLAIM";
 const ENV_PARENT_PID: &str = "ATERM_HANDOFF_PARENT_PID";
 /// The outgoing process's KERNEL BIRTH RECORD, published beside its pid. A pid
 /// alone is a recyclable number; this is what makes it an identity the
@@ -1527,6 +1666,8 @@ fn clear_handoff_env() {
         ENV_LAYOUT,
         ENV_READY_FD,
         ENV_COMMIT_FD,
+        ENV_RENDEZVOUS,
+        ENV_CLAIM,
         ENV_PARENT_PID,
         ENV_PARENT_BIRTH,
     ] {
@@ -1597,6 +1738,11 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     let layout_present = std::env::var_os(ENV_LAYOUT).is_some();
     let ready_present = std::env::var_os(ENV_READY_FD).is_some();
     let commit_present = std::env::var_os(ENV_COMMIT_FD).is_some();
+    // The out-of-band lane's two names. They are read here — beside every other
+    // handoff name — so that ONE function decides what a recognizable handoff
+    // environment is, and `clear_handoff_env` below cannot forget to wipe them.
+    let rendezvous_present = std::env::var_os(ENV_RENDEZVOUS).is_some();
+    let claim_present = std::env::var_os(ENV_CLAIM).is_some();
     let parent_present = std::env::var_os(ENV_PARENT_PID).is_some();
     let birth_present = std::env::var_os(ENV_PARENT_BIRTH).is_some();
     let published_birth = std::env::var(ENV_PARENT_BIRTH)
@@ -1616,6 +1762,8 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
         || layout_present
         || ready_present
         || commit_present
+        || rendezvous_present
+        || claim_present
         || parent_present
         || birth_present;
     let mut authority_valid = true;
@@ -1698,14 +1846,16 @@ pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     // A partial or legacy-shaped env set is now unrecognizable authority, so its
     // descriptors are closed here rather than carried to an exec image that would
     // refuse them anyway.
-    let modern = handoff_is_modern_overlap(
-        manifest_present,
-        fds_present,
-        nonce_present,
-        layout_present,
-        ready_present,
-        commit_present,
-    );
+    let modern = handoff_is_modern_overlap(HandoffEnvPresence {
+        manifest: manifest_present,
+        fds: fds_present,
+        nonce: nonce_present,
+        layout: layout_present,
+        ready: ready_present,
+        commit: commit_present,
+        rendezvous: rendezvous_present,
+        claim: claim_present,
+    });
     if recognizable && !modern {
         authority_valid = false;
     }
@@ -2573,22 +2723,55 @@ mod tests {
         assert_ne!(a, b, "two draws differ (CSPRNG)");
     }
 
+    /// EXHAUSTIVE over all 256 env-presence combinations, because the cost of a
+    /// wrong answer here is not a refused handoff: a successor that accepts a
+    /// MIXED shape would read an fd NUMBER out of an environment whose process
+    /// inherited no descriptors, and adopt whatever LaunchServices left at that
+    /// index as a terminal master.
     #[test]
-    fn protocol_shape_table_accepts_exactly_one_form() {
-        for bits in 0u8..64 {
+    fn protocol_shape_table_accepts_exactly_the_two_legal_forms() {
+        let shape = |bits: u16| HandoffEnvPresence {
+            manifest: bits & 1 != 0,
+            fds: bits & 2 != 0,
+            nonce: bits & 4 != 0,
+            layout: bits & 8 != 0,
+            ready: bits & 16 != 0,
+            commit: bits & 32 != 0,
+            rendezvous: bits & 64 != 0,
+            claim: bits & 128 != 0,
+        };
+        for bits in 0u16..256 {
             let manifest = bits & 1 != 0;
             let fds = bits & 2 != 0;
             let nonce = bits & 4 != 0;
             let layout = bits & 8 != 0;
             let ready = bits & 16 != 0;
             let commit = bits & 32 != 0;
-            let got = handoff_is_modern_overlap(manifest, fds, nonce, layout, ready, commit);
-            let expected = matches!(
-                (manifest, fds, nonce, layout, ready, commit),
-                (true, true, true, true, true, true)
-            );
-            assert_eq!(got, expected, "shape bits {bits:06b}");
+            let rendezvous = bits & 64 != 0;
+            let claim = bits & 128 != 0;
+            let got = handoff_is_modern_overlap(shape(bits));
+            let base = manifest && nonce && layout;
+            let inherited = base && fds && ready && commit && !rendezvous && !claim;
+            let out_of_band = cfg!(target_os = "macos")
+                && base
+                && rendezvous
+                && claim
+                && !fds
+                && !ready
+                && !commit;
+            assert_eq!(got, inherited || out_of_band, "shape bits {bits:08b}");
         }
+        // The two forms are disjoint and neither is empty, so the disjunction
+        // above is not quietly satisfied by one of them being unreachable.
+        assert!(handoff_is_modern_overlap(shape(0b0011_1111)));
+        assert_eq!(
+            handoff_is_modern_overlap(shape(0b1100_1101)),
+            cfg!(target_os = "macos")
+        );
+        assert!(
+            !handoff_is_modern_overlap(shape(0b1111_1111)),
+            "a MIXED shape is a forgery or a bug, never a handoff"
+        );
     }
 
     // Immutable bytes emitted by v0.52's `serialize_lines`. Plain lines use its
@@ -2747,11 +2930,20 @@ mod tests {
     /// dropping the history it was carrying.
     ///
     /// This pins the arithmetic that makes the degrade load-bearing rather than
-    /// theoretical: at one real window geometry, carried history admits only a
-    /// couple of sessions while visible-only admits many times more. If a future
-    /// change raises the aggregate enough that history alone can no longer exhaust
-    /// it, this test goes red and should be retired deliberately — not silently
-    /// weakened, because the degrade is what upholds `checkpoint_carry`'s documented
+    /// theoretical: at one real window geometry, carried history admits strictly
+    /// fewer sessions than visible-only, so the degrade below is exercised.
+    ///
+    /// RETIRED RUNG. This used to also assert `with_history <= 4`, with a note that
+    /// raising the aggregate should retire that bound deliberately. It has been
+    /// retired: the "4" was never a property, it was the symptom. The aggregate was
+    /// 128 Ki cells, so four ordinary panes exhausted it and the FIFTH could not be
+    /// admitted even visible-only — the update simply did not apply. The aggregate
+    /// is now 4 Mi cells and the producer reserves every session's mandatory
+    /// visible+alt cells before anyone spends on scrollback, so that pool is
+    /// admitted outright — `app_update_handoff`'s
+    /// `a_heavy_pool_is_admitted_even_when_it_must_drop_history` pins that. What
+    /// survives here is what the rung stood in for: history still costs real
+    /// aggregate, so the degrade still upholds `checkpoint_carry`'s documented
     /// "the failure mode is *less scrollback*, never *the update did not apply*".
     #[test]
     fn carried_history_can_exhaust_the_aggregate_that_visible_only_admits() {
@@ -2776,12 +2968,6 @@ mod tests {
             with_history < visible_only,
             "carrying history must cost aggregate budget \
              (with={with_history}, without={visible_only})"
-        );
-        assert!(
-            with_history <= 4,
-            "a handful of ordinary sessions must be enough to exhaust the aggregate \
-             WITH history — that is what made the refusal reachable in the field \
-             (admitted {with_history})"
         );
         assert!(
             visible_only >= with_history * 2,
@@ -4315,6 +4501,112 @@ mod tests {
         }
         staged.teardown();
     }
+
+    /// B4's replacement proof term, measured instead of remembered.
+    /// [`adoption_proof`] explains why the fd number stops agreeing the moment
+    /// the masters travel over `SCM_RIGHTS`, and names the PTY's own device minor
+    /// as what survives. Two facts have to hold for that to be a PROOF rather
+    /// than a better-looking integer, and both were until now recorded as
+    /// something somebody once saw on a terminal:
+    ///
+    /// * SUBSTITUTION. Simultaneously-open masters must answer DIFFERENT minors.
+    ///   Without this the term detects a permutation and nothing else — which is
+    ///   exactly the objection that disqualifies the transfer-order ordinal
+    ///   sketched in `tests/handoff_launchd_job.rs`, and it would be no less
+    ///   fatal here.
+    /// * IDENTITY OF THE OPEN FILE DESCRIPTION. `dup` must preserve it, because
+    ///   that is the same property `SCM_RIGHTS` leans on when it hands the
+    ///   description itself to another process. The fd number is the thing that
+    ///   changes across both; the PTY is not.
+    ///
+    /// macOS only, and that is the claim rather than a portability gap:
+    /// `/dev/ptmx` is a cloning device there, so each open takes its own minor
+    /// and `st_ino`/`st_dev` cannot tell two masters apart at all. Linux's
+    /// masters share one `st_rdev` and expose the number through
+    /// `ioctl(TIOCGPTN)` — a different measurement, for the lane that needs it to
+    /// assert when it exists.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_replacement_proof_term_distinguishes_masters_and_survives_dup() {
+        // Darwin's `minor(3)`: the low 24 bits of `st_rdev`. Masked rather than
+        // cast, so the sign bit of a `dev_t` cannot ride into the comparison.
+        fn pty_device_minor(fd: i32) -> i32 {
+            // SAFETY: `fstat` only fills the zeroed `stat` out-parameter, and
+            // `fd` is a live descriptor the caller holds across the whole call.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstat(fd, &mut st) };
+            assert_eq!(rc, 0, "fstat on a live PTY master");
+            st.st_rdev & 0x00ff_ffff
+        }
+
+        let (mut masters, mut slaves) = ([0i32; 3], [0i32; 3]);
+        for (master, slave) in masters.iter_mut().zip(slaves.iter_mut()) {
+            // SAFETY: valid out-params; openpty fills them on success.
+            let rc = unsafe {
+                libc::openpty(
+                    master,
+                    slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(rc, 0, "openpty");
+        }
+        let minors = [
+            pty_device_minor(masters[0]),
+            pty_device_minor(masters[1]),
+            pty_device_minor(masters[2]),
+        ];
+        assert!(
+            minors[0] != minors[1] && minors[1] != minors[2] && minors[0] != minors[2],
+            "three simultaneously-open masters must answer three minors, got {minors:?}"
+        );
+
+        // AND THE MINOR IDENTIFIES THE PTY, which is the half that makes it a term
+        // at all rather than a distinct counter: it is the number in the
+        // `/dev/ttysNNN` the SLAVE answers to. The doc above claimed this from
+        // recollection; measure it.
+        for (i, &slave) in slaves.iter().enumerate() {
+            let mut name = [0i8; 128];
+            // SAFETY: `slave` is a live descriptor this test owns and `name` is a
+            // 128-byte buffer whose length is passed alongside it.
+            let rc = unsafe { libc::ttyname_r(slave, name.as_mut_ptr(), name.len()) };
+            assert_eq!(rc, 0, "ttyname_r on a live PTY slave");
+            // SAFETY: ttyname_r NUL-terminates on success.
+            let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                .to_str()
+                .expect("a device path is ASCII");
+            let n: i32 = path
+                .strip_prefix("/dev/ttys")
+                .expect("a Darwin PTY slave is /dev/ttysNNN")
+                .parse()
+                .expect("the NNN parses through its zero padding");
+            assert_eq!(
+                n, minors[i],
+                "the master's device minor IS the slave's /dev/ttysNNN ({path})"
+            );
+        }
+
+        // SAFETY: duplicating a live descriptor this test owns.
+        let duplicate = unsafe { libc::dup(masters[0]) };
+        assert!(duplicate >= 0, "dup");
+        assert_ne!(
+            duplicate, masters[0],
+            "the duplicate is a different NUMBER for the same PTY"
+        );
+        assert_eq!(
+            pty_device_minor(duplicate),
+            minors[0],
+            "the term follows the open file description, not the descriptor table slot"
+        );
+
+        aterm_pty::close_fd(duplicate);
+        for (master, slave) in masters.into_iter().zip(slaves) {
+            aterm_pty::close_fd(master);
+            aterm_pty::close_fd(slave);
+        }
+    }
 }
 
 /// F4 ADJUDICATION — the adoption-proof asymmetry that WAS.
@@ -4653,6 +4945,48 @@ mod f4_adoption_proof_asymmetry {
             unknown.is_some(),
             admitted,
             "`unknown` commit is release-fatal (no proof is ever emitted)"
+        );
+    }
+
+    /// THE TRIPWIRE for the frozen cross-version wire, and the only test in this
+    /// file that does not compare [`adoption_proof`] against itself. Every other
+    /// one stays green while a changed domain string, a reordered field, a
+    /// dropped length prefix or a different [`normalize_commit`] quietly makes
+    /// the outgoing build and the incoming build compute different digests — and
+    /// that disagreement is `AdoptionMismatch`, which `finish_update_handoff`
+    /// latches manual-only for every parent already in the field. A self-
+    /// consistent suite cannot see it, because both sides of every comparison
+    /// move together.
+    ///
+    /// So this compares against a constant derived once from the wire as
+    /// specified, and the input is chosen to hold down the parts that are easiest
+    /// to change by accident: an unsorted identity set (the sort is hashed
+    /// membership, not presentation) and a 40-hex uppercase commit (the
+    /// fold-and-truncate to 12 is hashed too).
+    ///
+    /// If this fails, the question is never "what is the digest now". It is
+    /// whether the edit was meant to be a wire break at all — and if it was,
+    /// nothing in the protocol tells the parents in the field why their update
+    /// lane stopped working.
+    #[test]
+    fn the_v1_adoption_digest_is_frozen_to_this_exact_vector() {
+        const FROZEN: &str = "9f32e4a273bbb14fb95b80b90788b41fce5cbfbc9fff94051934eb9b7d78ccbd";
+
+        let ids = [(2u64, 9i32, 4242i32), (0, 7, 101), (1, 8, 777)];
+        let proof = adoption_proof(
+            "0123456789abcdef0123456789abcdef",
+            1_784_869_524,
+            "7BF23BBE1234567890ABCDEF1234567890ABCDEF",
+            &[1u8; 32],
+            &[2u8; 32],
+            &ids,
+        )
+        .expect("a well-formed identity set proves");
+        assert_eq!(proof.count, 3, "the count rides beside the digest");
+        let digest: String = proof.digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            digest, FROZEN,
+            "the LIVE adoption wire changed — read this test's doc before touching the constant"
         );
     }
 

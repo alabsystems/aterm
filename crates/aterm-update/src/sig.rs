@@ -228,7 +228,10 @@ mod tests {
         let pk = B64.encode(kp.public_key().as_ref());
         let msg = b"m";
         let sig = kp.sign(msg);
-        assert_eq!(verify_detached_any(&["not-base64!!", &pk], msg, sig.as_ref()), Ok(1));
+        assert_eq!(
+            verify_detached_any(&["not-base64!!", &pk], msg, sig.as_ref()),
+            Ok(1)
+        );
         assert_eq!(verify_detached_any(&["", &pk], msg, sig.as_ref()), Ok(1));
         assert_eq!(
             verify_detached_any(&[&B64.encode([0u8; 16]), &pk], msg, sig.as_ref()),

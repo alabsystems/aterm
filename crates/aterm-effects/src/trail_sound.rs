@@ -192,35 +192,94 @@ pub enum CelebrationGesture {
     /// mid-hold key change simply changes the payload the NEXT bar carries,
     /// over the same uninterrupted bar grid.
     ///
-    /// NAMING (transition): this is the spec's `RiffBar { bar, sig }` under
-    /// a temporary name while the deprecated `RiffBar { bar, key }` shim
-    /// below holds the old name for the not-yet-patched host builder
-    /// (`backups/PENDING-sing-sig-app_render.patch`). Once that patch lands,
-    /// delete the shim and rename this variant to `RiffBar` — hosts that
-    /// construct through [`CelebrationGesture::riff_bar`] survive the rename
-    /// untouched.
-    RiffBarSig { bar: u16, sig: u32 },
-    /// COMPATIBILITY SHIM — DELETE WITH THE PENDING GUI PATCH. The pre-
-    /// signature payload: a clamped 5-class pentatonic root, which is
-    /// exactly the defect the signature exists to fix ('a'/'f'/'k'/'p'/'u'/
-    /// 'z'/space were bit-identical). Decoded by delegating into a synthetic
-    /// signature whose derived root IS this key (home mode), so the
-    /// unpatched host keeps its old per-class transpose while every axis
-    /// stays a pure function of one payload.
-    #[deprecated(note = "carries only 5 key classes; construct via \
-                         CelebrationGesture::riff_bar with KittySing::signature() — \
-                         see backups/PENDING-sing-sig-app_render.patch")]
-    RiffBar { bar: u16, key: i8 },
+    /// `class` is the held character's SECTION CLASS
+    /// (`kitty_sing::section_class` — 0 verse, 1 chorus, 2 bridge,
+    /// 3 percussive, 4 breath) and `energy_q` the SONG ARC's energy,
+    /// quantized ×200 into `0..=250`. ONE number, TWO reads
+    /// (`design_celebration`): the build escalation clamps it
+    /// (`min(200)/200`) while the clap gate reads it RAW against
+    /// [`CLAP_GATE_Q`]`[class]` — the double-booking the old
+    /// bar-index-derived build/clap could never resolve. Class changes
+    /// TIMBRE / DYNAMICS / the host-side earn rate only; rhythm, form,
+    /// swing, tempo and voice count are class-blind (pinned by
+    /// `sections_change_timbre_not_the_clock_or_the_form`).
+    ///
+    /// (Named `RiffBar` at last: the deprecated `{ bar, key }` shim this
+    /// variant was `RiffBarSig` to coexist with is deleted — both hosts
+    /// construct through [`CelebrationGesture::riff_bar_arc`] /
+    /// [`CelebrationGesture::riff_bar`], exactly so this rename touched no
+    /// call site.)
+    RiffBar {
+        bar: u16,
+        sig: u32,
+        class: u8,
+        energy_q: u8,
+    },
+    /// THE ANNOUNCED SWITCH — the drummer's cue. Pushed ONCE by the host
+    /// when a key switch COMMITS with runway (bar phase < 1.2 s —
+    /// `kitty_sing::FILL_CUE_RUNWAY`): the authored four-sixteenth
+    /// turnaround fill lands on the sounding bar's LAST beat, WALKING from
+    /// the departed key's shift (`sig`) into the arriving key's
+    /// (`sig_next`) — the graceful-merge pivot (owner: "the tunes don't
+    /// gracefully merge into the next tune"). TIMING IS THE SYNTH'S OWN
+    /// (the judge's day-one condition): the hits are quantized to the
+    /// sixteenth grid derived from samples-since-the-last-riff-bar — a
+    /// pure function of payload + sample clock, never host wall time — and
+    /// a cue arriving after a grid point simply DROPS the hits already
+    /// past, it never reschedules them off-grid.
+    RiffFillCue { sig: u32, sig_next: u32 },
+    /// THE FINALE — one cadence bar after a gentle release of a
+    /// performance >= `kitty_sing::ARC_FINALE_MIN_BARS` bars
+    /// (`kitty_sing::KittySing::take_cadence`): lead on eighth-slots
+    /// 0 / 2 / 4 playing degrees [4, 2, 0] — V, a passing tone, the tonic
+    /// "ta-daa" — shifted by the RELEASED key's root + mode (your song
+    /// ends in YOUR key), the tonic's tail ringing x1.5, the bass
+    /// third-partial on slots 0/4 (the carrier law, zero extra voices),
+    /// and one fused clap on the tonic when the performance earned it
+    /// (`energy_q` >= 230). Gain scales with the earned energy:
+    /// `0.6 * (0.8 + 0.2 * min(q,200)/200)` — a peak finale is up to
+    /// +1.9 dB over a modest one. <= 4 voices; `span_bars` rides along
+    /// for symmetry with the visual fireworks (and any future recording
+    /// layer) — the synth reads sig + energy today.
+    RiffCadence {
+        sig: u32,
+        energy_q: u8,
+        span_bars: u16,
+    },
 }
 
 impl CelebrationGesture {
-    /// Build the canonical riff-bar gesture from the bar index and the held
-    /// character's song signature. Hosts construct through THIS (not the
-    /// variant literal) so the planned `RiffBarSig` → `RiffBar` rename after
-    /// the pending GUI patch lands touches no call site.
+    /// Build the canonical riff-bar gesture: bar index, the held
+    /// character's song signature, its section class and the arc's
+    /// quantized energy. Hosts construct through THIS (not the variant
+    /// literal). `class` is clamped into the five-section domain at the
+    /// boundary, so a hostile payload can never index out of the tables.
+    #[must_use]
+    pub fn riff_bar_arc(bar: u16, sig: u32, class: u8, energy_q: u8) -> Self {
+        Self::RiffBar {
+            bar,
+            sig,
+            class: class.min(4),
+            energy_q,
+        }
+    }
+
+    /// COMPAT SHIM — the pre-arc constructor, kept for callers that speak
+    /// only `(bar, sig)` (`examples/typing_voice_ab.rs`, `mix_meter.rs`):
+    /// class 0 (verse) with the EXACT single-hold verse curve the arc
+    /// walks, `energy = 0.30 + 0.125·bar` (`q = 60 + 25·bar`, capped at
+    /// the 1.25 ceiling). Build hits 1.0 at bar 6 — exactly where the
+    /// retired `min(bar / CELEBRATION_BUILD_BARS, 1)` ramp landed it — and
+    /// the clap fires from bar 7 (`q = 235 ≥ 230`), ONE BAR EARLIER than
+    /// the retired `bar ≥ 8` gate: THE NEW PINNED LAW (owner decision, the
+    /// clap under the verse arc belongs to bar 7). The low bars open
+    /// warmer than the old ramp (bar 0 build 0.30, not 0.0) — that is
+    /// [`kitty_sing::ARC_START`], the arc's floor, deliberately shared so
+    /// one curve family describes every hold.
     #[must_use]
     pub fn riff_bar(bar: u16, sig: u32) -> Self {
-        Self::RiffBarSig { bar, sig }
+        let q = (60 + 25 * u32::from(bar)).min(250) as u8;
+        Self::riff_bar_arc(bar, sig, 0, q)
     }
 }
 
@@ -831,19 +890,159 @@ const CELEBRATION_BAR_LIFT: [f32; CELEBRATION_PHRASE_BARS] =
 /// (`celebration_bar_matches_the_visual_clock`).
 const CELEBRATION_SWING: f32 = 0.14;
 
-/// ESCALATION: the song opens lean and fills in over its first bars — the low
-/// end fades up, the lowpass opens, the octave shimmer grows. A pure function of
-/// the bar index: no new rng draws, so the riff stays replayable independently
-/// of what the typed layer consumed from the shared stream.
-const CELEBRATION_BUILD_BARS: f32 = 6.0;
+/// ESCALATION: the song opens lean and fills in as the ARC's energy grows —
+/// the low end fades up, the lowpass opens, the octave shimmer grows. A pure
+/// function of the payload's `energy_q` (clamped at 200, i.e. energy 1.0):
+/// no new rng draws, so the riff stays replayable independently of what the
+/// typed layer consumed from the shared stream. (The retired bar-index ramp
+/// — `min(bar / 6, 1)` with the clap from bar 8 — lives on as the compat
+/// shim's curve, see [`CelebrationGesture::riff_bar`]; sourcing escalation
+/// from energy is also what keeps the build CONTINUOUS across a key
+/// switch's forward bar-index jump, where the old ramp would have slammed
+/// to 1.0 and forced the clap on after the first switch.)
+///
+/// THE CLAP GATE, per section class: from this raw `energy_q` on, the
+/// backbeat slots pick up a chip CLAP — a short noise burst fused into the
+/// note's OWN noise channel, so it costs no extra voice. Percussive keys
+/// (class 3) clap EARLY at 170 — rhythm keys earn their backbeat first; on
+/// the single-hold verse curve 230 is crossed at bar 7 (the pinned law).
+const CLAP_GATE_Q: [u8; 5] = [230, 230, 230, 170, 230];
 
-/// From this bar on (one full phrase in), the backbeat slots pick up a chip
-/// CLAP — a short noise burst fused into the note's OWN noise channel, so it
-/// costs no extra voice.
-const CELEBRATION_CLAP_BAR: u16 = 8;
+/// AXIS 4, RE-VOICED FOR THE BELL (the pulse-duty table died with the pulse
+/// body — a sine has no duty; the 2026-08-10 "duty voices are the day-one
+/// class contrast" decision is superseded by the owner's failed A/B of
+/// 2026-08-12). The class axis now lives where a struck bell can show it:
+///
+/// - [`SECTION_STRIKE_FM`] — the glass face's FM index (strike brightness):
+///   verse moderate, chorus brilliant, bridge between, percussive dimmer
+///   glass (its identity is the click), breath soft.
+/// - [`SECTION_STRIKE_CLICK`] — the mallet click's level: percussive keys
+///   hit hardest (rhythm keys ARE the hits), the breath barely taps.
+/// - [`SECTION_SPARKLE_MIX`] — the double-octave tink's share: the chorus
+///   shines, the breath nearly bare.
+const SECTION_STRIKE_FM: [f32; 5] = [2.3, 3.2, 2.6, 1.5, 0.9];
+const SECTION_STRIKE_CLICK: [f32; 5] = [4.6, 3.5, 4.2, 4.2, 2.0];
+const SECTION_SPARKLE_MIX: [f32; 5] = [1.0, 1.4, 1.2, 0.7, 0.5];
+
+/// Per-SECTION gain trim, multiplied INSIDE the tier-5 [`CELEBRATION_KIND_GAIN`]
+/// ladder (max trim −2.9 dB, breath — the loudness tier is intact): verse
+/// sits back, the chorus is open, bridge/percussive between, breath dim.
+const SECTION_GAIN: [f32; 5] = [0.88, 1.00, 0.92, 0.96, 0.72];
+
+/// The CHORUS-KEY lift: class 1 (vowels) rides ×1.10 over its section gain.
+/// Deliberately UNCAPPED against the per-bar chorus lift
+/// ([`CELEBRATION_BAR_LIFT`]`[4] = 1.12`, product ≈ 1.23 — owner decision):
+/// a vowel held into the form's own lift is the loudest moment the
+/// instrument has, and it is earned twice.
+const CELEBRATION_CLASS_LIFT: f32 = 1.10;
+
+/// FORM AWARENESS, exported for the show (the singer's call-and-response
+/// sway, the audience pet's frolic-hop — the concert-scene seam): the ROLE
+/// of each form bar, 0 = verse (the held key's own walk), 1 = chorus (the
+/// shared authored block), 2 = the turnaround (fill included). Cross-pinned
+/// to [`CELEBRATION_VERSE`] and the phrase by
+/// `the_form_kind_table_matches_the_phrase` — the tempo-pin discipline
+/// applied to form.
+pub const CELEBRATION_FORM_KIND: [u8; CELEBRATION_PHRASE_BARS] = [0, 0, 1, 0, 0, 0, 1, 2];
 
 /// Riff register root — C5, the rainbow kitty palette's own chip register.
 const CELEBRATION_BASE_HZ: f32 = 523.25;
+
+// ---------------------------------------------------------------------------
+// The bell voicing, TAKE TWO (the owner A/B'd take one and ruled, verbatim:
+// "these all sound pretty similar to me" — the earlier "a bit" qualifier is
+// OVERRIDDEN by that failed audition; the mandate now is a blind-test-obvious
+// different instrument inside the first two seconds)
+// ---------------------------------------------------------------------------
+//
+// Take one kept the pulse body and only tightened the envelope: measurably
+// different, audibly "pretty similar". Take two changes the physics, chip
+// idiom intact — this is still mallet-on-a-toy-glockenspiel, not cathedral
+// FM:
+//
+// - STRIKE: every note opens with an audible mallet transient — a ~8 ms
+//   bright band-passed noise click fused into the voice's own noise channel
+//   (no extra voice), plus a fast-decaying inharmonic FM face on the
+//   fundamental (ratio 3.01, the comet-chime "ICE, not organ" idiom) so the
+//   glass glints at the hit and purifies as it rings.
+// - GLASS BODY: the lead's sustained portion is a SINE, not a pulse — the
+//   ring is pure. The pulse-duty class axis dies with the buzz; the class
+//   identity moves to where a bell can carry it: strike brightness, click
+//   weight and sparkle mix ([`SECTION_STRIKE_FM`], [`SECTION_STRIKE_CLICK`],
+//   [`SECTION_SPARKLE_MIX`]).
+// - RING: longer exponential tails ([`CELEBRATION_RING`] 3.0) that audibly
+//   decay through the next onset — the merge-glue leg is stronger, not
+//   weaker — with the double-octave tink loud enough to headline the tail.
+//
+// The ring is also one leg of the graceful merge: the departed key's final
+// bar decays THROUGH the new key's downbeat instead of butting against it
+// (the other legs: the fill cue's pivot walk, and the arc's energy
+// continuity).
+
+/// Lead attack — instant strike (well under the 16 ms house budget).
+const CELEBRATION_LEAD_ATTACK: f32 = 0.002;
+
+/// Lead decay per owned slot-span: span 1 falls to 1/e in 75 ms — struck,
+/// not held (under a tenth by the slot boundary, the pluck law) — while
+/// [`CELEBRATION_RING`]'s duration keeps the fallen tail SOUNDING through
+/// the next two slots.
+const CELEBRATION_LEAD_DECAY: f32 = 0.075;
+
+/// Duration in EIGHTHS per owned slot: 3.0 rings two slots past the next
+/// onset at tail level (was 2.0). Voice-budget note: a span-1 tail now
+/// lives 0.6 s, so late-bar voices overlap the next bar — worst case ~6
+/// ringing tails + 8 fresh + 4 turnaround fill + 4 fill cue = 22 ≤
+/// MAX_VOICES 28, and steal-quietest culls tails first by construction
+/// ([`Voice::weight`] decays with age).
+const CELEBRATION_RING: f32 = 3.0;
+
+/// THE TINKLE: the double-octave sine ping on the third partial of every
+/// lead voice NOT carrying the bass sub (the bass keeps its carrier — the
+/// carrier law is untouched). 0.44, up from take one's 0.12: the owner
+/// could not hear 0.12 under the body. Sized against the 0.34 body so the
+/// tail's crossings belong to the TINK, not the fundamental (4f × 0.44 out-
+/// slopes f × 0.34 all the way down the shared envelope). Scaled per class
+/// by [`SECTION_SPARKLE_MIX`].
+const CELEBRATION_SPARKLE: f32 = 0.44;
+
+/// The glass face — inharmonic FM on the lead fundamental. Ratio 3.01 is
+/// the house "ICE rather than organ" idiom (the comet chimes); the index
+/// starts at the class's [`SECTION_STRIKE_FM`] and decays with
+/// [`CELEBRATION_STRIKE_FM_TAU`], roughly twice as fast as the body — the
+/// bright partials die first, which IS bell physics.
+const CELEBRATION_STRIKE_FM_RATIO: f32 = 3.01;
+const CELEBRATION_STRIKE_FM_TAU: f32 = 0.045;
+
+/// THE MALLET CLICK: band-passed noise sweeping 4.6 kHz → 140 Hz in 7.5 ms
+/// (inside the 3–8 ms mallet window), fused into the note's own noise
+/// channel so it costs no voice. After the sweep the filter parks
+/// sub-audibly low, so the ring stays pure. Level per class:
+/// [`SECTION_STRIKE_CLICK`].
+const CELEBRATION_STRIKE_HZ: f32 = 4600.0;
+const CELEBRATION_STRIKE_FLOOR_HZ: f32 = 140.0;
+const CELEBRATION_STRIKE_GLIDE: f32 = 0.0075;
+const CELEBRATION_STRIKE_Q: f32 = 0.65;
+
+/// THE BELL'S LIGHT: the celebration lead's one-pole lowpass, opened for
+/// take two (was 2800 + 1400·build — a 3 kHz roof is a horn's roof, and it
+/// swallowed the mallet click whole). The escalation still OPENS
+/// the same audible door as the build grows; only the hinge moved.
+const CELEBRATION_LP_FLOOR: f32 = 4200.0;
+const CELEBRATION_LP_SPAN: f32 = 2000.0;
+
+/// THE FILL'S ANNOUNCEMENT: the turnaround's four sixteenths (and the fill
+/// cue's) strike brighter and harder than any lead class — the drummer
+/// counting the band back in must be unmistakable.
+const CELEBRATION_FILL_STRIKE_FM: f32 = 3.6;
+const CELEBRATION_FILL_CLICK: f32 = 4.3;
+const CELEBRATION_FILL_STRIKE_HZ: f32 = 7500.0;
+const CELEBRATION_FILL_STRIKE_GLIDE: f32 = 0.005;
+
+/// THE CLAP, re-weighed for take two: the earned backbeat burst (fused into
+/// the note's noise channel, 2.6 kHz signature — the shim test pins that
+/// band) must now read OVER per-note mallet clicks, so it is louder and
+/// wider than the click, never just another tick.
+const CELEBRATION_CLAP_LVL: f32 = 1.20;
 
 /// TIER 5 — the sing-along riff's place on the loudness ladder. The riff is the
 /// ONLY governor-exempt gesture (`design_celebration` omits the flood duck by
@@ -851,11 +1050,14 @@ const CELEBRATION_BASE_HZ: f32 = 523.25;
 /// at 1.0 bar 12 renders at -9.5 dBFS, 2 dB OVER the bonk and 11 dB over a
 /// keystroke it is simultaneously ducking by -9 dB ([`SING_DUCK_DEPTH`]).
 ///
-/// 0.6 lands the whole ESCALATION inside tier 5: the riff opens at -18.9 dBFS
-/// (bar 0, lean), reaches -14.9 by the chorus and tops out at -13.7 with the
-/// full build and clap. It still audibly grows — it grows INTO the ceiling
+/// 0.48 lands the whole ESCALATION inside tier 5 for the take-two bells
+/// (was 0.6 for the pulse voicing): the strike transients now carry the
+/// crest, so the same tier peak takes less body gain — on the audition
+/// bench the loudest moment of the set renders at ~-11.4 dBFS before and
+/// after the re-voice (within the ~0.5 dB tier-peak law) while the ring
+/// sits far below it. It still audibly grows — it grows INTO the ceiling
 /// instead of through it.
-const CELEBRATION_KIND_GAIN: f32 = 0.6;
+const CELEBRATION_KIND_GAIN: f32 = 0.48;
 
 // ---------------------------------------------------------------------------
 // The per-key song axes (owner: "I also want a more obvious difference in the
@@ -947,18 +1149,18 @@ fn celebration_mode(sig: u32) -> i32 {
     MODE_ROTATIONS[(sig % 3) as usize]
 }
 
-/// AXIS 4 — per-key pulse DUTY for the riff's lead (chip timbre families
-/// {0.25, 0.375, 0.5}), wired but GATED OFF: an owner decision pending the
-/// owner's ear. Duty is the loudest timbral lever the chip voice has — three
-/// keys apart would read as three different instruments — so it ships dark
-/// until it has been heard. Flipping the flag is the whole change.
-const CELEBRATION_KEY_DUTY: bool = false;
-fn celebration_duty(sig: u32) -> f32 {
-    if CELEBRATION_KEY_DUTY {
-        [0.25, 0.375, 0.5][((sig >> 8) % 3) as usize]
-    } else {
-        0.25
-    }
+/// AXIS 4 — the per-SECTION strike voicing (the bell's class identity):
+/// FM face brightness, mallet click weight and sparkle mix, one row per
+/// class. Still a pure function of the payload's class — the hand-over law
+/// holds — and still MEANING-sourced, not `sig`-hashed. (The retired
+/// pulse-duty table this replaces lived here; the pulse body is gone.)
+fn celebration_class_strike(class: u8) -> (f32, f32, f32) {
+    let i = usize::from(class.min(4));
+    (
+        SECTION_STRIKE_FM[i],
+        SECTION_STRIKE_CLICK[i],
+        SECTION_SPARKLE_MIX[i],
+    )
 }
 
 /// Which form slots are VERSE (per-key walk) vs the SHARED CHORUS. The
@@ -1016,15 +1218,6 @@ fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
         }
     }
     row
-}
-
-/// The synthetic signature the DEPRECATED `RiffBar { key }` shim delegates
-/// through: `6 · (key + 2)` decodes to root == the clamped key (`% 5`) in
-/// the home mode (`% 3 == 0`), so the unpatched host keeps its old 5-class
-/// transpose semantics until the pending patch lands. `key == 0` lands on
-/// `kitty_sing::NEUTRAL_SIGNATURE` exactly (cross-pinned by test).
-fn legacy_key_signature(key: i8) -> u32 {
-    6 * (i32::from(key).clamp(-2, 2) + 2) as u32
 }
 
 /// The pre-delay of eighth-grid slot `slot`, SWUNG: odd slots land
@@ -1408,9 +1601,8 @@ pub struct TrailSynth {
     /// apart — and nothing bound a typed note to the chord under it, so the
     /// typing was simply ducked out of the way rather than made to agree.
     ///
-    /// Latched by [`TrailSynth::latch_song_key`] from EVERY riff-bar variant —
-    /// the canonical `RiffBarSig` and the deprecated `RiffBar` shim alike, both
-    /// through the same `celebration_root(sig)` the riff itself transposes by —
+    /// Latched by [`TrailSynth::latch_song_key`] from every riff bar,
+    /// through the same `celebration_root(sig)` the riff itself transposes by,
     /// and released with the sing duck, so it is exactly as live as the song is:
     /// while the cat sings, what you type is IN THE SAME KEY and reads as
     /// counterpoint; the moment the song ends the typing is back on the neutral
@@ -1418,6 +1610,13 @@ pub struct TrailSynth {
     song_key: i8,
     /// Seconds of full sing-duck hold remaining (block-rate countdown).
     sing_hold: f32,
+    /// Seconds of SAMPLE time since the last riff bar was admitted — the
+    /// anchor the fill cue's sixteenth grid derives from
+    /// ([`CelebrationGesture::RiffFillCue`]). Starts (and, on the
+    /// exact-silence reset, returns to) [`RIFF_BAR_NEVER`]: with no bar
+    /// anchor every grid point reads as already past, so a stray cue
+    /// schedules nothing.
+    since_riff_bar: f32,
     /// DC blockers (one-pole highpass ~20 Hz) per channel.
     dc_x_l: f32,
     dc_y_l: f32,
@@ -1441,6 +1640,11 @@ const MASTER: f32 = 2.0;
 /// pressure. ~45 ms ⇒ at most ~22 voices/s even under key repeat.
 const MIN_GAP: f32 = 0.045;
 
+/// "No riff bar has ever sounded" for the fill cue's grid anchor
+/// ([`TrailSynth::since_riff_bar`]): far past any bar, so every grid point
+/// reads as already gone.
+const RIFF_BAR_NEVER: f32 = 1.0e6;
+
 /// PER-PALETTE LEVEL TRIM — the one knob that makes the loudness ladder a
 /// property of the GESTURE instead of the LOOK. Each palette's voice design has
 /// its own intrinsic level (a Mech thock is ~8 dB hotter than a Beam blip at
@@ -1462,18 +1666,23 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
         SoundVoice::Style => match style {
             GlowStyle::Lumen | GlowStyle::Custom => 0.95,
             GlowStyle::Phaser => 0.94,
-            // RE-FITTED 2026-08-10 with the sung doop, on the SAME quantity the
-            // ladder is written in: `mix_meter`'s isolated PEAK. The retuned
-            // voice measured -21.60 dBFS at the host default volume; ×1.0715
-            // lands it on the -21.0 floor (verified: -21.00).
+            // RE-FITTED 2026-08-15 with the tingly bell, on the SAME quantity
+            // the ladder is written in: `mix_meter`'s isolated PEAK at the
+            // host default volume. Fitted by DELTA against the previous
+            // verified fit rather than the meter's own suggestion line (that
+            // line targets gain 1.0 and prints a ×0.34 "correction" even for
+            // a correctly fitted palette — do not follow it): the sung doop
+            // re-measured exactly -21.00 @vol 0.40 at its parent commit, the
+            // re-voiced bell measured -18.64 through the same trim — 2.36 dB
+            // hot from the brighter transient and the added tink — so
+            // 1.1151 × 10^(-2.36/20) lands the bell back on the -21.0 floor
+            // (verified: -20.99).
             //
-            // The trim is deliberately NOT the knob for the clickiness the last
-            // pass introduced. A trim is one scalar: matching peak with it let
-            // RMS fall 3.5 dB and crest rise 3.6 dB, which is exactly how a
-            // voice gets sharper while the ladder keeps reporting success.
-            // Crest belongs to the VOICE (attack, decay, body) and is fixed
-            // there — see `RainbowKittyPalette::design`.
-            GlowStyle::RainbowKitty => 1.1151,
+            // The trim is deliberately NOT the knob for brightness or crest.
+            // A trim is one scalar: it holds the LADDER; the tingle lives in
+            // the VOICE (register, duty, attack, tink) and is measured there
+            // — see `RainbowKittyPalette::design`.
+            GlowStyle::RainbowKitty => 0.8498,
             GlowStyle::Sparkle => 1.27,
             GlowStyle::Fire => 0.88,
             GlowStyle::Laser => 0.77,
@@ -1514,6 +1723,7 @@ impl TrailSynth {
             sing: 0.0,
             song_key: 0,
             sing_hold: 0.0,
+            since_riff_bar: RIFF_BAR_NEVER,
             dc_x_l: 0.0,
             dc_y_l: 0.0,
             dc_x_r: 0.0,
@@ -1684,21 +1894,25 @@ impl TrailSynth {
                 self.design_trail(ev, kind, duck);
             }
             SoundGesture::Words(WordGesture::Bonk) => self.design_bonk(ev, duck),
-            SoundGesture::Celebration(CelebrationGesture::RiffBarSig { bar, sig }) => {
+            SoundGesture::Celebration(CelebrationGesture::RiffBar {
+                bar,
+                sig,
+                class,
+                energy_q,
+            }) => {
                 self.latch_song_key(sig);
-                self.design_celebration(ev, bar, sig);
+                self.design_celebration(ev, bar, sig, class, energy_q);
             }
-            #[allow(deprecated)]
-            SoundGesture::Celebration(CelebrationGesture::RiffBar { bar, key }) => {
-                // COMPAT (delete with the pending GUI patch): the unpatched
-                // host still speaks the 5-class key. Delegate through a
-                // synthetic signature whose derived root IS that key, so the
-                // legacy path keeps its old transpose while the design stays
-                // a pure function of ONE payload — INCLUDING the key latch,
-                // which now runs off that one payload for both variants.
-                let sig = legacy_key_signature(key);
+            SoundGesture::Celebration(CelebrationGesture::RiffFillCue { sig, sig_next }) => {
+                self.design_celebration_fill(ev, sig, sig_next);
+            }
+            SoundGesture::Celebration(CelebrationGesture::RiffCadence {
+                sig,
+                energy_q,
+                span_bars: _,
+            }) => {
                 self.latch_song_key(sig);
-                self.design_celebration(ev, bar, sig);
+                self.design_celebration_cadence(ev, sig, energy_q);
             }
         }
     }
@@ -2217,14 +2431,12 @@ impl TrailSynth {
     /// the typed note and the riff are transposed by the same integer, derived
     /// from the same `sig`, so they cannot drift apart.
     ///
-    /// THE DEFECT THIS CLOSES: the latch used to live in the DEPRECATED
-    /// `RiffBar { key }` arm only. The canonical `RiffBarSig` arm — the one the
-    /// pending GUI patch switches every host to — scheduled the riff and never
-    /// touched `song_key`, so on the payload the design is moving TO, the typed
-    /// melody silently kept walking the neutral lattice under a transposed
-    /// song: exactly the "two lattices that only happened to be a near-just
-    /// fourth apart" the feature was written to end. Both arms now latch, off
-    /// the same signature.
+    /// THE DEFECT THIS CLOSED (kept for the archaeology): the latch used to
+    /// live in the long-deleted `RiffBar { key }` shim arm only, so on the
+    /// canonical signature payload the typed melody silently kept walking
+    /// the neutral lattice under a transposed song — exactly the "two
+    /// lattices that only happened to be a near-just fourth apart" the
+    /// feature was written to end.
     fn latch_song_key(&mut self, sig: u32) {
         // THE WHOLE SHIFT, not half of it. The riff transposes every sounding
         // degree by `root + mode` (`design_celebration`), but this latch used
@@ -2267,8 +2479,21 @@ impl TrailSynth {
     ///   back to the reference key mid-modulation).
     /// * AXIS 3 — the MODE: [`celebration_mode`]'s pentatonic rotation,
     ///   folded in with the root — felt color, same lattice.
-    /// * AXIS 4 — per-key pulse DUTY ([`celebration_duty`]) — wired but
-    ///   gated OFF pending the owner's ear.
+    /// * AXIS 4 — the per-SECTION STRIKE voicing
+    ///   ([`celebration_class_strike`]): FM face brightness, mallet click
+    ///   weight and sparkle mix from the payload's class, so the sections
+    ///   read as different mallets on the same glass.
+    ///
+    /// THE ARC AXES (the SONG-BUILDER instrument), all payload-pure too:
+    /// `class` trims the gain ([`SECTION_GAIN`], inside the tier-5 ladder),
+    /// lifts the chorus keys ([`CELEBRATION_CLASS_LIFT`]), kills the octave
+    /// shimmer for the breath (class 4), picks the strike row and the clap
+    /// gate;
+    /// `energy_q` drives the build escalation (clamped at 200 == energy
+    /// 1.0) and the clap (RAW against [`CLAP_GATE_Q`]) — one number, two
+    /// reads, no double booking. Escalation from ENERGY instead of the bar
+    /// index is what keeps the build continuous across a key switch's
+    /// forward index jump.
     ///
     /// Deliberate deviations from the trail path, each an anti-annoyance
     /// inversion: NO governor duck (the armed state IS a key-repeat flood —
@@ -2296,8 +2521,23 @@ impl TrailSynth {
     ///
     /// Callers must latch the key with [`Self::latch_song_key`] first — see
     /// that method for why the two are separate.
-    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32) {
-        let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
+    fn design_celebration(&mut self, ev: SoundEvent, bar: u16, sig: u32, class: u8, energy_q: u8) {
+        let class = class.min(4); // boundary defense; the constructor clamps too
+        // SECTION DYNAMICS inside the tier-5 ladder: the class trim and the
+        // chorus-key lift ride the same `g` every voice of the bar scales
+        // by, so the whole bar (lead, bass partial, clap noise) moves as
+        // one instrument. Chorus key × chorus bar (1.10 × 1.12 ≈ 1.23) is
+        // deliberately uncapped — the loudest moment is earned twice.
+        let class_lift = if class == 1 {
+            CELEBRATION_CLASS_LIFT
+        } else {
+            1.0
+        };
+        let g = ev.gain
+            * (0.55 + 0.45 * ev.heat)
+            * CELEBRATION_KIND_GAIN
+            * SECTION_GAIN[usize::from(class)]
+            * class_lift;
         let idx = usize::from(bar) % CELEBRATION_PHRASE_BARS;
         // AXIS 1 — this key's verse (chorus bars come back authored).
         let phrase = &celebration_bar_degrees(sig, idx);
@@ -2307,20 +2547,29 @@ impl TrailSynth {
         // `melody_hz`, so the whole song modulates coherently and stays on
         // the shared consonant lattice.
         let shift = celebration_root(sig) + celebration_mode(sig);
-        // AXIS 4 — per-key duty, owner-gated (see [`CELEBRATION_KEY_DUTY`]).
-        let duty = celebration_duty(sig);
-        // Escalation ramp 0..1 across the opening bars of the hold. A PURE
-        // function of the bar index — no rng draw — so the riff replays
-        // independently of the typed layer's consumption of the shared stream.
-        let build = (f32::from(bar) / CELEBRATION_BUILD_BARS).min(1.0);
+        // AXIS 4 — the per-section STRIKE voicing (FM face, mallet click,
+        // sparkle mix — the bell's class identity).
+        let (strike_fm, click, sparkle_mix) = celebration_class_strike(class);
+        let sparkle = CELEBRATION_SPARKLE * sparkle_mix;
+        // THE ARC'S ESCALATION 0..1: the payload's energy, clamped at 200
+        // (energy 1.0) for the build — a pure function of the payload, no
+        // rng draw, so the riff replays independently of the typed layer's
+        // consumption of the shared stream, and CONTINUOUS across a key
+        // switch's forward bar-index jump.
+        let build = f32::from(energy_q.min(200)) / 200.0;
         let lift = CELEBRATION_BAR_LIFT[idx];
-        let clap = bar >= CELEBRATION_CLAP_BAR;
+        // THE CLAP reads the energy RAW: the earned headroom above 1.0 is
+        // exactly what crosses the gate (verse curve: bar 7, the pinned
+        // law; percussive keys clap early at 170).
+        let clap = energy_q >= CLAP_GATE_Q[usize::from(class)];
         let turnaround = idx == CELEBRATION_PHRASE_BARS - 1;
         // On the turnaround the last two slots belong to the fill, so a
         // sustain may not reach into them.
         let sustain_limit = if turnaround { 6 } else { phrase.len() };
-        let lp_cut = 2800.0 + 1400.0 * build;
-        let shimmer = 0.10 + 0.12 * build;
+        let lp_cut = CELEBRATION_LP_FLOOR + CELEBRATION_LP_SPAN * build;
+        // The BREATH (class 4) exhales the octave shimmer entirely — the
+        // quiet passage is dim as well as thin.
+        let shimmer = if class == 4 { 0.0 } else { 0.10 + 0.12 * build };
         for (i, &deg) in phrase.iter().enumerate() {
             if deg == REST {
                 continue; // held by the note before it
@@ -2333,7 +2582,9 @@ impl TrailSynth {
             let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
             // The BASSLINE rides the lead voice that opens its beat — third
             // partial, no extra voice. `build` fades the low end in over the
-            // opening bars.
+            // opening bars. Every OTHER voice's free third partial carries
+            // the bell's TINKLE instead: a quiet double-octave sine ping
+            // ([`CELEBRATION_SPARKLE`]) — downbeats ground, offbeats ring.
             let sub = if i.is_multiple_of(2) && bass_bar[i / 2] != REST {
                 let b = self.melody_hz(CELEBRATION_BASE_HZ, bass_bar[i / 2] + shift);
                 Partial {
@@ -2343,35 +2594,57 @@ impl TrailSynth {
                     ..Partial::default()
                 }
             } else {
-                Partial::default()
+                Partial {
+                    lvl: sparkle,
+                    f0: hz * 4.0,
+                    f1: hz * 4.0,
+                    ..Partial::default()
+                }
             };
-            // BACKBEAT CLAP once the hold has run a full phrase: fused into the
-            // note's own band-passed noise channel, so it costs no voice.
+            // THE MALLET: every note opens with the ~8 ms click, fused into
+            // the note's own band-passed noise channel (no extra voice). On
+            // an earned backbeat the click widens into the CLAP — louder,
+            // mid-band, 20 ms — keeping its pinned 2.6 kHz signature.
             let (n_lvl, n_f0, n_f1, n_glide, n_q) = if clap && (i == 2 || i == 6) {
-                (0.10, 2600.0, 1200.0, 0.02, 1.4)
+                (CELEBRATION_CLAP_LVL, 2600.0, 900.0, 0.02, 1.4)
             } else {
-                (0.0, 0.0, 0.0, 0.0, 0.0)
+                (
+                    click,
+                    CELEBRATION_STRIKE_HZ,
+                    CELEBRATION_STRIKE_FLOOR_HZ,
+                    CELEBRATION_STRIKE_GLIDE,
+                    CELEBRATION_STRIKE_Q,
+                )
             };
             let v = Voice {
                 delay: celebration_slot_delay(i),
-                // Span 1 is EXACTLY 0.30 s: in f32,
-                // `CELEBRATION_EIGHTH * 1.5 == 0.30` bit for bit.
-                dur: span as f32 * CELEBRATION_EIGHTH * 1.5,
-                attack: 0.004,
-                decay: 0.10 * span as f32,
+                // BELL: the note owns its slots and RINGS two slots beyond
+                // them at tail level ([`CELEBRATION_RING`]); the struck
+                // envelope below is what keeps that from reading as
+                // sustain.
+                dur: span as f32 * CELEBRATION_EIGHTH * CELEBRATION_RING,
+                attack: CELEBRATION_LEAD_ATTACK,
+                decay: CELEBRATION_LEAD_DECAY * span as f32,
                 p: [
+                    // GLASS BODY: a sine that GLINTS at the strike — the
+                    // inharmonic FM face decays ~2x faster than the body,
+                    // so the hit is bright metal and the ring is pure.
                     Partial {
-                        lvl: 0.55,
+                        lvl: 0.34,
                         f0: hz,
                         f1: hz,
-                        wave: Wave::Pulse { duty },
+                        fm_ratio: CELEBRATION_STRIKE_FM_RATIO,
+                        fm_i0: strike_fm,
+                        fm_tau: CELEBRATION_STRIKE_FM_TAU,
                         ..Partial::default()
                     },
+                    // The octave shimmer, now a pure partial too (the
+                    // escalation still grows it; the breath still exhales
+                    // it).
                     Partial {
                         lvl: shimmer,
                         f0: hz * 2.0,
                         f1: hz * 2.0,
-                        wave: Wave::Pulse { duty: 0.5 },
                         ..Partial::default()
                     },
                     sub,
@@ -2402,26 +2675,43 @@ impl TrailSynth {
                 let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
                 let v = Voice {
                     delay: (6.0 + 0.5 * k as f32) * CELEBRATION_EIGHTH,
+                    // The fill keeps its exact one-eighth duration (the
+                    // sixteenths already ring into each other at 0.1 s
+                    // spacing — and `fill_carries_root` fingerprints fill
+                    // voices by this bit-exact dur); the ANNOUNCEMENT is in
+                    // the strike — brighter glass, harder click than any
+                    // lead class, authored the same for every key.
                     dur: CELEBRATION_EIGHTH,
-                    attack: 0.003,
-                    decay: 0.055,
+                    attack: CELEBRATION_LEAD_ATTACK,
+                    decay: 0.04,
                     p: [
                         Partial {
-                            lvl: 0.55,
+                            lvl: 0.34,
                             f0: hz,
                             f1: hz,
-                            wave: Wave::Pulse { duty },
+                            fm_ratio: CELEBRATION_STRIKE_FM_RATIO,
+                            fm_i0: CELEBRATION_FILL_STRIKE_FM,
+                            fm_tau: CELEBRATION_STRIKE_FM_TAU,
                             ..Partial::default()
                         },
                         Partial {
                             lvl: shimmer,
                             f0: hz * 2.0,
                             f1: hz * 2.0,
-                            wave: Wave::Pulse { duty: 0.5 },
                             ..Partial::default()
                         },
-                        Partial::default(),
+                        Partial {
+                            lvl: CELEBRATION_SPARKLE,
+                            f0: hz * 4.0,
+                            f1: hz * 4.0,
+                            ..Partial::default()
+                        },
                     ],
+                    n_lvl: CELEBRATION_FILL_CLICK,
+                    n_f0: CELEBRATION_FILL_STRIKE_HZ,
+                    n_f1: CELEBRATION_STRIKE_FLOOR_HZ,
+                    n_glide: CELEBRATION_FILL_STRIKE_GLIDE,
+                    n_q: CELEBRATION_STRIKE_Q,
                     lp_cut,
                     duck_exempt: true,
                     ..Voice::default()
@@ -2436,6 +2726,178 @@ impl TrailSynth {
         // Arm + hold the sing duck for the whole bar (plus a hair so two
         // bars scheduled back-to-back never gap): constant depth while bars
         // keep arriving, exponential handback once they stop.
+        self.sing = 1.0;
+        self.sing_hold = CELEBRATION_BAR_SECONDS + 0.1;
+        // The fill cue's grid anchor: this bar's downbeat, on the sample
+        // clock ([`Self::since_riff_bar`]).
+        self.since_riff_bar = 0.0;
+    }
+
+    /// THE DRUMMER'S CUE ([`CelebrationGesture::RiffFillCue`]): the four
+    /// authored turnaround sixteenths, landing on THIS bar's last beat by
+    /// the synth's own grid — hit `k` belongs at bar-time `1.2 + 0.1*k` on
+    /// the sample clock anchored at the last riff bar, and a hit whose
+    /// grid point already passed is dropped, never rescheduled (the
+    /// sixteenth-quantize law; block granularity ~10.7 ms is well inside
+    /// half a sixteenth). Pitch WALKS from the departed key's shift into
+    /// the arriving key's across the four hits — the pivot leg of the
+    /// graceful merge; with no shift change the walk degenerates to the
+    /// authored fill verbatim. Bell voicing, <= 4 voices, governor-
+    /// bypassed like all Celebration; worst-case concurrency bar-0's
+    /// 8 + 4 = 12 <= MAX_VOICES.
+    fn design_celebration_fill(&mut self, ev: SoundEvent, sig: u32, sig_next: u32) {
+        let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
+        let from = celebration_root(sig) + celebration_mode(sig);
+        let to = celebration_root(sig_next) + celebration_mode(sig_next);
+        // The cue only fires on a LIVE, bars-deep celebration (the host
+        // latches it at a switch commit), so the full-build face is the
+        // honest constant: open lowpass, grown shimmer.
+        let lp_cut = CELEBRATION_LP_FLOOR + CELEBRATION_LP_SPAN;
+        let shimmer = 0.22;
+        for (k, &deg) in CELEBRATION_FILL.iter().enumerate() {
+            let delay = (6.0 + 0.5 * k as f32) * CELEBRATION_EIGHTH - self.since_riff_bar;
+            if delay < 0.0 {
+                continue; // grid point already past - drop, never slide
+            }
+            // THE PIVOT WALK: hit 0 speaks the departed key, hit 3 the
+            // arriving one, the middle hits stepping the shortest integer
+            // path between the two shifts on the shared lattice.
+            let step = ((to - from) as f32 * (k as f32 / 3.0)).round() as i32;
+            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + from + step);
+            let v = Voice {
+                delay,
+                dur: CELEBRATION_EIGHTH,
+                attack: CELEBRATION_LEAD_ATTACK,
+                decay: 0.04,
+                // The cue IS the fill — same announcement strike (bright
+                // glass, hard click), so the drummer's count-in sounds the
+                // same whether the turnaround or a key switch calls it.
+                p: [
+                    Partial {
+                        lvl: 0.34,
+                        f0: hz,
+                        f1: hz,
+                        fm_ratio: CELEBRATION_STRIKE_FM_RATIO,
+                        fm_i0: CELEBRATION_FILL_STRIKE_FM,
+                        fm_tau: CELEBRATION_STRIKE_FM_TAU,
+                        ..Partial::default()
+                    },
+                    Partial {
+                        lvl: shimmer,
+                        f0: hz * 2.0,
+                        f1: hz * 2.0,
+                        ..Partial::default()
+                    },
+                    Partial {
+                        lvl: CELEBRATION_SPARKLE,
+                        f0: hz * 4.0,
+                        f1: hz * 4.0,
+                        ..Partial::default()
+                    },
+                ],
+                n_lvl: CELEBRATION_FILL_CLICK,
+                n_f0: CELEBRATION_FILL_STRIKE_HZ,
+                n_f1: CELEBRATION_STRIKE_FLOOR_HZ,
+                n_glide: CELEBRATION_FILL_STRIKE_GLIDE,
+                n_q: CELEBRATION_STRIKE_Q,
+                lp_cut,
+                duck_exempt: true,
+                ..Voice::default()
+            };
+            self.spawn(
+                v,
+                g * (0.34 + 0.06 * k as f32),
+                celebration_sway(ev.pan, deg),
+            );
+        }
+    }
+
+    /// THE ENDING ([`CelebrationGesture::RiffCadence`]): three bell leads —
+    /// V (degree 4, slots 0-1), a passing tone (degree 2, slots 2-3), the
+    /// tonic "ta-daa" (degree 0, slots 4-7, tail x1.5) — in the released
+    /// key's shift, the bass third-partial grounding slots 0 and 4
+    /// (degrees -7 -> -10: the V-I walk home under the carrier law), a
+    /// fused clap on the tonic when `energy_q` crossed the verse gate, and
+    /// the sing duck armed for the bar so typing under the ending ducks at
+    /// full depth (the a-keypress-ducks-the-cadence law). 3 voices, <= 4
+    /// pinned; escalation face and gain both read the EARNED energy.
+    fn design_celebration_cadence(&mut self, ev: SoundEvent, sig: u32, energy_q: u8) {
+        let build = f32::from(energy_q.min(200)) / 200.0;
+        let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN * (0.8 + 0.2 * build);
+        let shift = celebration_root(sig) + celebration_mode(sig);
+        let lp_cut = CELEBRATION_LP_FLOOR + CELEBRATION_LP_SPAN * build;
+        let shimmer = 0.10 + 0.12 * build;
+        // (slot, degree, owned slots, bass degree under it)
+        const CADENCE_LEAD: [(usize, i32, f32, i32); 3] =
+            [(0, 4, 2.0, -7), (2, 2, 2.0, REST), (4, 0, 4.0, -10)];
+        for &(slot, deg, span, bass) in &CADENCE_LEAD {
+            let hz = self.melody_hz(CELEBRATION_BASE_HZ, deg + shift);
+            let tonic = deg == 0;
+            let sub = if bass != REST {
+                let b = self.melody_hz(CELEBRATION_BASE_HZ, bass + shift);
+                Partial {
+                    lvl: 0.42 * build,
+                    f0: b,
+                    f1: b,
+                    ..Partial::default()
+                }
+            } else {
+                Partial {
+                    lvl: CELEBRATION_SPARKLE,
+                    f0: hz * 4.0,
+                    f1: hz * 4.0,
+                    ..Partial::default()
+                }
+            };
+            // The earned clap, fused into the tonic's own noise channel.
+            // The cadence bells keep their noise channel otherwise SILENT —
+            // the ending's law is "the clap is the tonic's alone", so the
+            // mallet here is the FM glass face only.
+            let (n_lvl, n_f0, n_f1, n_glide, n_q) = if tonic && energy_q >= CLAP_GATE_Q[0] {
+                (CELEBRATION_CLAP_LVL, 2600.0, 900.0, 0.02, 1.4)
+            } else {
+                (0.0, 0.0, 0.0, 0.0, 0.0)
+            };
+            let v = Voice {
+                delay: celebration_slot_delay(slot), // even slots: no swing
+                dur: span * CELEBRATION_EIGHTH * CELEBRATION_RING,
+                attack: CELEBRATION_LEAD_ATTACK,
+                // The tonic RINGS: the x1.5 tail is the "daa" of the
+                // ta-daa.
+                decay: CELEBRATION_LEAD_DECAY * span * if tonic { 1.5 } else { 1.0 },
+                p: [
+                    Partial {
+                        lvl: 0.34,
+                        f0: hz,
+                        f1: hz,
+                        fm_ratio: CELEBRATION_STRIKE_FM_RATIO,
+                        fm_i0: SECTION_STRIKE_FM[0],
+                        fm_tau: CELEBRATION_STRIKE_FM_TAU,
+                        ..Partial::default()
+                    },
+                    Partial {
+                        lvl: shimmer,
+                        f0: hz * 2.0,
+                        f1: hz * 2.0,
+                        ..Partial::default()
+                    },
+                    sub,
+                ],
+                n_lvl,
+                n_f0,
+                n_f1,
+                n_glide,
+                n_q,
+                lp_cut,
+                duck_exempt: true,
+                ..Voice::default()
+            };
+            let groove = CELEBRATION_GROOVE[slot] * if tonic { 1.15 } else { 1.0 };
+            self.spawn(v, g * groove, celebration_sway(ev.pan, deg));
+        }
+        // The ending replaces the melody exactly like a bar does: duck
+        // armed and held, exponential handback after — the audio tail the
+        // deferred wind-down was timed around.
         self.sing = 1.0;
         self.sing_hold = CELEBRATION_BAR_SECONDS + 0.1;
     }
@@ -2454,6 +2916,7 @@ impl TrailSynth {
         // Rate estimate decays with real (sample-clock) time.
         self.since_event += dt_block;
         self.since_voice += dt_block;
+        self.since_riff_bar = (self.since_riff_bar + dt_block).min(RIFF_BAR_NEVER);
         self.rate *= (-dt_block / 0.6).exp();
 
         if self.is_quiet() {
@@ -2468,6 +2931,7 @@ impl TrailSynth {
             self.sing = 0.0;
             self.sing_hold = 0.0;
             self.song_key = 0;
+            self.since_riff_bar = RIFF_BAR_NEVER;
             return;
         }
 
@@ -3201,91 +3665,107 @@ impl Palette for RainbowKittyPalette {
         deg: i32,
         _col_off: i32,
     ) {
-        // THE SUNG DOOP — "musical, lyrical and cute" (owner, 2026-08-10).
+        // THE TINGLY BELL — "The new sounds for typing are not tingly bell
+        // enough. I like the older sounds." (owner, 2026-08-15). This ruling
+        // OVERRIDES the sung doop of 2026-08-10 ("musical, lyrical and cute")
+        // and its measured targets: the owner heard the released voice and
+        // ruled for the one it replaced.
         //
-        // WHAT WAS WRONG. `57ad9c7c` ("the doop is cute again") was briefed as
-        // "a BIT cuter" but measured as a FULL revert to the founding voice: at
-        // HEAD the keystroke sat within 1.3 % of `c48b10e4`'s spectral centroid
-        // (1692 Hz vs 1714) and 2.2 % of its share of energy over 2 kHz (0.262
-        // vs 0.268), while the version the owner asked to come back — the
-        // mellow G4 doop that shipped in v0.18.0 — measures 1010 Hz / 0.051.
-        // The two axes that commit kept for the July "more mellow" brief (dur
-        // 0.105, sub-octave 0.09) carry essentially none of the timbre.
+        // WHAT WAS WRONG. `4a292436` read the v0.20.0 cute doop's measurements
+        // (centroid 1692 Hz, 0.262 of its energy over 2 kHz, crest 17.6 dB) as
+        // defects — "CLICKINESS" — and re-voiced the keystroke a fourth down
+        // (G4), widened the duty to 0.375, tripled the attack and doubled the
+        // sub-octave, landing at 963 Hz / 0.054. Every one of those axes moved
+        // AWAY from what the owner, listening to the release, now names as
+        // the thing he liked: the tingle. Brightness was the identity, not
+        // the bug. (The sung doop's own post-mortem of `57ad9c7c` is kept
+        // below for the trim-fitting lesson it carries.)
         //
-        // Worse, its trim re-fit was done on the WRONG QUANTITY: `mix_meter`
-        // reports PEAK, so 1.39 → 1.097 equalised peak to within 0.1 dB while
-        // RMS fell 3.5 dB and CREST rose 3.6 dB (14.0 → 17.6). "Cuteness must
-        // not buy loudness" was enforced; what it bought instead was
-        // CLICKINESS, and nothing measured that. Sensory roughness in the
-        // 15-30 Hz band rose 38 % with it.
+        // WHAT THIS IS: the older voice's brightness axes restored, plus the
+        // one element the owner's word "bell" names that no doop ever had —
+        // a ringing top. Knob by knob:
+        // - REGISTER back to C5 (523.25), the founding chip register — the
+        //   fundamental sits where the older voice sang.
+        // - DUTY back to the founding 25 % chirp: full-strength second
+        //   harmonic, the bright nasal edge that read as "tingly".
+        // - ATTACK back to 1.2 ms — the tick on the front IS the mallet of
+        //   this tiny bell; the sung doop's 3 ms rounded it off.
+        // - BODY back to short: dur 0.110 / decay 0.055 (the older 0.105 /
+        //   0.052 with 5 ms more ring for the tink to live in), sub-octave
+        //   back down to 0.09 — floor enough that the chirp is a note.
+        // - THE TINK, the new part: a double-octave sine (4f) at 0.22 on the
+        //   third partial slot — the celebration bells' sparkle idiom
+        //   (`CELEBRATION_SPARKLE`) scaled to a keystroke. No FM, no noise:
+        //   the older sound had neither, and the ruling says LIKE THE OLDER
+        //   SOUNDS. The tink is pure glass over the founding chirp.
+        // - THE ROOF opens 2600 → 3000: a one-pole corner at 2600 sat right
+        //   on the tink's band (4f of the melody's C5-region notes is
+        //   2.1–4.2 kHz); at 3000 the tingle passes while the corner still
+        //   keeps the chirp's upper harmonics polite.
+        // - THE BEND stays. It is the gesture family's articulation (a
+        //   deletion is the keystroke mirrored), 12 ms and over before the
+        //   tenth of the note — it survives the ruling because it is
+        //   inaudible as pitch and structural to the family's tests.
         //
-        // WHAT THIS IS. Cute is not the same axis as bright, and neither is the
-        // same axis as sharp. Each knob was moved for one reason and measured:
-        // - REGISTER — back to G4, the register of the voice the owner picked
-        //   out by ear. What brightness the doop has now comes from a pulse's
-        //   harmonics under a soft corner, not from transposing the fundamental
-        //   up a fourth and hoping.
-        // - DUTY 0.375, between the founding 25 % chirp and the mellow 50 %
-        //   square. Duty is the loudest timbral lever a chip voice has: at
-        //   25 % the second harmonic is at full strength (nasal, cartoonish —
-        //   and the sharpest crest of the three), at 50 % it vanishes entirely
-        //   (hollow, organ-like). 0.375 keeps ~71 % of that harmonic, which is
-        //   audibly a chip voice, while its stronger fundamental is worth
-        //   ~1.3 dB of RMS against the same peak — i.e. the same loudness with
-        //   less of it in the transient.
-        // - THE ATTACK is 3.0 ms, not 1.2. A sub-2 ms attack on a narrow pulse
-        //   IS the click; at 3 ms the note still starts crisply but the
-        //   transient stops out-peaking its own body.
-        // - THE BODY comes back: dur 0.140 / decay 0.078 and a sub-octave at
-        //   0.18 (the mellow voice's weight, twice HEAD's). Peak is unchanged —
-        //   the ladder is a peak law — and RMS and crest are what move.
-        // - THE BEND is the new part, and the LYRICAL one: every doop SINGS
-        //   onto its note from a lattice step below (`gesture_bend`) instead of
-        //   starting dead on it. That tiny scoop is what turns a row of blips
-        //   into a row of little sung syllables — and it is the same
-        //   articulation, mirrored, that makes a deletion read as the keystroke
-        //   undone (see the gesture-family section).
+        // THE TRIM LESSON, inherited. `57ad9c7c` ("the doop is cute again") was briefed as
+        // "a BIT cuter" but landed a full revert to the founding voice, and its
+        // trim re-fit was done on the WRONG QUANTITY: `mix_meter` reports
+        // PEAK, so 1.39 → 1.097 equalised peak to within 0.1 dB while RMS
+        // fell 3.5 dB and CREST rose 3.6 dB (14.0 → 17.6). "Cuteness must not
+        // buy loudness" was enforced; what it bought instead went unmeasured.
+        // The lesson stands for THIS re-voice too: fit the trim on peak to
+        // hold the −21.0 dBFS ladder floor, and WATCH RMS and crest while
+        // doing it — this voice's crest is high (the older voice's was
+        // 17.6 dB) because that sharpness is the ruled-for identity, but it
+        // must be a measured choice, not a fitting artifact.
         //
         // MEASURED over the 12.5 s typing script (`typing_voice_ab`, scenario
-        // `a-neutral`), against HEAD → this voice, with the v0.18.0 mellow
-        // reference in brackets:
-        //   spectral centroid  1692 → 963 Hz   [1010]
-        //   energy over 2 kHz  0.262 → 0.054   [0.051]
-        //   roughness 15-30 Hz 0.178 → 0.110   [0.129]
-        //   RMS                -35.5 → -32.3   [-32.1]
-        //   CREST              17.6 → 14.5 dB  [14.0]
-        // — inside the mellow voice's numbers on every axis, with the trim
-        // re-fitted to hold the ladder floor on PEAK exactly as before.
-        let base = 392.0; // G4 — the chip register the owner picked by ear
+        // `a-neutral`), sung doop → this voice, with the v0.20.0 cute-doop
+        // reference (the "older sounds" the ruling asks for) in brackets:
+        //   spectral centroid  963 → 1633 Hz   [~1692]
+        //   energy over 2 kHz  0.054 → 0.252   [~0.262]
+        // — the two brightness axes back inside the older voice's
+        // neighbourhood (each within 4 % of the reference), with the tink
+        // carrying the top of the tail. The gesture family holds: f-family
+        // measures 1551 Hz / 0.223 — deletions and word motions brighten
+        // with the keystroke they mirror instead of lagging an era behind.
+        let base = 523.25; // C5 — the founding chip register, ruled back in
         // `deg` already carries the family's deletion step; the palette states
         // the TIMBRE, not the interval.
         let (f0, f1) = gesture_bend(s.melody_hz(base, deg), gesture_shape(kind).dir);
         let mk = |f0: f32, f1: f32, delay: f32| Voice {
             delay,
-            dur: 0.140,
-            attack: 0.0030,
-            decay: 0.078,
+            dur: 0.110,
+            attack: 0.0012,
+            decay: 0.055,
             p: [
                 Partial {
-                    lvl: 0.5,
+                    lvl: 0.52,
                     f0,
                     f1,
                     glide: GESTURE_BEND_TAU,
-                    wave: Wave::Pulse { duty: 0.375 },
+                    wave: Wave::Pulse { duty: 0.25 },
                     ..Partial::default()
                 },
-                // Sub-octave sine: the warmth under the doop — the body that
-                // keeps the blip from reading as a tick.
+                // Sub-octave sine: just enough floor that the chirp is a
+                // note and not a tick.
                 Partial {
-                    lvl: 0.18,
+                    lvl: 0.09,
                     f0: f0 * 0.5,
                     f1: f1 * 0.5,
                     glide: GESTURE_BEND_TAU,
                     ..Partial::default()
                 },
-                Partial::default(),
+                // THE TINK — the double-octave glass that makes it a bell.
+                Partial {
+                    lvl: 0.22,
+                    f0: f0 * 4.0,
+                    f1: f1 * 4.0,
+                    glide: GESTURE_BEND_TAU,
+                    ..Partial::default()
+                },
             ],
-            lp_cut: 2600.0,
+            lp_cut: 3000.0,
             ..Voice::default()
         };
         s.spawn(mk(f0, f1, 0.0), g * 0.34, ev.pan);
@@ -3315,7 +3795,7 @@ impl Palette for RainbowKittyPalette {
         (b.lp1 * lvl * 0.022, 0.0)
     }
 
-    /// Tracks the palette's own `base` (G4). The bonk's clash is defined as an
+    /// Tracks the palette's own `base` (C5). The bonk's clash is defined as an
     /// interval AGAINST the voice it interrupts (`BONK_MINOR_SECOND` /
     /// `BONK_TRITONE` against this anchor), and the movement family sings in
     /// this register too, so an anchor left behind at an old `base` would stop
@@ -3323,7 +3803,7 @@ impl Palette for RainbowKittyPalette {
     /// invariant `tone_tables_are_mutually_consonant_and_exclude_the_bonk_clash`
     /// pins the two moving together.
     fn anchor_hz(&self) -> f32 {
-        392.0
+        523.25
     }
 }
 
@@ -5581,10 +6061,11 @@ mod tests {
     fn bonk_is_discordant_against_the_walk_and_moves_nothing() {
         let mut s = TrailSynth::new(48_000.0, 33);
         let walk_before = s.walk;
-        // The rainbow kitty's anchor (G4) at the current degree — one register
+        // The rainbow kitty's anchor (C5) at the current degree — one register
         // per palette (`Palette::anchor_hz`), tracking its `base`, so it moved
-        // with the typing voice when the doop went back to G4 on 2026-08-10.
-        let root = penta(392.0, walk_before);
+        // with the typing voice when the doop went back to G4 on 2026-08-10
+        // and again when the tingly bell went back up to C5 on 2026-08-15.
+        let root = penta(523.25, walk_before);
         s.push(bonk(GlowStyle::RainbowKitty));
         assert_eq!(s.walk, walk_before, "a bonk must not step the melody walk");
         assert_eq!(
@@ -5901,7 +6382,10 @@ mod tests {
         );
         for current in [0u64, 1, 5, 6, 7, 8, 9, 63, 64, 1000, u64::from(u16::MAX)] {
             let target = crate::kitty_sing::section_reopen_bar(current);
-            assert!(target > current, "the reopened section outruns bar {current}");
+            assert!(
+                target > current,
+                "the reopened section outruns bar {current}"
+            );
             let slot = (target % (CELEBRATION_PHRASE_BARS as u64)) as usize;
             assert_eq!(slot, 0, "reopen from bar {current} landed mid-form");
             assert!(CELEBRATION_VERSE[slot]);
@@ -6126,8 +6610,9 @@ mod tests {
     /// landed in the REFERENCE key, not the held one.
     #[test]
     fn fill_carries_root() {
-        // Legacy key +2 == sig 24: root +2, home mode — the shift is pure root.
-        let sig = legacy_key_signature(2);
+        // sig 24: 24 % 5 == 4 ⇒ root +2, 24 % 3 == 0 ⇒ home mode — the
+        // shift is pure root.
+        let sig = 24u32;
         assert_eq!(celebration_root(sig), 2);
         assert_eq!(celebration_mode(sig), 0);
         let mut s = TrailSynth::new(48_000.0, 3);
@@ -6261,62 +6746,502 @@ mod tests {
     }
 
     /// The neutral signature (nothing held) IS the reference voicing — root
-    /// 0, home mode — and the legacy key shim lands exactly on it for key 0.
+    /// 0, home mode.
     /// Cross-pins `kitty_sing::NEUTRAL_SIGNATURE` to this module's decode.
     #[test]
     fn neutral_signature_is_the_reference_voicing() {
         use crate::kitty_sing::NEUTRAL_SIGNATURE;
         assert_eq!(celebration_root(NEUTRAL_SIGNATURE), 0);
         assert_eq!(celebration_mode(NEUTRAL_SIGNATURE), 0);
-        assert_eq!(legacy_key_signature(0), NEUTRAL_SIGNATURE);
     }
 
-    /// The DEPRECATED `RiffBar { key }` shim (alive only until the pending
-    /// GUI patch lands): it decodes to root == clamped key in the home mode,
-    /// and still schedules a full bar through `push` — the unpatched host
-    /// keeps a working (5-class) celebration during the transition window.
+    /// ACCEPTANCE 8 — the legacy shim still claps: `riff_bar(bar, sig)`
+    /// walks the exact single-hold verse curve `q = min(60 + 25·bar, 250)`,
+    /// its build (read back off the voices' lowpass) is `min(0.30 +
+    /// 0.125·bar, 1.0)` — 1.0 at bar 6, exactly where the retired
+    /// `min(bar/6, 1)` ramp landed — monotone all the way, and the clap is
+    /// present from BAR 7 (one bar earlier than the retired `bar ≥ 8`
+    /// gate: the new pinned law). DOCUMENTED DEVIATION from the spec's
+    /// "identical to min(bar/6,1) within one quantum" prose: the low bars
+    /// open at the arc floor (bar 0 build 0.30, not 0.0) — the two curves
+    /// only meet at bar 6+ and the spec's own shim constants (60 + 25·bar)
+    /// SAY so; the pinned equivalences are the bar-6 summit and the bar-7
+    /// clap. Existing shim callers (`examples/typing_voice_ab.rs`,
+    /// `mix_meter.rs`) regress nothing else — the clap-kill defect's
+    /// regression pin.
     #[test]
-    #[allow(deprecated)]
-    fn legacy_riff_bar_shim_keeps_the_old_transpose() {
-        for key in -4..=4i8 {
-            let sig = legacy_key_signature(key);
-            assert_eq!(celebration_root(sig), i32::from(key).clamp(-2, 2));
+    fn the_legacy_shim_still_claps() {
+        let mut prev_build = -1.0f32;
+        for bar in 0..=10u16 {
+            // The payload curve itself.
+            let CelebrationGesture::RiffBar {
+                class, energy_q, ..
+            } = CelebrationGesture::riff_bar(bar, 0)
+            else {
+                unreachable!("riff_bar constructs the riff-bar variant");
+            };
+            assert_eq!(class, 0, "the shim speaks verse");
             assert_eq!(
-                celebration_mode(sig),
-                0,
-                "legacy keys stay in the home mode"
+                u32::from(energy_q),
+                (60 + 25 * u32::from(bar)).min(250),
+                "bar {bar}: the shim walks the single-hold verse curve"
+            );
+            // The rendered consequences: build via lp_cut, clap via n_lvl.
+            let mut s = TrailSynth::new(48_000.0, 7);
+            s.push(riff(GlowStyle::RainbowKitty, bar));
+            let lp = s
+                .voices
+                .iter()
+                .filter(|v| v.on)
+                .map(|v| v.lp_cut)
+                .fold(0.0f32, f32::max);
+            let build = (lp - CELEBRATION_LP_FLOOR) / CELEBRATION_LP_SPAN;
+            let expect = (0.30 + 0.125 * f32::from(bar)).min(1.0);
+            assert!(
+                (build - expect).abs() < 1e-3,
+                "bar {bar}: build {build} != verse-curve {expect}"
+            );
+            assert!(build >= prev_build, "the shim build stays monotone");
+            prev_build = build;
+            // Every bell now opens with a mallet click in its noise
+            // channel (the take-two strike), so the clap is detected by
+            // its own pinned signature: the 2.6 kHz band no click uses.
+            let clapping = s
+                .voices
+                .iter()
+                .any(|v| v.on && v.n_lvl > 0.0 && v.n_f0 == 2600.0);
+            assert_eq!(
+                clapping,
+                bar >= 7,
+                "bar {bar}: the clap fires from bar 7 — the new pinned law"
             );
         }
-        let mut s = TrailSynth::new(48_000.0, 5);
+    }
+
+    /// ACCEPTANCE 5 — sections change TIMBRE, never the clock or the form:
+    /// the same `(sig, bar, energy)` rendered as all five classes schedules
+    /// voices with IDENTICAL slot onsets, pre-delays and durations (rhythm,
+    /// swing and form are class-blind), ≤ 10 voices for every class, the
+    /// lead's STRIKE voicing follows the class tables (the bell-pass axis:
+    /// [`SECTION_STRIKE_FM`] on the glass face, [`SECTION_STRIKE_CLICK`] on
+    /// the mallet click, [`SECTION_SPARKLE_MIX`] on the tink), gains scale
+    /// by [`SECTION_GAIN`] (× the chorus-key lift for class 1), and the
+    /// breath's shimmer partial is silenced.
+    #[test]
+    fn sections_change_timbre_not_the_clock_or_the_form() {
+        let sig = crate::kitty_sing::song_signature('w');
+        let energy_q = 200u8;
+        let bar = 1u16; // a verse bar: full 8-voice phrase, no fill
+        let render_class = |class: u8| {
+            let mut s = TrailSynth::new(48_000.0, 42);
+            s.push(SoundEvent {
+                kind: SoundGesture::Celebration(CelebrationGesture::riff_bar_arc(
+                    bar, sig, class, energy_q,
+                )),
+                ..riff(GlowStyle::RainbowKitty, 0)
+            });
+            let mut voices: Vec<Voice> = s.voices.iter().filter(|v| v.on).copied().collect();
+            voices.sort_by(|a, b| a.delay.total_cmp(&b.delay));
+            voices
+        };
+        let reference = render_class(0);
+        assert!(reference.len() <= 10, "the riff voice budget holds");
+        let ref_gain: f32 = reference.iter().map(|v| v.gl + v.gr).sum();
+        for class in 0u8..=4 {
+            let voices = render_class(class);
+            assert_eq!(voices.len(), reference.len(), "class {class}: voice count");
+            assert!(voices.len() <= 10);
+            for (v, r) in voices.iter().zip(&reference) {
+                assert_eq!(
+                    v.delay.to_bits(),
+                    r.delay.to_bits(),
+                    "class {class}: slot onsets/pre-delays are class-blind"
+                );
+                assert_eq!(
+                    v.dur.to_bits(),
+                    r.dur.to_bits(),
+                    "class {class}: durations are class-blind"
+                );
+                assert_eq!(
+                    v.p[0].f0.to_bits(),
+                    r.p[0].f0.to_bits(),
+                    "class {class}: pitch is class-blind"
+                );
+                // The STRIKE axis (the bell pass): the lead body is GLASS
+                // — a sine, never a pulse — and the strike's FM face
+                // carries the class's brightness.
+                assert_eq!(v.p[0].wave, Wave::Sine, "class {class}: glass, not buzz");
+                assert_eq!(v.p[0].fm_ratio, CELEBRATION_STRIKE_FM_RATIO);
+                assert_eq!(
+                    v.p[0].fm_i0,
+                    SECTION_STRIKE_FM[usize::from(class)],
+                    "class {class}: strike brightness"
+                );
+                // The mallet click carries the class's weight — except an
+                // earned backbeat CLAP (class 3 claps early: gate 170 ≤
+                // q 200), which keeps its pinned 2.6 kHz band.
+                if v.n_f0 == 2600.0 {
+                    assert_eq!(class, 3, "only the percussive class claps at q=200");
+                    assert_eq!(v.n_lvl, CELEBRATION_CLAP_LVL);
+                } else {
+                    assert_eq!(v.n_f0, CELEBRATION_STRIKE_HZ, "class {class}: click band");
+                    assert_eq!(
+                        v.n_lvl,
+                        SECTION_STRIKE_CLICK[usize::from(class)],
+                        "class {class}: mallet click weight"
+                    );
+                }
+                // The tink follows the class's sparkle mix on every voice
+                // not carrying the bass sub.
+                if v.p[2].f0 > v.p[0].f0 * 3.9 {
+                    assert_eq!(
+                        v.p[2].lvl,
+                        CELEBRATION_SPARKLE * SECTION_SPARKLE_MIX[usize::from(class)],
+                        "class {class}: sparkle mix"
+                    );
+                }
+                // The BREATH exhales the shimmer.
+                if class == 4 {
+                    assert_eq!(v.p[1].lvl, 0.0, "breath: shimmer off");
+                } else {
+                    assert!(v.p[1].lvl > 0.0, "class {class}: shimmer lives");
+                }
+            }
+            // The GAIN axis: the whole bar scales by SECTION_GAIN (and the
+            // chorus-key lift for class 1).
+            let gain: f32 = voices.iter().map(|v| v.gl + v.gr).sum();
+            let lift = if class == 1 {
+                CELEBRATION_CLASS_LIFT
+            } else {
+                1.0
+            };
+            let expect = ref_gain * SECTION_GAIN[usize::from(class)] * lift / SECTION_GAIN[0];
+            assert!(
+                (gain - expect).abs() < 1e-3 * expect.abs(),
+                "class {class}: bar gain {gain} != {expect} (SECTION_GAIN × lift)"
+            );
+        }
+        // Out-of-domain classes clamp instead of indexing out (both the
+        // constructor's clamp and `celebration_class_strike`'s own).
+        assert_eq!(celebration_class_strike(200), celebration_class_strike(4));
+        let _ = render_class(200);
+    }
+
+    /// THE BELL PASS, TAKE TWO (the owner's A/B verdict on take one,
+    /// verbatim: "these all sound pretty similar to me"): every lead voice
+    /// STRIKES — a real mallet transient, a ~8 ms band-passed noise click
+    /// in the 3–8 ms window plus an inharmonic FM face that decays faster
+    /// than the body — on a GLASS body (sine, never a pulse) that DECAYS
+    /// below a tenth by its owned slot's end and RINGS two slots past it
+    /// at tail level. And every lead voice not carrying the bass sub
+    /// carries the double-octave tinkle at its class's mix.
+    #[test]
+    fn the_lead_voices_strike_and_ring_like_bells() {
+        // The pluck law as arithmetic: one slot into a span-1 note the
+        // envelope is under 0.1 — struck, not held.
+        assert!(
+            (-(CELEBRATION_EIGHTH / CELEBRATION_LEAD_DECAY)).exp() < 0.1,
+            "a span's decay must fall below a tenth by the slot boundary"
+        );
+        // …while the note still RINGS past its slot — take two rings a full
+        // two slots, the merge-glue tail.
+        // A `const` block, so this is proved at COMPILE time rather than when the test
+        // happens to run — both sides are constants, and a violation should stop the
+        // build, not wait for a test invocation.
+        const {
+            assert!(
+                CELEBRATION_RING > 2.5,
+                "the tail rings two slots past its own"
+            )
+        };
+        // The mallet window: the click sweep completes in 3–8 ms.
+        const {
+            assert!(
+                CELEBRATION_STRIKE_GLIDE >= 0.003 && CELEBRATION_STRIKE_GLIDE <= 0.008,
+                "the click is a mallet hit, not a whoosh"
+            )
+        };
+        // The strike's bright face dies faster than the body — bell physics.
+        const {
+            assert!(
+                CELEBRATION_STRIKE_FM_TAU < CELEBRATION_LEAD_DECAY,
+                "bright partials decay first"
+            )
+        };
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(riff(GlowStyle::RainbowKitty, 1)); // A': all 8 slots sound
+        let leads: Vec<&Voice> = s.voices.iter().filter(|v| v.on).collect();
+        assert_eq!(leads.len(), 8);
+        for v in &leads {
+            assert_eq!(v.attack, CELEBRATION_LEAD_ATTACK, "instant strike");
+            let span = v.dur / (CELEBRATION_EIGHTH * CELEBRATION_RING);
+            assert!(
+                (v.decay - CELEBRATION_LEAD_DECAY * span).abs() < 1e-6,
+                "per-span pluck decay"
+            );
+            // GLASS BODY with the strike's glint.
+            assert_eq!(v.p[0].wave, Wave::Sine, "the body is glass, not buzz");
+            assert_eq!(
+                v.p[0].fm_ratio, CELEBRATION_STRIKE_FM_RATIO,
+                "ice, not organ"
+            );
+            assert_eq!(v.p[0].fm_i0, SECTION_STRIKE_FM[0], "the shim speaks verse");
+            assert_eq!(v.p[0].fm_tau, CELEBRATION_STRIKE_FM_TAU);
+            // THE MALLET CLICK on every lead (bar 1 is far below the clap
+            // gate, so the noise channel is purely the strike).
+            assert_eq!(v.n_lvl, SECTION_STRIKE_CLICK[0], "every note is struck");
+            assert_eq!(v.n_f0, CELEBRATION_STRIKE_HZ, "the click starts bright");
+            assert_eq!(v.n_glide, CELEBRATION_STRIKE_GLIDE);
+        }
+        // Bar 1's bass sits on beats 0/2 (slots 0/4): two subs, six pings.
+        let pinged = leads
+            .iter()
+            .filter(|v| {
+                v.p[2].lvl == CELEBRATION_SPARKLE * SECTION_SPARKLE_MIX[0]
+                    && v.p[2].f0 > v.p[0].f0 * 3.9
+            })
+            .count();
+        assert_eq!(pinged, 6, "the tinkle rides every non-bass lead voice");
+    }
+
+    /// ACCEPTANCE 3 (the synth half) + the quantize pin — the fill cue's
+    /// hits land on the SYNTH'S OWN sixteenth grid: a cue arriving 0.9 s
+    /// (sample time) into the bar schedules all four hits at bar-times
+    /// 1.2 / 1.3 / 1.4 / 1.5 s ± half a sixteenth, on the sample clock
+    /// anchored at the bar — never at cue-arrival-plus-offsets.
+    #[test]
+    fn the_fill_cue_quantizes_to_the_synths_own_sixteenth() {
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(riff(GlowStyle::RainbowKitty, 2)); // the syncopated B: 6 voices
+        let mut buf = [0.0f32; 960]; // 10 ms blocks
+        for _ in 0..90 {
+            s.render(&mut buf); // 0.9 s of the bar elapses
+        }
         s.push(SoundEvent {
-            kind: SoundGesture::Celebration(CelebrationGesture::RiffBar { bar: 0, key: 2 }),
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffFillCue {
+                sig: crate::kitty_sing::NEUTRAL_SIGNATURE,
+                sig_next: crate::kitty_sing::NEUTRAL_SIGNATURE,
+            }),
             ..riff(GlowStyle::RainbowKitty, 0)
         });
-        assert_eq!(
-            s.live_voices(),
-            8,
-            "the legacy gesture still sings a full bar"
+        let mut fills: Vec<f32> = s
+            .voices
+            .iter()
+            .filter(|v| v.on && v.dur.to_bits() == CELEBRATION_EIGHTH.to_bits())
+            .map(|v| -v.t) // pre-delay remaining == onset from NOW
+            .collect();
+        fills.sort_by(f32::total_cmp);
+        assert_eq!(fills.len(), 4, "all four hits have runway at 0.9 s");
+        for (k, &onset) in fills.iter().enumerate() {
+            let bar_time = 0.9 + onset;
+            let expect = 1.2 + 0.1 * k as f32;
+            assert!(
+                (bar_time - expect).abs() <= 0.05,
+                "hit {k} lands at bar-time {bar_time:.3}, wanted {expect} \
+                 (± half a sixteenth)"
+            );
+        }
+    }
+
+    /// ACCEPTANCE 10 — the fill cue respects every budget: <= 4 voices, a
+    /// worst-case bar-0 + cue concurrency of 12 <= MAX_VOICES, a LATE cue
+    /// drops the hits already past instead of sliding them, and a cue with
+    /// no bar anchor at all schedules nothing.
+    #[test]
+    fn the_fill_cue_respects_every_budget() {
+        let cue = |sig: u32| SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffFillCue { sig, sig_next: sig }),
+            ..riff(GlowStyle::RainbowKitty, 0)
+        };
+        // Worst case: the 8-voice cold open plus the whole cue.
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(riff(GlowStyle::RainbowKitty, 0));
+        let before = s.live_voices();
+        assert_eq!(before, 8);
+        s.push(cue(12));
+        assert_eq!(s.live_voices(), 12, "8 + 4 = 12 <= MAX_VOICES 28");
+        // Late: 1.45 s in, only the 1.5 s hit remains.
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(riff(GlowStyle::RainbowKitty, 2));
+        let mut buf = [0.0f32; 960];
+        for _ in 0..145 {
+            s.render(&mut buf);
+        }
+        let before = s.live_voices();
+        s.push(cue(12));
+        assert!(
+            s.live_voices() <= before + 1,
+            "a late cue drops the hits whose grid points passed"
+        );
+        // No anchor: a stray cue on a fresh synth schedules nothing.
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(cue(12));
+        assert_eq!(s.live_voices(), 0, "no bar anchor, no fill");
+    }
+
+    /// THE PIVOT WALK — the merge leg the owner asked for: a cue from a
+    /// shift-0 key into a shift-4 key steps its four hits 0 / +1 / +3 / +4
+    /// (the shortest integer path), so the fill WALKS between the tunes;
+    /// same-key cues keep the authored fill verbatim.
+    #[test]
+    fn the_fill_cue_walks_from_the_old_key_into_the_new() {
+        // sig 12 (neutral): shift 0. sig 4: root +2, mode +2 => shift 4.
+        let (old_sig, new_sig) = (crate::kitty_sing::NEUTRAL_SIGNATURE, 4u32);
+        assert_eq!(celebration_root(old_sig) + celebration_mode(old_sig), 0);
+        assert_eq!(celebration_root(new_sig) + celebration_mode(new_sig), 4);
+        let mut s = TrailSynth::new(48_000.0, 7);
+        s.push(riff(GlowStyle::RainbowKitty, 2));
+        s.push(SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffFillCue {
+                sig: old_sig,
+                sig_next: new_sig,
+            }),
+            ..riff(GlowStyle::RainbowKitty, 0)
+        });
+        let mut fills: Vec<&Voice> = s
+            .voices
+            .iter()
+            .filter(|v| v.on && v.dur.to_bits() == CELEBRATION_EIGHTH.to_bits())
+            .collect();
+        fills.sort_by(|a, b| a.delay.total_cmp(&b.delay));
+        assert_eq!(fills.len(), 4);
+        for (k, v) in fills.iter().enumerate() {
+            let expect_step = [0i32, 1, 3, 4][k];
+            assert_eq!(
+                v.p[0].f0.to_bits(),
+                penta(CELEBRATION_BASE_HZ, CELEBRATION_FILL[k] + expect_step).to_bits(),
+                "hit {k} pivots by {expect_step} on the walk from 0 to 4"
+            );
+        }
+    }
+
+    /// THE ENDING'S SHAPE (acceptance 6, the synth half): a cadence in a
+    /// +2-shift key schedules exactly three bell leads on eighth-slots
+    /// 0 / 2 / 4 (even slots — no swing), degrees [4, 2, 0] in the
+    /// RELEASED key's shift, the tonic's tail ringing x1.5, the fused
+    /// clap only when the performance earned it, the sing duck armed for
+    /// the bar (typing under the ending ducks — acceptance 11's synth
+    /// half), and the whole ending's gain scaling with the earned energy.
+    #[test]
+    fn the_cadence_lands_three_bells_and_the_earned_clap() {
+        let push_cadence = |q: u8| {
+            let mut s = TrailSynth::new(48_000.0, 7);
+            s.push(SoundEvent {
+                kind: SoundGesture::Celebration(CelebrationGesture::RiffCadence {
+                    sig: 24, // root +2, home mode
+                    energy_q: q,
+                    span_bars: 6,
+                }),
+                ..riff(GlowStyle::RainbowKitty, 0)
+            });
+            s
+        };
+        let s = push_cadence(235);
+        let mut voices: Vec<&Voice> = s.voices.iter().filter(|v| v.on).collect();
+        voices.sort_by(|a, b| a.delay.total_cmp(&b.delay));
+        assert_eq!(voices.len(), 3, "three leads — under the <= 4 pin");
+        for (v, (slot, deg)) in voices.iter().zip([(0usize, 4i32), (2, 2), (4, 0)]) {
+            assert_eq!(
+                v.delay.to_bits(),
+                celebration_slot_delay(slot).to_bits(),
+                "slot {slot}: even slots carry no swing"
+            );
+            assert_eq!(
+                v.p[0].f0.to_bits(),
+                penta(CELEBRATION_BASE_HZ, deg + 2).to_bits(),
+                "degree {deg} sings in the RELEASED key's shift"
+            );
+        }
+        assert!(
+            voices[2].decay > voices[0].decay * 2.9,
+            "the tonic's ta-daa tail rings x1.5 over its span"
+        );
+        assert!(
+            voices[2].n_lvl > 0.0,
+            "the earned clap fuses into the tonic"
+        );
+        assert_eq!(voices[0].n_lvl, 0.0, "…and only the tonic");
+        assert_eq!(s.sing, 1.0, "the ending arms the sing duck like a bar");
+        // Below the gate: no clap anywhere.
+        let quiet = push_cadence(200);
+        assert!(
+            quiet.voices.iter().filter(|v| v.on).all(|v| v.n_lvl == 0.0),
+            "energy under the gate ends without a clap"
+        );
+        // The earned-energy gain law: q=200 vs q=0 is (0.8+0.2)/(0.8).
+        let loudness =
+            |s: &TrailSynth| -> f32 { s.voices.iter().filter(|v| v.on).map(|v| v.gl + v.gr).sum() };
+        let hot = loudness(&push_cadence(200));
+        let cold = loudness(&push_cadence(0));
+        assert!(
+            (hot / cold - 1.25).abs() < 1e-3,
+            "a peak-earned finale plays +1.9 dB over a cold one ({hot} / {cold})"
         );
     }
 
-    /// AXIS 4 stays DARK until the owner has heard it: with the gate off,
-    /// every signature's lead duty is the authored 0.25 — flipping
-    /// [`CELEBRATION_KEY_DUTY`] is the entire enable.
+    /// THE TAIL'S AUDIO SHAPE: a cadence RINGS (the ta-daa is louder than
+    /// nothing) and then returns to EXACT silence — the ~3.6 s worst-case
+    /// post-release tail is bars + cadence + duck handback, never a hum.
     #[test]
-    fn per_key_duty_is_gated_off_pending_the_owners_ear() {
-        for sig in [
-            0u32,
-            12,
-            24,
-            crate::kitty_sing::song_signature('w'),
-            u32::MAX,
-        ] {
-            if CELEBRATION_KEY_DUTY {
-                assert!([0.25f32, 0.375, 0.5].contains(&celebration_duty(sig)));
-            } else {
-                assert_eq!(celebration_duty(sig), 0.25);
+    fn the_cadence_tail_rings_and_returns_to_exact_silence() {
+        let mut s = TrailSynth::new(48_000.0, 9);
+        s.push(SoundEvent {
+            kind: SoundGesture::Celebration(CelebrationGesture::RiffCadence {
+                sig: 24,
+                energy_q: 235,
+                span_bars: 6,
+            }),
+            ..riff(GlowStyle::RainbowKitty, 0)
+        });
+        let mut buf = [0.0f32; 960];
+        let mut cadence_energy = 0.0f64;
+        for _ in 0..160 {
+            // the cadence bar itself (1.6 s)
+            s.render(&mut buf);
+            for &x in &buf {
+                cadence_energy += f64::from(x) * f64::from(x);
             }
         }
+        assert!(cadence_energy > 0.0, "the ta-daa actually sounds");
+        for _ in 0..400 {
+            // + 4 s: tails + duck handback drain completely
+            s.render(&mut buf);
+        }
+        assert!(
+            s.is_quiet(),
+            "after the tail the synth is at exact-zero rest"
+        );
+        assert_eq!(s.sing, 0.0, "the sing duck handed back");
+    }
+
+    /// ACCEPTANCE 13 — the form-kind table matches the phrase (the
+    /// tempo-pin discipline applied to FORM): kind agrees with
+    /// [`CELEBRATION_VERSE`] bar by bar — verse bars are 0, the shared
+    /// chorus block 1, and the one turnaround (the bar that owns the fill)
+    /// is 2, last in the form.
+    #[test]
+    fn the_form_kind_table_matches_the_phrase() {
+        assert_eq!(CELEBRATION_FORM_KIND.len(), CELEBRATION_PHRASE_BARS);
+        for (i, &kind) in CELEBRATION_FORM_KIND.iter().enumerate() {
+            match kind {
+                0 => assert!(CELEBRATION_VERSE[i], "bar {i}: verse kind on a chorus bar"),
+                1 => assert!(!CELEBRATION_VERSE[i], "bar {i}: chorus kind on a verse bar"),
+                2 => {
+                    assert_eq!(
+                        i,
+                        CELEBRATION_PHRASE_BARS - 1,
+                        "the turnaround is the form's last bar — where the fill lives"
+                    );
+                    assert!(!CELEBRATION_VERSE[i]);
+                }
+                other => panic!("bar {i}: unknown form kind {other}"),
+            }
+        }
+        assert_eq!(
+            CELEBRATION_FORM_KIND.iter().filter(|&&k| k == 2).count(),
+            1,
+            "exactly one turnaround"
+        );
     }
 
     // -- tone-melody proofs --------------------------------------------------
@@ -7503,33 +8428,40 @@ mod tests {
 
                     // RAINBOW KITTY — see `RainbowKittyPalette::design`.
                     GlowStyle::RainbowKitty => {
-                        let base = 392.0; // G4 — the chip register
+                        let base = 523.25; // C5 — the tingly-bell register
                         let (f0, f1) = gesture_bend(penta(base, deg), gesture_shape(kind).dir);
                         let mk = |f0: f32, f1: f32, delay: f32| Voice {
                             delay,
-                            dur: 0.140,
-                            attack: 0.0030,
-                            decay: 0.078,
+                            dur: 0.110,
+                            attack: 0.0012,
+                            decay: 0.055,
                             p: [
                                 Partial {
-                                    lvl: 0.5,
+                                    lvl: 0.52,
                                     f0,
                                     f1,
                                     glide: GESTURE_BEND_TAU,
-                                    wave: Wave::Pulse { duty: 0.375 },
+                                    wave: Wave::Pulse { duty: 0.25 },
                                     ..Partial::default()
                                 },
-                                // Sub-octave sine: the warmth under the doop.
+                                // Sub-octave sine: the floor under the chirp.
                                 Partial {
-                                    lvl: 0.18,
+                                    lvl: 0.09,
                                     f0: f0 * 0.5,
                                     f1: f1 * 0.5,
                                     glide: GESTURE_BEND_TAU,
                                     ..Partial::default()
                                 },
-                                Partial::default(),
+                                // THE TINK — the double-octave glass.
+                                Partial {
+                                    lvl: 0.22,
+                                    f0: f0 * 4.0,
+                                    f1: f1 * 4.0,
+                                    glide: GESTURE_BEND_TAU,
+                                    ..Partial::default()
+                                },
                             ],
-                            lp_cut: 2600.0,
+                            lp_cut: 3000.0,
                             ..Voice::default()
                         };
                         self.spawn(mk(f0, f1, 0.0), g * 0.34, pan);

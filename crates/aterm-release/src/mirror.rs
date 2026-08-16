@@ -210,8 +210,18 @@ pub fn zip_asset_name(version: &str) -> String {
 /// The zip is unconditional because every manifest this cutter emits names one,
 /// and a manifest naming an asset the channel does not carry is exactly the
 /// live-but-unelectable state this module exists to prevent.
+///
+/// `rostered` adds the master-signed machine roster and its signature. It belongs in
+/// the CLIENT-REQUIRED set rather than the private-debugging set for a blunt reason:
+/// a client with the paper master pinned refuses, structurally and before any
+/// artifact crypto, a release that does not carry both
+/// (`aterm_update::github::authorize_by_roster` step 1). Mirroring the appcast
+/// without the roster would publish a channel head the whole armed fleet declines —
+/// the exact failure this module exists to prevent, one tier along. It stays
+/// conditional because with an unpinned master no client ever looks for them, and
+/// the mirrored set must not change by one byte while that is true.
 #[must_use]
-pub fn required_asset_names(version: &str, signed: bool) -> Vec<String> {
+pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<String> {
     let mut names = vec![
         manifest_out::MANIFEST_ASSET.to_string(),
         dmg_asset_name(version),
@@ -219,6 +229,10 @@ pub fn required_asset_names(version: &str, signed: bool) -> Vec<String> {
     ];
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());
+    }
+    if rostered {
+        names.push(aterm_update_core::roster::ROSTER_ASSET.to_string());
+        names.push(aterm_update_core::roster::ROSTER_SIG_ASSET.to_string());
     }
     names.sort();
     names
@@ -231,8 +245,13 @@ pub fn required_asset_names(version: &str, signed: bool) -> Vec<String> {
 /// Called against a fresh listing of the mirrored draft before it is flipped
 /// visible, and again after the flip: a channel head is only useful if the
 /// election rule can actually resolve it.
-pub fn validate_mirror_asset_set(names: &[String], version: &str, signed: bool) -> Result<()> {
-    let required = required_asset_names(version, signed);
+pub fn validate_mirror_asset_set(
+    names: &[String],
+    version: &str,
+    signed: bool,
+    rostered: bool,
+) -> Result<()> {
+    let required = required_asset_names(version, signed, rostered);
     let mut observed: Vec<String> = names.to_vec();
     observed.sort();
     if observed == required {
@@ -394,13 +413,26 @@ mod tests {
         // mirror step a silent no-op, hiding the regression.
         //
         // Scoped to the private staging namespace on purpose: `publish/` exports
-        // a PUBLIC source snapshot that rewrites `alabsystems` -> `alabsystems`
-        // throughout, so in that tree `repository` and `update_channel` legally
-        // coincide — one public repo serving both source and releases, which is
-        // the documented "no separate mirror" configuration, not a regression.
+        // a PUBLIC source snapshot that rewrites the staging owner into the
+        // public org throughout, so in that tree `repository` and
+        // `update_channel` legally coincide — one public repo serving both
+        // source and releases, which is the documented "no separate mirror"
+        // configuration, not a regression.
+        //
+        // The scope test must therefore contain NO rewritable literal: guarding
+        // on the staging owner's spelling would be rewritten into the public
+        // org, flip to always-true in the exported tree, and deterministically
+        // fail there. "alabsystems" is a FIXED POINT of that rewrite, so
+        // "publish owner is not the public org" identifies the private staging
+        // tree in both snapshots. Not `DEFAULT_OWNER` on purpose: build.rs
+        // stamps that from `update_channel`, so it MOVES WITH the exact
+        // regression this test names (channel repointed at the private repo
+        // recompiles DEFAULT_OWNER to the private owner and would skip the
+        // guard); the fixed literal keeps the tripwire live in that world.
         let channel = update_channel_slug(REAL_MANIFEST).unwrap().unwrap();
         let publish = crate::publish::repo_slug(REAL_MANIFEST).unwrap();
-        if publish.starts_with("alabsystems/") {
+        let publish_owner = publish.split('/').next().unwrap_or("");
+        if publish_owner != "alabsystems" {
             assert_ne!(
                 channel, publish,
                 "the private staging repo must never be the update channel"
@@ -476,7 +508,7 @@ update_channel = \"someone/else\"
         // Unsigned (Tier REPO, the default): appcast + version-bound DMG + the
         // version-bound zip the in-app updater actually stages from.
         assert_eq!(
-            required_asset_names("0.5.0", false),
+            required_asset_names("0.5.0", false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
@@ -485,7 +517,7 @@ update_channel = \"someone/else\"
         );
         // Signed (Tier SIG): a pinned client REFUSES a head with no .sig.
         assert_eq!(
-            required_asset_names("0.5.0", true),
+            required_asset_names("0.5.0", true, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
@@ -507,14 +539,14 @@ update_channel = \"someone/else\"
             "aterm-0.5.0.dmg".to_string(),
             "aterm-0.5.0-mac.zip".to_string(),
         ];
-        validate_mirror_asset_set(&ok, "0.5.0", false).unwrap();
+        validate_mirror_asset_set(&ok, "0.5.0", false, false).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
             "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0.dmg".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
-        validate_mirror_asset_set(&reordered, "0.5.0", false).unwrap();
+        validate_mirror_asset_set(&reordered, "0.5.0", false, false).unwrap();
 
         // Every way a plausible-looking mirror silently never updates:
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
@@ -600,7 +632,7 @@ update_channel = \"someone/else\"
         ];
         for (names, version, signed, needle) in cases {
             let names: Vec<String> = names.into_iter().map(str::to_string).collect();
-            let err = validate_mirror_asset_set(&names, version, signed)
+            let err = validate_mirror_asset_set(&names, version, signed, false)
                 .expect_err(&format!("{names:?} must be refused"));
             assert!(
                 err.to_string().contains(needle),

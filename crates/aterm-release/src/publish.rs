@@ -29,10 +29,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use aterm_update_core::Manifest;
+use aterm_update_core::roster;
 use aterm_update_core::tag::TagError;
 
 use crate::ledger::{self, Error, GitCli, GitRunner, Result, RunOut, git_ok, rev_parse};
-use crate::{buildplan, bundle, changelog, dmg, gates, manifest_out, mirror, sign, verify};
+use crate::{
+    buildplan, bundle, changelog, dmg, gates, machines, manifest_out, mirror, sign, verify,
+};
 
 // ---------------------------------------------------------------------------
 // CLI-facing surface
@@ -65,6 +68,15 @@ pub struct CutOptions {
     pub rehearse: Option<String>,
     /// Ship a single-arch build (explicit opt-out of universal, decision 18).
     pub arm64_only: bool,
+    /// `--strand-pre-roster-clients`: the operator asserts that no client running a
+    /// build older than the machine roster is left in the field, so this cut may be
+    /// signed by a key that is on the roster but in no shipped keyset.
+    ///
+    /// Meaningless — and inert — while `pins::PAPER_MASTER_PUBKEYS` is empty: with no
+    /// master pinned, the keyset IS the authority and a non-member is refused by
+    /// `committed_channel_signature_policy` with no flag able to change that. See
+    /// [`PreRosterClients`].
+    pub strand_pre_roster_clients: bool,
 }
 
 /// Which cut flavor is running — decided once, checked per step.
@@ -303,7 +315,7 @@ pub fn unix_now() -> u64 {
 /// Same file the publication engine reads (`publication/bin/pub` `MIRROR_TOKEN_PATH`,
 /// documented in its `KEYS.md`): one credential for the release org, shared by both
 /// pipelines.
-fn channel_token_path() -> Option<PathBuf> {
+pub(crate) fn channel_token_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".secrets/gh_access_token_alabsystems"))
 }
@@ -434,6 +446,16 @@ pub const RECOVERY_STOPPED_PROCESS_REFUSAL: &str = "lost-machine recovery requir
      a fence rotation cannot cancel an already in-flight GitHub REST request";
 pub const RECOVERY_STOPPED_PROCESS_BANNER: &str =
     "OPERATOR ASSERTION: old publisher is stopped; Git fencing cannot cancel in-flight REST";
+
+/// Mandatory acknowledgement for the OTHER operation whose safety has an external,
+/// operator-established precondition: cutting under a key that only ROSTER-AWARE
+/// clients can verify.
+///
+/// Same shape and same reasoning as [`RECOVERY_STOPPED_PROCESS_FLAG`] — the program
+/// cannot prove that no pre-roster client is left in the field, and it is not going to
+/// pretend it can. See [`PreRosterClients`] for why this is a flag on the command
+/// rather than a key in the credentials profile.
+pub const PRE_ROSTER_STRANDING_FLAG: &str = "--strand-pre-roster-clients";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseLeaseGuard {
@@ -1161,6 +1183,23 @@ pub struct Journal {
     /// definition; the private key is never journaled or printed.
     #[serde(default)]
     pub signature_pubkey: Option<String>,
+    /// WHICH MACHINE signed, when the machine-roster tier is armed — the id the
+    /// master-signed roster maps [`Self::signature_pubkey`] to. `None` with an
+    /// unpinned paper master, which is every journal this tree writes.
+    ///
+    /// It rides beside the public key rather than replacing it because the two
+    /// answer different questions on resume: the key is what the published
+    /// signature must verify under, the id is what the published manifest CLAIMS.
+    /// A resume that re-authorizes to a DIFFERENT machine must abort, and this is
+    /// the recorded value that makes the comparison possible — without it a second
+    /// machine could finish the first machine's cut, and the manifest already
+    /// carries (and is signed over) the first machine's id, so the release would
+    /// ship an attribution its own signer contradicts.
+    ///
+    /// Public identity only, exactly like [`Self::signature_pubkey`]: nothing
+    /// secret is ever journaled.
+    #[serde(default)]
+    pub signature_machine_id: Option<String>,
     /// Immutable GitHub release object capability. Draft tag names are not
     /// unique, so every upload/edit/flip/delete after `draft` is pinned to
     /// this ID and revalidates its tag, target commit, and draft state.
@@ -1819,6 +1858,68 @@ pub fn channel_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) 
         )));
     }
     Ok(())
+}
+
+/// THE ROSTER RATCHET, and the exact sibling of [`channel_floor_covered`]: a cut may
+/// not publish a roster generation OLDER than the one already on the channel head.
+///
+/// # Why the producer needs its own floor at all
+///
+/// The client keeps a permanent high-water mark. `Floor::bump_and_write` ratchets
+/// `roster_seq` on OBSERVATION — whether or not the release was staged — and
+/// `Roster::admit` returns `Rollback` for anything below it, before any artifact
+/// crypto. `machines::authorize_cut` cannot see that mark (it is remote channel
+/// state, not a property of a local file) and deliberately does not pretend to, so
+/// without this function the producer's gate is strictly WEAKER than the client's on
+/// a channel-visible monotonic counter.
+///
+/// # Why that gap is the normal case, not the exotic one
+///
+/// `atpkg-keys`' `DEFAULT_ROSTER` is `dist/aterm-machines.toml` and `/dist/` is
+/// gitignored, so the roster is not distributed with the repo: every machine that did
+/// not run the mint holds a hand-copied roster, and holding a stale-but-unexpired one
+/// is the steady state. Machine B mints or revokes, publishing `roster_seq` 5; every
+/// live client ratchets its floor to 5. Machine A, still on its seq-4 copy, passes
+/// freshness, passes the deny-list, and publishes — and every client that saw B's
+/// release refuses A's with `Rollback`. `select_authoritative_release` picks exactly
+/// one candidate with no fallback to an older release, so those clients do not get a
+/// later update, they get NO update, and the cut reports success.
+///
+/// The corollary runs the other way too, and this is what makes the check a security
+/// property and not just a hygiene one: a machine revoked at seq 5 is still authorized
+/// by its own seq-4 copy. The producer-side deny-list is only ever as current as the
+/// least-updated cutter, and a floor read from the channel is what forces it forward.
+///
+/// # Shape
+///
+/// `None` on either side means "no roster in play", which is every cut this tree makes
+/// and must therefore be `Ok`. An unattributed cut against a rostered head is NOT
+/// silently allowed: dropping the tier is a downgrade the client would refuse
+/// structurally, so it is named here while naming it is free.
+pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -> Result<()> {
+    // A LOWER floor than the client's, deliberately, and by exactly one generation:
+    // the client ratchets on OBSERVATION, so its floor is the head's `roster_seq`, and
+    // republishing AT that generation is exactly what a second machine holding the same
+    // roster does. `>=` admits that and refuses only a genuine step backwards.
+    match (carried, newest_channel) {
+        (_, None) => Ok(()),
+        (Some(carried), Some(newest)) if carried >= newest => Ok(()),
+        (Some(carried), Some(newest)) => Err(Error::new(format!(
+            "the channel head was published under machine roster generation {newest}, but \
+             this cut carries {carried}; every client that has already seen generation \
+             {newest} refuses a release under an older one (RosterReject::Rollback) before \
+             it checks any artifact crypto, and the updater has no fallback to an older \
+             release — so publishing this would stop those clients updating at all. Refresh \
+             this machine's copy of aterm-machines.toml (it is the master-signed document \
+             `atpkg-keys join`/`machine-revoke` wrote) and cut again"
+        ))),
+        (None, Some(newest)) => Err(Error::new(format!(
+            "the channel head was published under machine roster generation {newest}, but \
+             this cut carries no attribution at all; an armed client refuses a release with \
+             no aterm-machines.toml structurally. Cut from a machine the roster lists, or \
+             unpin the paper master in a tracked commit"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2545,6 +2646,472 @@ pub fn committed_channel_signature_policy(
     })
 }
 
+/// What a pipeline entry will still DO with the signing material, and therefore how
+/// much of the roster chain it has any business re-proving.
+///
+/// The distinction exists because the roster answers a question that stops being
+/// askable once the bytes exist. A cut that will still assemble, stamp and SIGN a
+/// manifest is choosing an attribution, so it must prove the roster still authorizes
+/// this machine. A cut that is finishing already-signed bytes has no such choice
+/// left: the attribution is inside a signature, the roster document is frozen in
+/// `dist/`, and re-reading today's roster file says nothing about either.
+///
+/// Treating the second case like the first is not a harmless extra check, it is a
+/// wrong one, and it fails in the direction that costs the most:
+///
+/// * It can only ever fail SPURIOUSLY. Satisfying it — re-signing the roster from the
+///   paper master — does not change one byte of what the cut will publish, because
+///   `step_mirror` serves the `dist/` bytes that `verify` proved live. So the gate
+///   blocks on a condition whose remedy fixes nothing.
+/// * It fires on the path taken when something has ALREADY gone wrong. A roster whose
+///   window lapses between `flip` and `mirror` would otherwise make a cut that is one
+///   upload from done into one that can never be finished, leaving the release live
+///   on the publish repo and absent from the public channel the fleet actually reads,
+///   with the lease still held.
+/// * It refuses cross-machine recovery outright — the one path designed for a dead
+///   publisher, in the one design where publishers are plural.
+///
+/// This is the same trade `resume_apple_tier` makes for an expired certificate, for
+/// the same reason, and `resume_cut` already stated it in a comment; [`RosterDuty`] is
+/// what makes the statement true at every entry rather than one of them.
+///
+/// What [`RosterDuty::Finish`] does NOT relax: the committed channel keyset. A key
+/// that is not a keyset member could never have produced these bytes, so that check
+/// costs nothing and stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RosterDuty {
+    /// This entry may still produce and sign new manifest bytes. The full chain runs.
+    Sign,
+    /// Every byte this entry will publish is already assembled and signed. The key
+    /// decision runs; the roster chain does not.
+    Finish,
+}
+
+/// WHO THIS CUT WOULD STRAND, and whether anybody said that was acceptable.
+///
+/// A client that predates the roster verifies the appcast under its own compiled-in
+/// `UPDATE_CHANNEL_PUBKEYS` and has never heard of a machine roster. It cannot be
+/// taught a new key by anything except a release it already accepts, and
+/// `select_authoritative_release` gives it exactly ONE candidate with no fallback to
+/// an older release — so a release signed by a key that client does not hold does not
+/// delay it, it WEDGES it permanently.
+///
+/// That is a fact about the FLEET, not about this machine or this roster, and no
+/// signed document can answer it: only the operator knows whether any meaningful part
+/// of the fleet is still on a pre-roster build. So the cutter refuses by default and
+/// takes the answer from the command that ran — the same shape, and for the same
+/// reason, as [`RECOVERY_STOPPED_PROCESS_FLAG`]. It is deliberately NOT a key in the
+/// release-credentials profile: a profile can only ever NARROW what is accepted
+/// (`sign.rs` leans on that property), this WIDENS it, and a file written once would
+/// go on answering "yes, strand them" long after the operator stopped meaning it.
+///
+/// # ⚠ THE TEST IS HEAD EQUALITY, NOT KEYSET MEMBERSHIP — and the difference bricks fleets
+///
+/// The question is "can a SHIPPED build verify this?", and the only evidence this tree
+/// has is `pins::UPDATE_CHANNEL_PUBKEYS` — which is what the NEXT build will carry, not
+/// what the fielded ones do. Membership in it is therefore not the property being asked
+/// about, and the gap is not theoretical: K2 (`aterm-update-v3`) was appended to that
+/// keyset on 2026-08-12 and appears in no published tag at all, exactly as step 1 of the
+/// documented rotation requires. A membership test would call K2 "safe for pre-roster
+/// clients" while every client in the field holds `[K1]` alone and would wedge on it —
+/// and it would do so silently, with no flag and no warning, which is the precise
+/// outcome this type exists to prevent.
+///
+/// Index 0 is the only member the tree can honestly claim the field holds, because
+/// promotion TO index 0 is step 3 of that rotation: the reviewed commit in which the
+/// operator asserts the adoption window has closed. Every other member is either an
+/// incoming key no shipped build carries yet or an outgoing key inside its retirement
+/// window; neither is provably held by every pre-roster client. So the test here is
+/// equality with the head — the same rule the unarmed path enforces
+/// ([`committed_channel_signature_policy`]) — and arming the master consequently does
+/// not widen by one key who may sign without saying so out loud.
+///
+/// A consequence worth stating, because it is the thing an operator will bump into: an
+/// ordinary K1→K2 channel rotation needs no flag. Step 3 PROMOTES K2 to index 0 in a
+/// reviewed commit, and a cut after that promotion is a cut by the head. The flag is for
+/// the case the rotation does not cover — a rostered machine whose key is not, and is not
+/// going to be, the committed head — which is exactly the case the roster tier exists to
+/// make possible and the one nothing else in the tree can vouch for.
+///
+/// # Why not a separate committed list of keys known to have SHIPPED
+///
+/// It was considered: a third anchor recording which keys are actually in the field, so
+/// the gate could consult it instead of inferring from index 0. It is worse in the way
+/// that matters. Nothing can PROVE adoption — the fleet does not report in — so such a
+/// list would still be an operator assertion, only now one written into a file once and
+/// consulted forever, which is precisely the objection this type raises against putting
+/// the acknowledgement in the credentials profile. It would also be a third anchor to
+/// keep in step with two others, and the failure mode of a stale one is silent. Index 0
+/// already carries the assertion, made in a reviewed commit, by the person who is in a
+/// position to make it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreRosterClients {
+    /// A cut is STARTING here and nobody has said otherwise: a signing key that is not
+    /// the committed channel HEAD is refused. The fail-closed default.
+    #[default]
+    Protected,
+    /// A cut is starting here and the operator passed
+    /// [`PRE_ROSTER_STRANDING_FLAG`], accepting that clients older than the roster
+    /// will never install this release or any release after it.
+    Stranded,
+    /// NOT THIS ENTRY'S QUESTION. A resume, a recovery or a mirror is continuing a cut
+    /// that answered it at pre-claim, under a key it is not permitted to change
+    /// (`revalidate_ctx_signature_policy` refuses a changed key outright). Re-asking
+    /// could only fail spuriously — and it would fail on the path taken when something
+    /// has already gone wrong, turning a cut that is one upload from done into one that
+    /// can never be finished. Exactly the trade [`RosterDuty::Finish`] makes.
+    Answered,
+}
+
+/// Where a signing key stands with respect to the clients that predate the roster —
+/// the fact [`PreRosterClients`] then decides what to DO about.
+///
+/// Separated from the decision because the two are different kinds of statement. This
+/// one is derivable from the tree and is not the operator's to override; the other is a
+/// judgement about the world that nothing in the tree can make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreRosterStanding<'a> {
+    /// The committed keyset is EMPTY, so no shipped build pinned a channel key and no
+    /// client is verifying under one. There is nobody in a position to be stranded —
+    /// the configuration a fork has, and the one the owner reaches once the rollover is
+    /// complete.
+    NobodyToStrand,
+    /// The key IS `UPDATE_CHANNEL_PUBKEYS[0]`. Every client that accepts anything at
+    /// all accepts this, which is the strongest statement the tree can make.
+    Head,
+    /// The key is in the keyset but NOT at index 0. This is the case a membership test
+    /// got wrong, and it is the DANGEROUS one precisely because it looks safe: an
+    /// accept-only member is appended so that a FUTURE build can carry it (step 1 of
+    /// the rotation), so at the moment it is appended no shipped client holds it at
+    /// all. Carries its index so the message can say which, and the head so the remedy
+    /// can name the key that would have been safe.
+    AcceptOnlyMember { index: usize, head: &'a str },
+    /// The key is nowhere in the keyset — a freshly minted machine, which is the
+    /// ordinary case the roster tier exists to enable.
+    Stranger(&'a str),
+}
+
+impl PreRosterStanding<'_> {
+    /// `Some(reason)` when a cut under this key cannot be verified by clients that
+    /// predate the roster; `None` when it demonstrably can. The reason is a sentence
+    /// fragment so the refusal and the warning can share one wording and never drift.
+    #[must_use]
+    pub fn strands(&self) -> Option<String> {
+        match self {
+            Self::NobodyToStrand | Self::Head => None,
+            Self::AcceptOnlyMember { index, .. } => Some(format!(
+                "is UPDATE_CHANNEL_PUBKEYS[{index}], an ACCEPT-ONLY member and not the \
+                 head (index 0). Membership in this tree's keyset is not the same thing \
+                 as being carried by a SHIPPED build: a non-head member was appended so \
+                 that a future build could carry it, and until it is promoted to index 0 \
+                 in a reviewed commit — which is the act that asserts the adoption window \
+                 has closed — no fielded client is known to hold it"
+            )),
+            Self::Stranger(_) => Some(String::from(
+                "is not a member of the committed channel keyset at all \
+                 (aterm-update-core::pins, UPDATE_CHANNEL_PUBKEYS)",
+            )),
+        }
+    }
+
+    /// The head every pre-roster client is known to hold, for the remedy line. `None`
+    /// only when the keyset is empty, in which case there is no remedy to offer because
+    /// there is no problem — and when this key IS the head, in which case there is no
+    /// problem either.
+    #[must_use]
+    pub fn head(&self) -> Option<&str> {
+        match self {
+            Self::NobodyToStrand | Self::Head => None,
+            Self::AcceptOnlyMember { head, .. } | Self::Stranger(head) => Some(head),
+        }
+    }
+}
+
+/// Locate `material` in the committed keyset, by canonical identity rather than by
+/// spelling — the same normalisation the client's verifier applies, so two base64
+/// aliases of one key cannot be judged differently here than there.
+fn pre_roster_standing<'a>(
+    keyset: &'a [&'a str],
+    material: &str,
+) -> Result<PreRosterStanding<'a>> {
+    let Some(head_raw) = keyset.first() else {
+        return Ok(PreRosterStanding::NobodyToStrand);
+    };
+    if canonical_update_pubkey(head_raw)? == material {
+        return Ok(PreRosterStanding::Head);
+    }
+    for (index, candidate) in keyset.iter().enumerate().skip(1) {
+        if canonical_update_pubkey(candidate)? == material {
+            return Ok(PreRosterStanding::AcceptOnlyMember {
+                index,
+                head: head_raw,
+            });
+        }
+    }
+    Ok(PreRosterStanding::Stranger(head_raw))
+}
+
+/// Everything the ARMED machine-roster tier decides on, bundled so the gate takes
+/// one parameter rather than five and so a caller cannot supply four of them and
+/// forget the fifth. Deliberately the same shape as the client's `RosterPolicy`.
+///
+/// `master_pubkeys` EMPTY is the whole two-state switch: the tier is absent, and
+/// [`channel_signature_policy`] delegates verbatim to
+/// [`committed_channel_signature_policy`].
+pub struct RosterEvidence<'a> {
+    /// The pinned paper master(s) — `pins::PAPER_MASTER_PUBKEYS` in production,
+    /// armed in this tree since 2026-08-15 (`atpkg-keys setup --id m3`).
+    pub master_pubkeys: &'a [&'a str],
+    /// The whole committed channel keyset — `pins::UPDATE_CHANNEL_PUBKEYS`, not
+    /// just its head.
+    ///
+    /// With the master ARMED this is no longer an authorization input: the roster
+    /// authorizes, and this keyset can neither grant nor deny (see
+    /// [`channel_signature_policy`]). It is read for exactly two things, neither of
+    /// them a grant: whether it is EMPTY (then no client is verifying under a channel
+    /// key at all, so there is nobody to strand), and what its HEAD is (the one member
+    /// a shipped build is known to carry — see [`PreRosterClients`] for why a
+    /// membership test would be a fleet-bricking mistake here).
+    ///
+    /// The whole slice rather than the head alone, because "empty" is a fact about the
+    /// slice and because a non-head member has to be RECOGNISED to be reported as one:
+    /// "that key is accept-only and in no shipped build" is a very different sentence
+    /// from "that key is a stranger", and an operator acts differently on each.
+    pub committed_keyset: &'a [&'a str],
+    /// Whether stranding pre-roster clients is this entry's question, and if so
+    /// whether the operator has accepted it.
+    pub pre_roster: PreRosterClients,
+    /// The master-signed roster this cut claims authority from, read once,
+    /// pre-claim. `None` means the profile named none — which is a refusal on the
+    /// armed path, never a downgrade.
+    pub roster: Option<&'a machines::RosterDocument>,
+    /// What this machine claims its id is (profile, else `~/.aterm/machine.toml`).
+    /// A cross-check only; see [`machines::declared_machine_id`].
+    pub declared_machine_id: Option<&'a str>,
+    /// Injected wall clock, so every freshness case is testable without waiting.
+    pub now_unix: i64,
+    /// Whether this entry can still SIGN, which is what decides whether the roster
+    /// chain is any of its business. See [`RosterDuty`].
+    pub duty: RosterDuty,
+}
+
+/// THE two-state signing gate: the committed channel pin alone, or the channel pin
+/// AND the master-signed machine roster.
+///
+/// # Anchor empty — today's behaviour, byte for byte
+///
+/// With no paper master pinned this is [`committed_channel_signature_policy`] and
+/// nothing else: same verdict, same errors, same absent attribution, so the emitted
+/// manifest bytes are identical to every manifest this cutter has ever produced.
+/// That is not politeness, it is the bridge:
+/// `aterm_update::github::select_authoritative_release` picks exactly ONE candidate
+/// (the highest tag) and has no fallback to an older release, so a shipped client
+/// that meets a release it cannot verify is not delayed — it is WEDGED there
+/// permanently. Any behaviour change on this path is a fleet-bricking bug, which is
+/// why the empty-anchor path is a delegation rather than a re-implementation.
+///
+/// # Anchor armed — the ROSTER governs, and it governs alone
+///
+/// `aterm_update::github::fetch_authoritative_release` under an armed anchor consults
+/// the master-signed roster and nothing else: the compiled-in keyset can no longer
+/// refuse what the roster authorized. So this gate does not require keyset membership
+/// either — requiring it is what made adding a machine need a shipped release, which
+/// is precisely the ceremony the roster exists to remove.
+///
+/// The keyset is not dead, though, and pretending it is would brick a fleet. It is
+/// the allowance held by clients that PREDATE the roster, and those clients are the
+/// one party the producer still owes something to: they verify under their own
+/// compiled-in keyset, they cannot be taught a new key except by a release they
+/// already accept, and release selection gives them no fallback. A cut signed by a
+/// key those clients do not hold therefore wedges every one of them, permanently.
+///
+/// **Which key do they hold? `UPDATE_CHANNEL_PUBKEYS[0]`, and only that one.** A
+/// non-head member is by construction either not shipped yet (step 1 of the rotation
+/// appends it precisely so a FUTURE build can carry it) or on its way out. So the
+/// obligation is tested as equality with the head, exactly as the unarmed path tests
+/// it — arming the master changes WHO MAY SIGN, and must not quietly change WHO CAN
+/// VERIFY. [`PreRosterClients`] carries the full argument, including the live example
+/// (K2) that a membership test would have waved through.
+///
+/// Only the operator knows whether any pre-roster client is left, so the obligation is
+/// enforced as [`PreRosterClients`]: refuse by default, proceed on an explicit
+/// per-cut flag, and say loudly what is being given up. Silence is not available —
+/// the failure mode is a fleet that never updates again and never says why.
+///
+/// An EMPTY committed keyset means there is nobody in that position: no shipped build
+/// pinned a channel key, so no client is verifying under one. The obligation check is
+/// skipped, and only it.
+///
+/// Every armed failure is a refusal. There is no arrangement of arguments that
+/// returns a policy while the anchor is armed and the roster did not authorize.
+pub fn channel_signature_policy(
+    committed_pubkey: Option<&str>,
+    material_pubkey: Option<&str>,
+    evidence: &RosterEvidence<'_>,
+) -> Result<(SignaturePolicy, Option<roster::Attribution>)> {
+    if evidence.master_pubkeys.is_empty() {
+        return Ok((
+            committed_channel_signature_policy(committed_pubkey, material_pubkey)?,
+            None,
+        ));
+    }
+    let Some(material) = material_pubkey else {
+        return Err(Error::new(
+            "the paper master (aterm-update-core::pins, PAPER_MASTER_PUBKEYS) is pinned, \
+             so every cut must be authorized by the master-signed machine roster — but no \
+             signing material was supplied. A keyless machine may not cut for a rostered \
+             channel; no ledger claim was made",
+        ));
+    };
+    let material = canonical_update_pubkey(material)?;
+    // THE OBLIGATION TO CLIENTS THAT PREDATE THE ROSTER. Not an authorization check —
+    // the roster below is the authority, and this can neither grant nor deny on its
+    // behalf. It answers a different question: can the clients that have never heard
+    // of a roster verify what this cut is about to publish?
+    //
+    // It runs BEFORE the roster chain deliberately. Both refusals are pre-claim and
+    // free, but this one is decidable from two strings, and an operator whose key is
+    // outside the keyset needs to hear about the fleet they are about to strand rather
+    // than about a roster file they would then go and fix for nothing.
+    let standing = pre_roster_standing(evidence.committed_keyset, &material)?;
+    if let Some(why) = standing.strands() {
+        match evidence.pre_roster {
+            PreRosterClients::Protected => {
+                return Err(Error::new(format!(
+                    "the configured signing key's public identity {material} {why}. The \
+                     master-signed roster authorizes this machine, and every ROSTER-AWARE \
+                     client will accept this release — but a client running a build older \
+                     than the roster verifies the appcast under its own compiled-in \
+                     keyset, has no fallback to an older release, and would therefore \
+                     never update again. If no such client is left, say so on the command \
+                     line: pass {PRE_ROSTER_STRANDING_FLAG}. If some are, cut with the \
+                     committed channel head {} — the roster names it as a machine for \
+                     exactly this reason, and the release-credentials profile on that \
+                     machine must set `machine_id` to the roster id it is listed under; \
+                     no ledger claim was made",
+                    // `strands()` is `Some` only for the two variants that carry a head,
+                    // so the fallback is unreachable — spelled out rather than unwrapped
+                    // because a refusal path is the worst place to learn that.
+                    standing.head().unwrap_or("(the keyset is empty)"),
+                )));
+            }
+            PreRosterClients::Stranded => {
+                // Loud, unmissable, and printed on every entry that signs under such a
+                // key — not once at the moment the flag was invented.
+                step("signing", "");
+                step(
+                    "signing",
+                    "⚠ STRANDING PRE-ROSTER CLIENTS, because you asked for it",
+                );
+                step("", &format!("the signing key {material} {why}"));
+                step(
+                    "",
+                    "every client running a build older than the machine roster verifies",
+                );
+                step(
+                    "",
+                    "the appcast under its own compiled-in keyset, and release selection",
+                );
+                step(
+                    "",
+                    "has NO fallback to an older release. Those clients will not install",
+                );
+                step(
+                    "",
+                    "this release, or any release after it, ever — they are not delayed,",
+                );
+                step("", "they are wedged, and a reinstall is the only remedy.");
+                step("signing", "");
+            }
+            PreRosterClients::Answered => {}
+        }
+    }
+    // A FINISH entry stops here, with the key decision made and no attribution
+    // claimed. It has nothing left to sign, so it has no roster question to answer;
+    // see [`RosterDuty`] for why asking anyway is a wrong check rather than a spare
+    // one. Returning `None` for the attribution is the honest answer and is what stops
+    // a caller comparing a fresh local claim against bytes that already shipped.
+    if evidence.duty == RosterDuty::Finish {
+        return Ok((
+            SignaturePolicy {
+                required: true,
+                pubkey: Some(material),
+            },
+            None,
+        ));
+    }
+    let Some(document) = evidence.roster else {
+        return Err(Error::new(
+            "the paper master is pinned but the release-credentials profile names no \
+             `machine_roster`. An armed anchor never degrades to the single-key path: \
+             name the master-signed aterm-machines.toml (its <path>.sig must sit beside \
+             it), or unpin the master in a tracked commit",
+        ));
+    };
+    let who = machines::authorize_cut(
+        evidence.master_pubkeys,
+        document.bytes.clone(),
+        &document.signature,
+        &material,
+        evidence.now_unix,
+    )?;
+    // The cross-check, last because it is the cheapest and the least authoritative:
+    // the roster has already decided who this key belongs to. A profile (or a
+    // `~/.aterm/machine.toml`) that disagrees means a copied profile, a re-minted
+    // machine, or a mixed-up pair of keys — every one of which would publish an
+    // attribution that is true of the bytes and false of the world.
+    if let Some(declared) = evidence.declared_machine_id
+        && declared != who.machine_id
+    {
+        // THE REMEDY MUST NOT POINT AT THE CLIFF. There are two ways out of a mismatch —
+        // correct the declaration, or change the key — and they are not symmetric. On the
+        // bootstrap machine the SAFE path is exactly the one that trips this check
+        // (`~/.aterm/machine.toml` says "m3" while the cut has to go out under the
+        // incumbent head's key), so an operator following the second suggestion switches
+        // to m3's key, lands on the pre-roster refusal, and is handed
+        // `--strand-pre-roster-clients` as the way through. Two fail-closed refusals
+        // composing into a staircase whose bottom step bricks the installed base is still
+        // a bug: it is the program leading the way. So the alternative is offered only
+        // when taking it would NOT strand anyone, and named as the hazard it is otherwise.
+        let alternative = match machines::roster_pubkey_for(
+            evidence.master_pubkeys,
+            document.bytes.clone(),
+            &document.signature,
+            declared,
+        )
+        .map(|key| canonical_update_pubkey(&key))
+        .transpose()?
+        .map(|key| pre_roster_standing(evidence.committed_keyset, &key))
+        .transpose()?
+        {
+            Some(standing) if standing.strands().is_some() => format!(
+                ". Do NOT switch to {declared:?}'s key to satisfy this: that key cannot be \
+                 verified by clients that predate the roster, so it would trade an \
+                 attribution mismatch for a permanently wedged installed base"
+            ),
+            Some(_) => format!(", or cut with the key that belongs to {declared:?}"),
+            // The roster does not name the declared machine at all (or the document did
+            // not re-verify). No alternative can be recommended, because there is no key
+            // to recommend — say nothing rather than guess.
+            None => String::new(),
+        };
+        return Err(Error::new(format!(
+            "this machine declares it is {declared:?}, but the roster maps the configured \
+             signing key to {:?}. Refusing to publish an attribution that contradicts the \
+             machine it was cut on — set `machine_id = {:?}` in the release-credentials \
+             profile, which is what a cut from this machine under that key is{alternative}",
+            who.machine_id, who.machine_id,
+        )));
+    }
+    Ok((
+        SignaturePolicy {
+            required: true,
+            pubkey: Some(material),
+        },
+        Some(who),
+    ))
+}
+
 /// Decode and re-emit the updater Ed25519 key so journal/config comparisons
 /// use one canonical identity rather than textual base64 aliases.
 pub fn canonical_update_pubkey(encoded: &str) -> Result<String> {
@@ -2800,22 +3367,16 @@ fn download_snapshot_appcast_asset(
     Ok(bytes)
 }
 
-fn signer_tool(repo: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("atpkg-keys")));
-    }
-    candidates.push(repo.join("target/release/atpkg-keys"));
-    if let Some(tool) = candidates.into_iter().find(|path| path.is_file()) {
-        return Ok(tool);
-    }
-    Err(Error::new(
-        "update signing is configured (~/.aterm/release.conf names a signing key), but \
-         atpkg-keys is unavailable to sign the manifest. Build the owner tool with \
-         `cargo build --release -p atpkg-keys`, or remove the signing configuration to cut \
-         an unsigned release (signing is optional)",
-    ))
-}
+// `signer_tool` lived here: it searched PATH and target/release for an
+// `atpkg-keys` binary to shell out to for manifest signing. It is DELETED rather
+// than revived, because reviving it would undo the credentials redesign. Signing
+// is in-process now (`load_signing_material` below, docs/RELEASE-KEYS.md: "no
+// spawning atpkg-keys... no second binary required to cut"), so the function had
+// no caller, and its error text still instructed the operator to fix
+// `~/.aterm/release.conf` — a file the same redesign retired. Searching `$PATH`
+// for the thing that signs releases is exactly the ambient discovery that
+// `--release-credentials` exists to abolish; there is no honest way to make this
+// reachable again.
 
 /// The loaded signing identity. There is no longer a `tool` or a `key_path`: the
 /// key is held in memory by [`sign::ReleaseCredentials`], loaded once from the path
@@ -2832,13 +3393,90 @@ struct SigningMaterial {
 /// channel, which `committed_channel_signature_policy` decides, not this function.
 /// Nothing here reads the filesystem or the environment: whether a machine can cut
 /// is now a property of the command that ran, not of ambient state.
-fn load_signing_material(creds: Option<&sign::ReleaseCredentials>) -> Result<Option<SigningMaterial>> {
+fn load_signing_material(
+    creds: Option<&sign::ReleaseCredentials>,
+) -> Result<Option<SigningMaterial>> {
     let Some(creds) = creds else {
         return Ok(None);
     };
     Ok(Some(SigningMaterial {
         pubkey: canonical_update_pubkey(creds.pubkey())?,
     }))
+}
+
+/// Resolve Tier APPLE from THE anchor.
+///
+/// `pins::anchor_active` is the predicate, so an unpinned build is inert by
+/// exactly the same rule every other consumer of the anchor uses — the updater,
+/// atpkg, and `tools/install.sh` alike.
+///
+/// The anchor is a PARAMETER, not a read. The two cut entry points ([`run_cut`]
+/// and [`resume_cut`]) are the only places that name `pins::APPLE_TEAM_ID` for
+/// the purpose of deciding anything (`step_build` also names it, but only to copy
+/// it verbatim into the manifest), and they pass it inward from there. That is
+/// what makes every decision below this line drivable by a test with a
+/// placeholder team: a resolver that read the constant itself would be inert in
+/// this tree — the anchor is empty — and its rules would be untestable for
+/// exactly as long as they are unused, which is exactly as long as nobody would
+/// notice them breaking.
+///
+/// Note that this deliberately does NOT vary by [`CutKind`]. A dry run or a
+/// rehearsal with the anchor set signs and notarizes for real, which costs a
+/// submission and several minutes. That is the point: a rehearsal that skips the
+/// slowest, most failure-prone, most externally-dependent step in the pipeline
+/// rehearses the easy part, and the self-check it then runs would fail anyway —
+/// `spctl` rejects a bundle that was never notarized. One path, exercised the
+/// same way every time, beats a second path that only runs when it is least
+/// wanted.
+fn resolve_apple_tier(
+    team_id: &str,
+    credentials: Option<&sign::ReleaseCredentials>,
+) -> Result<sign::AppleTier> {
+    if !aterm_update_core::pins::anchor_active(team_id) {
+        return Ok(sign::AppleTier::Inactive);
+    }
+    let tier = sign::resolve_apple_tier(team_id, credentials).map_err(Error::new)?;
+    // Announced only when ACTIVE. The inactive tier must add zero steps and zero
+    // transcript lines: a cut that signs ad-hoc, as every shipped cut does, looks
+    // exactly as it did before Tier APPLE was wired.
+    println!("{}", tier.describe());
+    Ok(tier)
+}
+
+/// The tier a RESUME must resolve — which is nothing at all unless `build` is
+/// still going to run.
+///
+/// A resume is the path taken when something has already gone wrong, and the
+/// cost of demanding a credential it will never use is that a cut which is one
+/// upload away from finished cannot be finished at all. Only [`step_build`]
+/// reads `ctx.apple`; every later step re-proves the artifacts ON DISK against
+/// the MANIFEST's `team_id` (see [`selfcheck_signing`]), which is the claim that
+/// actually ships and is independent of whatever the keychain holds today. So a
+/// resume past `build` needs no certificate, and asking for one only converts a
+/// recoverable cut into an unrecoverable one when a certificate expires between
+/// the build and the upload.
+///
+/// The fail-closed property is untouched where it bites: when `build` WILL run,
+/// this resolves exactly as [`run_cut`] does, from the same anchor, with the same
+/// hard failure if the machine cannot keep the anchor's promise. The gate is
+/// deliberately the same predicate as the signing-key re-proof immediately above
+/// its call site — "is this resume going to bake artifact bytes?" — so the two
+/// credentials a rebuild needs are demanded under one rule rather than two that
+/// can drift apart.
+pub fn resume_apple_tier(
+    team_id: &str,
+    journal: &Journal,
+    credentials: Option<&sign::ReleaseCredentials>,
+) -> Result<sign::AppleTier> {
+    if journal.is_done("build") {
+        // Not a claim that the tier is off — the build that already ran resolved
+        // the real tier, and its artifacts carry whatever it did. It is the
+        // statement that nothing REMAINING will sign or notarize, and
+        // `AppleTier::Inactive` is precisely "no identity, no auth, every hook a
+        // no-op", which is what must happen if one were somehow reached.
+        return Ok(sign::AppleTier::Inactive);
+    }
+    resolve_apple_tier(team_id, credentials)
 }
 
 const MAX_SMALL_RELEASE_ASSET_BYTES: u64 = 256 * 1024;
@@ -3524,6 +4162,13 @@ pub fn release_inventory_asset_name_by_id(
     Ok(asset.name.clone())
 }
 
+/// The exact asset set a draft may carry before it is allowed to become visible.
+///
+/// `roster_attached` is derived from the MANIFEST's own `machine_id`, not from a
+/// local flag, at every call site: a release whose appcast claims a machine must
+/// carry the roster that proves it, and a release whose appcast claims none must not
+/// carry a roster at all. Deriving it from the published bytes is what keeps this a
+/// total check — the draft is judged by what it says about itself.
 pub fn validate_draft_asset_set(
     names: &[String],
     manifest: &Manifest,
@@ -3531,6 +4176,7 @@ pub fn validate_draft_asset_set(
     provenance_name: &str,
     dsym_name: Option<&str>,
 ) -> Result<()> {
+    let roster_attached = manifest.machine_id.is_some();
     let count = |name: &str| {
         names
             .iter()
@@ -3548,6 +4194,8 @@ pub fn validate_draft_asset_set(
         ),
         (manifest.dmg.as_str(), 1usize),
         (provenance_name, 1usize),
+        (roster::ROSTER_ASSET, usize::from(roster_attached)),
+        (roster::ROSTER_SIG_ASSET, usize::from(roster_attached)),
     ];
     if let Some(zip) = manifest.zip.as_deref() {
         exact_counts.push((zip, 1usize));
@@ -3581,6 +4229,10 @@ pub fn validate_draft_asset_set(
     }
     if signature_required {
         allowed.push(manifest_out::MANIFEST_SIG_ASSET);
+    }
+    if roster_attached {
+        allowed.push(roster::ROSTER_ASSET);
+        allowed.push(roster::ROSTER_SIG_ASSET);
     }
     if let Some(dsym) = dsym_name {
         allowed.push(dsym);
@@ -3837,10 +4489,226 @@ fn verify_release_asset_digest_inner(
     }
 }
 
+/// WHICH KEY must the shipped binary prove it compiled in?
+///
+/// `aterm-gui/build.rs` embeds `__DATA,__aterm_upin` from
+/// `pins::update_channel_signing_pubkey()` — the committed keyset HEAD — because the
+/// record exists to prove which ANCHOR reached the artifact, which is a property of
+/// the source tree and not of the machine that ran the build. So the head is what
+/// `buildplan` must expect.
+///
+/// It used to be derived from the SIGNING key instead, and that was correct only
+/// while "the signer IS the head" was an invariant — which is exactly the invariant
+/// the machine roster relaxes. Left alone it would have been a trap with a long fuse:
+/// a rostered non-head machine would clear every pre-claim gate, burn a ledger
+/// number, spend fifteen minutes building, and then fail the Mach-O pin proof with a
+/// fingerprint mismatch that names neither the roster nor the keyset.
+///
+/// Nothing changes for either configuration that exists today, and that is checkable
+/// rather than hopeful:
+///
+/// * PINNED CHANNEL — [`channel_signature_policy`] has already refused unless the
+///   signing key is the head (unarmed), so on the shipped path `committed_head` and
+///   `signing` are the same string and this returns the same fingerprint it always
+///   did. ARMED, the two may legitimately differ — the roster authorizes machines the
+///   keyset never carried — and taking the HEAD is what keeps this record a statement
+///   about the source tree rather than about which laptop ran the build.
+/// * UNPINNED CHANNEL (a fork) — there is no head, so the signing key remains the
+///   expectation, byte for byte as before.
+pub fn expected_embedded_update_pin(
+    committed_head: Option<&str>,
+    signing: Option<&str>,
+) -> Result<Option<String>> {
+    committed_head
+        .or(signing)
+        .map(update_key_fingerprint)
+        .transpose()
+}
+
+/// Unix seconds for the roster's freshness window — fail-closed in the OPPOSITE
+/// direction from [`unix_now`], and deliberately so.
+///
+/// `unix_now` returns 0 on an unreadable clock, which is right where it is used (a
+/// zero timestamp reads as "long ago" and makes every deadline look passed). Here 0
+/// would read as 1970, which is before every conceivable `valid_until`, so a LAPSED
+/// roster would sail through the gate and the cut would publish a release the whole
+/// fleet refuses. A clock we cannot read must therefore look like the far future,
+/// which makes every window look expired and refuses the cut. This is the same
+/// reasoning, and the same value, as `aterm_update::github::unix_now`.
+fn roster_now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(i64::MAX, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// The complete pre-claim signing verdict: WHETHER this cut signs, with WHICH key,
+/// as WHICH machine, and under WHICH roster document.
+///
+/// One struct rather than a tuple because the three parts are only ever correct
+/// together: an attribution without the roster bytes could not be published (the
+/// client refuses a release whose roster assets are absent), and roster bytes
+/// without an attribution would be assets nobody is authorized by.
+///
+/// `Debug` is derived rather than hand-written, and that is safe by construction:
+/// every field is public information — a public key, a machine id, a published
+/// roster and a detached signature. The redaction discipline lives where a secret
+/// actually is, on `sign::ReleaseCredentials`, and this type deliberately does not
+/// hold one.
+#[derive(Debug)]
+pub struct SigningVerdict {
+    /// The verdict the pipeline has always carried.
+    pub policy: SignaturePolicy,
+    /// WHICH machine the roster says this key is, when the tier is armed. `None`
+    /// with an unpinned master — which is every cut this tree can make.
+    pub attribution: Option<roster::Attribution>,
+    /// The exact roster bytes that authorized the cut, to be published as assets so
+    /// clients can check the same document. `None` exactly when `attribution` is.
+    pub roster: Option<machines::RosterDocument>,
+}
+
+impl SigningVerdict {
+    /// The journaled half of the attribution: public identity only, exactly as
+    /// `signature_pubkey` is.
+    fn machine_id(&self) -> Option<String> {
+        self.attribution.as_ref().map(|who| who.machine_id.clone())
+    }
+
+    /// The three attribution-shaped fields a [`CutCtx`] carries, derived together.
+    ///
+    /// Together, because they are only correct together and the ways they can be wrong
+    /// are silent: an id with no roster bytes stages no assets and publishes a release
+    /// an armed client refuses structurally; roster bytes with no id attach a document
+    /// nothing is authorized by. Handing the cut ONE value it destructures is what
+    /// stops a future edit setting two of the three.
+    fn cut_attribution(self) -> CutAttribution {
+        CutAttribution {
+            machine_id: self.machine_id(),
+            attribution: self.attribution,
+            roster: self.roster,
+        }
+    }
+}
+
+/// The attribution half of a [`CutCtx`], as one value. See
+/// [`SigningVerdict::cut_attribution`].
+struct CutAttribution {
+    machine_id: Option<String>,
+    attribution: Option<roster::Attribution>,
+    roster: Option<machines::RosterDocument>,
+}
+
+impl CutAttribution {
+    /// Nothing to stamp and nothing to stage — every cut this tree makes, and every
+    /// resume past `build`, where the manifest already carries its attribution and the
+    /// roster assets are already on disk.
+    const fn none() -> Self {
+        Self {
+            machine_id: None,
+            attribution: None,
+            roster: None,
+        }
+    }
+}
+
+/// May a resume that re-authorized as `observed` continue a cut the journal says was
+/// started by `journaled`?
+///
+/// Only if they are the same machine — including "both nameless", which is every cut
+/// made while the paper master is unpinned. The asymmetric cases are the interesting
+/// ones and both must refuse:
+///
+/// * journaled `Some`, observed `None` — the cut was authorized by a roster and this
+///   resume has none. Continuing would rebuild and re-sign a manifest whose
+///   attribution nothing currently proves.
+/// * journaled `None`, observed `Some` — the anchor was armed mid-cut. The already
+///   published (or already built) bytes carry no attribution, so finishing under one
+///   would produce a release whose halves disagree.
+///
+/// A pure rule with a name, rather than an inline `!=`, because it is the only part
+/// of the resume path the empty anchor makes unreachable — and an unreachable rule
+/// with no test is a rule that rots for exactly as long as nobody would notice.
+pub fn resume_attribution_agrees(journaled: Option<&str>, observed: Option<&str>) -> Result<()> {
+    if journaled == observed {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "this cut was started by machine {journaled:?} but the machine roster authorizes \
+         this one as {observed:?}; refusing to rebuild another machine's cut — its \
+         manifest is already signed over the first machine's attribution"
+    )))
+}
+
+/// The pipeline's entry point into the verdict: [`signing_verdict`] with THE anchors.
+///
+/// The anchors are named here and nowhere below, exactly as [`resolve_apple_tier`]
+/// names `pins::APPLE_TEAM_ID` at the two cut entry points and passes it inward. That
+/// is what makes the armed path drivable by a test with a synthetic master: a
+/// resolver that read the constants itself would be inert in this tree — the master
+/// is unpinned — and its rules would be untestable for exactly as long as they are
+/// unused, which is exactly as long as nobody would notice them breaking.
 fn preflight_signature_policy(
     repo: &Path,
     creds: Option<&sign::ReleaseCredentials>,
-) -> Result<SignaturePolicy> {
+    duty: RosterDuty,
+    pre_roster: PreRosterClients,
+) -> Result<SigningVerdict> {
+    signing_verdict(
+        repo,
+        creds,
+        &SigningAnchors {
+            master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+            committed_keyset: aterm_update_core::pins::UPDATE_CHANNEL_PUBKEYS,
+            identity_path: machines::conventional_identity_path().as_deref(),
+            now_unix: roster_now_unix(),
+            duty,
+            pre_roster,
+        },
+    )
+}
+
+/// Which [`RosterDuty`] a re-entry carries, from the one fact that decides it: has
+/// `build` already run?
+///
+/// `build` is the only step that assembles a manifest, stamps an attribution into it
+/// and signs it (`stage_manifest` → `sign_manifest_with_policy`), and the only step
+/// that stages the roster assets. Every step after it moves bytes that already exist.
+///
+/// A named function rather than an inline `if` because three entry points must agree
+/// on it — `resume_cut`, `run_recover_lost` and `revalidate_ctx_signature_policy` —
+/// and the bug this closes was exactly those three disagreeing.
+const fn roster_duty(build_done: bool) -> RosterDuty {
+    if build_done {
+        RosterDuty::Finish
+    } else {
+        RosterDuty::Sign
+    }
+}
+
+/// The anchors and ambient inputs [`signing_verdict`] resolves against — parameters,
+/// never reads, so every one of them can be a synthetic value in a test.
+pub struct SigningAnchors<'a> {
+    /// `pins::PAPER_MASTER_PUBKEYS` in production. Empty ⇒ the tier is absent.
+    pub master_pubkeys: &'a [&'a str],
+    /// `pins::UPDATE_CHANNEL_PUBKEYS` in production — the whole keyset.
+    pub committed_keyset: &'a [&'a str],
+    /// `~/.aterm/machine.toml` in production; `None` on a machine with no `HOME`.
+    /// Consulted only when the profile declares no `machine_id`, and only ever as a
+    /// cross-check.
+    pub identity_path: Option<&'a Path>,
+    /// Injected wall clock for the roster's freshness window.
+    pub now_unix: i64,
+    /// Whether this entry can still sign; see [`RosterDuty`].
+    pub duty: RosterDuty,
+    /// Whether this entry owes an answer for stranding clients that predate the
+    /// roster, and if so what the operator said. See [`PreRosterClients`].
+    pub pre_roster: PreRosterClients,
+}
+
+pub fn signing_verdict(
+    repo: &Path,
+    creds: Option<&sign::ReleaseCredentials>,
+    anchors: &SigningAnchors<'_>,
+) -> Result<SigningVerdict> {
     // Signing is opt-in UNLESS the workspace commits a channel pin. Without
     // `[workspace.metadata.aterm] update_channel_pubkey` the channel is Tier
     // REPO (SHA-256 + monotonic build number); no signing key is required to
@@ -3851,12 +4719,61 @@ fn preflight_signature_policy(
     // is not the pinned key refuses by name. Recovery and the yank successor
     // cut route through this same verdict, so a pinned channel cannot be
     // reopened to unsigned bytes by any pipeline flavor.
-    committed_channel_signature_policy(
+    //
+    // The machine-roster tier folds in HERE, at the same seam, for the same reason:
+    // this function is the pipeline's one answer to "may this machine sign?", and a
+    // second seam would be a second thing to keep in step. Its inputs are resolved
+    // here and passed inward — `pins` stays the only place the anchors are named,
+    // and `channel_signature_policy` stays a pure decision a test can drive with a
+    // synthetic master.
+    //
+    // With `PAPER_MASTER_PUBKEYS` empty (this tree) the roster document is not even
+    // READ: an unarmed anchor must cost nothing and must not fail a cut because a
+    // profile mentions a file that has since moved.
+    //
+    // A `Finish` duty does not read it either, and for a related reason: the roster it
+    // would read is not the roster the cut is publishing (that one is frozen in
+    // `dist/`), so reading it could only produce a verdict about the wrong document.
+    let armed = !anchors.master_pubkeys.is_empty() && anchors.duty == RosterDuty::Sign;
+    let document = match (
+        armed,
+        creds.and_then(sign::ReleaseCredentials::machine_roster),
+    ) {
+        (true, Some(path)) => Some(machines::RosterDocument::read(path)?),
+        _ => None,
+    };
+    let declared = if armed {
+        machines::declared_machine_id(
+            creds.and_then(sign::ReleaseCredentials::machine_id),
+            anchors.identity_path,
+        )?
+    } else {
+        None
+    };
+    let (policy, attribution) = channel_signature_policy(
         workspace_channel_pubkey(repo)?.as_deref(),
         load_signing_material(creds)?
             .as_ref()
             .map(|material| material.pubkey.as_str()),
-    )
+        &RosterEvidence {
+            master_pubkeys: anchors.master_pubkeys,
+            committed_keyset: anchors.committed_keyset,
+            roster: document.as_ref(),
+            declared_machine_id: declared.as_deref(),
+            now_unix: anchors.now_unix,
+            duty: anchors.duty,
+            pre_roster: anchors.pre_roster,
+        },
+    )?;
+    Ok(SigningVerdict {
+        // The roster document is kept only when it actually authorized something, so
+        // "we have roster bytes" and "we have an attribution" can never disagree —
+        // every later step keys off one of them and would otherwise have to trust
+        // that the other agrees.
+        roster: attribution.as_ref().and(document),
+        attribution,
+        policy,
+    })
 }
 
 fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
@@ -3897,6 +4814,69 @@ fn sign_manifest_with_policy(ctx: &CutCtx, manifest: &Path) -> Result<PathBuf> {
         ),
     );
     Ok(signature)
+}
+
+/// Assemble the manifest, STAMP the attribution into it, prove the bytes, and write
+/// them — in that order, which is the entire security property.
+///
+/// `machine_id` and `roster_seq` are worth nothing unless they are inside what the
+/// signature covers. The signature is produced by `sign_manifest_with_policy`, which
+/// reads the FILE this function wrote; so as long as the stamp happens before the
+/// write, it is inside the signed bytes by construction. Stamp after the write and
+/// the release ships an attribution any attacker can rewrite; stamp after the
+/// SIGNATURE and the release ships a signature that does not verify at all, which
+/// `sign_manifest_with_policy`'s own read-back check catches.
+///
+/// It exists as a named function rather than four lines inside `step_build` because
+/// `step_build` needs a real universal build to run and this ordering therefore had
+/// no covering test — the one property most in need of one.
+pub fn stage_manifest(
+    dist: &Path,
+    inputs: &manifest_out::ManifestInputs<'_>,
+    who: Option<&roster::Attribution>,
+) -> Result<PathBuf> {
+    let mut manifest = manifest_out::build(inputs);
+    // With an unpinned paper master `who` is `None` on every cut, both keys stay
+    // absent, and the emitted bytes are identical to what this cutter has always
+    // produced. That is the fleet-safety requirement, not a nicety.
+    if let Some(who) = who {
+        machines::attribute(&mut manifest, who);
+    }
+    manifest_out::write(dist, &manifest)
+}
+
+/// Stage the master-signed roster beside the appcast, so a client can fetch the
+/// document that authorizes the signature it is about to check.
+///
+/// These are the exact bytes the pre-claim gate verified, carried through the cut
+/// rather than re-read: publishing a roster other than the one that authorized the
+/// cut is the producer-side version of checking one document and using another.
+///
+/// `None` — the shipped state — writes nothing and removes nothing, so an unarmed
+/// cut's `dist/` is exactly what it was. There is no "clean up a stale roster" branch
+/// on purpose: `validate_draft_asset_set` refuses any asset outside the exact allowed
+/// set, so a leftover file in `dist/` cannot become a published asset.
+pub fn stage_roster_assets(dist: &Path, document: Option<&machines::RosterDocument>) -> Result<()> {
+    let Some(document) = document else {
+        return Ok(());
+    };
+    let roster = dist.join(roster::ROSTER_ASSET);
+    let signature = dist.join(roster::ROSTER_SIG_ASSET);
+    fs::write(&roster, &document.bytes)
+        .map_err(|e| Error::new(format!("stage {}: {e}", roster.display())))?;
+    fs::write(&signature, &document.signature)
+        .map_err(|e| Error::new(format!("stage {}: {e}", signature.display())))?;
+    step(
+        "roster",
+        &format!(
+            "{} + {} staged as release assets ({} + {} bytes)",
+            roster::ROSTER_ASSET,
+            roster::ROSTER_SIG_ASSET,
+            document.bytes.len(),
+            document.signature.len()
+        ),
+    );
+    Ok(())
 }
 
 pub fn sha256_bytes(bytes: &[u8]) -> String {
@@ -4079,6 +5059,16 @@ pub struct CutCtx {
     /// file contents change between reading and signing — so the identity is what is
     /// recorded and matched.
     pub credentials: Option<sign::ReleaseCredentials>,
+    /// Tier APPLE, resolved ONCE at the entry point for exactly the reason
+    /// `credentials` is: a cut must not be able to change what signed it halfway
+    /// through. Resolution happens before the ledger claim, so a machine with no
+    /// Developer-ID certificate or no notarytool credential fails while failing
+    /// is still free — a claim burns a single-use build number, and discovering
+    /// an empty keychain after that costs one.
+    ///
+    /// `AppleTier::Inactive` whenever `pins::APPLE_TEAM_ID` is empty, which is
+    /// every build that ships today.
+    pub apple: sign::AppleTier,
     pub repo: PathBuf,
     pub dist: PathBuf,
     pub journal_path: PathBuf,
@@ -4098,6 +5088,21 @@ pub struct CutCtx {
     /// Frozen pre-claim channel-signature ratchet and its actual public key.
     pub signature_required: bool,
     pub signature_pubkey: Option<String>,
+    /// The machine the roster authorized, journaled beside the public key. Set on
+    /// every real cut and restored from the journal on resume — including a resume
+    /// past `build`, where [`CutCtx::attribution`] is deliberately not restored.
+    /// That asymmetry is the point: the id is what every later step must keep
+    /// AGREEING with, the full attribution is only needed to STAMP a manifest.
+    pub signature_machine_id: Option<String>,
+    /// The full attribution (id + key + `roster_seq`) for the one step that stamps
+    /// it into the manifest, and the roster bytes that authorized it, to be
+    /// published as assets. Both are `Some` only when a build will actually run
+    /// under an armed anchor; a resume that will not rebuild neither stamps nor
+    /// re-stages, and asking it for a roster it cannot use would convert a
+    /// recoverable cut into an unrecoverable one — the same rule
+    /// [`resume_apple_tier`] applies to the Developer-ID certificate.
+    pub attribution: Option<roster::Attribution>,
+    pub roster: Option<machines::RosterDocument>,
     /// Immutable GitHub release object ID, persisted in the real-cut journal
     /// as soon as draft creation is observed.
     pub release_id: Option<u64>,
@@ -4306,10 +5311,88 @@ impl CutCtx {
     /// remote listing is checked against, so the upload set and the acceptance
     /// rule cannot drift apart.
     fn mirror_asset_paths(&self) -> Vec<PathBuf> {
-        mirror::required_asset_names(&self.version, self.signature_required)
-            .into_iter()
-            .map(|name| self.dist.join(name))
-            .collect()
+        mirror::required_asset_names(
+            &self.version,
+            self.signature_required,
+            self.attaches_roster(),
+        )
+        .into_iter()
+        .map(|name| self.dist.join(name))
+        .collect()
+    }
+
+    /// Does this cut publish the machine roster?
+    ///
+    /// Exactly when it has an attributed machine, which is exactly when the paper
+    /// master is pinned — and the answer is read from the JOURNALED id rather than
+    /// from the in-memory roster document so that it survives a resume past `build`,
+    /// which has the assets on disk and no document in hand.
+    fn attaches_roster(&self) -> bool {
+        self.signature_machine_id.is_some()
+    }
+
+    /// The two roster assets in `dist/`, or nothing at all on the shipped path.
+    fn roster_asset_paths(&self) -> Vec<PathBuf> {
+        if !self.attaches_roster() {
+            return Vec::new();
+        }
+        vec![
+            self.dist.join(roster::ROSTER_ASSET),
+            self.dist.join(roster::ROSTER_SIG_ASSET),
+        ]
+    }
+
+    /// Every local artifact that must reach the DRAFT release, in upload order.
+    ///
+    /// A named set rather than a `vec![]` inside `step_upload` because the roster's
+    /// membership in it is a fleet-safety property with no other test: an armed client
+    /// refuses a release carrying no `aterm-machines.toml` structurally, before any
+    /// artifact crypto, and the updater has no fallback to an older release — so a
+    /// regression that silently stopped attaching the pair would publish a well-formed
+    /// release that wedges the fleet, and nothing would fail.
+    fn upload_asset_paths(&self) -> Vec<PathBuf> {
+        let mut files = vec![
+            self.dmg_path(),
+            self.zip_path(),
+            self.manifest_path(),
+            self.provenance_path(),
+        ];
+        files.extend(self.roster_asset_paths());
+        files
+    }
+
+    /// Every local artifact whose bytes the draft proof compares against the remote
+    /// object, minus the dSYM (which is present only when the build produced one).
+    ///
+    /// The roster has to be in here and not merely in the asset-NAME check: the
+    /// appcast's signature does not cover it — the master's does — so nothing else in
+    /// that proof would notice a roster replaced remotely between upload and flip.
+    fn proof_asset_paths(&self) -> Vec<PathBuf> {
+        let mut files = vec![
+            self.manifest_path(),
+            self.dmg_path(),
+            self.zip_path(),
+            self.provenance_path(),
+        ];
+        if self.signature_required {
+            files.push(self.manifest_path().with_extension("toml.sig"));
+        }
+        files.extend(self.roster_asset_paths());
+        files
+    }
+
+    /// WHICH fingerprint the shipped binary must prove it compiled in.
+    ///
+    /// One accessor so `step_build` (which sets the expectation and writes it into the
+    /// provenance) and `step_selfcheck` (which checks the binary and the provenance
+    /// against it) cannot derive it differently. They did: the build followed the
+    /// committed head and the self-check followed the signing key, which agree only
+    /// while signer == head — the invariant the machine roster relaxes.
+    fn expected_embedded_pin(&self) -> Result<Option<String>> {
+        expected_embedded_update_pin(
+            workspace_channel_pubkey(&self.repo)?.as_deref(),
+            self.signature_pubkey.as_deref(),
+        )
     }
 }
 
@@ -4942,7 +6025,19 @@ pub fn run_recover_lost(
     // Validate the immutable signing identity before rotating a killed
     // process's token.  Missing key recovery therefore leaves the old fence
     // untouched and the channel visibly blocked, never silently unsigned.
-    let signature_policy = preflight_signature_policy(repo, credentials)?;
+    // A recovery's duty is read off the journal it found, not assumed: a journal that
+    // never reached `build` will rebuild and re-sign, so it must re-prove the roster;
+    // one that is past `build` — and the no-journal case, which is a PUBLISHED release
+    // being finished — has nothing left to sign. Demanding a still-fresh roster from
+    // the second kind would make recovery fail for a reason unrelated to recovering,
+    // which is the trade the `AppleTier::Inactive` decision below already refuses to
+    // make for an expired certificate.
+    let duty = roster_duty(journal.as_ref().is_none_or(|j| j.is_done("build")));
+    // A RECOVERY never begins a cut; it continues one whose signing key it is not
+    // permitted to change. The pre-roster question was answered at that cut's pre-claim.
+    let signature_verdict =
+        preflight_signature_policy(repo, credentials, duty, PreRosterClients::Answered)?;
+    let signature_policy = signature_verdict.policy.clone();
     if let Some(journal) = &journal
         && (journal.signature_required != signature_policy.required
             || journal.signature_pubkey.as_deref() != signature_policy.pubkey.as_deref())
@@ -4950,6 +6045,23 @@ pub fn run_recover_lost(
         return Err(Error::new(
             "recovery journal signing policy/key differs from the current signing configuration",
         ));
+    }
+    // Attribution is compared on exactly the same terms as the key — and ONLY when this
+    // recovery will rebuild. A recovery that will re-assemble and re-sign a manifest is
+    // choosing an attribution, and choosing a different one than the journal records
+    // would publish a claim the cut's own history contradicts; that is what this
+    // refuses. A recovery that is finishing already-signed bytes chooses nothing, so
+    // there is nothing to disagree about, and refusing there would kill the one path
+    // designed for a DEAD PUBLISHER in the one design where publishers are plural. The
+    // rule is the shared pure one so that recovery and resume cannot state it
+    // differently; the old inline `is_some()` guard was one-sided and did.
+    if duty == RosterDuty::Sign
+        && let Some(journal) = &journal
+    {
+        resume_attribution_agrees(
+            journal.signature_machine_id.as_deref(),
+            signature_verdict.machine_id().as_deref(),
+        )?;
     }
 
     // This is the last line before the first recovery mutation. The flag is an
@@ -5030,7 +6142,8 @@ fn recover_under_fence(
     let tag = format!("v{version}");
     match verify::release_state(slug, &tag)? {
         verify::ReleaseState::Published => {
-            let fresh_policy = fresh_published_recovery_signature_policy(repo, slug, version, credentials)?;
+            let fresh_policy =
+                fresh_published_recovery_signature_policy(repo, slug, version, credentials)?;
             recover_published_cut(
                 repo,
                 slug,
@@ -5083,8 +6196,12 @@ fn recover_under_fence(
                     }
                 }
                 verify::ReleaseState::Published => {
-                    let fresh_policy =
-                        fresh_published_recovery_signature_policy(repo, slug, version, credentials)?;
+                    let fresh_policy = fresh_published_recovery_signature_policy(
+                        repo,
+                        slug,
+                        version,
+                        credentials,
+                    )?;
                     return recover_published_cut(
                         repo,
                         slug,
@@ -5134,7 +6251,102 @@ fn fresh_published_recovery_signature_policy(
             "recovery release v{version} changed away from Published while refreshing its signature authority"
         )));
     }
-    preflight_signature_policy(repo, credentials)
+    // Only the POLICY half is refreshed here. A published recovery rebuilds nothing —
+    // it validates and finishes bytes that already shipped — so the attribution it
+    // must record is the one INSIDE those bytes, read from the downloaded manifest by
+    // `recover_published_cut`, never a fresh local claim about who this machine is.
+    Ok(
+        preflight_signature_policy(repo, credentials, RosterDuty::Finish, PreRosterClients::Answered)?
+            .policy,
+    )
+}
+
+/// Which assets a published release must be carrying for its own manifest to make
+/// sense, beyond the ones every release has.
+///
+/// Derived from the MANIFEST's `machine_id` — what the release says about itself —
+/// rather than from local state, exactly as `validate_draft_asset_set` derives the same
+/// requirement. A recovery that judged the release by the recovering machine's
+/// configuration would reconstruct one set and mirror another.
+fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
+    if manifest.machine_id.is_none() {
+        return Vec::new();
+    }
+    vec![roster::ROSTER_ASSET, roster::ROSTER_SIG_ASSET]
+}
+
+/// Rebuild `dist/`'s roster pair from the published release, for a recovery that found
+/// an attributed manifest.
+///
+/// # Why this is not optional
+///
+/// `recover_published_cut` sets `signature_machine_id` from the recovered manifest —
+/// correctly, out of bytes a signature covers — and that makes `CutCtx::attaches_roster`
+/// true, which puts both roster names into `mirror_asset_paths`. `step_mirror` hard-errors
+/// on any mirror asset that is not a local file. Reconstructing the DMG, the zip, the
+/// appcast, its signature and the provenance but not these two therefore left
+/// `cargo ship recover-lost` unable to complete on the armed path: it failed with
+/// "…dist/ artifacts are gone… recover the cut rather than mirroring different bytes",
+/// whose advice is the command that was already running. The release stayed live on the
+/// publish repo and absent from the public channel the fleet actually reads.
+///
+/// # What binds them, given the manifest's signature does not
+///
+/// There is no SHA-256 for these two in the manifest — the MASTER signs them, not the
+/// release key — so they are bound cryptographically instead, by
+/// `machines::verify_published_roster`: the master signature proves authorship, and the
+/// `roster_seq`/`machine_id` pair proves it is THIS release's roster. That is strictly
+/// stronger than the digest check the other assets get.
+fn reconstruct_roster_assets(
+    slug: &str,
+    release_id: u64,
+    names: &[String],
+    manifest: &Manifest,
+    dist: &Path,
+) -> Result<()> {
+    let required = recovered_roster_asset_names(manifest);
+    if required.is_empty() {
+        return Ok(());
+    }
+    let machine_id = manifest
+        .machine_id
+        .as_deref()
+        .expect("required is non-empty exactly when machine_id is Some");
+    for name in &required {
+        if !exact_asset_present(names, name)? {
+            return Err(Error::new(format!(
+                "published recovery release is attributed to machine {machine_id:?} but \
+                 carries no exact {name}; an armed client refuses such a release \
+                 structurally, so there is nothing here to recover"
+            )));
+        }
+    }
+    let roster_bytes =
+        download_release_asset_for_release_id(slug, release_id, roster::ROSTER_ASSET)?;
+    let roster_sig =
+        download_release_asset_for_release_id(slug, release_id, roster::ROSTER_SIG_ASSET)?;
+    machines::verify_published_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        roster_bytes.clone(),
+        &roster_sig,
+        machine_id,
+        manifest.roster_seq,
+    )?;
+    fs::write(dist.join(roster::ROSTER_ASSET), &roster_bytes)
+        .map_err(|error| Error::new(format!("reconstruct machine roster: {error}")))?;
+    fs::write(dist.join(roster::ROSTER_SIG_ASSET), &roster_sig)
+        .map_err(|error| Error::new(format!("reconstruct machine roster signature: {error}")))?;
+    step(
+        "recover",
+        &format!(
+            "reconstructed {} + {} and proved them under the pinned paper master \
+             (machine {machine_id}, roster_seq {:?})",
+            roster::ROSTER_ASSET,
+            roster::ROSTER_SIG_ASSET,
+            manifest.roster_seq
+        ),
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5270,6 +6482,7 @@ fn recover_published_cut(
     }
     fs::write(dist.join(&provenance_name), provenance)
         .map_err(|error| Error::new(format!("reconstruct provenance: {error}")))?;
+    reconstruct_roster_assets(slug, release_object.id, &names, &manifest, &dist)?;
     let journal_path = dist.join("cut-state.toml");
     let journal = Journal {
         format: JOURNAL_FORMAT,
@@ -5281,6 +6494,12 @@ fn recover_published_cut(
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
+        // FROM THE PUBLISHED BYTES, not from this machine. The manifest being
+        // recovered is already signed, and `machine_id` is inside what that
+        // signature covers — so the only truthful answer to "which machine cut
+        // this?" is the one the artifact itself carries. Deriving it locally would
+        // let a recovery relabel someone else's release.
+        signature_machine_id: manifest.machine_id.clone(),
         release_id: Some(release_object.id),
         draft_create_issued: true,
         upload_intents: Vec::new(),
@@ -5320,6 +6539,12 @@ fn recover_published_cut(
     );
     let mut ctx = CutCtx {
         credentials: credentials.cloned(),
+        // A recovered cut has already published; every build step is marked done
+        // and none will run again, so there is nothing left for the tier to
+        // sign. Resolving it here would make recovery — the path taken when
+        // something has ALREADY gone wrong — fail for a reason unrelated to
+        // recovering, e.g. a certificate that expired since the cut shipped.
+        apple: sign::AppleTier::Inactive,
         repo: repo.to_path_buf(),
         dist,
         journal_path,
@@ -5333,6 +6558,12 @@ fn recover_published_cut(
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
+        signature_machine_id: manifest.machine_id.clone(),
+        // Nothing left to stamp and nothing left to stage: every build step is
+        // already marked done, so the manifest that would carry an attribution and
+        // the assets that would carry a roster are both already published bytes.
+        attribution: None,
+        roster: None,
         release_id: Some(release_object.id),
         draft_create_issued: true,
         upload_intents: Vec::new(),
@@ -5358,14 +6589,12 @@ fn recover_published_cut(
 /// bumping Cargo.toml therefore lands on the already-published guard in
 /// [`verify::derive_cut_mode`], which names the bump.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
-    // Loaded ONCE, here, from the path on the command line. Every later stage —
-    // build, resume, recovery, flip — reads this value rather than re-discovering
-    // credentials, so a cut cannot change identity halfway through.
-    let credentials = opts
-        .release_credentials
-        .as_deref()
-        .map(sign::ReleaseCredentials::load)
-        .transpose()
+    // Resolved ONCE, here — the explicit flag when given, else this machine's
+    // provisioned identity (`~/.aterm/machine.key`, the same file every atpkg
+    // producer tool signs with). Every later stage — build, resume, recovery,
+    // flip — reads this value rather than re-discovering credentials, so a cut
+    // cannot change identity halfway through.
+    let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
         .map_err(Error::new)?;
     let credentials = credentials.as_ref();
     let t0 = Instant::now();
@@ -5471,6 +6700,16 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             }
         }
     }
+
+    // Tier APPLE, resolved HERE: after the resume delegation above (a resume
+    // resolves its own tier, under its own rule — see `resume_apple_tier`) and
+    // well before the gates, the lease and the claim. If the anchor is set, this
+    // is where "is there a Developer-ID certificate for the committed team, and a
+    // notarytool credential to submit with?" gets answered. Everything that can
+    // fail must fail before the ledger claim burns a build number
+    // (docs/RELEASE-KEYS.md's ordering rule); this is a fresh cut, so `build`
+    // will certainly run and the tier is certainly needed.
+    let apple = resolve_apple_tier(aterm_update_core::pins::APPLE_TEAM_ID, credentials)?;
 
     // ---- decide the version (fresh vs remote-derived recut, spec §5) ------
     let changelog_text = fs::read_to_string(repo.join(changelog::CHANGELOG_FILE))
@@ -5617,13 +6856,29 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     };
     let newest_channel = channel.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    let signature_policy = preflight_signature_policy(repo, credentials)?;
+    // THE MACHINE-ROSTER GATE RUNS HERE, inside this call, and here is deliberate:
+    // it is the last of the pre-claim gates and it sits BEFORE the ledger claim a few
+    // lines below. A claim burns a single-use build number and is pushed to origin, so
+    // a refusal after it costs a number that can never be reused and leaves a dangling
+    // claim for `cargo ship status` to explain. Everything the roster gate needs is
+    // local — a file, a signature, a clock — so there is no reason for it to happen
+    // one line later than the cheapest gates, and every reason for it not to.
+    // THE ONE ENTRY THAT BEGINS A CUT, and therefore the only one that owes an answer
+    // for the pre-roster fleet. Every re-entry below inherits it by inheriting the key.
+    let signature_verdict = preflight_signature_policy(
+        repo,
+        credentials,
+        RosterDuty::Sign,
+        if opts.strand_pre_roster_clients {
+            PreRosterClients::Stranded
+        } else {
+            PreRosterClients::Protected
+        },
+    )?;
+    let signature_policy = signature_verdict.policy.clone();
     step(
         "signature",
-        &match (
-            workspace_channel_pubkey(repo)?,
-            signature_policy.required,
-        ) {
+        &match (workspace_channel_pubkey(repo)?, signature_policy.required) {
             (Some(pin), _) => format!(
                 "committed channel anchor (aterm-update-core::pins) pins signing to \
                  {pin} · configured key matches"
@@ -5631,11 +6886,39 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             (None, true) => {
                 "signing key configured · matches persisted public identity".to_string()
             }
-            (None, false) => {
-                "no committed channel anchor and no signing configuration".to_string()
-            }
+            (None, false) => "no committed channel anchor and no signing configuration".to_string(),
         },
     );
+    // THE ROSTER RATCHET, pre-claim, against the head this scan already has in hand.
+    // `machines::authorize_cut` judges the roster document; only this can judge the
+    // roster GENERATION, because the floor is channel state and lives in the published
+    // head's manifest. Both refusals must land before the claim: a cut whose roster is
+    // older than the channel's is one the fleet refuses on sight, and finding that out
+    // after burning a build number costs a number that can never be reused.
+    let newest_roster_seq = published_roster_seq(newest_channel)?;
+    roster_floor_covered(
+        signature_verdict
+            .attribution
+            .as_ref()
+            .map(|who| who.roster_seq),
+        newest_roster_seq,
+    )?;
+    // Announced only when the tier is ARMED. An inert anchor must add zero transcript
+    // lines, exactly as Tier APPLE does — a cut from this tree has to look precisely
+    // as it did before the roster existed.
+    if let Some(who) = &signature_verdict.attribution {
+        step(
+            "roster",
+            &format!(
+                "machine {} authorized by the paper-master roster (roster_seq {} · \
+                 channel head {}) (pre-claim)",
+                who.machine_id,
+                who.roster_seq,
+                newest_roster_seq.map_or_else(|| "none".to_string(), |seq| seq.to_string())
+            ),
+        );
+    }
+    let attributed = signature_verdict.cut_attribution();
 
     // ---- claim (spec §2 — before the expensive build) ----------------------
     let now = unix_now();
@@ -5722,6 +7005,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
 
     let mut ctx = CutCtx {
         credentials: credentials.cloned(),
+        apple,
         repo: repo.to_path_buf(),
         dist,
         journal_path: journal_path.clone(),
@@ -5740,6 +7024,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         manifest_signed: false,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
+        signature_machine_id: attributed.machine_id,
+        attribution: attributed.attribution,
+        roster: attributed.roster,
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
@@ -5763,6 +7050,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             manifest_signed: ctx.manifest_signed,
             signature_required: ctx.signature_required,
             signature_pubkey: ctx.signature_pubkey.clone(),
+            signature_machine_id: ctx.signature_machine_id.clone(),
             release_id: None,
             draft_create_issued: false,
             upload_intents: Vec::new(),
@@ -5838,10 +7126,62 @@ fn resume_cut(
         }
     }
 
+    // THE ROSTER, re-derived under exactly the rule above it: only a resume that
+    // will REBUILD needs it, because only `step_build` stamps a manifest and stages
+    // the roster assets. A resume past `build` is finishing bytes that already carry
+    // both, and demanding a still-fresh roster from it would turn a cut that is one
+    // upload from done into one that can never be finished — the same trade
+    // `resume_apple_tier` makes for an expired certificate, for the same reason.
+    //
+    // Re-deriving rather than trusting the journal is the point: the roster may have
+    // lapsed or revoked this machine since the cut began, and a journal cannot know
+    // that. What the journal DOES know is which machine started the cut, and a
+    // resume that authorizes as a different machine is refused outright — the
+    // manifest's attribution is inside bytes that are already signed, so a second
+    // machine finishing the first machine's cut would publish a claim the artifact
+    // contradicts.
+    //
+    // The `roster_tier_armed()` guard is what makes the unarmed resume path provably
+    // unchanged: with `PAPER_MASTER_PUBKEYS` empty this block is not entered at all,
+    // so a resume performs exactly the calls, in exactly the order, that it always
+    // has. The RULE inside it is a pure function ([`resume_attribution_agrees`]) so
+    // that being unreachable in this tree does not make it untested.
+    let resumed = if aterm_update_core::pins::roster_tier_armed() && !journal.is_done("build") {
+        let verdict = preflight_signature_policy(
+            repo,
+            credentials,
+            RosterDuty::Sign,
+            PreRosterClients::Answered,
+        )?;
+        resume_attribution_agrees(
+            journal.signature_machine_id.as_deref(),
+            verdict.machine_id().as_deref(),
+        )?;
+        Some(verdict)
+    } else {
+        None
+    };
+
+    let resumed_attribution =
+        resumed.map_or_else(CutAttribution::none, SigningVerdict::cut_attribution);
+
+    // Symmetric with the signing-key re-proof directly above, under the same
+    // `!is_done("build")` rule: a resume that can still rebuild artifacts must
+    // re-prove it can still sign and notarize them, and a resume that cannot must
+    // not be asked for credentials it will never use. Re-resolving rather than
+    // trusting the journal is deliberate — the certificate could have expired or
+    // been removed since the cut began, and a journal cannot know that.
+    let apple = resume_apple_tier(
+        aterm_update_core::pins::APPLE_TEAM_ID,
+        &journal,
+        credentials,
+    )?;
+
     let (lease, fence) =
         recovered_session.map_or((None, None), |(lease, fence)| (Some(lease), Some(fence)));
     let mut ctx = CutCtx {
         credentials: credentials.cloned(),
+        apple,
         repo: repo.to_path_buf(),
         dist: dist.to_path_buf(),
         journal_path: journal_path.to_path_buf(),
@@ -5856,6 +7196,14 @@ fn resume_cut(
         manifest_signed: journal.manifest_signed,
         signature_required: journal.signature_required,
         signature_pubkey: journal.signature_pubkey.clone(),
+        // The ID comes from the JOURNAL on every resume, including one past `build`:
+        // it is the cut's fixed identity and every later step must keep agreeing with
+        // it. The full attribution and the roster bytes come from the re-derivation
+        // and are therefore `None` on a resume that will not rebuild — nothing left
+        // to stamp, nothing left to stage.
+        signature_machine_id: journal.signature_machine_id.clone(),
+        attribution: resumed_attribution.attribution,
+        roster: resumed_attribution.roster,
         release_id: journal.release_id,
         draft_create_issued: journal.draft_create_issued,
         upload_intents: journal.upload_intents.clone(),
@@ -6030,14 +7378,46 @@ fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
-    let observed = preflight_signature_policy(&ctx.repo, ctx.credentials.as_ref())?;
-    if observed.required != ctx.signature_required
-        || observed.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
+    // The DUTY, from the same fact `resume_cut` and `run_recover_lost` read it from.
+    // This used to be unconditional, and `resume_cut`'s own comment promised otherwise:
+    // it guards its roster re-derivation with `!is_done("build")` and says demanding a
+    // still-fresh roster from a later resume "would turn a cut that is one upload from
+    // done into one that can never be finished". That promise was defeated here, four
+    // hundred lines away, because `run_pipeline` calls this on every real entry whose
+    // first incomplete step is not `unlock`. See [`RosterDuty`] for why the post-build
+    // check is not merely inconvenient but wrong: the roster it would read is not the
+    // roster the cut will publish.
+    let duty = roster_duty(ctx.is_done("build"));
+    let observed = preflight_signature_policy(
+        &ctx.repo,
+        ctx.credentials.as_ref(),
+        duty,
+        PreRosterClients::Answered,
+    )?;
+    if observed.policy.required != ctx.signature_required
+        || observed.policy.pubkey.as_deref() != ctx.signature_pubkey.as_deref()
     {
         return Err(Error::new(
             "local signing configuration or the committed channel pin changed after this \
              cut's pre-claim scan; refusing to build/upload/flip under stale signing state",
         ));
+    }
+    // On a SIGN entry the roster has just been re-proved by the call above — freshness
+    // and revocation included — and this adds the identity half: the machine that will
+    // stamp and sign must be the machine the journal already records. A roster that
+    // lapses or revokes this machine before `build` is a genuine refusal; the release
+    // it would produce is one every armed client rejects, so failing here is strictly
+    // better than failing in the fleet.
+    //
+    // On a FINISH entry `observed.machine_id()` is `None` by construction and nothing
+    // is compared: the attribution is already inside signed bytes and no local verdict
+    // can change it. This is what lets ANY rostered machine finish a dead publisher's
+    // released cut — the case a plural-publisher design exists for.
+    if duty == RosterDuty::Sign {
+        resume_attribution_agrees(
+            ctx.signature_machine_id.as_deref(),
+            observed.machine_id().as_deref(),
+        )?;
     }
     ensure_ctx_release_lease(ctx)
 }
@@ -6135,6 +7515,137 @@ fn run_gate_script(repo: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Notarize + package: the ordered middle of `step_build`, extracted so the
+// ORDER is a tested fact
+// ---------------------------------------------------------------------------
+
+/// The two container builders and the two digest reads, behind a trait.
+///
+/// `hdiutil` and `ditto` want a real signed bundle and tens of seconds; the
+/// sequence that calls them is where a mutation is invisible and expensive —
+/// notarizing after the zip is built, or skipping the post-hook re-hash, both
+/// produce a green cut and a broken artifact. This seam is what lets
+/// [`notarize_and_package`] be driven end to end, offline, by a fake that records
+/// what happened in what order.
+///
+/// It wraps `dmg.rs` rather than changing it: the real implementation is four
+/// one-line delegations, so nothing about how a DMG is actually built moved.
+pub trait Packager {
+    fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
+    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
+    fn sha256(&self, path: &Path) -> Result<String>;
+    fn size(&self, path: &Path) -> Result<u64>;
+}
+
+/// The real packaging tools. The only implementation the pipeline constructs.
+pub struct RealPackager;
+
+impl Packager for RealPackager {
+    fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
+        dmg::create(app, dist, version).map_err(Error::new)
+    }
+    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
+        dmg::create_zip(app, dist, version).map_err(Error::new)
+    }
+    fn sha256(&self, path: &Path) -> Result<String> {
+        dmg::sha256_file(path).map_err(Error::new)
+    }
+    fn size(&self, path: &Path) -> Result<u64> {
+        Ok(fs::metadata(path)
+            .map_err(|e| Error::new(format!("stat {}: {e}", path.display())))?
+            .len())
+    }
+}
+
+/// Both containers, and the digests the manifest will publish for them.
+pub struct PackagedCut {
+    pub dmg: dmg::Packaged,
+    /// The DMG digest AFTER the Tier APPLE hook, which rewrites the bytes.
+    pub dmg_sha256: String,
+    /// The DMG size AFTER the hook, for the same reason.
+    pub dmg_size: u64,
+    pub zip: dmg::Packaged,
+}
+
+/// Notarize the bundle, build both containers around it, notarize the DMG, and
+/// return the digests that go in the manifest.
+///
+/// # The order is the property
+///
+/// Every line of this function is sequenced against a failure that produces a
+/// GREEN cut and a broken artifact, which is why it is one extracted unit with
+/// one test over it rather than five statements inline in a 300-line step:
+///
+/// 1. the `.app` is notarized and stapled FIRST, because [`Packager::zip`]
+///    archives the bundle as it finds it and the zip is what every self-updating
+///    install downloads — a zip made before the staple strands the fleet on any
+///    Mac that cannot reach Apple;
+/// 2. the DMG is built AFTER that staple, so the human's artifact carries the
+///    ticket twice over;
+/// 3. the DMG is Developer-ID signed and notarized by the hook, which REWRITES
+///    its bytes;
+/// 4. so the DMG digest is re-read from disk afterwards — driven by what the
+///    hook REPORTS doing, so the re-hash cannot drift away from the mutation it
+///    exists to cover.
+///
+/// On the inactive tier (the shipped one) both hooks do nothing, no re-hash
+/// happens, and this is `dmg::create` + `dmg::create_zip` with the digests they
+/// minted — byte-for-byte the pipeline as it has always run.
+pub fn notarize_and_package(
+    app: &Path,
+    dist: &Path,
+    version: &str,
+    tier: &sign::AppleTier,
+    tools: &dyn sign::AppleTools,
+    pack: &dyn Packager,
+) -> Result<PackagedCut> {
+    // THE BUNDLE IS NOTARIZED FIRST, before either container exists.
+    if sign::notarize_app(app, tier, tools).map_err(Error::new)? {
+        step(
+            "notarize",
+            &format!(
+                "{} — submitted, stapled and validated before packaging",
+                app.display()
+            ),
+        );
+    }
+
+    let dmg_out = pack.dmg(app, dist, version)?;
+    // THE hook. Inactive: returns false having done nothing. Active: Dev-ID
+    // signs, preflights, notarizes and staples the DMG — and any failure in that
+    // sequence propagates here and aborts the cut, because the manifest stamps
+    // `team_id` from the anchor unconditionally and a non-empty `team_id` is a
+    // promise to `tools/install.sh` and the in-app updater that the artifact is
+    // notarized. There is no state in which we make that claim without having
+    // earned it.
+    let dmg_notarized =
+        sign::sign_and_notarize_dmg(&dmg_out.path, tier, tools).map_err(Error::new)?;
+    // Re-hash AFTER the hook: codesign REWRITES the DMG bytes and the staple
+    // appends a ticket, so the digest `dmg::create` minted covers the pre-hook
+    // bytes only. The manifest sha256 must be the digest of the exact bytes
+    // clients download — a stale one would hard-abort the self-check after the
+    // whole build+notarize, and (were the self-check ever skipped) fail the
+    // sha256 gate on every v0.25 client.
+    let (dmg_sha256, dmg_size) = if dmg_notarized {
+        (pack.sha256(&dmg_out.path)?, pack.size(&dmg_out.path)?)
+    } else {
+        (dmg_out.sha256.clone(), dmg_out.size_bytes)
+    };
+    // The updater container, from the SAME signed — and, on the active tier,
+    // already stapled — .app. It is built from the bundle rather than from the
+    // DMG because `ditto` must archive the bundle directly to preserve its seal,
+    // and `create_zip` hashes what it writes, so its digest already covers the
+    // ticket without a second pass.
+    let zip = pack.zip(app, dist, version)?;
+    Ok(PackagedCut {
+        dmg: dmg_out,
+        dmg_sha256,
+        dmg_size,
+        zip,
+    })
+}
+
 /// Step "build": per-arch builds → lipo → dSYM → bundle → sign → DMG →
 /// notarize hook → provenance → manifest + notes. One re-enterable unit whose
 /// outputs are all functions of (version, build_number, claim commit).
@@ -6157,11 +7668,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         build_number: ctx.build,
         short_version: ctx.version.clone(),
         arm64_only: ctx.arm64_only,
-        expected_update_pin_sha256: ctx
-            .signature_pubkey
-            .as_deref()
-            .map(update_key_fingerprint)
-            .transpose()?,
+        expected_update_pin_sha256: ctx.expected_embedded_pin()?,
     };
     let bout = buildplan::run(&plan)?;
 
@@ -6196,33 +7703,6 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
-    // Batteries-included seed (§9.1): validate BEFORE assemble so a cut never
-    // seals a seed its own client would refuse. The gate is fail-closed both
-    // ways — a seed present without the root key the client bakes is dead
-    // weight plus a false "batteries included" label, so it errors rather
-    // than silently shipping either half.
-    let seed = match crate::seedpack::resolve(&ctx.dist) {
-        Some(dir) => {
-            // The committed anchor, not conf and not $ATERM_PKG_ROOTKEY. The env
-            // fallback here was the last place an environment variable could decide
-            // which root a sealed seed trusts.
-            let root_key = {
-                let k = aterm_update_core::pins::PKG_ROOT_PUBKEY;
-                (!k.is_empty()).then(|| k.to_string())
-            };
-            let Some(root_key) = root_key else {
-                return Err(Error::new(format!(
-                    "{} is present but no ATERM_PKG_ROOTKEY is configured (release.conf or env) — \
-                     the client would bake no root key and ignore the seed; configure the pin or \
-                     remove the seed dir",
-                    dir.display()
-                )));
-            };
-            Some(crate::seedpack::validate(&dir, &root_key).map_err(Error::new)?)
-        }
-        None => None,
-    };
-
     let spec = bundle::BundleSpec {
         repo_root: ctx.repo.clone(),
         out_dir: ctx.dist.clone(),
@@ -6231,82 +7711,65 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         bundle_id: "com.aterm.aterm".to_string(),
         git_commit: stamp.clone(),
         aterm_bin: bout.aterm,
-        seed,
     };
     let app = bundle::assemble(&spec)?;
     step(
         "bundle",
         &format!(
-            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}  seed={}",
-            ctx.version,
-            ctx.build,
-            match &spec.seed {
-                Some(s) => format!(
-                    "{} program(s), index_build {}",
-                    s.programs.len(),
-                    s.index_build
-                ),
-                None => "none".to_string(),
-            }
+            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}",
+            ctx.version, ctx.build,
         ),
     );
 
-    // Tier APPLE is off (`pins::APPLE_TEAM_ID` is empty), so there is no
-    // Developer-ID identity: the bundle is signed ad-hoc, as it ships today.
-    let sign_id: Option<String> = None;
+    // Tier APPLE, resolved once at the entry point. Inactive (the shipped tier)
+    // means `identity()` is None and every hook below is a no-op, leaving this
+    // region byte-for-byte the ad-hoc path it has always been.
+    let sign_id = ctx.apple.identity();
     let signed_by = sign::sign_app(
         &app,
         &ctx.repo.join("apps/aterm-mac/aterm.entitlements"),
-        sign_id.as_deref(),
+        sign_id,
     )?;
     step(
         "sign",
         &(if sign_id.is_some() {
             format!("Developer ID: {signed_by}")
         } else {
-            "ad-hoc (no ~/.aterm/release.conf signing identity) — Dev-ID/notarize hook idle"
-                .to_string()
+            "ad-hoc (pins::APPLE_TEAM_ID is empty — Tier APPLE inactive)".to_string()
         }),
     );
 
-    let dout = dmg::create(&app, &ctx.dist, &ctx.version)?;
-    // Tier APPLE is off: `pins::APPLE_TEAM_ID` is empty and aterm ships ad-hoc, so
-    // there is no Developer-ID identity to pass. Turning it on is a reviewed change
-    // that adds the anchor AND the credentials together.
-    sign::sign_and_notarize_dmg(&dout.path, None)?;
-    // Re-hash AFTER the Dev-ID hook: codesign REWRITES the DMG bytes (and the
-    // notarization staple appends its ticket), so the digest dmg::create
-    // minted covers the pre-hook bytes only. The manifest sha256 must be
-    // the digest of the exact bytes clients download — a stale one would
-    // hard-abort the self-check after the whole build+notarize, and (were the
-    // self-check ever skipped) fail the sha256 gate on every v0.25 client.
-    // The hook only ever mutates under a configured signing identity, so the
-    // default ad-hoc path keeps dmg::create's digest without a second pass.
-    let (dmg_sha, dmg_size) = if sign_id.is_some() {
-        let sha = dmg::sha256_file(&dout.path)?;
-        let size = fs::metadata(&dout.path)
-            .map_err(|e| Error::new(format!("stat {}: {e}", dout.path.display())))?
-            .len();
-        (sha, size)
-    } else {
-        (dout.sha256.clone(), dout.size_bytes)
-    };
-    // The updater container, from the SAME signed .app. It is built here rather
-    // than from the DMG because the Dev-ID hook above rewrites only the DMG's
-    // bytes — the bundle is final the moment `sign_app` returns — and because
-    // `ditto` must archive the bundle directly to preserve its seal.
-    let zout = dmg::create_zip(&app, &ctx.dist, &ctx.version)?;
+    // Notarize the bundle, package both containers around it, notarize the DMG,
+    // and re-hash it — ONE ordered unit, because every step of that order is
+    // load-bearing and none of it is observable from a green cut. See
+    // `notarize_and_package`; its ordering and its fail-closed propagation are
+    // proved offline in tests/apple_tier.rs.
+    let PackagedCut {
+        dmg: dout,
+        dmg_sha256: dmg_sha,
+        dmg_size,
+        zip: zout,
+    } = notarize_and_package(
+        &app,
+        &ctx.dist,
+        &ctx.version,
+        &ctx.apple,
+        &sign::RealAppleTools,
+        &RealPackager,
+    )?;
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
     if ctx.signature_required {
-        // Optional signing: bind the provenance to the actual signing key's
-        // fingerprint. There is no permanent-authority/epoch record any more —
-        // the pin is simply the configured update key.
+        // Bind the provenance to the fingerprint the BINARY carries — the committed
+        // keyset head, which is what `aterm-gui/build.rs` embeds — not to the signing
+        // key's. The field records which anchor reached the artifact, so recording a
+        // fingerprint the artifact does not contain would make the record a claim about
+        // the machine instead of about the build. The two are the same string on every
+        // configuration that exists today (see `expected_embedded_update_pin`), and
+        // stop being the same the moment a rostered non-head machine cuts, which is
+        // exactly when a self-consistent record matters.
         let fingerprint = ctx
-            .signature_pubkey
-            .as_deref()
-            .map(update_key_fingerprint)
-            .transpose()?
+            .expected_embedded_pin()?
             .ok_or_else(|| Error::new("signed build has no persisted public key"))?;
         let mut provenance = fs::read_to_string(&provenance_path).map_err(|error| {
             Error::new(format!(
@@ -6352,15 +7815,17 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
     let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
         .unwrap_or_else(|| "11.0".to_string());
-    let manifest = manifest_out::build(&manifest_out::ManifestInputs {
+    let inputs = manifest_out::ManifestInputs {
         version: &ctx.version,
         build_number: ctx.build,
         commit: &ctx.commit,
         dmg_name: &mirror::dmg_asset_name(&ctx.version),
         dmg_sha256: &dmg_sha,
         zip_name: &mirror::zip_asset_name(&ctx.version),
-        // No re-hash pass: the Dev-ID hook never touches the zip, so these are
-        // the bytes clients download.
+        // No re-hash pass needed, but not because nothing touches the zip — on
+        // the active tier the bundle inside it carries a notarization ticket.
+        // `create_zip` runs AFTER the staple and hashes the bytes it writes, so
+        // this digest already covers them.
         zip_sha256: &zout.sha256,
         // The manifest's `url` must name the repository a reader can actually
         // fetch from. These same bytes ride BOTH the private release and the
@@ -6378,8 +7843,14 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         pub_date: &bundle::epoch_to_rfc3339(unix_now()),
         min_build: ctx.min_build,
         changelog: &body,
-    });
-    let mpath = manifest_out::write(&ctx.dist, &manifest)?;
+    };
+    let mpath = stage_manifest(&ctx.dist, &inputs, ctx.attribution.as_ref())?;
+    // The roster assets are staged from the bytes the PRE-CLAIM gate authorized, and
+    // staged BEFORE the signature below for no cryptographic reason at all — they are
+    // separately master-signed and the appcast signature does not cover them. It is
+    // ordering for the operator's sake: if this fails, it fails before a signature
+    // exists to be confusing about.
+    stage_roster_assets(&ctx.dist, ctx.roster.as_ref())?;
     // A re-entered build may reuse dist/. Never let an earlier signed cut's
     // detached bytes masquerade as this cut's signature when signing is now
     // disabled or fails before producing a replacement.
@@ -6411,9 +7882,76 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         journal.manifest_signed = ctx.manifest_signed;
         journal.signature_required = ctx.signature_required;
         journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
+        journal
+            .signature_machine_id
+            .clone_from(&ctx.signature_machine_id);
     }
     Ok(())
 }
+/// The SIGNING half of the self-check: the hard `codesign` gate every cut faces,
+/// and the Tier APPLE evidence a cut faces iff its manifest CLAIMS a team.
+///
+/// Returns the transcript suffix the "selfcheck" step prints, which is how the
+/// transcript's Tier APPLE claim is made BY this verdict rather than beside it:
+/// there is no arrangement of this code in which the line says "stapled ticket +
+/// Gatekeeper" without these checks having passed, because the words are this
+/// function's return value.
+///
+/// # Why the gate lives here, and why the evidence comes through the seam
+///
+/// This branch is the invariant, not the happy path. A resumed cut skips
+/// [`step_build`] entirely when the journal marks it done, so this is the only
+/// thing that re-proves the artifacts on disk match what the manifest says about
+/// them. It is gated on the MANIFEST's `team_id` rather than on `ctx.apple`
+/// deliberately: the manifest is the promise that ships, and re-deriving the
+/// tier here would let a cut be judged by what the cutting machine can do today
+/// instead of by what its own artifact claims.
+///
+/// Every spawn goes through [`sign::AppleTools`] — including the plain
+/// `codesign --verify --deep --strict`, whose verdict decides whether a release
+/// ships and which therefore has no business being resolved through `$PATH`
+/// (see [`sign::RealAppleTools`], where each tool is named absolutely once).
+/// Routing it through the seam is also what makes this whole branch, gate
+/// included, reachable from a test with no certificate and no Apple account.
+pub fn selfcheck_signing(
+    team: &str,
+    app: &Path,
+    dmg: &Path,
+    tools: &dyn sign::AppleTools,
+) -> Result<&'static str> {
+    // The hard gate (sign.rs's inline verify print is advisory), on EVERY tier
+    // including the ad-hoc one that ships today.
+    tools.codesign_verify_strict(app).map_err(|e| {
+        Error::new(format!(
+            "self-check failed: codesign --verify --deep --strict: {e}"
+        ))
+    })?;
+    if team.is_empty() {
+        // The shipped tier claims no team, so there is no notarization promise
+        // to keep and nothing further to prove. Note what is NOT done here: no
+        // Apple tool is spawned at all, so an inactive cut costs exactly what it
+        // did before Tier APPLE was wired.
+        return Ok("");
+    }
+    // Evidence gathered here, verdict passed in sign.rs — so the rules are
+    // testable without an Apple account, and so this function has nothing to
+    // decide beyond WHICH evidence to collect.
+    sign::apple_selfcheck_verdict(&sign::AppleSelfcheck {
+        team_id: team,
+        app_codesign_dv: &tools.codesign_dv(app).map_err(Error::new)?,
+        app_stapled: tools.stapler_validate(app).map_err(Error::new)?,
+        app_gatekeeper_ok: tools
+            .gatekeeper_ok(app, sign::GatekeeperKind::App)
+            .map_err(Error::new)?,
+        dmg_stapled: tools.stapler_validate(dmg).map_err(Error::new)?,
+        dmg_gatekeeper_ok: tools
+            .gatekeeper_ok(dmg, sign::GatekeeperKind::Dmg)
+            .map_err(Error::new)?,
+    })
+    .map_err(Error::new)?;
+    Ok(" · Tier APPLE: TeamIdentifier + stapled ticket + Gatekeeper on .app and .dmg")
+}
+
 /// Step "selfcheck" (spec §7 step 4): triple build-number agreement
 /// (binary == plist == manifest == n), DMG digest, codesign, the shared +
 /// vendored-v0.25 manifest proof, and the client-rule monotonic check.
@@ -6502,14 +8040,18 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     validate_claim_provenance(&provenance, &ctx.version, ctx.build, &ctx.commit)?;
 
     if ctx.signature_required {
-        // Optional signing: prove the shipped binary embedded the fingerprint of
-        // the configured signing key, and that the provenance records it. There
-        // is no permanent authority or epoch metadata to bind against.
+        // Prove the shipped binary embedded the pin the BUILD expected, and that the
+        // provenance records the same one — through the SAME accessor `step_build`
+        // used, so the two can never state different expectations of one artifact.
+        //
+        // Deriving this from `ctx.signature_pubkey` instead was the same long-fuse trap
+        // `expected_embedded_update_pin` exists to close, relocated one step later: on
+        // the armed path a rostered non-head machine would clear every pre-claim gate,
+        // burn a ledger number, build and notarize for the better part of an hour, and
+        // then fail here with a fingerprint mismatch naming neither the roster nor the
+        // keyset. Identical on every configuration that exists today.
         let fingerprint = ctx
-            .signature_pubkey
-            .as_deref()
-            .map(update_key_fingerprint)
-            .transpose()?
+            .expected_embedded_pin()?
             .ok_or_else(|| Error::new("signed channel has no persisted public key"))?;
         buildplan::validate_slice_update_pin_reports(
             &fingerprint,
@@ -6611,52 +8153,14 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         }
     }
 
-    // codesign — the hard gate (sign.rs's inline verify print is advisory).
-    let cs = Command::new("codesign")
-        .args(["--verify", "--deep", "--strict"])
-        .arg(&app)
-        .output()
-        .map_err(|e| Error::new(format!("spawn codesign --verify: {e}")))?;
-    if !cs.status.success() {
-        return Err(Error::new(format!(
-            "self-check failed: codesign --verify --deep --strict: {}",
-            String::from_utf8_lossy(&cs.stderr).trim()
-        )));
-    }
-    // Team-ID + spctl, iff signing (spec §7 step 4).
+    // codesign + Tier APPLE (spec §7 step 4), iff the manifest CLAIMS a team.
+    // The suffix is the verdict's own words — see `selfcheck_signing`.
     let team = manifest.team_id.clone().unwrap_or_default();
-    if !team.is_empty() {
-        let dv = Command::new("codesign")
-            .args(["-dv", "--verbose=2"])
-            .arg(&app)
-            .output()
-            .map_err(|e| Error::new(format!("spawn codesign -dv: {e}")))?;
-        let info = format!(
-            "{}{}",
-            String::from_utf8_lossy(&dv.stderr),
-            String::from_utf8_lossy(&dv.stdout)
-        );
-        if !info.contains(&format!("TeamIdentifier={team}")) {
-            return Err(Error::new(format!(
-                "self-check failed: bundle TeamIdentifier does not match manifest team_id {team}"
-            )));
-        }
-        let sp = Command::new("spctl")
-            .args(["-a", "-t", "exec"])
-            .arg(&app)
-            .output()
-            .map_err(|e| Error::new(format!("spawn spctl: {e}")))?;
-        if !sp.status.success() {
-            return Err(Error::new(format!(
-                "self-check failed: spctl assessment rejected the signed app: {}",
-                String::from_utf8_lossy(&sp.stderr).trim()
-            )));
-        }
-    }
+    let apple_note = selfcheck_signing(&team, &app, &ctx.dmg_path(), &sign::RealAppleTools)?;
     step(
         "selfcheck",
         &format!(
-            "binary == plist == manifest == {} · codesign --verify --deep --strict ok",
+            "binary == plist == manifest == {} · codesign --verify --deep --strict ok{apple_note}",
             ctx.build
         ),
     );
@@ -6676,6 +8180,57 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
 /// Replay the client selection against the publish target and apply both the
 /// monotonic-build gate and the carried-floor gate; returns the selected live
 /// build for the transcript.
+/// The `roster_seq` a published channel head was cut under, read out of its own
+/// manifest bytes.
+///
+/// `verify::Published` already carries the exact downloaded manifest text, so the
+/// generation the channel is standing on costs a parse rather than a fetch. `None`
+/// means the head carries no attribution — an unarmed channel, which is every channel
+/// this tree publishes to.
+fn published_roster_seq(newest: Option<&verify::Published>) -> Result<Option<u64>> {
+    let Some(published) = newest else {
+        return Ok(None);
+    };
+    Ok(Manifest::parse(&published.text)
+        .map_err(|e| {
+            Error::new(format!(
+                "channel head {} carries a manifest this cutter cannot parse ({e}); \
+                 refusing to reason about its machine roster generation",
+                published.tag
+            ))
+        })?
+        .roster_seq)
+}
+
+/// The `roster_seq` THIS cut will publish, from whichever of its two authorities is
+/// available at the moment of asking.
+///
+/// Before `build` the authority is the pre-claim gate's attribution. After `build` it
+/// is the staged manifest itself — which is the stronger of the two, because those are
+/// the bytes that will actually ship, and a resume past `build` deliberately carries no
+/// attribution to re-stamp with.
+///
+/// A cut that attaches a roster but can answer neither is an ERROR rather than a silent
+/// `None`: `None` reads as "no roster in play" to [`roster_floor_covered`], which would
+/// turn an unreadable manifest into a passed ratchet.
+fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
+    if let Some(who) = &ctx.attribution {
+        return Ok(Some(who.roster_seq));
+    }
+    if !ctx.attaches_roster() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(ctx.manifest_path()).map_err(|e| {
+        Error::new(format!(
+            "read {} to learn which machine-roster generation this cut carries: {e}",
+            ctx.manifest_path().display()
+        ))
+    })?;
+    Ok(Manifest::parse(&text)
+        .map_err(|e| Error::new(format!("staged manifest re-parse failed: {e}")))?
+        .roster_seq)
+}
+
 fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     let scanned = if ctx.kind == CutKind::Rehearse {
         verify::scan_published(&ctx.slug, true)?
@@ -6684,6 +8239,12 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     };
     let best = scanned.first();
     let newest_floor = best.and_then(|published| published.min_build);
+    // The roster ratchet rides with the `min_build` ratchet, at all four of the places
+    // that guard it — lock, selfcheck, preflip, flip — because it closes the same race
+    // for the same reason: another publisher's release can land between this cut's
+    // pre-claim scan and its flip, and a channel head is never allowed to become
+    // visible under a roster generation the fleet has already moved past.
+    roster_floor_covered(cut_roster_seq(ctx)?, published_roster_seq(best)?)?;
     if ctx.kind == CutKind::Real {
         let guard = ctx.lease.as_ref().ok_or_else(|| {
             Error::new("PublishChecked requires an acquired release lease".to_string())
@@ -6874,12 +8435,11 @@ fn step_upload(ctx: &mut CutCtx) -> Result<()> {
             ctx.tag, ctx.slug
         )));
     }
-    let mut files: Vec<PathBuf> = vec![
-        ctx.dmg_path(),
-        ctx.zip_path(),
-        ctx.manifest_path(),
-        ctx.provenance_path(),
-    ];
+    // The roster travels with the release it authorizes; see `upload_asset_paths`. The
+    // predicate is the JOURNALED machine id, not the in-memory roster document, because
+    // a resume past `build` has the assets on disk and no document in hand — keying off
+    // the document would silently stop attaching them.
+    let mut files: Vec<PathBuf> = ctx.upload_asset_paths();
     let sig = ctx.manifest_path().with_extension("toml.sig");
     match (ctx.signature_required, ctx.manifest_signed, sig.is_file()) {
         (true, true, true) => {
@@ -7087,15 +8647,9 @@ fn prove_draft_artifacts(ctx: &mut CutCtx) -> Result<()> {
         dsym_name,
     )?;
 
-    let mut files = vec![
-        ctx.manifest_path(),
-        ctx.dmg_path(),
-        ctx.zip_path(),
-        ctx.provenance_path(),
-    ];
-    if ctx.signature_required {
-        files.push(ctx.manifest_path().with_extension("toml.sig"));
-    }
+    // `validate_draft_asset_set` above has already required the roster's PRESENCE from
+    // the manifest's own `machine_id`; `proof_asset_paths` is the bytes half of that.
+    let mut files = ctx.proof_asset_paths();
     if ctx.dsym_zip_path().is_file() {
         files.push(ctx.dsym_zip_path());
     }
@@ -7814,7 +9368,9 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    for name in mirror::required_asset_names(&ctx.version, ctx.signature_required) {
+    for name in
+        mirror::required_asset_names(&ctx.version, ctx.signature_required, ctx.attaches_roster())
+    {
         if !body.contains(&format!("\"name\":\"{name}\"")) {
             return Err(Error::new(format!(
                 "the anonymous view of {slug} {} does not list the required asset \
@@ -7975,7 +9531,12 @@ fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         .iter()
         .map(|asset| asset.name.clone())
         .collect();
-    mirror::validate_mirror_asset_set(&names, &ctx.version, ctx.signature_required)?;
+    mirror::validate_mirror_asset_set(
+        &names,
+        &ctx.version,
+        ctx.signature_required,
+        ctx.attaches_roster(),
+    )?;
     for file in ctx.mirror_asset_paths() {
         let name = file
             .file_name()
@@ -8008,7 +9569,12 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         .into_iter()
         .map(|asset| asset.name)
         .collect();
-    mirror::validate_mirror_asset_set(&names, &ctx.version, ctx.signature_required)?;
+    mirror::validate_mirror_asset_set(
+        &names,
+        &ctx.version,
+        ctx.signature_required,
+        ctx.attaches_roster(),
+    )?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
     // `aterm-appcast.toml` only, greatest numeric tag wins regardless of REST
@@ -8083,4 +9649,366 @@ fn step_verify(ctx: &mut CutCtx) -> Result<()> {
             local_signature: Some(&signature),
         },
     )
+}
+
+#[cfg(test)]
+mod roster_wiring_tests {
+    //! THE PRODUCER-SIDE ATTACH PATH — the lines that decide whether an armed cut is
+    //! attributed and carries its roster AT ALL.
+    //!
+    //! These live inside `publish.rs` rather than in `tests/machine_roster.rs` because
+    //! every property below is a private method of [`CutCtx`], and every one of them
+    //! failed silently: a regression on any of them produces a WELL-FORMED release with
+    //! no `machine_id` or no `aterm-machines.toml`, which an armed client refuses
+    //! structurally before any artifact crypto. `select_authoritative_release` picks one
+    //! candidate with no fallback to an older release, so that is a fleet wedge, not a
+    //! delay — and until these tests existed nothing in the tree would have failed.
+
+    use super::*;
+
+    /// A context shaped like a real cut, differing only in whether it is attributed.
+    /// Every remote-facing field is inert; nothing here touches the network or a repo.
+    fn ctx(machine_id: Option<&str>) -> CutCtx {
+        CutCtx {
+            credentials: None,
+            apple: sign::AppleTier::Inactive,
+            repo: PathBuf::from("/nonexistent/repo"),
+            dist: PathBuf::from("/nonexistent/repo/dist"),
+            journal_path: PathBuf::from("/nonexistent/repo/dist/cut-state.toml"),
+            slug: "owner/repo".to_string(),
+            version: "0.5.0".to_string(),
+            tag: "v0.5.0".to_string(),
+            build: 500,
+            commit: "a".repeat(40),
+            min_build: None,
+            arm64_only: false,
+            manifest_signed: true,
+            signature_required: true,
+            signature_pubkey: None,
+            signature_machine_id: machine_id.map(str::to_string),
+            attribution: None,
+            roster: None,
+            release_id: None,
+            draft_create_issued: false,
+            upload_intents: Vec::new(),
+            mirror_slug: Some("channel/repo".to_string()),
+            mirror_release_id: None,
+            mirror_create_issued: false,
+            mirror_upload_intents: Vec::new(),
+            kind: CutKind::Real,
+            lease: None,
+            fence: None,
+            journal: None,
+            notes_section: "0.5.0".to_string(),
+        }
+    }
+
+    fn names(paths: &[PathBuf]) -> Vec<String> {
+        paths
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect()
+    }
+
+    /// AN ATTRIBUTED CUT attaches the roster to everything that carries assets, and an
+    /// UNATTRIBUTED one — every cut this tree makes — attaches it to nothing.
+    ///
+    /// Kills four mutations that were all silent: `attaches_roster()` returning false,
+    /// `roster_asset_paths()` returning empty, dropping the roster from the upload set,
+    /// and dropping it from the draft byte-proof set.
+    #[test]
+    fn an_attributed_cut_carries_its_roster_through_every_asset_set() {
+        let rostered = ctx(Some("m3"));
+        assert!(rostered.attaches_roster());
+        assert_eq!(
+            names(&rostered.roster_asset_paths()),
+            vec![
+                roster::ROSTER_ASSET.to_string(),
+                roster::ROSTER_SIG_ASSET.to_string()
+            ]
+        );
+        for (label, set) in [
+            ("upload", rostered.upload_asset_paths()),
+            ("draft byte-proof", rostered.proof_asset_paths()),
+            ("mirror", rostered.mirror_asset_paths()),
+        ] {
+            let set = names(&set);
+            assert!(
+                set.contains(&roster::ROSTER_ASSET.to_string()),
+                "the {label} set must carry the roster: {set:?}"
+            );
+            assert!(
+                set.contains(&roster::ROSTER_SIG_ASSET.to_string()),
+                "the {label} set must carry the roster signature: {set:?}"
+            );
+            // Precondition, so the two assertions above are not passing on an
+            // accidentally-everything set: the ordinary artifacts are still there.
+            assert!(set.contains(&"aterm-appcast.toml".to_string()), "{set:?}");
+        }
+
+        // THE SHIPPED PATH. An unattributed cut's sets are exactly what they were
+        // before the roster existed — the fleet-safety requirement, not a nicety.
+        let plain = ctx(None);
+        assert!(!plain.attaches_roster());
+        assert!(plain.roster_asset_paths().is_empty());
+        for set in [
+            plain.upload_asset_paths(),
+            plain.proof_asset_paths(),
+            plain.mirror_asset_paths(),
+        ] {
+            let set = names(&set);
+            assert!(
+                !set.iter().any(|n| n.starts_with("aterm-machines")),
+                "an unattributed cut must publish no roster: {set:?}"
+            );
+        }
+    }
+
+    /// The verdict's three attribution fields reach the cut TOGETHER, or the release
+    /// is malformed in a way only the fleet would notice.
+    ///
+    /// Kills the mutations "carry the id but not the document" (the cut then stages no
+    /// roster assets while the manifest claims a machine) and "carry the document but
+    /// no attribution" (assets nobody is authorized by, and an unstamped manifest).
+    #[test]
+    fn the_verdict_hands_the_cut_all_three_attribution_fields_or_none() {
+        let document = machines::RosterDocument {
+            bytes: b"schema = 1\n".to_vec(),
+            signature: vec![0u8; 64],
+        };
+        let armed = SigningVerdict {
+            policy: SignaturePolicy {
+                required: true,
+                pubkey: Some("k".to_string()),
+            },
+            attribution: Some(roster::Attribution {
+                machine_id: "m3".to_string(),
+                pubkey_b64: "k".to_string(),
+                roster_seq: 4,
+            }),
+            roster: Some(document.clone()),
+        }
+        .cut_attribution();
+        assert_eq!(armed.machine_id.as_deref(), Some("m3"));
+        assert_eq!(armed.attribution.map(|who| who.roster_seq), Some(4));
+        assert_eq!(armed.roster, Some(document));
+
+        let unarmed = SigningVerdict {
+            policy: SignaturePolicy {
+                required: false,
+                pubkey: None,
+            },
+            attribution: None,
+            roster: None,
+        }
+        .cut_attribution();
+        assert_eq!(unarmed.machine_id, None);
+        assert!(unarmed.attribution.is_none());
+        assert!(unarmed.roster.is_none());
+    }
+
+    /// THE PIN EXPECTATION FOLLOWS THE COMMITTED HEAD, from whichever step asks.
+    ///
+    /// `aterm-gui/build.rs` embeds `__DATA,__aterm_upin` from the keyset HEAD, so that
+    /// is what a shipped binary can prove. `step_build` sets the buildplan's expectation
+    /// and writes the fingerprint into the provenance; `step_selfcheck` then checks the
+    /// binary's `--diagnose` line and the provenance against it. Those two derived it
+    /// differently — the build from the head, the self-check from the SIGNING key — and
+    /// the two agree only while signer == head, the exact invariant the roster relaxes.
+    ///
+    /// Kills the mutation "derive from `signature_pubkey`": the assertion below then
+    /// reports the signing key's fingerprint for a tree pinned to another key, which is
+    /// the mismatch a rostered non-head machine would have hit after burning a ledger
+    /// number and an hour of build.
+    #[test]
+    fn the_pin_expectation_follows_the_committed_head_from_every_step_that_asks() {
+        let head = aterm_update_core::pins::update_channel_signing_pubkey();
+        assert!(
+            !head.is_empty(),
+            "precondition: this tree pins a channel head"
+        );
+        // A second, obviously-synthetic key (base64 of thirty-two 0x42 bytes) — it
+        // only needs to differ from the head; borrowing a real committed constant
+        // here would couple this test to anchors it has no business reading.
+        let other = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
+        assert_ne!(
+            other, head,
+            "precondition: a second, different key"
+        );
+
+        let mut signing_elsewhere = ctx(None);
+        signing_elsewhere.signature_pubkey = Some(other.to_string());
+        let mut signing_as_head = ctx(None);
+        signing_as_head.signature_pubkey = Some(head.to_string());
+        assert_eq!(
+            signing_elsewhere.expected_embedded_pin().unwrap(),
+            signing_as_head.expected_embedded_pin().unwrap(),
+            "the binary embeds the COMMITTED anchor, so the cutting machine cannot move \
+             what the build and the self-check expect of it"
+        );
+        // ...and it really is the head's fingerprint, not merely a stable one.
+        assert_eq!(
+            signing_elsewhere.expected_embedded_pin().unwrap(),
+            expected_embedded_update_pin(Some(head), None).unwrap()
+        );
+        assert_ne!(
+            signing_elsewhere.expected_embedded_pin().unwrap(),
+            expected_embedded_update_pin(None, Some(other)).unwrap(),
+            "deriving from the signer is the trap; the two must be distinguishable"
+        );
+    }
+
+    /// The two READINGS the ratchet stands on: what generation the CHANNEL is at, and
+    /// what generation THIS CUT carries. Both are derived from manifest bytes, and both
+    /// return `None` only when there genuinely is no roster in play.
+    ///
+    /// Kills the mutations "always report `None` for the channel head" and "always
+    /// report `None` for the cut" — either one silently disables the whole ratchet,
+    /// because `roster_floor_covered` reads `None` as "no roster in play" and passes.
+    #[test]
+    fn the_ratchet_reads_both_generations_out_of_manifest_bytes() {
+        let dir = std::env::temp_dir().join(format!("aterm-ratchet-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
+            version: "0.5.0",
+            build_number: 500,
+            commit: &"a".repeat(40),
+            dmg_name: "aterm-0.5.0.dmg",
+            dmg_sha256: &"ab".repeat(32),
+            zip_name: "aterm-0.5.0-mac.zip",
+            zip_sha256: &"cd".repeat(32),
+            repo_slug: "owner/repo",
+            min_os: "11.0",
+            team_id: "",
+            pub_date: "2026-08-11T00:00:00Z",
+            min_build: None,
+            changelog: "### Added\n- a thing\n",
+        });
+        let unattributed = manifest.to_toml().unwrap();
+        machines::attribute(
+            &mut manifest,
+            &roster::Attribution {
+                machine_id: "m3".to_string(),
+                pubkey_b64: "k".to_string(),
+                roster_seq: 7,
+            },
+        );
+        let attributed = manifest.to_toml().unwrap();
+
+        let head = |text: &str| verify::Published {
+            release_id: Some(1),
+            release: None,
+            tag: "v0.5.0".to_string(),
+            build: 500,
+            version: "0.5.0".to_string(),
+            asset: manifest_out::MANIFEST_ASSET.to_string(),
+            min_build: None,
+            text: text.to_string(),
+        };
+        assert_eq!(published_roster_seq(None).unwrap(), None);
+        assert_eq!(
+            published_roster_seq(Some(&head(&unattributed))).unwrap(),
+            None,
+            "an unrostered head imposes no floor — the shipped state"
+        );
+        assert_eq!(
+            published_roster_seq(Some(&head(&attributed))).unwrap(),
+            Some(7)
+        );
+
+        // THE CUT's side. Before `build` the authority is the gate's attribution;
+        // after it, the staged manifest — the bytes that will actually ship.
+        let mut fresh = ctx(Some("m3"));
+        fresh.attribution = Some(roster::Attribution {
+            machine_id: "m3".to_string(),
+            pubkey_b64: "k".to_string(),
+            roster_seq: 7,
+        });
+        assert_eq!(cut_roster_seq(&fresh).unwrap(), Some(7));
+
+        let mut resumed = ctx(Some("m3"));
+        resumed.dist = dir.clone();
+        fs::write(dir.join(manifest_out::MANIFEST_ASSET), &attributed).unwrap();
+        assert_eq!(
+            cut_roster_seq(&resumed).unwrap(),
+            Some(7),
+            "a resume past build carries no attribution and must read its own manifest"
+        );
+        // An unattributed cut asks nothing of the filesystem and imposes no floor.
+        assert_eq!(cut_roster_seq(&ctx(None)).unwrap(), None);
+        // A rostered cut that can answer NEITHER is an error, never a silent `None`:
+        // `None` reads as "no roster in play" and would pass the ratchet.
+        let mut lost = ctx(Some("m3"));
+        lost.dist = dir.join("gone");
+        assert!(cut_roster_seq(&lost).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The DUTY is the same function of the same fact at all three entry points.
+    ///
+    /// `build` is the only step that assembles, stamps and signs a manifest, so it is
+    /// the only fact that can decide whether an entry has a roster question to answer.
+    /// The bug this closes was `resume_cut` guarding on it, `revalidate_ctx_signature_policy`
+    /// not, and `run_recover_lost` stating a third rule.
+    #[test]
+    fn the_duty_is_decided_by_one_fact_and_shared_by_every_entry() {
+        assert_eq!(roster_duty(false), RosterDuty::Sign);
+        assert_eq!(roster_duty(true), RosterDuty::Finish);
+    }
+
+    /// A recovery reconstructs the roster pair from what the PUBLISHED MANIFEST says
+    /// about itself, so the set it rebuilds is the set `mirror_asset_paths` will demand.
+    ///
+    /// Kills the mutation "reconstruct nothing": the two sets then disagree, and
+    /// `step_mirror` dies on a file recovery never wrote — with advice ("recover the
+    /// cut") naming the command that was already running.
+    #[test]
+    fn recovery_rebuilds_exactly_the_roster_assets_the_mirror_will_demand() {
+        let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
+            version: "0.5.0",
+            build_number: 500,
+            commit: &"a".repeat(40),
+            dmg_name: "aterm-0.5.0.dmg",
+            dmg_sha256: &"ab".repeat(32),
+            zip_name: "aterm-0.5.0-mac.zip",
+            zip_sha256: &"cd".repeat(32),
+            repo_slug: "owner/repo",
+            min_os: "11.0",
+            team_id: "",
+            pub_date: "2026-08-11T00:00:00Z",
+            min_build: None,
+            changelog: "### Added\n- a thing\n",
+        });
+        // An UNATTRIBUTED published release reconstructs no roster, and demands none.
+        assert!(recovered_roster_asset_names(&manifest).is_empty());
+        assert!(
+            ctx(manifest.machine_id.as_deref())
+                .roster_asset_paths()
+                .is_empty()
+        );
+
+        machines::attribute(
+            &mut manifest,
+            &roster::Attribution {
+                machine_id: "m3".to_string(),
+                pubkey_b64: "k".to_string(),
+                roster_seq: 4,
+            },
+        );
+        let rebuilt: Vec<String> = recovered_roster_asset_names(&manifest)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let demanded = names(&ctx(manifest.machine_id.as_deref()).mirror_asset_paths());
+        for name in &rebuilt {
+            assert!(demanded.contains(name), "{name} rebuilt but not demanded");
+        }
+        for name in demanded.iter().filter(|n| n.starts_with("aterm-machines")) {
+            assert!(rebuilt.contains(name), "{name} demanded but never rebuilt");
+        }
+        assert_eq!(rebuilt.len(), 2, "{rebuilt:?}");
+    }
 }

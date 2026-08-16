@@ -10,6 +10,9 @@
 //! go to the app log via [`crate::log`]/[`crate::warn`]; this file is the durable,
 //! at-a-glance summary.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::Serialize;
 
 use crate::paths::Staging;
@@ -37,6 +40,23 @@ struct Status<'a> {
     outcome: &'a str,
 }
 
+/// A scratch path no other in-flight writer of this record can be holding.
+///
+/// The rename is what makes the write atomic; picking the SOURCE file is what has to
+/// be exclusive, and a per-pid name only got that half right. It separates processes,
+/// but [`record`] is called from several lanes inside one process — the background
+/// check, the apply path and the control socket — so two threads could land on the
+/// same `status.toml.<pid>.tmp`: the loser's `write` truncates and rewrites the file
+/// the winner is about to rename, and the winner publishes the loser's (or a spliced)
+/// bytes. The counter closes that, so each writer renames exactly what it wrote (F18).
+fn temp_path(staging: &Staging) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    staging
+        .root
+        .join(format!("status.toml.{}.{sequence}.tmp", std::process::id()))
+}
+
 /// Atomically write the status record (temp + rename). Best-effort: failures are
 /// silent — status is diagnostics, never load-bearing.
 pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
@@ -53,16 +73,16 @@ pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
     let Ok(text) = toml::to_string(&status) else {
         return;
     };
-    // Per-pid temp so two instances writing status concurrently can't truncate each
-    // other's in-progress write before the atomic rename (F18).
-    let tmp = staging
-        .root
-        .join(format!("status.toml.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, &staging.status);
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    let tmp = temp_path(staging);
+    if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &staging.status).is_ok() {
+        return;
     }
+    // BOTH arms have to reclaim. Under the old per-pid name a leaked scratch was
+    // overwritten by the next `record`, so a failed rename cost one stale file forever-at-
+    // most; a per-writer name has no such self-healing, and every rename failure (a
+    // `status.toml` replaced by a directory, a permissions fault on `Updates/`) would
+    // strand a distinct `status.toml.<pid>.<seq>.tmp` that nothing sweeps.
+    let _ = std::fs::remove_file(&tmp);
 }
 
 #[cfg(test)]
@@ -89,6 +109,52 @@ mod tests {
         // It must be valid TOML.
         let _: toml::Value = toml::from_str(&text).expect("status is valid TOML");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Concurrent writers inside ONE process must not share a scratch file. Keying the
+    /// temp on the pid alone handed every thread the same path, so one writer's `write`
+    /// could truncate another's bytes in the window before its `rename` — and the
+    /// rename would then publish a half-written record. Threads, not just repeated
+    /// calls, because that is the shape the old name actually collided in.
+    #[test]
+    fn concurrent_writers_never_share_a_temp_path() {
+        let root = std::env::temp_dir().join(format!("aterm-status-tmp-{}", std::process::id()));
+        let staging = Staging {
+            apply_lock: root.join("apply.lock"),
+            stage_lock: root.join("stage.lock"),
+            download: root.join("download"),
+            staged_app: root.join("staged/aterm.app"),
+            ready: root.join("ready.toml"),
+            status: root.join("status.toml"),
+            root: root.clone(),
+        };
+
+        let paths: std::collections::BTreeSet<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..8).map(|_| temp_path(&staging)).collect::<Vec<_>>()))
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("writer thread"))
+                .collect()
+        });
+
+        assert_eq!(
+            paths.len(),
+            64,
+            "every writer must get its own scratch file"
+        );
+        for path in &paths {
+            assert_eq!(path.parent(), Some(root.as_path()));
+            assert!(
+                path.extension().is_some_and(|e| e == "tmp"),
+                "scratch must stay distinguishable from the record itself: {path:?}"
+            );
+            assert_ne!(
+                path, &staging.status,
+                "the scratch path may never be the published record"
+            );
+        }
     }
 
     #[test]

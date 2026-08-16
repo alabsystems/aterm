@@ -20,20 +20,10 @@
 #    — detonated an f-bomb. Suppressing the benign compounds fixes it while
 #    "我操这也太慢了" still fires.
 
-[[exception]]
-word = "熊猫"
-lang = "ja"
-meaning = "panda"
-
-[[exception]]
-word = "熊猫"
-lang = "zh"
-meaning = "panda"
-
-[[exception]]
-word = "貓熊"
-lang = "zh"
-meaning = "panda"
+# (2026-08-10) 熊猫 / 貓熊 left this list: they are POSITIVE panda forms in
+# the animal-multilingual lexicon group now. The suppression job they did —
+# keeping the cat ideograph inside 'panda' from sparkling — is done better by
+# the longer compound winning the maximal munch and showing an actual panda.
 
 [[exception]]
 word = "山猫"
@@ -92,3 +82,203 @@ meaning = "I control (操控 = to control)"
 word = "我操心"
 lang = "zh"
 meaning = "I worry about (操心 = to be concerned)"
+
+# --- animal-multilingual prefix bombs (2026-08-10) ---------------------------
+# The zh/ja/ko/th menagerie expansion listed short kana/hangul/Thai animal
+# words that are real, typed, and worth keeping — but sit at the head of a
+# SMALL, FINITE set of everyday compounds. Maximal munch would fire the animal
+# inside them (カメラ grew a turtle in review). Where the set is open-ended
+# (トラ→トラブル, りす→リスト, とり→とりあえず) the form was SKIPPED in the
+# lexicon instead — this file is only for bomb lists short enough to enumerate.
+# Stub entries (メカニ, インコー, ハチャ, ปลาย) deliberately suppress a
+# non-word prefix so one line covers the whole family behind it.
+
+[[exception]]
+word = "カメラ"
+lang = "ja"
+meaning = "camera (not a カメ turtle)"
+
+[[exception]]
+word = "カメレオン"
+lang = "ja"
+meaning = "chameleon (not a カメ turtle)"
+
+[[exception]]
+word = "ワカメ"
+lang = "ja"
+meaning = "wakame seaweed (contains カメ)"
+
+[[exception]]
+word = "カメオ"
+lang = "ja"
+meaning = "cameo (not a カメ turtle)"
+
+[[exception]]
+word = "ヘビー"
+lang = "ja"
+meaning = "heavy (not a ヘビ snake)"
+
+[[exception]]
+word = "ヘビメタ"
+lang = "ja"
+meaning = "heavy metal (not a ヘビ snake)"
+
+[[exception]]
+word = "タコス"
+lang = "ja"
+meaning = "tacos (not a タコ octopus)"
+
+[[exception]]
+word = "シカゴ"
+lang = "ja"
+meaning = "Chicago (not a シカ deer)"
+
+[[exception]]
+word = "シカト"
+lang = "ja"
+meaning = "the cold shoulder (not a シカ deer)"
+
+[[exception]]
+word = "ロバート"
+lang = "ja"
+meaning = "Robert (not a ロバ donkey)"
+
+[[exception]]
+word = "ロバスト"
+lang = "ja"
+meaning = "robust (not a ロバ donkey)"
+
+[[exception]]
+word = "オウム真理教"
+lang = "ja"
+meaning = "the Aum cult (a parrot here would be grim)"
+
+[[exception]]
+word = "インコー"
+lang = "ja"
+meaning = "stub: kills インコース and インコーナー (not an インコ parakeet)"
+
+[[exception]]
+word = "ハチ公"
+lang = "ja"
+meaning = "Hachikō the dog (not a ハチ bee)"
+
+[[exception]]
+word = "ハチャ"
+lang = "ja"
+meaning = "stub: kills ハチャメチャ (not a ハチ bee)"
+
+[[exception]]
+word = "クモ膜"
+lang = "ja"
+meaning = "arachnoid membrane, medical (not a クモ spider)"
+
+[[exception]]
+word = "くまなく"
+lang = "ja"
+meaning = "thoroughly (not a くま bear; the くま form is ja-gated on top)"
+
+[[exception]]
+word = "くまで"
+lang = "ja"
+meaning = "rake (not a くま bear)"
+
+[[exception]]
+word = "メカニ"
+lang = "ja"
+meaning = "stub: kills メカニズム/メカニック/メカニカル (not a カニ crab)"
+
+[[exception]]
+word = "まさかな"
+lang = "ja"
+meaning = "'surely not…' (not a さかな fish)"
+
+[[exception]]
+word = "きくらげ"
+lang = "ja"
+meaning = "wood-ear mushroom (contains くらげ)"
+
+[[exception]]
+word = "サルベージ"
+lang = "ja"
+meaning = "salvage (not a サル monkey)"
+
+[[exception]]
+word = "サルモネラ"
+lang = "ja"
+meaning = "salmonella (not a サル monkey)"
+
+[[exception]]
+word = "サルサ"
+lang = "ja"
+meaning = "salsa (not a サル monkey)"
+
+[[exception]]
+word = "アクマ"
+lang = "ja"
+meaning = "悪魔, devil (contains クマ; the bear stays out of it)"
+
+[[exception]]
+word = "사자성어"
+lang = "ko"
+meaning = "four-character idiom (not a 사자 lion)"
+
+[[exception]]
+word = "오리지널"
+lang = "ko"
+meaning = "original (not an 오리 duck)"
+
+[[exception]]
+word = "오리엔탈"
+lang = "ko"
+meaning = "oriental (not an 오리 duck)"
+
+[[exception]]
+word = "오리엔테이션"
+lang = "ko"
+meaning = "orientation (not an 오리 duck)"
+
+[[exception]]
+word = "오리무중"
+lang = "ko"
+meaning = "五里霧中, 'lost in fog' (not an 오리 duck)"
+
+[[exception]]
+word = "오리온"
+lang = "ko"
+meaning = "Orion (not an 오리 duck)"
+
+[[exception]]
+word = "문어체"
+lang = "ko"
+meaning = "literary style, 文語體 (not a 문어 octopus)"
+
+[[exception]]
+word = "하마터면"
+lang = "ko"
+meaning = "'very nearly…' (not a 하마 hippo)"
+
+[[exception]]
+word = "ม้านั่ง"
+lang = "th"
+meaning = "bench, lit. 'sitting horse' (not a ม้า horse)"
+
+[[exception]]
+word = "ลิงก์"
+lang = "th"
+meaning = "link, the loanword (not a ลิง monkey)"
+
+[[exception]]
+word = "ลิงค์"
+lang = "th"
+meaning = "link, alternative spelling (not a ลิง monkey)"
+
+[[exception]]
+word = "กบฏ"
+lang = "th"
+meaning = "rebellion (not a กบ frog)"
+
+[[exception]]
+word = "ปลาย"
+lang = "th"
+meaning = "stub: end/tip — kills ปลายทาง/ปลายปี and friends (not a ปลา fish)"

@@ -245,9 +245,56 @@ const LAND_DECAY: f32 = 3.0;
 /// SING-ALONG dance depths at full drive (`crate::kitty_sing`): the ON-BEAT
 /// squash pulse (each beat lands as a bounce that relaxes across the beat)
 /// and the two-beat side-to-side lean sway. Both scale with the drive, so
-/// the wind-down crossfade eases the whole dance out — never a hard cut.
+/// the wind-down crossfade eases the whole dance out — never a hard cut —
+/// and with the ARC's energy ([`SING_AMP_FLOOR`]): the intro sways small,
+/// the peak sways full.
 const SING_SQUASH: f32 = 0.14;
 const SING_SWAY: f32 = 0.12;
+
+/// Dance amplitude = `SING_AMP_FLOOR + (1 − SING_AMP_FLOOR) × energy`: the
+/// spec's `(0.5 + 0.5·energy)` — a cold intro dances at half depth, a
+/// peaked song at full.
+const SING_AMP_FLOOR: f32 = 0.5;
+
+/// The COMMIT LANDING: the reopened bar's first beat squashes ×1.6 — one
+/// double-squash announcing the switch the ear is about to confirm.
+const SING_LANDING_BOOST: f32 = 1.6;
+
+/// PRE-ECHO POSE BIAS, per section class (verse, chorus, bridge,
+/// percussive, breath): a small standing lean, in cell widths, that flips
+/// to the DESTINATION key's class on the very press that starts a
+/// hand-over — the eye reads the switch a bar before the ear. Chorus leans
+/// in, bridge leans back, the breath stands centered.
+const SING_CLASS_LEAN: [f32; 5] = [-0.03, 0.05, -0.05, 0.03, 0.0];
+
+/// THE BOW (the finale): at full depth the singer squashes to this
+/// fraction of standing height. The down/hold/rise envelope is timed by
+/// `kitty_sing`'s cadence clock and arrives here as the 0..1 depth in
+/// [`SingSync::bow`] — this module only translates depth to pose.
+const BOW_SQUASH: f32 = 0.75;
+
+/// One frame's sing-along sync from the host: the drive/beat pair the dance
+/// always rode, plus the SONG-BUILDER arc (energy, class) and the moment
+/// flags (the commit landing, the announced fill's final beat, the bow).
+/// One struct so both render paths speak the same seam and a new axis never
+/// forks the call sites again.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SingSync {
+    /// Celebration drive 0..=1 (1 armed, easing through the wind-down).
+    pub drive: f32,
+    /// Beat phase in beats since the arm (fractional).
+    pub beat: f32,
+    /// Arc RENDER energy 0..=1.25 (`KittySing::arc_energy_q` / 200).
+    pub energy: f32,
+    /// Section class 0..=4 (`KittySing::section_class_now`).
+    pub class: u8,
+    /// True during the reopened bar's first beat (`switch_landing`).
+    pub landing: bool,
+    /// True while the announced fill rolls under beat 4 (`fill_beat`).
+    pub fill: bool,
+    /// Bow depth 0..=1 (`bow_depth`, phase 3) — 0 when no finale.
+    pub bow: f32,
+}
 
 /// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
 fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
@@ -555,6 +602,10 @@ pub struct CursorCat {
     /// The shared dance-beat phase in beats (fractional), from the same
     /// host sync. Meaningful only while `sing > 0`.
     sing_beat: f32,
+    /// The rest of the per-frame sing sync — the SONG-BUILDER arc's energy
+    /// and class plus the moment flags (landing, fill, bow). See
+    /// [`SingSync`]. Meaningful only while `sing > 0`.
+    sing_sync: SingSync,
     rng: u32,
 }
 
@@ -596,6 +647,7 @@ impl Default for CursorCat {
             delight_chain: 0,
             sing: 0.0,
             sing_beat: 0.0,
+            sing_sync: SingSync::default(),
             rng: 0x2545_F491,
         }
     }
@@ -820,7 +872,11 @@ impl CursorCat {
 
     /// Host sync for the SING-ALONG (`crate::kitty_sing`): once per
     /// frame, BEFORE [`Self::frame`]/[`Self::static_frame`], with the
-    /// detector's current drive and the shared dance-beat phase.
+    /// detector's current drive, the shared dance-beat phase, and the
+    /// SONG-BUILDER arc ([`SingSync`] — energy scales the dance, class
+    /// biases the pose within a frame of a hand-over press, the landing/
+    /// fill flags drive the one-beat flourishes, and the bow depth plays
+    /// the finale).
     ///
     /// THE MOMENTUM BYPASS (documented, deliberate): while ARMED
     /// (`drive == 1`) the canonical typing-momentum metric is pinned to 1.0.
@@ -836,13 +892,33 @@ impl CursorCat {
     /// correlated cursor travel. The wind-down (`drive < 1`) pins nothing —
     /// the metric resumes its natural decay, which is the momentum half of the
     /// crossfade.
-    pub fn set_singing(&mut self, now: Instant, drive: f32, beat: f32) {
-        self.sing = if drive.is_finite() {
-            drive.clamp(0.0, 1.0)
+    pub fn set_singing(&mut self, now: Instant, sync: SingSync) {
+        self.sing = if sync.drive.is_finite() {
+            sync.drive.clamp(0.0, 1.0)
         } else {
             0.0
         };
-        self.sing_beat = if beat.is_finite() { beat } else { 0.0 };
+        self.sing_beat = if sync.beat.is_finite() {
+            sync.beat
+        } else {
+            0.0
+        };
+        self.sing_sync = SingSync {
+            drive: self.sing,
+            beat: self.sing_beat,
+            energy: if sync.energy.is_finite() {
+                sync.energy.clamp(0.0, 1.25)
+            } else {
+                0.0
+            },
+            class: sync.class.min(4),
+            bow: if sync.bow.is_finite() {
+                sync.bow.clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            ..sync
+        };
         if self.sing < 1.0 {
             return;
         }
@@ -1267,11 +1343,38 @@ impl CursorCat {
         // resumes mid-dance, not mid-glitch. The delete "oops" recoil above
         // still reads through it (the wrong-note gag outranks the song).
         if self.sing > 0.0 {
-            let u = self.sing_beat.fract();
+            // THE ARC IN THE BODY: amplitude follows the earned energy —
+            // the intro sways at half depth, the peak at full.
+            let amp = SING_AMP_FLOOR + (1.0 - SING_AMP_FLOOR) * self.sing_sync.energy.min(1.0);
+            // THE ANNOUNCED FILL (beat 4 of an early switch's bar): the
+            // squash pulse clock-divides to SIXTEENTH rate — a drum-roll
+            // head-bob riding the exact envelope the beat already owns.
+            let u = if self.sing_sync.fill {
+                (self.sing_beat * 4.0).fract()
+            } else {
+                self.sing_beat.fract()
+            };
             let pulse = (1.0 - u) * (1.0 - u);
-            scale_y *= 1.0 - SING_SQUASH * pulse * self.sing;
-            scale_x *= 1.0 + SING_SQUASH * 0.7 * pulse * self.sing;
-            lead += SING_SWAY * (std::f32::consts::PI * self.sing_beat).sin() * self.sing;
+            // THE COMMIT LANDING: one double-squash on the reopened bar's
+            // first beat.
+            let squash = SING_SQUASH
+                * if self.sing_sync.landing {
+                    SING_LANDING_BOOST
+                } else {
+                    1.0
+                };
+            let dance = 1.0 - self.sing_sync.bow; // the bow stills the dance
+            scale_y *= 1.0 - squash * amp * pulse * self.sing * dance;
+            scale_x *= 1.0 + squash * 0.7 * amp * pulse * self.sing * dance;
+            lead +=
+                SING_SWAY * amp * (std::f32::consts::PI * self.sing_beat).sin() * self.sing * dance;
+            // PRE-ECHO POSE BIAS: the destination class's standing lean,
+            // live from the hand-over press itself.
+            lead += SING_CLASS_LEAN[usize::from(self.sing_sync.class.min(4))] * self.sing;
+            // THE BOW: squash toward BOW_SQUASH height at full depth, the
+            // envelope timed by the cadence clock host-side.
+            scale_y *= 1.0 - (1.0 - BOW_SQUASH) * self.sing_sync.bow;
+            scale_x *= 1.0 + 0.5 * (1.0 - BOW_SQUASH) * self.sing_sync.bow;
         }
         // Expression: blink/squint only over the plain cruising/discovery face —
         // the wink/celebrate reactions own their own eyes via a variant swap.
@@ -1284,7 +1387,7 @@ impl CursorCat {
             EyesFrame::Happy
         } else if !plain_face {
             EyesFrame::Open
-        } else if self.blink_active(now) && self.sing <= 0.33 {
+        } else if self.blink_active(now) && (self.sing <= 0.33 || self.sing_sync.bow > 0.5) {
             // A BLINK OUTRANKS THE CRUISING FACE. This arm used to sit BELOW the
             // happy face and was additionally gated on `disp < BLINK_CEIL` — but
             // `disp` is pinned at 1.0 at every human cadence whenever the cat is
@@ -1294,6 +1397,8 @@ impl CursorCat {
             // the cheapest life in the sprite. SINGING still outranks it: the
             // open-mouth meow head is a different baked head, and blinking
             // through a song reads as a glitch rather than as breathing.
+            // THE BOW is the exception — the song is over, the singer dips,
+            // and the blink re-enabling is what sells "at rest, grateful".
             EyesFrame::Blink
         } else if self.sing > 0.33 || self.disp >= HAPPY_GATE {
             // Singing is sung with happy eyes (over the open-mouth meow head
@@ -3559,17 +3664,29 @@ mod tests {
         assert_eq!(after.pose, CatPose::STILL);
     }
 
+    /// A full-energy [`SingSync`] from just (drive, beat) — the shape every
+    /// pre-arc test spoke; energy 1.0 keeps their amplitude assertions at
+    /// the classic full-depth dance.
+    fn sync(drive: f32, beat: f32) -> SingSync {
+        SingSync {
+            drive,
+            beat,
+            energy: 1.0,
+            ..SingSync::default()
+        }
+    }
+
     fn arm_singing_after_travel(c: &mut CursorCat, t: Instant) -> Instant {
         // The detector arms after sixteen repeat events; pinning the metric at
         // that point must NOT silently substitute for the independent sixteen-
         // event cursor-travel floor.
-        c.set_singing(t, 1.0, 0.0);
+        c.set_singing(t, sync(1.0, 0.0));
         assert!(!c.is_active(), "an armed hold still owes cursor travel");
         let mut armed_at = t;
         for i in 1..=MIN_RUN_KEYS {
             armed_at = t + Duration::from_millis(u64::from(i) * 40);
             c.on_key(armed_at, true);
-            c.set_singing(armed_at, 1.0, i as f32 * 0.1);
+            c.set_singing(armed_at, sync(1.0, i as f32 * 0.1));
         }
         assert!(
             c.is_active(),
@@ -3592,7 +3709,7 @@ mod tests {
         // Two presents inside ONE beat, past the fade-in: fresh-beat pulse
         // vs relaxed mid-beat — the dance loop must move the pose.
         let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        c.set_singing(t1, 1.0, 2.02);
+        c.set_singing(t1, sync(1.0, 2.02));
         let on_beat = c.frame(t1);
         assert_eq!(on_beat.alpha, 255);
         assert_eq!(on_beat.sing, 1.0);
@@ -3602,7 +3719,7 @@ mod tests {
             "the roster's open-mouth meow head IS the singing face"
         );
         let t2 = armed_at + Duration::from_secs_f32(FADE_IN + 0.2);
-        c.set_singing(t2, 1.0, 2.47);
+        c.set_singing(t2, sync(1.0, 2.47));
         let mid_beat = c.frame(t2);
         assert!(
             on_beat.pose.scale_y < mid_beat.pose.scale_y,
@@ -3625,7 +3742,7 @@ mod tests {
         let t = Instant::now();
         let armed_at = arm_singing_after_travel(&mut c, t);
         let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.05);
-        c.set_singing(t1, 1.0, 1.1);
+        c.set_singing(t1, sync(1.0, 1.1));
         c.on_key(t1, false); // a delete mid-song
         let f = c.frame(t1 + Duration::from_millis(16));
         assert_eq!(f.render_look().variant, CatGlyphId::S121, "oops wins");
@@ -3640,7 +3757,7 @@ mod tests {
         let t = Instant::now();
         let armed_at = arm_singing_after_travel(&mut c, t);
         let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.05);
-        c.set_singing(t1, 0.5, 3.05);
+        c.set_singing(t1, sync(0.5, 3.05));
         let half = c.frame(t1);
         assert_eq!(half.sing, 0.5);
         assert_eq!(
@@ -3649,7 +3766,7 @@ mod tests {
             "half drive still sings"
         );
         let t2 = t1 + Duration::from_millis(100);
-        c.set_singing(t2, 0.0, 0.0);
+        c.set_singing(t2, sync(0.0, 0.0));
         let off = c.frame(t2);
         assert_eq!(off.sing, 0.0);
         assert_ne!(
@@ -3678,7 +3795,7 @@ mod tests {
         let mut c = CursorCat::default();
         let t = Instant::now();
         let armed_at = arm_singing_after_travel(&mut c, t);
-        c.set_singing(armed_at, 1.0, 5.3);
+        c.set_singing(armed_at, sync(1.0, 5.3));
         let f = c.static_frame(armed_at);
         assert_eq!(f.alpha, 255, "static celebration presents fully opaque");
         assert_eq!(f.pose, CatPose::STILL, "no dance loop under reduced motion");
@@ -3686,8 +3803,176 @@ mod tests {
         assert_eq!(f.render_look().variant, CatGlyphId::S115);
         // Below half drive: one-step off (the hello's disappearance law).
         let t1 = armed_at + Duration::from_millis(800);
-        c.set_singing(t1, 0.3, 7.3);
+        c.set_singing(t1, sync(0.3, 7.3));
         let off = c.static_frame(t1);
         assert_eq!(off.alpha, 0, "one-step disappearance, no fade animation");
+    }
+
+    /// THE ARC IN THE BODY: at the same beat phase, a peaked song (energy
+    /// 1.0) squashes deeper than a cold intro (energy 0.0) — the dance
+    /// amplitude follows the earned energy, half depth to full.
+    #[test]
+    fn the_dance_amplitude_follows_the_arc_energy() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
+        let pose_at_energy = |c: &mut CursorCat, energy: f32| {
+            c.set_singing(
+                t1,
+                SingSync {
+                    drive: 1.0,
+                    beat: 2.05, // just after a beat: the pulse is near full
+                    energy,
+                    ..SingSync::default()
+                },
+            );
+            c.frame(t1).pose
+        };
+        let cold = pose_at_energy(&mut c, 0.0);
+        let peak = pose_at_energy(&mut c, 1.0);
+        assert!(
+            peak.scale_y < cold.scale_y,
+            "full energy dances deeper ({} vs {})",
+            peak.scale_y,
+            cold.scale_y
+        );
+    }
+
+    /// THE COMMIT LANDING: the reopened bar's first beat squashes deeper
+    /// (×1.6) than the same beat phase without the landing flag.
+    #[test]
+    fn the_commit_landing_doubles_the_squash() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
+        let pose_landing = |c: &mut CursorCat, landing: bool| {
+            c.set_singing(
+                t1,
+                SingSync {
+                    drive: 1.0,
+                    beat: 4.1,
+                    energy: 1.0,
+                    landing,
+                    ..SingSync::default()
+                },
+            );
+            c.frame(t1).pose
+        };
+        let plain = pose_landing(&mut c, false);
+        let landed = pose_landing(&mut c, true);
+        assert!(
+            landed.scale_y < plain.scale_y,
+            "the landing beat is the double squash ({} vs {})",
+            landed.scale_y,
+            plain.scale_y
+        );
+    }
+
+    /// THE FILL BEAT: with the announced fill rolling, the squash pulse
+    /// clock-divides to sixteenth rate — at mid-beat (where the beat pulse
+    /// has relaxed) a fresh sixteenth lands a NEW pulse.
+    #[test]
+    fn the_fill_beat_bobs_at_sixteenth_rate() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
+        let pose_fill = |c: &mut CursorCat, fill: bool| {
+            c.set_singing(
+                t1,
+                SingSync {
+                    drive: 1.0,
+                    beat: 7.5, // mid-beat: beat pulse relaxed, sixteenth fresh
+                    energy: 1.0,
+                    fill,
+                    ..SingSync::default()
+                },
+            );
+            c.frame(t1).pose
+        };
+        let normal = pose_fill(&mut c, false);
+        let rolling = pose_fill(&mut c, true);
+        assert!(
+            rolling.scale_y < normal.scale_y,
+            "the drum-roll head-bob pulses on the sixteenth ({} vs {})",
+            rolling.scale_y,
+            normal.scale_y
+        );
+    }
+
+    /// THE PRE-ECHO POSE BIAS: the destination class leans the singer —
+    /// chorus in, bridge back — at the same beat phase, so a hand-over
+    /// press changes the pose on the very next frame.
+    #[test]
+    fn the_class_lean_pre_echoes_the_destination() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
+        let pose_class = |c: &mut CursorCat, class: u8| {
+            c.set_singing(
+                t1,
+                SingSync {
+                    drive: 1.0,
+                    beat: 3.0,
+                    energy: 1.0,
+                    class,
+                    ..SingSync::default()
+                },
+            );
+            c.frame(t1).pose
+        };
+        let chorus = pose_class(&mut c, 1);
+        let bridge = pose_class(&mut c, 2);
+        assert!(
+            chorus.lead > bridge.lead,
+            "chorus leans in, bridge leans back ({} vs {})",
+            chorus.lead,
+            bridge.lead
+        );
+    }
+
+    /// THE BOW stills the dance and dips the body: at full bow depth the
+    /// pose no longer varies with the beat, the height dips toward the
+    /// bow squash, and the blink re-enables through the singing face.
+    #[test]
+    fn the_bow_stills_the_dance_and_dips() {
+        let mut c = CursorCat::default();
+        let t = Instant::now();
+        let armed_at = arm_singing_after_travel(&mut c, t);
+        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
+        let pose_bow = |c: &mut CursorCat, beat: f32, bow: f32| {
+            c.set_singing(
+                t1,
+                SingSync {
+                    drive: 1.0,
+                    beat,
+                    energy: 1.0,
+                    bow,
+                    ..SingSync::default()
+                },
+            );
+            c.frame(t1).pose
+        };
+        let dancing_a = pose_bow(&mut c, 2.05, 0.0);
+        let dancing_b = pose_bow(&mut c, 2.5, 0.0);
+        assert_ne!(
+            dancing_a.scale_y, dancing_b.scale_y,
+            "without the bow the dance moves with the beat"
+        );
+        let bowed_a = pose_bow(&mut c, 2.05, 1.0);
+        let bowed_b = pose_bow(&mut c, 2.5, 1.0);
+        assert_eq!(
+            bowed_a.scale_y, bowed_b.scale_y,
+            "at full bow the dance is stilled"
+        );
+        assert!(
+            bowed_a.scale_y < dancing_b.scale_y,
+            "the bow dips below the standing dance ({} vs {})",
+            bowed_a.scale_y,
+            dancing_b.scale_y
+        );
     }
 }

@@ -161,7 +161,8 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName]) 
 
 /// Best-effort undo of [`activate_channel`] plus a partial [`install_tools`] pass, for a
 /// build that is about to be DISCARDED. An abort path that deletes a build AFTER activation
-/// succeeded (sourcebuild's shim-failure arm) must call this first, or the deleted tree
+/// succeeded (the sysroot resolve-check discard in `flow::install_program`) must call this
+/// first, or the deleted tree
 /// stays live everywhere that matters: both `current` links dangle into it (and a broken
 /// per-program link makes GC abstain on the program until the next activation), and any
 /// shims already written this pass point at nothing.
@@ -227,6 +228,47 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    /// The permission bits of an existing directory, for the prefix-shape assertions.
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A prefix whose WHOLE chain is root-owned, or `None` when this run cannot build one.
+    /// Only root can create a directory under a root-owned parent, and even root cannot
+    /// under a SIP-protected `/usr`, so the caller SKIPS rather than fails — the
+    /// `$HOME`-shape half of the property is what runs unprivileged.
+    ///
+    /// The candidates are ordinary root-owned system dirs; the first that both reads as the
+    /// system shape (a brew-owned `/usr/local` does not) and accepts a `mkdir` wins.
+    #[cfg(unix)]
+    fn system_prefix_fixture(label: &str) -> Option<Layout> {
+        for parent in ["/opt", "/usr/local", "/var/lib", "/usr/lib"] {
+            let prefix =
+                Path::new(parent).join(format!("atpkg-act-{label}-{}", std::process::id()));
+            let layout = Layout { prefix };
+            if !layout.is_system_prefix() {
+                continue; // the parent chain is not root-owned — wrong shape, keep looking
+            }
+            let _ = std::fs::remove_dir_all(&layout.prefix);
+            if std::fs::create_dir(&layout.prefix).is_err() {
+                continue; // not root, or the parent refuses writes even to root
+            }
+            // `create_dir` applies the umask, so re-state the mode: the prefix itself must
+            // stay non-group/other-writable or it is no longer the system shape.
+            let shaped =
+                std::fs::set_permissions(&layout.prefix, std::fs::Permissions::from_mode(0o755))
+                    .is_ok()
+                    && layout.is_system_prefix();
+            if !shaped {
+                let _ = std::fs::remove_dir_all(&layout.prefix);
+                continue;
+            }
+            return Some(layout);
+        }
+        None
+    }
 
     fn temp_prefix(label: &str) -> Layout {
         let p = std::env::temp_dir().join(format!("atpkg-act-{label}-{}", std::process::id()));
@@ -552,11 +594,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// The mode `bin/` and `channels/<ch>/` come out at is a property of the PREFIX SHAPE,
+    /// and activation is where it was easiest to get wrong: these three entry points
+    /// chmod'd their directory to `0700` unconditionally, so every install and update
+    /// re-hardened the ONE directory on the user's PATH (undoing a correct `atpkg link`
+    /// on the way).
+    ///
+    /// A `$HOME` prefix — this fixture, and every install that is not a system prefix —
+    /// must be UNCHANGED by the routing: still exactly `0700`. The probe comparison is the
+    /// shape-agnostic half: `bin/` carries the mode THIS layout gives its own directories,
+    /// whatever shape the layout turns out to be.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_shaped_prefix_keeps_bin_and_channels_private() {
+        let layout = temp_prefix("mode-home");
+        assert!(
+            !layout.is_system_prefix(),
+            "a user-owned temp prefix is never the system shape"
+        );
+        let b18 = make_build(&layout, "ay", 18, &["ay"]);
+        install_tools(&layout, &b18, &[tool("ay")]).unwrap();
+        assert_eq!(mode_of(&layout.bin_dir()), 0o700, "bin/ stays private");
+
+        activate_channel(&layout, "stable", &b18).unwrap();
+        let chan = layout.channel_current("stable");
+        assert_eq!(
+            mode_of(chan.parent().unwrap()),
+            0o700,
+            "channels/<ch>/ stays private"
+        );
+
+        install_tombstone_shim(&layout, &tool("ay")).unwrap();
+        let probe = layout.prefix.join("mode-probe");
+        layout.ensure_dir(&probe).unwrap();
+        assert_eq!(
+            mode_of(&layout.bin_dir()),
+            mode_of(&probe),
+            "bin/ carries this layout's own dir mode, not a hardcoded 0700"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The regression, and the only assertion that can tell the two shapes apart: under a
+    /// root-owned SYSTEM prefix, activation must publish `bin/` and `channels/<ch>/` at
+    /// `0755`. Nothing upstream objects to `0700` — it satisfies `dir_safe_for_private_write`
+    /// and Trust's launcher predicate alike — so the break surfaces only as a bare
+    /// `Permission denied` at the first non-root invocation of an installed tool.
+    ///
+    /// Skips when this run cannot build an all-root-owned chain (see
+    /// [`system_prefix_fixture`]); the `$HOME` shape is covered above.
+    #[cfg(unix)]
+    #[test]
+    fn a_system_shaped_prefix_publishes_bin_and_channels_traversable() {
+        let Some(layout) = system_prefix_fixture("mode-sys") else {
+            return;
+        };
+        let b18 = make_build(&layout, "ay", 18, &["ay"]);
+        install_tools(&layout, &b18, &[tool("ay")]).unwrap();
+        assert_eq!(
+            mode_of(&layout.bin_dir()),
+            0o755,
+            "a system prefix's bin/ must be traversable by every user, not root-only"
+        );
+
+        activate_channel(&layout, "stable", &b18).unwrap();
+        let chan = layout.channel_current("stable");
+        assert_eq!(
+            mode_of(chan.parent().unwrap()),
+            0o755,
+            "channels/<ch>/ belongs to the same prefix and must not disagree"
+        );
+
+        install_tombstone_shim(&layout, &tool("ay")).unwrap();
+        assert_eq!(
+            mode_of(&layout.bin_dir()),
+            0o755,
+            "the revoke path must not re-harden the shared bin/ either"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
     /// `undo_activation` unwinds exactly the DOOMED build's footprint and nothing wider.
     /// The channel link here has already moved on to another program's build, so it must
     /// SURVIVE the undo — the link-removal guard is "names this build", not "names this
     /// channel" — while the doomed build's witness link and shim both go. Without the
-    /// undo, sourcebuild's discard-after-activation abort left both `current` links and
+    /// undo, the sysroot resolve-check discard (`flow::install_program`) left both `current` links and
     /// the written shims dangling into a deleted tree.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {

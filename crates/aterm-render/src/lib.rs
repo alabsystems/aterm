@@ -305,13 +305,13 @@ pub enum FaceId {
     /// STIX/Apple Symbols): it guarantees a visible, theme-coloured glyph instead
     /// of `.notdef` tofu, while still never rendering in colour.
     ColorEmojiMono,
-    /// One of the EXTRA bundled game-title faces of an active `game:` MIX
-    /// (`game:minecraft+zelda`): a character whose deterministic pick
-    /// ([`game_mix_face_index`]) lands on a non-primary mix face routes here
+    /// One of the EXTRA bundled display faces of an active `display:` MIX
+    /// (`display:pixel+engraved`): a character whose deterministic pick
+    /// ([`display_mix_face_index`]) lands on a non-primary mix face routes here
     /// and rasterizes through the metric-normalized fallback pipeline. The
     /// pick is a pure function of the code point, so cache keys stay stable
     /// without carrying an index.
-    GameMix,
+    DisplayMix,
     /// A RUNTIME-DISCOVERED fallback face (M3 FONT-DISCOVERY): a system font found
     /// at query time to cover a code point that NONE of the configured faces
     /// (primary / broad / symbol / colour) carry. On macOS the cover is resolved
@@ -974,18 +974,18 @@ pub struct Renderer {
     /// so [`FaceId::Fallback`] tries each chain entry IN ORDER and the first that
     /// has the glyph wins — the per-char winner is memoized in [`Self::fallback_pick`].
     fallback_chain: Vec<FallbackFace>,
-    /// The EXTRA faces of an active game-font MIX (`game:<id>+<id>[+<id>]`),
+    /// The EXTRA faces of an active display-face MIX (`display:<id>+<id>[+<id>]`),
     /// in toggle order; the mix's FIRST face is the ordinary primary. Empty =
-    /// no mix. See [`Renderer::set_game_mix_faces`] / [`FaceId::GameMix`].
-    game_mix: Vec<FallbackFace>,
-    /// FONT-GAME-FIT: how the PRIMARY face is fitted to the grid when it is a
-    /// bundled game face — `None` for every ordinary font, which is what keeps
-    /// the whole policy off the normal path. See [`GameFaceFit`].
-    game_fit: Option<GameFaceFit>,
-    /// The px the host last REQUESTED, before [`GameFaceFit::px_scale`]. Equals
+    /// no mix. See [`Renderer::set_display_mix_faces`] / [`FaceId::DisplayMix`].
+    display_mix: Vec<FallbackFace>,
+    /// FONT-DISPLAY-FIT: how the PRIMARY face is fitted to the grid when it is a
+    /// bundled display face — `None` for every ordinary font, which is what keeps
+    /// the whole policy off the normal path. See [`DisplayFaceFit`].
+    display_fit: Option<DisplayFaceFit>,
+    /// The px the host last REQUESTED, before [`DisplayFaceFit::px_scale`]. Equals
     /// `px` for every unfitted face; only the size-change guards read it.
     px_request: f32,
-    /// FONT-GAME-FIT: extra cell px LEARNED by [`Renderer::calibrate_fitted_cell`]
+    /// FONT-DISPLAY-FIT: extra cell px LEARNED by [`Renderer::calibrate_fitted_cell`]
     /// — how far the real rasterizer's coverage exceeded the metric prediction
     /// for this face. Kept as a field (rather than applied to `cell_w` alone) so
     /// the pure geometry read [`Renderer::cell_geometry`], which cannot measure,
@@ -1789,63 +1789,69 @@ pub fn embedded_font() -> &'static [u8] {
     include_bytes!("../assets/DejaVuSansMono.ttf")
 }
 
-/// One bundled game-title face: the `game:<id>` virtual-family target. These
-/// are the REAL faces of each game's title lettering (or the community fan
-/// recreation of it), not open lookalikes. Each ships with its license text
-/// beside it in `assets/game/`.
+/// One bundled DISPLAY FACE: the `display:<id>` virtual-family target. Each
+/// ships with its licence text beside it in `assets/game/`, and `build.rs`
+/// refuses to compile the crate unless that notice names an OFL / Apache / MIT
+/// grant — `include_bytes!` puts these outlines in the shipped binary, and
+/// embedding IS redistribution, so a menu that declines to name a face changes
+/// the marketing and not the distribution.
 ///
-/// LICENSING (read before cutting a release): only Monocraft (`minecraft`) is
-/// open-licensed (OFL-1.1). The rest are development-branch assets whose
-/// redistribution is UNRESOLVED — Hylia Serif (`zelda`) and Mario Kart F2
-/// (`mariokart`) are free fan faces without an open grant, while Gill Sans
-/// UltraBold (`roblox`, Monotype) and FinkHeavy (`animal-crossing`, House
-/// Industries) are commercial retail faces. Each LICENSE.txt names the honest
-/// fallback if its face cannot be cleared.
-pub struct GameFont {
-    /// The stable selector after the `game:` scheme (config `game_font` value).
+/// The ids describe the LETTERFORM (`pixel`, `chunky`, `bubble`, `engraved`),
+/// never a game. That is a TRADEMARK question rather than a licence one, which
+/// is why it binds even the face whose outlines are unambiguously free:
+/// Monocraft is OFL-1.1 and may ship, but "Minecraft" is a Mojang trademark.
+/// The pre-rename spellings still resolve — see [`DISPLAY_FACE_LEGACY_IDS`].
+pub struct DisplayFace {
+    /// The stable selector after the `display:` scheme (config `display_font`
+    /// value).
     pub id: &'static str,
-    /// The game whose title screen the face evokes (display label).
-    pub game: &'static str,
-    /// The actual open font's name + license, for honest attribution in UI.
+    /// What the letterform IS, for the Settings label — the shapes you get, not
+    /// the franchise the face was once filed under.
+    pub label: &'static str,
+    /// The actual font's name + licence, for honest attribution in UI.
     pub face: &'static str,
     /// Render this face with a synthetic WEIGHT BOOST (the `apply_synthetic_style`
     /// coverage dilation, applied to REGULAR cells). The reason a face wants it
     /// is legibility rather than taste: its strokes rasterize to a hairline at
-    /// body px, however heavy the design looks at display sizes —
-    /// `animal-crossing`'s FinkHeavy thins to ~1px strokes at 16px without it.
+    /// body px, however heavy the design looks at display sizes — `bubble`'s
+    /// Chewy thins to ~1px strokes at 16px without it.
     ///
-    /// Faces that rasterize heavy (`minecraft`'s pixel face, `roblox`'s
-    /// UltraBold, `mariokart`'s solid lettering) MUST leave this off; dilating
-    /// them fills their counters and turns text to mud.
+    /// Faces that rasterize heavy (`pixel`'s pixel-grid face, `chunky`'s solid
+    /// lettering) MUST leave this off; dilating them fills their counters and
+    /// turns text to mud.
     pub embolden: bool,
     bytes: &'static [u8],
 }
 
-/// The virtual-family scheme for bundled game faces: a request of `game:<id>`
-/// (e.g. `game:minecraft`) resolves to embedded bytes in BOTH resolution paths
-/// (startup [`Renderer::from_system_with_family`] and the off-thread
-/// [`font_catalog::resolve_and_admit`]), never the filesystem.
-pub const GAME_FONT_SCHEME: &str = "game:";
+/// The virtual-family scheme for bundled display faces: a request of
+/// `display:<id>` (e.g. `display:pixel`) resolves to embedded bytes in BOTH
+/// resolution paths (startup [`Renderer::from_system_with_family`] and the
+/// off-thread [`font_catalog::resolve_and_admit`]), never the filesystem.
+pub const DISPLAY_FACE_SCHEME: &str = "display:";
 
-/// The bundled game-title faces (FONT-GAME), in display order. One table drives
+/// The pre-rename spelling of [`DISPLAY_FACE_SCHEME`], still resolved so a
+/// config or theme written as `font_family = "game:minecraft"` keeps rendering
+/// the face it asked for instead of falling back to the primary font.
+pub const LEGACY_DISPLAY_FACE_SCHEME: &str = "game:";
+
+/// The bundled display faces (FONT-DISPLAY), in display order. One table drives
 /// the resolver, the settings toggles, and the attribution strings.
-pub const GAME_FONTS: &[GameFont] = &[
-    GameFont {
-        id: "roblox",
-        game: "Roblox",
-        // Was Luckiest Guy — an open lookalike. This is the REAL face of the
-        // classic Roblox logo, extracted from macOS's bundled collection. A
-        // commercial Monotype face: see `assets/game/GillSans.LICENSE.txt`
-        // before cutting a release.
-        face: "Gill Sans UltraBold (Monotype, macOS system copy — commercial, redistribution unresolved)",
-        // UltraBold is already the heaviest cut of the family; dilation would
-        // close its tight counters (`e`, `a`) and turn body text to mud.
+pub const DISPLAY_FACES: &[DisplayFace] = &[
+    DisplayFace {
+        id: "chunky",
+        label: "Chunky",
+        // Restored after the unlicensed Gill Sans UltraBold was deleted: that
+        // face was a Monotype retail font extracted from macOS, and its own
+        // notice named this one as the honest fallback.
+        face: "Luckiest Guy (Brian J. Bonislawsky / Astigmatic, Apache-2.0)",
+        // Already a heavy poster face; dilation would close its counters
+        // (`e`, `a`) and turn body text to mud.
         embolden: false,
-        bytes: include_bytes!("../assets/game/GillSansUltraBold.ttf"),
+        bytes: include_bytes!("../assets/game/LuckiestGuy-Regular.ttf"),
     },
-    GameFont {
-        id: "minecraft",
-        game: "Minecraft",
+    DisplayFace {
+        id: "pixel",
+        label: "Pixel",
         face: "Monocraft (Idrees Hassan, OFL-1.1)",
         // The one genuinely MONOSPACED bundled face, and already heavy — it takes
         // neither the weight boost nor the proportional fit below, so it renders
@@ -1853,80 +1859,108 @@ pub const GAME_FONTS: &[GameFont] = &[
         embolden: false,
         bytes: include_bytes!("../assets/game/Monocraft.ttf"),
     },
-    GameFont {
-        id: "zelda",
-        game: "The Legend of Zelda",
-        // NOT an open lookalike — a free FAN face whose author asks to be
-        // contacted before redistribution. See the type's doc comment and
-        // `assets/game/HyliaSerif.LICENSE.txt` before cutting a release.
-        face: "Hylia Serif Beta v0.009 (Omni Jacala, free — redistribution by arrangement)",
+    DisplayFace {
+        id: "engraved",
+        label: "Engraved",
+        // Restored after Hylia Serif Beta was deleted: that face carried no
+        // open grant, drifted between beta revisions, and was fan work on a
+        // Nintendo property. Cinzel is the inscriptional serif it displaced.
+        face: "Cinzel (Natanael Gama / NDISCOVER, OFL-1.1)",
         embolden: false,
-        bytes: include_bytes!("../assets/game/HyliaSerifBeta-Regular.otf"),
+        bytes: include_bytes!("../assets/game/Cinzel-var.ttf"),
     },
-    GameFont {
-        id: "mariokart",
-        game: "Mario Kart",
-        // Was Titan One, then briefly Super Mario 256. This is the community
-        // face of the Mario Kart title lettering — full printable-ASCII
-        // coverage, unlike Super Mario 256 (which lacked & ` { } ~). A free
-        // FAN face, NOT an open lookalike — see
-        // `assets/game/MarioKartF2.LICENSE.txt`.
-        face: "Mario Kart F2 (fan font, free — redistribution unresolved)",
-        embolden: false,
-        bytes: include_bytes!("../assets/game/MarioKartF2.ttf"),
-    },
-    GameFont {
-        id: "animal-crossing",
-        game: "Animal Crossing",
-        // Was Chewy — an open lookalike. This is the ACTUAL Animal Crossing
-        // face, licensed by Nintendo from House Industries for the games; a
-        // commercial face — see `assets/game/FinkHeavy.LICENSE.txt` before
-        // cutting a release.
-        face: "FinkHeavy (Ken Barber / House Industries — commercial, redistribution unresolved)",
-        // "Heavy" describes the design, not the raster: at body px its strokes
-        // thin to a hairline (same failure Chewy had) — the boost restores it.
+    DisplayFace {
+        id: "bubble",
+        label: "Bubble",
+        // Restored after the unlicensed FinkHeavy (House Industries) was
+        // deleted; its own notice named this one as the honest fallback.
+        face: "Chewy (Font Diner / Sideshow, Apache-2.0)",
+        // Chewy is the face the weight boost was written for: at body px its
+        // strokes thin to a hairline, and the boost restores them.
         embolden: true,
-        bytes: include_bytes!("../assets/game/FinkHeavy.ttf"),
+        bytes: include_bytes!("../assets/game/Chewy-Regular.ttf"),
     },
 ];
 
-/// The embedded face bytes for a `game_font` id (`"minecraft"`, …), or `None`
-/// for an unknown id — the caller falls back to normal family resolution.
+/// The pre-rename ids, each paired with what it resolves to now. Kept because a
+/// config that was valid yesterday must keep loading: dropping a shipped
+/// spelling turns an existing `aterm.toml` into a config-language complaint
+/// about a key the user never typed wrong.
+///
+/// `mariokart` maps to `None` — the one id with no successor. Its face (Mario
+/// Kart F2) shipped a `name` table still reading "Typeface © (your company).
+/// 2014": there was no grant to read, and no substitute to promote in its
+/// place. A config naming it warns and falls back to the primary font rather
+/// than erroring.
+pub const DISPLAY_FACE_LEGACY_IDS: &[(&str, Option<&str>)] = &[
+    ("roblox", Some("chunky")),
+    ("minecraft", Some("pixel")),
+    ("zelda", Some("engraved")),
+    ("mariokart", None),
+    ("animal-crossing", Some("bubble")),
+];
+
+/// Canonicalize a display-face id: a current id maps to itself, a legacy game id
+/// to its successor, and everything else — including `mariokart`, whose face was
+/// deleted with no replacement — to `None`, so the caller falls back to ordinary
+/// family resolution instead of failing.
 #[must_use]
-pub fn game_font_bytes(id: &str) -> Option<&'static [u8]> {
-    GAME_FONTS
+pub fn display_face_canonical_id(id: &str) -> Option<&'static str> {
+    let id = id.trim();
+    if let Some(face) = DISPLAY_FACES.iter().find(|face| face.id == id) {
+        return Some(face.id);
+    }
+    DISPLAY_FACE_LEGACY_IDS
         .iter()
-        .find(|font| font.id == id)
-        .map(|font| font.bytes)
+        .find(|(legacy, _)| *legacy == id)
+        .and_then(|(_, current)| *current)
 }
 
-/// Resolve a FAMILY REQUEST under the `game:` scheme: `Some(bytes)` only for
-/// `game:<known-id>`. Any other shape (including a bare id without the scheme)
-/// is `None`, so real families named like a game are never shadowed.
+/// The embedded face bytes for a `display_font` id (`"pixel"`, …, or a legacy
+/// game id), or `None` for an unknown one — the caller falls back to normal
+/// family resolution.
 #[must_use]
-pub fn game_font_for_family(family: &str) -> Option<&'static [u8]> {
-    game_font_mix_for_family(family).map(|faces| faces[0])
+pub fn display_face_bytes(id: &str) -> Option<&'static [u8]> {
+    let id = display_face_canonical_id(id)?;
+    DISPLAY_FACES
+        .iter()
+        .find(|face| face.id == id)
+        .map(|face| face.bytes)
 }
 
-/// The maximum number of faces one game-font MIX may combine.
-pub const GAME_FONT_MIX_MAX: usize = 3;
+/// Resolve a FAMILY REQUEST under the `display:` scheme (or its legacy `game:`
+/// spelling): `Some(bytes)` only for `display:<known-id>`. Any other shape
+/// (including a bare id without the scheme) is `None`, so a real installed
+/// family called "pixel" is never shadowed.
+#[must_use]
+pub fn display_face_for_family(family: &str) -> Option<&'static [u8]> {
+    display_face_mix_for_family(family).map(|faces| faces[0])
+}
 
-/// Resolve a FAMILY REQUEST under the `game:` scheme to its full face list:
-/// `game:<id>` yields one face, `game:<id>+<id>[+<id>]` up to
-/// [`GAME_FONT_MIX_MAX`]. `None` for any unknown/duplicate id, an empty list,
+/// The maximum number of faces one display-face MIX may combine.
+pub const DISPLAY_FACE_MIX_MAX: usize = 3;
+
+/// Resolve a FAMILY REQUEST under the `display:` scheme to its full face list:
+/// `display:<id>` yields one face, `display:<id>+<id>[+<id>]` up to
+/// [`DISPLAY_FACE_MIX_MAX`]. `None` for any unknown/duplicate id, an empty list,
 /// or more than the cap — the whole request is rejected rather than silently
 /// dropping a face the user asked for.
 #[must_use]
-pub fn game_font_mix_for_family(family: &str) -> Option<Vec<&'static [u8]>> {
-    let ids = family.strip_prefix(GAME_FONT_SCHEME)?;
-    let mut seen: Vec<&str> = Vec::new();
+pub fn display_face_mix_for_family(family: &str) -> Option<Vec<&'static [u8]>> {
+    let ids = family
+        .strip_prefix(DISPLAY_FACE_SCHEME)
+        .or_else(|| family.strip_prefix(LEGACY_DISPLAY_FACE_SCHEME))?;
+    let mut seen: Vec<&'static str> = Vec::new();
     let mut faces = Vec::new();
     for id in ids.split('+') {
-        let id = id.trim();
-        if seen.contains(&id) || faces.len() == GAME_FONT_MIX_MAX {
+        // Dedupe on the CANONICAL id: `display:pixel+minecraft` names ONE face
+        // under two spellings, and must reject exactly like `pixel+pixel` —
+        // otherwise the legacy aliases would smuggle a duplicate past the cap.
+        let id = display_face_canonical_id(id)?;
+        if seen.contains(&id) || faces.len() == DISPLAY_FACE_MIX_MAX {
             return None;
         }
-        faces.push(game_font_bytes(id)?);
+        faces.push(display_face_bytes(id)?);
         seen.push(id);
     }
     (!faces.is_empty()).then_some(faces)
@@ -1938,21 +1972,21 @@ pub fn game_font_mix_for_family(family: &str) -> Option<Vec<&'static [u8]>> {
 /// face — across frames, resizes, and reloads — and adjacent letters spread
 /// across the mix (the ransom-note look) instead of clustering.
 #[must_use]
-pub fn game_mix_face_index(ch: char, total: usize) -> usize {
+pub fn display_mix_face_index(ch: char, total: usize) -> usize {
     if total <= 1 {
         return 0;
     }
     ((ch as u32).wrapping_mul(2_654_435_761) >> 16) as usize % total
 }
 
-/// How a bundled game face is fitted to the fixed terminal grid (FONT-GAME-FIT).
+/// How a bundled display face is fitted to the fixed terminal grid (FONT-DISPLAY-FIT).
 ///
 /// # Why a policy is needed at all
 ///
 /// The default cell width is the primary face's `M` advance — sound for a
-/// MONOSPACED face, where every advance is that same number. The bundled game
-/// faces are display faces and wildly PROPORTIONAL: the since-retired Luckiest
-/// Guy (whose measurements motivated this policy) ran `i` at 0.22 em against
+/// MONOSPACED face, where every advance is that same number. The bundled
+/// display faces are title faces and wildly PROPORTIONAL: Luckiest Guy (whose
+/// measurements motivated this policy) runs `i` at 0.22 em against
 /// `m` at 0.91 em, with `M` itself only 0.79 em. Deriving the cell from `M`
 /// therefore does two visible damages at once:
 ///
@@ -1973,7 +2007,7 @@ pub fn game_mix_face_index(ch: char, total: usize) -> usize {
 ///   for Luckiest Guy, ~15% fewer columns); the scale lands the new cell back at
 ///   roughly the old width, so the collision fix does not cost a column of text.
 /// * the renderer additionally CENTRES each glyph in its cell (see
-///   [`Renderer::game_fit_center_offset`]), splitting the leftover slack evenly
+///   [`Renderer::display_fit_center_offset`]), splitting the leftover slack evenly
 ///   instead of dumping it to the right of every narrow letter.
 ///
 /// A MONOSPACED bundled face (Monocraft) needs none of this: its widest advance
@@ -1981,7 +2015,7 @@ pub fn game_mix_face_index(ch: char, total: usize) -> usize {
 /// and `px_scale: 1.0`, which routes it down the untouched pre-policy path —
 /// the fit cannot regress the one face that was already correct.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GameFaceFit {
+pub struct DisplayFaceFit {
     /// Cell width as an em fraction, or `None` to keep the ordinary `M`-advance
     /// derivation (monospaced faces).
     ///
@@ -1993,12 +2027,12 @@ pub struct GameFaceFit {
     pub cell_advance_em: Option<f32>,
     /// Rasterization px multiplier; `1.0` leaves the requested size alone.
     pub px_scale: f32,
-    /// Apply the synthetic weight boost — see [`GameFont::embolden`].
+    /// Apply the synthetic weight boost — see [`DisplayFace::embolden`].
     pub embolden: bool,
 }
 
 /// The identity fit: what a face that needs no fitting reports.
-impl Default for GameFaceFit {
+impl Default for DisplayFaceFit {
     fn default() -> Self {
         Self {
             cell_advance_em: None,
@@ -2008,44 +2042,44 @@ impl Default for GameFaceFit {
     }
 }
 
-/// The px multiplier applied to a PROPORTIONAL bundled game face
-/// ([`GameFaceFit::px_scale`]). Chosen so the widest-advance cell lands back at
+/// The px multiplier applied to a PROPORTIONAL bundled display face
+/// ([`DisplayFaceFit::px_scale`]). Chosen so the widest-advance cell lands back at
 /// about the width the `M`-advance cell had: the bundled proportional faces run
 /// `max/M` ≈ 1.15, and 1/1.15 ≈ 0.87.
-pub const GAME_FACE_PX_SCALE: f32 = 0.87;
+pub const DISPLAY_FACE_PX_SCALE: f32 = 0.87;
 
 /// The advance spread (`max/median`) above which a face counts as PROPORTIONAL
 /// and takes the fit. A true monospaced face measures exactly 1.0; the margin
 /// only absorbs hinting jitter, so nothing borderline is misclassified.
-const GAME_FACE_MONO_SPREAD: f32 = 1.02;
+const DISPLAY_FACE_MONO_SPREAD: f32 = 1.02;
 
 /// The em-fraction probe size. Advances scale linearly with px, so any size
 /// gives the same fraction; 128 is large enough that a rasterized INK width
 /// carries ~2 decimal digits of em precision, and small enough that probing all
 /// 94 printable ASCII glyphs stays cheap (this runs once per font construction,
 /// not per frame).
-const GAME_FACE_PROBE_PX: f32 = 128.0;
+const DISPLAY_FACE_PROBE_PX: f32 = 128.0;
 
-/// The [`GameFaceFit`] for a bundled game face, identified by its BYTES —
-/// `None` for anything that is not one of [`GAME_FONTS`], so a user's own
+/// The [`DisplayFaceFit`] for a bundled display face, identified by its BYTES —
+/// `None` for anything that is not one of [`DISPLAY_FACES`], so a user's own
 /// proportional font is never silently re-fitted behind their back (that would
 /// change cell metrics for existing configs). The registry entry supplies
 /// `embolden`; the measurement supplies the rest.
 #[must_use]
-pub fn game_face_fit(bytes: &[u8]) -> Option<GameFaceFit> {
-    let entry = GAME_FONTS.iter().find(|font| {
+pub fn display_face_fit(bytes: &[u8]) -> Option<DisplayFaceFit> {
+    let entry = DISPLAY_FACES.iter().find(|font| {
         std::ptr::eq(font.bytes.as_ptr(), bytes.as_ptr()) && font.bytes.len() == bytes.len()
     })?;
-    let identity = GameFaceFit {
+    let identity = DisplayFaceFit {
         embolden: entry.embolden,
-        ..GameFaceFit::default()
+        ..DisplayFaceFit::default()
     };
     let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
     // Advance AND ink per glyph: the cell has to clear whichever is wider.
     let mut advances: Vec<f32> = Vec::new();
     let mut widest_extent = 0.0_f32;
     for ch in '!'..='~' {
-        let (metrics, _) = font.rasterize(ch, GAME_FACE_PROBE_PX);
+        let (metrics, _) = font.rasterize(ch, DISPLAY_FACE_PROBE_PX);
         let advance = metrics.advance_width;
         if advance > 0.0 {
             advances.push(advance);
@@ -2059,12 +2093,12 @@ pub fn game_face_fit(bytes: &[u8]) -> Option<GameFaceFit> {
     let max = advances[advances.len() - 1];
     let median = advances[advances.len() / 2];
     // Monospaced: no overrun to prevent and no slack to centre — identity.
-    if median <= 0.0 || max / median < GAME_FACE_MONO_SPREAD {
+    if median <= 0.0 || max / median < DISPLAY_FACE_MONO_SPREAD {
         return Some(identity);
     }
-    Some(GameFaceFit {
-        cell_advance_em: Some(widest_extent / GAME_FACE_PROBE_PX),
-        px_scale: GAME_FACE_PX_SCALE,
+    Some(DisplayFaceFit {
+        cell_advance_em: Some(widest_extent / DISPLAY_FACE_PROBE_PX),
+        px_scale: DISPLAY_FACE_PX_SCALE,
         embolden: entry.embolden,
     })
 }
@@ -4622,10 +4656,10 @@ pub fn resolve_config_font(family: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("empty font name or path".to_string());
     }
-    // The `game:` scheme names embedded bytes, not a file: admissible by
+    // The `display:` scheme names embedded bytes, not a file: admissible by
     // construction, and the virtual name IS its resolved identity. An unknown
-    // game id falls through to normal resolution (and its honest error).
-    if game_font_for_family(trimmed).is_some() {
+    // face id falls through to normal resolution (and its honest error).
+    if display_face_for_family(trimmed).is_some() {
         return Ok(trimmed.to_string());
     }
     let explicit_path = trimmed.contains(['/', '\\']);
@@ -4956,13 +4990,13 @@ impl Renderer {
     pub fn from_bytes(bytes: &[u8], px: f32, theme: Theme) -> Result<Self, String> {
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .map_err(|e| e.to_string())?;
-        // FONT-GAME-FIT: a bundled PROPORTIONAL game face rasterizes a notch
+        // FONT-DISPLAY-FIT: a bundled PROPORTIONAL display face rasterizes a notch
         // smaller and takes its cell from the widest advance, not `M` (see
-        // [`GameFaceFit`]). Every other face — including the monospaced bundled
+        // [`DisplayFaceFit`]). Every other face — including the monospaced bundled
         // one — reports the identity fit, so `px_eff == px` and the derivations
         // below are the originals verbatim.
-        let game_fit = game_face_fit(bytes);
-        let px_eff = px * game_fit.map_or(1.0, |fit| fit.px_scale);
+        let display_fit = display_face_fit(bytes);
+        let px_eff = px * display_fit.map_or(1.0, |fit| fit.px_scale);
         let lm = font
             .horizontal_line_metrics(px_eff)
             .ok_or("font has no horizontal line metrics")?;
@@ -5010,7 +5044,7 @@ impl Renderer {
             resolved_features: ligature_shaping::build_feature_list(&[], true),
             shaped_runs: ShapedRunCache::default(),
             fallback_chain: Vec::new(),
-            game_mix: Vec::new(),
+            display_mix: Vec::new(),
             fallback_pick: FxHashMap::default(),
             fallback_paths: Vec::new(),
             cfg_fallback_fonts: Vec::new(),
@@ -5045,7 +5079,7 @@ impl Renderer {
             color_font: None,
             color_font_paths: Vec::new(),
             runtime_fallback: RuntimeFallback::default(),
-            game_fit,
+            display_fit,
             // The size the HOST asked for, kept so the no-op guards in `set_px` /
             // `activate_px` compare like with like: `px` below is the FITTED size,
             // and comparing a fresh request against it would read as a size change
@@ -5100,7 +5134,7 @@ impl Renderer {
         // Regular) and re-derive the cell geometry at the resolved coords.
         // A non-variable face resolves to `None` — byte-identical to before.
         r.refresh_variations();
-        // FONT-GAME-FIT: apply the shared cell derivation now that `r` exists, so
+        // FONT-DISPLAY-FIT: apply the shared cell derivation now that `r` exists, so
         // a freshly constructed renderer and one that has been through
         // `set_px`/`activate_px` agree on the cell to the pixel. Identity for
         // every unfitted face (`fitted_cell_w` returns the `M`-advance value the
@@ -5110,7 +5144,7 @@ impl Renderer {
         Ok(r)
     }
 
-    /// FONT-GAME-FIT: widen the cell, if needed, to the WIDEST COVERAGE the real
+    /// FONT-DISPLAY-FIT: widen the cell, if needed, to the WIDEST COVERAGE the real
     /// glyph pipeline actually produces for this face at this size.
     ///
     /// [`fitted_cell_w`](Self::fitted_cell_w) predicts that width from fontdue
@@ -5123,7 +5157,7 @@ impl Renderer {
     /// construction.
     ///
     /// A glyph's coverage width does not depend on `cell_w` (only its PLACEMENT
-    /// does, via [`game_fit_place`](Self::game_fit_place)), so measuring against
+    /// does, via [`display_fit_place`](Self::display_fit_place)), so measuring against
     /// the provisional cell and then widening is sound. The caches are dropped
     /// afterwards because the glyphs rasterized during the measurement carry
     /// placements computed against that provisional cell.
@@ -5131,7 +5165,11 @@ impl Renderer {
     /// No-op for every unfitted face — the ordinary path neither measures nor
     /// clears anything.
     fn calibrate_fitted_cell(&mut self) {
-        if self.game_fit.and_then(|fit| fit.cell_advance_em).is_none() {
+        if self
+            .display_fit
+            .and_then(|fit| fit.cell_advance_em)
+            .is_none()
+        {
             return;
         }
         let mut widest = 0usize;
@@ -5153,18 +5191,18 @@ impl Renderer {
     /// instead of going blank. Prefer the lazy path (`from_system`) unless you have
     /// a reason to pay the parse cost upfront. To add MORE fallbacks for scripts one
     /// face misses, follow with [`add_fallback_bytes`](Self::add_fallback_bytes).
-    /// Install the EXTRA faces of a game-font MIX (the mix's first face is the
+    /// Install the EXTRA faces of a display-face MIX (the mix's first face is the
     /// ordinary primary this renderer was built from). Every character then
     /// deterministically picks one face of the whole mix
-    /// ([`game_mix_face_index`]); picks landing on an extra face rasterize
+    /// ([`display_mix_face_index`]); picks landing on an extra face rasterize
     /// through the metric-normalized fallback pipeline, so differently-metriced
     /// title faces still fill the same cell grid. An empty slice clears the mix.
-    pub fn set_game_mix_faces(&mut self, faces: &[&[u8]]) -> Result<(), String> {
+    pub fn set_display_mix_faces(&mut self, faces: &[&[u8]]) -> Result<(), String> {
         let mut mix = Vec::with_capacity(faces.len());
         for bytes in faces {
             mix.push(FallbackFace::from_bytes(bytes, None)?);
         }
-        self.game_mix = mix;
+        self.display_mix = mix;
         // Per-char routing + rasters were keyed to the OLD mix; re-resolve.
         self.keys.clear();
         self.glyphs.clear();
@@ -5627,9 +5665,9 @@ impl Renderer {
         px: f32,
         theme: Theme,
     ) -> Result<Self, String> {
-        if let Some(mix) = game_font_mix_for_family(family.trim()) {
+        if let Some(mix) = display_face_mix_for_family(family.trim()) {
             let mut renderer = Self::from_resolved_font_file(family.trim(), mix[0], px, theme)?;
-            renderer.set_game_mix_faces(&mix[1..])?;
+            renderer.set_display_mix_faces(&mix[1..])?;
             return Ok(renderer);
         }
         let path = resolve_config_font(family)?;
@@ -5644,14 +5682,14 @@ impl Renderer {
     /// A `None` family — or a family that resolves to nothing — reduces EXACTLY to
     /// `from_system`, so the default (and a typo'd family) is byte-identical.
     pub fn from_system_with_family(family: Option<&str>, px: f32, theme: Theme) -> Option<Self> {
-        // The `game:` scheme resolves to embedded bytes, never the filesystem —
+        // The `display:` scheme resolves to embedded bytes, never the filesystem —
         // the same interception `font_catalog::resolve_and_admit` performs, so
-        // startup and live reload can never disagree about a game face.
+        // startup and live reload can never disagree about a display face.
         if let Some(requested) = family
-            && let Some(mix) = game_font_mix_for_family(requested)
+            && let Some(mix) = display_face_mix_for_family(requested)
             && let Ok(mut renderer) = Self::from_resolved_font_file(requested, mix[0], px, theme)
         {
-            if renderer.set_game_mix_faces(&mix[1..]).is_err() {
+            if renderer.set_display_mix_faces(&mix[1..]).is_err() {
                 // A bundled face that parses standalone always parses here;
                 // fail open to the first face alone rather than no font.
             }
@@ -6361,7 +6399,7 @@ impl Renderer {
         rebuilt.styled_loaded = true;
         rebuilt.primary_path = self.primary_path.clone(); // diagnostics only
         rebuilt.fallback_chain = self.fallback_chain.clone();
-        rebuilt.game_mix = self.game_mix.clone();
+        rebuilt.display_mix = self.display_mix.clone();
         rebuilt.fallback_paths.clear();
         rebuilt
             .cfg_fallback_fonts
@@ -6460,7 +6498,7 @@ impl Renderer {
         // Font routing assets. Loaded faces are immutable Arc-backed values;
         // per-character decisions/caches remain private to the fork.
         fork.fallback_chain = self.fallback_chain.clone();
-        fork.game_mix = self.game_mix.clone();
+        fork.display_mix = self.display_mix.clone();
         fork.cfg_fallback_fonts = self.cfg_fallback_fonts.clone();
         fork.fallback_paths = if fork.fallback_chain.is_empty() {
             fallback_candidate_paths(&fork.cfg_fallback_fonts)
@@ -6672,9 +6710,9 @@ impl Renderer {
                 }
                 // The mix pick is a pure function of the code point — recompute it
                 // (no per-char memo to recover). Fail safe to the primary below.
-                FaceId::GameMix => game_mix_face_index(ch, self.game_mix.len() + 1)
+                FaceId::DisplayMix => display_mix_face_index(ch, self.display_mix.len() + 1)
                     .checked_sub(1)
-                    .and_then(|i| self.game_mix.get(i))
+                    .and_then(|i| self.display_mix.get(i))
                     .map(|f| (Some(f.font.clone()), f.bytes.clone(), f.index, f.norm)),
                 _ => None,
             };
@@ -7387,7 +7425,7 @@ impl Renderer {
         if (px - self.px_request).abs() < 0.01 {
             return;
         }
-        // FONT-GAME-FIT: rasterize a fitted face at the scaled size. Identity
+        // FONT-DISPLAY-FIT: rasterize a fitted face at the scaled size. Identity
         // (`px_eff == px`) for every ordinary font.
         let px_eff = self.fitted_px(px);
         // Re-apply the live line-height scale at the new px so the cell box honours
@@ -7404,7 +7442,7 @@ impl Renderer {
         self.cell_w = self.fitted_cell_w(px_eff, adv);
         self.cell_h = cell_h;
         self.baseline = baseline;
-        // FONT-GAME-FIT: the new size needs its own measurement (the rasterizer's
+        // FONT-DISPLAY-FIT: the new size needs its own measurement (the rasterizer's
         // padding and the weight dilation are both px-dependent).
         self.calibrate_fitted_cell();
         // Glyphs were rasterized at the old px; drop the caches so they re-rasterize.
@@ -7467,7 +7505,7 @@ impl Renderer {
         self.cell_w = self.fitted_cell_w(px_eff, adv);
         self.cell_h = cell_h;
         self.baseline = baseline;
-        // FONT-GAME-FIT: re-measure the cell at the newly activated size.
+        // FONT-DISPLAY-FIT: re-measure the cell at the newly activated size.
         self.calibrate_fitted_cell();
         // The px-baked char→key memos alone become stale (their cached key embeds
         // the OLD `px_q`); everything expensive (the atlas, shaping, faces) stays.
@@ -7486,7 +7524,7 @@ impl Renderer {
     /// the no-op `set_px`/`activate_px` take in that case).
     #[must_use]
     pub fn cell_geometry(&self, px: f32) -> (usize, usize, i32) {
-        // FONT-GAME-FIT: resolve at the FITTED size, exactly as `activate_px`
+        // FONT-DISPLAY-FIT: resolve at the FITTED size, exactly as `activate_px`
         // would — so this pure read keeps agreeing with the activated renderer.
         let px = self.fitted_px(px);
         // VARIABLE primary: resolve the m-advance AND the line metrics from ONE
@@ -7511,19 +7549,19 @@ impl Renderer {
         }
     }
 
-    /// FONT-GAME-FIT: the rasterization size for a host request of `px` — scaled
-    /// down for a fitted (proportional bundled game) face, and `px` unchanged for
-    /// every other font. See [`GameFaceFit::px_scale`].
+    /// FONT-DISPLAY-FIT: the rasterization size for a host request of `px` — scaled
+    /// down for a fitted (proportional bundled display) face, and `px` unchanged for
+    /// every other font. See [`DisplayFaceFit::px_scale`].
     fn fitted_px(&self, px: f32) -> f32 {
-        px * self.game_fit.map_or(1.0, |fit| fit.px_scale)
+        px * self.display_fit.map_or(1.0, |fit| fit.px_scale)
     }
 
-    /// FONT-GAME-FIT: the cell width at rasterization size `px_eff`. A fitted
+    /// FONT-DISPLAY-FIT: the cell width at rasterization size `px_eff`. A fitted
     /// face takes its cell from the WIDEST printable-ASCII advance, so no glyph
     /// can overrun into the next cell; every other font keeps the historical
     /// `M`-advance derivation, byte-for-byte.
     fn fitted_cell_w(&self, px_eff: f32, m_advance: f32) -> usize {
-        match self.game_fit.and_then(|fit| fit.cell_advance_em) {
+        match self.display_fit.and_then(|fit| fit.cell_advance_em) {
             // CEIL, never round: rounding DOWN would cut the cell narrower than
             // the very glyph it was measured from, reintroducing the overrun the
             // fit exists to prevent. The extra headroom covers the two ways a
@@ -7532,17 +7570,17 @@ impl Renderer {
             // a further `round(px/18)` px when the face carries a weight boost.
             Some(em) => {
                 let ink = (em * px_eff).ceil().max(1.0) as usize;
-                ink + 1 + self.game_fit_embolden_px(px_eff) + self.fit_cell_pad
+                ink + 1 + self.display_fit_embolden_px(px_eff) + self.fit_cell_pad
             }
             None => cell_w_from_advance(m_advance),
         }
     }
 
-    /// FONT-GAME-FIT: the px `apply_synthetic_style` will dilate a weight-boosted
+    /// FONT-DISPLAY-FIT: the px `apply_synthetic_style` will dilate a weight-boosted
     /// glyph by at this size — mirrors the `(px / 18.0).round().max(1.0)` there,
     /// and `0` when this face takes no boost.
-    fn game_fit_embolden_px(&self, px_eff: f32) -> usize {
-        match self.game_fit {
+    fn display_fit_embolden_px(&self, px_eff: f32) -> usize {
+        match self.display_fit {
             Some(fit) if fit.embolden && self.synthetic_styles => {
                 (px_eff / 18.0).round().max(1.0) as usize
             }
@@ -7550,7 +7588,7 @@ impl Renderer {
         }
     }
 
-    /// FONT-GAME-FIT: where a glyph whose final coverage is `width` px wide, with
+    /// FONT-DISPLAY-FIT: where a glyph whose final coverage is `width` px wide, with
     /// natural bearing `xmin`, is placed in its cell — the value that REPLACES
     /// `xmin` at blit time.
     ///
@@ -7566,8 +7604,12 @@ impl Renderer {
     /// however the dilation grew the bitmap, the glyph is placed inside its own
     /// cell or flush against its left edge. Returns the untouched `xmin` when no
     /// fit is active, so the ordinary path is byte-identical.
-    fn game_fit_place(&self, xmin: i32, width: usize) -> i32 {
-        if self.game_fit.and_then(|fit| fit.cell_advance_em).is_none() {
+    fn display_fit_place(&self, xmin: i32, width: usize) -> i32 {
+        if self
+            .display_fit
+            .and_then(|fit| fit.cell_advance_em)
+            .is_none()
+        {
             return xmin;
         }
         let slack = self.cell_w as i32 - width as i32;
@@ -8008,10 +8050,10 @@ impl Renderer {
         if let Some(&key) = self.keys.get(&ch) {
             return (key, false);
         }
-        // FONT-GAME MIX: with extra game faces installed, every character
+        // FONT-DISPLAY MIX: with extra display faces installed, every character
         // deterministically picks one face of the mix — pick 0 continues on the
         // ordinary cascade below; a covered pick on an extra face routes to
-        // [`FaceId::GameMix`] (rasterized metric-normalized, like a fallback
+        // [`FaceId::DisplayMix`] (rasterized metric-normalized, like a fallback
         // face). Procedural cells stay procedural: box drawing must be
         // cell-exact and seam-free whatever the mix, so the mix defers to what
         // is also the chain's first tier.
@@ -8021,19 +8063,20 @@ impl Renderer {
         // that already covers `ch` and otherwise falls through untouched, so it
         // cannot manufacture tofu and cannot perturb the tier order that
         // `font_chain`'s proofs pin.
-        if !self.game_mix.is_empty() && !(self.procedural && procedural::covers(ch)) {
-            let pick = game_mix_face_index(ch, self.game_mix.len() + 1);
-            // The mix is host-INJECTED (`set_game_mix_faces`), so its faces are
+        if !self.display_mix.is_empty() && !(self.procedural && procedural::covers(ch)) {
+            let pick = display_mix_face_index(ch, self.display_mix.len() + 1);
+            // The mix is host-INJECTED (`set_display_mix_faces`), so its faces are
             // parsed eagerly and this probe stays the fontdue one it has always
             // been — no chain face is reachable here, so nothing can be
             // materialised on the render thread by it.
-            if let Some(face) = pick.checked_sub(1).and_then(|i| self.game_mix.get(i))
+            if let Some(face) = pick.checked_sub(1).and_then(|i| self.display_mix.get(i))
                 && face
                     .font
                     .get(&face.bytes)
                     .is_some_and(|f| f.lookup_glyph_index(ch) != 0)
             {
-                let key = GlyphKey::mono_char(FaceId::GameMix, ch, StyleBits::REGULAR, self.px_q);
+                let key =
+                    GlyphKey::mono_char(FaceId::DisplayMix, ch, StyleBits::REGULAR, self.px_q);
                 self.keys.insert(ch, key);
                 return (key, false);
             }
@@ -8939,7 +8982,7 @@ impl Renderer {
                     FaceId::Fallback
                         | FaceId::SymbolFallback
                         | FaceId::RuntimeFallback
-                        | FaceId::GameMix
+                        | FaceId::DisplayMix
                 ) {
                     // W8 (fallback harmony): fallback faces rasterize through
                     // their own pipeline — CoreText-native on macOS, metric-
@@ -8965,7 +9008,7 @@ impl Renderer {
                         | FaceId::Fallback
                         | FaceId::SymbolFallback
                         | FaceId::RuntimeFallback
-                        | FaceId::GameMix => &self.font,
+                        | FaceId::DisplayMix => &self.font,
                         // BoldPrimary keys are always built as MonoGid (handled in the
                         // MonoGid arm); this Mono-class case is unreachable on the real
                         // path, so fail safe to the bold face (then the primary).
@@ -8989,17 +9032,17 @@ impl Renderer {
                 } else {
                     StyleBits::REGULAR
                 };
-                // FONT-GAME-FIT (weight): a bundled game face marked `embolden`
+                // FONT-DISPLAY-FIT (weight): a bundled display face marked `embolden`
                 // takes the synthetic-bold dilation on REGULAR cells too — the
                 // face is either drawn too light to read as body text, or draws a
                 // comma whose hairline tail collapses into its period at body px.
                 // This rides the EXISTING synthesis rather than adding a second
                 // thickening path, so a genuinely bold cell is unaffected (the bit
                 // is already set) and `font_synthetic_style = false` still
-                // suppresses everything. See [`GameFont::embolden`].
+                // suppresses everything. See [`DisplayFace::embolden`].
                 let synth_style = if matches!(key.source, FaceId::Primary)
                     && self.synthetic_styles
-                    && self.game_fit.is_some_and(|fit| fit.embolden)
+                    && self.display_fit.is_some_and(|fit| fit.embolden)
                 {
                     StyleBits(synth_style.0 | StyleBits::BOLD.0)
                 } else {
@@ -9009,14 +9052,14 @@ impl Renderer {
                 GlyphImage::Mono {
                     width,
                     height: gh,
-                    // FONT-GAME-FIT (rhythm): centre the glyph in its cell for a
-                    // fitted face. Only the two sources that draw from a game face
-                    // in a game-fitted cell take it — procedural cells (box
+                    // FONT-DISPLAY-FIT (rhythm): centre the glyph in its cell for a
+                    // fitted face. Only the two sources that draw from a display face
+                    // in a fitted cell take it — procedural cells (box
                     // drawing) are cell-filling by construction and must stay put.
                     // `width` (post-dilation), not `gw`: the placement has to know
                     // how wide the coverage actually ENDED UP.
-                    xmin: if matches!(key.source, FaceId::Primary | FaceId::GameMix) {
-                        self.game_fit_place(gxmin, width)
+                    xmin: if matches!(key.source, FaceId::Primary | FaceId::DisplayMix) {
+                        self.display_fit_place(gxmin, width)
                     } else {
                         gxmin
                     },
@@ -9178,14 +9221,14 @@ impl Renderer {
                 } else {
                     StyleBits::REGULAR
                 };
-                // FONT-GAME-FIT (weight): the by-GLYPH-ID twin of the weight boost
+                // FONT-DISPLAY-FIT (weight): the by-GLYPH-ID twin of the weight boost
                 // in the per-char arm above. This is the arm plain text actually
                 // takes for the primary face (keys are built by id so an Apple
                 // `.ttc`'s Mac-Roman cmap can't mis-map), so a boost applied only
-                // there would never reach the screen. See [`GameFont::embolden`].
+                // there would never reach the screen. See [`DisplayFace::embolden`].
                 let synth = if matches!(pick, FacePick::Primary)
                     && self.synthetic_styles
-                    && self.game_fit.is_some_and(|fit| fit.embolden)
+                    && self.display_fit.is_some_and(|fit| fit.embolden)
                 {
                     StyleBits(synth.0 | StyleBits::BOLD.0)
                 } else {
@@ -9195,9 +9238,9 @@ impl Renderer {
                 GlyphImage::Mono {
                     width,
                     height: gh,
-                    // FONT-GAME-FIT (rhythm): centre in the cell, as above.
+                    // FONT-DISPLAY-FIT (rhythm): centre in the cell, as above.
                     xmin: if matches!(pick, FacePick::Primary) {
-                        self.game_fit_place(gxmin, width)
+                        self.display_fit_place(gxmin, width)
                     } else {
                         gxmin
                     },
@@ -18668,7 +18711,11 @@ mod tests {
         // the wallpaper texel of its column parity, opaque (transmittance 0) —
         // not the flat theme bg.
         let tr = w - 1;
-        let expect_tr = if (w - 1) % 2 == 0 { 0x0040_2060 } else { 0x0080_2060 };
+        let expect_tr = if (w - 1) % 2 == 0 {
+            0x0040_2060
+        } else {
+            0x0080_2060
+        };
         assert_eq!(pixels[tr], expect_tr, "a blank cell must show the backdrop");
         // The SGR-colored cell's interior covers the backdrop with its own bg.
         let (cw, ch) = r.cell_size();
@@ -18682,7 +18729,11 @@ mod tests {
         assert_ne!(colored & 0x00ff_ffff, 0x0040_2060 & 0x00ff_ffff);
         // A blank default-bg cell interior shows the backdrop texel.
         let (bx, by) = (r.pad() + cw * 5 + cw / 2, r.grid_top() + ch * 2 + ch / 2);
-        let expect_blank = if (bx % 2) == 0 { 0x0040_2060 } else { 0x0080_2060 };
+        let expect_blank = if (bx % 2) == 0 {
+            0x0040_2060
+        } else {
+            0x0080_2060
+        };
         assert_eq!(
             pixels[by * w + bx],
             expect_blank,

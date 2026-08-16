@@ -174,7 +174,7 @@ fn curl_argv(args: &[&str], url: &str, authenticated: bool) -> Vec<String> {
     // The capacity is a pre-size HINT only; clamp it so the `+ 7` and the resulting
     // allocation size are provably panic-free for any abstract `args` (the verifier
     // refutes the unclamped form with a huge unconstrained slice length). Every
-    // caller in this crate passes a fixed option list of <= 13 items, so the clamp
+    // caller in this crate passes a fixed option list of <= 19 items, so the clamp
     // never binds on a real path — and even if it ever did, `Vec` growth in `extend`
     // /`push` keeps the returned contents identical.
     let mut v = Vec::with_capacity(args.len().min(32) + 7);
@@ -304,11 +304,67 @@ pub fn api_get(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
     api_get_classified(url, token).map_err(|e| e.to_string())
 }
 
+/// How many times a request whose BODY is captured from curl's stdout is attempted,
+/// in-process. Matches the budget curl's own `--retry 2` used to spend here (one try
+/// plus two retries), so the worst-case wall time is unchanged in magnitude.
+const CURL_ATTEMPTS: u32 = 3;
+
+/// Whether an HTTP status is worth another in-process attempt: the transient
+/// server-side set curl itself calls retryable (`man curl`, `--retry`).
+///
+/// 429 — and the rate-limited 403 — are deliberately ABSENT. Classification here is
+/// code-only, so a retry buys nothing but a second request against a budget that is
+/// already exhausted, and hammering GitHub's secondary limit without honouring
+/// `Retry-After` is strictly worse than the back-off-and-retry-on-the-next-cycle this
+/// layer already documents. Everything else (2xx, 401/403/404, a mangled trailer) is a
+/// verdict rather than a blip and is returned on the first attempt.
+fn transient_api_status(code: &str) -> bool {
+    matches!(code, "408" | "500" | "502" | "503" | "504")
+}
+
+/// The fixed option list for [`api_get_classified`], extracted so the flag set itself
+/// is assertable in a unit test.
+///
+/// It carries NO `--retry`, and that omission is load-bearing. The body is captured
+/// from curl's STDOUT, and curl truncates only a FILE sink between attempts (a pipe has
+/// no filename to `ftruncate`), so a curl-level retry CONCATENATES the failed attempt's
+/// error document in front of the good one while `-w` writes the status trailer exactly
+/// once — the result parses as a healthy 200 whose JSON then fails with "trailing
+/// characters", i.e. a blip curl HAD recovered from is reported as a broken publisher.
+/// Reproduced against curl 8.7.1. [`api_get_classified`] retries the whole subprocess
+/// instead: a fresh pipe per attempt, so no failed attempt's bytes can survive.
+fn api_get_args() -> [&'static str; 11] {
+    [
+        "-sS",
+        "--max-time",
+        "30",
+        // Bound the buffered-in-memory API response. GitHub API JSON (a releases
+        // list / a manifest) is small; 16 MiB is generous headroom while stopping
+        // a rogue/oversized response from being read whole into memory, matching
+        // the caps download_bytes/download_to already carry.
+        "--max-filesize",
+        "16777216",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "-H",
+        "X-GitHub-Api-Version: 2022-11-28",
+        "-w",
+        "\n%{http_code}",
+    ]
+}
+
 /// GET a GitHub API JSON resource, returning the raw body bytes. Distinguishes an
 /// authentication failure (401/403 — expired/revoked/insufficient token, or no token
 /// against a private repo) from a rate limit and from a transient error, so the
 /// caller can act on the difference instead of collapsing it into one string. We
 /// append the HTTP status via `-w` and DON'T pass `-f` (we want the code even on 4xx).
+///
+/// A transport failure or a transient server status is retried up to three times HERE
+/// rather than by curl, because each attempt must start from a fresh pipe: curl
+/// truncates only a FILE sink between retries, so a curl-level retry CONCATENATES the
+/// failed attempt's error document in front of the good body under one `-w` status
+/// trailer, and the whole thing then fails JSON parsing as a "broken publisher".
+/// See `api_get_args`.
 // Skip: response-text handling — from_utf8_lossy over curl output (display/
 // classification only; the byte-exact BODY is returned untouched as Vec<u8>)
 // and the trailing-status split arithmetic, whose bounds ride the lossy
@@ -316,80 +372,79 @@ pub fn api_get(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
 // Audited (update-atpkg); droppable with the byte-exact contract lane.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, HttpError> {
-    let out = curl_fetch(
-        &[
-            "-sS",
-            "--retry",
-            "2",
-            "--max-time",
-            "30",
-            // Bound the buffered-in-memory API response. GitHub API JSON (a releases
-            // list / a manifest) is small; 16 MiB is generous headroom while stopping
-            // a rogue/oversized response from being read whole into memory, matching
-            // the caps download_bytes/download_to already carry.
-            "--max-filesize",
-            "16777216",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: 2022-11-28",
-            "-w",
-            "\n%{http_code}",
-        ],
-        url,
-        token,
-    )
-    .map_err(HttpError::Transport)?;
-    if !out.status.success() {
-        // Transport-level failure (curl exit != 0): DNS, TLS, timeout, etc.
-        return Err(HttpError::Transport(format!(
-            "curl GET {} failed ({}): {}",
-            url,
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    // Split the trailing "\n<http_code>" we appended via -w.
-    let stdout = out.stdout;
-    let text = String::from_utf8_lossy(&stdout);
-    let (body, code) = match text.rfind('\n') {
-        Some(i) => (&text[..i], text[i + 1..].trim()),
-        None => ("", text.trim()),
-    };
-    if code.starts_with('2') {
-        return Ok(body.as_bytes().to_vec());
-    }
-    // GitHub signals rate limiting with 429, or a 403 whose body mentions a (primary
-    // or secondary) rate limit. That is TRANSIENT — the credential (or its absence) is
-    // not the problem — so it must not be reported as an auth failure ("rotate the
-    // token"), and `--retry` doesn't cover 403 anyway; we surface it as
-    // back-off-and-retry-next-cycle (F11). It is the ROUTINE outcome on the anonymous
-    // lane, whose budget is ~60 requests/hour per IP.
-    let rate_limited =
-        code == "429" || (code == "403" && body.to_ascii_lowercase().contains("rate limit"));
-    let Ok(numeric) = code.parse::<u16>() else {
-        // A non-numeric trailer means something mangled the response (captive
-        // portal / proxy). Fail closed with the historical wording.
-        return Err(HttpError::Malformed(format!(
-            "GitHub API returned HTTP {code} for {url}"
-        )));
-    };
-    if rate_limited {
-        return Err(HttpError::RateLimited {
-            code: numeric,
-            url: url.to_string(),
-            authenticated: token.is_some(),
-        });
-    }
-    match numeric {
-        401 | 403 => Err(HttpError::Unauthorized { code: numeric }),
-        404 => Err(HttpError::NotFound {
-            url: url.to_string(),
-        }),
-        other => Err(HttpError::Status {
-            code: other,
-            url: url.to_string(),
-        }),
+    // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns
+    // there, so the loop cannot run more than `CURL_ATTEMPTS` times.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
+            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
+        }
+        let last = attempt >= CURL_ATTEMPTS;
+        // The token is passed in unchanged on every attempt — never re-read or
+        // re-validated per attempt, so a rotation mid-loop cannot split the lanes.
+        let out = curl_fetch(&api_get_args(), url, token).map_err(HttpError::Transport)?;
+        if !out.status.success() {
+            if !last {
+                continue;
+            }
+            // Transport-level failure (curl exit != 0): DNS, TLS, timeout, etc.
+            return Err(HttpError::Transport(format!(
+                "curl GET {} failed ({}): {}",
+                url,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        // Split the trailing "\n<http_code>" we appended via -w.
+        let stdout = out.stdout;
+        let text = String::from_utf8_lossy(&stdout);
+        let (body, code) = match text.rfind('\n') {
+            Some(i) => (&text[..i], text[i + 1..].trim()),
+            None => ("", text.trim()),
+        };
+        if code.starts_with('2') {
+            return Ok(body.as_bytes().to_vec());
+        }
+        if !last && transient_api_status(code) {
+            // Discard this attempt's bytes ENTIRELY — that discarding is the whole
+            // point of retrying out here instead of inside curl.
+            continue;
+        }
+        // GitHub signals rate limiting with 429, or a 403 whose body mentions a
+        // (primary or secondary) rate limit. That is TRANSIENT — the credential (or its
+        // absence) is not the problem — so it must not be reported as an auth failure
+        // ("rotate the token"), and retrying it here would only spend a budget that is
+        // already gone; we surface it as back-off-and-retry-next-cycle (F11). It is the
+        // ROUTINE outcome on the anonymous lane, whose budget is ~60 requests/hour per
+        // IP.
+        let rate_limited =
+            code == "429" || (code == "403" && body.to_ascii_lowercase().contains("rate limit"));
+        let Ok(numeric) = code.parse::<u16>() else {
+            // A non-numeric trailer means something mangled the response (captive
+            // portal / proxy). Fail closed with the historical wording.
+            return Err(HttpError::Malformed(format!(
+                "GitHub API returned HTTP {code} for {url}"
+            )));
+        };
+        if rate_limited {
+            return Err(HttpError::RateLimited {
+                code: numeric,
+                url: url.to_string(),
+                authenticated: token.is_some(),
+            });
+        }
+        return match numeric {
+            401 | 403 => Err(HttpError::Unauthorized { code: numeric }),
+            404 => Err(HttpError::NotFound {
+                url: url.to_string(),
+            }),
+            other => Err(HttpError::Status {
+                code: other,
+                url: url.to_string(),
+            }),
+        };
     }
 }
 
@@ -408,10 +463,49 @@ fn require_https_url(url: &str) -> Result<(), String> {
     }
 }
 
+/// The option list for [`download_bytes`], extracted so the flag set is assertable in
+/// a unit test.
+///
+/// Like [`api_get_args`] it carries NO `--retry`: these bytes are captured from curl's
+/// stdout, which curl does not truncate between attempts. `-f` makes the concatenation
+/// window much narrower than the API lane's (a 5xx writes zero body bytes before the
+/// retry fires), but a `--max-time` that expires after partial bytes still lands two
+/// attempts' fragments in one buffer — and the buffer is exactly what the Ed25519
+/// check reads. [`download_bytes`] retries the subprocess instead.
+///
+/// NOTE: no `-w "\n%{http_code}"` here (and none in [`download_to_args`]). These carry
+/// `-f`, so curl's exit status already reports a non-2xx, and appending the status to
+/// stdout would CORRUPT the downloaded bytes — including the appcast the Ed25519
+/// signature covers. Asset downloads therefore stay unclassified; every public/private
+/// verdict is taken from the releases LIST, which always runs first.
+fn download_bytes_args(cap: &str) -> [&str; 9] {
+    [
+        "-fsSL",
+        // Redirects (GitHub's 302 to object storage) may only land on https —
+        // `-L` alone would also follow http/ftp(s), a MITM downgrade vector.
+        "--proto-redir",
+        "=https",
+        "--max-time",
+        "60",
+        "--max-filesize",
+        cap,
+        "-H",
+        "Accept: application/octet-stream",
+        // The `--` end-of-options guard for the server-controlled asset URL is
+        // appended by `curl_argv` (AFTER the auth channel — see its invariants);
+        // `require_https_url` closes the scheme-injection vector.
+    ]
+}
+
 /// Download a SMALL asset's bytes (e.g. a manifest) into memory, size-capped at
 /// `max_filesize` bytes so a rogue/oversized asset can't be buffered whole. The cap
 /// is caller-supplied (the meaning of "small" is artifact-specific); curl aborts
 /// before reading past it.
+///
+/// A failed attempt is retried up to three times here rather than by curl, so the
+/// returned buffer always holds exactly ONE attempt's bytes — the Ed25519 check reads
+/// that buffer, and curl does not truncate a pipe between its own retries. See
+/// `download_bytes_args`.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_bytes(
@@ -421,41 +515,28 @@ pub fn download_bytes(
 ) -> Result<Vec<u8>, String> {
     require_https_url(asset_url)?;
     let cap = max_filesize.to_string();
-    // NOTE: no `-w "\n%{http_code}"` here (and none in `download_to`). These carry
-    // `-f`, so curl's exit status already reports a non-2xx, and appending the status
-    // to stdout would CORRUPT the downloaded bytes — including the appcast the
-    // Ed25519 signature covers. Asset downloads therefore stay unclassified; every
-    // public/private verdict is taken from the releases LIST, which always runs first.
-    let out = curl_fetch(
-        &[
-            "-fsSL",
-            // Redirects (GitHub's 302 to object storage) may only land on https —
-            // `-L` alone would also follow http/ftp(s), a MITM downgrade vector.
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "2",
-            "--max-time",
-            "60",
-            "--max-filesize",
-            &cap,
-            "-H",
-            "Accept: application/octet-stream",
-            // The `--` end-of-options guard for the server-controlled asset URL is
-            // appended by `curl_argv` (AFTER the auth channel — see its invariants);
-            // `require_https_url` above closes the scheme-injection vector.
-        ],
-        asset_url,
-        token,
-    )?;
-    if !out.status.success() {
-        return Err(format!(
-            "curl asset download failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+    // Bounded exactly as `api_get_classified`'s loop is: the final attempt returns on
+    // both arms.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
+            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
+        }
+        let out = curl_fetch(&download_bytes_args(&cap), asset_url, token)?;
+        if out.status.success() {
+            return Ok(out.stdout);
+        }
+        // With `-f` every failure — HTTP error, timeout, DNS — is a non-zero exit.
+        if attempt >= CURL_ATTEMPTS {
+            return Err(format!(
+                "curl asset download failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
     }
-    Ok(out.stdout)
 }
 
 /// GitHub's per-release-asset ceiling, and THE one number both sides of the
@@ -469,10 +550,79 @@ pub fn download_bytes(
 /// which reads as a network failure and never escalates.
 pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
 
+/// The wall-clock backstop for a file-sink asset download, DERIVED from the size cap
+/// instead of fixed.
+///
+/// A ceiling decoupled from the payload is what strands a big container on a slow link.
+/// The fixed 600 s this replaces demanded 1.3 MB/s (~10 Mbit/s) sustained to move the
+/// shipped 775 MB batteries-included container, and 13 MB/s to move atpkg's 8 GiB
+/// `ARTIFACT_CAP` — and since nothing resumes (the caller deletes the `.part` on
+/// failure), such a machine died at the SAME wall on every single cycle and could never
+/// update at all, while the operator-facing notification blamed a "broken update
+/// pipeline". The 600 came in with the original extraction and was never revisited when
+/// the size bound was raised to 2 GiB: the same coupled-constant miss that once shipped
+/// a 512 MiB client cap against 775 MB containers.
+///
+/// The floor rate is a deliberately slow 64 KiB/s so this stays a BACKSTOP, never a
+/// second stall detector — `--speed-limit`/`--speed-time` are what express "stalled",
+/// and this only bounds a transfer that trickles forever. Never below the historical
+/// 600 s, never above 6 h.
+fn download_max_time_secs(max_filesize: u64) -> u64 {
+    (max_filesize / 65_536).clamp(600, 21_600)
+}
+
+/// The option list for [`download_to`], extracted so the flag set is assertable in a
+/// unit test.
+///
+/// This is the ONE lane that keeps curl's own `--retry`: the sink is a file (`-o`), and
+/// curl DOES truncate a file sink between attempts (verified), so no failed attempt's
+/// bytes can survive into `dest` the way they survive on a pipe — see
+/// [`api_get_args`].
+fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a str; 19] {
+    [
+        "-fSL",
+        // https-only redirects — see `download_bytes_args`.
+        "--proto-redir",
+        "=https",
+        "--retry",
+        "2",
+        // Bound the CONNECT, not the transfer — a black-holed TCP/TLS setup must
+        // still fail fast.
+        "--connect-timeout",
+        "30",
+        // Abort only on a REAL stall: under 4 KiB/s for 120 s. This — not the wall
+        // clock — is what tells a dead link from a merely slow one, and it exits 28
+        // just like a `--max-time` expiry, so the error text and the `pipeline`-class
+        // health accounting are unchanged for genuinely dead links.
+        "--speed-limit",
+        "4096",
+        "--speed-time",
+        "120",
+        "--max-time",
+        max_time,
+        "--max-filesize",
+        cap,
+        "-H",
+        "Accept: application/octet-stream",
+        "-o",
+        dest,
+        // The `--` guard before the server-controlled asset URL is appended by
+        // `curl_argv` (see `download_bytes_args`); `require_https_url` rejects
+        // non-https schemes.
+    ]
+}
+
 /// Download an asset (e.g. a DMG) to a file, following the storage redirect.
 /// Bounded at `max_filesize` bytes (caller-supplied) so an attacker-controlled or
 /// mis-pointed release asset can't fill the disk — curl aborts before writing past
 /// it.
+///
+/// The TIME bound is derived from that same cap (`download_max_time_secs`) and paired
+/// with a stall detector, so a slow link finishes instead of dying at a fixed wall it
+/// can never beat. There is no `-C -` resume: a ranged request would make
+/// `--max-filesize` bound only the REMAINING range rather than total bytes written,
+/// which is the stated anti-disk-fill guard, and it would need the caller's `.part`
+/// lifecycle to change too.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to(
@@ -484,29 +634,9 @@ pub fn download_to(
     require_https_url(asset_url)?;
     let dest_s = dest.to_str().ok_or("non-UTF-8 destination path")?;
     let cap = max_filesize.to_string();
-    let out = curl_fetch(
-        &[
-            "-fSL",
-            // https-only redirects — see `download_bytes`.
-            "--proto-redir",
-            "=https",
-            "--retry",
-            "2",
-            "--max-time",
-            "600",
-            "--max-filesize",
-            &cap,
-            "-H",
-            "Accept: application/octet-stream",
-            "-o",
-            dest_s,
-            // The `--` guard before the server-controlled asset URL is appended by
-            // `curl_argv` (see `download_bytes`); `require_https_url` rejects
-            // non-https schemes.
-        ],
-        asset_url,
-        token,
-    )?;
+    // Both must outlive the argv array, which borrows them as `&str`.
+    let max_time = download_max_time_secs(max_filesize).to_string();
+    let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url, token)?;
     if !out.status.success() {
         return Err(format!(
             "curl download failed ({}): {}",
@@ -520,8 +650,9 @@ pub fn download_to(
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, curl_argv, curl_bin, curl_fetch, curl_prepared,
-        token_config_safe,
+        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, curl_argv, curl_bin, curl_fetch,
+        curl_prepared, download_bytes_args, download_max_time_secs, download_to_args,
+        token_config_safe, transient_api_status,
     };
     use std::process::Command;
 
@@ -822,5 +953,95 @@ mod tests {
         // A claim about a constant belongs at COMPILE time; a runtime assert
         // over constants can never fail a run that compiled.
         const { assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000) };
+    }
+
+    /// The download ceiling must scale with the payload it is supposed to admit. A
+    /// FIXED 600 s is decoupled from `--max-filesize` in exactly the way the 512 MiB
+    /// client cap was decoupled from the 775 MB container: the shipped batteries
+    /// container needed 1.3 MB/s sustained to beat it and atpkg's 8 GiB bundles needed
+    /// 13 MB/s, nothing resumes, so a slower machine died at the SAME wall every cycle
+    /// and could never update at all.
+    #[test]
+    fn the_download_ceiling_is_derived_from_the_size_cap() {
+        // A release-sized asset gets hours, not ten minutes (64 KiB/s floor rate).
+        assert_eq!(download_max_time_secs(775_000_000), 11_825);
+        // The 2 GiB release bound and atpkg's 8 GiB ARTIFACT_CAP both take the 6 h clamp.
+        assert_eq!(download_max_time_secs(RELEASE_ASSET_DOWNLOAD_BOUND), 21_600);
+        assert_eq!(download_max_time_secs(8 << 30), 21_600);
+        // …and a small cap never drops BELOW the historical wall.
+        assert_eq!(download_max_time_secs(1024), 600);
+        assert_eq!(download_max_time_secs(0), 600);
+    }
+
+    /// "No stall" must not be spelled as "no bound". The asset download bounds the
+    /// CONNECT and the STALL, and keeps a wall clock that is derived rather than fixed.
+    #[test]
+    fn the_asset_download_bounds_the_stall_not_the_transfer() {
+        let cap = RELEASE_ASSET_DOWNLOAD_BOUND.to_string();
+        let max_time = download_max_time_secs(RELEASE_ASSET_DOWNLOAD_BOUND).to_string();
+        let args = download_to_args(&cap, &max_time, "/tmp/aterm.dmg.part");
+        let value_of = |flag: &str| {
+            let i = args
+                .iter()
+                .position(|a| *a == flag)
+                .unwrap_or_else(|| panic!("{flag} present in {args:?}"));
+            args[i + 1]
+        };
+        assert_eq!(
+            value_of("--max-time"),
+            "21600",
+            "the wall clock must be the derived ceiling, never the fixed 600 s: {args:?}"
+        );
+        assert_eq!(value_of("--connect-timeout"), "30");
+        assert_eq!(value_of("--speed-limit"), "4096");
+        assert_eq!(value_of("--speed-time"), "120");
+        // The size cap and the sink are untouched by the timing change.
+        assert_eq!(value_of("--max-filesize"), cap);
+        assert_eq!(value_of("-o"), "/tmp/aterm.dmg.part");
+        // Callers must never place `--` themselves — curl_argv appends it after the
+        // auth channel (the v0.5.10 bricking regression).
+        assert!(!args.contains(&"--"), "no caller-side `--`: {args:?}");
+    }
+
+    /// Only the FILE-sink lane may use curl's own `--retry`. On a pipe curl cannot
+    /// truncate what a failed attempt already wrote, so a retried API GET returns the
+    /// error document CONCATENATED in front of the good body under a single `-w`
+    /// status trailer — a 200 whose JSON then fails with "trailing characters",
+    /// blaming the publisher for a blip curl had recovered from. Those two lanes retry
+    /// the subprocess instead; `download_to` writes to `-o`, which curl DOES truncate.
+    #[test]
+    fn only_the_file_sink_lane_uses_curls_own_retry() {
+        assert!(
+            !api_get_args().contains(&"--retry"),
+            "a stdout-captured GET must not let curl retry: {:?}",
+            api_get_args()
+        );
+        let cap = "16777216";
+        assert!(
+            !download_bytes_args(cap).contains(&"--retry"),
+            "the buffer the Ed25519 check reads must hold ONE attempt's bytes: {:?}",
+            download_bytes_args(cap)
+        );
+        assert!(
+            download_to_args(cap, "600", "/tmp/x").contains(&"--retry"),
+            "the -o lane keeps curl's retry — a file sink is truncated between attempts"
+        );
+    }
+
+    /// The in-process retry decision: the transient server-side set curl itself
+    /// retries, and nothing else. 429 is the deliberate exclusion — the classification
+    /// is code-only, so retrying spends an exhausted budget and hammers GitHub's
+    /// secondary limit instead of backing off to the next cycle.
+    #[test]
+    fn only_transient_server_statuses_are_retried_in_process() {
+        for code in ["408", "500", "502", "503", "504"] {
+            assert!(transient_api_status(code), "{code} is transient");
+        }
+        for code in ["200", "204", "301", "401", "403", "404", "429", "418", ""] {
+            assert!(
+                !transient_api_status(code),
+                "{code} is a verdict, not a blip — retrying it is wrong"
+            );
+        }
     }
 }

@@ -7,10 +7,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — OWNER-side Ed25519 signing for atpkg manifests (keygen + detached sign over exact raw bytes). Produces signatures the verify-only atpkg client accepts; never shipped to clients."
+description = "aterm — OWNER-side Ed25519 signing for atpkg manifests (provisioning + detached sign over exact raw bytes). Produces signatures the verify-only atpkg client accepts; never shipped to clients."
 
 [lib]
 path = "src/lib.rs"
+# The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a
+# linked custom toolchain cannot `rustup component add` one — so `cargo test`'s
+# doc-test phase aborts the whole run on this tree even with every real test green.
+# Same constraint (and comment) as crates/atpkg: bare `cargo test` must be able to pass.
+doctest = false
 
 [[bin]]
 name = "atpkg-keys"
@@ -24,6 +29,19 @@ path = "src/main.rs"
 ring = "0.17.14"
 # Encode the 32-byte raw public key (for PINNED_PKG_ROOTKEY / the index release_key_pubkey).
 base64 = "0.22.1"
+# The MACHINE ROSTER type + its client verifier. The minting tool emits the roster through
+# the very same `Roster` struct the updater parses, so producer and client cannot drift on
+# what a valid roster is — the same reason the release manifest is a shared serde type.
+aterm-update-core = { workspace = true }
+# RFC3339 formatting for `added_at` / `valid_until` (`aterm_types::rfc3339`), already in
+# the graph via aterm-update-core.
+aterm-types = { workspace = true }
+# Read the roster file and re-serialize it after an edit.
+toml = { workspace = true }
+# The master is read from /dev/tty with ECHO off (`tcgetattr`/`tcsetattr`), kept out of
+# swap best-effort (`mlock`), and protected from core dumps (`setrlimit(RLIMIT_CORE, 0)`).
+# Four narrow syscalls with no safe std wrapper; POSIX-only, like the rest of this tool.
+libc = { workspace = true }
 
 [dev-dependencies]
 # Prove the producer↔client contract: sign here, verify + INSTALL with the ACTUAL client.

@@ -18,9 +18,15 @@
 //!
 //! Rungs 2+3 are ALSO emitted on their own as `ATERM_PUBLISH_OWNER`/`_REPO`, the
 //! account this project is published under, which is independent of where installed
-//! copies fetch updates from. Consumers whose trust is account-bound (atpkg's signed
-//! package index) read that pair, so repointing `update_channel` at a mirror cannot
-//! silently move them.
+//! copies fetch updates from.
+//!
+//! A THIRD slug rides along: `[workspace.metadata.atpkg] account`, emitted as
+//! `ATERM_ATPKG_INDEX_OWNER` (falling back to the publish owner when absent or
+//! malformed) — the account the SIGNED PACKAGE INDEX is published under. atpkg's
+//! account-bound trust (§8) reads THIS key: not `update_channel`, because
+//! repointing the app channel at a mirror must never move the index's trust
+//! root, and not `repository`, because that is the private staging repo a
+//! default-configured (tokenless) install cannot read at all.
 //!
 //! The runtime knobs (`ATERM_UPDATE_OWNER`/`_REPO`, `[update]` config) still
 //! override whatever is emitted here.
@@ -57,19 +63,31 @@ fn main() {
     // The SOURCE/publish repo, derived from `repository` alone and NEVER from
     // `update_channel`. Emitted separately because the two slugs answer different
     // questions and only coincidentally matched before the public mirror existed:
-    // consumers that mean "the account this project is published under" (atpkg's
-    // signed package index, whose trust is account-bound) must not follow the
-    // update channel when it is repointed at a mirror.
+    // consumers that mean "the account this project is published under" (the
+    // token chain's private-repo target; the absent-key fallback for the atpkg
+    // index account below) must not follow the update channel when it is
+    // repointed at a mirror.
     let (publish_owner, publish_repo) =
         parse_github_owner_repo(&url).unwrap_or(("alabsystems", "aterm"));
     let (owner, repo) = match channel {
         Some(slug) => slug,
         None => (publish_owner.to_string(), publish_repo.to_string()),
     };
+    // The account the SIGNED PACKAGE INDEX lives under, from its own tracked key.
+    // Neither slug above fits: `update_channel` is the app-update knob the
+    // account-bound index (§8) must not follow, and `repository` is the private
+    // staging repo — a tokenless default-configured install 404s there, which
+    // orphaned every such install from the published registry. Absent/malformed
+    // degrades to the publish owner (the pre-key behavior), per the best-effort
+    // contract above.
+    let index_owner = table_string(&workspace_text, "workspace.metadata.atpkg", "account")
+        .filter(|s| valid_segment(s))
+        .unwrap_or_else(|| publish_owner.to_string());
     println!("cargo:rustc-env=ATERM_DEFAULT_OWNER={owner}");
     println!("cargo:rustc-env=ATERM_DEFAULT_REPO={repo}");
     println!("cargo:rustc-env=ATERM_PUBLISH_OWNER={publish_owner}");
     println!("cargo:rustc-env=ATERM_PUBLISH_REPO={publish_repo}");
+    println!("cargo:rustc-env=ATERM_ATPKG_INDEX_OWNER={index_owner}");
     // Re-derive if either input changes. `repository` is inherited via
     // `repository.workspace = true` and `update_channel` lives only in the
     // workspace root, so that manifest is the authoritative file; watch this
@@ -119,16 +137,21 @@ fn table_string(toml: &str, table: &str, key: &str) -> Option<String> {
 /// This mirrors `source::is_valid_slug`, which re-checks the value at runtime.
 fn split_owner_repo(slug: &str) -> Option<(&str, &str)> {
     let (owner, repo) = slug.trim().split_once('/')?;
-    let ok = |segment: &str| {
-        !segment.is_empty()
-            && segment.len() <= 100
-            && segment != "."
-            && segment != ".."
-            && segment
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    (ok(owner) && ok(repo)).then_some((owner, repo))
+    (valid_segment(owner) && valid_segment(repo)).then_some((owner, repo))
+}
+
+/// Whether one bare GitHub name segment (an owner OR a repo — never a full
+/// `OWNER/REPO` slug) is safe to embed in the API URL as one path segment.
+/// Shared by [`split_owner_repo`] and the `[workspace.metadata.atpkg] account`
+/// read; mirrors `source::is_valid_slug`, which re-checks values at runtime.
+fn valid_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 100
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// Extract `(owner, repo)` from a GitHub repository URL, accepting the `https://`

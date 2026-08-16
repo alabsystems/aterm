@@ -296,17 +296,17 @@ pub(crate) fn prepare(request: Request) -> Completion {
         }
     };
 
-    // FONT-GAME MIX: a `game:<id>+<id>` family carries EXTRA faces beyond the
+    // FONT-DISPLAY MIX: a `display:<id>+<id>` family carries EXTRA faces beyond the
     // admitted primary (the mix's first face). Installed on the prepared
     // renderer here, so hot reload and the seal/rebuild path (which clones the
     // mix) both carry it; a rejected face degrades to the primary alone.
     if let Some(mix) = family
         .as_deref()
-        .and_then(aterm_render::game_font_mix_for_family)
+        .and_then(aterm_render::display_face_mix_for_family)
         && mix.len() > 1
-        && let Err(error) = renderer.set_game_mix_faces(&mix[1..])
+        && let Err(error) = renderer.set_display_mix_faces(&mix[1..])
     {
-        warnings.push(format!("game font mix rejected ({error})"));
+        warnings.push(format!("display face mix rejected ({error})"));
     }
 
     let mut config = FontConfig::default();

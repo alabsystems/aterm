@@ -8,13 +8,15 @@
 //! `aterm-update-core`'s authenticated `curl` plumbing.
 //!
 //! The ordered, fail-closed pipeline ([`install`]):
-//! 1. fetch index candidates → [`crate::select::select_index`] (verify-then-select, §5);
+//! 1. fetch index candidates (index + the master-signed roster published beside it) →
+//!    [`crate::select::select_index`] (admit-roster-then-verify-then-select, §5);
 //! 2. **reachability** — the program must be named in the verified index (§5), and pinned
 //!    in the requested channel;
 //! 3. [`crate::gate::decide`] — `UpToDate`/`Tombstone`/`NotPinned` short-circuit;
-//! 4. fetch the per-build `pkg.toml`, [`verify_pkg`] under the index's delegated release
-//!    key, [`parse_pkg`], and check its signed `program`/`build_number` bind the request
-//!    (anti-replay, §4.2);
+//! 4. fetch the per-build `pkg.toml`, verify it under the SAME roster generation that
+//!    authorized the index ([`TrustedIndex::verify_pkg`] — revoked and expired machines
+//!    already excluded), [`parse_pkg`], and check its signed `program`/`build_number`
+//!    bind the request (anti-replay, §4.2);
 //! 5. select the artifact for the target triple (a missing triple is a clean skip, §6);
 //! 6. download → [`crate::install::verify_and_stage`] (sha256 → extract → tree_root);
 //! 7. [`crate::activate::activate_channel`] + the `bin/` shim install
@@ -31,7 +33,7 @@ use crate::gate::{ApplyDecision, decide};
 use crate::install::{StageError, verify_and_stage};
 use crate::manifest::{Channel, Index, parse_pkg};
 use crate::select::{Candidate, select_index};
-use crate::sig::verify_pkg;
+use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::{Layout, ToolName};
 
 /// The network operations the install flow needs, abstracted so the orchestration is
@@ -74,6 +76,25 @@ pub trait Fetcher {
     fn source_id(&self) -> String {
         "fetcher:unspecified".to_string()
     }
+    /// The §14 last-good-index cache key this fetcher's candidates are stored under AND
+    /// loaded from on a failed/empty fetch. Default: [`Fetcher::source_id`]. A chained
+    /// fetcher ([`crate::net::ChainFetcher`]) narrows it to its PRIMARY (network) leg's
+    /// key, so the cache identity is the same whether or not a seed leg happens to be
+    /// chained: the bootstrap-time cache must serve the post-bootstrap plain-network
+    /// path, and a `dir:` seed cache must never satisfy it (the same-source guard).
+    fn cache_source_id(&self) -> String {
+        self.source_id()
+    }
+    /// The subset of `resolved` — THIS call's just-returned [`Fetcher::index_candidates`]
+    /// success — the §14 cache may persist, or `None` to skip the write. Default: all of
+    /// it (a single-source fetcher IS its network leg). [`crate::net::ChainFetcher`]
+    /// overrides this to the primary (network) leg's own candidates: a seed-leg success
+    /// must neither mask a network failure into a cache refresh nor overwrite the
+    /// last-good network candidates with sealed-seed bytes (the CACHE-MASKING tooth,
+    /// adversarial review 2026-07-30).
+    fn cacheable_candidates(&self, resolved: &[Candidate]) -> Option<Vec<Candidate>> {
+        Some(resolved.to_vec())
+    }
 }
 
 /// What an install did.
@@ -86,6 +107,13 @@ pub struct InstallReport {
     /// The `index_build` of the index this install resolved from — the caller advances the
     /// durable high-water [`crate::sig::Floor`] to this on success (§8 gate 3).
     pub index_build: u64,
+    /// The `roster_seq` of the master-signed generation that authorized that index. The
+    /// caller ratchets the durable ROSTER floor to this on success, which is what makes a
+    /// replayed generation refusable forever after. Carried beside `index_build` rather
+    /// than derived from it because the two documents move independently: a roster bump
+    /// (mint, revoke) does not re-cut the index, and an index re-publish does not bump the
+    /// roster.
+    pub roster_seq: u64,
     /// Whether it was already current (no change).
     pub already_current: bool,
     /// The `bin/` shims installed.
@@ -278,21 +306,25 @@ pub struct InstallRequest<'a> {
 }
 
 /// Install (or force-upgrade) the program named by `req`, using `fetcher` for all network
-/// I/O, `root_pubkey_b64` as the pinned root key, and `floor` as the durable index
-/// high-water. See the module docs for the ordered, fail-closed pipeline.
+/// I/O, `anchor` as the pinned paper-master keyset + durable roster ratchet, and `floor`
+/// as the durable index high-water **paired with the roster generation that recorded it**
+/// ([`BuildFloor`] — a floor a machine set does not outlive the generation that revoked
+/// that machine). See the module docs for the ordered, fail-closed pipeline. An unarmed
+/// `anchor` installs nothing: `select_index` yields no candidate and this returns
+/// [`FlowError::NoIndex`].
 pub fn install(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
+    anchor: &Anchor,
     req: &InstallRequest,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
 ) -> Result<InstallReport, FlowError> {
     let mut seen = BTreeSet::new();
     install_inner(
         fetcher,
         layout,
-        root_pubkey_b64,
+        anchor,
         req,
         floor,
         now_unix,
@@ -312,9 +344,9 @@ pub fn install(
 fn install_inner(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
+    anchor: &Anchor,
     req: &InstallRequest,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
     seen: &mut BTreeSet<String>,
 ) -> Result<InstallReport, FlowError> {
@@ -329,7 +361,7 @@ fn install_inner(
     seen.insert(program.to_string());
     // 1–2. Resolve + verify-select the index + freshness (§8 gate 2) — the shared
     // [`resolve_verified_index`] prologue (cached-fallback, §14) — then reachability.
-    let index = resolve_verified_index(fetcher, layout, root_pubkey_b64, floor, now_unix)?;
+    let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
     let repo = index
         .program(program)
         .ok_or_else(|| FlowError::NotReachable(program.to_string()))?
@@ -352,6 +384,7 @@ fn install_inner(
                 program: program.to_string(),
                 build: pinned,
                 index_build: index.index_build,
+                roster_seq: index.roster_seq(),
                 already_current: true,
                 shimmed: vec![],
                 refused_shims: vec![],
@@ -377,7 +410,7 @@ fn install_inner(
     let (raw, sig) = fetcher
         .pkg_manifest(&repo, program, pinned)
         .map_err(FlowError::PkgFetch)?;
-    let verified = verify_pkg(raw, &sig, &index.delegation()).map_err(|_| FlowError::PkgVerify)?;
+    let verified = index.verify_pkg(raw, &sig).map_err(|_| FlowError::PkgVerify)?;
     let pkg = parse_pkg(&verified).map_err(|_| FlowError::PkgParse)?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
         return Err(FlowError::Mismatch);
@@ -417,7 +450,7 @@ fn install_inner(
         match install_inner(
             fetcher,
             layout,
-            root_pubkey_b64,
+            anchor,
             &dep_req,
             floor,
             now_unix,
@@ -447,9 +480,11 @@ fn install_inner(
     // Per-member dispatch (§16.4): the tool path installs plain `binary`/`cargo-src`
     // (Shim) AND now `sysroot-bundle` (trust / trust-mc) artifacts. A sysroot-bundle
     // gets bundle-specific wiring ([`apply_sysroot_bundle`]) BEFORE activation plus a
-    // fail-loud resolve check AFTER — so a broken toolchain aborts instead of being
-    // laid down and reported SUCCESS. `app-bundle` (notarized self-swap) and unknown
-    // kinds remain refused CLOSED. (audit: sysroot-bundle silent-broken-install.)
+    // fail-loud resolve check AFTER — a failure past activation UNWINDS
+    // ([`abort_activated_install`]) so a broken toolchain is neither reported SUCCESS
+    // nor left live reading as 'already current'. `app-bundle` (notarized self-swap)
+    // and unknown kinds remain refused CLOSED. (audit: sysroot-bundle
+    // silent-broken-install; sysroot-bundle resolve-failure left-active wedge.)
     let strategy = crate::dispatch::strategy_for(&artifact.kind);
     match strategy {
         crate::dispatch::ApplyStrategy::Shim | crate::dispatch::ApplyStrategy::SysrootBundle => {}
@@ -475,18 +510,41 @@ fn install_inner(
     if let Some(parent) = dl.parent() {
         std::fs::create_dir_all(parent).map_err(|e| FlowError::Download(e.to_string()))?;
     }
-    fetcher
-        .download_for(program, &repo, &artifact.asset, &dl)
-        .map_err(FlowError::Download)?;
+    if let Err(e) = fetcher.download_for(program, &repo, &artifact.asset, &dl) {
+        // An aborted transfer leaves BYTES here: the production fetcher hands curl `-o <dl>`
+        // with no `--remove-on-error` and no `.part`+rename, so a timed-out multi-GB body is
+        // still on disk. It is never resumed (the retry re-fetches from zero), so it is pure
+        // strandage — reclaim it on this exit exactly as on the stage exit below.
+        let _ = std::fs::remove_file(&dl);
+        return Err(FlowError::Download(e));
+    }
     let build_dir = layout.build_dir(program, pinned);
+    // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it and
+    // before `activate_channel` can move the links — by abort time the answer is gone. The
+    // `installed` argument cannot answer it: it is the SHIM view and goes silent for a live
+    // program whose tools were unlinked or tombstoned, which is the very reason `decide`
+    // returned Install for a build that is already active. See `abort_activated_install`.
+    let was_live = std::fs::read_link(layout.program_current(program))
+        .is_ok_and(|t| t == build_dir)
+        || std::fs::read_link(layout.channel_current(channel)).is_ok_and(|t| t == build_dir);
     // Preflight again before extract: the asset is already downloaded, so only the extracted
-    // tree remains to fit.
-    disk_gate(
+    // tree remains to fit. Reclaim the asset before returning — the ONE failure whose
+    // meaning is "the volume is full" must not walk away leaving the thing making it fuller.
+    if let Err(e) = disk_gate(
         artifact.cost.disk_installed,
         crate::freespace::available_bytes(&build_dir),
-    )?;
-    verify_and_stage(artifact, &dl, &build_dir).map_err(FlowError::Stage)?;
-    let _ = std::fs::remove_file(&dl); // reclaim the compressed asset
+    ) {
+        let _ = std::fs::remove_file(&dl);
+        return Err(e);
+    }
+    // Reclaim the compressed asset on EVERY exit, not just the happy one: a stage that fails
+    // (bad mirror, tree_root mismatch, full disk) otherwise strands a full archive in
+    // `staging/` forever — nothing else ever sweeps that directory, since
+    // `gc::interrupted_debris` walks `store/` only — and a member that keeps failing keeps
+    // leaking, one copy per distinct asset name.
+    let staged = verify_and_stage(artifact, &dl, &build_dir);
+    let _ = std::fs::remove_file(&dl);
+    staged.map_err(FlowError::Stage)?;
 
     // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op).
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
@@ -498,12 +556,33 @@ fn install_inner(
     activate_channel(layout, channel, &build_dir)
         .map_err(|e| FlowError::Activate(e.to_string()))?;
     let (tools, refused) = crate::store::split_exposed(&pkg.exposes);
-    install_tools(layout, &build_dir, &tools).map_err(|e| FlowError::Activate(e.to_string()))?;
+    // Past activation a failure leaves the broken build LIVE — channel `current`,
+    // per-program witness, any shims already written — AND carrying its `.ready`
+    // marker, so `active_builds` reports it, `decide` calls it UpToDate, and a retry
+    // prints 'already current' with nothing working (the wedge `flip_member` rolls
+    // back on the transactional path). Capture the same rollback input here so both
+    // error arms below unwind identically. (audit: resolve-failure left-active wedge.)
+    let staged = Staged {
+        build: pinned,
+        build_dir: build_dir.clone(),
+        exposes: tools.clone(),
+        prior_build: installed,
+        was_live,
+        reloc: None,
+        tree_root: String::new(),
+    };
+    if let Err(e) = install_tools(layout, &build_dir, &tools) {
+        abort_activated_install(layout, channel, program, &staged);
+        return Err(FlowError::Activate(e.to_string()));
+    }
 
     // 7b. Fail-loud resolve check: an installed sysroot-bundle's compilers must
-    // actually load. A dynamic-loader failure here aborts the install.
-    if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
-        bundle_resolve_check(&build_dir, &tools)?;
+    // actually load. A dynamic-loader failure here aborts — and UNWINDS — the install.
+    if strategy == crate::dispatch::ApplyStrategy::SysrootBundle
+        && let Err(e) = bundle_resolve_check(&build_dir, &tools)
+    {
+        abort_activated_install(layout, channel, program, &staged);
+        return Err(e);
     }
     // NOTE: the shell.d hook refresh runs at the main.rs CLI edge (do_install / cmd_update),
     // NOT here — writing ~/.aterm from flow's synthetic-layout unit tests would pollute the
@@ -513,6 +592,7 @@ fn install_inner(
         program: program.to_string(),
         build: pinned,
         index_build: index.index_build,
+        roster_seq: index.roster_seq(),
         already_current: false,
         shimmed,
         refused_shims: refused,
@@ -533,6 +613,40 @@ fn install_tombstone_shims(layout: &Layout, program: &str, installed: Option<u64
             let _ = install_tombstone_shim(layout, &tool);
         }
     }
+}
+
+/// Unwind a per-program install that failed strictly AFTER [`activate_channel`]
+/// (`install_tools` / [`bundle_resolve_check`]). Three steps, each already proven
+/// elsewhere: [`rollback_member`] restores the prior build's whole shim surface +
+/// links (an upgrade reverts; a fresh install removes its shims + witness);
+/// [`crate::activate::undo_activation`] then sweeps any pointer STILL naming the
+/// doomed build — the channel `current` a fresh-install rollback has no prior to
+/// re-point at — and is a no-op after a successful prior-build restore (it only
+/// removes links/shims resolving INTO `build_dir`); finally the staged build is
+/// DISCARDED so `active_builds`/`decide` can never re-read the broken tree as
+/// complete and answer 'already current' on a retry.
+///
+/// …EXCEPT when `staged.was_live`, i.e. this install re-staged the build that was ALREADY
+/// live. The discard's whole justification is "do not leave behind a build a retry will
+/// trust", and it is sound for a build this call created. It is not sound for one that was
+/// live and complete before the call: the failures that land here are `install_tools`
+/// (writing `bin/` shims — an EACCES, EROFS or full disk, i.e. a fact about the environment
+/// and not about the tree) and the resolve check. Deleting a multi-gigabyte verified tree in
+/// response to a failed shim write leaves the user with NO toolchain, and re-downloading it
+/// is exactly what the failing condition tends to forbid. `decide` cannot be fooled by what
+/// survives, either: `undo_activation` still runs, so no shim and no `current` link resolves
+/// into the tree, `active_builds` is silent about it, and the next run re-activates it from
+/// disk instead of re-fetching it. Reached whenever the SHIM-derived `installed` view is
+/// silent for a live program (`atpkg unlink`, tombstoned tools, dev-link mode) and `decide`
+/// therefore returns Install for the build `store/<program>/current` already names — the
+/// same blind spot [`Staged::was_live`] exists for in the group transaction.
+fn abort_activated_install(layout: &Layout, channel: &str, program: &str, staged: &Staged) {
+    rollback_member(layout, channel, program, staged);
+    crate::activate::undo_activation(layout, channel, &staged.build_dir);
+    if staged.was_live {
+        return;
+    }
+    crate::store::discard_build(&staged.build_dir);
 }
 
 /// Drive the two-anchor app-apply gate ([`crate::appgate::app_apply_allowed`], §16.2/§16.4)
@@ -586,6 +700,12 @@ struct Staged {
     exposes: Vec<ToolName>,
     /// The member's prior active build (`None` ⇒ a fresh install: rollback removes the shims).
     prior_build: Option<u64>,
+    /// `true` when this member's `build_dir` was ALREADY the live build when we staged it: a
+    /// `current` authority link named it while the SHIM-derived `installed` view
+    /// ([`crate::ops::active_builds`]) was silent (every tool tombstoned, or `atpkg unlink`
+    /// removed the dev shims), so `decide` returned Install for the build that is already
+    /// active. The abort discard must never delete such a tree.
+    was_live: bool,
     /// `Some(reloc_policy)` for a `sysroot-bundle` member (its pre-activation wiring +
     /// post-activation resolve check run during the flip); `None` for a plain Shim.
     reloc: Option<String>,
@@ -599,6 +719,8 @@ struct Staged {
 pub struct ChannelApplyReport {
     /// The `index_build` of the signed index this apply trusted (to advance the floor).
     pub index_build: u64,
+    /// The `roster_seq` that authorized it (to advance the durable roster floor).
+    pub roster_seq: u64,
     /// Per coherence group: the group and its transaction outcome.
     pub groups: Vec<(Group, TxnOutcome)>,
     /// Per member the apply flipped LIVE: its new build + SIGNED `tree_root`, so the CLI can
@@ -631,6 +753,8 @@ pub struct RollbackReport {
     pub to_build: u64,
     /// The `index_build` of the signed index this rollback trusted (advance the floor to it).
     pub index_build: u64,
+    /// The `roster_seq` that authorized it (advance the durable roster floor to it).
+    pub roster_seq: u64,
     /// The program's coherence group, if it is in one (a per-program rollback splits it).
     pub coherence_group: Option<String>,
 }
@@ -656,16 +780,16 @@ pub struct RollbackReport {
 pub fn apply_channel(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
+    anchor: &Anchor,
     channel: &str,
     triple: &str,
     installed: &BTreeMap<String, u64>,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
     // 1–2. Resolve + verify-select the index ONCE + freshness (§8) — the shared
     //      [`resolve_verified_index`] prologue (cached-fallback, §14).
-    let index = resolve_verified_index(fetcher, layout, root_pubkey_b64, floor, now_unix)?;
+    let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -705,6 +829,7 @@ pub fn apply_channel(
     // `install` — to keep apply_channel's unit tests hermetic w.r.t. the real ~/.aterm.)
     Ok(ChannelApplyReport {
         index_build: index.index_build,
+        roster_seq: index.roster_seq(),
         groups: results,
         applied,
         skipped_linked,
@@ -732,7 +857,7 @@ pub fn apply_channel(
 fn apply_group(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    index: &Index,
+    index: &TrustedIndex,
     ch: &Channel,
     channel: &str,
     triple: &str,
@@ -769,7 +894,7 @@ fn apply_group(
 pub fn bootstrap_group(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    index: &Index,
+    index: &TrustedIndex,
     channel: &str,
     triple: &str,
     group: &Group,
@@ -794,7 +919,7 @@ pub fn bootstrap_group(
 /// parse is the shared [`verified_pkg`] sequence.
 pub fn group_missing_triple(
     fetcher: &dyn Fetcher,
-    index: &Index,
+    index: &TrustedIndex,
     channel: &str,
     triple: &str,
     members: &[String],
@@ -824,7 +949,7 @@ pub fn group_missing_triple(
 fn apply_group_txn(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    index: &Index,
+    index: &TrustedIndex,
     ch: &Channel,
     channel: &str,
     triple: &str,
@@ -926,8 +1051,13 @@ fn apply_group_txn(
     // prior build via rollback), so leaving a complete-but-inactive build on disk would make
     // list_installed/`decide` mis-read it as the active build next run — silently splitting
     // the coherence tuple and wedging the update while reporting success. Within THIS
-    // process each staged `build_dir` is the NEW pinned build (decide only stages Install
-    // members, so new != the prior active build); across processes the discard rests on the
+    // process the staged `build_dir` is USUALLY the NEW pinned build — but not always, and
+    // the earlier claim that it always is ("decide only stages Install members, so new !=
+    // the prior active build") was WRONG: `decide` reads the SHIM-derived `installed` view
+    // ([`crate::ops::active_builds`]), which goes SILENT when a program's tools are all
+    // tombstoned or `atpkg unlink` removed its dev shims, so it legitimately returns Install
+    // for the build `store/<program>/current` already names. `Staged::was_live` catches
+    // exactly that member below. Across processes the discard rests on the
     // SINGLE-WRITER-PER-STORE contract ([`crate::lock`]): every mutating verb try-acquires
     // the store-wide `store.lock` at the CLI edge, so no OTHER atpkg process can be staging
     // or activating builds in this store while this transaction runs — without that lock, a
@@ -935,6 +1065,14 @@ fn apply_group_txn(
     // discard would leave its shims dangling on a deleted tree.
     if matches!(outcome, TxnOutcome::Aborted { .. }) {
         for s in staged.borrow().values() {
+            // NEVER delete a build that was already LIVE when this transaction re-staged it.
+            // [`crate::gc::live_builds`] calls exactly that build live and protects it;
+            // deleting it here leaves both `current` links dangling and forces a full
+            // re-download of a multi-GB toolchain — triggered by the very network failure
+            // that aborted the group and that makes re-downloading impossible.
+            if s.was_live {
+                continue;
+            }
             crate::store::discard_build(&s.build_dir);
         }
     }
@@ -989,7 +1127,7 @@ fn disk_gate(required: u64, available: Option<u64>) -> Result<(), FlowError> {
 /// OPEN, letting the real stage surface the failure.
 fn group_disk_required(
     fetcher: &dyn Fetcher,
-    index: &Index,
+    index: &TrustedIndex,
     ch: &Channel,
     install_members: &[&String],
     triple: &str,
@@ -1014,12 +1152,12 @@ fn group_disk_required(
 pub fn resolve_verified_index(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
-    floor: u64,
+    anchor: &Anchor,
+    floor: BuildFloor,
     now_unix: i64,
-) -> Result<Index, FlowError> {
+) -> Result<TrustedIndex, FlowError> {
     let candidates = resolve_candidates(fetcher, layout)?;
-    verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)
+    verify_select_fresh(layout, anchor, candidates, floor, now_unix)
 }
 
 /// The verify-select + freshness half of [`resolve_verified_index`], over caller-supplied
@@ -1027,35 +1165,94 @@ pub fn resolve_verified_index(
 /// [`plan_update`]), which fetch their candidates directly (no §14 cached fallback).
 /// Freshness (§8 gate 2): refuse a selected index whose window has lapsed; a
 /// `valid_until` we cannot parse is treated as lapsed (fail closed).
+///
+/// # The roster ratchet turns HERE, on observation
+///
+/// The durable `roster_seq` high-water advances to the newest generation this pass ADMITTED,
+/// before the freshness gate and before any caller decides whether to install. That is the
+/// only ordering under which the replay defence works, and it is the one `aterm-update`'s
+/// sibling tier already uses: a client that merely SAW generation *n* must refuse *n-1*
+/// forever after, whether or not it went on to install anything. Ratcheting after a
+/// completed install instead — which is what atpkg did — left every no-install outcome
+/// (a local pin holding, a staging failure an attacker can induce, a plan that decided
+/// there was nothing to do) with a floor BELOW a revocation it had already verified, and
+/// the still-genuine pre-revocation roster then re-authorized the revoked machine.
+///
+/// Raising it here cannot lock the client out of a document it is still meant to use:
+/// `observed_roster_seq` is only ever a generation that was master-signed, fresh, and
+/// already at-or-above the current floor, and the ratchet refuses only STRICTLY older ones.
+/// Best-effort, like every other floor write — a failed write leaves the older floor, which
+/// is the direction that refuses nothing it should accept.
 fn verify_select_fresh(
-    root_pubkey_b64: &str,
+    layout: &Layout,
+    anchor: &Anchor,
     candidates: Vec<Candidate>,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
-) -> Result<Index, FlowError> {
-    let selected = select_index(root_pubkey_b64, candidates, floor).ok_or(FlowError::NoIndex)?;
+) -> Result<TrustedIndex, FlowError> {
+    let pass = select_index(anchor, candidates, floor, now_unix);
+    observe_roster_generation(layout, pass.observed_roster_seq);
+    let selected = pass.selected.ok_or(FlowError::NoIndex)?;
     let index = selected.index;
-    match rfc3339_to_unix(&index.valid_until) {
-        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok() => {}
-        _ => return Err(FlowError::Stale),
+    if !index_is_fresh(&index, now_unix) {
+        return Err(FlowError::Stale);
     }
     Ok(index)
 }
 
-/// Resolve the index candidates with a SAME-SOURCE cached fallback (§14): a successful fetch
-/// refreshes the cache under the fetcher's `source_id`; a fetch failure falls back to the last
-/// cached candidates FOR THE SAME SOURCE (a `dir:` cache never satisfies a failed `github:`
-/// fetch). Cached bytes are RAW — everything downstream (verify-then-select, freshness, floor)
+/// Durably record that this client has ADMITTED roster generation `seq` — the replay
+/// ratchet's write half (`<prefix>/roster.floor`).
+///
+/// `0` means no generation was admitted at all (an unarmed anchor, a suppressed or
+/// unverifiable roster), and writing it would be meaningless; the guard keeps a refused
+/// pass from touching the file at all. Everything else is a master signature this process
+/// checked itself.
+pub(crate) fn observe_roster_generation(layout: &Layout, seq: u64) {
+    if seq == 0 {
+        return;
+    }
+    // The discarded Result is the accept/refuse DECISION (a Rollback here just means a
+    // concurrent pass already recorded something newer — nothing to act on). A failure
+    // to PERSIST the advance is not discarded: `check_and_record` reports it on stderr
+    // itself, so a standing replay window is never silent.
+    let _ = crate::sig::Floor::new(layout.roster_floor()).check_and_record(seq);
+}
+
+/// The §8 gate-2 freshness predicate over a verified index: whether its signed
+/// `valid_until` window is still open at `now_unix`. A `valid_until` we cannot parse
+/// is lapsed (fail closed). Shared by [`verify_select_fresh`] and the CLI's
+/// seed-as-update-source admission, so the two can never drift on what "fresh" means.
+pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
+    matches!(
+        rfc3339_to_unix(&index.valid_until),
+        Some(until) if crate::sig::check_freshness(now_unix, until).is_ok()
+    )
+}
+
+/// Resolve the index candidates with a SAME-SOURCE cached fallback (§14): a successful
+/// NON-EMPTY fetch refreshes the cache; a fetch failure — or an EMPTY success, which is a
+/// fetch that FOUND nothing (an index tag pushed off the release listing, a repo with no
+/// index release) and previously bypassed the fallback into a repo-wide `NoIndex` while a
+/// good cache sat on disk — falls back to the last cached candidates FOR THE SAME SOURCE
+/// (a `dir:` cache never satisfies a failed `github:` fetch). Both the write and the load
+/// are keyed by [`Fetcher::cache_source_id`], and the write persists only
+/// [`Fetcher::cacheable_candidates`] — the NETWORK leg of a chained fetcher — so a seed-leg
+/// success can never overwrite the last-good network cache (cache masking, 2026-07-30).
+/// Cached bytes are RAW — everything downstream (verify-then-select, freshness, floor)
 /// is unchanged, so a tampered/stale cache installs nothing the live path wouldn't.
 fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Candidate>, FlowError> {
     let cache = crate::cache::IndexCache::new(layout.prefix.join("index-cache.toml"));
-    let src = fetcher.source_id();
+    let src = fetcher.cache_source_id();
     match fetcher.index_candidates() {
-        Ok(c) => {
-            cache.store(&src, &c);
+        Ok(c) if !c.is_empty() => {
+            if let Some(cacheable) = fetcher.cacheable_candidates(&c) {
+                // `store` itself refuses an empty set, so a network leg that succeeded
+                // with nothing keeps the older good cache rather than clobbering it.
+                cache.store(&src, &cacheable);
+            }
             Ok(c)
         }
-        Err(_) => cache.load(&src).ok_or(FlowError::NoIndex),
+        _ => cache.load(&src).ok_or(FlowError::NoIndex),
     }
 }
 
@@ -1076,10 +1273,10 @@ fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Cand
 pub fn rollback(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
+    anchor: &Anchor,
     channel: &str,
     program: &str,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
 ) -> Result<RollbackReport, FlowError> {
     // 1. The ACTIVE build (shim-derived), never a merely-staged one.
@@ -1089,7 +1286,7 @@ pub fn rollback(
     // 2. Resolve + verify-select the SIGNED index so the floor/yank gate is authoritative
     //    (direct fetch — the single-program paths use no §14 cached fallback).
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
+    let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     // 3. Reachability — capture the coherence group for the report/warn.
     let coherence_group = index
         .program(program)
@@ -1130,6 +1327,9 @@ pub fn rollback(
         build_dir: layout.build_dir(program, current),
         exposes: crate::ops::active_tools(layout, program, current),
         prior_build: Some(target),
+        // Honest (this IS the live build we are rolling off) though never read here: only the
+        // group transaction's abort discard consults `was_live`, and rollback stages nothing.
+        was_live: true,
         reloc: None,
         tree_root: String::new(),
     };
@@ -1139,6 +1339,7 @@ pub fn rollback(
         from_build: current,
         to_build: target,
         index_build: index.index_build,
+        roster_seq: index.roster_seq(),
         coherence_group,
     })
 }
@@ -1159,16 +1360,16 @@ pub fn rollback(
 pub fn apply_program(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    root_pubkey_b64: &str,
+    anchor: &Anchor,
     channel: &str,
     triple: &str,
     program: &str,
     installed: &BTreeMap<String, u64>,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
+    let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -1194,6 +1395,7 @@ pub fn apply_program(
             .collect();
         return Ok(ChannelApplyReport {
             index_build: index.index_build,
+            roster_seq: index.roster_seq(),
             groups: vec![],
             applied: BTreeMap::new(),
             skipped_linked,
@@ -1210,6 +1412,7 @@ pub fn apply_program(
     // (Shell.d hook refresh runs at the main.rs CLI edge — see the note in `install`.)
     Ok(ChannelApplyReport {
         index_build: index.index_build,
+        roster_seq: index.roster_seq(),
         groups: results,
         applied,
         skipped_linked: vec![],
@@ -1219,18 +1422,30 @@ pub fn apply_program(
 /// Read-only routing decision for the `update` verb (§11): resolve + verify-select the index
 /// (verify-before-parse), then return `program`'s coherence group (to pick the transactional-
 /// vs-single path) AND the authoritative [`decide`] result (so an ungrouped pin gate can be
-/// applied strictly AFTER it, never hiding a Tombstone). Pure read — no staging/mutation.
+/// applied strictly AFTER it, never hiding a Tombstone).
+///
+/// Read-only as to the STORE; it takes `layout` because the roster ratchet turns on
+/// observation ([`verify_select_fresh`]), and this verb is the clearest case for why: it
+/// routinely admits a generation and then installs nothing at all (the local-pin hold), and
+/// that outcome must still leave the client refusing every older generation afterwards.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the routing decision needs the fetcher, the layout its roster ratchet turns \
+              in, the anchor, the channel + program selectors, the installed build, and \
+              the floor + clock the anti-rollback/freshness gates read"
+)]
 pub fn plan_update(
     fetcher: &dyn Fetcher,
-    root_pubkey_b64: &str,
+    layout: &Layout,
+    anchor: &Anchor,
     channel: &str,
     program: &str,
     installed_build: Option<u64>,
-    floor: u64,
+    floor: BuildFloor,
     now_unix: i64,
 ) -> Result<UpdatePlan, FlowError> {
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
-    let index = verify_select_fresh(root_pubkey_b64, candidates, floor, now_unix)?;
+    let index = verify_select_fresh(layout, anchor, candidates, floor, now_unix)?;
     let ch = index
         .channels
         .iter()
@@ -1260,20 +1475,20 @@ pub struct UpdatePlan {
 }
 
 /// The verified per-build manifest for `program`'s channel pin: pin lookup → repo lookup →
-/// fetch → [`verify_pkg`] → [`parse_pkg`], in exactly that order (VERIFY-BEFORE-PARSE, §4.2).
+/// fetch → [`TrustedIndex::verify_pkg`] → [`parse_pkg`], in that order (VERIFY-BEFORE-PARSE, §4.2).
 /// Returns `(pinned build, repo, manifest)`; `None` on a missing pin/program or any
 /// fetch/verify/parse failure. A caller that must bind the signed `program`/`build_number`
 /// to its request (anti-replay) checks that on the returned manifest.
 fn verified_pkg(
     fetcher: &dyn Fetcher,
-    index: &Index,
+    index: &TrustedIndex,
     ch: &Channel,
     program: &str,
 ) -> Option<(u64, String, crate::manifest::PkgManifest)> {
     let pinned = *ch.pin.get(program)?;
     let repo = index.program(program)?.repo.clone();
     let (raw, sig) = fetcher.pkg_manifest(&repo, program, pinned).ok()?;
-    let verified = verify_pkg(raw, &sig, &index.delegation()).ok()?;
+    let verified = index.verify_pkg(raw, &sig).ok()?;
     let pkg = parse_pkg(&verified).ok()?;
     Some((pinned, repo, pkg))
 }
@@ -1285,7 +1500,7 @@ fn verified_pkg(
 fn stage_member(
     fetcher: &dyn Fetcher,
     layout: &Layout,
-    index: &Index,
+    index: &TrustedIndex,
     ch: &Channel,
     program: &str,
     triple: &str,
@@ -1307,12 +1522,31 @@ fn stage_member(
     };
     let dl = layout.staging_dir(program).join(&artifact.asset);
     std::fs::create_dir_all(dl.parent()?).ok()?;
-    fetcher
+    if fetcher
         .download_for(program, &repo, &artifact.asset, &dl)
-        .ok()?;
+        .is_err()
+    {
+        // An aborted transfer still wrote a truncated body here (curl `-o`, no
+        // `--remove-on-error`); the retry re-fetches rather than resumes, so it is dead
+        // weight. Same reclaim as the stage exit below.
+        let _ = std::fs::remove_file(&dl);
+        return None;
+    }
     let build_dir = layout.build_dir(program, pinned);
-    verify_and_stage(artifact, &dl, &build_dir).ok()?;
+    // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it, and
+    // before any flip can move the links: on a flip-phase abort `flip_member`/`rollback_member`
+    // re-point or REMOVE the very links this asks about, so by discard time the answer is
+    // gone. `installed` is the shim view and can be silent for a live build (see the abort
+    // discard in `apply_group_txn`), which is the whole reason this flag exists.
+    let was_live = std::fs::read_link(layout.program_current(program))
+        .is_ok_and(|t| t == build_dir)
+        || std::fs::read_link(layout.channel_current(&ch.name)).is_ok_and(|t| t == build_dir);
+    // Reclaim the compressed asset on EVERY exit, not just the happy one: a group member
+    // that fails to stage otherwise strands its archive in `staging/` forever, and nothing
+    // else ever sweeps that directory (`gc::interrupted_debris` walks `store/` only).
+    let staged = verify_and_stage(artifact, &dl, &build_dir);
     let _ = std::fs::remove_file(&dl);
+    staged.ok()?;
     Some(Staged {
         build: pinned,
         build_dir,
@@ -1321,6 +1555,7 @@ fn stage_member(
         // group member's refusals are not a stage failure, matching `install`.
         exposes: crate::store::split_exposed(&pkg.exposes).0,
         prior_build,
+        was_live,
         reloc,
         tree_root: artifact.tree_root.clone(),
     })
@@ -1479,26 +1714,54 @@ fn bundle_resolve_check(build_dir: &Path, exposes: &[ToolName]) -> Result<(), Fl
 
 /// Current Unix epoch second — the `now_unix` input every freshness gate takes as a
 /// parameter (the flow entry points stay clock-free for determinism; the CLI edge reads
-/// the real clock through THIS one definition). 0 if the clock is before the epoch.
+/// the real clock through THIS one definition).
+///
+/// # A clock we cannot read fails CLOSED — `i64::MAX`, never `0`
+///
+/// This used to return `0` on a pre-epoch clock, and that was safe only while this value
+/// fed one index's freshness window. It now also drives the ROSTER's `valid_until` and every
+/// machine's `not_after`, and zero reads as 1970 — before every conceivable deadline — so a
+/// roster generation that lapsed years ago would be ADMITTED and an expired machine would be
+/// treated as live. Roster freshness is the only defence a fresh install has (it carries no
+/// floor), so that is the one gate that must not fail open.
+///
+/// `i64::MAX` makes every window look already-expired, which refuses everything. It is the
+/// same choice, for the same reason, as `aterm-update`'s `github::unix_now`, and the
+/// opposite of a retry-deadline clock (where "passed" means "retry now" and zero is right).
+/// The direction is asserted in this module's tests.
 pub(crate) fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+    unix_or_fail_closed(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+}
+
+/// [`now_unix`]'s decision, separated from the clock read so the fail-closed direction is
+/// TESTABLE rather than asserted in prose. Takes exactly what `duration_since` returns; the
+/// tests feed it a genuine `SystemTimeError` (`UNIX_EPOCH.duration_since(now())`, which
+/// errors on any post-1970 clock) rather than a stand-in.
+fn unix_or_fail_closed(
+    since_epoch: Result<std::time::Duration, std::time::SystemTimeError>,
+) -> i64 {
+    since_epoch.map_or(i64::MAX, |d| {
+        i64::try_from(d.as_secs()).unwrap_or(i64::MAX)
+    })
 }
 
 /// Parse an RFC3339 UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` to a Unix epoch second. Pure (no
 /// clock), so the freshness gate stays deterministic; `None` on any malformed field, which
-/// the caller treats as lapsed (fail closed). Calendar math is the shared
-/// `aterm_types::rfc3339::days_from_civil`.
+/// the caller treats as lapsed (fail closed). The `Z` suffix is REQUIRED and the length
+/// exact: a timezone-offset stamp (`…+09:00`) must not be silently read as UTC — up to 14h
+/// of fail-open skew on the freshness gate — and trailing bytes past the seconds field must
+/// not parse at all; both are refused so the producer contract (`tools/atpkg-*.sh` and
+/// `now_rfc3339` both emit exactly this shape) is enforced instead of assumed. Calendar
+/// math is the shared `aterm_types::rfc3339::days_from_civil`.
 pub(crate) fn rfc3339_to_unix(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 19
+    if b.len() != 20
         || b[4] != b'-'
         || b[7] != b'-'
         || b[10] != b'T'
         || b[13] != b':'
         || b[16] != b':'
+        || b[19] != b'Z'
     {
         return None;
     }
@@ -1527,8 +1790,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    const ROOT_SEED: [u8; 32] = [7u8; 32];
-    const RELEASE_SEED: [u8; 32] = [1u8; 32];
+    use crate::sig::testkit;
+
+    /// The synthetic paper master, and the one machine its roster authorizes. The whole
+    /// crate signs with this same pair, so a flow test cannot prove something under a
+    /// trust shape no other layer uses. (`ROOT_SEED` still names the ROOT of trust — it
+    /// is just the paper master now, not a package-specific root.)
+    const ROOT_SEED: [u8; 32] = testkit::MASTER_SEED;
+    const RELEASE_SEED: [u8; 32] = testkit::MACHINE_SEED;
+
+    /// A durable build floor of `index_build`, recorded under the generation these fixtures
+    /// publish at — i.e. a floor that actually BINDS. Written as a helper rather than a bare
+    /// integer because `BuildFloor` carries the generation that set it: a floor stamped with
+    /// some OTHER generation is waived, and a floor test that accidentally built one would
+    /// pass vacuously. `fl(0)` is "nothing recorded", which admits everything.
+    fn fl(index_build: u64) -> BuildFloor {
+        BuildFloor {
+            index_build,
+            roster_seq: testkit::SEQ,
+        }
+    }
+
+    /// The anchor every flow test resolves under: armed with the synthetic master, roster
+    /// floor 0. `anchor_of` is the seam the negative tests use to arm a DIFFERENT master.
+    fn anchor() -> Anchor {
+        anchor_of(&ROOT_SEED)
+    }
+
+    fn anchor_of(master_seed: &[u8; 32]) -> Anchor {
+        Anchor::of(vec![pk(master_seed)], 0)
+    }
+
+    /// The attribution head every fixture index carries — `machine_id` + `roster_seq`
+    /// must name the machine that actually signs, or the bind refuses the index.
+    fn attribution() -> String {
+        format!(
+            "machine_id = \"{}\"\nroster_seq = {}\n",
+            testkit::MACHINE_ID,
+            testkit::SEQ
+        )
+    }
     const TRIPLE: &str = "aarch64-apple-darwin";
 
     fn kp(seed: &[u8; 32]) -> Ed25519KeyPair {
@@ -1553,11 +1854,18 @@ mod tests {
     /// A raw USTAR + zstd archive with `bin/ay` (+ a sensitive `bin/git` to prove the shim
     /// gate). Returns the path.
     fn make_archive(dir: &Path) -> PathBuf {
-        fn entry(name: &str, content: &[u8]) -> Vec<u8> {
+        make_archive_with(dir, b"#!/bin/true\nay", b"0000755\0")
+    }
+
+    /// As [`make_archive`], but with explicit `bin/ay` content + tar mode (the
+    /// resolve-check rollback tests ship a native-object magic with NO exec bit, so the
+    /// spawn fails and the fail-loud check takes its spawn-failure arm).
+    fn make_archive_with(dir: &Path, ay_content: &[u8], ay_mode: &[u8; 8]) -> PathBuf {
+        fn entry(name: &str, content: &[u8], mode: &[u8; 8]) -> Vec<u8> {
             let mut h = [0u8; 512];
             let nb = name.as_bytes();
             h[..nb.len()].copy_from_slice(nb);
-            h[100..108].copy_from_slice(b"0000755\0");
+            h[100..108].copy_from_slice(mode);
             h[108..116].copy_from_slice(b"0000000\0");
             h[116..124].copy_from_slice(b"0000000\0");
             h[124..136].copy_from_slice(format!("{:011o}\0", content.len()).as_bytes());
@@ -1574,8 +1882,12 @@ mod tests {
             out
         }
         let mut tar = Vec::new();
-        tar.extend(entry("bin/ay", b"#!/bin/true\nay"));
-        tar.extend(entry("bin/git", b"#!/bin/true\nnot-really-git")); // sensitive → refused shim
+        tar.extend(entry("bin/ay", ay_content, ay_mode));
+        tar.extend(entry(
+            "bin/git",
+            b"#!/bin/true\nnot-really-git",
+            b"0000755\0",
+        )); // sensitive → refused shim
         tar.resize(tar.len() + 1024, 0);
         let path = dir.join("ay-18.tar.zst");
         let f = std::fs::File::create(&path).unwrap();
@@ -1595,10 +1907,15 @@ mod tests {
     }
     impl Fetcher for Fake {
         fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            // The master-signed roster is published WITH the index, exactly as a real
+            // release carries `aterm-machines.toml` beside `index.toml`.
+            let (roster_bytes, roster_sig) = testkit::published_roster();
             Ok(vec![Candidate {
                 label: "v0".into(),
                 index_bytes: self.index.clone(),
                 sig: self.index_sig.clone(),
+                roster_bytes,
+                roster_sig,
             }])
         }
         fn pkg_manifest(
@@ -1629,23 +1946,42 @@ mod tests {
     /// As [`fixture`], but with an explicit artifact `kind` (to exercise the
     /// per-member dispatch — e.g. `sysroot-bundle`, which must fail closed).
     fn fixture_with_kind(dir: &Path, kind: &str) -> Fake {
-        let archive = make_archive(dir);
+        fixture_from(dir, kind, make_archive(dir), None)
+    }
+
+    /// As [`fixture_with_kind`], but with explicit `bin/ay` content + tar mode (the
+    /// resolve-check rollback tests ship a native-object magic that cannot spawn).
+    fn fixture_with(dir: &Path, kind: &str, ay_content: &[u8], ay_mode: &[u8; 8]) -> Fake {
+        fixture_from(dir, kind, make_archive_with(dir, ay_content, ay_mode), None)
+    }
+
+    /// The signed release over an archive the caller already built.
+    ///
+    /// `signed_root` overrides the `tree_root` the manifest carries. `None` is the honest
+    /// case — the real root of the real archive. `Some(..)` is how a test makes the SIGNED
+    /// value disagree with the bytes on disk, which is the only way to reach the apply-time
+    /// TOCTOU re-verify through the real flow: the artifact's `sha256` covers the compressed
+    /// asset, so no substituted archive can satisfy that gate and still fail a later one.
+    fn fixture_from(dir: &Path, kind: &str, archive: PathBuf, signed_root: Option<&str>) -> Fake {
         let sha = crate::tree::file_sha256(&archive).unwrap();
         // Learn the extracted tree_root by a throwaway stage.
         let probe = dir.join("probe");
+        let _ = std::fs::remove_dir_all(&probe);
         crate::extract::extract_tar_zst(&archive, &probe, 10_000_000, 10_000).unwrap();
-        let root = crate::tree::tree_root(&probe).unwrap();
+        let root = signed_root.map_or_else(
+            || crate::tree::tree_root(&probe).unwrap(),
+            std::string::ToString::to_string,
+        );
 
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
              [programs.ay]\nrepo = \"ay\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              pin = {{ ay = 18 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         let pkg_body = format!(
-            "schema = 1\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
+            "schema = 2\nprogram = \"ay\"\nversion = \"0.1\"\nbuild_number = 18\n\
              exposes = [\"ay\", \"git\"]\n\
              [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"{kind}\"\nasset = \"ay-18.tar.zst\"\n\
              sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
@@ -1663,7 +1999,7 @@ mod tests {
         archives.insert("ay-18.tar.zst".to_string(), archive);
         Fake {
             index: index_body.clone().into_bytes(),
-            index_sig: sign(&ROOT_SEED, index_body.as_bytes()),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
             pkg,
             archives,
         }
@@ -1704,7 +2040,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert_eq!(report.build, 18);
         assert!(!report.already_current);
         assert_eq!(report.shimmed, vec!["ay".to_string()]);
@@ -1729,6 +2065,235 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// THE GOVERNING STAGING INVARIANT, THROUGH THE REAL INSTALL FLOW: a re-install that
+    /// fails to stage must leave the toolchain already on the machine installed, complete,
+    /// and on PATH.
+    ///
+    /// Step 6 used to be `remove_dir_all(build_dir)` → extract, so this exact sequence — a
+    /// live `ay@18`, then a re-install whose signed `tree_root` does not describe the bytes —
+    /// ended with no `ay` at all, while the sibling `<build>.ready` marker the delete never
+    /// touched still claimed the build was installed. The unit tests in `install.rs` pin the
+    /// staging chain itself; this pins that the flow the user actually runs goes through it.
+    #[test]
+    fn a_restage_that_fails_leaves_the_live_toolchain_installed_and_on_path() {
+        let dir = scratch("restage-keeps-toolchain");
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap();
+
+        let build = layout.build_dir("ay", 18);
+        assert!(
+            crate::store::build_is_complete(&build),
+            "the fixture is only interesting once ay@18 is really installed"
+        );
+        let ay = tool_bin(&build, "ay");
+        let original = std::fs::read(&ay).unwrap();
+
+        // The SAME archive bytes (so the sha256 gate passes and the failure lands late) under
+        // a signed tree_root that cannot match — the apply-time TOCTOU re-verify, i.e. the
+        // last point at which the old shape had already destroyed the live tree.
+        let tampered = fixture_from(&dir, "binary", make_archive(&dir), Some(&"a".repeat(64)));
+        let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(
+            matches!(err, FlowError::Stage(StageError::TreeRootMismatch { .. })),
+            "the fixture must fail at the re-verify, else this proves nothing: got {err:?}"
+        );
+
+        assert!(
+            crate::store::build_is_complete(&build),
+            "the installed build must still be marked complete"
+        );
+        assert_eq!(
+            std::fs::read(&ay).unwrap(),
+            original,
+            "the live binary must be the ORIGINAL one, byte for byte"
+        );
+        assert_eq!(
+            crate::ops::which(&layout, "ay").unwrap(),
+            ay,
+            "and it must still be what the shim forwards to"
+        );
+        assert_eq!(
+            crate::ops::list_installed(&layout),
+            vec![("ay".to_string(), 18u64)],
+            "the store must still report exactly the build that is really there"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.channel_current("stable")).unwrap(),
+            build
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every entry in `prefix/staging/<program>/`, sorted.
+    fn staged_assets(layout: &Layout, program: &str) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(layout.staging_dir(program)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect();
+        out.sort();
+        out
+    }
+
+    // THE COMPRESSED ASSET IS RECLAIMED ON EVERY EXIT, NOT JUST THE HAPPY ONE. A stage that
+    // fails otherwise strands a full toolchain archive in `staging/` forever: nothing else
+    // sweeps that directory (`gc::interrupted_debris` walks `store/` only), so `atpkg gc`
+    // cannot even name the bytes, and a member that keeps failing keeps leaking.
+    #[test]
+    fn a_failed_stage_reclaims_its_archive_instead_of_stranding_it() {
+        let dir = scratch("staging-leak");
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        // The same archive bytes under a signed tree_root that cannot match: the sha256 gate
+        // passes, so the download really lands in `staging/` and the failure is late.
+        let tampered = fixture_from(&dir, "binary", make_archive(&dir), Some(&"a".repeat(64)));
+        for _ in 0..3 {
+            let err = install(&tampered, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+            assert!(
+                matches!(err, FlowError::Stage(StageError::TreeRootMismatch { .. })),
+                "PRECONDITION: the stage must fail AFTER the download: {err:?}"
+            );
+        }
+        assert!(
+            staged_assets(&layout, "ay").is_empty(),
+            "a failed stage stranded its archive in staging/: {:?}",
+            staged_assets(&layout, "ay")
+        );
+
+        // Non-vacuity: the archive really does pass through that directory on the way in —
+        // a successful install leaves it empty for the same reason, not because nothing
+        // was ever downloaded there.
+        install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert!(staged_assets(&layout, "ay").is_empty());
+        assert!(crate::store::build_is_complete(&layout.build_dir("ay", 18)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE SAME BLIND SPOT ON THE SINGLE-PROGRAM PATH. `abort_activated_install` unwinds an
+    // install that failed AFTER activation, and its discard is sound for a build this call
+    // created. It is not sound for one that was already live: the failures that land there
+    // are `install_tools` (an EACCES/EROFS/full disk while writing `bin/` shims — a fact
+    // about the environment, not the tree) and the resolve check, and deleting a verified
+    // multi-gigabyte tree in response leaves the user with no toolchain at all.
+    #[test]
+    fn a_post_activation_abort_never_discards_a_build_that_was_already_live() {
+        let dir = scratch("single-abort-live");
+        let ndir = scratch("single-abort-fresh");
+        // Both layouts before the binding shadows the constructor.
+        let nlayout = layout(&ndir);
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap();
+        let build = layout.build_dir("ay", 18);
+        assert!(
+            crate::store::build_is_complete(&build),
+            "PRECONDITION: ay@18 is really installed"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            build,
+            "PRECONDITION: and really live"
+        );
+
+        // Break `install_tools` the way an unwritable prefix does: a regular FILE where the
+        // `bin/` directory must be, so `ensure_private_dir` fails AFTER activation. The
+        // `installed: None` request is the shim view being silent about a live program.
+        std::fs::remove_dir_all(layout.bin_dir()).unwrap();
+        std::fs::write(layout.bin_dir(), b"not a dir").unwrap();
+
+        let err = install(&fixture(&dir), &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(
+            matches!(err, FlowError::Activate(_)),
+            "PRECONDITION: the failure must land after activation: {err:?}"
+        );
+
+        assert!(
+            build.is_dir(),
+            "a failed shim write destroyed the live toolchain tree"
+        );
+        assert_eq!(
+            std::fs::read(tool_bin(&build, "ay")).unwrap(),
+            b"#!/bin/true\nay",
+            "and the tree left behind is the verified one"
+        );
+        assert!(
+            crate::store::build_is_complete(&build),
+            "it must still read as installed, so the retry re-activates instead of re-fetching"
+        );
+
+        // Non-vacuity: a build this call really did create IS still discarded. Restore the
+        // prefix, then fail a FRESH install of a program that was never live.
+        std::fs::remove_file(layout.bin_dir()).unwrap();
+        let ndir = scratch("single-abort-fresh");
+        std::fs::create_dir_all(nlayout.prefix.join("store")).unwrap();
+        std::fs::write(nlayout.bin_dir(), b"not a dir").unwrap();
+        let nerr = install(&fixture(&ndir), &nlayout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(nerr, FlowError::Activate(_)), "got {nerr:?}");
+        assert!(
+            !nlayout.build_dir("ay", 18).exists(),
+            "a build the failed install itself created is still discarded"
+        );
+        let _ = std::fs::remove_dir_all(&ndir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The group path leaks the same way and must reclaim the same way: an aborted member's
+    // archive is the one nobody ever comes back for.
+    #[test]
+    fn an_aborted_group_member_reclaims_its_archive_too() {
+        let dir = scratch("staging-leak-group");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        // trust's archive no longer matches its signed sha256 → its stage fails, after the
+        // download has already put the bytes in `staging/trust/`.
+        std::fs::write(fake.archives.get("trust-4821.tar.zst").unwrap(), b"corrupt").unwrap();
+
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &std::collections::BTreeMap::from([("ay".to_string(), 17u64)]),
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Aborted { .. }),
+            "PRECONDITION: the group aborted: {:?}",
+            report.groups[0].1
+        );
+        assert!(
+            staged_assets(&layout, "trust").is_empty(),
+            "the failing member stranded its archive: {:?}",
+            staged_assets(&layout, "trust")
+        );
+        assert!(
+            staged_assets(&layout, "ay").is_empty(),
+            "and so did the member that staged fine before the abort"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn app_bundle_refused_closed_but_sysroot_bundle_installs() {
         // app-bundle is the notarized self-swap topology, NOT a tool install — it
@@ -1742,7 +2307,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&app, &alay, &pk(&ROOT_SEED), &areq, 0, 0).unwrap_err();
+        let err = install(&app, &alay, &anchor(), &areq, fl(0), 0).unwrap_err();
         // Now routed through the two-anchor app-apply gate (appgate::app_apply_allowed), which
         // fails closed on the CLI path because notarization is unproven here — a distinct,
         // gate-driven refusal rather than a blanket UnsupportedKind.
@@ -1769,7 +2334,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let rep = install(&sr, &slay, &pk(&ROOT_SEED), &sreq, 0, 0)
+        let rep = install(&sr, &slay, &anchor(), &sreq, fl(0), 0)
             .expect("self-contained sysroot-bundle should install");
         assert!(
             rep.shimmed.contains(&"ay".to_string()),
@@ -1784,6 +2349,114 @@ mod tests {
             slay.build_dir("ay", 18)
         );
         let _ = std::fs::remove_dir_all(&sdir);
+    }
+
+    /// Mach-O magic over garbage, shipped with tar mode 0644: the magic makes
+    /// [`crate::relocate::is_native_object`] admit it to the resolve check, and the
+    /// missing exec bit makes the spawn fail (`EACCES`) — [`crate::sysroot::resolve_check`]'s
+    /// documented "cannot spawn" arm — so [`bundle_resolve_check`] errors. (A garbage
+    /// EXECUTABLE Mach-O is no good as a fixture: macOS reports the exec-format failure
+    /// as a NORMAL exit 126, which the check's run-to-completion contract accepts.)
+    const BROKEN_NATIVE_BIN: &[u8] = &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0];
+    const NO_EXEC_MODE: &[u8; 8] = b"0000644\0";
+
+    // THE resolve-failure unwind (fresh install): a sysroot-bundle whose exposed binary
+    // cannot load must NOT be left ACTIVE — before the fix the channel `current`, the
+    // witness, and the shims all kept naming the broken `.ready` build, `decide` read it
+    // as UpToDate, and a retried install printed 'already current' forever. The install
+    // path now unwinds like the transactional flip: no pointer survives, the build is
+    // discarded, and a retry with a healthy bundle re-installs cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn failed_bundle_resolve_check_unwinds_a_fresh_install() {
+        let dir = scratch("resolve-fresh");
+        let broken = fixture_with(&dir, "sysroot-bundle", BROKEN_NATIVE_BIN, NO_EXEC_MODE);
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let err = install(&broken, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(err, FlowError::Activate(_)), "got {err:?}");
+        // Nothing points at the broken build, and the build itself is gone…
+        assert!(crate::ops::which(&layout, "ay").is_none(), "no live shim");
+        assert!(
+            std::fs::symlink_metadata(layout.program_current("ay")).is_err(),
+            "no witness link"
+        );
+        assert!(
+            std::fs::symlink_metadata(layout.channel_current("stable")).is_err(),
+            "no channel link"
+        );
+        assert!(
+            !layout.build_dir("ay", 18).exists(),
+            "the broken build is discarded, never re-read as complete"
+        );
+        assert!(crate::ops::active_builds(&layout).is_empty());
+        // …so a retry (healthy bundle, SAME store) re-installs instead of 'already current'.
+        let hdir = scratch("resolve-fresh-retry");
+        let healthy = fixture_with_kind(&hdir, "sysroot-bundle");
+        let rep = install(&healthy, &layout, &anchor(), &req, fl(0), 0)
+            .expect("a retry after the unwind re-installs");
+        assert!(
+            !rep.already_current,
+            "the unwound install must not read as current"
+        );
+        assert_eq!(
+            crate::ops::which(&layout, "ay").unwrap(),
+            tool_bin(&layout.build_dir("ay", 18), "ay")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hdir);
+    }
+
+    // The upgrade variant of the resolve-failure unwind: ay@17 is live, the pinned
+    // ay@18 bundle fails its resolve check — shims, witness, and channel `current` all
+    // revert to 17 (the prior working surface) and 18 is discarded, exactly what
+    // `flip_member` guarantees on the transactional path.
+    #[cfg(unix)]
+    #[test]
+    fn failed_bundle_resolve_check_reverts_an_upgrade_to_the_prior_build() {
+        let dir = scratch("resolve-revert");
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 17, true); // ay@17 active + shimmed
+        let broken = fixture_with(&dir, "sysroot-bundle", BROKEN_NATIVE_BIN, NO_EXEC_MODE);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: Some(17),
+        };
+        let err = install(&broken, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(err, FlowError::Activate(_)), "got {err:?}");
+        let b17 = layout.build_dir("ay", 17);
+        assert_eq!(
+            crate::ops::which(&layout, "ay").unwrap(),
+            tool_bin(&b17, "ay"),
+            "the shim reverts to the prior working build"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            b17,
+            "the witness reverts"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.channel_current("stable")).unwrap(),
+            b17,
+            "the channel current reverts"
+        );
+        assert!(
+            !layout.build_dir("ay", 18).exists(),
+            "the broken build is discarded"
+        );
+        assert_eq!(
+            crate::ops::active_builds(&layout).get("ay").copied(),
+            Some(17),
+            "the gate keeps seeing 17, so the update stays due — never 'already current'"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // §7 (step 21): the single-program `install` path also DISABLES a tombstoned build's old
@@ -1804,7 +2477,7 @@ mod tests {
             triple: TRIPLE,
             installed: Some(17),
         };
-        let err = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(
             matches!(err, FlowError::Tombstoned(ref p) if p == "ay"),
             "got {err:?}"
@@ -1838,7 +2511,7 @@ mod tests {
             triple: TRIPLE,
             installed: Some(18),
         };
-        let r = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let r = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(r.already_current && r.shimmed.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1855,7 +2528,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(matches!(err, FlowError::NotReachable(_)), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1871,7 +2544,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&fake, &layout, &pk(&RELEASE_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout, &anchor_of(&RELEASE_SEED), &req, fl(0), 0).unwrap_err();
         assert!(matches!(err, FlowError::NoIndex), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1887,7 +2560,7 @@ mod tests {
             triple: "x86_64-unknown-linux-gnu",
             installed: None,
         };
-        let err = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(matches!(err, FlowError::NoArtifact(_)), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1906,7 +2579,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 2_000_000_000).unwrap_err();
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 2_000_000_000).unwrap_err();
         assert!(matches!(err, FlowError::Stale), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1918,14 +2591,13 @@ mod tests {
     fn refuses_app_bundle_kind() {
         let dir = scratch("appkind");
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{}\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2099-01-01T00:00:00Z\"\n{}\
              [programs.aterm]\nrepo = \"aterm\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\npin = {{ aterm = 18 }}\n",
-            pk(&RELEASE_SEED)
+            attribution()
         );
         let pkg_body = format!(
-            "schema = 1\nprogram = \"aterm\"\nbuild_number = 18\nexposes = []\n\
+            "schema = 2\nprogram = \"aterm\"\nbuild_number = 18\nexposes = []\n\
              [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"app-bundle\"\nasset = \"x.dmg\"\nsha256 = \"00\"\n"
         );
         let mut pkg = HashMap::new();
@@ -1938,7 +2610,7 @@ mod tests {
         );
         let fake = Fake {
             index: index_body.clone().into_bytes(),
-            index_sig: sign(&ROOT_SEED, index_body.as_bytes()),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
             pkg,
             archives: HashMap::new(),
         };
@@ -1948,7 +2620,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&fake, &layout(&dir), &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout(&dir), &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(
             matches!(err, FlowError::AppBundleRefused(ref p) if p == "aterm"),
             "got {err:?}"
@@ -1979,6 +2651,16 @@ mod tests {
         assert_eq!(rfc3339_to_unix("2026-07-05"), None);
         assert_eq!(rfc3339_to_unix("not-a-date"), None);
         assert_eq!(rfc3339_to_unix("2026-13-05T00:00:00Z"), None); // month 13
+        // The `Z` suffix is REQUIRED, exactly once, exactly at byte 19: a timezone
+        // offset must not be silently read as UTC (up to 14h of fail-open freshness
+        // skew), and trailing bytes past the seconds field must not parse either.
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00+09:00"), None); // offset, not UTC
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00-05:00"), None);
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00"), None); // bare, no zone
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00GARBAGE"), None);
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00Z "), None); // trailing byte
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00Zjunk"), None);
+        assert_eq!(rfc3339_to_unix("2026-07-05T12:00:00.5Z"), None); // fractional secs
     }
 
     // --- coherence-group transactional apply (apply_channel over the REAL flow) --------
@@ -2032,7 +2714,7 @@ mod tests {
             let root = crate::tree::tree_root(&probe).unwrap();
             let asset = format!("{program}-{build}.tar.zst");
             let pkg_body = format!(
-                "schema = 1\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
+                "schema = 2\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
                  exposes = [\"{program}\"]\n\
                  [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\nasset = \"{asset}\"\n\
                  sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
@@ -2048,17 +2730,16 @@ mod tests {
             archives.insert(asset, archive);
         }
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
-             [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                          [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
              [programs.ay]\nrepo = \"ay\"\ncoherence_group = \"rustc\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              pin = {{ trust = 4821, ay = 18 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         Fake {
             index: index_body.clone().into_bytes(),
-            index_sig: sign(&ROOT_SEED, index_body.as_bytes()),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
             pkg,
             archives,
         }
@@ -2075,11 +2756,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2119,11 +2800,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2163,11 +2844,11 @@ mod tests {
         let report2 = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2182,6 +2863,98 @@ mod tests {
         assert_eq!(
             crate::ops::which(&layout, "trust").unwrap(),
             tool_bin(&layout.build_dir("trust", 4821), "trust")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The abort discard must never delete a build that was ALREADY LIVE when this
+    // transaction re-staged it. The shim-derived `installed` view goes silent when a
+    // program's tools are gone (`atpkg unlink`, tombstones, dev-link mode) while the
+    // `current` authority links still name the live build, so `decide` legitimately
+    // returns Install for the build that is already active. A SIBLING member then failing
+    // to stage must not take that live toolchain down with it.
+    #[test]
+    fn a_group_abort_never_discards_a_member_that_was_already_live() {
+        let dir = scratch("group-abort-live");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+
+        // 1. Really install the tuple: ay@18 + trust@4821 go live.
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            fl(0),
+            0,
+        )
+        .unwrap();
+        let ay18 = layout.build_dir("ay", 18);
+        assert!(
+            crate::store::build_is_complete(&ay18),
+            "PRECONDITION: ay@18 is installed and complete"
+        );
+
+        // 2. `atpkg unlink`-shaped state: ay's shim is gone, so the SHIM view is silent for
+        //    ay — while the authority link still names ay@18 as live.
+        std::fs::remove_file(layout.shim(&tool("ay"))).unwrap();
+        assert!(
+            !crate::ops::active_builds(&layout).contains_key("ay"),
+            "PRECONDITION: the shim view no longer knows ay — `decide` will re-Install 18"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            ay18,
+            "PRECONDITION: the authority link still names ay@18, so it IS live"
+        );
+
+        // 3. A SIBLING member fails to stage → the group aborts after ay re-staged fine.
+        std::fs::write(fake.archives.get("trust-4821.tar.zst").unwrap(), b"corrupt").unwrap();
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &std::collections::BTreeMap::from([("trust".to_string(), 4820u64)]),
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                report.groups[0].1,
+                TxnOutcome::Aborted {
+                    during_flip: false,
+                    ..
+                }
+            ),
+            "PRECONDITION: the group aborted in the stage phase: {:?}",
+            report.groups[0].1
+        );
+
+        // The casualty test: the failing member is `trust`; `ay` must survive intact.
+        assert!(
+            ay18.is_dir(),
+            "the abort discarded a build that was already LIVE — the toolchain is gone"
+        );
+        assert!(
+            crate::store::build_is_complete(&ay18),
+            "the abort took down the completeness marker of a LIVE build"
+        );
+        assert_eq!(
+            std::fs::read_link(layout.program_current("ay")).unwrap(),
+            ay18,
+            "the authority link must still resolve"
+        );
+        assert!(
+            crate::ops::list_installed(&layout)
+                .iter()
+                .any(|(p, b)| p == "ay" && *b == 18),
+            "ay@18 must still read as installed after a sibling's failure"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2215,16 +2988,15 @@ mod tests {
             format!("yanked = [{}]\n", items.join(", "))
         };
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
-             [programs.ay]\nrepo = \"ay\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                          [programs.ay]\nrepo = \"ay\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = {min_build}\n\
              {yanked_toml}pin = {{ ay = 18 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         Fake {
             index: index_body.clone().into_bytes(),
-            index_sig: sign(&ROOT_SEED, index_body.as_bytes()),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
             pkg: HashMap::new(),
             archives: HashMap::new(),
         }
@@ -2235,17 +3007,16 @@ mod tests {
     fn group_fixture_yanking_ay18(dir: &Path) -> Fake {
         let mut f = group_fixture(dir);
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
-             [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                          [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
              [programs.ay]\nrepo = \"ay\"\ncoherence_group = \"rustc\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              yanked = [\"ay@18\"]\n\
              pin = {{ trust = 4821, ay = 18 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         f.index = index_body.clone().into_bytes();
-        f.index_sig = sign(&ROOT_SEED, index_body.as_bytes());
+        f.index_sig = sign(&RELEASE_SEED, index_body.as_bytes());
         f
     }
 
@@ -2262,11 +3033,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2290,17 +3061,16 @@ mod tests {
     fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
         let mut f = group_fixture(dir);
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
-             [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                          [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
              [programs.ay]\nrepo = \"ay\"\ncoherence_group = \"rustc\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              yanked = [\"ay@17\"]\n\
              pin = {{ trust = 4821, ay = 18 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         f.index = index_body.clone().into_bytes();
-        f.index_sig = sign(&ROOT_SEED, index_body.as_bytes());
+        f.index_sig = sign(&RELEASE_SEED, index_body.as_bytes());
         f
     }
 
@@ -2318,11 +3088,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2351,11 +3121,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2394,7 +3164,7 @@ mod tests {
         seed_build(&layout, "ay", 16, false);
         seed_build(&layout, "ay", 17, false);
         seed_build(&layout, "ay", 18, true); // active
-        let r = rollback(&fake, &layout, &pk(&ROOT_SEED), "stable", "ay", 0, 0).unwrap();
+        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap();
         assert_eq!(r.from_build, 18);
         assert_eq!(r.to_build, 17);
         assert_eq!(
@@ -2420,10 +3190,10 @@ mod tests {
             let r = rollback(
                 &rollback_index(17, &[]),
                 &lay,
-                &pk(&ROOT_SEED),
+                &anchor(),
                 "stable",
                 "ay",
-                0,
+                fl(0),
                 0,
             )
             .unwrap();
@@ -2440,10 +3210,10 @@ mod tests {
             let r = rollback(
                 &rollback_index(0, &["ay@17"]),
                 &lay,
-                &pk(&ROOT_SEED),
+                &anchor(),
                 "stable",
                 "ay",
-                0,
+                fl(0),
                 0,
             )
             .unwrap();
@@ -2460,10 +3230,10 @@ mod tests {
             let err = rollback(
                 &rollback_index(18, &[]),
                 &lay,
-                &pk(&ROOT_SEED),
+                &anchor(),
                 "stable",
                 "ay",
-                0,
+                fl(0),
                 0,
             )
             .unwrap_err();
@@ -2478,7 +3248,7 @@ mod tests {
         let fake = rollback_index(0, &[]);
         let layout = layout(&dir);
         seed_build(&layout, "ay", 18, true); // only 18 present
-        let err = rollback(&fake, &layout, &pk(&ROOT_SEED), "stable", "ay", 0, 0).unwrap_err();
+        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap_err();
         assert!(matches!(err, FlowError::Rollback(_)), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2495,12 +3265,12 @@ mod tests {
         let report = apply_program(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             "ay",
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2550,7 +3320,7 @@ mod tests {
             let root = crate::tree::tree_root(&probe).unwrap();
             let asset = format!("{program}-{build}.tar.zst");
             let pkg_body = format!(
-                "schema = 1\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
+                "schema = 2\nprogram = \"{program}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
                  exposes = [\"{program}\"]\n{reqs}\
                  [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\nasset = \"{asset}\"\n\
                  sha256 = \"{sha}\"\ntree_root = \"{root}\"\nsize = 100\n\
@@ -2573,16 +3343,15 @@ mod tests {
             format!("yanked = [{}]\n", items.join(", "))
         };
         let index_body = format!(
-            "schema = 1\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n\
-             [keys]\nrelease_key_id = \"rk\"\nrelease_key_pubkey = \"{rk}\"\n\
-             [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n\
+            "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                          [programs.ay]\nrepo = \"ay\"\n[programs.ny]\nrepo = \"ny\"\n\
              [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
              {yanked_toml}pin = {{ ay = 18, ny = 9 }}\n",
-            rk = pk(&RELEASE_SEED)
+            attr = attribution()
         );
         Fake {
             index: index_body.clone().into_bytes(),
-            index_sig: sign(&ROOT_SEED, index_body.as_bytes()),
+            index_sig: sign(&RELEASE_SEED, index_body.as_bytes()),
             pkg,
             archives,
         }
@@ -2599,7 +3368,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert_eq!(report.build, 18);
         assert!(
             report
@@ -2629,7 +3398,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(
             crate::ops::which(&layout, "ay").is_some(),
             "ay still installs"
@@ -2660,7 +3429,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(crate::ops::which(&layout, "ay").is_some());
         assert!(
             report
@@ -2684,7 +3453,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        install(&fake, &layout, &pk(&ROOT_SEED), &ny, 0, 0).unwrap();
+        install(&fake, &layout, &anchor(), &ny, fl(0), 0).unwrap();
         // Now ay requires ny, which is already active.
         let ay = InstallRequest {
             channel: "stable",
@@ -2692,7 +3461,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &ay, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &ay, fl(0), 0).unwrap();
         assert!(
             report
                 .dependencies
@@ -2715,7 +3484,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         // No infinite recursion: ay completes, both active, the back-edge is a cycle skip.
         assert!(crate::ops::which(&layout, "ay").is_some());
         assert!(crate::ops::which(&layout, "ny").is_some());
@@ -2740,7 +3509,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let report = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert!(
             !report.tree_root.is_empty(),
             "the signed tree_root is recorded"
@@ -2762,7 +3531,7 @@ mod tests {
         std::fs::write(
             layout.link_marker(program),
             format!(
-                "schema = 1\nprogram = \"{program}\"\ncheckout = \"/nonexistent\"\nbins = []\n"
+                "schema = 2\nprogram = \"{program}\"\ncheckout = \"/nonexistent\"\nbins = []\n"
             ),
         )
         .unwrap();
@@ -2781,7 +3550,7 @@ mod tests {
             triple: TRIPLE,
             installed: None,
         };
-        let err = install(&fake, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(matches!(err, FlowError::Linked(_)), "got {err:?}");
         assert!(
             crate::ops::which(&layout, "ay").is_none(),
@@ -2802,11 +3571,11 @@ mod tests {
         let report = apply_channel(
             &fake,
             &layout,
-            &pk(&ROOT_SEED),
+            &anchor(),
             "stable",
             TRIPLE,
             &installed,
-            0,
+            fl(0),
             0,
         )
         .unwrap();
@@ -2825,17 +3594,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A [`Fake`] wrapper whose index fetch can be toggled to fail, with a controllable
-    /// `source_id` (to exercise the same-source cache guard).
+    /// A [`Fake`] wrapper whose index fetch can be toggled to fail — or to succeed
+    /// EMPTY (the pushed-off-the-page listing) — with a controllable `source_id`
+    /// (to exercise the same-source cache guard + the empty-success fallback).
     struct FlakyFake {
         inner: Fake,
         fail: std::cell::Cell<bool>,
+        empty: std::cell::Cell<bool>,
         source: String,
+    }
+    impl FlakyFake {
+        fn new(inner: Fake, source: &str) -> Self {
+            Self {
+                inner,
+                fail: std::cell::Cell::new(false),
+                empty: std::cell::Cell::new(false),
+                source: source.into(),
+            }
+        }
     }
     impl Fetcher for FlakyFake {
         fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
             if self.fail.get() {
                 Err("network down".into())
+            } else if self.empty.get() {
+                Ok(vec![])
             } else {
                 self.inner.index_candidates()
             }
@@ -2860,11 +3643,7 @@ mod tests {
     fn cached_index_is_used_only_on_same_source_fetch_failure() {
         let dir = scratch("cache-fallback");
         let layout = layout(&dir);
-        let f = FlakyFake {
-            inner: fixture(&dir),
-            fail: std::cell::Cell::new(false),
-            source: "src:A".into(),
-        };
+        let f = FlakyFake::new(fixture(&dir), "src:A");
         let req = InstallRequest {
             channel: "stable",
             program: "ay",
@@ -2872,17 +3651,14 @@ mod tests {
             installed: None,
         };
         // 1. A good fetch installs AND caches the index under source "src:A".
-        install(&f, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
         // 2. Fetch now fails, SAME source → the install is served from the cache.
         f.fail.set(true);
-        install(&f, &layout, &pk(&ROOT_SEED), &req, 0, 0).expect("cache fallback serves the index");
+        install(&f, &layout, &anchor(), &req, fl(0), 0).expect("cache fallback serves the index");
         // 3. A DIFFERENT source with a failing fetch has no cache → NoIndex.
-        let f2 = FlakyFake {
-            inner: fixture(&dir),
-            fail: std::cell::Cell::new(true),
-            source: "src:B".into(),
-        };
-        let err = install(&f2, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap_err();
+        let f2 = FlakyFake::new(fixture(&dir), "src:B");
+        f2.fail.set(true);
+        let err = install(&f2, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(
             matches!(err, FlowError::NoIndex),
             "a dir: cache never satisfies a github: fetch"
@@ -2890,15 +3666,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // An EMPTY listing success is a fetch that FOUND nothing — the index tag pushed off
+    // the release page by app-release cadence, a repo with no index release — and must
+    // take the SAME §14 same-source fallback as a hard Err. Before the fix, Ok(empty)
+    // bypassed the fallback into a repo-wide NoIndex while a good cache sat on disk.
+    #[test]
+    fn empty_candidates_success_takes_the_same_source_cache_fallback() {
+        let dir = scratch("cache-empty");
+        let layout = layout(&dir);
+        let f = FlakyFake::new(fixture(&dir), "src:A");
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        // 1. A good fetch installs AND caches under "src:A".
+        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        // 2. The listing now succeeds EMPTY, SAME source → served from the cache.
+        f.empty.set(true);
+        install(&f, &layout, &anchor(), &req, fl(0), 0)
+            .expect("an empty success falls back to the last-good cache");
+        // 3. Empty success + no cache (fresh store, different source) → NoIndex.
+        let dir2 = scratch("cache-empty-fresh");
+        let fresh_layout = super::tests::layout(&dir2);
+        let f2 = FlakyFake::new(fixture(&dir2), "src:B");
+        f2.empty.set(true);
+        let err = install(&f2, &fresh_layout, &anchor(), &req, fl(0), 0).unwrap_err();
+        assert!(matches!(err, FlowError::NoIndex), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    // §14 CACHE KEYED OFF THE NETWORK LEG ONLY (the cache-masking tooth, 2026-07-30):
+    // chaining a seed dir must not let a seed-leg success rewrite the cache. Network
+    // leg DOWN → the resolve succeeds from the seed but writes NO cache; network leg
+    // UP → the cache holds the NETWORK candidates under the NETWORK source id, so the
+    // post-seed plain-network path falls back to the very same cache.
+    #[test]
+    fn chain_cache_is_keyed_off_the_network_leg_only() {
+        let dir = scratch("chain-cache");
+        let fake = fixture(&dir);
+        // The seed leg: the fixture laid out as a dir registry.
+        let reg = dir.join("seed-reg");
+        std::fs::create_dir_all(&reg).unwrap();
+        std::fs::write(reg.join("index.toml"), &fake.index).unwrap();
+        std::fs::write(reg.join("index.toml.sig"), &fake.index_sig).unwrap();
+        // A `dir:` registry publishes the master-signed roster too, exactly as a release
+        // does: index without the generation that authorized its signer is not a registry.
+        let (rb, rs) = testkit::published_roster();
+        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_ASSET), &rb).unwrap();
+        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_SIG_ASSET), &rs).unwrap();
+        let (raw, sig) = fake.pkg.get(&("ay".to_string(), 18u64)).unwrap();
+        std::fs::write(reg.join("pkg-ay-18.toml"), raw).unwrap();
+        std::fs::write(reg.join("pkg-ay-18.toml.sig"), sig).unwrap();
+        std::fs::copy(
+            fake.archives.get("ay-18.tar.zst").unwrap(),
+            reg.join("ay-18.tar.zst"),
+        )
+        .unwrap();
+        let layout = layout(&dir);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let cache = crate::cache::IndexCache::new(layout.prefix.join("index-cache.toml"));
+        // 1. Network DOWN, seed serves: the install succeeds via the seed leg…
+        let down = FlakyFake::new(fixture(&dir), "github:t/aterm");
+        down.fail.set(true);
+        let chain = crate::net::ChainFetcher::new(
+            Box::new(down),
+            Box::new(crate::net::DirFetcher::new(reg.clone())),
+        );
+        install(&chain, &layout, &anchor(), &req, fl(0), 0)
+            .expect("the seed leg serves the bootstrap");
+        // …but writes NO cache: a seed success must not mask the network failure.
+        assert!(
+            cache.load("github:t/aterm").is_none(),
+            "no network cache from a seed-leg success"
+        );
+        assert!(
+            cache.load(&chain.source_id()).is_none(),
+            "no chain-id cache either"
+        );
+        // 2. Network UP: the cache holds the NETWORK leg's candidates, network id.
+        let chain_up = crate::net::ChainFetcher::new(
+            Box::new(FlakyFake::new(fixture(&dir), "github:t/aterm")),
+            Box::new(crate::net::DirFetcher::new(reg.clone())),
+        );
+        install(&chain_up, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        let cached = cache
+            .load("github:t/aterm")
+            .expect("network candidates cached under the NETWORK id");
+        assert_eq!(cached.len(), 1, "the seed leg's candidate is not absorbed");
+        assert_eq!(
+            cached[0].label, "v0",
+            "the network leg's candidate, not the dir leg's"
+        );
+        // 3. The plain-network path (same id, seed no longer chained) falls back to it.
+        let plain = FlakyFake::new(fixture(&dir), "github:t/aterm");
+        plain.fail.set(true);
+        install(&plain, &layout, &anchor(), &req, fl(0), 0)
+            .expect("the §14 fallback serves the plain-network path from the chain-written cache");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn stale_cached_index_is_still_refused() {
         let dir = scratch("cache-stale");
         let layout = layout(&dir);
-        let f = FlakyFake {
-            inner: fixture(&dir),
-            fail: std::cell::Cell::new(false),
-            source: "src:A".into(),
-        };
+        let f = FlakyFake::new(fixture(&dir), "src:A");
         let req = InstallRequest {
             channel: "stable",
             program: "ay",
@@ -2907,14 +3786,14 @@ mod tests {
         };
         // A `now` past valid_until: even a good fetch is refused Stale — but the bytes are cached.
         assert!(matches!(
-            install(&f, &layout, &pk(&ROOT_SEED), &req, 0, 2_000_000_000),
+            install(&f, &layout, &anchor(), &req, fl(0), 2_000_000_000),
             Err(FlowError::Stale)
         ));
         // The fetch now fails → fallback to the cached bytes, which are STILL past valid_until.
         f.fail.set(true);
         assert!(
             matches!(
-                install(&f, &layout, &pk(&ROOT_SEED), &req, 0, 2_000_000_000),
+                install(&f, &layout, &anchor(), &req, fl(0), 2_000_000_000),
                 Err(FlowError::Stale)
             ),
             "freshness still gates cached bytes"
@@ -2930,6 +3809,11 @@ mod tests {
         std::fs::create_dir_all(&reg).unwrap();
         std::fs::write(reg.join("index.toml"), &fake.index).unwrap();
         std::fs::write(reg.join("index.toml.sig"), &fake.index_sig).unwrap();
+        // A `dir:` registry publishes the master-signed roster too, exactly as a release
+        // does: index without the generation that authorized its signer is not a registry.
+        let (rb, rs) = testkit::published_roster();
+        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_ASSET), &rb).unwrap();
+        std::fs::write(reg.join(aterm_update_core::roster::ROSTER_SIG_ASSET), &rs).unwrap();
         let (raw, sig) = fake.pkg.get(&("ay".to_string(), 18u64)).unwrap();
         std::fs::write(reg.join("pkg-ay-18.toml"), raw).unwrap();
         std::fs::write(reg.join("pkg-ay-18.toml.sig"), sig).unwrap();
@@ -2947,7 +3831,7 @@ mod tests {
             installed: None,
         };
         // dir bytes pass the identical verify + floor + freshness + shim gate.
-        let report = install(&df, &layout, &pk(&ROOT_SEED), &req, 0, 0).unwrap();
+        let report = install(&df, &layout, &anchor(), &req, fl(0), 0).unwrap();
         assert_eq!(report.build, 18);
         assert_eq!(
             crate::ops::which(&layout, "ay").unwrap(),
@@ -2959,7 +3843,7 @@ mod tests {
         );
         // Wrong root key ⇒ NoIndex (verify-before-parse intact even offline).
         let df2 = crate::net::DirFetcher::new(reg);
-        let err = install(&df2, &layout, &pk(&RELEASE_SEED), &req, 0, 0).unwrap_err();
+        let err = install(&df2, &layout, &anchor_of(&RELEASE_SEED), &req, fl(0), 0).unwrap_err();
         assert!(
             matches!(err, FlowError::NoIndex),
             "wrong root refuses the dir index"
@@ -3004,6 +3888,7 @@ mod tests {
             build_dir: b19,
             exposes: vec![tool("ay")],
             prior_build: Some(18),
+            was_live: false,
             reloc: None,
             tree_root: String::new(),
         };
@@ -3045,6 +3930,7 @@ mod tests {
             build_dir: b19,
             exposes: vec![tool("ay")],
             prior_build: Some(18),
+            was_live: false,
             reloc: None,
             tree_root: String::new(),
         };
@@ -3076,6 +3962,7 @@ mod tests {
             build_dir: b19,
             exposes: vec![tool("ay")],
             prior_build: None,
+            was_live: false,
             reloc: None,
             tree_root: String::new(),
         };
@@ -3085,5 +3972,71 @@ mod tests {
             "no witness link survives a failed fresh install"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // THE CLOCK. A clock we cannot read must refuse everything, never admit everything.
+    // ---------------------------------------------------------------------------------
+
+    /// An unreadable clock yields `i64::MAX`, not `0`.
+    ///
+    /// This value drives the ROSTER's `valid_until` and every machine's `not_after`, and
+    /// zero reads as 1970 — before every conceivable deadline — so it would ADMIT a roster
+    /// generation that lapsed years ago and treat an expired machine as live. Roster
+    /// freshness is the only defence a fresh install has (it carries no floor), so this is
+    /// the one direction that must not invert.
+    ///
+    /// The error is a REAL `SystemTimeError`, not a stand-in: `UNIX_EPOCH.duration_since(now)`
+    /// fails on any post-1970 clock, which the first assertion states as a precondition so
+    /// the test cannot pass by never reaching the fallback.
+    #[test]
+    fn an_unreadable_clock_fails_closed_rather_than_reading_as_1970() {
+        let err = std::time::UNIX_EPOCH.duration_since(std::time::SystemTime::now());
+        assert!(
+            err.is_err(),
+            "precondition: this machine's clock is after 1970, so we really do have a \
+             SystemTimeError to feed the fallback"
+        );
+        assert_eq!(
+            unix_or_fail_closed(err),
+            i64::MAX,
+            "an unreadable clock must make every window look EXPIRED"
+        );
+        // NON-VACUITY: the readable path is unaffected and still returns the real second.
+        let ok = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        assert!(unix_or_fail_closed(ok) > 1_700_000_000);
+    }
+
+    /// ...and the direction MATTERS, proved on the gate itself rather than on the constant:
+    /// the same lapsed roster is REFUSED under the fail-closed sentinel and ADMITTED under
+    /// the old `0`.
+    ///
+    /// MUTATION: put `.unwrap_or(0)` back in `unix_or_fail_closed` and the first assertion
+    /// here still passes (it uses the literal), but `now_unix`'s callers start behaving like
+    /// the second — which is why this test asserts BOTH readings of the same bytes.
+    #[test]
+    fn the_clock_sentinel_is_what_refuses_a_lapsed_roster() {
+        let mut r = testkit::roster();
+        r.valid_until = "2020-01-01T00:00:00Z".into();
+        let bytes = r.to_toml().expect("a valid roster emits").into_bytes();
+        let sig = testkit::sign(&testkit::MASTER_SEED, &bytes);
+        let anchor = anchor();
+
+        assert_eq!(
+            crate::sig::admit_roster(&anchor, bytes.clone(), &sig, i64::MAX).err(),
+            Some(crate::sig::Reject::Stale),
+            "the fail-closed sentinel refuses a roster whose window lapsed"
+        );
+        assert!(
+            crate::sig::admit_roster(&anchor, bytes.clone(), &sig, 0).is_ok(),
+            "precondition: 0 really would have admitted it — that is the bug this guards"
+        );
+        // NON-VACUITY: the identical pair is admitted inside its window, so the refusal
+        // above is the clock and not the fixture.
+        let mut live = testkit::roster();
+        live.valid_until = "2099-01-01T00:00:00Z".into();
+        let live_bytes = live.to_toml().unwrap().into_bytes();
+        let live_sig = testkit::sign(&testkit::MASTER_SEED, &live_bytes);
+        assert!(crate::sig::admit_roster(&anchor, live_bytes, &live_sig, testkit::NOW).is_ok());
     }
 }

@@ -57,8 +57,10 @@ pub mod color_math;
 /// tile, handed to the shared cat atlas through `CatBaker::host_tile` — the
 /// [`pet_baker`] pattern applied to the typed-word dog cameo.
 pub mod dog_baker;
-/// The typed-word DOG cameo — the canine twin of the typed-"kitty" summon's
-/// hello: lifecycle envelope, breed/coat roll, and the happy entry bounce.
+/// The typed-word DOG cameo — the visitor that trots up when you type `dog`
+/// past the typed-a-lot gate: lifecycle envelope, breed/coat roll, and the
+/// happy entry bounce. The feline family has no such toy: an on-screen cat
+/// word grows the ambient word-cat that already lives in the text.
 pub mod dog_cameo;
 /// `@generated` — the checked-in const drawlists for the DOG roster (do not edit
 /// by hand). Produced by `cargo run -p aterm-effects --example gen_dog_glyphs`;
@@ -81,10 +83,6 @@ mod effect_util;
 /// Hardened, bounded file admission shared by every native visual-feed loader.
 pub mod file_feed;
 pub mod genome;
-/// THE TYPED-KITTY CAMEO — the standalone toy that appears where you typed the
-/// word. Deliberately not the cursor escort ([`kitty_cursor`]): owner, 2026-08-09,
-/// "when I type 'kitty' … I want THE kitty to appear".
-pub mod kitty_cameo;
 /// The rainbow kitty that flies in front of the cursor on the `rainbow kitty`
 /// trail style — its art, pose, and exit choreography.
 pub mod kitty_cursor;
@@ -113,6 +111,21 @@ pub mod pet_glyphs_gen {
     include!("pet_glyphs_gen.rs");
 }
 pub mod pipeline;
+/// The chrome-walking helper ROBOT (Robi, from the user's Nitro Keyboard game):
+/// the clockless show engine — walks the prompt line, climbs a ladder, swings
+/// the tab bar like monkey bars, does jumping jacks, and hands out tips.
+pub mod robi;
+/// The Robi roster's bake path: one authored robot pose → an exact-size RGBA
+/// tile, handed to the shared cat atlas through `CatBaker::host_tile` — the
+/// [`pet_baker`] pattern applied to the helper robot's animation frames.
+pub mod robi_baker;
+/// `@generated` — the checked-in const drawlists for the ROBI roster (do not
+/// edit by hand). Produced by `cargo run -p aterm-effects --example
+/// gen_robi_glyphs`; kept honest by the `robi_glyphs_gen_matches_assets` drift
+/// test. `include!`d for the same reason [`cat_glyphs_gen`] is.
+pub mod robi_glyphs_gen {
+    include!("robi_glyphs_gen.rs");
+}
 pub mod spec;
 pub mod supernova;
 /// Tone-of-typing — the tiny hashed-char-n-gram neural classifier that turns

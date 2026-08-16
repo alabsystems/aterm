@@ -26,8 +26,9 @@ use crate::native_app::{
 };
 use crate::native_ui::{
     ActionId, AuditedCustomNode, ButtonIcon, ButtonSpec, Control, ControlState, GroupSpec, Insets,
-    Layout, Length, LogicalRect, RichTextSpec, SemanticRole, SemanticValue, SliderSpec, StyleRef,
-    SwitchSpec, TAB_COLOR_WHEEL_AUDIT, TextFieldSpec, TextSpec, UiContent, UiKey, UiNode, UiTree,
+    Layout, Length, LogicalRect, RAINBOW_BANNER_AUDIT, RichTextSpec, SemanticRole, SemanticValue,
+    SliderSpec, StyleRef, SwitchSpec, TAB_COLOR_WHEEL_AUDIT, TextFieldSpec, TextSpec, UiContent,
+    UiKey, UiNode, UiTree,
 };
 use crate::packages_screen::{PackagesBusy, PackagesProjection, PackagesState};
 use crate::prefs::{self, EditField, EditKind, Section};
@@ -51,6 +52,12 @@ pub(crate) enum SettingsRoute {
     Appearance,
     TextFonts,
     CursorMotion,
+    /// The CURSOR KITTY's own page (owner ask, 2026-08-10). The walking pet is
+    /// the shipped default now, and the only way to reach it was a ten-option
+    /// popup on a page that also owns bloom radius and the Sound menu. This
+    /// route renders the companion choice over its live cursor preview plus the
+    /// [`Section::CursorKitty`] registry rows.
+    CursorKitty,
     WindowTabs,
     /// The selected-tab color spectrum (HSV wheel + hex + the "Transparent
     /// white" reset) — a SPECIAL page over the ONE `active_tab_color` key.
@@ -67,7 +74,7 @@ pub(crate) enum SettingsRoute {
 }
 
 impl SettingsRoute {
-    pub(crate) const ALL: [Self; 15] = [
+    pub(crate) const ALL: [Self; 16] = [
         Self::Home,
         Self::Modified,
         Self::Manual,
@@ -75,6 +82,7 @@ impl SettingsRoute {
         Self::Wallpaper,
         Self::TextFonts,
         Self::CursorMotion,
+        Self::CursorKitty,
         Self::WindowTabs,
         Self::TabColor,
         Self::KeyboardInput,
@@ -93,6 +101,7 @@ impl SettingsRoute {
             Self::Appearance => "/appearance",
             Self::TextFonts => "/text-fonts",
             Self::CursorMotion => "/cursor-motion",
+            Self::CursorKitty => "/cursor-kitty",
             Self::WindowTabs => "/window-tabs",
             Self::TabColor => "/tab-color",
             Self::Wallpaper => "/wallpaper",
@@ -113,6 +122,7 @@ impl SettingsRoute {
             Self::Appearance => "Appearance",
             Self::TextFonts => "Text & Fonts",
             Self::CursorMotion => "Cursor & Motion",
+            Self::CursorKitty => "Cursor Kitty",
             Self::WindowTabs => "Window",
             Self::TabColor => "Tab Color",
             Self::Wallpaper => "Wallpaper",
@@ -134,6 +144,7 @@ impl SettingsRoute {
             Self::Appearance => Some(Section::Appearance),
             Self::TextFonts => Some(Section::Typography),
             Self::CursorMotion => Some(Section::Cursor),
+            Self::CursorKitty => Some(Section::CursorKitty),
             Self::WindowTabs => Some(Section::Window),
             Self::KeyboardInput => Some(Section::Input),
             Self::Terminal => Some(Section::Terminal),
@@ -141,7 +152,7 @@ impl SettingsRoute {
             // Packages and Tab Color are SPECIAL pages (each renders its own
             // rows over its key(s)); their registry fields stay owned by the
             // ordinary sections, so Search + Modified still find them without
-            // a page double-listing them. (The Game Fonts toggles ride the
+            // a page double-listing them. (The Display Faces toggles ride the
             // Text & Fonts page's showcase slot, not a route of their own.)
             Self::Home
             | Self::Modified
@@ -1557,8 +1568,7 @@ impl SettingsApp {
             // The Wallpaper page's calling card: arriving with NO wallpaper
             // attached opens the system picker right away (the page still
             // offers the button, and cancel simply leaves the page showing).
-            if route == SettingsRoute::Wallpaper
-                && view.raw_value(prefs::EDIT_WALLPAPER).is_none()
+            if route == SettingsRoute::Wallpaper && view.raw_value(prefs::EDIT_WALLPAPER).is_none()
             {
                 cx.choose_wallpaper_image();
             }
@@ -1710,24 +1720,24 @@ impl SettingsApp {
             return EventResult::Handled;
         }
 
-        // Game Fonts page: five mutually-exclusive toggles over the ONE
-        // `game_font` key. Turning a game ON writes its id (which inherently
-        // turns every other game off — there is only one key); turning the
-        // active game OFF clears the key, restoring the default font. A single
+        // Display Faces card: mutually-exclusive toggles over the ONE
+        // `display_font` key. Turning a face ON writes its id (which inherently
+        // turns every other face off — there is only one key); turning the
+        // active face OFF clears the key, restoring the default font. A single
         // ConfigEdit with the optimistic-concurrency guard, like every write.
-        if let Some(id) = action.strip_prefix("settings/game-font/") {
-            if !prefs::GAME_FONT_OPTIONS.contains(&id) {
+        if let Some(id) = action.strip_prefix("settings/display-face/") {
+            if !prefs::DISPLAY_FONT_OPTIONS.contains(&id) {
                 return EventResult::Handled;
             }
-            if Self::reject_pending_key(view, prefs::EDIT_GAME_FONT, cx) {
+            if Self::reject_pending_key(view, prefs::EDIT_DISPLAY_FONT, cx) {
                 return EventResult::Handled;
             }
-            let current = view.raw_value(prefs::EDIT_GAME_FONT);
-            // MIX semantics: the key holds 1..=GAME_FONT_MIX_MAX `+`-joined ids
+            let current = view.raw_value(prefs::EDIT_DISPLAY_FONT);
+            // MIX semantics: the key holds 1..=DISPLAY_FACE_MIX_MAX `+`-joined ids
             // in toggle order. Toggling ON appends (the OLDEST id yields when a
             // fourth comes on); toggling OFF removes just that id; the last id
             // off clears the key back to the regular font.
-            let mut ids = game_font_ids(current.as_deref());
+            let mut ids = display_font_ids(current.as_deref());
             let currently_on = ids.iter().any(|on| on == id);
             let desired_on = match invocation.value.as_ref() {
                 Some(SemanticInput::Bool(value)) => *value,
@@ -1735,7 +1745,7 @@ impl SettingsApp {
             };
             if desired_on && !currently_on {
                 ids.push(id.to_string());
-                while ids.len() > aterm_render::GAME_FONT_MIX_MAX {
+                while ids.len() > aterm_render::DISPLAY_FACE_MIX_MAX {
                     ids.remove(0);
                 }
             } else if !desired_on {
@@ -1744,7 +1754,7 @@ impl SettingsApp {
             let patch = ConfigPatch {
                 base_revision: self.config_revision,
                 edits: vec![ConfigEdit {
-                    key: prefs::EDIT_GAME_FONT.to_string(),
+                    key: prefs::EDIT_DISPLAY_FONT.to_string(),
                     expected: ExpectedConfigValue::Exact(current),
                     value: (!ids.is_empty()).then(|| ids.join("+")),
                 }],
@@ -1752,7 +1762,7 @@ impl SettingsApp {
             let operation = cx.config_patch(patch.clone());
             view.pending.insert(operation, PendingAction::Config(patch));
             view.feedback = Some("Applying…".to_string());
-            view.common.last_focus = Some(UiKey::new(format!("settings/game-font/{id}")));
+            view.common.last_focus = Some(UiKey::new(format!("settings/display-face/{id}")));
             cx.repaint(crate::native_app::DamageRegion::All);
             return EventResult::Handled;
         }
@@ -3087,7 +3097,18 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // `cfg.intensity` on all three — it was simply unreachable outside
         // Manual, so a user whose only complaint is "too bright" had no slider
         // to move and had to file a bug instead.
-        | prefs::EDIT_CURSOR_TRAIL_INTENSITY => Some(Effect::CursorAndMotion),
+        | prefs::EDIT_CURSOR_TRAIL_INTENSITY
+        // THE RAINBOW WAKE dial (2026-08-10, with the walking pet becoming the
+        // shipped default). Same audit finding as the intensity slider one line
+        // up, and for the same reason: it already ships, it is already consumed
+        // every frame — `Config::cursor_trail_wake_persist_or_default` →
+        // `CursorGlowInputs::wake_persist_s` → `GlowConfig::wake_persist_s`,
+        // which `cursor_glow` reads when it lays the typing plume — it is
+        // clamped 0..=1500 ms at the resolver, and it was reachable only by
+        // hand-editing `aterm.toml`. It is also the ONLY tuning knob that
+        // belongs to the cat rather than to the trail engine, so a Cursor Kitty
+        // page without it would be a page with nothing on it but a picker.
+        | prefs::EDIT_CURSOR_TRAIL_WAKE_MS => Some(Effect::CursorAndMotion),
         prefs::EDIT_WINDOW_PADDING | prefs::EDIT_WINDOW_PADDING_TOP => Some(Effect::WindowRuntime),
         prefs::EDIT_SCROLLBACK
         | prefs::EDIT_SEARCH_HISTORY_LINES
@@ -4243,6 +4264,7 @@ fn preview_route_for_key(key: &str) -> Option<SettingsRoute> {
         Section::Appearance => Some(SettingsRoute::Appearance),
         Section::Typography => Some(SettingsRoute::TextFonts),
         Section::Cursor => Some(SettingsRoute::CursorMotion),
+        Section::CursorKitty => Some(SettingsRoute::CursorKitty),
         Section::Window => Some(SettingsRoute::WindowTabs),
         _ => None,
     }
@@ -4661,7 +4683,9 @@ fn renderer_preview_spec_for_key_with_font(
     let mut spec = match route {
         SettingsRoute::Appearance => SettingsPreviewSpec::appearance(font_px),
         SettingsRoute::TextFonts => SettingsPreviewSpec::typography(font_px),
-        SettingsRoute::CursorMotion => SettingsPreviewSpec::cursor(cursor.clone()),
+        SettingsRoute::CursorMotion | SettingsRoute::CursorKitty => {
+            SettingsPreviewSpec::cursor(cursor.clone())
+        }
         SettingsRoute::WindowTabs => SettingsPreviewSpec::window_tabs(
             WindowTabsPreviewSpec {
                 columns: preview_field_number(state, prefs::EDIT_COLUMNS, 80_usize),
@@ -4693,7 +4717,7 @@ fn renderer_preview_spec_for_key_with_font(
     spec.scene = match route {
         SettingsRoute::Appearance => PreviewScene::Appearance,
         SettingsRoute::TextFonts => PreviewScene::Typography,
-        SettingsRoute::CursorMotion => PreviewScene::CursorMotion,
+        SettingsRoute::CursorMotion | SettingsRoute::CursorKitty => PreviewScene::CursorMotion,
         SettingsRoute::WindowTabs => PreviewScene::WindowTabs,
         _ => return None,
     };
@@ -4702,7 +4726,10 @@ fn renderer_preview_spec_for_key_with_font(
     // their `PreviewAnimation::None` contract is also pixel-true. Overwriting
     // that cursor here made their pixels cross blink edges without changing
     // the retained fingerprint or arming the scheduler.
-    if route == SettingsRoute::CursorMotion {
+    if matches!(
+        route,
+        SettingsRoute::CursorMotion | SettingsRoute::CursorKitty
+    ) {
         spec.cursor = cursor;
     }
     let focused_value = {
@@ -4843,19 +4870,31 @@ fn group_heading_height() -> f32 {
     28.0 + group_heading_label_height()
 }
 
+/// The AIRY rail's route-row FLOOR. Its ceiling is the 32pt rhythm; like the
+/// dense rail's 24pt floor this exists so that ADDING A ROUTE costs a few points
+/// of row height instead of collapsing the whole Settings surface to the compact
+/// category sheet. Without it the airy rail was a fixed 32pt row and its total
+/// requirement grew by exactly one row per route, so each new destination
+/// silently demoted a band of window heights to Compact — the 2026-08-10 Cursor
+/// Kitty route moved that band's edge from 680pt to 714pt at 1×, and the earlier
+/// 13-route growth had done the same thing higher up.
+fn airy_navigation_route_floor(scale: f32) -> f32 {
+    28.0_f32.max(22.0 * scale)
+}
+
 fn persistent_navigation_fits(width: SettingsWidth, height: f32) -> bool {
     debug_assert_ne!(width, SettingsWidth::Compact);
     let scale = settings_text_scale();
-    // Mirror the exact lower bounds authored by `navigation`: the dense rail
-    // derives its row height from the remaining budget and compresses toward
-    // a 24pt dense-list floor before any clipping would be accepted, so the
-    // rail is viable exactly when its fixed chrome, every route, and every
-    // inter-child gap fit. Below that floor the compact category toolbar is
-    // more usable than a squeezed labeled sidebar. The dense threshold is the
-    // SAME `< 700` edge the `navigation` builder densifies at — the fit test
-    // must judge the rail the builder would actually draw (a stricter 620 here
-    // silently went Compact for 620–700pt windows once the rail grew past 13
-    // routes, while the builder's dense rail would have fit them fine).
+    // Mirror the exact lower bounds authored by `navigation`: BOTH rails derive
+    // their row height from the remaining budget and compress toward a floor
+    // before any clipping would be accepted, so a rail is viable exactly when
+    // its fixed chrome, every route at that floor, and every inter-child gap
+    // fit. Below the floor the compact category toolbar is more usable than a
+    // squeezed labeled sidebar. The dense threshold is the SAME `< 700` edge the
+    // `navigation` builder densifies at — the fit test must judge the rail the
+    // builder would actually draw (a stricter 620 here silently went Compact for
+    // 620–700pt windows once the rail grew past 13 routes, while the builder's
+    // dense rail would have fit them fine).
     let dense = height < 700.0;
     let (vertical_padding, title, search, section, gap, route, sections) = if dense {
         let floor = 24.0_f32.max(20.0 * scale);
@@ -4884,7 +4923,7 @@ fn persistent_navigation_fits(width: SettingsWidth, height: f32) -> bool {
             })
             .max(14.0 * scale),
             2.0,
-            32.0_f32.max(24.0 * scale),
+            airy_navigation_route_floor(scale),
             4.0,
         )
     };
@@ -5984,7 +6023,26 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
             32.0_f32.max(24.0 * text_scale),
         )
     } else {
-        32.0_f32.max(24.0 * text_scale)
+        // The AIRY rail compresses the same way, for the same reason: a fixed
+        // 32pt row made the rail's total requirement grow by exactly one row per
+        // route, so every new destination demoted a band of window heights to
+        // the compact category sheet. Its four section eyebrows and full labels
+        // stay; only the rhythm gives, down to
+        // [`airy_navigation_route_floor`] — the bound
+        // `persistent_navigation_fits` judges it by.
+        let section_labels = 4.0;
+        // Title + search + the four eyebrows + the route rows, one gap between
+        // each child.
+        let child_gaps = routes + section_labels + 1.0;
+        let fixed = vertical_padding * 2.0
+            + title_height
+            + search_height
+            + section_labels * section_height
+            + child_gaps * gap;
+        ((available_height - fixed) / routes).clamp(
+            airy_navigation_route_floor(text_scale),
+            32.0_f32.max(24.0 * text_scale),
+        )
     };
 
     let mut items = Vec::new();
@@ -6020,6 +6078,7 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
                 SettingsRoute::Wallpaper,
                 SettingsRoute::TextFonts,
                 SettingsRoute::CursorMotion,
+                SettingsRoute::CursorKitty,
             ],
         ),
         (
@@ -6043,10 +6102,14 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
     ];
     for (section, routes) in sections {
         if !dense && !section.is_empty() {
+            // Accent micro-labels: the rail's section structure is the one
+            // place chrome may wear the theme accent at rest — it turns the
+            // sidebar from a flat list into a legible map without spending a
+            // single extra point of height.
             let content = UiContent::Text(TextSpec {
                 text: (*section).to_string(),
                 role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
+                style: StyleRef::Accent,
             });
             items.push(
                 UiNode::new(
@@ -6069,6 +6132,7 @@ fn navigation(state: &SettingsViewState, width: SettingsWidth, available_height:
                     SettingsRoute::Appearance => "Appearance",
                     SettingsRoute::TextFonts => "Fonts",
                     SettingsRoute::CursorMotion => "Cursor",
+                    SettingsRoute::CursorKitty => "Kitty",
                     SettingsRoute::WindowTabs => "Window",
                     SettingsRoute::TabColor => "Tab Color",
                     SettingsRoute::Wallpaper => "Wallpaper",
@@ -6139,6 +6203,7 @@ const fn route_icon(route: SettingsRoute) -> ButtonIcon {
         SettingsRoute::Appearance => ButtonIcon::Appearance,
         SettingsRoute::TextFonts => ButtonIcon::Text,
         SettingsRoute::CursorMotion => ButtonIcon::Cursor,
+        SettingsRoute::CursorKitty => ButtonIcon::Cursor,
         SettingsRoute::WindowTabs => ButtonIcon::Window,
         SettingsRoute::TabColor => ButtonIcon::Appearance,
         SettingsRoute::Wallpaper => ButtonIcon::Appearance,
@@ -8212,22 +8277,24 @@ fn top_settings_landscape_section(
     )
 }
 
-/// The Game Fonts page: five mutually-exclusive toggles over the ONE
-/// `game_font` key — one bundled open-licensed face per famous title screen.
+/// The Display Faces card: mutually-exclusive toggles over the ONE
+/// `display_font` key — one bundled, openly-licensed display face per row.
 /// Turning one on turns the previous one off (a single key can hold a single
-/// id); all off restores the default font. See [`aterm_render::GAME_FONTS`].
+/// id); all off restores the default font. See [`aterm_render::DISPLAY_FACES`].
 ///
-/// The ACTIVE game-font ids from the raw `game_font` value, in toggle order:
-/// splits the `+`-joined MIX form, keeps only real bundled ids (never "off"),
-/// deduplicates, and caps at [`aterm_render::GAME_FONT_MIX_MAX`] — the same
-/// normalization `Config::font_family_request` applies, so the toggles always
-/// reflect what actually renders.
-fn game_font_ids(raw: Option<&str>) -> Vec<String> {
+/// The ACTIVE ids from the raw `display_font` value, in toggle order: splits the
+/// `+`-joined MIX form, CANONICALIZES each part (so a config still spelling a
+/// face `minecraft` lights the `pixel` toggle rather than none of them), keeps
+/// only real bundled ids (never "off"), deduplicates, and caps at
+/// [`aterm_render::DISPLAY_FACE_MIX_MAX`] — the same normalization
+/// `Config::font_family_request` applies, so the toggles always reflect what
+/// actually renders.
+fn display_font_ids(raw: Option<&str>) -> Vec<String> {
     let mut ids: Vec<String> = Vec::new();
-    for id in raw.unwrap_or_default().split('+').map(str::trim) {
-        if aterm_render::game_font_bytes(id).is_some()
+    for id in raw.unwrap_or_default().split('+') {
+        if let Some(id) = aterm_render::display_face_canonical_id(id)
             && !ids.iter().any(|seen| seen == id)
-            && ids.len() < aterm_render::GAME_FONT_MIX_MAX
+            && ids.len() < aterm_render::DISPLAY_FACE_MIX_MAX
         {
             ids.push(id.to_string());
         }
@@ -8238,23 +8305,23 @@ fn game_font_ids(raw: Option<&str>) -> Vec<String> {
 /// Sits below the live preview on the Text & Fonts page (Medium/Wide);
 /// Compact keeps the registry popup row instead. Returns the node + its exact
 /// authored height for the page's budget math.
-fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, f32) {
-    let current = state.raw_value(prefs::EDIT_GAME_FONT);
-    let active = game_font_ids(current.as_deref());
-    let pending = state.config_key_pending(prefs::EDIT_GAME_FONT);
+fn display_faces_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, f32) {
+    let current = state.raw_value(prefs::EDIT_DISPLAY_FONT);
+    let active = display_font_ids(current.as_deref());
+    let pending = state.config_key_pending(prefs::EDIT_DISPLAY_FONT);
     let mut rows = Vec::new();
-    for font in aterm_render::GAME_FONTS {
+    for font in aterm_render::DISPLAY_FACES {
         let on = active.iter().any(|id| id == font.id);
-        let control_key = format!("settings/game-font/{}", font.id);
+        let control_key = format!("settings/display-face/{}", font.id);
         let focused = state
             .common
             .last_focus
             .as_ref()
             .is_some_and(|key| key.as_str() == control_key);
         let label = UiNode::new(
-            format!("settings/game-font/label/{}", font.id),
+            format!("settings/display-face/label/{}", font.id),
             UiContent::Text(TextSpec {
-                text: font.game.to_string(),
+                text: font.label.to_string(),
                 role: SemanticRole::Text,
                 style: StyleRef::Primary,
             }),
@@ -8264,12 +8331,13 @@ fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, 
                 .width(Length::Fixed(300.0 * settings_text_scale()))
                 .height(Length::Fill),
         );
-        // The face credit keeps the toggles honest: these are open-licensed
-        // lookalikes of each title screen, not the games' own fonts. Inline on
-        // the same 44pt line so the card leaves room for the typography rows
-        // below it on ordinary window heights.
+        // The face credit keeps the toggles honest: it names the actual font
+        // and its licence, which is the fact a user needs and the one the
+        // pre-rename entries obscured by naming a game instead. Inline on the
+        // same 44pt line so the card leaves room for the typography rows below
+        // it on ordinary window heights.
         let credit = UiNode::new(
-            format!("settings/game-font/credit/{}", font.id),
+            format!("settings/display-face/credit/{}", font.id),
             UiContent::Text(TextSpec {
                 text: font.face.to_string(),
                 role: SemanticRole::Text,
@@ -8278,7 +8346,7 @@ fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, 
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill));
         let text = UiNode::new(
-            format!("settings/game-font/text/{}", font.id),
+            format!("settings/display-face/text/{}", font.id),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
         )
         .layout(
@@ -8293,13 +8361,10 @@ fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, 
             UiContent::Switch(
                 Control::new(
                     SwitchSpec {
-                        label: format!("{} font", font.game),
-                        description: Some(format!(
-                            "Renders all of aterm in {} — evoking the {} title screen.",
-                            font.face, font.game
-                        )),
+                        label: format!("{} display face", font.label),
+                        description: Some(format!("Renders all of aterm in {}.", font.face)),
                     },
-                    ActionId::new(format!("settings/game-font/{}", font.id)),
+                    ActionId::new(format!("settings/display-face/{}", font.id)),
                 )
                 .value(SemanticValue::Bool(on))
                 .state(ControlState {
@@ -8318,8 +8383,8 @@ fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, 
         );
         rows.push(
             UiNode::new(
-                format!("settings/game-font/row/{}", font.id),
-                UiContent::Group(GroupSpec::new(font.game)),
+                format!("settings/display-face/row/{}", font.id),
+                UiContent::Group(GroupSpec::new(font.label)),
             )
             .layout(
                 Layout::row()
@@ -8331,13 +8396,55 @@ fn game_fonts_card(state: &SettingsViewState, width: SettingsWidth) -> (UiNode, 
         );
     }
     top_card(
-        "game-fonts",
-        "Game fonts — mix up to three",
+        "display-faces",
+        "Display faces — mix up to three",
         Some(
-            "Toggle up to three games on and the letters MIX between their fonts \
+            "Toggle up to three faces on and the letters MIX between them \
              (a fourth bumps the oldest); all off = the regular font. Bundled \
-             open-licensed lookalikes of each game's title lettering.",
+             display faces, each under an open licence.",
         ),
+        None,
+        rows,
+        width,
+    )
+}
+
+/// The CURSOR KITTY page's showcase card: the companion picker itself.
+///
+/// `cursor_trail_style` is a TOP SETTING, so `settings_field_is_visible` keeps
+/// the ordinary registry from drawing it on any category page — which is exactly
+/// why the cat's page needs to own the row rather than inherit it. This is the
+/// SAME [`top_setting_row`] Top Settings paints, not a second control: activating
+/// it runs the one key-keyed transaction in `AppEvent::Action` handling (style +
+/// the `cursor_trail` master + the Serious Mode escape, atomically), and the page
+/// heading's live preview above it already demos the highlighted candidate, so
+/// the card carries no preview of its own.
+fn cursor_kitty_card(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> (UiNode, f32) {
+    let rows = top_setting_row(
+        state,
+        prefs::EDIT_CURSOR_TRAIL_STYLE,
+        Some(top_projected_trail_value(state)),
+        width,
+        viewport,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    top_card(
+        "cursor-kitty",
+        "Your companion",
+        // ONE LINE, like every other `top_card` description: the box reserves
+        // exactly `page_subtitle_height()` for it, so anything longer would
+        // paint past its own measure. Compact drops it entirely — this card is
+        // a LEADING node on every virtual page (unlike the Display Faces
+        // showcase, which yields to a registry row that this key does not
+        // have), so every line it keeps is a line the wake row below cannot
+        // use, and the picker's own options say pet vs kitty anyway.
+        (width != SettingsWidth::Compact)
+            .then_some("The pet walks your line; the plain kitty flies. Off removes the trail."),
         None,
         rows,
         width,
@@ -8440,10 +8547,9 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
     let current = state.raw_value(prefs::EDIT_WALLPAPER);
     let pending = state.config_key_pending(prefs::EDIT_WALLPAPER);
     let status_text = match (&current, &state.config_assets().wallpaper) {
-        (
-            Some(path),
-            crate::app_config::WallpaperAsset::Invalid { bounded_reason, .. },
-        ) => format!("Current: {path} — {bounded_reason}"),
+        (Some(path), crate::app_config::WallpaperAsset::Invalid { bounded_reason, .. }) => {
+            format!("Current: {path} — {bounded_reason}")
+        }
         (Some(path), _) => format!("Current: {path}"),
         (None, _) => "No wallpaper — the flat theme background (the default).".to_string(),
     };
@@ -8632,6 +8738,14 @@ fn top_settings_page(
         return out;
     }
 
+    // A one-line descriptive subtitle cannot stay whole at large Dynamic Type on
+    // anything narrower than the Wide page: the Medium page is 720pt and this
+    // sentence needs ~860pt at 2×, so the painter would ellipsize it. It yields
+    // instead — the same rule `settings_fields_page` applies to route subtitles.
+    // (This first bit at a 1520×900 host, where 2× text makes the EFFECTIVE
+    // width Medium; before the rail learned to densify for a 16th route that
+    // host fell all the way to the compact sheet and never drew a subtitle.)
+    let subtitle_yields = width != SettingsWidth::Wide && settings_text_scale() > 1.25;
     let mut out = if width == SettingsWidth::Compact && settings_text_scale() > 1.25 {
         // The compact toolbar already names Settings. Yield the duplicate hero
         // at large type so the requested control—not ornamental chrome—owns
@@ -8640,7 +8754,7 @@ fn top_settings_page(
     } else {
         page_heading(
             "Top Settings",
-            if width == SettingsWidth::Compact {
+            if width == SettingsWidth::Compact || subtitle_yields {
                 ""
             } else if cx.motion.serious {
                 "Serious Mode is hiding playful effects. Turning one on disables Serious Mode and keeps the others off."
@@ -8649,8 +8763,14 @@ fn top_settings_page(
             },
         )
     };
-    if compact_serious_disclosure {
+    // Serious Mode's consequence is NOT decorative, so a yielded subtitle hands
+    // it to the dedicated status node — which keeps the COMPLETE sentence in its
+    // semantic label and paints a short caption — rather than dropping it.
+    if compact_serious_disclosure || (subtitle_yields && cx.motion.serious) {
         out.push(top_serious_mode_disclosure());
+    }
+    if rainbow_banner_fits(width, cx) {
+        out.push(rainbow_banner_node());
     }
     let show_all = top_settings_shows_all(width, cx.viewport);
     if show_all {
@@ -8731,16 +8851,22 @@ fn top_settings_page(
             width,
         );
         let right_height = trail_height + 10.0 + playful_height;
+        // Balance the grid: stretch the shorter side's terminal card so both
+        // columns land on one shared baseline — a dead notch under one column
+        // reads as a layout accident, not a composition.
+        let row_height = theme_height.max(right_height);
+        let mut theme = theme;
+        theme.layout.height = Length::Fixed(row_height);
+        let mut playful = playful;
+        if right_height < row_height {
+            playful.layout.height = Length::Fixed(playful_height + (row_height - right_height));
+        }
         out.push(
             UiNode::new(
                 "settings/top/grid",
                 UiContent::Group(GroupSpec::new("Top settings")),
             )
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(theme_height.max(right_height)))
-                    .gap(12.0),
-            )
+            .layout(Layout::row().height(Length::Fixed(row_height)).gap(12.0))
             .children(vec![
                 theme,
                 UiNode::new(
@@ -8750,7 +8876,7 @@ fn top_settings_page(
                 .layout(
                     Layout::column()
                         .width(Length::Fill)
-                        .height(Length::Fixed(right_height))
+                        .height(Length::Fixed(row_height))
                         .gap(10.0),
                 )
                 .children(vec![trail, playful]),
@@ -8809,6 +8935,47 @@ fn top_settings_page(
     ));
     out.push(card);
     out
+}
+
+/// The rainbow banner's fixed height on the Home page (its gap rides the
+/// column).
+const RAINBOW_BANNER_HEIGHT: f32 = 96.0;
+
+/// Whether the Home page has room for its welcome flourish. Ornamental chrome
+/// yields FIRST: never on Compact (every line there belongs to controls), not
+/// at large Dynamic Type (the same rule the route subtitles apply), never
+/// under Serious Mode (a rainbow is unapologetically playful), and only on
+/// hosts tall enough that today's tightest layouts keep their exact measure —
+/// the gate clears `top_settings_shows_all`'s 680 floor by more than the
+/// banner's own height, so no layout that fit before gains an overflow.
+fn rainbow_banner_fits(width: SettingsWidth, cx: &ViewCx<'_>) -> bool {
+    width != SettingsWidth::Compact
+        && !cx.motion.serious
+        && settings_text_scale() <= 1.25
+        && cx.viewport.height >= 790.0
+}
+
+/// The Top Settings hero banner: a pastel rainbow arch cresting through star
+/// glints in a mint sky. Pure static decoration through the audited
+/// custom-node lowering ([`RAINBOW_BANNER_AUDIT`]) — no action, no focus, no
+/// animation frames requested; the semantic label names the scenery.
+fn rainbow_banner_node() -> UiNode {
+    UiNode::new(
+        "settings/top/rainbow",
+        UiContent::Custom(AuditedCustomNode {
+            audit_id: RAINBOW_BANNER_AUDIT,
+            role: SemanticRole::Text,
+            label: "A rainbow arcs over the settings".to_string(),
+            value: None,
+            action: None,
+            focusable: false,
+        }),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fill)
+            .height(Length::Fixed(RAINBOW_BANNER_HEIGHT)),
+    )
 }
 
 fn top_settings_shows_all(width: SettingsWidth, viewport: LogicalRect) -> bool {
@@ -9617,13 +9784,13 @@ fn settings_fields_page(
     } else {
         Vec::new()
     };
-    // The Game Fonts toggle card rides the Text & Fonts page as a SECOND
+    // The Display Faces toggle card rides the Text & Fonts page as a SECOND
     // leading node right below the always-reserved live preview (the specimen
     // demonstrates the chosen face; the card switches it — design pin:
     // `visual_preview_matrix_covers_four_viewports_at_three_text_scales`).
     // Compact keeps the registry popup row instead (tight page budgets), so
     // the key is never uncontrolled anywhere.
-    let game_fonts_showcase_eligible = !modified_only
+    let display_faces_showcase_eligible = !modified_only
         && !global_search
         && state.route == SettingsRoute::TextFonts
         && width != SettingsWidth::Compact
@@ -9654,7 +9821,22 @@ fn settings_fields_page(
     let compact_smart_title_health = show_smart_title_health
         && width == SettingsWidth::Compact
         && (cx.viewport.height <= 420.0 || settings_text_scale() > 1.25);
-    let game_fonts_showcase = game_fonts_showcase_eligible.then(|| game_fonts_card(state, width));
+    let display_faces_showcase =
+        display_faces_showcase_eligible.then(|| display_faces_card(state, width));
+    // THE CURSOR KITTY CARD. Unlike the Display Faces showcase it can never be
+    // shed outright: `cursor_trail_style` is a Top Setting, so the ordinary form
+    // has no fallback row for it, and a "Cursor Kitty" page with no way to
+    // choose a cat would be the page's whole point missing. On a COMPACT host it
+    // instead becomes a page-0 slice, exactly like the renderer preview's
+    // `preview_disclosure`: it is the tallest leading node this route has, and
+    // repeating it on every virtual page left the wake row with zero capacity
+    // (`advanced_group_footnotes_…`'s 2× compact reachability sweep).
+    let cursor_kitty_showcase = (!modified_only
+        && !global_search
+        && state.route == SettingsRoute::CursorKitty
+        && state.choice_picker.is_none()
+        && (width != SettingsWidth::Compact || state.page_scroll == 0))
+        .then(|| cursor_kitty_card(state, width, cx.viewport));
     let title = if global_search {
         "Search Results"
     } else {
@@ -9689,11 +9871,11 @@ fn settings_fields_page(
                 || state.is_explicit(field.key)
                 || state.field_has_unsaved_draft(field.key)
         })
-        // The Game Fonts showcase owns `game_font` on Medium/Wide Text & Fonts
+        // The Display Faces showcase owns `display_font` on Medium/Wide Text & Fonts
         // (whether the card or the yielded-to preview is on glass right now) —
         // the generic popup row would be a second control for the same key.
         .filter(|(_, field)| {
-            !(field.key == prefs::EDIT_GAME_FONT
+            !(field.key == prefs::EDIT_DISPLAY_FONT
                 && !modified_only
                 && !global_search
                 && state.route == SettingsRoute::TextFonts
@@ -9848,7 +10030,11 @@ fn settings_fields_page(
             used += showcase_height;
             leading_children += 1;
         }
-        if let Some((_, height)) = &game_fonts_showcase {
+        if let Some((_, height)) = &display_faces_showcase {
+            used += height;
+            leading_children += 1;
+        }
+        if let Some((_, height)) = &cursor_kitty_showcase {
             used += height;
             leading_children += 1;
         }
@@ -10045,7 +10231,10 @@ fn settings_fields_page(
     if show_smart_title_health {
         out.push(smart_title_health_card(state, compact_smart_title_health));
     }
-    if let Some((card, _height)) = game_fonts_showcase {
+    if let Some((card, _height)) = display_faces_showcase {
+        out.push(card);
+    }
+    if let Some((card, _height)) = cursor_kitty_showcase {
         out.push(card);
     }
 
@@ -10638,6 +10827,12 @@ const GPU_POST_EFFECT_KEYS: &[&str] = &[
 const TRAIL_TUNING_KEYS: &[&str] = &[
     prefs::EDIT_CURSOR_TRAIL_MS,
     prefs::EDIT_CURSOR_TRAIL_LENGTH,
+    // The rainbow WAKE dial. It rides `GlowConfig`, which `glow_config` builds
+    // with `enabled: cursor_trail_or_default() && …`, so with the master off the
+    // glow never spawns and the plume length reaches nothing. It only became a
+    // native row on 2026-08-10 (see `native_advanced_effect`); before that it was
+    // Manual-only and so never owed a disclosure.
+    prefs::EDIT_CURSOR_TRAIL_WAKE_MS,
     prefs::EDIT_CURSOR_TRAIL_INTENSITY,
     prefs::EDIT_CURSOR_TRAIL_RADIUS,
     prefs::EDIT_CURSOR_TRAIL_RING,
@@ -13840,10 +14035,7 @@ const MAX_UPDATE_OUTCOME_LINES: usize = 3;
 /// [`compact_update_summary`], which has no room for a result line, and losing
 /// the one message that explains a stalled update would be the worst possible
 /// thing to drop.
-fn compact_update_outcome(
-    update: &UpdateProjection,
-    text_width: f32,
-) -> Option<(UiNode, f32)> {
+fn compact_update_outcome(update: &UpdateProjection, text_width: f32) -> Option<(UiNode, f32)> {
     let display = update_outcome_line(update)?;
     let scale = settings_text_scale();
     let line_height = 24.0_f32.max(20.0 * scale);
@@ -14075,8 +14267,7 @@ fn update_status_card(
                 }),
             )
             .layout(
-                Layout::column()
-                    .height(Length::Fixed(outcome_lines.len() as f32 * detail_height)),
+                Layout::column().height(Length::Fixed(outcome_lines.len() as f32 * detail_height)),
             )
             .children(
                 outcome_lines
@@ -14509,7 +14700,8 @@ fn update_page(
     }
 
     let content_height = noncompact_content_height.expect("non-compact Update content height");
-    let ordinary_notes = update_release_notes_cards(update, ordinary_notes_height, notes_text_width);
+    let ordinary_notes =
+        update_release_notes_cards(update, ordinary_notes_height, notes_text_width);
     let (notes, notes_height) = if ordinary_notes.len() <= 1 {
         (ordinary_notes, ordinary_notes_height)
     } else {
@@ -14533,7 +14725,12 @@ fn update_page(
                     "updates/workbench",
                     UiContent::Group(GroupSpec::new("Update status and automatic updates")),
                 )
-                .layout(Layout::row().height(Length::Fixed(height)).gap(16.0).clipped())
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(height))
+                        .gap(16.0)
+                        .clipped(),
+                )
                 .children(vec![
                     status.layout(
                         Layout::column()
@@ -15471,10 +15668,11 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
     if width == SettingsWidth::Compact {
         return match route {
             SettingsRoute::Appearance => "Theme, color, contrast, and selection.",
-            SettingsRoute::TextFonts => "Fonts, game faces, shaping, and glyphs.",
+            SettingsRoute::TextFonts => "Fonts, display faces, shaping, and glyphs.",
             // Names SOUND: the Sound menu lives on this page now, and a
             // subtitle that promises only "visual trails" hides it.
             SettingsRoute::CursorMotion => "Cursor, motion, trails, and sound.",
+            SettingsRoute::CursorKitty => "Your cursor's cat.",
             SettingsRoute::WindowTabs => "Padding, chrome, and Smart Titles.",
             SettingsRoute::TabColor => "Any color for your selected tab.",
             SettingsRoute::Wallpaper => "An image behind every terminal tab.",
@@ -15492,10 +15690,13 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
     match route {
         SettingsRoute::Appearance => "Theme, color, contrast, and selection behavior.",
         SettingsRoute::TextFonts => {
-            "Typography, game title-screen faces, shaping, fallback, and glyph rendering."
+            "Typography, bundled display faces, shaping, fallback, and glyph rendering."
         }
         SettingsRoute::CursorMotion => {
             "Cursor form, motion policy, visual trails, and every sound aterm makes."
+        }
+        SettingsRoute::CursorKitty => {
+            "The companion that walks your line, and how far its rainbow wake reaches."
         }
         SettingsRoute::WindowTabs => {
             "Window geometry, title and Description formatting, live Activity, and chrome."
@@ -17462,6 +17663,43 @@ mod tests {
             .expect("Settings compiles")
     }
 
+    /// The Home page's welcome flourish: on a roomy host the rainbow banner is
+    /// present with a descriptive semantic label, decorative (no action,
+    /// unfocusable), and paint-clean; ornamental chrome yields on short hosts
+    /// and under Serious Mode.
+    #[test]
+    fn top_settings_rainbow_banner_present_and_yielding() {
+        let key = UiKey::new("settings/top/rainbow");
+        let (runtime, instance, view) = setup();
+        let cx = view_cx_at(1_200.0, 810.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let node = compiled
+            .semantic(&key)
+            .expect("roomy Home page shows the rainbow banner");
+        assert_eq!(node.label, "A rainbow arcs over the settings");
+        assert!(node.action.is_none(), "the banner is pure decoration");
+        assert_zero_top_paint(&compiled, "rainbow banner at 1200x810 1x");
+
+        // A host below the fit gate keeps today's exact layout.
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_200.0, 700.0));
+        assert!(
+            compiled.semantic(&key).is_none(),
+            "short hosts must not gain the banner"
+        );
+
+        // Serious Mode hides the unapologetically playful.
+        let mut serious = view_cx_at(1_200.0, 810.0);
+        serious.motion = crate::native_app::ViewMotionCx {
+            serious: true,
+            ..crate::native_app::ViewMotionCx::default()
+        };
+        let compiled = compile_settings_view(&runtime, instance, view, &serious);
+        assert!(
+            compiled.semantic(&key).is_none(),
+            "Serious Mode must not show the banner"
+        );
+    }
+
     fn assert_zero_top_paint(compiled: &crate::native_ui::CompiledUi, context: &str) {
         compiled
             .validate_parity()
@@ -19215,7 +19453,13 @@ mod tests {
     fn legacy_trail_master_is_authored_picker_state_but_empty_style_alone_is_reset() {
         for (text, expected) in [
             ("cursor_trail = false\n", Some("off")),
-            ("cursor_trail = true\n", Some("rainbow kitty")),
+            // The master alone authors the DEFAULT style — read from the single
+            // definition, so flipping the shipped companion cannot leave this
+            // pinning a dead spelling.
+            (
+                "cursor_trail = true\n",
+                Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            ),
             ("cursor_trail_style = \"\"\n", None),
         ] {
             let service = VersionedConfigService::new(text.to_string()).unwrap();
@@ -19337,6 +19581,142 @@ mod tests {
             edit.and_then(|edit| edit.value.as_deref()),
             Some(name),
             "the literal suffix survives the durable patch",
+        );
+    }
+
+    /// THE CAT'S PAGE IS WIRED, NOT DECORATIVE (owner ask, 2026-08-10: "fix the
+    /// settings and add a page for this").
+    ///
+    /// `cursor_trail_style` is a TOP SETTING, so `settings_field_is_visible`
+    /// keeps every ordinary category page from drawing it — which is exactly why
+    /// the Cursor Kitty page owns the row through its showcase card. This proves
+    /// the SAVE rather than the pixels: activating the card's control emits the
+    /// same one atomic `ConfigPatch` the Top Settings trail card does, carrying
+    /// the style AND the `cursor_trail` master, so a chosen cat can never land
+    /// behind an off switch. A test that only asserted the row renders would
+    /// pass for a control wired to nothing — the defect commit 9adbc571 was
+    /// written to end.
+    #[test]
+    fn the_cursor_kitty_page_saves_the_companion_and_arms_the_trail_master() {
+        let (mut runtime, instance, view) = setup();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::CursorKitty);
+        }
+        let cx = view_cx_at(1_024.0, 768.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        for (key, why) in [
+            (
+                prefs::EDIT_CURSOR_TRAIL_STYLE,
+                "the companion picker is the reason this page exists",
+            ),
+            (
+                prefs::EDIT_CURSOR_TRAIL_WAKE_MS,
+                "the rainbow wake dial is the cat's own tuning row",
+            ),
+        ] {
+            assert!(
+                compiled
+                    .semantic(&UiKey::new(format!("settings/control/{key}")))
+                    .is_some(),
+                "{key}: {why}"
+            );
+        }
+
+        let outcome = runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("settings/set/{}", prefs::EDIT_CURSOR_TRAIL_STYLE)),
+                    value: Some(SemanticInput::Text(
+                        prefs::DEFAULT_CURSOR_TRAIL_STYLE.to_string(),
+                    )),
+                }),
+            )
+            .unwrap();
+        let patch = emitted_config_patch(&outcome);
+        let written = |key: &str| -> Option<String> {
+            patch
+                .edits
+                .iter()
+                .find(|edit| edit.key == key)
+                .unwrap_or_else(|| panic!("{key} is missing from the Cursor Kitty page's patch"))
+                .value
+                .clone()
+        };
+        assert_eq!(
+            written(prefs::EDIT_CURSOR_TRAIL_STYLE).as_deref(),
+            Some(prefs::DEFAULT_CURSOR_TRAIL_STYLE),
+            "the chosen companion is what gets written"
+        );
+        assert_eq!(
+            written(prefs::EDIT_CURSOR_TRAIL).as_deref(),
+            Some("true"),
+            "choosing a cat arms the trail master in the SAME patch"
+        );
+    }
+
+    /// The wake dial became a native row on 2026-08-10; prove it reaches the
+    /// ENGINE, not merely the form. `cursor_trail_wake_ms` must arrive at
+    /// `GlowConfig::wake_persist_s` — the field `cursor_glow` reads when it lays
+    /// the typing plume — and must carry the honest "Inactive · Cursor trail
+    /// Off" disclosure the rest of the trail surface carries. A row that only
+    /// round-trips through TOML is the inert switch this repo has been burned by.
+    #[test]
+    fn the_rainbow_wake_row_lands_on_the_kitty_page_and_reaches_the_glow() {
+        assert_eq!(
+            prefs::section_of(prefs::EDIT_CURSOR_TRAIL_WAKE_MS),
+            prefs::Section::CursorKitty
+        );
+        assert_eq!(
+            SettingsRoute::CursorKitty.section(),
+            Some(prefs::Section::CursorKitty),
+            "the route and the section must agree or the page paints empty"
+        );
+        assert!(
+            settings_field_is_visible(prefs::EDIT_CURSOR_TRAIL_WAKE_MS, false, false),
+            "a Manual-only key would leave the page with nothing but a card"
+        );
+        assert_eq!(
+            prefs::group_of(prefs::EDIT_CURSOR_TRAIL_WAKE_MS).0,
+            "Rainbow wake"
+        );
+        assert!(
+            prefs::group_footnote("Rainbow wake")
+                .is_some_and(|note| note.contains("0 hides the plume"))
+        );
+
+        let config: Config = toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
+        let glow = crate::app_config::resolve_cursor_glow(
+            crate::app_config::CursorGlowInputs {
+                enabled: true,
+                style_raw: config.cursor_trail_style_raw(),
+                color: None,
+                accent: None,
+                duration_ms: 260,
+                length: 24,
+                intensity: 0.7,
+                radius: 0.6,
+                ring: true,
+                wake_persist_s: config.cursor_trail_wake_persist_or_default(),
+            },
+            crate::app_config::resolve_trail_style(
+                config.cursor_trail_style_raw(),
+                &crate::app_config::TrailPackCatalog::default(),
+            ),
+            0x00FF_FFFF,
+            true,
+            0x00C8_D3F5,
+            0x001A_1B26,
+            0.5,
+        );
+        assert!(
+            (glow.wake_persist_s - 0.9).abs() < 1e-6,
+            "the saved dial must reach the engine's plume length, got {}",
+            glow.wake_persist_s
         );
     }
 
@@ -21080,7 +21460,9 @@ mod tests {
         assert!(notes.rect.y >= status.rect.bottom());
         assert!(notes.rect.bottom() <= wide.viewport.bottom());
         assert!(
-            updates.semantic(&UiKey::new("updates/pagination")).is_none(),
+            updates
+                .semantic(&UiKey::new("updates/pagination"))
+                .is_none(),
             "an ordinary desktop window shows the whole Update page at once"
         );
         // The switch is the real config control, not a lookalike.
@@ -21668,7 +22050,10 @@ mod tests {
         }
 
         assert_eq!(visited_pages, global_total.unwrap());
-        assert_eq!(saw_outcome, 1, "the outcome is surfaced on exactly one page");
+        assert_eq!(
+            saw_outcome, 1,
+            "the outcome is surfaced on exactly one page"
+        );
         for key in [
             "updates/hero",
             "updates/install-now",
@@ -28771,13 +29156,7 @@ enabled = true
             trail_audio: false,
             ..availability
         };
-        let muted_riff = projected_effect(
-            "",
-            &[],
-            prefs::EDIT_TRAIL_SOUND_RIFF,
-            silent,
-            motion,
-        );
+        let muted_riff = projected_effect("", &[], prefs::EDIT_TRAIL_SOUND_RIFF, silent, motion);
         assert!(
             effect_note_contains(&muted_riff, "Audio unavailable"),
             "{muted_riff:?}"
@@ -28962,7 +29341,11 @@ enabled = true
             // The two BONK keys are `[sparkle_words]` leaves in the FILE but
             // SFX in the UI; their accessors are named after the feature, not
             // the key path.
-            (prefs::EDIT_SPARKLE_BONK, "curse_bonk_enabled()", &[render][..]),
+            (
+                prefs::EDIT_SPARKLE_BONK,
+                "curse_bonk_enabled()",
+                &[render][..],
+            ),
             (
                 prefs::EDIT_SPARKLE_BONK_DETONATION,
                 "curse_bonk_detonation_enabled()",
@@ -28988,11 +29371,20 @@ enabled = true
         // a pin on this file's test layout rather than on the wiring.
         let production_calls = render
             .match_indices("sing_riff_gain(")
-            .filter(|(at, needle)| render[at + needle.len()..].trim_start().starts_with("ws.focused"))
+            .filter(|(at, needle)| {
+                render[at + needle.len()..]
+                    .trim_start()
+                    .starts_with("ws.focused")
+            })
             .count();
+        // The song-arc instrument multiplied the seams: each path now pushes
+        // the BAR riff, the announced-switch FILL, and the finale CADENCE —
+        // three audible pushes per path, single-pane + compose = six. The law
+        // is unchanged (every push resolves gain through the one policy
+        // function, identified by the raw focus bit); only the census grew.
         assert_eq!(
-            production_calls, 2,
-            "both riff pushes must resolve gain through the one policy function"
+            production_calls, 6,
+            "all riff/fill/cadence pushes must resolve gain through the one policy function"
         );
 
         // BOTH BONK SEAMS MUST FEED THE MASTER IN. This is a LAYOUT pin and it
@@ -29195,14 +29587,25 @@ enabled = true
         // stays a Top Effect control with its own "Effect policy" box and
         // reaches this box as a per-row disclosure instead — the reasoning is
         // recorded in full at `prefs::SOUND_MENU_KEYS`.
+        //
+        // THE RAINBOW WAKE DIAL (2026-08-10): +1 on every platform. Same
+        // conscious decision as the intensity slider above, taken for the same
+        // reason: `cursor_trail_wake_ms` has shipped for a long time, is read
+        // every frame through `GlowConfig::wake_persist_s`, is clamped at the
+        // resolver, and was reachable only from Manual — and it is the ONE
+        // tuning knob that belongs to the cursor kitty rather than to the trail
+        // engine, so the cat's new page would otherwise carry a picker and
+        // nothing else. Its live consumer is pinned by
+        // `the_rainbow_wake_row_lands_on_the_kitty_page_and_reaches_the_glow`,
+        // and its trail-master disclosure by the `TRAIL_TUNING_KEYS` sweep.
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                51
+                52
             } else if cfg!(windows) {
-                49
+                50
             } else {
-                46
+                47
             },
             "the audited Advanced surface changed; new expert keys belong in Manual"
         );
@@ -29237,6 +29640,11 @@ enabled = true
             // the one control the owner named first, and the only one every
             // other row in the box is scaled by.
             ("Sound", prefs::EDIT_TRAIL_SOUND_VOLUME),
+            // The Cursor Kitty page's one group box. (Its "Companion" caption
+            // belongs to `cursor_trail_style`, a Top Setting the ordinary form
+            // never draws, so that caption is not an ordinary group and needs
+            // no witness — the showcase card owns that row.)
+            ("Rainbow wake", prefs::EDIT_CURSOR_TRAIL_WAKE_MS),
         ];
         if cfg!(target_os = "macos") {
             group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
@@ -29275,6 +29683,9 @@ enabled = true
             // The Sound box's footnote must name what the VOLUME slider does
             // and does not reach — the reason the bell needed its own row.
             ("Sound", "Volume"),
+            // The wake box must say what `0` does: a bare 0..1500 dial reads as
+            // "off means no cat", and it does not.
+            ("Rainbow wake", "0 hides the plume"),
         ] {
             if ordinary_groups.contains(group) {
                 let note = prefs::group_footnote(group)

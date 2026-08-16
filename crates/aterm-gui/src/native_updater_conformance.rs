@@ -372,7 +372,7 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
 
     assert!(state["trial"] == 1 && state["first_present_done"] == 0);
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(false, false, false, true, true),
+        !crate::should_dispatch_boot_health_confirmation(false, false, false, false, true, true),
         "negative control: a live OS window is not evidence that any content presented"
     );
     assert!(
@@ -394,15 +394,19 @@ fn real_gui_boot_health_dispatch_requires_first_present_before_model_disarm() {
     let presented = model.successors("PresentInstalledUi", &state)[0].clone();
     assert_exact_model_action(&model, "PresentInstalledUi", &state, &presented);
     assert!(crate::should_dispatch_boot_health_confirmation(
-        false, true, false, true, true,
+        false, false, true, false, true, true,
     ));
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(false, true, true, true, true),
+        !crate::should_dispatch_boot_health_confirmation(false, false, true, true, true, true),
         "the same present cannot enqueue a second confirmation"
     );
     assert!(
-        !crate::should_dispatch_boot_health_confirmation(true, true, false, true, false),
-        "headless startup has no on-glass health boundary"
+        !crate::should_dispatch_boot_health_confirmation(true, false, true, false, true, false),
+        "headless proves health at the control-socket boundary, not on glass"
+    );
+    assert!(
+        crate::should_dispatch_boot_health_confirmation(true, true, false, false, true, false),
+        "a bound control socket (or none configured) is the headless health proof"
     );
     let proved = model.successors("ProveInstalledHealth", &presented)[0].clone();
     assert_exact_model_action(&model, "ProveInstalledHealth", &presented, &proved);

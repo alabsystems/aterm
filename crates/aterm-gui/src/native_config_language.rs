@@ -82,11 +82,17 @@ const RETIRED_CONFIG_KEYS: &[RetiredConfigKeyMetadata] = &[
         feature: "Keyword Kitty opacity control",
         effect_label: "No effect",
     },
-    RetiredConfigKeyMetadata {
-        key: "cursor_trail_wake_ms",
-        feature: "Nyan typing wake",
-        effect_label: "No effect",
-    },
+    // `cursor_trail_wake_ms` USED TO BE LISTED HERE and it was wrong (found
+    // 2026-08-10 while giving the cursor kitty its own Settings page). The
+    // typing wake came back: `CursorGlow::wake` reads `GlowConfig::wake_persist_s`
+    // on every rainbow frame — its own comment even names the Settings row — the
+    // value is clamped 0..=1500 ms by `Config::cursor_trail_wake_persist_or_default`,
+    // and `cursor_glow::rainbow_wake_persistence_is_a_host_dial_that_fails_off`
+    // proves the plume lengthens monotonically with it and fails OFF at 0/NaN.
+    // Manual was telling anyone who authored the key that it "has no effect",
+    // and Settings projected it as "Compatibility only · No effect". A dial that
+    // works and a UI that says it does not is the same defect as a switch that
+    // does nothing, pointing the other way.
 ];
 
 pub(crate) fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKeyMetadata> {
@@ -1698,20 +1704,27 @@ pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[
                 .strip_prefix("pack:")
                 .is_some_and(|id| !id.trim().is_empty());
     }
-    // `game_font` also accepts a MIX — 2..=3 distinct bundled ids joined by
-    // `+` ("minecraft+zelda"), authored by the Text & Fonts toggles. The same
+    // `display_font` also accepts a MIX — 2..=3 distinct bundled ids joined by
+    // `+` ("pixel+engraved"), authored by the Text & Fonts toggles. The same
     // domain the typed TOML writer enforces (`prefs::typed_item`).
-    if key == crate::prefs::EDIT_GAME_FONT && value.contains('+') {
-        let parts: Vec<&str> = value.split('+').map(str::trim).collect();
+    //
+    // Parts are compared CANONICALIZED, so a legacy spelling is neither
+    // rejected (a mix that was valid before the rename must stay valid) nor a
+    // way to name one face twice ("pixel+minecraft" is a duplicate).
+    if key == crate::prefs::EDIT_DISPLAY_FONT && value.contains('+') {
+        let parts: Vec<&str> = value
+            .split('+')
+            .map(|part| aterm_render::display_face_canonical_id(part).unwrap_or(part.trim()))
+            .collect();
         let distinct = parts
             .iter()
             .all(|part| parts.iter().filter(|other| other == &part).count() == 1);
         return parts.len() >= 2
-            && parts.len() <= aterm_render::GAME_FONT_MIX_MAX
+            && parts.len() <= aterm_render::DISPLAY_FACE_MIX_MAX
             && distinct
             && parts
                 .iter()
-                .all(|part| aterm_render::game_font_bytes(part).is_some());
+                .all(|part| crate::prefs::display_font_id_is_accepted(part));
     }
     options
         .iter()
@@ -1730,6 +1743,9 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         crate::prefs::EDIT_TRAIL_SOUND_STYLE => TRAIL_SOUND_STYLE_ALIASES,
         crate::prefs::EDIT_WINDOW_COLORSPACE => WINDOW_COLORSPACE_ALIASES,
         crate::prefs::EDIT_BACKGROUND_MATERIAL => BACKGROUND_MATERIAL_ALIASES,
+        // The pre-rename face ids. Accepted, never OFFERED — see
+        // `prefs::LEGACY_DISPLAY_FONT_IDS`.
+        crate::prefs::EDIT_DISPLAY_FONT => crate::prefs::LEGACY_DISPLAY_FONT_IDS,
         "sparkle_words.custom.burst.kind" => CUSTOM_BURST_KIND_ALIASES,
         _ => &[],
     }
@@ -1800,6 +1816,49 @@ fn warn_unknown_item(
         // The compatibility walker already reports every concrete entry in an
         // inert subtree. Calling it "unknown" as well would give one authored
         // Orca key two contradictory recovery stories.
+        return;
+    }
+    if path == crate::prefs::LEGACY_EDIT_DISPLAY_FONT {
+        // DEPRECATED, not unknown. The key still parses and still applies (a
+        // serde alias on `Config::display_font`); "unknown to this build" would
+        // be a lie that reads like data loss. Say what to rename it to instead,
+        // and return so the key gets exactly one story.
+        let range = source_value_range(source, path)
+            .or_else(|| item.span())
+            .unwrap_or(0..source.len().min(1));
+        push_diagnostic(
+            analysis,
+            source,
+            range.clone(),
+            ConfigDiagnosticSeverity::Warning,
+            format!(
+                "`{path}` is deprecated; rename it to `{current}` (the old key still \
+                 applies — the faces are named for the letterform now, not a game)",
+                current = crate::prefs::EDIT_DISPLAY_FONT
+            ),
+        );
+        // The VALUE is still checked against the live domain. A deprecated key
+        // is not an unvalidated one: without this, `game_font = "dooom"` would
+        // silently lose the "must be one of" error it used to get, and the
+        // rename would have made a typo harder to notice than before.
+        if let Some(value) = item.as_str()
+            && !registered_enum_value_is_valid(
+                crate::prefs::EDIT_DISPLAY_FONT,
+                value,
+                crate::prefs::DISPLAY_FONT_OPTIONS,
+            )
+        {
+            push_diagnostic(
+                analysis,
+                source,
+                range,
+                ConfigDiagnosticSeverity::Error,
+                format!(
+                    "{path} must be one of: {}",
+                    crate::prefs::DISPLAY_FONT_OPTIONS.join(", ")
+                ),
+            );
+        }
         return;
     }
     let schema = config_schema_entry(path);
@@ -3105,6 +3164,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · macOS CoreText only; parsed and preserved but inert on other platforms"
         }
         crate::prefs::EDIT_MOTION => crate::prefs::motion_auto_help(),
+        crate::prefs::EDIT_ROBI => {
+            " · a permanent resident: typing robi or robot makes him greet you · hidden only under reduced motion or serious mode"
+        }
         // Every SYNTH voice shares the one macOS-only output path, so they share
         // one platform caveat. Grown with the Sound menu: these keys are now
         // reachable from Settings, so Manual must state the same limit the panel
@@ -3817,6 +3879,71 @@ mod tests {
         );
     }
 
+    /// MIGRATION: the pre-rename display-face spellings LOAD. A config written
+    /// before "Game Fonts" became "Display Faces" must not turn into an error,
+    /// or a shipped key would have been deleted out from under the people who
+    /// used it — so `game_font` stays valid, every retired id stays valid
+    /// (including `mariokart`, whose face was removed with no substitute), and
+    /// the only consequence is a warning naming the current spelling.
+    ///
+    /// "Deprecated" and "unknown" must not BOTH be said: the key still applies,
+    /// and "unknown to this build; preserved for forward compatibility" reads
+    /// like the setting stopped working.
+    #[test]
+    fn the_deprecated_display_font_key_warns_with_the_new_spelling_and_never_errors() {
+        for value in crate::prefs::LEGACY_DISPLAY_FONT_IDS
+            .iter()
+            .copied()
+            .chain(["pixel", "minecraft+zelda", "pixel+engraved"])
+        {
+            let source = format!("{} = {value:?}\n", crate::prefs::LEGACY_EDIT_DISPLAY_FONT);
+            let analysis = analyze(&source);
+            assert!(
+                !analysis.has_errors(),
+                "a config valid before the rename must still load ({value:?}): {:?}",
+                analysis.diagnostics
+            );
+            let messages: Vec<&str> = analysis
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect();
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.contains("is deprecated")
+                        && message.contains(crate::prefs::EDIT_DISPLAY_FONT)),
+                "the deprecation must name the new key ({value:?}): {messages:?}"
+            );
+            assert!(
+                messages.iter().all(|message| !message.contains("unknown")),
+                "a deprecated key is not an unknown key ({value:?}): {messages:?}"
+            );
+        }
+        // The current key with a legacy VALUE: accepted, because the same
+        // migration promise covers the ids, not just the key name.
+        for value in crate::prefs::LEGACY_DISPLAY_FONT_IDS {
+            let source = format!("{} = {value:?}\n", crate::prefs::EDIT_DISPLAY_FONT);
+            assert!(
+                !analyze(&source).has_errors(),
+                "legacy id {value:?} must remain accepted under the current key"
+            );
+        }
+        // …and a genuine typo is still an ERROR under either spelling. A
+        // deprecated key is not an unvalidated one.
+        for key in [
+            crate::prefs::EDIT_DISPLAY_FONT,
+            crate::prefs::LEGACY_EDIT_DISPLAY_FONT,
+        ] {
+            for bad in ["dooom", "pixel+dooom", "pixel+minecraft"] {
+                assert!(
+                    analyze(&format!("{key} = {bad:?}\n")).has_errors(),
+                    "{bad:?} must not pass validation under {key}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unterminated_parser_diagnostic_targets_the_authored_line_before_trailing_newline() {
         let source = "# Manual\nfont_px = [ \n";
@@ -4520,7 +4647,7 @@ home = "~/aterm"
             "bidi",
             "cursor_style",
             "cursor_trail_style",
-            "game_font",
+            "display_font",
             "motion",
             "predictive_echo",
             "sparkle_words.feline.style",
@@ -4569,6 +4696,13 @@ home = "~/aterm"
             (
                 crate::prefs::EDIT_BACKGROUND_MATERIAL,
                 BACKGROUND_MATERIAL_ALIASES,
+            ),
+            // Every pre-rename face id, including the one whose face was
+            // deleted: a config that was valid before the rename must still
+            // LOAD without an error, whatever it renders with.
+            (
+                crate::prefs::EDIT_DISPLAY_FONT,
+                crate::prefs::LEGACY_DISPLAY_FONT_IDS,
             ),
         ] {
             for alias in aliases {

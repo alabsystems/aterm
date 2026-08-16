@@ -39,11 +39,25 @@ impl Staging {
     /// Resolve (and create, `0700`, ownership-verified) the staging layout.
     /// Returns `None` if `HOME` is unset or the directory cannot be made private.
     pub fn resolve() -> Option<Self> {
-        let home = std::env::var_os("HOME")?;
-        let base = PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("aterm");
+        // TEST/DEMO ISOLATION (2026-08-15): `ATERM_UPDATE_ROOT` overrides the
+        // HOME-keyed base wholesale. Without it, every `cargo test -p
+        // aterm-gui` run drove the REAL per-user ledgers through the real
+        // recorders — ~2,125 of the 2,191 "apply failures" on this machine's
+        // health ledger were the unit suite's fixture strings (current_build
+        // 10, "handoff proof ended TimedOut"), laundered into `update status`
+        // as a persistent streak on a healthy, up-to-date install. The GUI
+        // test harness pins this to a per-process scratch dir; a demo or
+        // rehearsal shell may point it anywhere.
+        let base = match std::env::var_os("ATERM_UPDATE_ROOT") {
+            Some(root) if !root.is_empty() => PathBuf::from(root),
+            _ => {
+                let home = std::env::var_os("HOME")?;
+                PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("aterm")
+            }
+        };
         let root = base.join("Updates");
         ensure_private_dir(&root).ok()?;
         let download = root.join("download");

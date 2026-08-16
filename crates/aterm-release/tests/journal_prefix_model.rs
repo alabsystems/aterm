@@ -26,18 +26,21 @@ mod gates;
 #[path = "../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
+#[path = "../src/machines.rs"]
+#[allow(dead_code)]
+mod machines;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
 #[path = "../src/mirror.rs"]
 #[allow(dead_code)]
 mod mirror;
+#[path = "../src/provision.rs"]
+#[allow(dead_code)]
+mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -59,6 +62,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
+        signature_machine_id: None,
         release_id,
         draft_create_issued: release_id.is_some(),
         upload_intents: Vec::new(),

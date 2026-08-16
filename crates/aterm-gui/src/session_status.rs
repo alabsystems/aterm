@@ -406,8 +406,8 @@ impl StatusFsm {
         if let Some(shell) = evidence.shell {
             // A genuine contradiction: the shell claims to be executing while
             // the foreground process group is the shell itself.
-            let conflict = matches!(shell, ShellEvidence::Executing)
-                && evidence.foreground_job == Some(false);
+            let conflict =
+                matches!(shell, ShellEvidence::Executing) && evidence.foreground_job == Some(false);
             return match shell {
                 ShellEvidence::Executing => Candidate {
                     phase: if moved { Phase::Running } else { Phase::Quiet },
@@ -489,9 +489,7 @@ impl StatusFsm {
     /// a session that has exited must not be reported as running for another
     /// three-quarters of a second.
     fn apply(&mut self, candidate: Candidate, now: Instant) -> bool {
-        let outcome = candidate
-            .outcome
-            .unwrap_or(self.published.last_outcome);
+        let outcome = candidate.outcome.unwrap_or(self.published.last_outcome);
         // A new unit of work clears the remembered result of the previous one.
         // Keyed on LEAVING rest rather than on entering Running specifically:
         // an Idle -> Quiet -> Running path (a command that prints nothing for a
@@ -864,7 +862,10 @@ impl crate::App {
             // process name (the name is not available on the session path at
             // all), so the classifier is deliberately built to need only this.
             let foreground_job = (master >= 0 && pid > 0).then(|| {
-                crate::quit_safety::foreground_is_job(crate::quit_safety::foreground_pgrp(master), pid)
+                crate::quit_safety::foreground_is_job(
+                    crate::quit_safety::foreground_pgrp(master),
+                    pid,
+                )
             });
             let Ok(guard) = term.try_lock() else {
                 continue;
@@ -1300,17 +1301,16 @@ mod tests {
         let t0 = Instant::now();
         let mut fsm = StatusFsm::new(policy(), t0);
         let mut ev = evidence(blank(1));
-        ev.shell = Some(ShellEvidence::Complete {
-            exit_code: Some(1),
-        });
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(1) });
 
         settle(&mut fsm, &ev, t0);
 
-        assert_eq!(fsm.status().phase, Phase::Idle, "finished work is not a phase");
         assert_eq!(
-            fsm.status().last_outcome,
-            Outcome::Failure { exit_code: 1 }
+            fsm.status().phase,
+            Phase::Idle,
+            "finished work is not a phase"
         );
+        assert_eq!(fsm.status().last_outcome, Outcome::Failure { exit_code: 1 });
         assert!(fsm.status().last_outcome.is_failure());
     }
 
@@ -1319,9 +1319,7 @@ mod tests {
         let t0 = Instant::now();
         let mut fsm = StatusFsm::new(policy(), t0);
         let mut ev = evidence(blank(1));
-        ev.shell = Some(ShellEvidence::Complete {
-            exit_code: Some(2),
-        });
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
         let t1 = settle(&mut fsm, &ev, t0);
         assert!(fsm.status().last_outcome.is_failure());
 
@@ -1379,7 +1377,10 @@ mod tests {
 
         settle(&mut fsm, &ev, t0);
 
-        assert!(fsm.status().conflict, "contradictory evidence must be visible");
+        assert!(
+            fsm.status().conflict,
+            "contradictory evidence must be visible"
+        );
     }
 
     fn published(phase: Phase, last_outcome: Outcome) -> Status {
@@ -1632,7 +1633,12 @@ mod tests {
         ev.shell = Some(ShellEvidence::Executing);
         ev.activity.content_seq = 2;
         ev.activity.last_output = Some(t0 + Duration::from_millis(10));
-        let t1 = settle_observer(&mut app.session_status, 0, &ev, t0 + Duration::from_millis(10));
+        let t1 = settle_observer(
+            &mut app.session_status,
+            0,
+            &ev,
+            t0 + Duration::from_millis(10),
+        );
         assert_eq!(
             app.session_status.status(0).map(|s| s.last_outcome),
             Some(Outcome::None),
@@ -1661,11 +1667,21 @@ mod tests {
 
         // And the same on a PURE-terminal tab, which the latch broke too.
         ev.shell = Some(ShellEvidence::Complete { exit_code: Some(2) });
-        let t2 = settle_observer(&mut app.session_status, 0, &ev, t1 + Duration::from_millis(10));
+        let t2 = settle_observer(
+            &mut app.session_status,
+            0,
+            &ev,
+            t1 + Duration::from_millis(10),
+        );
         app.refresh_tab_status_indicators(wid, tab_id);
         assert!(attention_of(&app, wid, tab_id));
         ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
-        settle_observer(&mut app.session_status, 0, &ev, t2 + Duration::from_millis(10));
+        settle_observer(
+            &mut app.session_status,
+            0,
+            &ev,
+            t2 + Duration::from_millis(10),
+        );
         app.refresh_tab_status_indicators(wid, tab_id);
         assert!(
             !attention_of(&app, wid, tab_id),
@@ -1675,7 +1691,11 @@ mod tests {
 
     /// What the CHROME shows: the fold both renderers and the introspection
     /// serializer read, not either owner's field alone.
-    fn attention_of(app: &crate::App, wid: crate::WindowId, tab_id: crate::tab_model::TabId) -> bool {
+    fn attention_of(
+        app: &crate::App,
+        wid: crate::WindowId,
+        tab_id: crate::tab_model::TabId,
+    ) -> bool {
         app.windows[&wid]
             .tab_set
             .get(tab_id)
@@ -1712,7 +1732,10 @@ mod tests {
         ev.foreground_job = Some(true);
         ev.activity.last_output = Some(t0);
         settle_observer(&mut app.session_status, 0, &ev, t0);
-        assert_eq!(app.session_status.status(0).map(|s| s.phase), Some(Phase::Running));
+        assert_eq!(
+            app.session_status.status(0).map(|s| s.phase),
+            Some(Phase::Running)
+        );
 
         // The stub session's pid is not a real child, so the collector honestly
         // answers "unknown" rather than inventing a code.
@@ -1803,7 +1826,9 @@ mod tests {
         ev.foreground_job = Some(false);
         let t1 = t0 + DWELL;
         observer.observe(1, &ev, t1);
-        let before = observer.next_wake().expect("a pending candidate owes a wake");
+        let before = observer
+            .next_wake()
+            .expect("a pending candidate owes a wake");
         assert_eq!(before, t1 + DWELL);
 
         assert!(
@@ -1896,7 +1921,10 @@ mod tests {
             Some(Outcome::Failure { exit_code: 1 }),
             "the record is still classified and still readable"
         );
-        assert_eq!(app.session_status_text(0).as_deref(), Some("failed (exit 1)"));
+        assert_eq!(
+            app.session_status_text(0).as_deref(),
+            Some("failed (exit 1)")
+        );
     }
 
     /// The `status` verb's reply, field by field. `schema=` leads so a consumer
@@ -1921,7 +1949,10 @@ mod tests {
         let record = app.session_status_record(0).expect("live session");
         assert!(record.contains(" observed=true "), "{record}");
         assert!(record.contains(" phase=idle "), "{record}");
-        assert!(record.contains(" outcome=failure exit_code=3 signal=- "), "{record}");
+        assert!(
+            record.contains(" outcome=failure exit_code=3 signal=- "),
+            "{record}"
+        );
         assert!(record.contains(" confidence=strong "), "{record}");
         assert!(record.contains(" reasons=shell_block "), "{record}");
         assert!(record.contains(" conflict=false "), "{record}");

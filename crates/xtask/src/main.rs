@@ -69,7 +69,10 @@ fn main() -> ExitCode {
             }
         },
         Some("spec-link") => spec_link(),
-        Some("gate") => gate::run(args.get(2).map(String::as_str)),
+        Some("gate") => gate::run(
+            args.get(2).map(String::as_str),
+            args.get(3..).unwrap_or_default(),
+        ),
         Some("verify") => verify(&args[2..]),
         _ => {
             eprintln!(
@@ -78,6 +81,7 @@ fn main() -> ExitCode {
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
                  gate <check>      local enforcement gate (NO CI): all|drift|dormant|lint|perf\n\
+                                   `gate lint [--no-fmt]` — --no-fmt is the push gate's setting\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
                                    (this is what the `cargo verify` alias dispatches to)"

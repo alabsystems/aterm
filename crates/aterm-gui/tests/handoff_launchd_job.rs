@@ -39,116 +39,21 @@
 //! carries the per-instance bootstrap subset the app's frameworks resolve
 //! against.
 //!
-//! # What has to become true for this to pass
+//! # Running the live guard
 //!
-//! [`survivor_is_a_live_launchd_application_job`] FAILS today, and is `#[ignore]`d
-//! for that reason as much as for needing a real app bundle. It is a
-//! SPECIFICATION, not a disabled test: it passes exactly when the overlap
-//! successor stops being a `fork` child of the outgoing process and is launched
-//! through LaunchServices (`NSWorkspace.openApplication` with
-//! `createsNewApplicationInstance`, the `open -n` equivalent), so launchd mints
-//! it its OWN `application.com.aterm.aterm.<hex>.<hex>` job whose bootstrap
-//! context outlives the outgoing job's teardown.
-//!
-//! That launch cannot be swapped in on its own. A LaunchServices launch inherits
-//! no descriptors and is launchd's child rather than ours, so four properties
-//! the current `fork` gets for free must be re-established FIRST. Each is
-//! documented at the call site that owns it; all four are prerequisites of the
-//! launch-shape change, not follow-ups.
-//!
-//! * **B1 — parent attestation. DONE (0.13).** The successor's admission check
-//!   and its `_exit(74)` fail-stop used to be `getppid()`-based, and a
-//!   LaunchServices-launched process has ppid 1 from birth, so it would have
-//!   refused the handoff and then killed itself on its first watch pass. Both
-//!   now rest on the outgoing process's kernel BIRTH RECORD
-//!   (`seamless::AttestedParent`), which is independent of the process tree,
-//!   immune to pid reuse, and edged on the parent's `exit` rather than its
-//!   reap.
-//!
-//!   `getppid()` has NOT left the code, and claiming otherwise would misread
-//!   what B1 needs. Admission still consults it — `attest_handoff_parent`
-//!   refuses a candidate whose creator is a live process OTHER than the pid it
-//!   was told to trust — and the `ForkLink` witness IS `getppid() == pid`,
-//!   re-evaluated on every watch tick. What changed is that neither is now
-//!   REQUIRED to be satisfiable: a successor born with ppid 1 has a vacuous
-//!   identity rule and takes the `Birth` witness instead, so it no longer
-//!   fail-stops on its first pass. On a non-macOS unix `read_process_birth` is
-//!   a `None` stub, so `ForkLink` is the only witness there and the fail-stop
-//!   remains entirely ppid-based — which is correct for a platform whose
-//!   successor is still a fork child.
-//! * **B2 — reap authority. DONE (0.14).** `kill_and_reap_handoff_child` used
-//!   to resume the parked readers only on a `wait` that proved the rejected
-//!   candidate gone, and `waitpid` on a non-child answers `ECHILD`, losing that
-//!   proof. Rollback is now licensed by a typed `HandoffRollbackWarrant`:
-//!   `waitpid` still mints one while the candidate IS our fork child, and when
-//!   it is not, `kill(pid, 0)` vacancy or a disagreeing kernel birth stamp mints
-//!   the same fact from outside the process tree. `ECHILD` is no longer read as
-//!   evidence of anything.
-//! * **B3 — process-group containment. Mechanism BUILT (0.15), not yet REACHED
-//!   on the launched lane.** The `pre_exec` `setpgid(0, 0)` in
-//!   `run_handoff_worker` is what makes `kill(-pid)` sweep the candidate's own
-//!   codesign/PlistBuddy/spctl helpers, and a LaunchServices launch has no
-//!   equivalent hook — so a successor is given the means to contain ITSELF:
-//!   `app_update_handoff::contain_own_process_group`, called from
-//!   `aterm_gui::main_entry` ahead of the boot apply, which is the first point
-//!   at which that process runs another program. `setpgid`'s EPERM is not read
-//!   as failure (the one process it refuses is a session leader, which already
-//!   leads its own group), but neither is it read as success: the postcondition
-//!   `getpgrp() == getpid()` is read back from the kernel, and a candidate that
-//!   cannot satisfy it exits before forking anything rather than leaving helpers
-//!   no reaper could sweep.
-//!
-//!   BE PRECISE ABOUT WHAT THAT BUYS TODAY, because the obvious reading is
-//!   wrong. The call is gated on `incoming_exec_fds.parent_pid().is_some()`,
-//!   i.e. a VALIDATED incoming handoff — and validation requires all six
-//!   handoff env vars plus a live `F_GETFD` on every named descriptor
-//!   (`seamless::handoff_is_modern_overlap`, `authority_valid`). A
-//!   LaunchServices launch inherits no descriptors, which is B4's whole premise
-//!   below, so such a successor fails validation and RETURNS before this call
-//!   rather than reaching it. On today's fork lane the call is therefore
-//!   redundant (`pre_exec` already did it, strictly earlier); on the launched
-//!   lane it is unreachable until B4's transport revalidates the handoff over
-//!   the socket. The mechanism is correct and probe-verified; it simply cannot
-//!   fire for the launch shape it was written for until B4 lands, and B4 must
-//!   extend that gate to a socket-named candidate.
-//!
-//!   What does NOT carry over is the PARENT's knowledge of the group. `pre_exec`
-//!   establishes it before `spawn` returns; a launched successor has no wire on
-//!   which to report its pgid, so on that lane `kill(-pid)` is an unproven sweep
-//!   until B4's socket carries an attested group id — see
-//!   `app_update_handoff::signal_handoff_candidate` for what each reaper may
-//!   conclude from it meanwhile.
-//! * **B4 — transport.** The PTY masters (`ATERM_SEAMLESS_FDS`), the readiness
-//!   pipe and the Commit pipe must move to an out-of-band `SCM_RIGHTS` transfer
-//!   over the per-user control socket. That also changes what
-//!   `seamless::adoption_proof` may hash: it hashes fd NUMBERS today, and
-//!   `SCM_RIGHTS` installs descriptors at whatever numbers the receiver has
-//!   free, so the two sides would hash different values and every handoff would
-//!   end in `AdoptionMismatch`. The fd term cannot simply be dropped — it is
-//!   what stops an identity-only subset claiming a different PTY — so it needs
-//!   a term both sides compute independently of their own fd tables, such as
-//!   the descriptor's ordinal in the parent-declared transfer order.
-//!
-//! So: B1 and B2 are closed. B3's mechanism is built and verified but cannot be
-//! REACHED on the launched lane until B4 revalidates a handoff that arrives
-//! without inherited descriptors — so B4 gates the remainder of B3 twice over:
-//! once for the successor's own containment call, and once for the attested
-//! group id the parent needs in order to aim `kill(-pid)` at a candidate it did
-//! not fork. Everything left is therefore B4.
-//!
-//! This test FAILING is still the expected outcome until that lands and the
-//! `spawn` in
-//! `app_update_handoff::run_handoff_worker` is replaced. Run it with:
+//! The LaunchServices + `SCM_RIGHTS` handoff is implemented. This test remains
+//! ignored by default only because it needs a built, signed-enough-to-launch
+//! app bundle and creates a real GUI application job. It targets that exact
+//! fixture by pid; flagless control discovery is forbidden here because another
+//! aterm instance may already be running.
 //!
 //! ```text
 //! ATERM_HANDOFF_E2E_APP=/path/to/aterm.app \
 //!   cargo test -p aterm-gui --test handoff_launchd_job -- --ignored --nocapture
 //! ```
 //!
-//! The pure tests around [`running_application_job`] DO run in the gate: they
-//! pin the reading of the `launchctl` table, which is the part of the guard
-//! that could silently rot into a vacuous pass (a parser that matches nothing
-//! would make the e2e assertion unfalsifiable).
+//! The pure parser test still runs in the default gate so this assertion cannot
+//! silently become vacuous.
 
 #![cfg(target_os = "macos")]
 
@@ -337,16 +242,9 @@ fn running_application_job_reads_the_launchctl_table() {
     assert_eq!(labels, vec!["application.com.aterm.aterm.0x10a5f.0x10a5f"]);
 }
 
-/// PASSES WHEN: the overlap successor is launched through LaunchServices
-/// (`createsNewApplicationInstance`) instead of `Command::spawn`, so launchd
-/// gives it an `application.com.aterm.aterm.*` job of its own. That requires
-/// blockers B2, B3 and B4 (this file's module docs name the call site that owns
-/// each; B1 is done). Until then, failing is the expected outcome and the
-/// failure IS the reproducer for the orphaned-XPC-domain defect.
+/// The overlap successor must be a new LaunchServices application job.
 #[test]
-#[ignore = "live LaunchServices/launchd e2e (needs ATERM_HANDOFF_E2E_APP); \
-            FAILS by design until blockers B2-B4 land and the overlap successor \
-            is launched through LaunchServices as its own launchd job"]
+#[ignore = "live LaunchServices/launchd e2e; needs ATERM_HANDOFF_E2E_APP"]
 fn survivor_is_a_live_launchd_application_job() {
     let app = PathBuf::from(
         std::env::var_os("ATERM_HANDOFF_E2E_APP")
@@ -407,9 +305,19 @@ fn survivor_is_a_live_launchd_application_job() {
         "the first session's shell",
     );
 
+    let original_pid = original.to_string();
+    // A live shell is not necessarily settled: its startup files may still be
+    // producing structural output, which correctly revokes a handoff snapshot.
+    // Wait on the fixture's own readiness signal instead of racing that output.
+    let ready = Command::new(&ctl)
+        .args(["--pid", original_pid.as_str(), "ready"])
+        .status()
+        .expect("wait for fixture readiness");
+    assert!(ready.success(), "aterm-ctl ready failed");
+
     // Drive the handoff through the same verb the GUI's [Relaunch] nudge uses.
     let applied = Command::new(&ctl)
-        .args(["update", "apply"])
+        .args(["--pid", original_pid.as_str(), "update", "apply"])
         .status()
         .expect("run aterm-ctl update apply");
     assert!(applied.success(), "aterm-ctl update apply failed");

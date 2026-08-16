@@ -8,7 +8,7 @@
 //! resolution verbatim — [`pick_slug`](aterm_update_core::pick_slug) /
 //! [`is_valid_slug`](aterm_update_core::is_valid_slug), the same gate that keeps a
 //! stray/hostile config value from redirecting fetches off the GitHub API — and then
-//! fetches exactly one asset: `index.toml` on `<account>/aterm-toolchain-index`
+//! fetches exactly one asset: `index.toml` on `<account>/aterm`
 //! ([`crate::manifest::INDEX_REPO`]). Everything installable flows from that one
 //! root-signed document; an unlisted repo is unreachable by construction (§5,
 //! [`crate::manifest::Index::installable`]).
@@ -37,7 +37,7 @@ pub fn index_repo() -> String {
         .unwrap_or_else(|| INDEX_REPO.to_string())
 }
 
-/// The resolved index location: `github.com/<owner>/aterm-toolchain-index`. `repo` is
+/// The resolved index location: `github.com/<owner>/aterm`. `repo` is
 /// always [`INDEX_REPO`]; only the `owner` (account) is configurable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexRepo {
@@ -83,17 +83,23 @@ pub fn resolve_account(cfg_account: Option<&str>) -> IndexRepo {
 /// mutating the process environment (which is `unsafe`/UB-prone under edition 2024).
 #[must_use]
 pub fn resolve_account_with(env: Option<&str>, cfg_account: Option<&str>) -> IndexRepo {
-    // PUBLISH_OWNER, not DEFAULT_OWNER: the index account is the account this
-    // project is published under, NOT wherever installed copies fetch updates from.
-    // Those were the same string until the updater's default channel was repointed
-    // at the public mirror — following it would have silently moved the package
-    // index's ACCOUNT-BOUND trust root (§8) to an owner whose root key is not the
-    // pinned one, turning a channel change into an authenticity change.
+    // ATPKG_INDEX_OWNER — the package index's OWN tracked key
+    // (`[workspace.metadata.atpkg] account`), neither of the updater's slugs:
+    //   * not DEFAULT_OWNER — that is the APP update channel; following it would
+    //     silently move the index's ACCOUNT-BOUND trust root (§8) whenever the
+    //     channel is repointed, turning a channel change into an authenticity
+    //     change;
+    //   * not PUBLISH_OWNER — that is the PRIVATE staging repo, which a
+    //     default-configured (tokenless) install cannot read at all, so binding
+    //     the index to it orphaned every such install from the published
+    //     registry.
+    // Repointing the compiled default is a HOST decision only: the index still
+    // verifies against the pinned root key wherever it is fetched from.
     let owner = aterm_update_core::pick_slug(
         ACCOUNT_ENV,
         env,
         cfg_account,
-        aterm_update_core::PUBLISH_OWNER,
+        aterm_update_core::ATPKG_INDEX_OWNER,
     );
     IndexRepo {
         owner,
@@ -106,12 +112,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_alabsystems_index_repo() {
+    fn defaults_to_the_public_alabsystems_index_repo() {
         // With no env override and no config, the default account + fixed index repo.
         // (ATPKG_ACCOUNT is atpkg-specific and unset in dev/CI shells.)
         if std::env::var_os(ACCOUNT_ENV).is_none() {
             let r = resolve_account(None);
-            assert_eq!(r.owner, aterm_update_core::PUBLISH_OWNER);
+            assert_eq!(r.owner, aterm_update_core::ATPKG_INDEX_OWNER);
             assert_eq!(r.owner, "alabsystems");
             assert_eq!(r.repo, INDEX_REPO);
             assert_eq!(r.repo, "aterm"); // the index rides the aterm repo itself (§16)
@@ -119,45 +125,61 @@ mod tests {
         }
     }
 
-    /// The index account must track the PUBLISH owner, never the update channel.
+    /// The index account is its OWN tracked key (`[workspace.metadata.atpkg]
+    /// account`) — never the update channel, never the publish repo.
     ///
-    /// These were the same string until aterm's default update channel was repointed
-    /// at the public mirror (`[workspace.metadata.aterm] update_channel`). Binding
-    /// the index to `DEFAULT_OWNER` — as this module briefly did — silently moved the
-    /// package index's ACCOUNT-BOUND trust root (§8) to an owner whose root key is
-    /// not the pinned one, i.e. it turned a "where do bytes come from" change into an
-    /// authenticity change, and pointed installs at a repo with no index at all.
+    /// Two bindings this tripwires, both regressions this module actually had:
+    ///   * `DEFAULT_OWNER` (the app channel) — following it silently moved the
+    ///     package index's ACCOUNT-BOUND trust root (§8) when the channel was
+    ///     repointed at the public mirror, turning a "where do bytes come from"
+    ///     change into an authenticity change;
+    ///   * `PUBLISH_OWNER` (the private staging repo) — a default-configured,
+    ///     tokenless install 404s there, so the published registry was
+    ///     unreachable by construction for exactly the installs the compiled
+    ///     default exists to serve.
     ///
     /// Asserting the CONSTANT the resolver uses (not just today's literal) is what
-    /// makes this a tripwire: it keeps failing if the channel moves again.
+    /// makes this a tripwire: it keeps failing if either binding comes back.
     #[test]
-    fn index_account_does_not_follow_the_update_channel() {
+    fn index_account_is_its_own_knob() {
         if std::env::var_os(ACCOUNT_ENV).is_none() {
             assert_eq!(
                 resolve_account(None).owner,
-                aterm_update_core::PUBLISH_OWNER,
-                "the index account must be the publish owner"
+                aterm_update_core::ATPKG_INDEX_OWNER,
+                "the index account must be the dedicated package-index owner"
             );
         }
-        // The two knobs are genuinely independent: in the private tree the channel is
-        // repointed at the public mirror while the index stays on the publish account.
-        //
-        // Scoped to the private staging namespace on purpose — `publish/` exports a
-        // PUBLIC source snapshot that rewrites `alabsystems` -> `alabsystems`
-        // throughout, so in THAT tree the two legally coincide (one public repo
-        // serving source, releases and the index — the documented "no separate
-        // mirror" configuration, not a regression). Same scoping as
+        // The compiled default is the PUBLIC package org in BOTH trees: this tree
+        // spells `alabsystems` in the metadata key verbatim, and `publish/` exports
+        // a PUBLIC source snapshot that rewrites the private staging owner's name
+        // to `alabsystems` throughout — leaving this value untouched — so a
+        // public-snapshot build points at alabsystems too.
+        assert_eq!(aterm_update_core::ATPKG_INDEX_OWNER, "alabsystems");
+        // Scoped to the private staging namespace on purpose — in the public
+        // snapshot the index account and the publish owner legally coincide (one
+        // public org serving source, releases and the index). Same scoping as
         // `aterm-release`'s `the_channel_is_never_pointed_back_at_the_private_staging_repo`.
-        if aterm_update_core::PUBLISH_OWNER == "alabsystems" {
+        //
+        // The gate is spelled WITHOUT the private owner's literal name, on
+        // purpose: publish/transforms.sh rewrites that name to the public org in
+        // EVERY text file of the export — this one included — so a literal-keyed
+        // guard would flip to always-true in the exported tree and its
+        // `assert_ne!` below would fail deterministically for every public-
+        // snapshot `cargo test` run (adversarial review 2026-08-11). `PUBLISH_OWNER
+        // != DEFAULT_OWNER` holds exactly in the private tree (staging and the
+        // public channel are different orgs, asserted below) and collapses in the
+        // export (one org serves both), so the tripwire fires precisely where the
+        // distinction it protects exists.
+        if aterm_update_core::PUBLISH_OWNER != aterm_update_core::DEFAULT_OWNER {
+            assert_ne!(
+                aterm_update_core::ATPKG_INDEX_OWNER,
+                aterm_update_core::PUBLISH_OWNER,
+                "the index default must be publicly readable, never the private staging owner"
+            );
             assert_eq!(
                 aterm_update_core::DEFAULT_OWNER,
                 "alabsystems",
                 "the private tree's update channel is the public mirror"
-            );
-            assert_ne!(
-                aterm_update_core::PUBLISH_OWNER,
-                aterm_update_core::DEFAULT_OWNER,
-                "index account and update channel must not be the same knob"
             );
         }
     }
@@ -181,11 +203,11 @@ mod tests {
             // so it can never redirect the index fetch off api.github.com.
             assert_eq!(
                 resolve_account(Some("evil.com/x")).owner,
-                aterm_update_core::PUBLISH_OWNER
+                aterm_update_core::ATPKG_INDEX_OWNER
             );
             assert_eq!(
                 resolve_account(Some("a b")).owner,
-                aterm_update_core::PUBLISH_OWNER
+                aterm_update_core::ATPKG_INDEX_OWNER
             );
         }
     }
@@ -210,7 +232,7 @@ mod tests {
         // invalid env AND no/invalid config → trusted default (never an attacker slug).
         assert_eq!(
             resolve_account_with(Some("e v i l"), Some("c/d")).owner,
-            aterm_update_core::PUBLISH_OWNER
+            aterm_update_core::ATPKG_INDEX_OWNER
         );
         // blank env is treated as absent.
         assert_eq!(

@@ -1275,6 +1275,10 @@ impl SettingsPreviewSpec {
         }
         let show_scene = scene_width + 8.0 + state_width <= available;
         if show_scene {
+            // The scene badge is the preview's kicker — it wears the theme
+            // accent so every card header carries one confident spot of the
+            // theme's own color (the state badge on the right keeps its
+            // quieter semantic coloring).
             prims.push(text_prim(
                 rect.x + inset,
                 caption_y,
@@ -1282,7 +1286,7 @@ impl SettingsPreviewSpec {
                 caption_size,
                 TextWeight::Regular,
                 TextFace::UiBold,
-                rgba(roles.text_secondary, 255),
+                rgba(roles.accent, 255),
             ));
         }
         prims.push(text_prim(

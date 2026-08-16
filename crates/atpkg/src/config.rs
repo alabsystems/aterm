@@ -368,12 +368,13 @@ mod tests {
             "env-org"
         );
         // …and an invalid config account can never redirect (falls to default).
-        // PUBLISH_OWNER, not DEFAULT_OWNER: the package index is account-bound and
-        // deliberately does NOT follow the updater's public-mirror channel.
+        // ATPKG_INDEX_OWNER, not PUBLISH_OWNER or DEFAULT_OWNER: the package
+        // index has its own tracked owner key (the public account) — it follows
+        // neither the private staging repo nor the updater's mirror channel.
         let bad = parse_packages("[packages]\naccount = \"evil.com/x\"\n");
         assert_eq!(
             crate::resolve_account_with(None, bad.account()).owner,
-            aterm_update_core::PUBLISH_OWNER
+            aterm_update_core::ATPKG_INDEX_OWNER
         );
         // Blank config account is treated as unset.
         let blank = parse_packages("[packages]\naccount = \"\"\n");
@@ -472,11 +473,13 @@ mod tests {
     #[test]
     fn prefix_path_resolves_absolute_and_tilde_and_refuses_relative() {
         let home = Path::new("/home/someone");
-        let of = |v: Option<&str>| PackagesConfig {
-            prefix: v.map(str::to_string),
-            ..PackagesConfig::default()
-        }
-        .prefix_path(Some(home));
+        let of = |v: Option<&str>| {
+            PackagesConfig {
+                prefix: v.map(str::to_string),
+                ..PackagesConfig::default()
+            }
+            .prefix_path(Some(home))
+        };
 
         assert_eq!(of(None), None, "absent ⇒ the default prefix");
         assert_eq!(of(Some("   ")), None, "blank ⇒ the default prefix");

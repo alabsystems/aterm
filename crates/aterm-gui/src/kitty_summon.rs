@@ -7,8 +7,10 @@
 //! Three families are recognized, all straight out of [`aterm_lexicon`]:
 //!
 //! * [`Class::Feline`] — typing `kitty` (or `gato`, `chat`, `neko`, `kucing`,
-//!   `猫`, …) summons a kitty cameo IN the terminal, the input-path twin of the
-//!   Settings overlay's §L.4 cameo, and DELIGHTS the cursor companion.
+//!   `猫`, …) records a Kitty Log sighting. It draws NOTHING of its own: the
+//!   word echoes onto the grid and the screen scanner answers it with the one
+//!   ambient word-cat, centred on the word (owner, 2026-08-12: *"I want the cat
+//!   just like in the main text"*).
 //! * [`Class::Profanity`] — typing a complete curse in any listed language
 //!   makes the companion WINCE. The screen scanner already reacts to profanity
 //!   it can SEE (`word_decorations`'s `CurseCue`); this is the same reaction
@@ -58,13 +60,14 @@
 //! "writing kitty is suppose to cause the toy kitty to appear. I just now typed
 //! it, and it didn't appear! why! it should be 100% of the time"):
 //!
-//! * The CAMEO fires on EVERY completion. Typing the word is a direct request;
-//!   answering it only sometimes reads as broken, not as restraint.
+//! * The COMPLETION fires on EVERY typed word and is CONSUMED there. Typing
+//!   the word is a direct request; answering it only sometimes reads as broken,
+//!   not as restraint. What answers it is the ambient word-cat.
 //! * The LEDGER row is what [`TYPED_SUMMON_COOLDOWN`] rate-limits, measured
 //!   from the last RECORDED summon (a suppressed completion does not restamp
 //!   the clock). That was always the documented concern: kitty-spam must not
 //!   inflate the Kitty Log or force its writer batches. Nothing about it
-//!   requires withholding the drawing.
+//!   requires withholding the drawing, and nothing here does.
 //!
 //! Profanity carries no ledger tier at all — the companion's wince is pure
 //! expression and records nothing.
@@ -81,8 +84,9 @@ use std::time::{Duration, Instant};
 /// kitty-spam pointless; it matches the Kitty Log's own flush-debounce scale,
 /// so spam cannot force ledger writer batches.
 ///
-/// This bounds the RECORD ONLY. The cameo itself is never withheld — see the
-/// two-tier note in the module docs.
+/// This bounds the RECORD ONLY. The word's own cat — the ambient peek the
+/// screen scanner grows — is never withheld; see the two-tier note in the
+/// module docs.
 pub(crate) const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// THE DOG GATE (owner's design, 2026-08-10: "you have to type a lot first"):
@@ -95,41 +99,22 @@ pub(crate) const TYPED_SUMMON_COOLDOWN: Duration = Duration::from_secs(30);
 /// breaks, or backspaces — deleting text does not un-type it.
 pub(crate) const DOG_SUMMON_KEYS: u64 = 500;
 
-/// What one keystroke did to the typed-feline detector.
-///
-/// Ordered so folding several outcomes (a multi-char IME commit) with `max`
-/// keeps the strongest: recording implies showing.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
-pub(crate) enum TypedSummon {
-    /// No feline completion on this keystroke.
-    #[default]
-    None,
-    /// A feline word completed inside the ledger cooldown: SHOW the cameo,
-    /// record nothing.
-    CameoOnly,
-    /// A feline word completed and the ledger clock granted: show AND record.
-    CameoAndLog,
-}
-
-impl TypedSummon {
-    /// Whether the cameo should be presented (either completion tier).
-    pub(crate) fn shows_cameo(self) -> bool {
-        self != Self::None
-    }
-
-    /// Whether the Kitty Log may record this summon.
-    pub(crate) fn records(self) -> bool {
-        self == Self::CameoAndLog
-    }
-}
-
 /// Everything one keystroke (or one IME commit char) produced.
+///
+/// FOUR INDEPENDENT AXES, each a latch. [`Self::feline`] and [`Self::records`]
+/// are the two feline TIERS: the completion is unconditional, the ledger row is
+/// what the cooldown limits. They were one ordered enum while a third thing —
+/// the typed-kitty cameo — needed "completed but not recorded" as a state of
+/// its own; with the cameo gone the tiers are exactly these two bits, and
+/// `records` implies `feline` by construction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) struct TypedHit {
-    /// The feline cameo/ledger verdict.
-    pub(crate) summon: TypedSummon,
-    /// A feline word completed — the companion's DELIGHT reaction is owed.
+    /// A feline word completed. Expression only — nothing on the input path
+    /// draws for it; the echoed word's own ambient cat is the answer.
     pub(crate) feline: bool,
+    /// A feline word completed AND the Kitty Log's cooldown granted the row.
+    /// Never set without [`Self::feline`].
+    pub(crate) records: bool,
     /// A profanity word completed — the companion's WINCE reaction is owed.
     pub(crate) profanity: bool,
     /// A canine word completed AND the window has typed a lot
@@ -144,8 +129,8 @@ impl TypedHit {
     /// axis. Used across the chars of one IME commit.
     pub(crate) fn merge(self, other: Self) -> Self {
         Self {
-            summon: self.summon.max(other.summon),
             feline: self.feline || other.feline,
+            records: self.records || other.records,
             profanity: self.profanity || other.profanity,
             canine: self.canine || other.canine,
         }
@@ -206,7 +191,7 @@ pub(crate) struct TypedKittySummon {
     session: Option<u64>,
     /// Instant of the last GRANTED summon — the rate limiter. Deliberately
     /// NOT reset on session switch: flipping tabs must not defeat the
-    /// cooldown (the cameo presents per window, so the limit is per window).
+    /// cooldown (the detector is per window, so the limit is per window).
     last_summon: Option<Instant>,
     /// Resident scan buffers: after warmup the per-keystroke scan allocates
     /// nothing.
@@ -244,10 +229,10 @@ impl TypedKittySummon {
     ///
     /// Fires when this character COMPLETED a lexicon word — i.e. the scan
     /// finds a match whose end is the window's end. For the feline family the
-    /// cameo is owed either way; the cooldown only decides whether the Kitty
-    /// Log may record it. A completion consumes its letters regardless, so the
-    /// tail can never re-trigger; a suppressed RECORD does not restamp the
-    /// clock, so steady spam cannot starve the next legitimate ledger row.
+    /// cooldown only decides whether the Kitty Log may record it. A completion
+    /// consumes its letters regardless, so the tail can never re-trigger; a
+    /// suppressed RECORD does not restamp the clock, so steady spam cannot
+    /// starve the next legitimate ledger row.
     pub(crate) fn note_char(
         &mut self,
         now: Instant,
@@ -294,19 +279,17 @@ impl TypedKittySummon {
                 ..TypedHit::default()
             },
             Class::Feline => {
-                let summon = if self
+                // Inside the ledger window the completion still stands — the
+                // word's own ambient cat still comes — this just writes no row.
+                let records = !self
                     .last_summon
-                    .is_some_and(|at| now.saturating_duration_since(at) < TYPED_SUMMON_COOLDOWN)
-                {
-                    // Inside the ledger window: the cat still comes when called.
-                    TypedSummon::CameoOnly
-                } else {
+                    .is_some_and(|at| now.saturating_duration_since(at) < TYPED_SUMMON_COOLDOWN);
+                if records {
                     self.last_summon = Some(now);
-                    TypedSummon::CameoAndLog
-                };
+                }
                 TypedHit {
-                    summon,
                     feline: true,
+                    records,
                     ..TypedHit::default()
                 }
             }
@@ -351,20 +334,16 @@ mod tests {
         let lx = lex();
         let opts = ScanOptions::default();
         s.chars()
-            .filter(|&c| d.note_char(now, session, c, &lx, &opts).summon.records())
+            .filter(|&c| d.note_char(now, session, c, &lx, &opts).records)
             .count()
     }
 
-    /// Feed a string one char at a time; count the CAMEOS (either tier).
-    fn feed_cameos(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
+    /// Feed a string one char at a time; count the COMPLETIONS (either tier).
+    fn feed_completions(d: &mut TypedKittySummon, now: Instant, session: u64, s: &str) -> usize {
         let lx = lex();
         let opts = ScanOptions::default();
         s.chars()
-            .filter(|&c| {
-                d.note_char(now, session, c, &lx, &opts)
-                    .summon
-                    .shows_cameo()
-            })
+            .filter(|&c| d.note_char(now, session, c, &lx, &opts).feline)
             .count()
     }
 
@@ -388,16 +367,16 @@ mod tests {
         let opts = ScanOptions::default();
         for c in ['k', 'i', 't', 't'] {
             assert!(
-                !d.note_char(t, 7, c, &lx, &opts).summon.shows_cameo(),
+                !d.note_char(t, 7, c, &lx, &opts).feline,
                 "no summon before the word completes"
             );
         }
         assert!(
-            d.note_char(t, 7, 'y', &lx, &opts).summon.shows_cameo(),
+            d.note_char(t, 7, 'y', &lx, &opts).feline,
             "the completing letter summons"
         );
         assert!(
-            !d.note_char(t, 7, 'y', &lx, &opts).summon.shows_cameo(),
+            !d.note_char(t, 7, 'y', &lx, &opts).feline,
             "the completion was consumed — its tail cannot re-trigger"
         );
     }
@@ -423,9 +402,9 @@ mod tests {
         for word in ["kitty", "gato", "gatto", "kucing"] {
             let mut d = TypedKittySummon::default();
             assert_eq!(
-                feed_cameos(&mut d, t, 7, word),
+                feed_completions(&mut d, t, 7, word),
                 1,
-                "typing {word:?} summons the cameo"
+                "typing {word:?} completes the feline word"
             );
         }
     }
@@ -440,13 +419,13 @@ mod tests {
         let t = Instant::now();
         let mut glued = TypedKittySummon::default();
         assert_eq!(
-            feed_cameos(&mut glued, t, 7, "hellokitty"),
+            feed_completions(&mut glued, t, 7, "hellokitty"),
             0,
             "`kitty` welded onto a preceding token was not typed as a word"
         );
         let mut spaced = TypedKittySummon::default();
         assert_eq!(
-            feed_cameos(&mut spaced, t, 7, "hello kitty"),
+            feed_completions(&mut spaced, t, 7, "hello kitty"),
             1,
             "…and the ordinary spaced form still summons"
         );
@@ -514,16 +493,17 @@ mod tests {
     }
 
     /// THE OWNER'S CONTRACT (2026-07-24: "it should be 100% of the time"): the
-    /// cooldown bounds the ledger, never the drawing. Every completion — however
-    /// fast they are typed — is owed a cameo.
+    /// cooldown bounds the LEDGER, never the completion. Every typed word —
+    /// however fast they come — completes, so the word's own ambient cat is
+    /// never withheld by a rate limit that exists for the log file.
     #[test]
-    fn cooldown_never_withholds_the_cameo() {
+    fn the_cooldown_never_withholds_a_completion() {
         let mut d = TypedKittySummon::default();
         let t = Instant::now();
         assert_eq!(
-            feed_cameos(&mut d, t, 7, "kitty kitty kitty"),
+            feed_completions(&mut d, t, 7, "kitty kitty kitty"),
             3,
-            "every completion draws a cat"
+            "every typed word completes"
         );
         let mut ledger = TypedKittySummon::default();
         assert_eq!(
@@ -533,18 +513,34 @@ mod tests {
         );
     }
 
-    /// The two tiers are exactly the two completion outcomes, and `records`
-    /// implies `shows_cameo` — the ordering the IME fold relies on.
+    /// `records` NEVER STANDS ALONE. It is the second of two feline tiers, so a
+    /// recorded row is always a completion — the direction the ledger drain
+    /// relies on, and the one an independent bool could silently break.
+    /// Exercised over the real cooldown so both tiers are produced by the
+    /// detector rather than hand-built.
     #[test]
-    fn cameo_and_log_tiers_are_ordered() {
-        assert!(!TypedSummon::None.shows_cameo());
-        assert!(!TypedSummon::None.records());
-        assert!(TypedSummon::CameoOnly.shows_cameo());
-        assert!(!TypedSummon::CameoOnly.records());
-        assert!(TypedSummon::CameoAndLog.shows_cameo());
-        assert!(TypedSummon::CameoAndLog.records());
-        assert!(TypedSummon::CameoAndLog > TypedSummon::CameoOnly);
-        assert!(TypedSummon::CameoOnly > TypedSummon::None);
+    fn a_recorded_summon_is_always_a_completion() {
+        let mut d = TypedKittySummon::default();
+        let t = Instant::now();
+        let lx = lex();
+        let opts = ScanOptions::default();
+        let mut granted = 0;
+        let mut completions = 0;
+        for c in "kitty kitty".chars() {
+            let hit = d.note_char(t, 7, c, &lx, &opts);
+            assert!(
+                hit.feline || !hit.records,
+                "a row was recorded for a keystroke that completed nothing"
+            );
+            completions += usize::from(hit.feline);
+            granted += usize::from(hit.records);
+        }
+        assert_eq!(
+            (completions, granted),
+            (2, 1),
+            "PRECONDITION: this fixture really produces BOTH tiers — two \
+             completions, one of them inside the cooldown"
+        );
     }
 
     /// `merge` keeps the strongest of each independent axis, so one IME commit
@@ -552,8 +548,8 @@ mod tests {
     #[test]
     fn merge_keeps_every_axis() {
         let feline = TypedHit {
-            summon: TypedSummon::CameoAndLog,
             feline: true,
+            records: true,
             ..TypedHit::default()
         };
         let curse = TypedHit {
@@ -565,8 +561,7 @@ mod tests {
             ..TypedHit::default()
         };
         let all = feline.merge(curse).merge(dog);
-        assert_eq!(all.summon, TypedSummon::CameoAndLog);
-        assert!(all.feline && all.profanity && all.canine);
+        assert!(all.feline && all.records && all.profanity && all.canine);
     }
 
     /// Feed a string one char at a time; count CANINE hits (gate-passed dogs).
@@ -623,7 +618,7 @@ mod tests {
         type_filler(&mut earned, t, 7, DOG_SUMMON_KEYS);
         for c in "dog".chars() {
             let hit = earned.note_char(t, 7, c, &lx, &opts);
-            assert!(!hit.summon.shows_cameo(), "a dog is not a kitty cameo");
+            assert!(!hit.feline, "a dog is not a feline completion");
             assert!(!hit.feline && !hit.profanity, "a dog owes no cat reaction");
         }
     }
@@ -674,9 +669,9 @@ mod tests {
         let opts = ScanOptions::default();
         assert_eq!(feed(&mut d, t, 7, "kitx"), 0);
         d.note_backspace(7);
-        assert!(!d.note_char(t, 7, 't', &lx, &opts).summon.shows_cameo());
+        assert!(!d.note_char(t, 7, 't', &lx, &opts).feline);
         assert!(
-            d.note_char(t, 7, 'y', &lx, &opts).summon.shows_cameo(),
+            d.note_char(t, 7, 'y', &lx, &opts).feline,
             "the corrected word still summons"
         );
 
@@ -686,7 +681,7 @@ mod tests {
             fresh.note_backspace(7); // over-popping an emptied window is a no-op
         }
         assert!(
-            !fresh.note_char(t, 7, 'y', &lx, &opts).summon.shows_cameo(),
+            !fresh.note_char(t, 7, 'y', &lx, &opts).feline,
             "deletion cleared the run — a lone tail letter completes nothing"
         );
     }

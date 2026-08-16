@@ -438,6 +438,17 @@ struct AuthoritativeRelease {
     signature_index: Option<usize>,
 }
 
+/// A release still in max arbitration: its (unambiguous, already-parsed) tag, and either
+/// the proven-unique appcast asset index or the reason its update metadata is POISONED
+/// (duplicate exact-name assets). Poisoning is carried rather than propagated because it
+/// must only be fatal if this release WINS — see the loop comment in
+/// [`select_authoritative_release`].
+struct ArbitratedRelease {
+    tag: Vec<u64>,
+    release: Release,
+    manifest_index: Result<usize, String>,
+}
+
 /// Select the authoritative exact-name appcast without trusting REST response
 /// order. Every page must already have been collected before this runs.
 fn select_authoritative_release(
@@ -445,14 +456,24 @@ fn select_authoritative_release(
     pinned_update_pubkeys: &[&str],
 ) -> Result<Option<AuthoritativeRelease>, String> {
     let mut seen_tags = std::collections::BTreeSet::new();
-    let mut selected: Option<AuthoritativeRelease> = None;
+    let mut selected: Option<ArbitratedRelease> = None;
 
     for release in releases {
         if release.draft {
             continue;
         }
-        let Some(manifest_index) = unique_asset_index(&release, "aterm-appcast.toml")? else {
-            continue;
+        // A release with no exact-name appcast is not a candidate at all. A release whose
+        // appcast asset name appears TWICE is a candidate with POISONED metadata: it still
+        // competes in max arbitration under its unambiguous tag, carrying the error instead
+        // of an index. The error becomes fatal only if the poisoned release is the selected
+        // MAXIMUM (the winner-only gate after the loop). Erroring here — before arbitration
+        // — let a duplicate asset on an old, strictly-lower release wedge the whole check
+        // even though that release could never be elected; a losing release simply loses,
+        // and failing closed over it defended nothing.
+        let manifest_index = match unique_asset_index(&release, "aterm-appcast.toml") {
+            Ok(Some(index)) => Ok(index),
+            Ok(None) => continue,
+            Err(error) => Err(error),
         };
         // Retired-scheme releases stay published but are never installed. Skipping
         // (rather than erroring) is what lets the pre-cut-over archive coexist with
@@ -466,14 +487,10 @@ fn select_authoritative_release(
                 release.tag_name
             ));
         }
-        let candidate = AuthoritativeRelease {
+        let candidate = ArbitratedRelease {
             tag,
-            // Losing candidates need no canonical version. The selected numeric
-            // maximum is validated after the complete metadata pass.
-            version: String::new(),
             release,
             manifest_index,
-            signature_index: None,
         };
         if selected
             .as_ref()
@@ -483,22 +500,85 @@ fn select_authoritative_release(
         }
     }
 
-    if let Some(candidate) = &mut selected {
-        candidate.version =
-            canonical_authority_version(&candidate.release.tag_name, &candidate.tag)?;
-        if pinned_update_pubkeys.is_empty() {
-            return Ok(selected);
-        }
-        candidate.signature_index = Some(
-            unique_asset_index(&candidate.release, "aterm-appcast.toml.sig")?.ok_or_else(|| {
-                format!(
-                    "authoritative update {} is unsigned under the pinned channel",
-                    candidate.release.tag_name
-                )
-            })?,
-        );
+    let Some(winner) = selected else {
+        return Ok(None);
+    };
+    // THE WINNER-ONLY GATE. A poisoned maximum fails the whole check closed — never
+    // elect a runner-up behind a broken winner (the same rationale as the noncanonical
+    // -tag rule: the runner-up would be a silent downgrade candidate).
+    let manifest_index = winner.manifest_index?;
+    let mut candidate = AuthoritativeRelease {
+        version: String::new(),
+        tag: winner.tag,
+        release: winner.release,
+        manifest_index,
+        signature_index: None,
+    };
+    candidate.version = canonical_authority_version(&candidate.release.tag_name, &candidate.tag)?;
+    if pinned_update_pubkeys.is_empty() {
+        return Ok(Some(candidate));
     }
-    Ok(selected)
+    candidate.signature_index = Some(
+        unique_asset_index(&candidate.release, "aterm-appcast.toml.sig")?.ok_or_else(|| {
+            format!(
+                "authoritative update {} is unsigned under the pinned channel",
+                candidate.release.tag_name
+            )
+        })?,
+    );
+    Ok(Some(candidate))
+}
+
+/// Everything the master-signed machine roster tier needs to run, bundled so the client
+/// path takes ONE parameter rather than three and so a caller cannot supply two of them
+/// and forget the third.
+///
+/// [`RosterPolicy::INERT`] is the fail-closed default: no master pinned, which makes
+/// `verify_roster` return `Disabled` for every input and authorizes nothing. With
+/// `master_pubkeys` empty the tier is ABSENT and the compiled-in channel keyset is the
+/// authority, exactly as it is in every shipped build — the same shape as an empty
+/// `APPLE_TEAM_ID` removing the Developer-ID tier without loosening anything beside it.
+///
+/// ARMED, this tier does not sit BESIDE the keyset gate, it REPLACES it: the roster is
+/// the sole authority over who may have signed the appcast. See
+/// [`fetch_authoritative_release`] for why an OR of the two would give up revocation,
+/// which is the one thing a compiled-in keyset can never express.
+pub(crate) struct RosterPolicy<'a> {
+    /// The pinned paper master(s) — `pins::PAPER_MASTER_PUBKEYS` in production. Empty
+    /// means the tier is absent.
+    pub master_pubkeys: &'a [&'a str],
+    /// The highest `roster_seq` this client has ever durably recorded. THE replay defence
+    /// for a client that has already seen a newer roster; worth nothing to a fresh
+    /// install, which is what the roster's own `valid_until` is for.
+    pub floor_seq: u64,
+    /// Injected wall clock (unix seconds), so the freshness gate stays pure and every
+    /// expiry case is testable without waiting for one.
+    pub now_unix: i64,
+    /// Re-read the DURABLE floor immediately before admission, closing the TOCTOU that
+    /// `floor_seq` alone leaves open: that snapshot is taken before any network I/O, and
+    /// a concurrent instance of this process may ratchet the durable floor past it while
+    /// the roster assets download. Admission takes the max of the snapshot and this
+    /// re-read, so a roster generation a concurrent check has already superseded is
+    /// refused rather than admitted through a stale snapshot. `None` (tests that are not
+    /// about the race) means the snapshot alone decides, which is never LOOSER than the
+    /// snapshot — the hook can only raise the floor.
+    pub floor_refresh: Option<&'a dyn Fn() -> u64>,
+}
+
+impl RosterPolicy<'static> {
+    /// The tier switched off — the fixture every test that is not about the roster uses.
+    ///
+    /// `#[cfg(test)]` because production never names it: the real path always builds a
+    /// policy from `pins::PAPER_MASTER_PUBKEYS`, which is empty today and therefore
+    /// already inert. Two ways to spell "off" would be one too many, and this is the one
+    /// that is only a fixture.
+    #[cfg(test)]
+    pub(crate) const INERT: RosterPolicy<'static> = RosterPolicy {
+        master_pubkeys: &[],
+        floor_seq: 0,
+        now_unix: 0,
+        floor_refresh: None,
+    };
 }
 
 #[derive(Default)]
@@ -514,8 +594,187 @@ struct AuthoritativeFetch {
     manifest_fetch_attempts: u32,
     /// Detached-signature transport attempts, exposed only for Tier-1
     /// projection onto the bounded channel-scan model.
+    ///
+    /// Counted on the COMPILED-IN KEYSET path only. With the master armed the appcast
+    /// signature is fetched inside [`authorize_by_roster`], which owns the whole armed
+    /// transport sequence; the model this counter feeds is about the unarmed path.
     #[cfg(test)]
     signature_fetch_attempts: u32,
+    /// WHICH MACHINE SIGNED, when the roster tier is armed and the chain passed. `None`
+    /// with an unpinned master (the tier is absent) and `None` on any rejection, because
+    /// a rejection never produces a `selected` release either.
+    attribution: Option<aterm_update_core::roster::Attribution>,
+    /// The `roster_seq` of the master-verified roster that passed ADMISSION (the replay
+    /// floor and the freshness window), for the caller to ratchet into the durable floor.
+    ///
+    /// Set on OBSERVATION — the moment `admit` passes — NOT on successful artifact
+    /// authorization. The difference is the whole replay defence: a seq-10 roster that
+    /// REVOKES the appcast's signer refuses the release, and if the floor only ratcheted
+    /// on acceptance, a replayed still-fresh seq-9 roster would then re-authorize the very
+    /// machine the owner just revoked. Having SEEN generation 10, this client must refuse
+    /// 9 forever, whether or not it went on to install anything.
+    observed_roster_seq: Option<u64>,
+}
+
+/// Unix seconds now, for the roster's freshness and per-machine expiry gates.
+///
+/// The fallback is the OPPOSITE of `install::unix_now_secs`, and deliberately so. That
+/// one returns 0 on a broken clock because zero makes every retry deadline look passed,
+/// which is the safe direction for a retry budget. Here zero would read as 1970 — before
+/// every conceivable `valid_until` — so a lapsed roster would be ACCEPTED. A clock we
+/// cannot read must fail CLOSED, so this returns `i64::MAX`, which makes every window
+/// look expired and refuses the update.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(i64::MAX, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Why the roster chain did not produce an attribution — split into the two classes the
+/// health ledger must never confuse.
+///
+/// Both are REFUSALS; neither is ever a fallthrough. The distinction is only about what
+/// the operator is told, and it matters because the wordings are not interchangeable:
+/// a `pipeline`-class transport failure is postponed-and-will-retry, while a `manifest`
+/// -class refusal escalates to "this Mac cannot install any release until that is fixed
+/// at the publisher". Once the roster is the SOLE authority, a flaky network fetching
+/// `aterm-machines.toml` would otherwise accuse the publisher of shipping a bad release.
+enum RosterFailure {
+    /// An asset could not be FETCHED. Nothing has been judged; retrying may work.
+    Transport(String),
+    /// The chain RAN and refused: no roster, a bad master signature, a stale or
+    /// rolled-back generation, a revoked machine, an unauthorized signer.
+    Refused(String),
+}
+
+/// Run the master-signed machine-roster chain for one candidate release, returning WHICH
+/// machine signed its appcast.
+///
+/// With the master ARMED this is the ONLY thing that authorizes a release: the
+/// compiled-in channel keyset is not consulted, and cannot refuse what this accepts. See
+/// [`fetch_authoritative_release`] for why that is the correct reading of the two tiers.
+///
+/// Cheapest-first and fail-closed throughout — the ordering IS the design, so it is worth
+/// reading as a list:
+///
+/// 1. both roster assets must be present on the release. Free and structural: no roster
+///    means no authority, and an armed anchor never degrades to "unsigned is fine".
+/// 2. download them, under tight caps. A roster is a few hundred bytes per machine and a
+///    detached Ed25519 signature is exactly 64, so 64 KiB and 4 KiB are ceilings rather
+///    than fits.
+/// 3. verify the roster under the pinned paper master. THE FIRST CRYPTO.
+/// 4. parse it — only from `VerifiedRoster`, which has no public constructor, so parsing
+///    unverified roster bytes does not type-check.
+/// 5. `admit`: the durable `roster_seq` floor, then the freshness window. Both cheap,
+///    both before any artifact crypto.
+/// 6. `authorize_appcast`: revoked and expired machines are removed from the candidate
+///    set FIRST — so a revoked machine's perfectly valid signature is never even checked —
+///    and the survivors verify the appcast. THE SECOND CRYPTO.
+///
+/// Every error is a refusal. There is no path through here that returns "accept anyway".
+///
+/// `observed_roster_seq` is the OBSERVATION out-parameter: it is set the moment a
+/// master-verified roster passes `admit`, before — and regardless of — the appcast
+/// authorization that follows. The caller ratchets it into the durable floor even when
+/// this function then refuses the release, because a roster that revokes the release's
+/// signer is exactly the generation the floor must remember (see
+/// [`AuthoritativeFetch::observed_roster_seq`]).
+fn authorize_by_roster(
+    candidate: &AuthoritativeRelease,
+    appcast: &[u8],
+    policy: &RosterPolicy<'_>,
+    download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+    observed_roster_seq: &mut Option<u64>,
+) -> Result<aterm_update_core::roster::Attribution, RosterFailure> {
+    use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET, Roster, verify_roster};
+    use RosterFailure::{Refused, Transport};
+
+    // WHERE THE APPCAST SIGNATURE IS, resolved here rather than taken from the caller.
+    //
+    // `select_authoritative_release` records the index only when the compiled-in keyset
+    // is pinned, because that is the gate it was written for. The roster tier must not
+    // inherit that condition: a fork (or a fleet that has finished rolling over) may arm
+    // the master and hold an EMPTY keyset, and requiring a signature index the keyset
+    // gate happened to fill in would make the armed tier refuse every release for a
+    // reason that has nothing to do with the roster. So the index is reused when it is
+    // there and located here when it is not — the same unique-asset rule either way.
+    let signature_index = match candidate.signature_index {
+        Some(index) => index,
+        None => unique_asset_index(&candidate.release, "aterm-appcast.toml.sig")
+            .map_err(|e| Refused(format!("locate the appcast signature: {e}")))?
+            .ok_or_else(|| {
+                Refused(format!(
+                    "the paper master is pinned but {} carries no appcast signature",
+                    candidate.release.tag_name
+                ))
+            })?,
+    };
+
+    // (1) Structural, free.
+    let roster_index = unique_asset_index(&candidate.release, ROSTER_ASSET)
+        .map_err(|e| Refused(format!("locate {ROSTER_ASSET}: {e}")))?
+        .ok_or_else(|| {
+            Refused(format!(
+                "the paper master is pinned but {} carries no {ROSTER_ASSET}",
+                candidate.release.tag_name
+            ))
+        })?;
+    let roster_sig_index = unique_asset_index(&candidate.release, ROSTER_SIG_ASSET)
+        .map_err(|e| Refused(format!("locate {ROSTER_SIG_ASSET}: {e}")))?
+        .ok_or_else(|| {
+            Refused(format!(
+                "{} carries a machine roster with no master signature",
+                candidate.release.tag_name
+            ))
+        })?;
+
+    // (2) Bounded transport. A failure here has judged NOTHING — see [`RosterFailure`].
+    let roster_bytes = download(&candidate.release.assets[roster_index].url, 65_536)
+        .map_err(|e| Transport(format!("fetch {ROSTER_ASSET}: {e}")))?;
+    let roster_sig = download(&candidate.release.assets[roster_sig_index].url, 4096)
+        .map_err(|e| Transport(format!("fetch {ROSTER_SIG_ASSET}: {e}")))?;
+    let appcast_sig = download(&candidate.release.assets[signature_index].url, 4096)
+        .map_err(|e| Transport(format!("fetch appcast signature: {e}")))?;
+
+    // (3)(4) Verify under the paper master, then parse — in that order, by construction.
+    let verified = verify_roster(policy.master_pubkeys, roster_bytes, &roster_sig).map_err(|e| {
+        Refused(format!(
+            "machine roster did not verify under the pinned master ({e:?})"
+        ))
+    })?;
+    if verified.master_index() != 0 {
+        // Never a rejection: a hit on a non-head master is a rotation in flight. Saying so
+        // makes a STALLED rotation visible instead of silent until updates stop.
+        crate::warn(&format!(
+            "the machine roster was signed by master key #{}, not the current one — a \
+             master rotation is in progress or incomplete",
+            verified.master_index()
+        ));
+    }
+    let roster = Roster::parse(&verified)
+        .map_err(|e| Refused(format!("machine roster is unusable ({e:?})")))?;
+
+    // (5) Replay floor, then freshness. The floor is RE-READ here when the caller
+    // provides a reader, because `policy.floor_seq` is a snapshot taken before the
+    // downloads above and a concurrent instance may have ratcheted the durable floor
+    // past it in the meantime — admitting against the stale snapshot would accept a
+    // roster generation that instance has already superseded. The max keeps the hook
+    // strictly tightening: it can only raise the floor, never lower it.
+    let floor_seq = policy
+        .floor_refresh
+        .map_or(policy.floor_seq, |read| read().max(policy.floor_seq));
+    roster
+        .admit(floor_seq, policy.now_unix)
+        .map_err(|e| Refused(format!("machine roster refused ({e:?})")))?;
+    // THE OBSERVATION RATCHET. This roster is master-verified and admitted, so its
+    // generation has been SEEN — recorded here, before the appcast authorization,
+    // so a refusal below (a revoked signer, above all) still advances the floor.
+    *observed_roster_seq = Some(roster.roster_seq);
+
+    // (6) Deny-list before crypto, then the artifact signature.
+    roster
+        .authorize_appcast(appcast, &appcast_sig, policy.now_unix)
+        .map_err(|e| Refused(format!("no machine on the roster signed this release ({e:?})")))
 }
 
 /// Fetch and validate exactly one candidate after the complete metadata pass.
@@ -524,6 +783,7 @@ fn fetch_authoritative_release(
     candidate: Option<AuthoritativeRelease>,
     pinned_update_pubkeys: &[&str],
     download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
+    roster: &RosterPolicy<'_>,
 ) -> AuthoritativeFetch {
     let mut fetched = AuthoritativeFetch::default();
     let Some(candidate) = candidate else {
@@ -548,40 +808,137 @@ fn fetch_authoritative_release(
             return fetched;
         }
     };
-    if let Some(signature_url) = signature_url {
-        #[cfg(test)]
-        {
-            fetched.signature_fetch_attempts = 1;
+    // ---------------------------------------------------------------------------
+    // WHO IS ALLOWED TO HAVE SIGNED THIS APPCAST — in one of exactly two states.
+    //
+    // The states are chosen by the PAPER MASTER ANCHOR, and nothing else. They are not
+    // two gates that both run; that arrangement is what this replaced, and it made the
+    // roster unable to do the one job the owner asked of it.
+    //
+    // (A) NO MASTER PINNED — the compiled-in keyset decides, exactly as it always has.
+    //     This is every build ever shipped, and the branch below is deliberately
+    //     unchanged code rather than a re-expression of it:
+    //     `select_authoritative_release` yields exactly ONE candidate with no fallback
+    //     to an older release, so a client that meets a release it cannot verify does
+    //     not wait — it is WEDGED there permanently. Any behaviour change on this path
+    //     is a fleet-bricking bug.
+    //
+    // (B) MASTER ARMED — the master-signed roster decides, and it decides ALONE. The
+    //     keyset is not consulted, so it cannot refuse a machine the roster authorized;
+    //     that is the whole point of the tier, because it is what makes adding a machine
+    //     a LOCAL act (mint, roster, publish) instead of one that needs a release cut
+    //     from a machine that can already sign.
+    //
+    // # So what is the keyset FOR once the master is armed?
+    //
+    // It is the PRE-ROSTER COMPATIBILITY ALLOWANCE, and nothing else. It is not dead —
+    // it is the only thing a client that predates the roster has, and those clients are
+    // real and in the field — but it is not a second allowance HERE either, and the
+    // difference is not cosmetic. Accepting "keyset OR roster" would mean a machine the
+    // owner had REVOKED could keep publishing to every client whose build happens to
+    // carry its key, forever, because a compiled-in key cannot be un-shipped. Revocation
+    // is precisely what the roster exists to provide, so an OR would buy compatibility
+    // by giving up the tier's reason to exist. The obligation to old clients therefore
+    // lives where it can actually be discharged — at the PRODUCER, which chooses the
+    // signing key (`aterm_release::publish::channel_signature_policy`) — and this client
+    // reports the mismatch rather than enforcing it (see the note after the chain).
+    // ---------------------------------------------------------------------------
+    let attribution = if roster.master_pubkeys.is_empty() {
+        // (A) ------------------------------------------------------------------
+        if let Some(signature_url) = signature_url {
+            #[cfg(test)]
+            {
+                fetched.signature_fetch_attempts = 1;
+            }
+            let sigbytes = match download(&signature_url, 4096) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    crate::warn(&format!("fetch appcast signature: {error}"));
+                    fetched.appcast_fetch_error = true;
+                    return fetched;
+                }
+            };
+            match sig::verify_detached_any(pinned_update_pubkeys, &bytes, &sigbytes) {
+                // Index 0 is the key this build would sign with. Any other member is an
+                // outgoing key inside its retirement window (or one pre-seeded ahead of a
+                // rotation): still authoritative, but worth saying out loud so a stalled
+                // rotation is visible in the log rather than silent until the key is dropped.
+                Ok(0) => {}
+                Ok(index) => crate::warn(&format!(
+                    "release manifest for {} was signed by channel key #{index}, not the current \
+                     one — a key rotation is in progress or incomplete",
+                    candidate.release.tag_name
+                )),
+                Err(error) => {
+                    crate::warn(&format!(
+                        "release manifest signature did not verify ({error:?}); refusing authoritative {}",
+                        candidate.release.tag_name
+                    ));
+                    fetched.manifest_rejected = true;
+                    return fetched;
+                }
+            }
         }
-        let sigbytes = match download(&signature_url, 4096) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                crate::warn(&format!("fetch appcast signature: {error}"));
+        None
+    } else {
+        // (B) ------------------------------------------------------------------
+        // The chain runs here, over the RAW bytes and before the parse below, which is
+        // the only correct place for it: the identity claims INSIDE the appcast are not
+        // bound to anything until something has verified the bytes that carry them, and
+        // binding them requires a parse. So the crypto happens here and the cheap
+        // identity cross-check happens immediately after the parse (`bind`, below).
+        //
+        // The observed sequence lands in `fetched` on EVERY arm, including the refusals:
+        // it was set the moment a master-verified roster passed admission, and the
+        // caller's ratchet must advance on that observation even when the release itself
+        // is refused (see `AuthoritativeFetch::observed_roster_seq`).
+        let mut observed_roster_seq = None;
+        let authorized =
+            authorize_by_roster(&candidate, &bytes, roster, download, &mut observed_roster_seq);
+        fetched.observed_roster_seq = observed_roster_seq;
+        match authorized {
+            Ok(who) => {
+                // The compatibility NOTE, not a gate. A release signed by a machine
+                // outside this build's keyset is perfectly installable HERE — the roster
+                // said so — but no client that predates the roster can verify it, and
+                // those clients have no fallback. Saying so in the log is what makes a
+                // split fleet diagnosable from a user's machine instead of only from the
+                // publisher's.
+                if !pinned_update_pubkeys.is_empty()
+                    && !pinned_update_pubkeys.contains(&who.pubkey_b64.as_str())
+                {
+                    crate::warn(&format!(
+                        "authoritative {} was signed by machine {who}, whose key is not in \
+                         this build's channel keyset — the master-signed roster authorizes \
+                         it, but clients older than the roster cannot verify this release",
+                        candidate.release.tag_name
+                    ));
+                }
+                Some(who)
+            }
+            // FAIL CLOSED, and never back to the keyset. Falling back would make the
+            // roster advisory: an attacker who could suppress the two roster assets
+            // would downgrade every armed client to the tier the roster replaced, and a
+            // revoked machine's key would start working again.
+            Err(RosterFailure::Transport(error)) => {
+                crate::warn(&format!(
+                    "{error}; refusing authoritative {}",
+                    candidate.release.tag_name
+                ));
                 fetched.appcast_fetch_error = true;
                 return fetched;
             }
-        };
-        match sig::verify_detached_any(pinned_update_pubkeys, &bytes, &sigbytes) {
-            // Index 0 is the key this build would sign with. Any other member is an
-            // outgoing key inside its retirement window (or one pre-seeded ahead of a
-            // rotation): still authoritative, but worth saying out loud so a stalled
-            // rotation is visible in the log rather than silent until the key is dropped.
-            Ok(0) => {}
-            Ok(index) => crate::warn(&format!(
-                "release manifest for {} was signed by channel key #{index}, not the current \
-                 one — a key rotation is in progress or incomplete",
-                candidate.release.tag_name
-            )),
-            Err(error) => {
+            Err(RosterFailure::Refused(error)) => {
                 crate::warn(&format!(
-                    "release manifest signature did not verify ({error:?}); refusing authoritative {}",
+                    "{error}; refusing authoritative {}",
                     candidate.release.tag_name
                 ));
                 fetched.manifest_rejected = true;
                 return fetched;
             }
         }
-    }
+    };
+
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(error) => {
@@ -595,6 +952,31 @@ fn fetch_authoritative_release(
     };
     match Manifest::parse(&text) {
         Ok(manifest) if manifest.version == candidate.version => {
+            // THE IDENTITY BIND, over bytes that are authenticated by the time it runs.
+            // A genuine signature by one machine cannot be relabelled as another (the id
+            // is inside the signed bytes), and a machine cannot claim someone else's id
+            // (the roster maps id to key). Both directions are string compares.
+            if let Some(who) = &attribution
+                && let Err(reject) = who.bind(manifest.machine_id.as_deref(), manifest.roster_seq)
+            {
+                crate::warn(&format!(
+                    "authoritative {} verified under machine {} but its own attribution \
+                     does not agree ({reject:?}); refusing",
+                    candidate.release.tag_name, who.machine_id
+                ));
+                fetched.manifest_rejected = true;
+                return fetched;
+            }
+            if let Some(who) = &attribution {
+                // ATTRIBUTION, recorded where a human reads it. The owner asked to be able
+                // to track which computer does what; this is that answer for the client
+                // half, beside the release it applies to.
+                crate::log(&format!(
+                    "authoritative {} was signed by machine {who}",
+                    candidate.release.tag_name
+                ));
+                fetched.attribution = Some(who.clone());
+            }
             match select_stage_artifact(&candidate.release, &manifest, &candidate.version) {
                 Ok(artifact) => {
                     fetched.selected = Some((manifest, candidate.release, artifact));
@@ -623,6 +1005,20 @@ fn fetch_authoritative_release(
     fetched
 }
 
+/// Whether the roster generation that authorized this check's release has been
+/// SUPERSEDED by the durable floor while the check was in flight.
+///
+/// `observed` is the sequence the chain admitted for this release (`None` when the roster
+/// tier is inert, which can never be superseded); `floor_now` is a FRESH read of the
+/// durable floor. This run's own ratchet write makes `floor_now >= observed` in the
+/// quiescent case, so a strict `<` fires only when a CONCURRENT instance recorded a newer
+/// generation — at which point staging an artifact authorized under the older generation
+/// would act on authority this client already knows is withdrawn. The refusal is
+/// transient: the next check re-runs under the advanced floor.
+fn roster_authority_superseded(observed: Option<u64>, floor_now: u64) -> bool {
+    observed.is_some_and(|seq| seq < floor_now)
+}
+
 /// Whether a fully published local stage makes this release download redundant.
 /// Both the optimistic pre-lock check and the authoritative under-lock re-check
 /// call this exact predicate. For the same build, bind the marker back to the
@@ -641,6 +1037,36 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
                     })
                 }))
     })
+}
+
+/// The download path's counterpart to `install::sweep_stale_mounts` /
+/// `install::sweep_stale_extracts`: reclaim container scratch a previously-killed run
+/// leaked. Every removal on this path is keyed to the CURRENT artifact's name, and
+/// those names are version-keyed (`aterm-<version>-mac.zip{.part}`), so a partial —
+/// or a fully-downloaded container abandoned in the window between the finalize
+/// rename and the post-stage removal — for a version the channel has since moved past
+/// is unreachable by every other code path, forever. That is up to
+/// `RELEASE_ASSET_DOWNLOAD_BOUND` of the single largest file in the pipeline sitting
+/// in the user's Application Support, and `Staging::retire_published` deliberately
+/// never touches `download/`, so this is the only place it can be reclaimed.
+///
+/// Deleting every regular file (rather than sparing the current names) is what makes
+/// it a sweep and subsumes the pre-download `remove_file` it replaced: the pipeline
+/// always downloads into `{name}.part` and renames over the container, so no path
+/// ever reuses bytes already in this dir. Directories are left alone — nothing puts
+/// one here, and a recursive delete is not a risk worth taking for scratch.
+///
+/// Callers MUST hold `staging.stage_lock`: the staging critical section is this
+/// directory's only writer, and the apply/retire lane must keep its hands off it.
+fn sweep_download_scratch(staging: &Staging) {
+    let Ok(entries) = std::fs::read_dir(&staging.download) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// An OPEN stage-failure retry window, and what it is allowed to stop.
@@ -665,9 +1091,14 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
 #[derive(Debug)]
 struct StageBackoff {
     /// Seconds until the candidate named by the manifest may be downloaded again.
+    /// Meaningless when `quarantined` — that window never opens.
     retry_in_secs: u64,
     /// Consecutive stage failures recorded for that candidate (at least 1).
     attempts: u32,
+    /// The candidate is QUARANTINED: it was applied, crash-looped, and was reverted.
+    /// This is not a timed backoff and must not be reported as one — nothing on this
+    /// machine will retry it; the channel has to offer something else.
+    quarantined: bool,
     /// A published local stage that is strictly newer than the running build, if
     /// one exists. The backoff never gates this: the check reports it so the apply
     /// lane runs on it this cycle.
@@ -681,12 +1112,22 @@ impl StageBackoff {
     /// another 1387m") named neither, so it read as "nothing is happening" while
     /// sitting beside a `staged_build` that was ready the whole time.
     fn status_line(&self, candidate_build: u64) -> String {
-        let restage = format!(
-            "skipping re-stage of build {candidate_build} for another {}m (failed to stage \
-             {} time(s); retrying automatically, or re-publish to retry now)",
-            self.retry_in_secs.div_ceil(60),
-            self.attempts
-        );
+        let restage = if self.quarantined {
+            // A quarantine has no clock, and saying "retrying automatically" about one
+            // would be a lie an operator could only discover by waiting forever.
+            format!(
+                "build {candidate_build} is quarantined: it was applied, failed to start \
+                 cleanly, and was reverted — this machine will not retry it (a newer build, \
+                 or a re-publish under a different digest, clears it)"
+            )
+        } else {
+            format!(
+                "skipping re-stage of build {candidate_build} for another {}m (failed to stage \
+                 {} time(s); retrying automatically, or re-publish to retry now)",
+                self.retry_in_secs.div_ceil(60),
+                self.attempts
+            )
+        };
         match &self.applicable {
             None => format!("{restage}; no verified stage to apply"),
             Some(ready) => format!(
@@ -721,6 +1162,7 @@ fn stage_backoff(
     Some(StageBackoff {
         retry_in_secs: memo.retry_in_secs(now),
         attempts: memo.attempts.max(1),
+        quarantined: memo.is_quarantine(),
         applicable: Ready::read_publishable(staging)
             .filter(|ready| ready.build_number > current_build),
     })
@@ -890,15 +1332,18 @@ pub fn check_and_stage(current_build: u64, source: &Source) -> Result<Option<Str
     result
 }
 
-fn check_and_stage_inner(
-    current_build: u64,
-    source: &Source,
-) -> Result<Option<String>, String> {
+fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<String>, String> {
     // Only stage for a real installed bundle (a dev build has nothing to swap).
     if bundle::resolve().is_none() {
         return Ok(None);
     }
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    // A surviving apply streak recorded by a DIFFERENT build is proven stale
+    // — the machine moved by SOME means (channel, manual install, boot swap)
+    // — so every check heals it here rather than letting `update status`
+    // present `persistent=true` on an up-to-date install forever (see
+    // [`crate::health::Health::expire_stale_apply_streak`]).
+    crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);
     // The Application Support dir is the Updates dir's parent.
     let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
     // ONE walk of the token chain: the token, or the diagnosis explaining why there
@@ -908,7 +1353,11 @@ fn check_and_stage_inner(
     // RESOLVE, DO NOT GATE: the absence of a token may never end a check here — only
     // a network response may declare this machine unable to update (`plan_credential`,
     // `classify_list_error`).
-    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(&support, &source.owner, &source.repo));
+    let (mut tok, diagnosis) = plan_credential(token::resolve_or_diagnose(
+        &support,
+        &source.owner,
+        &source.repo,
+    ));
 
     // Persisted monotonic recency floor (operator yank + rollback guard, F5/F6).
     let floor = crate::manifest::Floor::read(&staging.floor());
@@ -921,37 +1370,76 @@ fn check_and_stage_inner(
         return Ok(None);
     };
 
-    let authoritative = match select_authoritative_release(release_catalog, crate::PINNED_UPDATE_PUBKEYS) {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            crate::warn(&error);
-            let h = crate::health::Health::record_failure(&staging.health(), "manifest", &error);
-            // Two-tier wording, exactly like the pipeline branch below. "deferred"
-            // means postponed-and-will-retry, which is a lie for this class: an
-            // untrustworthy authoritative release stays untrustworthy until the
-            // PUBLISHER republishes, so retrying changes nothing. A machine sat at
-            // failure 597 still being told its check was "deferred".
-            let msg = if h.is_persistent() {
-                format!(
-                    "FAILING ({} consecutive checks since {}): {error} — this Mac \
+    let authoritative =
+        match select_authoritative_release(release_catalog, crate::PINNED_UPDATE_PUBKEYS) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                crate::warn(&error);
+                let h =
+                    crate::health::Health::record_failure(&staging.health(), "manifest", &error);
+                // Two-tier wording, exactly like the pipeline branch below. "deferred"
+                // means postponed-and-will-retry, which is a lie for this class: an
+                // untrustworthy authoritative release stays untrustworthy until the
+                // PUBLISHER republishes, so retrying changes nothing. A machine sat at
+                // failure 597 still being told its check was "deferred".
+                let msg = if h.is_persistent() {
+                    format!(
+                        "FAILING ({} consecutive checks since {}): {error} — this Mac \
                      cannot install any release until that is fixed at the publisher",
-                    h.manifest_failures, h.failing_since
-                )
-            } else {
-                format!("update check deferred: {error} (attempt {})", h.manifest_failures)
-            };
-            crate::status::record(&staging, current_build, &msg);
-            return Ok(None);
-        }
-    };
+                        h.manifest_failures, h.failing_since
+                    )
+                } else {
+                    format!(
+                        "update check deferred: {error} (attempt {})",
+                        h.manifest_failures
+                    )
+                };
+                crate::status::record(&staging, current_build, &msg);
+                return Ok(None);
+            }
+        };
     // The asset fetches ride the SAME lane the list request settled on: if the token
     // was rejected above, `tok` is already `None` and these go anonymous too.
     let mut download = |url: &str, max_bytes: u64| {
         aterm_update_core::download_bytes(url, tok.as_deref(), max_bytes)
     };
-    let fetched = fetch_authoritative_release(authoritative, crate::PINNED_UPDATE_PUBKEYS, &mut download);
+    // The roster tier's inputs, resolved from the anchor and this client's durable state.
+    // `PAPER_MASTER_PUBKEYS` is empty in the shipped tree, which makes this policy inert
+    // and the whole tier a no-op — see `RosterPolicy::INERT`.
+    //
+    // `floor_seq` is a snapshot read before the (network) list fetch above, so it can be
+    // stale by the time a roster is admitted; `floor_refresh` re-reads the durable floor
+    // at the admission point itself, closing the check-vs-ratchet TOCTOU between two
+    // concurrent app instances.
+    let floor_path = staging.floor();
+    let floor_refresh = || crate::manifest::Floor::read(&floor_path).roster_seq;
+    let roster_policy = RosterPolicy {
+        master_pubkeys: aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        floor_seq: floor.roster_seq,
+        now_unix: unix_now(),
+        floor_refresh: Some(&floor_refresh),
+    };
+    let fetched = fetch_authoritative_release(
+        authoritative,
+        crate::PINNED_UPDATE_PUBKEYS,
+        &mut download,
+        &roster_policy,
+    );
+    // ATTRIBUTION, recorded where a human will find it later: the updater's own status
+    // file, beside the release it describes. The owner's requirement is "I can track
+    // which computer does what", and for the client half this is the record. It is
+    // written before the staging decision because knowing WHO signed the release a
+    // machine saw is useful whether or not that machine went on to install it.
+    if let Some(who) = &fetched.attribution {
+        crate::status::record(
+            &staging,
+            current_build,
+            &format!("authoritative release signed by machine {who}"),
+        );
+    }
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let manifest_rejected = fetched.manifest_rejected;
+    let observed_roster_seq = fetched.observed_roster_seq;
     let best = fetched.selected;
     let seen_min_build = best
         .as_ref()
@@ -960,7 +1448,19 @@ fn check_and_stage_inner(
 
     // Remember the authoritative release's operator floor immediately (even if we do
     // not stage). The persisted floor remains monotonic across checks.
-    crate::manifest::Floor::bump_and_write(&staging.floor(), seen_min_build, 0);
+    // The same call ratchets the roster sequence. Doing it here — on OBSERVATION, not on
+    // successful staging — is what makes the replay defence work: a client that merely
+    // SAW roster generation n must refuse n-1 forever after, whether or not it went on to
+    // install anything from that release. `observed_roster_seq` carries that observation
+    // out of the chain even when the chain then REFUSED the release (a roster that
+    // revokes the release's signer is admitted, observed here, and only then refuses),
+    // so the ratchet is genuinely observation-driven and not acceptance-driven.
+    crate::manifest::Floor::bump_and_write(
+        &staging.floor(),
+        seen_min_build,
+        0,
+        observed_roster_seq.unwrap_or(0),
+    );
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
@@ -1063,8 +1563,15 @@ fn check_and_stage_inner(
         return Ok(None);
     }
 
-    // If a newer build is already staged, don't re-download it.
+    // If a newer build is already staged, don't re-download it. This is still a
+    // TERMINAL HEALTHY outcome — the list and the manifest were fetched and accepted;
+    // the only step skipped is a download whose bytes we already have — so clear the
+    // acquisition streaks. Omitting that let non-consecutive pipeline/manifest blips
+    // accumulate for the whole life of a pending stage and cross PERSISTENT_AFTER,
+    // firing "your update pipeline is likely broken" at a machine whose only state is
+    // a stage waiting to apply.
     if publishable_stage_covers(&staging, &manifest) {
+        crate::health::Health::record_success(&staging.health());
         return Ok(None);
     }
 
@@ -1102,7 +1609,24 @@ fn check_and_stage_inner(
     let _stage_lock = aterm_update_core::FileLock::acquire(&staging.stage_lock)
         .map_err(|e| format!("stage lock: {e}"))?;
     // Re-check under the lock: another instance may have just staged this build.
+    // Same terminal-healthy reasoning as the pre-lock check above.
     if publishable_stage_covers(&staging, &manifest) {
+        crate::health::Health::record_success(&staging.health());
+        return Ok(None);
+    }
+    // Under the same lock, re-read the roster floor: a concurrent instance may have
+    // observed a newer roster generation after this check's admission. Nothing signed
+    // under a superseded generation may be staged (see [`roster_authority_superseded`]).
+    if roster_authority_superseded(
+        observed_roster_seq,
+        crate::manifest::Floor::read(&staging.floor()).roster_seq,
+    ) {
+        crate::status::record(
+            &staging,
+            current_build,
+            "held: a newer machine-roster generation was recorded during this check; \
+             re-checking under it next cycle",
+        );
         return Ok(None);
     }
 
@@ -1115,7 +1639,7 @@ fn check_and_stage_inner(
 
     let part = staging.download.join(format!("{}.part", artifact.name));
     let container_path = staging.download.join(&artifact.name);
-    let _ = std::fs::remove_file(&part);
+    sweep_download_scratch(&staging);
     // A failed download is a `pipeline`-class ledger entry: the asset provably
     // exists (the release names it) but could not be fetched.
     if let Err(e) = aterm_update_core::download_to(
@@ -1204,7 +1728,7 @@ fn check_and_stage_inner(
     crate::health::Health::record_success(&staging.health());
     // Raise the high-water to the build we just staged (never lowered): a later attempt
     // to roll us back below it is refused above (F6).
-    crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number);
+    crate::manifest::Floor::bump_and_write(&staging.floor(), 0, manifest.build_number, 0);
 
     // NOT "applies on next launch". The stager has no idea whether it does: the
     // in-session apply lane owns that decision, is on by default, and when it
@@ -1560,6 +2084,8 @@ mod tests {
             zip: None,
             zip_sha256: None,
             min_build: None,
+            machine_id: None,
+            roster_seq: None,
             changelog: None,
         }
     }
@@ -1806,7 +2332,8 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
+        let fetched =
+            fetch_authoritative_release(Some(selected), &[], &mut download, &RosterPolicy::INERT);
         assert!(fetched.selected.is_some());
         assert_eq!(urls, ["authoritative-10"]);
         let mut verified = selected_state.clone();
@@ -1854,7 +2381,12 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &[public_key.as_str()],
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert!(fetched.selected.is_some());
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
         let mut verified = selected_state.clone();
@@ -1890,7 +2422,12 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &[public_key.as_str()],
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert!(fetched.selected.is_none());
         assert!(fetched.appcast_fetch_error);
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
@@ -1931,7 +2468,12 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &[public_key.as_str()], &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &[public_key.as_str()],
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert!(fetched.selected.is_none());
         assert!(fetched.manifest_rejected);
         assert_eq!(urls, ["signed-high", "signed-high-sig"]);
@@ -1978,7 +2520,12 @@ mod tests {
                 calls += 1;
                 manifest_result.clone()
             };
-            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
+            let fetched = fetch_authoritative_release(
+                Some(selected),
+                &[],
+                &mut download,
+                &RosterPolicy::INERT,
+            );
             assert_eq!(calls, 1);
             assert!(fetched.selected.is_none());
             let mut refused = selected_state.clone();
@@ -2077,7 +2624,12 @@ mod tests {
                 assert_eq!(url, "authoritative-10", "{label}");
                 Ok(manifest.clone())
             };
-            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
+            let fetched = fetch_authoritative_release(
+                Some(selected),
+                &[],
+                &mut download,
+                &RosterPolicy::INERT,
+            );
             assert!(fetched.selected.is_none(), "{label}");
             assert!(fetched.manifest_rejected, "{label}");
             assert!(!fetched.appcast_fetch_error, "{label}");
@@ -2153,7 +2705,12 @@ mod tests {
                     unexpected => panic!("unexpected asset fetch: {unexpected}"),
                 }
             };
-            let fetched = fetch_authoritative_release(Some(authoritative), &[], &mut download);
+            let fetched = fetch_authoritative_release(
+                Some(authoritative),
+                &[],
+                &mut download,
+                &RosterPolicy::INERT,
+            );
             assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
             assert_eq!(urls, ["authoritative-10"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2185,7 +2742,12 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(authoritative), &[public_key.as_str()], &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(authoritative),
+            &[public_key.as_str()],
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert_eq!(fetched.selected.unwrap().0.version, "0.10.0");
         assert_eq!(urls, ["highest-manifest", "highest-signature"]);
         assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2235,7 +2797,12 @@ mod tests {
                     Err("historical asset must not be fetched".into())
                 }
             };
-            let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
+            let fetched = fetch_authoritative_release(
+                Some(selected),
+                &[],
+                &mut download,
+                &RosterPolicy::INERT,
+            );
             assert_eq!(fetched.selected.unwrap().0.version, "0.54.0");
             assert_eq!(urls, ["authoritative-54"]);
             assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2344,7 +2911,8 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(selected), &[], &mut download);
+        let fetched =
+            fetch_authoritative_release(Some(selected), &[], &mut download, &RosterPolicy::INERT);
         assert_eq!(fetched.selected.unwrap().0.version, "0.5.0");
         assert_eq!(urls, ["current-head"]);
         assert_eq!(fetched.manifest_fetch_attempts, 1);
@@ -2590,6 +3158,68 @@ mod tests {
         assert!(err.contains("numeric dotted"), "{err}");
     }
 
+    /// A DUPLICATE-ASSET RELEASE THAT LOSES SELECTION SIMPLY LOSES. Its tag is
+    /// unambiguous and strictly lower, so it cannot be elected no matter which duplicate
+    /// were chosen — failing the whole check closed over it would wedge every client on
+    /// a defect of a release that was never going to be installed. Both catalog orders,
+    /// so the outcome provably does not ride on REST response position.
+    ///
+    /// MUTATION: restore the pre-arbitration `?` on `unique_asset_index` (the old code)
+    /// and both iterations fail — selection errors out before the maximum is chosen.
+    #[test]
+    fn a_poisoned_release_that_loses_selection_cannot_wedge_the_check() {
+        for newest_first in [true, false] {
+            let winner = release_with_appcast("v0.10.0", "manifest-good");
+            let mut poisoned_loser = release_with_appcast("v0.9.0", "old-manifest-a");
+            poisoned_loser.assets.push(Asset {
+                name: "aterm-appcast.toml".into(),
+                url: "old-manifest-b".into(),
+                size: 0,
+            });
+            let catalog = if newest_first {
+                vec![winner, poisoned_loser]
+            } else {
+                vec![poisoned_loser, winner]
+            };
+            let selected = select_authoritative_release(catalog, &[])
+                .expect("a poisoned loser must not poison the check")
+                .expect("the clean maximum is elected");
+            assert_eq!(selected.release.tag_name, "v0.10.0");
+            assert_eq!(selected.version, "0.10.0");
+            assert_eq!(
+                selected.release.assets[selected.manifest_index].url, "manifest-good",
+                "the elected appcast is the winner's own, never the old release's"
+            );
+        }
+    }
+
+    /// ...AND A DUPLICATE-ASSET WINNER STILL FAILS THE WHOLE CHECK CLOSED, even with a
+    /// clean runner-up behind it: electing the runner-up would be a silent downgrade
+    /// behind a broken maximum — the same rule as the noncanonical-tag case. This is the
+    /// gate that proves the loser-tolerance above is winner-only.
+    #[test]
+    fn a_poisoned_winner_still_fails_the_whole_check_closed() {
+        let mut poisoned_winner = release_with_appcast("v0.10.0", "manifest-a");
+        poisoned_winner.assets.push(Asset {
+            name: "aterm-appcast.toml".into(),
+            url: "manifest-b".into(),
+            size: 0,
+        });
+        let err = select_authoritative_release(
+            vec![
+                poisoned_winner,
+                release_with_appcast("v0.9.0", "runner-up-must-not-fetch"),
+            ],
+            &[],
+        )
+        .err()
+        .expect("a poisoned maximum must fail closed, not elect the runner-up");
+        assert!(
+            err.contains("duplicate assets") && err.contains("v0.10.0"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn authoritative_manifest_version_must_equal_canonical_tag() {
         let authoritative = select_authoritative_release(
@@ -2610,7 +3240,12 @@ mod tests {
                 unexpected => panic!("unexpected asset fetch: {unexpected}"),
             }
         };
-        let fetched = fetch_authoritative_release(Some(authoritative), &[], &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(authoritative),
+            &[],
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert!(fetched.selected.is_none());
         assert!(fetched.manifest_rejected);
         assert_eq!(urls, ["mismatched-highest"]);
@@ -2911,6 +3546,127 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
+    /// A QUARANTINED BUILD NEVER COMES BACK, AND THE LINE MUST NOT PROMISE A TIMER.
+    ///
+    /// The crash-loop revert wrote its poison with `retry_after = 0` meaning "forever",
+    /// but `suppresses` — the only reader — treats a zero deadline as "already elapsed",
+    /// which is also what a pre-budget legacy marker means. So the poison was written and
+    /// then ignored: the very next check re-downloaded and re-applied the build that had
+    /// just crash-looped, straight back into the loop the poison exists to break. This
+    /// pins BOTH halves: the quarantine suppresses at any future time, and the old
+    /// permanent-shaped marker still does not (so the flag is what is load-bearing, not
+    /// the zero deadline).
+    #[test]
+    fn a_quarantined_build_is_skipped_forever_and_the_status_line_says_so() {
+        use crate::manifest::FailedMark;
+
+        let staging = test_staging("stage-backoff-quarantine");
+        let manifest = candidate_manifest();
+        let running = manifest.build_number - 1;
+        const NOW: u64 = 1_000_000;
+        const A_DECADE: u64 = 10 * 365 * 24 * 60 * 60;
+
+        // PRE-FIX CONTROL: the identity-only marker (the shape the poison used to take)
+        // opens no window at all.
+        FailedMark::record(&staging.failed(), manifest.build_number, &manifest.sha256);
+        assert!(
+            stage_backoff(&staging, &manifest, running, NOW).is_none(),
+            "a zero deadline reads as elapsed — this is exactly why the poison was inert"
+        );
+
+        FailedMark::record_quarantine(&staging.failed(), manifest.build_number, &manifest.sha256);
+        let backoff = stage_backoff(&staging, &manifest, running, NOW).expect("quarantined");
+        assert!(backoff.quarantined);
+        let line = backoff.status_line(manifest.build_number);
+        assert!(line.contains("is quarantined"), "{line}");
+        assert!(
+            !line.contains("retrying automatically") && !line.contains("for another "),
+            "a quarantine has no clock; the line must not imply one: {line}"
+        );
+        assert!(
+            line.contains("will not retry it"),
+            "and must say plainly that nothing here will: {line}"
+        );
+
+        // No deadline can lapse it.
+        assert!(
+            stage_backoff(&staging, &manifest, running, NOW + A_DECADE).is_some(),
+            "a quarantine does not expire"
+        );
+
+        // THE ESCAPES: a different build, and a re-publish of the same build under a
+        // different digest, both miss the memo's key and stage normally.
+        let newer = Manifest {
+            build_number: manifest.build_number + 1,
+            ..candidate_manifest()
+        };
+        assert!(
+            stage_backoff(&staging, &newer, running, NOW).is_none(),
+            "a newer build is not the quarantined artifact"
+        );
+        let republished = Manifest {
+            sha256: "cd".repeat(32),
+            ..candidate_manifest()
+        };
+        assert_ne!(
+            republished.sha256, manifest.sha256,
+            "the re-publish fixture must actually differ or it proves nothing"
+        );
+        assert!(
+            stage_backoff(&staging, &republished, running, NOW).is_none(),
+            "a re-publish under a different digest is not the quarantined artifact"
+        );
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// Every removal on the download path is keyed to the CURRENT artifact's name, and
+    /// those names carry the version — so a `.part` (or a whole container abandoned
+    /// between the finalize rename and the post-stage removal) for a version the channel
+    /// has moved past used to be unreachable by every code path, forever. The sweep is
+    /// the only reclaim, and it runs under the stage lock before the next download.
+    #[test]
+    fn download_scratch_from_a_version_the_channel_moved_past_is_reclaimed() {
+        let staging = test_staging("download-sweep");
+
+        // Two abandoned versions plus the current one: a killed transfer's `.part` and
+        // a fully-downloaded container that was never staged.
+        let stale_part = staging.download.join("aterm-0.52.0-mac.zip.part");
+        let stale_container = staging.download.join("aterm-0.53.0-mac.zip");
+        let current_part = staging.download.join("aterm-0.54.0-mac.zip.part");
+        for leftover in [&stale_part, &stale_container, &current_part] {
+            std::fs::write(leftover, b"abandoned bytes").unwrap();
+        }
+        // A directory is not scratch we own; the sweep must not recurse into one.
+        let bystander = staging.download.join("not-ours");
+        std::fs::create_dir_all(bystander.join("keep")).unwrap();
+
+        sweep_download_scratch(&staging);
+
+        assert!(
+            !stale_part.exists(),
+            "a killed transfer's part file for a superseded version has no other reclaimer"
+        );
+        assert!(
+            !stale_container.exists(),
+            "an abandoned full container for a superseded version has no other reclaimer"
+        );
+        assert!(
+            !current_part.exists(),
+            "the sweep subsumes the pre-download remove_file it replaced"
+        );
+        assert!(
+            bystander.join("keep").is_dir(),
+            "the sweep removes regular files only, never a directory tree"
+        );
+
+        // Idempotent, and silent on a download dir that does not exist yet (a first
+        // check on a fresh machine reaches it before anything has created the dir).
+        sweep_download_scratch(&staging);
+        let _ = std::fs::remove_dir_all(&staging.root);
+        sweep_download_scratch(&staging);
+    }
+
     /// ROTATION, end to end through the real selection + fetch path: a client whose
     /// keyset holds BOTH the incoming and the outgoing key installs a release signed
     /// by EITHER. This is the whole point of the keyset — without it, the release
@@ -2927,11 +3683,7 @@ mod tests {
 
         for (who, signer) in [("incoming", &incoming), ("outgoing", &outgoing)] {
             let signature = signer.sign(&manifest).as_ref().to_vec();
-            let releases = vec![release_with_signed_appcast(
-                "v0.10.0",
-                "m-url",
-                "sig-url",
-            )];
+            let releases = vec![release_with_signed_appcast("v0.10.0", "m-url", "sig-url")];
             let selected = select_authoritative_release(releases, &keyset)
                 .unwrap()
                 .expect("a signed candidate is selected");
@@ -2940,8 +3692,12 @@ mod tests {
                 "sig-url" => Ok(signature.clone()),
                 other => Err(format!("unexpected fetch {other}")),
             };
-            let fetched =
-                fetch_authoritative_release(Some(selected), &keyset, &mut download);
+            let fetched = fetch_authoritative_release(
+                Some(selected),
+                &keyset,
+                &mut download,
+                &RosterPolicy::INERT,
+            );
             assert!(
                 !fetched.manifest_rejected,
                 "{who} key is in the keyset and must be accepted"
@@ -2970,10 +3726,1105 @@ mod tests {
             "sig-url" => Ok(signature.clone()),
             other => Err(format!("unexpected fetch {other}")),
         };
-        let fetched = fetch_authoritative_release(Some(selected), &keyset, &mut download);
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy::INERT,
+        );
         assert!(
             fetched.manifest_rejected,
             "a key no longer in the keyset must not authenticate a release"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The machine-roster tier, on the real client transport path.
+    //
+    // The chain's own gates are proved in `aterm_update_core::roster`; what these
+    // exercise is the WIRING — that the assets are demanded, fetched, sequenced in the
+    // documented order, that attribution comes back out, and that every refusal is a
+    // refusal rather than a fallthrough.
+    // -----------------------------------------------------------------------
+
+    /// Obviously synthetic seeds, distinct from `SIGNING_SEED` so a mix-up between the
+    /// channel key and a machine key cannot pass by coincidence.
+    const MASTER_SEED_FIXTURE: [u8; 32] = [0xA7; 32];
+    const M3_SEED_FIXTURE: [u8; 32] = [0xB7; 32];
+
+    /// 2026-08-04T00:00:00Z.
+    const ROSTER_NOW: i64 = 1_785_801_600;
+
+    fn release_with_roster(tag: &str) -> Release {
+        let version = tag.strip_prefix('v').unwrap_or(tag);
+        let mut release = release_with_signed_appcast(tag, "m-url", "sig-url");
+        release.assets.push(Asset {
+            name: "aterm-machines.toml".into(),
+            url: "roster-url".into(),
+            size: 0,
+        });
+        release.assets.push(Asset {
+            name: "aterm-machines.toml.sig".into(),
+            url: "roster-sig-url".into(),
+            size: 0,
+        });
+        assert!(
+            release
+                .assets
+                .iter()
+                .any(|a| a.name == format!("aterm-{version}.dmg"))
+        );
+        release
+    }
+
+    /// An appcast carrying the two attribution keys, signed by `machine`.
+    fn attributed_manifest(machine_id: &str, roster_seq: u64) -> Vec<u8> {
+        let mut text = String::from_utf8(manifest_bytes("0.10.0", 10, 0)).unwrap();
+        text.push_str(&format!(
+            "machine_id = {machine_id:?}\nroster_seq = {roster_seq}\n"
+        ));
+        text.into_bytes()
+    }
+
+    /// The full owner side: a master-signed roster listing m3, plus everything the client
+    /// needs to check it.
+    struct RosterFixture {
+        master_pub: String,
+        roster: Vec<u8>,
+        roster_sig: Vec<u8>,
+        manifest: Vec<u8>,
+        manifest_sig: Vec<u8>,
+        machine_pub: String,
+        seq: u64,
+    }
+
+    fn roster_fixture(revoke_m3: bool) -> RosterFixture {
+        let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
+        let m3 = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
+        let machine_pub = B64.encode(m3.public_key().as_ref());
+        let seq = 4u64;
+        let roster = aterm_update_core::roster::Roster {
+            schema: 1,
+            roster_seq: seq,
+            valid_until: "2027-02-01T00:00:00Z".into(),
+            machines: vec![aterm_update_core::roster::Machine {
+                id: "m3".into(),
+                pubkey: machine_pub.clone(),
+                added_at: "2026-08-04T00:00:00Z".into(),
+                not_after: None,
+            }],
+            revoked: if revoke_m3 { vec!["m3".into()] } else { vec![] },
+        };
+        let roster_bytes = roster.to_toml().unwrap().into_bytes();
+        let manifest = attributed_manifest("m3", seq);
+        RosterFixture {
+            master_pub: B64.encode(master.public_key().as_ref()),
+            roster_sig: master.sign(&roster_bytes).as_ref().to_vec(),
+            roster: roster_bytes,
+            manifest_sig: m3.sign(&manifest).as_ref().to_vec(),
+            manifest,
+            machine_pub,
+            seq,
+        }
+    }
+
+    /// THE CLIENT HAPPY PATH: the roster assets are fetched, the chain passes, the release
+    /// is selected, and the attribution names the machine that signed it.
+    #[test]
+    fn an_armed_master_accepts_a_rostered_release_and_reports_which_machine_signed() {
+        let f = roster_fixture(false);
+        // The channel keyset is the MACHINE's key — which is exactly the bridge shape:
+        // the existing pinned key is declared to be a machine key, so old clients verify
+        // the appcast unchanged while roster-aware clients verify the same signature
+        // through the roster.
+        let keyset = [f.machine_pub.as_str()];
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let master = [f.master_pub.as_str()];
+        let mut urls = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            urls.push(url.to_string());
+            match url {
+                "m-url" => Ok(f.manifest.clone()),
+                "sig-url" => Ok(f.manifest_sig.clone()),
+                "roster-url" => Ok(f.roster.clone()),
+                "roster-sig-url" => Ok(f.roster_sig.clone()),
+                other => Err(format!("unexpected fetch {other}")),
+            }
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &master,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(
+            fetched.selected.is_some(),
+            "the chain must accept this release"
+        );
+        let who = fetched.attribution.expect("attribution is reported");
+        assert_eq!(who.machine_id, "m3");
+        assert_eq!(who.pubkey_b64, f.machine_pub);
+        assert_eq!(who.roster_seq, f.seq);
+        assert_eq!(
+            fetched.observed_roster_seq,
+            Some(f.seq),
+            "the accepted sequence must reach the caller so the durable floor ratchets"
+        );
+        assert!(
+            urls.contains(&"roster-url".to_string())
+                && urls.contains(&"roster-sig-url".to_string()),
+            "the roster and its master signature must actually be fetched: {urls:?}"
+        );
+    }
+
+    /// A RELEASE WITH NO ROSTER is refused under an armed master — structurally, before
+    /// any roster crypto. An armed anchor never degrades to "unsigned is fine".
+    #[test]
+    fn an_armed_master_refuses_a_release_that_carries_no_roster() {
+        let f = roster_fixture(false);
+        let keyset = [f.machine_pub.as_str()];
+        // The plain signed release: appcast + signature, no roster assets.
+        let selected = select_authoritative_release(
+            vec![release_with_signed_appcast("v0.10.0", "m-url", "sig-url")],
+            &keyset,
+        )
+        .unwrap()
+        .unwrap();
+        let master = [f.master_pub.as_str()];
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(f.manifest.clone()),
+            "sig-url" => Ok(f.manifest_sig.clone()),
+            other => panic!("nothing else may be fetched, got {other}"),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &master,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(fetched.selected.is_none());
+        assert!(fetched.manifest_rejected);
+        assert!(fetched.attribution.is_none());
+    }
+
+    /// A REVOKED MACHINE is refused on the real path, though its signature is genuine and
+    /// the channel keyset still accepts it. This is the whole point of the tier.
+    #[test]
+    fn a_revoked_machine_is_refused_on_the_client_transport_path() {
+        let f = roster_fixture(true);
+        let keyset = [f.machine_pub.as_str()];
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let master = [f.master_pub.as_str()];
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(f.manifest.clone()),
+            "sig-url" => Ok(f.manifest_sig.clone()),
+            "roster-url" => Ok(f.roster.clone()),
+            "roster-sig-url" => Ok(f.roster_sig.clone()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &master,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(
+            fetched.selected.is_none(),
+            "a revoked machine must not publish"
+        );
+        assert!(fetched.manifest_rejected);
+        assert!(fetched.attribution.is_none());
+    }
+
+    /// A REPLAYED PRE-REVOCATION ROSTER is refused by the durable floor, and a STALE one
+    /// by the freshness window. Both are checked before any artifact crypto, and both are
+    /// driven here through the real transport path.
+    #[test]
+    fn a_rolled_back_or_lapsed_roster_is_refused_on_the_client_transport_path() {
+        let f = roster_fixture(false);
+        let keyset = [f.machine_pub.as_str()];
+        let master = [f.master_pub.as_str()];
+        let refuse_with = |floor_seq: u64, now_unix: i64| {
+            let selected =
+                select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+                    .unwrap()
+                    .unwrap();
+            let mut download = |url: &str, _max: u64| match url {
+                "m-url" => Ok(f.manifest.clone()),
+                "sig-url" => Ok(f.manifest_sig.clone()),
+                "roster-url" => Ok(f.roster.clone()),
+                "roster-sig-url" => Ok(f.roster_sig.clone()),
+                other => Err(format!("unexpected fetch {other}")),
+            };
+            fetch_authoritative_release(
+                Some(selected),
+                &keyset,
+                &mut download,
+                &RosterPolicy {
+                    master_pubkeys: &master,
+                    floor_seq,
+                    now_unix,
+                    floor_refresh: None,
+                },
+            )
+        };
+        // A client that has durably seen sequence 5 refuses this seq-4 roster forever.
+        let rolled_back = refuse_with(f.seq + 1, ROSTER_NOW);
+        assert!(rolled_back.selected.is_none() && rolled_back.manifest_rejected);
+        assert_eq!(
+            rolled_back.observed_roster_seq, None,
+            "a rolled-back roster failed admission: not an observation, moves no floor"
+        );
+        // Past `valid_until`, the same roster is refused even with no floor at all — the
+        // only defence a fresh install has.
+        let lapsed = refuse_with(0, 1_900_000_000);
+        assert!(lapsed.selected.is_none() && lapsed.manifest_rejected);
+        assert_eq!(
+            lapsed.observed_roster_seq, None,
+            "a stale roster failed admission: not an observation, moves no floor"
+        );
+        // Negative control: at the same sequence and inside the window it is accepted, so
+        // the two refusals above are the gates and not a broken fixture.
+        assert!(refuse_with(f.seq, ROSTER_NOW).selected.is_some());
+    }
+
+    /// A GENUINE SIGNATURE WITH A MISMATCHED LABEL is refused after the parse. The bytes
+    /// verify under m3's key, but they claim to come from `m99`, and attribution follows
+    /// the key.
+    #[test]
+    fn a_release_whose_declared_machine_disagrees_with_the_signer_is_refused() {
+        let master = Ed25519KeyPair::from_seed_unchecked(&MASTER_SEED_FIXTURE).unwrap();
+        let m3 = Ed25519KeyPair::from_seed_unchecked(&M3_SEED_FIXTURE).unwrap();
+        let machine_pub = B64.encode(m3.public_key().as_ref());
+        let roster = aterm_update_core::roster::Roster {
+            schema: 1,
+            roster_seq: 4,
+            valid_until: "2027-02-01T00:00:00Z".into(),
+            machines: vec![aterm_update_core::roster::Machine {
+                id: "m3".into(),
+                pubkey: machine_pub.clone(),
+                added_at: String::new(),
+                not_after: None,
+            }],
+            revoked: vec![],
+        };
+        let roster_bytes = roster.to_toml().unwrap().into_bytes();
+        let roster_sig = master.sign(&roster_bytes).as_ref().to_vec();
+        // m3 signs bytes that CLAIM to be m99's.
+        let lying = attributed_manifest("m99", 4);
+        let lying_sig = m3.sign(&lying).as_ref().to_vec();
+
+        let keyset = [machine_pub.as_str()];
+        let master_pub = B64.encode(master.public_key().as_ref());
+        let masters = [master_pub.as_str()];
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(lying.clone()),
+            "sig-url" => Ok(lying_sig.clone()),
+            "roster-url" => Ok(roster_bytes.clone()),
+            "roster-sig-url" => Ok(roster_sig.clone()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &masters,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(
+            fetched.selected.is_none() && fetched.manifest_rejected,
+            "a signature cannot be relabelled onto another machine's identity"
+        );
+    }
+
+    /// AN UNPINNED MASTER LEAVES THE PATH EXACTLY AS IT WAS: the roster assets are never
+    /// fetched, no attribution is produced, and the release is accepted on the channel
+    /// keyset alone. This is the pre-v0.21.0 (pre-arming) behaviour, exercised here with
+    /// a synthetic empty anchor — the shipped tree has been armed since 2026-08-15.
+    #[test]
+    fn an_unpinned_master_never_touches_the_roster_assets() {
+        let f = roster_fixture(false);
+        let keyset = [f.machine_pub.as_str()];
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let mut urls = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            urls.push(url.to_string());
+            match url {
+                "m-url" => Ok(f.manifest.clone()),
+                "sig-url" => Ok(f.manifest_sig.clone()),
+                other => panic!("an inert tier must fetch nothing extra, got {other}"),
+            }
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy::INERT,
+        );
+        assert!(fetched.selected.is_some());
+        assert!(fetched.attribution.is_none());
+        assert_eq!(fetched.observed_roster_seq, None);
+        assert_eq!(urls, ["m-url", "sig-url"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // THE ROSTER IS THE AUTHORITY — the two-state gate, both states.
+    //
+    // Everything below drives the REAL transport path, because the change these
+    // exercise is not in the chain (the chain's gates are unchanged and proved in
+    // `aterm_update_core::roster`) — it is in WHICH gate gets to refuse.
+    // -----------------------------------------------------------------------
+
+    /// A second machine, and a second master, both obviously synthetic and distinct from
+    /// everything above so a mix-up cannot pass by coincidence.
+    const M11_SEED_FIXTURE: [u8; 32] = [0xB8; 32];
+    const OTHER_MASTER_FIXTURE: [u8; 32] = [0xA8; 32];
+
+    /// Everything the owner publishes for one release, with every placement under the
+    /// caller's control — which machine is on the roster, which is revoked, which one
+    /// signed, and at which generation. The placements ARE the subject of these tests.
+    struct Chain {
+        master_pub: String,
+        roster: Vec<u8>,
+        roster_sig: Vec<u8>,
+        manifest: Vec<u8>,
+        manifest_sig: Vec<u8>,
+    }
+
+    fn pub_b64(seed: &[u8; 32]) -> String {
+        B64.encode(
+            Ed25519KeyPair::from_seed_unchecked(seed)
+                .unwrap()
+                .public_key()
+                .as_ref(),
+        )
+    }
+
+    fn chain(
+        machines: &[(&str, [u8; 32])],
+        revoked: &[&str],
+        signer: (&str, [u8; 32]),
+        seq: u64,
+        master_seed: &[u8; 32],
+        claimed_seq: u64,
+    ) -> Chain {
+        let master = Ed25519KeyPair::from_seed_unchecked(master_seed).unwrap();
+        let roster = aterm_update_core::roster::Roster {
+            schema: 1,
+            roster_seq: seq,
+            valid_until: "2027-02-01T00:00:00Z".into(),
+            machines: machines
+                .iter()
+                .map(|(id, seed)| aterm_update_core::roster::Machine {
+                    id: (*id).to_string(),
+                    pubkey: pub_b64(seed),
+                    added_at: "2026-08-04T00:00:00Z".into(),
+                    not_after: None,
+                })
+                .collect(),
+            revoked: revoked.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let roster_bytes = roster.to_toml().unwrap().into_bytes();
+        let manifest = attributed_manifest(signer.0, claimed_seq);
+        let signing = Ed25519KeyPair::from_seed_unchecked(&signer.1).unwrap();
+        Chain {
+            master_pub: B64.encode(master.public_key().as_ref()),
+            roster_sig: master.sign(&roster_bytes).as_ref().to_vec(),
+            roster: roster_bytes,
+            manifest_sig: signing.sign(&manifest).as_ref().to_vec(),
+            manifest,
+        }
+    }
+
+    /// Drive the real path over a [`Chain`] with an explicit keyset and policy. Returns
+    /// both the verdict and the URLs that were actually fetched.
+    fn run_chain(
+        c: &Chain,
+        keyset: &[&str],
+        masters: &[&str],
+        floor_seq: u64,
+        now_unix: i64,
+    ) -> (AuthoritativeFetch, Vec<String>) {
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], keyset)
+            .unwrap()
+            .unwrap();
+        let mut urls = Vec::new();
+        let mut download = |url: &str, _max: u64| {
+            urls.push(url.to_string());
+            match url {
+                "m-url" => Ok(c.manifest.clone()),
+                "sig-url" => Ok(c.manifest_sig.clone()),
+                "roster-url" => Ok(c.roster.clone()),
+                "roster-sig-url" => Ok(c.roster_sig.clone()),
+                other => Err(format!("unexpected fetch {other}")),
+            }
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: masters,
+                floor_seq,
+                now_unix,
+                floor_refresh: None,
+            },
+        );
+        (fetched, urls)
+    }
+
+    /// **THE WHOLE POINT.** With the master ARMED, a machine the master-signed roster
+    /// names is accepted even though this build's compiled-in keyset has never heard of
+    /// it. That is what makes adding a machine a LOCAL act: mint on the new machine, put
+    /// it on the roster, publish — no release cut from a machine that can already sign.
+    ///
+    /// Kills the mutation this test was written against: restore the keyset gate ahead of
+    /// the roster chain and m11's release is refused here, exactly as it was before.
+    #[test]
+    fn an_armed_master_accepts_a_machine_the_compiled_in_keyset_does_not_carry() {
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE), ("m11", M11_SEED_FIXTURE)],
+            &[],
+            ("m11", M11_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        // The keyset is the OLD world: it holds m3 alone, which is exactly the state of
+        // every build shipped before m11 existed.
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        assert!(
+            !keyset.contains(&pub_b64(&M11_SEED_FIXTURE).as_str()),
+            "precondition: the keyset must NOT carry the signing machine, or this test \
+             proves nothing"
+        );
+        let masters = [c.master_pub.as_str()];
+        let (fetched, urls) = run_chain(&c, &keyset, &masters, 0, ROSTER_NOW);
+
+        assert!(
+            fetched.selected.is_some(),
+            "the roster authorized m11; the compiled-in keyset must not be able to refuse it"
+        );
+        let who = fetched.attribution.expect("attributed");
+        assert_eq!(who.machine_id, "m11");
+        assert_eq!(who.pubkey_b64, pub_b64(&M11_SEED_FIXTURE));
+        assert_eq!(fetched.observed_roster_seq, Some(4));
+        assert!(
+            urls.contains(&"roster-url".to_string()),
+            "the roster must actually be fetched: {urls:?}"
+        );
+    }
+
+    /// THE CONVERSE, and it is what stops the change from being a loosening: a key that
+    /// IS in the compiled-in keyset — the very key every shipped client accepts — is
+    /// refused when the roster does not name it. Membership grants nothing under an armed
+    /// anchor.
+    ///
+    /// Kills the mutation "accept if EITHER the keyset or the roster authorizes": under an
+    /// OR this release is accepted, and revocation stops meaning anything.
+    #[test]
+    fn an_armed_master_refuses_a_keyset_member_the_roster_does_not_name() {
+        // The roster names only m3; m11 signs. m11's key is in the keyset.
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m11", M11_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let m11_pub = pub_b64(&M11_SEED_FIXTURE);
+        let keyset = [m11_pub.as_str()];
+        let masters = [c.master_pub.as_str()];
+        // Precondition: with NO master pinned this very release is ACCEPTED — so the
+        // refusal below is the roster's doing and not a broken fixture.
+        let (unarmed, _) = run_chain(&c, &keyset, &[], 0, ROSTER_NOW);
+        assert!(
+            unarmed.selected.is_some(),
+            "precondition: the keyset accepts this signature when the tier is absent"
+        );
+
+        let (armed, _) = run_chain(&c, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(
+            armed.selected.is_none() && armed.manifest_rejected,
+            "keyset membership must not authorize a machine the roster does not name"
+        );
+        assert!(armed.attribution.is_none());
+    }
+
+    /// A REVOKED MACHINE is refused even though its key is in the keyset AND its
+    /// signature is genuine — and no crypto is ever run against it, because revocation
+    /// empties the candidate set before `authorize_appcast` reaches a verifier at all.
+    ///
+    /// The ordering property itself is proved by construction in
+    /// `aterm_update_core::roster` (`live()` filters, then the loop verifies). What this
+    /// adds is the seam: the same bytes, the same keyset, the same master — only the
+    /// deny-list differs, and the verdict flips.
+    #[test]
+    fn an_armed_master_refuses_a_revoked_machine_whose_key_the_keyset_still_carries() {
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let live = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let masters = [live.master_pub.as_str()];
+        // The negative control FIRST, so the refusal below cannot be a broken fixture.
+        let (ok, _) = run_chain(&live, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(ok.selected.is_some(), "precondition: m3 is live and signs");
+
+        let revoked = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &["m3"],
+            ("m3", M3_SEED_FIXTURE),
+            5,
+            &MASTER_SEED_FIXTURE,
+            5,
+        );
+        let (refused, _) = run_chain(&revoked, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(
+            refused.selected.is_none() && refused.manifest_rejected,
+            "a revoked machine may not publish, whatever the keyset says"
+        );
+        assert!(refused.attribution.is_none());
+        assert_eq!(
+            refused.observed_roster_seq,
+            Some(5),
+            "the revoking generation was master-verified and ADMITTED, so it was OBSERVED \
+             — the ratchet must learn seq 5 from this refusal, or a replayed seq-4 roster \
+             re-authorizes the machine the owner just revoked"
+        );
+    }
+
+    /// THE OBSERVATION-RATCHET SEMANTICS, pinned end to end so the code and its comment
+    /// can never again disagree about when the floor moves. "A client that merely SAW
+    /// roster generation n must refuse n-1 forever after" means the observation is
+    /// reported on ADMISSION — not on successful artifact authorization — and exactly on
+    /// admission: a roster that never passed `admit` (stale, rolled back, unverifiable)
+    /// has NOT been observed and moves nothing.
+    ///
+    /// MUTATION: move the `observed_roster_seq` assignment back inside the `Ok(who)` arm
+    /// of `authorize_by_roster`'s caller (the pre-fix code) and the first half fails; make
+    /// it fire before `admit` and the second half fails.
+    #[test]
+    fn the_roster_floor_ratchets_on_observation_not_on_acceptance() {
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+
+        // ACT 1 — the attack the ratchet exists for. Generation 10 revokes m3; m3 itself
+        // signed the release. The release is refused AND generation 10 is observed.
+        let revoking = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &["m3"],
+            ("m3", M3_SEED_FIXTURE),
+            10,
+            &MASTER_SEED_FIXTURE,
+            10,
+        );
+        let masters_owned = revoking.master_pub.clone();
+        let masters = [masters_owned.as_str()];
+        let (saw_revocation, _) = run_chain(&revoking, &keyset, &masters, 9, ROSTER_NOW);
+        assert!(saw_revocation.selected.is_none() && saw_revocation.manifest_rejected);
+        assert_eq!(
+            saw_revocation.observed_roster_seq,
+            Some(10),
+            "observing the revoking generation must be reported for the durable ratchet"
+        );
+
+        // ACT 2 — the replay, against the floor ACT 1's observation produced. The seq-9
+        // roster still lists m3 and is still inside its freshness window; with the floor
+        // at 10 it must be refused, and it is NOT an observation (admit failed).
+        let pre_revocation = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            9,
+            &MASTER_SEED_FIXTURE,
+            9,
+        );
+        let floor_after_observation = saw_revocation.observed_roster_seq.unwrap();
+        let (replayed, _) = run_chain(
+            &pre_revocation,
+            &keyset,
+            &masters,
+            floor_after_observation,
+            ROSTER_NOW,
+        );
+        assert!(
+            replayed.selected.is_none() && replayed.manifest_rejected,
+            "the replayed pre-revocation roster must be refused by the observed floor"
+        );
+        assert_eq!(
+            replayed.observed_roster_seq, None,
+            "a roster that failed admission was never observed and must not move the floor"
+        );
+
+        // NEGATIVE CONTROL — the same seq-9 roster is accepted below the floor ACT 1
+        // produced, so ACT 2's refusal is the ratchet's doing and not a broken fixture.
+        let (accepted, _) = run_chain(&pre_revocation, &keyset, &masters, 9, ROSTER_NOW);
+        assert!(accepted.selected.is_some());
+        assert_eq!(accepted.observed_roster_seq, Some(9));
+    }
+
+    /// THE ADMISSION-TIME FLOOR RE-READ (the check-vs-ratchet TOCTOU): the policy's
+    /// `floor_seq` snapshot is taken before any network I/O, and a concurrent instance
+    /// can ratchet the durable floor while the roster assets download. When the caller
+    /// provides `floor_refresh`, admission must consult the RE-READ value, so a roster
+    /// generation a concurrent check has already superseded is refused even though the
+    /// stale snapshot would admit it.
+    ///
+    /// MUTATION: drop the `floor_refresh` consultation in `authorize_by_roster` (admit
+    /// against `policy.floor_seq` alone — the pre-fix code) and the refusal below flips
+    /// to an acceptance.
+    #[test]
+    fn admission_rereads_the_durable_floor_a_concurrent_check_may_have_ratcheted() {
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            9,
+            &MASTER_SEED_FIXTURE,
+            9,
+        );
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let masters = [c.master_pub.as_str()];
+        let run_with_refresh = |refreshed_floor: u64| {
+            let selected =
+                select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+                    .unwrap()
+                    .unwrap();
+            let mut download = |url: &str, _max: u64| match url {
+                "m-url" => Ok(c.manifest.clone()),
+                "sig-url" => Ok(c.manifest_sig.clone()),
+                "roster-url" => Ok(c.roster.clone()),
+                "roster-sig-url" => Ok(c.roster_sig.clone()),
+                other => Err(format!("unexpected fetch {other}")),
+            };
+            // The concurrent actor's ratchet, visible only through the re-read: the
+            // snapshot below stays at 0, exactly as in the race.
+            let refresh = move || refreshed_floor;
+            fetch_authoritative_release(
+                Some(selected),
+                &keyset,
+                &mut download,
+                &RosterPolicy {
+                    master_pubkeys: &masters,
+                    floor_seq: 0,
+                    now_unix: ROSTER_NOW,
+                    floor_refresh: Some(&refresh),
+                },
+            )
+        };
+        // The other instance recorded generation 10 mid-download: this seq-9 roster is
+        // superseded and must be refused, stale snapshot notwithstanding.
+        let raced = run_with_refresh(10);
+        assert!(
+            raced.selected.is_none() && raced.manifest_rejected,
+            "admission must honour the re-read floor, not the pre-download snapshot"
+        );
+        assert_eq!(raced.observed_roster_seq, None);
+        // NEGATIVE CONTROL: with the durable floor still at 9, the same chain is
+        // admitted — so the refusal above is the re-read's doing.
+        let quiet = run_with_refresh(9);
+        assert!(quiet.selected.is_some());
+        assert_eq!(quiet.observed_roster_seq, Some(9));
+    }
+
+    /// The under-stage-lock half of the same defence: whether an already-authorized
+    /// release must be dropped because the durable floor advanced past its generation
+    /// while the check was in flight. Strictly `<` — this run's own ratchet write makes
+    /// the floor EQUAL in the quiescent case, and an inert tier (no observation) can
+    /// never be superseded.
+    #[test]
+    fn a_release_is_held_when_its_roster_generation_was_superseded_mid_check() {
+        // Quiescent: our own write put the floor at our generation.
+        assert!(!roster_authority_superseded(Some(9), 9));
+        // Raced: a concurrent instance recorded 10 — the release's authority is stale.
+        assert!(roster_authority_superseded(Some(9), 10));
+        // Inert tier: nothing was observed, nothing can be superseded.
+        assert!(!roster_authority_superseded(None, u64::MAX));
+    }
+
+    /// FAIL CLOSED, FOUR WAYS, AND NEVER BACK TO THE KEYSET.
+    ///
+    /// Every case here is arranged so that a keyset fallback would be VISIBLE: the
+    /// appcast is signed by a key the keyset holds, so "refuse the roster, then accept on
+    /// the keyset" would accept. All four must refuse.
+    ///
+    /// This is the case an attacker reaches for — suppressing or downgrading the roster
+    /// assets is far easier than forging a master signature — and a fallback would hand
+    /// them every armed client back at the old tier.
+    #[test]
+    fn an_armed_master_never_falls_back_to_the_keyset_when_the_roster_chain_fails() {
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let good = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let masters = [good.master_pub.as_str()];
+        // Precondition: the keyset alone WOULD accept these exact bytes.
+        let (unarmed, _) = run_chain(&good, &keyset, &[], 0, ROSTER_NOW);
+        assert!(
+            unarmed.selected.is_some(),
+            "precondition: a fallback would be observable"
+        );
+
+        // (1) THE ROSTER ASSETS ARE MISSING from the release.
+        let plain = select_authoritative_release(
+            vec![release_with_signed_appcast("v0.10.0", "m-url", "sig-url")],
+            &keyset,
+        )
+        .unwrap()
+        .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(good.manifest.clone()),
+            "sig-url" => Ok(good.manifest_sig.clone()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let missing = fetch_authoritative_release(
+            Some(plain),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &masters,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(missing.selected.is_none() && missing.manifest_rejected);
+
+        // (2) THE ROSTER IS UNVERIFIABLE — signed by a master this build does not pin.
+        let wrong_master = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &OTHER_MASTER_FIXTURE,
+            4,
+        );
+        let (forged, _) = run_chain(&wrong_master, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(forged.selected.is_none() && forged.manifest_rejected);
+
+        // (3) THE ROSTER IS STALE — past its own `valid_until`, the only defence a fresh
+        //     install has.
+        let (lapsed, _) = run_chain(&good, &keyset, &masters, 0, 1_900_000_000);
+        assert!(lapsed.selected.is_none() && lapsed.manifest_rejected);
+
+        // (4) THE ROSTER IS ROLLED BACK — below the generation this client has already
+        //     durably seen.
+        let (replayed, _) = run_chain(&good, &keyset, &masters, 5, ROSTER_NOW);
+        assert!(replayed.selected.is_none() && replayed.manifest_rejected);
+    }
+
+    /// A ROSTER ASSET THAT WILL NOT DOWNLOAD is a TRANSPORT failure, not a publisher
+    /// error — and it still refuses.
+    ///
+    /// The distinction is what the operator is told. `manifest_rejected` escalates to
+    /// "this Mac cannot install any release until that is fixed at the publisher", which
+    /// is a false accusation for a flaky network — and now that the roster is the sole
+    /// authority, every armed client's fetch of it is on that path.
+    ///
+    /// # This is also the ATTACKER'S branch, and that is why the fixture is built the way
+    /// it is
+    ///
+    /// Transport failure is the roster failure an adversary controls most directly: drop,
+    /// 404, reset or simply time out the `aterm-machines.toml` fetch while serving a
+    /// perfectly good, keyset-signed appcast. If this arm could be talked into "the
+    /// roster was unreachable, fall back to the keyset", one suppressed asset would
+    /// downgrade every armed client to the tier the roster replaced — and a revoked
+    /// machine's key would start working again.
+    ///
+    /// So the download closure below SERVES `sig-url` with a signature that verifies
+    /// under the keyset, and the keyset is the signing machine's own key. Everything a
+    /// fallback would need is present and correct; the only thing missing is the roster.
+    /// A closure that returned an error for `sig-url` would make this arm untestable —
+    /// the rescue would fail for an unrelated reason and every assertion below would
+    /// still hold, which is exactly how this branch went unguarded.
+    ///
+    /// Kills the mutation "rescue a Transport failure with `verify_detached_any` over the
+    /// pinned keyset".
+    #[test]
+    fn a_roster_that_cannot_be_fetched_is_reported_as_transport_and_still_refuses() {
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        // THE PRECONDITION THIS TEST WOULD BE VACUOUS WITHOUT: the appcast signature the
+        // closure is about to serve really does verify under the pinned keyset. A
+        // fallback would therefore succeed if one existed, and the refusal below is a
+        // decision rather than an accident.
+        assert!(
+            sig::verify_detached_any(&keyset, &c.manifest, &c.manifest_sig).is_ok(),
+            "precondition: the keyset-signed appcast is exactly what a fallback would take"
+        );
+        let masters = [c.master_pub.as_str()];
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(c.manifest.clone()),
+            // Served, deliberately. See the doc comment.
+            "sig-url" => Ok(c.manifest_sig.clone()),
+            "roster-url" => Err("connection reset".to_string()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &masters,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(fetched.selected.is_none(), "no roster, no release");
+        assert!(
+            fetched.attribution.is_none(),
+            "nothing may be accepted, attributed or not"
+        );
+        assert!(
+            fetched.appcast_fetch_error,
+            "a fetch failure is a pipeline-class failure"
+        );
+        assert!(
+            !fetched.manifest_rejected,
+            "a network failure must not accuse the publisher of shipping a bad release"
+        );
+
+        // THE SAME SUPPRESSION, ONE ASSET OVER. The roster body arrives and its master
+        // signature does not — the other half an attacker can withhold independently, and
+        // a second place a fallback could be bolted on.
+        let selected = select_authoritative_release(vec![release_with_roster("v0.10.0")], &keyset)
+            .unwrap()
+            .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(c.manifest.clone()),
+            "sig-url" => Ok(c.manifest_sig.clone()),
+            "roster-url" => Ok(c.roster.clone()),
+            "roster-sig-url" => Err("connection reset".to_string()),
+            other => Err(format!("unexpected fetch {other}")),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &keyset,
+            &mut download,
+            &RosterPolicy {
+                master_pubkeys: &masters,
+                floor_seq: 0,
+                now_unix: ROSTER_NOW,
+                floor_refresh: None,
+            },
+        );
+        assert!(
+            fetched.selected.is_none() && fetched.attribution.is_none(),
+            "a roster with no master signature authorizes nothing, keyset or no keyset"
+        );
+        assert!(fetched.appcast_fetch_error);
+        assert!(!fetched.manifest_rejected);
+    }
+
+    /// AN ARMED MASTER WITH AN EMPTY KEYSET works — the configuration a fork has, and the
+    /// one the owner reaches once no pre-roster client is left to protect.
+    ///
+    /// It is worth its own test because `select_authoritative_release` records the appcast
+    /// signature's asset index only when the KEYSET is pinned. The roster tier locates it
+    /// for itself, so arming the master does not depend on a keyset the build may not
+    /// have. Kills the mutation "take the index from the candidate and refuse if absent".
+    #[test]
+    fn an_armed_master_authorizes_with_no_channel_keyset_at_all() {
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let masters = [c.master_pub.as_str()];
+        let (fetched, _) = run_chain(&c, &[], &masters, 0, ROSTER_NOW);
+        assert!(
+            fetched.selected.is_some(),
+            "an empty keyset removes the OLD tier, it does not disarm the roster"
+        );
+        assert_eq!(
+            fetched.attribution.expect("attributed").machine_id,
+            "m3",
+            "attribution still follows the key that signed"
+        );
+    }
+
+    /// THE RATCHET AND THE BIND, on the transport path, under the new authority.
+    ///
+    /// `roster_seq` appears in two documents and both must agree: the roster's own
+    /// generation, and the copy inside the signed appcast. A manifest that names a
+    /// DIFFERENT generation is refused after the parse — that is what stops an old roster
+    /// being paired with a new release. And the accepted generation must reach the caller,
+    /// or the durable floor never advances and the replay defence is inert.
+    #[test]
+    fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest() {
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        // The roster is at generation 6; the appcast claims 5 — inside its own signed
+        // bytes, so this is a genuine signature over a mismatched claim.
+        let lying = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            6,
+            &MASTER_SEED_FIXTURE,
+            5,
+        );
+        let masters = [lying.master_pub.as_str()];
+        let (refused, _) = run_chain(&lying, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(
+            refused.selected.is_none() && refused.manifest_rejected,
+            "an appcast may not name a roster generation other than the one that \
+             authorized it"
+        );
+
+        // Truthful, same everything else: accepted, and the generation is handed back for
+        // the durable floor to ratchet.
+        let honest = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            6,
+            &MASTER_SEED_FIXTURE,
+            6,
+        );
+        let (ok, _) = run_chain(&honest, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(ok.selected.is_some());
+        assert_eq!(ok.observed_roster_seq, Some(6));
+        // ...and the floor it just advanced past now refuses that same generation's
+        // predecessor forever.
+        let older = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            5,
+            &MASTER_SEED_FIXTURE,
+            5,
+        );
+        let (rolled, _) = run_chain(&older, &keyset, &masters, 6, ROSTER_NOW);
+        assert!(rolled.selected.is_none() && rolled.manifest_rejected);
+    }
+
+    /// **THE FLEET-BRICKING CASE, TESTED HARDEST.** With the anchor EMPTY the decision is
+    /// the compiled-in keyset and nothing else, across the whole table — including when
+    /// the release is carrying perfectly good roster assets, which the client must not so
+    /// much as fetch.
+    ///
+    /// This is every build already in the field. `select_authoritative_release` yields
+    /// exactly ONE candidate with no fallback to an older release, so a client that meets
+    /// a release it cannot verify is not delayed, it is WEDGED permanently. Kills the
+    /// mutation "run the roster chain whenever the release carries a roster".
+    #[test]
+    fn an_empty_master_anchor_leaves_the_keyset_decision_exactly_as_it_was() {
+        let good = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let m11_pub = pub_b64(&M11_SEED_FIXTURE);
+
+        // (1) THE KEY IS THE HEAD: accepted, nothing attributed, and the roster assets on
+        //     the release are never touched.
+        let head_only = [m3_pub.as_str()];
+        let (fetched, urls) = run_chain(&good, &head_only, &[], 0, ROSTER_NOW);
+        assert!(fetched.selected.is_some());
+        assert!(fetched.attribution.is_none());
+        assert_eq!(fetched.observed_roster_seq, None);
+        assert_eq!(
+            urls,
+            ["m-url", "sig-url"],
+            "an absent tier must fetch nothing extra, even when the roster is right there"
+        );
+
+        // (2) THE KEY IS A NON-HEAD MEMBER (a rotation in flight): still accepted.
+        let rotating = [m11_pub.as_str(), m3_pub.as_str()];
+        let (fetched, urls) = run_chain(&good, &rotating, &[], 0, ROSTER_NOW);
+        assert!(fetched.selected.is_some(), "any keyset member is authoritative");
+        assert_eq!(urls, ["m-url", "sig-url"]);
+
+        // (3) THE KEY IS IN NO KEYSET: refused, as a manifest rejection.
+        let stranger = [m11_pub.as_str()];
+        let (fetched, _) = run_chain(&good, &stranger, &[], 0, ROSTER_NOW);
+        assert!(fetched.selected.is_none() && fetched.manifest_rejected);
+
+        // (4) THE SIGNATURE WILL NOT DOWNLOAD: a transport failure, unchanged.
+        let selected =
+            select_authoritative_release(vec![release_with_roster("v0.10.0")], &head_only)
+                .unwrap()
+                .unwrap();
+        let mut download = |url: &str, _max: u64| match url {
+            "m-url" => Ok(good.manifest.clone()),
+            "sig-url" => Err("connection reset".to_string()),
+            other => panic!("an absent tier must fetch nothing extra, got {other}"),
+        };
+        let fetched = fetch_authoritative_release(
+            Some(selected),
+            &head_only,
+            &mut download,
+            &RosterPolicy::INERT,
+        );
+        assert!(fetched.appcast_fetch_error && !fetched.manifest_rejected);
+
+        // (5) NO KEYSET AT ALL and no master: unauthenticated channel, accepted, and the
+        //     signature is not even fetched.
+        let (fetched, urls) = run_chain(&good, &[], &[], 0, ROSTER_NOW);
+        assert!(fetched.selected.is_some());
+        assert_eq!(urls, ["m-url"]);
     }
 }

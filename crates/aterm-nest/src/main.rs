@@ -10,6 +10,12 @@
 //! time, by each level's owner, never borrowed transitively (the confused-deputy
 //! boundary the proxy enforces and the Trust `authorize_soundness` model proves).
 //!
+//! The stack's settings are HERMETIC BUT NOT BARE: every level runs against a
+//! per-run scratch `XDG_CONFIG_HOME` seeded with a COPY of the caller's
+//! `aterm.toml` (see [`seed_config_dir`]), so the nested terminals look like the
+//! caller's while anything they write lands in the copy and is discarded on
+//! teardown.
+//!
 //! Usage:
 //!   aterm-nest [--depth N] [--keep] [--gui PATH] -- <command> [args...]
 //!   aterm-nest --depth 3 -- claude -p "say hi"
@@ -208,7 +214,11 @@ fn socket_from_line(line: &str) -> Option<String> {
 
 /// Spawn level 0 directly, returning (child, socket-path). Reads the child's stderr
 /// until the "listening at" line (then stops, leaving the child running).
-fn spawn_root(gui: &Path) -> io::Result<(std::process::Child, String)> {
+///
+/// `cfg` is the per-run scratch `XDG_CONFIG_HOME` from [`seed_config_dir`]; passing
+/// it is what keeps the stack off the caller's real `aterm.toml` (see that
+/// function's doc for why a nested level could otherwise WRITE it).
+fn spawn_root(gui: &Path, cfg: &Path) -> io::Result<(std::process::Child, String)> {
     // Headless via the FLAG — the canonical arming ($ATERM_HEADLESS is an exact
     // equivalent). The launch announces the mode on stderr, on the line before
     // the "listening at" line this function scans for.
@@ -216,6 +226,7 @@ fn spawn_root(gui: &Path) -> io::Result<(std::process::Child, String)> {
         .arg("--headless")
         .env("ATERM_LINES", "40")
         .env("ATERM_COLUMNS", "120")
+        .env("XDG_CONFIG_HOME", cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -325,23 +336,15 @@ fn sh_quote(s: &str) -> String {
 /// syntax: depth >= 2 nesting functionally requires a POSIX-ish shell inside
 /// the nested terminal (on Windows too — e.g. Git Bash). A limitation of the
 /// nested-spawn feature, not of the control-socket transport.
-fn spawn_child(parent_sock: &str, gui: &Path, errfile: &str) -> io::Result<String> {
+///
+/// `cfg` (the scratch `XDG_CONFIG_HOME`) is re-stated on this line even though the
+/// level above already exports it and `aterm-pty` forwards its environment to the
+/// shell: the same belt-and-braces `ATERM_LINES`/`ATERM_COLUMNS` get, and here it
+/// is load-bearing — if inheritance ever stopped carrying the variable, the
+/// SILENT failure is a nested level writing the caller's real settings.
+fn spawn_child(parent_sock: &str, gui: &Path, errfile: &str, cfg: &Path) -> io::Result<String> {
     let _ = std::fs::remove_file(errfile);
-    let g = gui.to_string_lossy();
-    // Both interpolations are single-quoted: the parent shell would otherwise
-    // word-split a path containing a space (or expand globs/metachars), and a
-    // redirect target undergoes field-splitting too — either silently breaking
-    // depth>=2 nesting. (Manual concatenation; `fmt::Arguments` is
-    // unlowerable for the verifier.)
-    let mut launch = String::new();
-    launch.push_str("ATERM_LINES=40 ATERM_COLUMNS=120 ");
-    launch.push_str(&sh_quote(&g));
-    // Headless via the FLAG (see `spawn_root`): the inner instance must never
-    // depend on the outer's environment, which CONSUMED `ATERM_HEADLESS` at its
-    // own boot precisely so a nested aterm is not a surprise headless engine.
-    launch.push_str(" --headless 2>");
-    launch.push_str(&sh_quote(errfile));
-    type_line(parent_sock, &launch)?;
+    type_line(parent_sock, &launch_line(gui, errfile, cfg))?;
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
@@ -358,10 +361,36 @@ fn spawn_child(parent_sock: &str, gui: &Path, errfile: &str) -> io::Result<Strin
     ))
 }
 
-/// The base directory for the per-run private errdir: `$XDG_RUNTIME_DIR` (a
+/// The line [`spawn_child`] types into the level above. Split out (pure) for
+/// testing, because what it carries is a security property, not a formatting
+/// detail: drop the `XDG_CONFIG_HOME=` prefix and every level below this one goes
+/// back to reading — and writing — the caller's real `aterm.toml`.
+///
+/// Every interpolation is single-quoted: the parent shell would otherwise
+/// word-split a path containing a space (or expand globs/metachars), and a
+/// redirect target undergoes field-splitting too — either silently breaking
+/// depth>=2 nesting. (Manual concatenation; `fmt::Arguments` is unlowerable for
+/// the verifier.)
+fn launch_line(gui: &Path, errfile: &str, cfg: &Path) -> String {
+    let g = gui.to_string_lossy();
+    let c = cfg.to_string_lossy();
+    let mut launch = String::new();
+    launch.push_str("XDG_CONFIG_HOME=");
+    launch.push_str(&sh_quote(&c));
+    launch.push_str(" ATERM_LINES=40 ATERM_COLUMNS=120 ");
+    launch.push_str(&sh_quote(&g));
+    // Headless via the FLAG (see `spawn_root`): the inner instance must never
+    // depend on the outer's environment, which CONSUMED `ATERM_HEADLESS` at its
+    // own boot precisely so a nested aterm is not a surprise headless engine.
+    launch.push_str(" --headless 2>");
+    launch.push_str(&sh_quote(errfile));
+    launch
+}
+
+/// The base directory for the per-run private rundir: `$XDG_RUNTIME_DIR` (a
 /// per-user 0700 dir on Linux), then `$TMPDIR`, then `/tmp`. Most-private first.
 #[cfg(unix)]
-fn errdir_base() -> PathBuf {
+fn rundir_base() -> PathBuf {
     if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR")
         // SAFETY: the unsafe block here is std's own, inlined from
         // `OsStr::is_empty` (the byte-slice view of an `OsStr`, sound because
@@ -385,14 +414,14 @@ fn errdir_base() -> PathBuf {
 /// (owner + SYSTEM + Administrators) is the isolation boundary — there is no
 /// world-writable `/tmp` analog to defend against here.
 #[cfg(windows)]
-fn errdir_base() -> PathBuf {
+fn rundir_base() -> PathBuf {
     std::env::temp_dir()
 }
 
 /// Create a per-run private directory (mode 0700) inside `base`, mkdtemp-style:
 /// an unpredictable name created atomically with `O_EXCL`-equivalent semantics
-/// (`mkdir` fails if the name exists). The deeper levels' stderr files live
-/// inside it.
+/// (`mkdir` fails if the name exists). The deeper levels' stderr files and the
+/// scratch config dir ([`seed_config_dir`]) live inside it.
 ///
 /// The 0700 directory — not merely the random name — is the security boundary:
 /// the parent shell launches each level with `... 2>{errfile}`, a redirection
@@ -400,6 +429,8 @@ fn errdir_base() -> PathBuf {
 /// in shared `/tmp` is still pre-positionable by a different uid. Inside a 0700
 /// dir no other uid can create entries or read through to the errfile (which
 /// carries the live control-socket path), which defeats the symlink-follow.
+/// The scratch config inherits that same boundary: no other uid can plant an
+/// `aterm.toml` under it for the nested levels to load.
 /// Digit glyphs for the manual decimal/hex renderers below. Both index it
 /// through a `& 0xf` mask, so every lookup is provably in-bounds (16 entries).
 const DIGITS16: &[u8; 16] = b"0123456789abcdef";
@@ -409,7 +440,7 @@ const DIGITS16: &[u8; 16] = b"0123456789abcdef";
 /// literals (provably nonzero) and every digit is masked before the table
 /// lookup, so all obligations discharge structurally.
 ///
-/// Only the `#[cfg(unix)]` `make_errdir_in` renders names this way (the Windows
+/// Only the `#[cfg(unix)]` `make_rundir_in` renders names this way (the Windows
 /// twin uses `format!` directly), so on Windows this is exercised solely by the
 /// cross-platform `manual_renderers_match_format` test — hence `any(unix, test)`.
 #[cfg(any(unix, test))]
@@ -448,7 +479,7 @@ fn push_digit(s: &mut String, v: usize) {
 /// Append `x` as exactly 16 lowercase hex digits (the `format!("{x:016x}")`
 /// shape) without routing through `fmt::Arguments`.
 ///
-/// Unix-only in production (the Windows `make_errdir_in` uses `format!`); on
+/// Unix-only in production (the Windows `make_rundir_in` uses `format!`); on
 /// Windows only the `manual_renderers_match_format` test reaches it, so gate on
 /// `any(unix, test)` to keep it out of the dead Windows bin build.
 #[cfg(any(unix, test))]
@@ -462,9 +493,9 @@ fn push_hex16(s: &mut String, x: u64) {
 }
 
 #[cfg(unix)]
-fn make_errdir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
+fn make_rundir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let mut last = io::Error::other("could not create private errdir");
+    let mut last = io::Error::other("could not create private rundir");
     for _ in 0..8 {
         // Manual `aterm-nest-{pid}-{:016x}` rendering: byte-identical to the
         // former `format!`, but lowerable by the verifier (no fmt::Arguments).
@@ -495,11 +526,11 @@ fn make_errdir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
 
 /// Windows twin: same unpredictable name + atomic `create_dir` (fails if the
 /// name exists). No POSIX 0700 bits — the `%TEMP%` default per-user ACL is
-/// the boundary (see [`errdir_base`]); the random name still keeps two
+/// the boundary (see [`rundir_base`]); the random name still keeps two
 /// concurrent runs from colliding.
 #[cfg(windows)]
-fn make_errdir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
-    let mut last = io::Error::other("could not create private errdir");
+fn make_rundir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
+    let mut last = io::Error::other("could not create private rundir");
     for _ in 0..8 {
         let path = base.join(format!("aterm-nest-{pid}-{:016x}", rand_u64()));
         match std::fs::create_dir(&path) {
@@ -509,6 +540,77 @@ fn make_errdir_in(base: &Path, pid: u32) -> io::Result<PathBuf> {
         }
     }
     Err(last)
+}
+
+/// The caller's OWN `aterm.toml`, resolved with the SAME precedence the gui uses
+/// (`app_config::config_path`): `$XDG_CONFIG_HOME/aterm/aterm.toml`, else (Windows)
+/// `%APPDATA%\aterm\aterm.toml`, else `$HOME/.config/aterm/aterm.toml`. Read only —
+/// this is the file the stack must never touch, and the file it copies FROM.
+///
+/// Resolved from THIS process's environment, which the isolation never mutates
+/// (the scratch dir is handed to each child through `Command::env` / the typed
+/// launch line), so the source cannot drift to the copy.
+fn caller_config_file() -> Option<PathBuf> {
+    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
+    }
+    #[cfg(windows)]
+    if let Some(appdata) = std::env::var_os("APPDATA").filter(|a| !a.is_empty()) {
+        return Some(PathBuf::from(appdata).join("aterm").join("aterm.toml"));
+    }
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
+}
+
+/// Seed the per-run scratch config dir inside `rundir` and return it (the value
+/// every level gets as `XDG_CONFIG_HOME`): `<rundir>/cfg`, holding a COPY of the
+/// caller's `aterm.toml` at `<rundir>/cfg/aterm/aterm.toml`.
+///
+/// WHY AT ALL. Config resolution has no probe marker and no `ATERM_CONFIG`
+/// override, so a headless level launched with the caller's environment resolves
+/// the DEVELOPER'S OWN `~/.config/aterm/aterm.toml` — and can WRITE it, because
+/// the token beside each socket carries owner scope and owner satisfies
+/// `ConfigWrite` unconditionally. That is not hypothetical: on 2026-08-10 a probe
+/// left `game_font = "minecraft"` in the owner's live settings and changed the
+/// font of their real terminal. `tools/visual-judge/*` was fixed the same day
+/// (edfdf7d4); this spawner was the one left.
+///
+/// WHY A COPY rather than the bare scratch dir those harnesses use: `aterm-nest`
+/// exists to SHOW the nesting feature, and a stack rendering in stock defaults
+/// while the outer terminal wears the user's theme, font and trail is a worse
+/// demo — the levels stop looking nested. Copying keeps the picture and still
+/// contains every write, because the copy is what the levels open. The nested
+/// stack is not a settings editor, so nothing of value is lost when the copy goes.
+///
+/// Best-effort by design: an unreadable or absent source leaves the scratch dir
+/// EMPTY (the levels then run on built-in defaults, exactly like the visual-judge
+/// probes). Isolation must not depend on the copy succeeding — only on the dir
+/// existing, which is why that half is the one that returns `Err`.
+///
+/// NOT copied, deliberately: `themes/` (a theme pack can be a whole checkout — a
+/// level naming a USER theme falls back to the built-in scheme) and the
+/// `kitty-log`/`kitty-collectibles` ledgers (a demo stack starts with an empty
+/// collection rather than a clone of the caller's).
+fn seed_config_dir(rundir: &Path) -> io::Result<PathBuf> {
+    seed_config_dir_from(rundir, caller_config_file().as_deref())
+}
+
+/// The seam of [`seed_config_dir`] with the source handed in, so the copy wiring
+/// is unit-tested without mutating the process-global environment (the same shape
+/// `aterm_pty::build_child_env` uses for its deny-list).
+fn seed_config_dir_from(rundir: &Path, src: Option<&Path>) -> io::Result<PathBuf> {
+    let cfg = rundir.join("cfg");
+    // `<cfg>/aterm/` is where `config_path()` looks; create it up front so a
+    // level that WRITES settings lands in the copy instead of failing over to
+    // some other path.
+    let aterm_dir = cfg.join("aterm");
+    std::fs::create_dir_all(&aterm_dir)?;
+    if let Some(src) = src {
+        // Copy failures are non-fatal (see the doc above): a missing source is
+        // the common case on a fresh machine, and an unreadable one still
+        // leaves an isolated — merely bare — scratch dir behind.
+        let _ = std::fs::copy(src, aterm_dir.join("aterm.toml"));
+    }
+    Ok(cfg)
 }
 
 /// 8 bytes of OS randomness for an unpredictable per-run directory name, via
@@ -577,46 +679,51 @@ fn main() {
 
 fn run(args: &Args) -> io::Result<i32> {
     let pid = std::process::id();
-    let (mut root, root_sock) = spawn_root(&args.gui)?;
+    // ONE per-run private directory (mode 0700) holds everything this run
+    // creates, and is removed on teardown.
+    //
+    // 1. The deeper levels' stderr files. They are launched by the parent shell
+    //    with `... 2>{errfile}`, a redirection that opens+truncates without
+    //    `O_EXCL` and follows symlinks, so a predictable name in world-writable
+    //    `/tmp` let a different uid pre-position a symlink and divert the nested
+    //    gui's stderr (which carries the live control-socket path) into an
+    //    arbitrary victim-writable file. No other uid can create entries in — or
+    //    read through — a 0700 dir, which is what defeats the symlink-follow.
+    // 2. The scratch `XDG_CONFIG_HOME` every level runs against
+    //    ([`seed_config_dir`]), seeded with a copy of the caller's aterm.toml.
+    //
+    // It is created BEFORE the root spawn (2 needs it, and depth==1 needs 2), and
+    // failing to create it FAILS THE RUN rather than degrading: without a private
+    // dir there is no scratch config, and a level without a scratch config edits
+    // the caller's real settings — the exact bug this closes.
+    let rundir = make_rundir_in(&rundir_base(), pid)?;
+    let cfg = match seed_config_dir(&rundir) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&rundir);
+            return Err(e);
+        }
+    };
+    let (mut root, root_sock) = match spawn_root(&args.gui, &cfg) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&rundir);
+            return Err(e);
+        }
+    };
     let mut msg = String::new();
     msg.push_str("aterm-nest: L0 socket ");
     msg.push_str(&root_sock);
     eprint_line(&msg);
     let mut socks = vec![root_sock];
-    // Deeper levels are launched by the parent shell with `... 2>{errfile}`, a
-    // redirection that opens+truncates the path without `O_EXCL` and follows
-    // symlinks. A predictable name in world-writable `/tmp` let a different uid
-    // pre-position a symlink and divert the nested gui's stderr (which carries
-    // the live control-socket path) into an arbitrary victim-writable file. We
-    // place every level's errfile inside ONE per-run private directory (mode
-    // 0700) instead: no other uid can create entries in — or read through — a
-    // 0700 dir, which is what defeats the symlink-follow. depth==1 spawns
-    // nothing deeper, so it needs no directory.
-    let errdir = if args.depth > 1 {
-        match make_errdir_in(&errdir_base(), pid) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                let _ = root.kill();
-                return Err(e);
-            }
-        }
-    } else {
-        None
-    };
     for k in 1..args.depth {
-        // errdir is always Some here (created above whenever depth > 1, and
-        // this loop body only runs then); the guard replaces an `expect` so
-        // the impossible path is a clean error instead of a panic obligation.
-        let Some(dir) = errdir.as_ref() else {
-            return Err(io::Error::other("internal: errdir missing for depth > 1"));
-        };
         // `aterm-nest-L{k}.err`, rendered without `fmt::Arguments`; k <= 7
         // (depth is capped at 8), so a single masked digit is exact.
         let mut fname = String::new();
         fname.push_str("aterm-nest-L");
         fname.push(DIGITS16[k & 0xf] as char);
         fname.push_str(".err");
-        let errfile = dir.join(fname);
+        let errfile = rundir.join(fname);
         let errfile = errfile.to_string_lossy();
         // socks holds exactly k entries here (L0..L{k-1}), so k-1 is always
         // in bounds; the guard replaces the panicking index with a clean
@@ -624,13 +731,11 @@ fn run(args: &Args) -> io::Result<i32> {
         let Some(parent_sock) = socks.get(k.saturating_sub(1)) else {
             return Err(io::Error::other("internal: parent socket missing"));
         };
-        let sock = match spawn_child(parent_sock, &args.gui, &errfile) {
+        let sock = match spawn_child(parent_sock, &args.gui, &errfile, &cfg) {
             Ok(s) => s,
             Err(e) => {
                 let _ = root.kill();
-                if let Some(d) = errdir.as_ref() {
-                    let _ = std::fs::remove_dir_all(d);
-                }
+                let _ = std::fs::remove_dir_all(&rundir);
                 return Err(e);
             }
         };
@@ -697,12 +802,19 @@ fn run(args: &Args) -> io::Result<i32> {
             msg.push_str(s);
             eprint_line(&msg);
         }
+        // The rundir OUTLIVES us under `--keep` and is named so: the levels still
+        // running hold it open as their `XDG_CONFIG_HOME` (they re-read it on
+        // every config change and write settings edits into it), so removing it
+        // here would silently drop them back onto built-in defaults. Whoever
+        // kills the kept stack removes this directory.
+        let mut msg = String::new();
+        msg.push_str("  scratch config (delete with the stack): ");
+        msg.push_str(&cfg.to_string_lossy());
+        eprint_line(&msg);
     } else {
         let _ = root.kill();
         let _ = root.wait();
-        if let Some(d) = errdir.as_ref() {
-            let _ = std::fs::remove_dir_all(d);
-        }
+        let _ = std::fs::remove_dir_all(&rundir);
     }
     Ok(0)
 }
@@ -872,20 +984,102 @@ mod tests {
         );
     }
 
+    /// The whole point of the isolation: the levels open a COPY, so a settings
+    /// write inside the stack cannot reach the caller's real `aterm.toml`. (A
+    /// probe run DID reach it on 2026-08-10 and changed the owner's font.)
+    #[test]
+    fn scratch_config_is_a_copy_the_stack_can_write_without_touching_the_original() {
+        let rundir = make_rundir_in(&std::env::temp_dir(), std::process::id())
+            .expect("create private rundir");
+        let real = rundir.join("real-aterm.toml");
+        std::fs::write(&real, "cursor_trail_style = \"rainbow kitty pet\"\n")
+            .expect("write source");
+
+        let cfg = seed_config_dir_from(&rundir, Some(&real)).expect("seed scratch config");
+
+        // 1. It is the path `config_path()` resolves from `XDG_CONFIG_HOME=cfg`,
+        //    and it carries the caller's settings verbatim — the nested stack
+        //    renders like the caller's terminal, not like stock defaults.
+        let copy = cfg.join("aterm").join("aterm.toml");
+        assert!(
+            copy.is_file(),
+            "expected a seeded copy at {}",
+            copy.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&copy).unwrap(),
+            std::fs::read_to_string(&real).unwrap(),
+            "the scratch config must be a faithful copy"
+        );
+        // 2. It is a COPY, not a link/alias: the exact write that escaped last
+        //    time lands here and leaves the original byte-identical.
+        std::fs::write(&copy, "game_font = \"minecraft\"\n").expect("write copy");
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "cursor_trail_style = \"rainbow kitty pet\"\n",
+            "a write inside the stack must not reach the caller's aterm.toml"
+        );
+        let _ = std::fs::remove_dir_all(&rundir);
+    }
+
+    /// Isolation must not depend on the copy succeeding: with no source (fresh
+    /// machine, or an unreadable file) the scratch dir still exists, so the
+    /// levels resolve into it and run on built-in defaults.
+    #[test]
+    fn scratch_config_exists_even_when_there_is_nothing_to_copy() {
+        let rundir = make_rundir_in(&std::env::temp_dir(), std::process::id())
+            .expect("create private rundir");
+        let missing = rundir.join("nope").join("aterm.toml");
+        let cfg = seed_config_dir_from(&rundir, Some(&missing)).expect("seed scratch config");
+        assert!(cfg.join("aterm").is_dir(), "scratch config dir must exist");
+        assert!(
+            !cfg.join("aterm").join("aterm.toml").exists(),
+            "no source means no copy, not a failure"
+        );
+        assert_eq!(
+            seed_config_dir_from(&rundir, None).ok(),
+            Some(cfg.clone()),
+            "an unresolvable source is not an error either"
+        );
+        let _ = std::fs::remove_dir_all(&rundir);
+    }
+
+    /// Deeper levels are launched by TYPING at the level above, so the isolation
+    /// has to survive as shell text. It is re-stated on the line (not merely
+    /// inherited) because the failure mode of losing it is silent.
+    #[test]
+    fn launch_line_carries_the_scratch_config_quoted() {
+        let line = launch_line(
+            Path::new("/opt/my gui/aterm-gui"),
+            "/run/x/aterm-nest-L1.err",
+            Path::new("/run/x/cfg dir"),
+        );
+        assert_eq!(
+            line,
+            "XDG_CONFIG_HOME='/run/x/cfg dir' ATERM_LINES=40 ATERM_COLUMNS=120 \
+             '/opt/my gui/aterm-gui' --headless 2>'/run/x/aterm-nest-L1.err'"
+        );
+        // The env assignment must PRECEDE the binary, or `sh` reads it as an
+        // argument and the level below inherits the caller's config after all.
+        let assign = line.find("XDG_CONFIG_HOME=").expect("assignment present");
+        let bin = line.find("aterm-gui").expect("binary present");
+        assert!(assign < bin, "the assignment must prefix the command");
+    }
+
     #[test]
     #[cfg(unix)]
-    fn errdir_is_private_0700_and_unpredictable() {
+    fn rundir_is_private_0700_and_unpredictable() {
         // The errfiles must live in a per-run 0700 directory, NOT under a
         // predictable world-writable /tmp name a different uid can pre-symlink.
         use std::os::unix::fs::PermissionsExt;
         let base = std::env::temp_dir();
         let pid = std::process::id();
-        let dir = make_errdir_in(&base, pid).expect("create private errdir");
-        assert!(dir.is_dir(), "errdir should be a directory");
+        let dir = make_rundir_in(&base, pid).expect("create private rundir");
+        assert!(dir.is_dir(), "rundir should be a directory");
         // mkdir applies 0700 atomically — no window where it is world-writable
         // and no other uid can read the control-socket path through it.
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "errdir must be mode 0700, got {mode:o}");
+        assert_eq!(mode, 0o700, "rundir must be mode 0700, got {mode:o}");
         // The name is unpredictable, not the old fixed aterm-nest-<pid>-L{k}.err.
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
@@ -894,29 +1088,29 @@ mod tests {
         );
         assert_ne!(name, format!("aterm-nest-{pid}-L1.err"));
         // Distinct per run (random component), so two stacks never collide.
-        let dir2 = make_errdir_in(&base, pid).expect("create second errdir");
-        assert_ne!(dir, dir2, "errdirs must be unique per run");
+        let dir2 = make_rundir_in(&base, pid).expect("create second rundir");
+        assert_ne!(dir, dir2, "rundirs must be unique per run");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// Windows twin (no POSIX mode bits — the `%TEMP%` per-user ACL is the
-    /// boundary): the errdir is created, unpredictably named, and unique.
+    /// boundary): the rundir is created, unpredictably named, and unique.
     #[test]
     #[cfg(windows)]
-    fn errdir_is_created_unpredictable_and_unique() {
+    fn rundir_is_created_unpredictable_and_unique() {
         let base = std::env::temp_dir();
         let pid = std::process::id();
-        let dir = make_errdir_in(&base, pid).expect("create private errdir");
-        assert!(dir.is_dir(), "errdir should be a directory");
+        let dir = make_rundir_in(&base, pid).expect("create private rundir");
+        assert!(dir.is_dir(), "rundir should be a directory");
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             name.starts_with(&format!("aterm-nest-{pid}-")),
             "got {name}"
         );
         assert_ne!(name, format!("aterm-nest-{pid}-L1.err"));
-        let dir2 = make_errdir_in(&base, pid).expect("create second errdir");
-        assert_ne!(dir, dir2, "errdirs must be unique per run");
+        let dir2 = make_rundir_in(&base, pid).expect("create second rundir");
+        assert_ne!(dir, dir2, "rundirs must be unique per run");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
     }

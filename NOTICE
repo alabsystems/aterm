@@ -35,6 +35,21 @@ Bundled fonts and font fixtures retain their own terms:
 - JetBrains Mono test fixture: SIL Open Font License 1.1 in
   `crates/aterm-render/tests/fixtures/OFL.txt`.
 
+The bundled DISPLAY FACES (`display_font` / the `display:` family scheme) live
+in `crates/aterm-render/assets/game/`, each beside its own notice. A face may
+only ship here under an OFL, Apache-2.0, or MIT grant — `crates/aterm-render/
+build.rs` fails the build otherwise, because compiling a face into the binary
+is redistribution whether or not any menu names it:
+
+- Monocraft (`pixel`), Idrees Hassan: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/game/Monocraft.LICENSE.txt`.
+- Luckiest Guy (`chunky`), Brian J. Bonislawsky / Astigmatic: Apache-2.0 in
+  `crates/aterm-render/assets/game/LuckiestGuy-Regular.LICENSE.txt`.
+- Cinzel (`engraved`), Natanael Gama / NDISCOVER: SIL Open Font License 1.1 in
+  `crates/aterm-render/assets/game/Cinzel-var.LICENSE.txt`.
+- Chewy (`bubble`), Font Diner / Sideshow: Apache-2.0 in
+  `crates/aterm-render/assets/game/Chewy-Regular.LICENSE.txt`.
+
 Generated Unicode segmentation, width, emoji-presentation, and compatibility
 tables derive from Unicode data. Unicode copyright and permission terms are in
 UNICODE-LICENSE.txt.

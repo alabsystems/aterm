@@ -32,6 +32,13 @@ fn animal_surfaces_scan_with_their_species() {
         ("fox", "fox"), // 3 folded chars: the short-word guards are feline/emphasis-only
         ("owl", "owl"),
         ("bee", "bee"),
+        // The two words the owner typed that were silent (2026-08-10).
+        ("turkey", "turkey"),
+        ("turkeys", "turkey"),
+        ("Turkey", "turkey"), // the country folds into the bird — deliberate, see the entry's notes
+        ("bird", "bird"),
+        ("birds", "bird"),
+        ("birdie", "bird"),
     ] {
         let m = scan_one(lex, word);
         assert_eq!(m.class, Class::Animal, "{word:?}");
@@ -39,7 +46,9 @@ fn animal_surfaces_scan_with_their_species() {
             m.ambiguous,
             "{word:?} must be ambiguous (live-caret deferral is the mid-typing guard)"
         );
-        let id = m.species.unwrap_or_else(|| panic!("{word:?} has no species"));
+        let id = m
+            .species
+            .unwrap_or_else(|| panic!("{word:?} has no species"));
         assert_eq!(lex.species_code(id), species, "{word:?}");
     }
 }

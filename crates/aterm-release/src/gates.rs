@@ -83,7 +83,6 @@ fn trust_stage2_candidates() -> Vec<PathBuf> {
     out
 }
 
-
 /// The `targo` build driver from the stage2 tool dir. All native-lane builds and
 /// metadata queries go through THIS binary — never a PATH `cargo`, which since
 /// the stock-name purge resolves to a rustup shim with nothing behind it.

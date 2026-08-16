@@ -134,6 +134,31 @@ pub struct Manifest {
     /// every successor, even when `cut --min-build N` is omitted. (F5)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_build: Option<u64>,
+    /// ATTRIBUTION: the id of the MACHINE that signed this release, e.g. `"m3"`.
+    ///
+    /// The owner's requirement is "I can track which computer does what", and this is
+    /// where a verifier reads the answer. It is deliberately INSIDE the signed bytes: a
+    /// genuine signature by one machine therefore cannot be relabelled as another, because
+    /// changing this string changes the bytes the signature covers. The converse — a
+    /// stolen key claiming somebody else's id — is refused by the roster, which maps id to
+    /// public key (`roster::Attribution::bind`).
+    ///
+    /// Absent ⇒ None, which is what every release cut before the roster existed carries.
+    /// A client with an ARMED paper master refuses an unattributed release; a client with
+    /// an unpinned one ignores this field entirely, which is what makes adding it
+    /// backward-compatible.
+    ///
+    /// It is NOT recorded in `RELEASES.ledger`: that file's parser hard-fails on any
+    /// non-comment line that is not exactly two whitespace-separated fields, and it is the
+    /// append-only ordering root of the entire update fleet. Attribution lands here, in
+    /// the cut journal, and in the roster — never there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// The `roster_seq` of the machine roster that authorized [`Self::machine_id`] at cut
+    /// time — the cross-check that stops an old roster being paired with a new release (or
+    /// a new roster with an old one) after a machine has been revoked. Absent ⇒ None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_seq: Option<u64>,
     /// Human-readable "what changed" notes — the hand-written CHANGELOG.md
     /// section body, verbatim. Surfaced by the in-app updater's status query +
     /// the Software Update window so the user sees what a staged update brings.
@@ -258,6 +283,8 @@ mod tests {
             team_id: Some(String::new()),
             pub_date: Some("2026-07-06T21:29:44Z".into()),
             min_build: None,
+            machine_id: None,
+            roster_seq: None,
             changelog: Some(
                 "### Added\n- a `thing` with \"quotes\", # hashes and a \\ backslash\n".into(),
             ),
@@ -349,6 +376,8 @@ mod tests {
             team_id: None,
             pub_date: None,
             min_build: None,
+            machine_id: None,
+            roster_seq: None,
             changelog: None,
         };
         let text = m.to_toml().unwrap();

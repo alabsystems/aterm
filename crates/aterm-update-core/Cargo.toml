@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 description = "aterm — artifact-agnostic, portable POSIX update primitives (source resolution, advisory file lock, curl/token plumbing, private-dir hardening, sha256) shared by aterm-update and atpkg."
 
+[lib]
+# The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a
+# linked custom toolchain cannot `rustup component add` one — so `cargo test`'s
+# doc-test phase aborts the whole run on this tree even with every real test green.
+# Same constraint (and comment) as crates/atpkg: bare `cargo test` must be able to pass.
+doctest = false
+
 [dependencies]
 # Reuse the single source-of-truth private-dir ownership predicate (no drift with
 # the control socket's Application Support hardening).
@@ -21,12 +28,32 @@ aterm-log = { workspace = true }
 # so field agreement is compiler-enforced rather than hand-synced.
 serde = { workspace = true }
 toml = { workspace = true }
+# Ed25519 verification of the master-signed MACHINE ROSTER (src/roster.rs). The chain
+# lives here rather than in aterm-update because BOTH sides need it: the client verifies
+# it, and the owner-side minting tool emits and signs it through the very same type. Two
+# spellings of one verifier is the drift this crate exists to prevent.
+#
+# `default-features = false` is deliberate and matches atpkg's edge: VERIFICATION needs
+# neither RNG nor alloc, so the client's crypto surface stays minimal. ring is already a
+# direct dependency of atpkg, aterm-update and aterm-release, so this adds an edge, not a
+# crate — and the `deny.toml` version floor already covers it.
+ring = { version = "0.17.14", default-features = false }
+# Decode the base64 master + machine Ed25519 public keys (32 raw bytes each).
+base64 = "0.22.1"
 
 # flock(2) for the apply/stage critical sections + getuid(2) for the private-dir
 # ownership check. The two narrow syscalls with no safe std wrapper (POSIX-only;
 # Windows uses std-only approximations).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
+# The roster tests must SIGN deterministic fixtures with obviously-synthetic seeds
+# (`Ed25519KeyPair::from_seed_unchecked` + `.sign`), which needs ring's `alloc` feature.
+# Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only, so
+# the normal build still proves the no-alloc verify path compiles on its own. Mirrors
+# atpkg's arrangement exactly.
+ring = { version = "0.17.14" }
 
 [lints]
 workspace = true

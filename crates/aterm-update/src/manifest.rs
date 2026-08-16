@@ -66,6 +66,17 @@ pub struct Manifest {
     /// notes). Surfaced by the in-app updater's status query + the "Check for
     /// Updates" menu so the user sees what a staged update brings. Absent ⇒ None.
     pub changelog: Option<String>,
+    /// ATTRIBUTION: which MACHINE signed this release (`"m3"`). Carried through from the
+    /// wire type because the roster chain binds it: the id sits inside the signed appcast
+    /// bytes, so a genuine signature by one machine cannot be relabelled as another, and
+    /// the roster maps id to public key so a stolen key cannot claim someone else's id.
+    /// Absent ⇒ None, which is every release cut before the roster existed and every
+    /// release seen by a build with no paper master pinned.
+    pub machine_id: Option<String>,
+    /// The `roster_seq` that authorized [`Self::machine_id`] — the cross-check that stops
+    /// an old roster being paired with a new release after a machine is revoked.
+    /// Absent ⇒ None.
+    pub roster_seq: Option<u64>,
 }
 
 impl Manifest {
@@ -86,6 +97,8 @@ impl Manifest {
             zip_sha256: m.zip_sha256,
             min_build: m.min_build,
             changelog: m.changelog,
+            machine_id: m.machine_id,
+            roster_seq: m.roster_seq,
         })
     }
 }
@@ -307,10 +320,11 @@ impl InstalledReceipt {
 ///   refuses to stage a "latest available" that is below this (an attacker who
 ///   re-points the newest release at an older genuine build can't roll a client back).
 ///
-/// NOTE: this is an *unsigned* floor, so it cannot protect a brand-new client that has
-/// never seen a higher build (it has no high-water yet); fully closing that requires a
-/// signed channel file the client pins (see `docs/RELEASING.md`). It DOES stop replay
-/// against any client that has already advanced, and gives the operator a working yank.
+/// NOTE: the first two fields are *unsigned* floors, so they cannot protect a brand-new
+/// client that has never seen a higher build (it has no high-water yet). `roster_seq` is
+/// the signed-channel answer to exactly that gap — see its own doc — though the residual
+/// it leaves is different rather than absent. All three DO stop replay against any client
+/// that has already advanced, and the first gives the operator a working yank.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Floor {
     /// Operator apply floor (max `min_build` ever seen). Absent ⇒ 0.
@@ -319,6 +333,24 @@ pub struct Floor {
     /// Highest build ever successfully staged by this client. Absent ⇒ 0.
     #[serde(default)]
     pub high_water: u64,
+    /// Highest `roster_seq` from any machine roster this client has ever accepted — THE
+    /// replay defence for the master-signed roster tier.
+    ///
+    /// The threat it answers is specific: the master revokes a stolen machine, but the
+    /// attacker still holds that machine's key AND a copy of the roster generation that
+    /// listed it. That old roster's master signature is valid FOREVER — signatures do not
+    /// expire, documents do — so nothing about the crypto stops it being served again.
+    /// This field does: a client that has durably seen sequence `n` refuses `n-1`
+    /// permanently.
+    ///
+    /// Its limit is the honest one and belongs here rather than in a design doc: it is
+    /// worth exactly nothing to a FRESH INSTALL, which has no recorded sequence and so
+    /// accepts whatever it is first shown. That client is protected only by the roster's
+    /// own `valid_until`, which is why that window is a deliberate number.
+    ///
+    /// Absent ⇒ 0, the permissive first-contact value, matching the other two.
+    #[serde(default)]
+    pub roster_seq: u64,
 }
 
 impl Floor {
@@ -336,7 +368,12 @@ impl Floor {
     /// read/max/write transaction, preventing two processes from overwriting each
     /// other's independent maxima. A no-op write is skipped. Best-effort — a
     /// failure to persist the floor never blocks an update decision.
-    pub fn bump_and_write(path: &Path, seen_min_build: u64, staged_build: u64) {
+    pub fn bump_and_write(
+        path: &Path,
+        seen_min_build: u64,
+        staged_build: u64,
+        seen_roster_seq: u64,
+    ) {
         let Ok(_lock) = aterm_update_core::FileLock::acquire(&path.with_extension("toml.lock"))
         else {
             return;
@@ -345,8 +382,9 @@ impl Floor {
         let next = Self {
             min_build: cur.min_build.max(seen_min_build),
             high_water: cur.high_water.max(staged_build),
+            roster_seq: cur.roster_seq.max(seen_roster_seq),
         };
-        if next.min_build == cur.min_build && next.high_water == cur.high_water {
+        if next == cur {
             return;
         }
         let Ok(text) = toml::to_string(&next) else {
@@ -407,6 +445,22 @@ pub struct FailedMark {
     /// safe direction: the worst case is one extra download.
     #[serde(default)]
     pub retry_after: u64,
+    /// QUARANTINE: this artifact was swapped in and then failed to confirm boot
+    /// health `MAX_BOOT_ATTEMPTS` times, and the updater reverted it. Unlike
+    /// `retry_after` this never lapses — the build proved itself bad ON THIS
+    /// MACHINE, and the only honest escapes are a newer build or a re-publish
+    /// under a different digest, both of which change the memo's key.
+    ///
+    /// It is a FIELD rather than a `retry_after` sentinel because the two states
+    /// are genuinely different and were previously conflated: the crash-loop path
+    /// wrote `retry_after = 0` meaning "forever", while [`Self::suppresses`] reads
+    /// `retry_after = 0` as "the deadline has passed, retry now" — which is also
+    /// exactly what a pre-budget legacy marker means. The poison was therefore
+    /// written and then ignored, and the crash-looping build was re-downloaded and
+    /// re-applied on the very next check. Absent ⇒ `false`, so a legacy marker
+    /// keeps its (safe) retryable reading.
+    #[serde(default)]
+    pub quarantined: bool,
 }
 
 /// The widening retry schedule for a candidate that failed to stage, in seconds:
@@ -433,18 +487,28 @@ impl FailedMark {
     }
 
     /// Whether this memo should SKIP the given candidate right now: it names the
-    /// same artifact AND its backoff deadline has not yet passed. Once the
-    /// deadline passes the candidate is retried (and, if it fails again, recorded
-    /// with the next-wider backoff).
+    /// same artifact AND either it is QUARANTINED (crash-looped — never retried) or
+    /// its backoff deadline has not yet passed. Once the deadline passes a
+    /// non-quarantined candidate is retried (and, if it fails again, recorded with
+    /// the next-wider backoff).
     ///
-    /// `now` is unix seconds. A marker with no `retry_after` (written before the
-    /// retry budget existed) never suppresses.
+    /// `now` is unix seconds. A marker with no `retry_after` and no quarantine flag
+    /// (written before the retry budget existed) never suppresses.
     #[must_use]
     pub fn suppresses(&self, build_number: u64, sha256: &str, now: u64) -> bool {
-        self.matches(build_number, sha256) && now < self.retry_after
+        self.matches(build_number, sha256) && (self.quarantined || now < self.retry_after)
     }
 
-    /// Seconds until this memo stops suppressing, or 0 if it already has.
+    /// Whether this memo is the never-lapsing crash-loop quarantine rather than a
+    /// timed backoff. Callers report the two differently: one ends by itself, the
+    /// other ends only when the channel offers a different artifact.
+    #[must_use]
+    pub fn is_quarantine(&self) -> bool {
+        self.quarantined
+    }
+
+    /// Seconds until this memo stops suppressing, or 0 if it already has. Meaningless
+    /// for a quarantine — check [`Self::is_quarantine`] first.
     #[must_use]
     pub fn retry_in_secs(&self, now: u64) -> u64 {
         self.retry_after.saturating_sub(now)
@@ -473,13 +537,51 @@ impl FailedMark {
         RETRY_BACKOFF_SECS[idx]
     }
 
-    /// Record `(build_number, sha256)` as the last failed candidate (best-effort).
+    /// Record `(build_number, sha256)` as the IN-FLIGHT trial artifact, discarding the
+    /// persistence error. TEST-ONLY: production arms the trial through
+    /// [`Self::record_required`], because a trial marker that failed to persist must abort
+    /// the apply rather than swap in a build whose crash-loop recovery cannot name it.
     ///
-    /// PERMANENT form — no backoff deadline is written, so [`Self::suppresses`]
-    /// never fires for it. This is the crash-loop TRIAL marker's semantics; the
-    /// download/stage memo wants [`Self::record_stage_failure`].
+    /// Identity only, no verdict: the trial marker exists so a machine that comes back
+    /// up after a swap can tell WHICH artifact it is trialing, and its readers use
+    /// [`Self::matches`], never the deadline. The download/stage memo wants
+    /// [`Self::record_stage_failure`]; the crash-loop verdict wants
+    /// [`Self::record_quarantine`] — which is what the one production caller this
+    /// convenience used to have was changed to, leaving it to the fixtures.
+    #[cfg(test)]
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
         let _ = Self::record_required(path, build_number, sha256);
+    }
+
+    /// QUARANTINE `(build_number, sha256)`: it was swapped in, failed to confirm boot
+    /// health `MAX_BOOT_ATTEMPTS` times, and was reverted. [`Self::suppresses`] then
+    /// skips it forever — until the channel offers a different build or a re-publish
+    /// under a different digest, either of which changes the key and so no longer
+    /// matches.
+    ///
+    /// This exists because [`Self::record`] could not express it. That path wrote
+    /// `retry_after = 0` intending "never retry", but `suppresses` reads a zero
+    /// deadline as "already elapsed" — so the memo was written and then ignored, and
+    /// the very next check re-downloaded and re-applied the build that had just
+    /// crash-looped, straight back into the crash/revert loop the poison existed to
+    /// break.
+    pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str) {
+        let m = FailedMark {
+            build_number,
+            sha256: sha256.to_ascii_lowercase(),
+            attempts: 0,
+            retry_after: 0,
+            quarantined: true,
+        };
+        let Ok(text) = toml::to_string(&m) else {
+            return;
+        };
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Record a download/stage failure of `(build_number, sha256)`, widening the
@@ -497,6 +599,9 @@ impl FailedMark {
             sha256: sha256.to_ascii_lowercase(),
             attempts,
             retry_after: now.saturating_add(Self::backoff_secs(attempts)),
+            // A timed backoff, never a quarantine: this failure is about fetching or
+            // staging the artifact, not about the artifact having proved itself bad.
+            quarantined: false,
         };
         let Ok(text) = toml::to_string(&m) else {
             return;
@@ -520,9 +625,10 @@ impl FailedMark {
         let m = FailedMark {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
-            // No deadline: this form is the deterministic crash-loop poison.
+            // Identity only — no deadline and no verdict; see `record`.
             attempts: 0,
             retry_after: 0,
+            quarantined: false,
         };
         let text =
             toml::to_string(&m).map_err(|error| format!("serialize artifact marker: {error}"))?;
@@ -649,6 +755,58 @@ mod tests {
         // it is genuinely a repeat, so it should not get the shortest backoff.
         assert_eq!(m.next_attempt(9, "ff"), 2);
         assert_eq!(m.next_attempt(10, "ff"), 1);
+        // A legacy marker is never mistaken for a quarantine: the flag is absent, and
+        // absent must mean "no", or every pre-budget machine strands itself on upgrade.
+        assert!(!m.is_quarantine());
+    }
+
+    /// THE CRASH-LOOP QUARANTINE, and why it needed a field of its own.
+    ///
+    /// The revert path wrote its poison as `retry_after = 0` MEANING "forever", while
+    /// [`FailedMark::suppresses`] reads a zero deadline as "already elapsed" — which is
+    /// also exactly what the pre-budget legacy marker above means. The two states were
+    /// indistinguishable, so the poison was written and then ignored, and the build that
+    /// had just crash-looped was re-downloaded and re-applied on the next check.
+    #[test]
+    fn a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not() {
+        let root = std::env::temp_dir().join(format!("aterm-quarantine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("failed.toml");
+        let sha = "ab".repeat(32);
+
+        // The OLD poison shape (identity only) — inert, at any time. This is the bug.
+        FailedMark::record(&path, 42, &sha);
+        let old = FailedMark::read(&path).expect("parses");
+        assert!(old.matches(42, &sha), "it names the right artifact…");
+        assert!(!old.is_quarantine());
+        assert!(!old.suppresses(42, &sha, 0), "…and suppresses nothing");
+
+        // The quarantine: same key, but it holds.
+        FailedMark::record_quarantine(&path, 42, &sha);
+        let q = FailedMark::read(&path).expect("parses");
+        assert!(q.is_quarantine());
+        assert!(q.suppresses(42, &sha, 0));
+        assert!(
+            q.suppresses(42, &sha, u64::MAX),
+            "no clock lapses a quarantine"
+        );
+        // Case-insensitive on the digest, like every other comparison here.
+        assert!(q.suppresses(42, &sha.to_ascii_uppercase(), 0));
+
+        // THE ESCAPES — a newer build, or a re-publish under a different digest.
+        assert!(!q.suppresses(43, &sha, 0));
+        assert!(!q.suppresses(42, &"cd".repeat(32), 0));
+
+        // A timed stage failure recorded afterwards REPLACES the quarantine with a
+        // lapsing window: the artifact identity is the key, and the last write wins.
+        FailedMark::record_stage_failure(&path, 42, &sha, 100);
+        let timed = FailedMark::read(&path).expect("parses");
+        assert!(!timed.is_quarantine());
+        assert!(timed.suppresses(42, &sha, 100));
+        assert!(!timed.suppresses(42, &sha, 100 + RETRY_BACKOFF_SECS[3]));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -698,16 +856,20 @@ mod tests {
         let path = root.join("floor.toml");
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
 
-        let writer = |seen_min_build, staged_build| {
+        let writer = |seen_min_build, staged_build, seen_roster_seq| {
             let path = path.clone();
             let start = std::sync::Arc::clone(&start);
             std::thread::spawn(move || {
                 start.wait();
-                Floor::bump_and_write(&path, seen_min_build, staged_build);
+                Floor::bump_and_write(&path, seen_min_build, staged_build, seen_roster_seq);
             })
         };
-        let min_writer = writer(1_000, 1);
-        let high_writer = writer(1, 2_000);
+        // Each writer carries the maximum of exactly one coordinate. If the locked
+        // transaction were not doing its job, the loser's write would clobber the
+        // winner's — including, now, the roster sequence, whose regression would make a
+        // replayed pre-revocation roster acceptable again.
+        let min_writer = writer(1_000, 1, 1);
+        let high_writer = writer(1, 2_000, 9);
         start.wait();
         min_writer.join().unwrap();
         high_writer.join().unwrap();
@@ -717,8 +879,9 @@ mod tests {
             Floor {
                 min_build: 1_000,
                 high_water: 2_000,
+                roster_seq: 9,
             },
-            "read/max/write is one locked transaction; neither coordinate may regress"
+            "read/max/write is one locked transaction; no coordinate may regress"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -992,18 +1155,23 @@ changelog = '''
         // Absent ⇒ all-zero default (permissive).
         assert_eq!(Floor::read(&p).min_build, 0);
         assert_eq!(Floor::read(&p).high_water, 0);
+        assert_eq!(Floor::read(&p).roster_seq, 0);
         // Bump up.
-        Floor::bump_and_write(&p, 5, 12);
+        Floor::bump_and_write(&p, 5, 12, 3);
         let f = Floor::read(&p);
-        assert_eq!((f.min_build, f.high_water), (5, 12));
-        // Lower observations must NOT lower the floor (monotonic).
-        Floor::bump_and_write(&p, 3, 8);
+        assert_eq!((f.min_build, f.high_water, f.roster_seq), (5, 12, 3));
+        // Lower observations must NOT lower the floor (monotonic). The roster sequence
+        // ratchets on exactly the same rule — that is what makes a replayed
+        // pre-revocation roster permanently unusable once a newer one has been seen.
+        Floor::bump_and_write(&p, 3, 8, 2);
         let f = Floor::read(&p);
-        assert_eq!((f.min_build, f.high_water), (5, 12));
+        assert_eq!((f.min_build, f.high_water, f.roster_seq), (5, 12, 3));
         // Higher observations raise each independently.
-        Floor::bump_and_write(&p, 9, 12);
+        Floor::bump_and_write(&p, 9, 12, 3);
         let f = Floor::read(&p);
         assert_eq!((f.min_build, f.high_water), (9, 12));
+        Floor::bump_and_write(&p, 0, 0, 7);
+        assert_eq!(Floor::read(&p).roster_seq, 7);
         let _ = std::fs::remove_file(&p);
     }
 

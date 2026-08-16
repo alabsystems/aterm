@@ -643,10 +643,7 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
         r.skip("redraw conformance (no targo)");
         return;
     }
-    let build = exec::run(
-        &targo(ctx, redraw_conformance_build_args()),
-        ctx.exec_env(),
-    );
+    let build = exec::run(&targo(ctx, redraw_conformance_build_args()), ctx.exec_env());
     if !build.ok {
         r.raw(build.output.as_str());
         r.fail(format!("targo build --bin {REDRAW_CONFORMANCE_BIN}"));
@@ -1183,10 +1180,7 @@ mod tests {
             redraw_outcome(Some(101)).0,
             Outcome::Fail(Severity::GateFailed)
         );
-        assert_eq!(
-            redraw_outcome(None).0,
-            Outcome::Fail(Severity::CouldNotRun)
-        );
+        assert_eq!(redraw_outcome(None).0, Outcome::Fail(Severity::CouldNotRun));
         for code in [None, Some(1), Some(2), Some(101), Some(-1)] {
             assert_ne!(redraw_outcome(code).0, Outcome::Ok, "{code:?}");
         }

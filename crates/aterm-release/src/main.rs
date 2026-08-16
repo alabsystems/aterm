@@ -22,10 +22,16 @@ mod cli;
 mod dmg;
 mod gates;
 mod ledger;
+// The producer half of the machine-roster tier: this machine's public identity, the
+// cut-time authorization gate, and the attribution stamp. Deliberately NOT in sign.rs or
+// publish.rs — it touches no secret and no upload.
+mod machines;
 mod manifest_out;
 mod mirror;
+// One command from fresh checkout to publishing machine: seed the roster pair from the
+// channel release, drive the atpkg-keys join in-process, audit the Apple/token stack.
+mod provision;
 mod publish;
-mod seedpack;
 mod sign;
 mod verify;
 

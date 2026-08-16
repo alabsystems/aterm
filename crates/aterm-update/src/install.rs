@@ -251,6 +251,36 @@ fn boot_sentinel(staging: &Staging) -> Sentinel {
     Sentinel::new(staging.root.join("boot.sentinel"))
 }
 
+/// Consecutive launches that observed a boot sentinel armed for a build this
+/// process is NOT running and could not recover.
+///
+/// Deliberately its OWN file rather than [`Sentinel::observe_launch`] on the boot
+/// sentinel: that attempt count belongs to the TRIALED build, and incrementing it
+/// from another build's launches would push a healthy build toward
+/// [`Sentinel::should_revert`] on its next launch — two installs (say
+/// `/Applications` and `~/Applications`) share one staging root, so a spurious
+/// crash-loop revert of a build that never crashed is reachable, not theoretical.
+/// Reusing the `Sentinel` TYPE is free and gives the atomic write shape: `arm`
+/// records `"<build> 0"`, `observe_launch` counts only while the recorded build
+/// still matches, `confirm` deletes it.
+fn foreign_trial_counter(staging: &Staging) -> Sentinel {
+    Sentinel::new(foreign_trial_path(staging))
+}
+
+/// The counter's path, needed on its own to compare its mtime against the boot
+/// sentinel's — see [`escape_wedged_foreign_trial`].
+fn foreign_trial_path(staging: &Staging) -> PathBuf {
+    staging.root.join("foreign-trial")
+}
+
+/// Last-modified time of `path`, or `None` when it does not exist / cannot be
+/// stat'd. Used ONLY to compare two files in the SAME directory against each other,
+/// never against a wall clock — so a system clock jump moves both or neither, and
+/// the comparison stays meaningful.
+fn mtime(path: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
 fn prepare_trial(staging: &Staging, ready: &Ready) -> Result<Sentinel, String> {
     let sentinel = boot_sentinel(staging);
     if let Err(error) = crate::manifest::FailedMark::record_required(
@@ -267,12 +297,30 @@ fn prepare_trial(staging: &Staging, ready: &Ready) -> Result<Sentinel, String> {
         crate::manifest::FailedMark::clear(&staging.trial());
         return Err(format!("arm boot-health trial: {error}"));
     }
+    // A fresh trial owns the sentinel now, so any launches counted against the
+    // PREVIOUS armed build are answered; the budget must never accumulate across
+    // unrelated trials.
+    let _ = foreign_trial_counter(staging).confirm();
     Ok(sentinel)
 }
 
 #[must_use]
 fn abandoned_preswap_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
     installed_build == process_build && armed_build > process_build
+}
+
+/// DEAD AUTHORITY: the sentinel names a build strictly OLDER than the bundle we
+/// are canonically installed as and running. Only an out-of-band install (a
+/// `tools/install.sh` run, a DMG drag) landing inside an armed trial window can
+/// produce it — and `MAX_BOOT_ATTEMPTS` is 3, so a trial legitimately survives two
+/// launches that crash before the health checkpoint, which is exactly when a user
+/// hand-installs a different build.
+///
+/// Disjoint from [`abandoned_preswap_trial`] by construction: the armed build sits
+/// above the installed one there and below it here.
+#[must_use]
+fn dead_authority_trial(process_build: u64, installed_build: u64, armed_build: u64) -> bool {
+    installed_build == process_build && armed_build < installed_build
 }
 
 fn identity_matches_running(
@@ -285,11 +333,65 @@ fn identity_matches_running(
         && running_commit.is_none_or(|commit| crate::commit_matches(commit, sealed_commit))
 }
 
+/// The terminal transition for a [`dead_authority_trial`]: disarm, and drop the
+/// artifacts that trial owned.
+///
+/// Leaving it armed is not the conservative choice, it is the permanent one. The
+/// trial can no longer be confirmed (its build is not installed) and must not be
+/// reverted (that would install a build older than the one already running), while
+/// `check_boot_health` / `confirm_boot_health` / `confirm_trial_health_after_proof`
+/// all early-out unless the armed build equals the running one — so nothing else
+/// in the tree can ever clear it, and every future apply is refused forever. Same
+/// reasoning as the wedged-trial escape hatch in `check_boot_health`.
+///
+/// The caller must have proved the shape first; `check_boot_health` already
+/// returned for the `armed == process_build` case, so this cannot race a live
+/// trial of ours.
+fn disarm_dead_authority_trial(
+    staging: &Staging,
+    installed: &Path,
+    armed_build: u64,
+    installed_build: u64,
+    installed_commit: &str,
+    process_build: u64,
+) -> bool {
+    if boot_sentinel(staging).confirm().is_err() {
+        return false;
+    }
+    crate::manifest::FailedMark::clear(&staging.trial());
+    // Its retained rollback source is older than the running build and has no
+    // sentinel behind it; drop it so a later `recover_orphaned_prepared_candidate`
+    // cannot mistake it for this transaction.
+    let _ = remove_path_no_follow(&rollback_path(installed));
+    if !crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
+        .is_some_and(|receipt| receipt.matches_sealed(installed_build, installed_commit))
+    {
+        crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
+    }
+    crate::warn(&format!(
+        "boot sentinel armed for build {armed_build} is older than the installed and running \
+         build {installed_build} (the bundle was replaced out of band); disarmed it rather \
+         than blocking every future update"
+    ));
+    crate::status::record(
+        staging,
+        process_build,
+        &format!(
+            "cleared a stale update trial for build {armed_build} (build {installed_build} is \
+             installed); updates re-enabled"
+        ),
+    );
+    true
+}
+
 /// Recover the sole safe mismatched-sentinel crash cut under apply_lock: this
 /// process's OLD build is still canonically installed while the armed build is
 /// newer. Because apply_lock is held, a live concurrent swap must finish before
 /// this observation; canonical OLD proves NEW is not installed. This covers both a
 /// pre-swap crash and a crash immediately after inverse rollback.
+///
+/// Also the one place a [`dead_authority_trial`] — a sentinel armed for a build
+/// OLDER than the running one, which no other transition can reach — is retired.
 fn recover_abandoned_preswap_trial_if_exact(
     staging: &Staging,
     installed: &Path,
@@ -303,6 +405,28 @@ fn recover_abandoned_preswap_trial_if_exact(
     let Ok((installed_build, installed_commit)) = verified_bundle_identity(installed) else {
         return false;
     };
+    // Placed AFTER the identity resolution on purpose: an installed bundle we
+    // cannot verify still fails closed, disarming nothing.
+    if dead_authority_trial(process_build, installed_build, armed_build)
+        && identity_matches_running(
+            installed_build,
+            &installed_commit,
+            process_build,
+            process_commit,
+        )
+    {
+        // Do NOT `retire_published()` here (unlike the check_boot_health escape
+        // hatch): returning true lets the caller go on to apply a legitimately
+        // staged newer build in this same launch, and retiring would throw it away.
+        return disarm_dead_authority_trial(
+            staging,
+            installed,
+            armed_build,
+            installed_build,
+            &installed_commit,
+            process_build,
+        );
+    }
     if !abandoned_preswap_trial(process_build, installed_build, armed_build) {
         return false;
     }
@@ -352,6 +476,96 @@ fn recover_abandoned_preswap_trial_if_exact(
     if !receipt_matches {
         crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
     }
+    true
+}
+
+/// Budgeted escape for a boot sentinel armed for a build that is NOT the running
+/// one and that [`recover_abandoned_preswap_trial_if_exact`] could not resolve.
+///
+/// Such a sentinel is otherwise permanent. Every lane that clears one — the
+/// launch counting and revert in `check_boot_health`, `confirm_boot_health`,
+/// `confirm_trial_health_after_proof` — early-outs unless the armed build equals
+/// the running build, and [`prepare_trial`], the only writer, is gated behind the
+/// very check that is failing, so the stuck sentinel blocks its own replacement.
+/// The observable result is the "staged and ready but never applies" signature:
+/// every launch returns `Deferred` while the background stager keeps downloading
+/// and publishing, with no client-side repair short of deleting the file by hand.
+/// The shapes that reach here are the ones the exact recovery deliberately
+/// refuses (a rollback sibling that is not the armed build, an unverifiable
+/// install, an armed build below a running build we are not canonically installed
+/// as), so refusing forever is not evidence of anything except that this launch
+/// cannot prove the trial's story.
+///
+/// So budget it exactly the way the same-build lane is budgeted: after
+/// [`MAX_BOOT_ATTEMPTS`] launches that observed the SAME unrecoverable armed
+/// build, disarm. The count lives in [`foreign_trial_counter`], never in the boot
+/// sentinel itself.
+///
+/// Returns whether the sentinel was disarmed. The caller still defers on the
+/// disarming launch: recovery state was just mutated, and the next launch takes
+/// the normal path (`recover_orphaned_prepared_candidate` requires an absent
+/// sentinel), so nothing is applied on the same pass that repaired it. That
+/// deferral is itself recorded by [`apply_staged_if_ready`], whose refusal line
+/// supersedes the status line written here for this launch — the durable record
+/// of the repair is the health ledger entry and the log warning below.
+fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_build: u64) -> bool {
+    let counter = foreign_trial_counter(staging);
+    // A LIVE TRIAL IS NOT A WEDGED ONE, and the staging root is shared by every copy
+    // this user runs (`~/Library/Application Support/aterm/Updates` — per USER, not per
+    // install). So a second installation — a locally built .app beside the released one
+    // is the ordinary case — can be mid-trial on a build this process does not run, and
+    // three launches of THIS copy would otherwise disarm it. That would take the
+    // crash-loop protection away from the very build that is crash-looping: its own
+    // `check_boot_health` would find no sentinel and never revert.
+    //
+    // The trial's owner is the only party that advances the sentinel (`observe_launch`
+    // counts only when the armed build is the RUNNING one), and it rewrites the file to
+    // do so. So "did anyone touch this trial while we were counting" is answerable
+    // without a clock, a pid, or new state: compare the sentinel's mtime against our own
+    // counter's. Advanced ⇒ the owner is alive ⇒ restart the budget and defer. Frozen
+    // across our whole budget ⇒ nobody is left to confirm or revert it, which is the
+    // wedge this escape exists for.
+    let sentinel = boot_sentinel(staging);
+    let counter_state = counter.read_state();
+    let advanced = mtime(&staging.root.join("boot.sentinel"))
+        .zip(mtime(&foreign_trial_path(staging)))
+        .is_some_and(|(trial, ours)| trial > ours);
+    if advanced {
+        // The owner moved since we last counted. Restart the budget, and do NOT count
+        // this launch: a trial that is being actively observed is not abandoned.
+        let _ = counter.arm(armed_build);
+        return false;
+    }
+    if !matches!(counter_state, Some((build, _)) if build == armed_build) {
+        // A different armed build than the one we were counting (or none yet):
+        // start this build's budget from zero rather than inheriting it.
+        let _ = counter.arm(armed_build);
+    }
+    let observed = counter.observe_launch(armed_build).unwrap_or(0);
+    if observed < MAX_BOOT_ATTEMPTS || sentinel.confirm().is_err() {
+        return false;
+    }
+    crate::manifest::FailedMark::clear(&staging.trial());
+    let _ = counter.confirm();
+    crate::health::Health::record_apply_failure(
+        &staging.health(),
+        current_build,
+        &format!(
+            "update trial for build {armed_build} was unrecoverable across {MAX_BOOT_ATTEMPTS} \
+             launches of build {current_build}; disarmed the boot sentinel to keep updates \
+             possible"
+        ),
+    );
+    crate::status::record(
+        staging,
+        current_build,
+        "recovered a wedged update trial (armed build is not installed); updates re-enabled",
+    );
+    crate::warn(&format!(
+        "boot sentinel armed for build {armed_build} could not be recovered in \
+         {MAX_BOOT_ATTEMPTS} launches of build {current_build}; disarmed it rather than \
+         blocking every future update"
+    ));
     true
 }
 
@@ -1098,7 +1312,13 @@ pub fn stage_from_dmg(
     // detach the DMG now; everything we need is in `incoming`.
     drop(mounted);
 
-    verify_and_publish_incoming(staging, &incoming, manifest, &manifest_commit, expected_team)
+    verify_and_publish_incoming(
+        staging,
+        &incoming,
+        manifest,
+        &manifest_commit,
+        expected_team,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,26 +1334,37 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 /// Hard ceiling on the UNCOMPRESSED bytes an update archive may DECLARE before
 /// [`stage_from_zip`] will hand it to `ditto`.
 ///
-/// WHY A CEILING EXISTS AT ALL. The download is capped (`github.rs` passes 512
-/// MiB to `download_to`) and the archive's sha256 is checked against the release
-/// manifest before extraction, so nothing reaches this point that the publisher
-/// did not sign for. But deflate EXPANDS, `ditto` has no size limit of its own,
-/// and one bad release is unpacked by every machine on the channel at once. A
-/// volume with no free space cannot stage the fix that would undo it, so the
-/// failure has no in-band recovery — it is a fleet-wide availability event, not
-/// a per-machine annoyance. Refusing on the archive's own declared size turns
-/// "every disk is full" into "the fleet stayed on the previous build and said
-/// why", which the caller's stage-failure path already knows how to sit on.
+/// WHY A CEILING EXISTS AT ALL. The download is capped (`github.rs` passes
+/// [`aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND`] to `download_to`) and the
+/// archive's sha256 is checked against the release manifest before extraction,
+/// so nothing reaches this point that the publisher did not sign for. But
+/// deflate EXPANDS, `ditto` has no size limit of its own, and one bad release is
+/// unpacked by every machine on the channel at once. A volume with no free space
+/// cannot stage the fix that would undo it, so the failure has no in-band
+/// recovery — it is a fleet-wide availability event, not a per-machine
+/// annoyance. Refusing on the archive's own declared size turns "every disk is
+/// full" into "the fleet stayed on the previous build and said why", which the
+/// caller's stage-failure path already knows how to sit on.
 ///
-/// WHY THIS NUMBER. The signed bundle is well under 100 MB uncompressed today (a
-/// handful of stripped Mach-O binaries, an icon, the help pages and the
-/// shell-integration scripts), so 1 GiB leaves more than a tenfold growth of
-/// headroom — aterm would have to become a different kind of program before an
-/// honest release tripped this — while staying an amount of scratch space any
-/// Mac that can run aterm can spare inside Application Support. If the bundle
-/// ever legitimately approaches it, raise the number in one deliberate commit;
-/// do not delete the check.
-const MAX_EXTRACT_BYTES: u64 = 1024 * 1024 * 1024;
+/// WHY THIS NUMBER, AND WHY IT IS NOT ITS OWN. It is the download bound itself,
+/// and it must never sit BELOW it. The cutter validates every published asset
+/// against that one constant (`UPDATER_MAX_DMG_BYTES` in `aterm-release`) and has
+/// no extraction gate of its own, so a stricter cap here is a hole the publisher
+/// cannot see: a container the cutter happily ships stages nowhere, on every
+/// machine on the channel, deterministically, and the stage-failure backoff just
+/// re-downloads it once a day forever.
+///
+/// The retired 1 GiB was picked when "the signed bundle is well under 100 MB
+/// uncompressed" was true of every cut. It is not: a batteries-included cut seals
+/// `Contents/Resources/toolchain-seed` into the SAME signed `.app` this archive
+/// carries, and one has already been observed at ~775 MB — three quarters of that
+/// cap, with a payload of already-compressed `.tar.zst` artifacts whose declared
+/// uncompressed size is roughly their packed size. Tying the two together removes
+/// the drift rather than re-guessing the headroom. The cap still does its job at
+/// the bound: it refuses any archive DECLARING more than the largest asset the
+/// publisher could ever have shipped, so an honestly-enormous zip is still
+/// refused before one byte is written.
+const MAX_EXTRACT_BYTES: u64 = aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND;
 
 /// Companion ceiling on the archive's entry COUNT, because bytes alone do not
 /// bound the damage: a million empty files declare zero uncompressed bytes and
@@ -1552,7 +1783,9 @@ pub fn stage_from_zip(
     // Extract into a fresh scratch dir rather than straight into `staged/`: the
     // archive's root entry is `aterm.app` (`--keepParent`), and unpacking that
     // name next to the PUBLISHED `staged/aterm.app` would collide with it.
-    let extract = staging.staged_dir().join(format!("zx-{}", std::process::id()));
+    let extract = staging
+        .staged_dir()
+        .join(format!("zx-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&extract);
     std::fs::create_dir_all(&extract).map_err(|e| format!("create zip extract dir: {e}"))?;
     // `ditto -x -k` (not `unzip`) restores extended attributes and the sequestered
@@ -1603,7 +1836,13 @@ pub fn stage_from_zip(
     // The `__MACOSX` sidecar and the scratch dir have served their purpose.
     let _ = std::fs::remove_dir_all(&extract);
 
-    verify_and_publish_incoming(staging, &incoming, manifest, &manifest_commit, expected_team)
+    verify_and_publish_incoming(
+        staging,
+        &incoming,
+        manifest,
+        &manifest_commit,
+        expected_team,
+    )
 }
 
 /// The manifest's git commit in canonical form — the one identity every stage
@@ -1706,9 +1945,65 @@ fn record_activating_status(staging: &Staging, ready: &Ready) {
     );
 }
 
+/// The one outcome shape that means "a newer build is staged and this launch
+/// REFUSED to apply it" — the entire answer to an operator's "the build is
+/// staged, so why is it not running?".
+///
+/// `NotApplicable`/`NoUpdate` are the every-launch common case, so recording them
+/// would rewrite `status.toml` on every single launch and neither is a refusal.
+/// `ReExecFailed` is excluded too: it is a genuine FAILURE that already recorded
+/// its own status line, and the refusal slot is the wrong ledger for it —
+/// [`crate::health::Health::record_apply_failure`] clears refusals by design, so
+/// routing a failure through the refusal slot would invert that ordering.
+fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
+    match outcome {
+        ApplyOutcome::Deferred(reason) => Some(reason),
+        ApplyOutcome::NotApplicable | ApplyOutcome::NoUpdate | ApplyOutcome::ReExecFailed(_) => {
+            None
+        }
+    }
+}
+
 /// Apply a staged update if it is ready and strictly newer. On success this
 /// re-execs and never returns. See module + crate docs for the full contract.
+///
+/// The body is `apply_staged_if_ready_inner`; this wrapper exists so that every
+/// refusal the boot lane can return is recorded in ONE place. Most of the inner
+/// deferrals used to be silent — no `status.toml` line, no health entry, nothing
+/// in the app log — so the lane that runs on every cold launch could refuse the
+/// same staged build forever while `status.toml` kept the stager's "verified and
+/// ready to apply" line and `aterm ctl update status` reported a healthy updater.
+/// The Deferred reason only ever reached stderr, which a Finder/launchd launch
+/// throws away. A refusal nobody can observe reads exactly like an updater that is
+/// not running — the same reasoning that put [`crate::record_apply_refusal`] on
+/// the in-session lane, which this one never called.
+///
+/// Recording happens OUT here, after the inner call returned: the apply lock (and
+/// `check_boot_health`'s) are both released by then, so the health ledger lock is
+/// never taken underneath them. Do not "simplify" this by writing at each return.
 pub fn apply_staged_if_ready(
+    current_build: u64,
+    current_commit: Option<&str>,
+    handoff_fds: &[i32],
+    handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> ApplyOutcome {
+    let outcome =
+        apply_staged_if_ready_inner(current_build, current_commit, handoff_fds, handoff_env);
+    if let Some(reason) = boot_apply_refusal_reason(&outcome) {
+        crate::warn(&format!("boot apply refused: {reason}"));
+        if let Some(staging) = Staging::resolve() {
+            crate::health::Health::record_apply_refusal(&staging.health(), current_build, reason);
+            crate::status::record(
+                &staging,
+                current_build,
+                &format!("boot apply refused: {reason}"),
+            );
+        }
+    }
+    outcome
+}
+
+fn apply_staged_if_ready_inner(
     current_build: u64,
     current_commit: Option<&str>,
     handoff_fds: &[i32],
@@ -1802,10 +2097,20 @@ pub fn apply_staged_if_ready(
         let armed_build = boot_sentinel(&staging)
             .read_state()
             .map_or(0, |(build, _)| build);
+        // A sentinel armed for a build that is not the running one can never be
+        // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
+        // future apply forever. Budget it — with its own counter, never the
+        // trial's.
+        if armed_build != 0 && armed_build != current_build {
+            escape_wedged_foreign_trial(&staging, current_build, armed_build);
+        }
         return ApplyOutcome::Deferred(format!(
             "update trial for build {armed_build} is still unconfirmed"
         ));
     }
+    // The mismatched-sentinel lane is behind us for this launch, so no budget is
+    // outstanding; never let one accumulate across unrelated trials.
+    let _ = foreign_trial_counter(&staging).confirm();
     if let ReadyState::Newer(orphaned_ready) = read_ready(&staging, current_build)
         && let Err(error) = recover_orphaned_prepared_candidate(
             &staging,
@@ -2175,6 +2480,7 @@ fn check_boot_health(
                 let disarm = sentinel.confirm();
                 crate::health::Health::record_apply_failure(
                     &staging.health(),
+                    current_build,
                     &format!(
                         "trial recovery proof failed {MAX_BOOT_ATTEMPTS}x ({error}); disarmed \
                          the boot sentinel to keep updates possible"
@@ -2267,7 +2573,17 @@ fn revert_to_rollback(
     if let Some(t) = crate::manifest::FailedMark::read(&staging.trial())
         && t.build_number == current_build
     {
-        crate::manifest::FailedMark::record(&staging.failed(), t.build_number, &t.sha256);
+        // QUARANTINE, not `record`. The old call wrote the memo with `retry_after = 0`
+        // meaning "forever" — but `FailedMark::suppresses`, the only reader, treats a
+        // zero deadline as "already elapsed". The poison was written and then ignored,
+        // so the next background check (75 s later) re-downloaded and re-applied the
+        // build that had just crash-looped, and the machine went straight back around
+        // the crash/revert loop this code exists to break.
+        crate::manifest::FailedMark::record_quarantine(
+            &staging.failed(),
+            t.build_number,
+            &t.sha256,
+        );
     }
     // OLD is restored at the install; failed NEW sits at rb. Disarm succeeded, so
     // transaction cleanup cannot leave an armed trial without recovery metadata.
@@ -2323,6 +2639,18 @@ fn confirm_trial_health_after_proof(
     // Booted healthy → no crash-loop poison pending. The installed receipt is
     // intentionally independent and survives for overlapping old processes.
     crate::manifest::FailedMark::clear(&staging.trial());
+    // THIS is where an apply is known to have SUCCEEDED, and therefore the only
+    // honest place to clear the apply-failure streak.
+    //
+    // The GUI used to call `record_apply_success` the moment it SUBMITTED an apply
+    // (`UpdateOutcome::Accepted`), which cleared the streak before the swap had even
+    // been attempted — so `apply_failures` could never reach `PERSISTENT_AFTER` and
+    // the self-healing ledger was blind to a lane that failed every single time. That
+    // call is gone; without this one the streak would instead be uncleanable, which is
+    // the opposite error. A new build swapped in, re-execed, and confirmed its own boot
+    // health is the whole apply lane working end to end, which is exactly the claim
+    // `record_apply_success` makes.
+    crate::health::Health::record_apply_success(&staging.health());
     true
 }
 
@@ -3294,6 +3622,209 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The two mismatched-sentinel shapes are disjoint, and neither admits a
+    /// process that is not running the installed build: an overlapping process
+    /// from another build has no authority to disarm anything.
+    #[test]
+    fn dead_authority_and_abandoned_preswap_shapes_are_disjoint() {
+        // Out-of-band replacement: armed BELOW the build that is installed and
+        // running. Nothing in the tree could ever clear this one before.
+        assert!(dead_authority_trial(1001, 1001, 1000));
+        assert!(!abandoned_preswap_trial(1001, 1001, 1000));
+        // The pre-swap crash cut the exact recovery was written for: armed ABOVE.
+        assert!(abandoned_preswap_trial(1000, 1000, 1001));
+        assert!(!dead_authority_trial(1000, 1000, 1001));
+        // Neither fires for a process that is not the installed build.
+        assert!(!dead_authority_trial(999, 1001, 1000));
+        assert!(!abandoned_preswap_trial(999, 1000, 1001));
+    }
+
+    /// An out-of-band install (install.sh, a DMG drag) landing inside an armed
+    /// trial window leaves a sentinel for a build that is no longer installed.
+    /// It can never be confirmed and must never be reverted, so the terminal
+    /// transition is to disarm it — otherwise every future apply is refused
+    /// forever while the stager keeps publishing "ready to apply".
+    #[test]
+    fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
+        let (s, root) = temp_staging();
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(1000).unwrap();
+        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+        // A receipt for the DEAD trial's build — not proof for what is installed.
+        crate::manifest::InstalledReceipt::record(
+            &s.installed_receipt(),
+            1000,
+            commit,
+            &"ab".repeat(32),
+        )
+        .unwrap();
+        let installed = root.join("Applications").join("aterm.app");
+        make_app(&installed, "HAND-INSTALLED-1001");
+        let rollback = rollback_path(&installed);
+        make_app(&rollback, "OLDER-THAN-RUNNING");
+
+        assert!(disarm_dead_authority_trial(
+            &s, &installed, 1000, 1001, commit, 1001
+        ));
+        assert_eq!(sentinel.read_state(), None, "the wedge is cleared");
+        assert!(!s.trial().exists(), "the dead trial's identity goes too");
+        assert!(
+            !rollback.exists(),
+            "its rollback source is older than the running build and has no sentinel behind it"
+        );
+        assert!(
+            !s.installed_receipt().exists(),
+            "a receipt for the dead build is not proof for the installed one"
+        );
+        assert!(
+            std::fs::read_to_string(&s.status)
+                .unwrap()
+                .contains("updates re-enabled"),
+            "the repair is durable and explains itself"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The unrecoverable mismatched-sentinel shapes get a budgeted escape of
+    /// their own. The budget must be counted in a SEPARATE file: incrementing the
+    /// boot sentinel would advance the trialed build's attempt count from
+    /// launches of a different build and could revert a build that never crashed.
+    #[test]
+    fn an_unrecoverable_foreign_trial_is_disarmed_on_a_budget_not_on_sight() {
+        let (s, root) = temp_staging();
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(1000).unwrap();
+        crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+
+        for launch in 1..MAX_BOOT_ATTEMPTS {
+            assert!(
+                !escape_wedged_foreign_trial(&s, 1001, 1000),
+                "launch {launch} is inside the budget"
+            );
+            assert_eq!(
+                sentinel.read_state(),
+                Some((1000, 0)),
+                "the trialed build's OWN attempt count is never touched"
+            );
+        }
+
+        assert!(
+            escape_wedged_foreign_trial(&s, 1001, 1000),
+            "the budget is exhausted"
+        );
+        assert_eq!(sentinel.read_state(), None, "the wedge is cleared");
+        assert!(!s.trial().exists());
+        assert!(
+            !s.root.join("foreign-trial").exists(),
+            "the counter is retired with the sentinel it was counting"
+        );
+        assert!(
+            std::fs::read_to_string(&s.status)
+                .unwrap()
+                .contains("updates re-enabled")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A LIVE TRIAL BELONGING TO ANOTHER INSTALLATION IS NEVER DISARMED.
+    ///
+    /// The staging root is per USER, not per install, so a locally built .app beside
+    /// the released one shares this sentinel. If launches of THIS copy could exhaust
+    /// the budget while the other copy is still trialing, the escape would strip the
+    /// crash-loop protection off the very build that is crash-looping: that build's
+    /// own `check_boot_health` would then find no sentinel and never revert.
+    ///
+    /// The owner advancing its own attempt count is what proves it alive, so a budget
+    /// that spans such an advance must restart rather than complete.
+    #[test]
+    fn a_foreign_trial_whose_owner_is_still_launching_is_never_disarmed() {
+        let (s, root) = temp_staging();
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(1000).unwrap();
+
+        // Run the budget to one launch short of the escape, over and over, with the
+        // trial's OWNER observing a launch each time — exactly what a crash-looping
+        // second installation does. The escape must never fire.
+        for round in 0..4 {
+            for _ in 1..MAX_BOOT_ATTEMPTS {
+                assert!(
+                    !escape_wedged_foreign_trial(&s, 1001, 1000),
+                    "round {round}: inside the budget"
+                );
+            }
+            // The other copy launches: `observe_launch` counts because IT is build 1000.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let attempts = sentinel.observe_launch(1000).unwrap();
+            assert!(attempts >= 1, "the owner really did advance its own trial");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(
+                !escape_wedged_foreign_trial(&s, 1001, 1000),
+                "round {round}: an advance restarts the budget instead of completing it"
+            );
+            assert!(
+                sentinel.read_state().is_some(),
+                "round {round}: the live trial survives"
+            );
+        }
+
+        // NEGATIVE CONTROL: the same number of launches with the owner GONE (nothing
+        // advances the sentinel) does reach the escape — so the guard above is what is
+        // holding, not a budget that never completes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut fired = false;
+        for _ in 0..MAX_BOOT_ATTEMPTS + 1 {
+            fired |= escape_wedged_foreign_trial(&s, 1001, 1000);
+        }
+        assert!(fired, "an abandoned trial is still escaped");
+        assert_eq!(sentinel.read_state(), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A new armed build restarts the budget: launches counted against a trial
+    /// that has since been replaced must not carry over and disarm the new one
+    /// early.
+    #[test]
+    fn the_foreign_trial_budget_does_not_accumulate_across_trials() {
+        let (s, root) = temp_staging();
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(1000).unwrap();
+        for _ in 1..MAX_BOOT_ATTEMPTS {
+            assert!(!escape_wedged_foreign_trial(&s, 1001, 1000));
+        }
+        // A different build is armed now (the previous one was resolved).
+        sentinel.arm(1002).unwrap();
+        assert!(
+            !escape_wedged_foreign_trial(&s, 1001, 1002),
+            "the new trial gets the full budget, not the tail of the old one"
+        );
+        assert_eq!(sentinel.read_state(), Some((1002, 0)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Only a refusal is recorded as one. The every-launch outcomes would rewrite
+    /// `status.toml` on every boot, and a re-exec FAILURE belongs in the failure
+    /// ledger — `record_apply_failure` clears refusals, never the reverse.
+    #[test]
+    fn only_a_deferred_boot_apply_is_recorded_as_a_refusal() {
+        let deferred = ApplyOutcome::Deferred("trial 1000 unconfirmed".to_string());
+        assert_eq!(
+            boot_apply_refusal_reason(&deferred),
+            Some("trial 1000 unconfirmed")
+        );
+        for quiet in [
+            ApplyOutcome::NotApplicable,
+            ApplyOutcome::NoUpdate,
+            ApplyOutcome::ReExecFailed("exec: ENOMEM".to_string()),
+        ] {
+            assert_eq!(
+                boot_apply_refusal_reason(&quiet),
+                None,
+                "{quiet:?} is not an apply refusal"
+            );
+        }
+    }
+
     #[test]
     fn active_trial_digest_rejects_same_build_commit_receipt_with_other_artifact() {
         let (s, root) = temp_staging();
@@ -3661,7 +4192,11 @@ mod tests {
         header.extend_from_slice(&[0u8; 2]); // internal attributes
         header.extend_from_slice(&[0u8; 4]); // external attributes
         header.extend_from_slice(&0u32.to_le_bytes()); // local header offset
-        assert_eq!(header.len(), CENTRAL_HEADER_FIXED_LEN, "fixed header layout");
+        assert_eq!(
+            header.len(),
+            CENTRAL_HEADER_FIXED_LEN,
+            "fixed header layout"
+        );
         header.extend_from_slice(name.as_bytes());
         header.extend_from_slice(extra);
         header
@@ -3766,13 +4301,46 @@ mod tests {
         );
     }
 
+    /// A batteries-included container — the toolchain seed sealed into the same
+    /// signed `.app` — declares far more than the retired 1 GiB cap while staying
+    /// inside the ONE bound the cutter validates every published asset against.
+    /// The client must be able to unpack anything the publisher was allowed to
+    /// publish, or a legitimate release strands the whole channel at unpack time
+    /// with nothing on the publishing side able to see it coming.
+    #[test]
+    fn zip_claim_admits_a_batteries_sized_container_the_cutter_would_publish() {
+        assert_eq!(
+            MAX_EXTRACT_BYTES,
+            aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
+            "the extract cap must never sit below the bound the cutter enforces"
+        );
+        let declared: u32 = 1_610_612_736; // 1.5 GiB
+        let zip = TempZip::new(
+            "batteries",
+            &well_formed_zip(&[(
+                "aterm.app/Contents/Resources/toolchain-seed/trust.tar.zst",
+                declared,
+            )]),
+        );
+        assert_eq!(
+            checked_zip_extraction_claim(&zip.0).expect("a publishable container is accepted"),
+            ZipExtractClaim {
+                entries: 1,
+                uncompressed_bytes: u64::from(declared),
+            }
+        );
+    }
+
     /// An absurd declared size is refused. `u32::MAX - 1` is the largest size a
     /// classic entry can state without tripping the ZIP64 escape, and it is
-    /// already four times the cap, so this is refused on BYTES — no
+    /// already twice the cap, so this is refused on BYTES — no
     /// filesystem, no `ditto`, nothing written.
     #[test]
     fn zip_claim_refuses_an_absurd_declared_size() {
-        let zip = TempZip::new("huge", &well_formed_zip(&[("aterm.app/huge", u32::MAX - 1)]));
+        let zip = TempZip::new(
+            "huge",
+            &well_formed_zip(&[("aterm.app/huge", u32::MAX - 1)]),
+        );
         let error = checked_zip_extraction_claim(&zip.0).expect_err("absurd size is refused");
         assert!(
             error.contains("uncompressed bytes") && error.contains("extraction cap"),

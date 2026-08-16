@@ -38,6 +38,12 @@ sha2 = { workspace = true }
 # the bytes uploaded to the public key compiled into clients.
 ring = { version = "0.17.14", default-features = false }
 base64 = "0.22.1"
+# The provisioning engine: `cargo ship provision` drives the join ceremony
+# in-process (RELEASE-KEYS.md's "signing is in-process" rule, extended to
+# minting), so one phrase prompt provisions the machine with no second binary.
+# This edge unifies ring's default features (RNG) into THIS binary's graph —
+# deliberate: the cutter is owner-only; shipped clients keep their own graphs.
+atpkg-keys = { workspace = true }
 
 [dev-dependencies]
 # Tier-1 binds the real release-floor resolver and late guard to their derived

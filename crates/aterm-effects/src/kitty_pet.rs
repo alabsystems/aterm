@@ -68,7 +68,7 @@ use core::f32::consts::TAU;
 
 use web_time::Instant;
 
-use crate::pet_glyphs_gen::PetGlyphId;
+use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
 
 // ── the chase ───────────────────────────────────────────────────────────────
 
@@ -236,11 +236,23 @@ const TOUCH_LAND_DUR: f32 = 0.13;
 // INSIDE the idle-to-zero window: light sleep drifts them, deep sleep spawns
 // nothing, and the last one dies before the frame lane releases.
 
-/// LIGHT sleep only: a z-mote every ~1.6 s, drifting up-and-away for ~2.2 s,
+/// LIGHT sleep only: a z-mote every ~1.2 s, drifting up-and-away for ~2.2 s,
 /// at most [`ZEE_ALIVE_MAX`] alive. Spawning stops [`ZEE_LIFE`] before the
 /// breath window closes, so deep sleep begins with an empty lane — the
 /// 0.15.0 idle-to-zero contract, kept to the letter.
-const ZEE_EVERY: f32 = 1.6;
+///
+/// Was 1.6 s. The sleeping loaf is the pose a long-idle terminal parks on, so
+/// it is the one the owner spends the most time looking at, and at 1.6 s the
+/// ~7.8 s spawn window (`SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE`) fitted only
+/// four z's — long enough between them that the tell read as intermittent
+/// rather than as breathing. 1.2 s fits six and puts the first one up 0.4 s
+/// sooner. It is a CADENCE change, not a brightness one: 0.83 Hz of births,
+/// each a slow fade-in/fade-out over 2.2 s, against WCAG 2.3.1's 3 Hz
+/// general-flash bound — the same bound `cursor_rainbow`'s twinkle is pinned
+/// under. Going much below ~1.1 s would start stacking three at once against
+/// [`ZEE_ALIVE_MAX`] (`ZEE_LIFE / ZEE_EVERY`), which is where a drift turns
+/// into a swarm.
+const ZEE_EVERY: f32 = 1.2;
 const ZEE_LIFE: f32 = 2.2;
 const ZEE_ALIVE_MAX: usize = 3;
 /// Waking pops ONE startled z — bigger, faster, briefer — before the stretch.
@@ -263,6 +275,63 @@ const SETTLE_TURN: f32 = 0.5;
 /// |caret gap| (caret column to the pet's left edge, cells) inside which the
 /// settle makes eye contact ([`PetGlyphId::PetSitFront`]).
 const SIT_FRONT_GAP: f32 = 3.0;
+
+// ── the settle-turn's brakes (owner ruling, 2026-08-12) ─────────────────────
+//
+// OWNER: "when it's sleeping, and the cursor is near it and moving back and
+// forth, having the kitty flip instantly looks bad. I'd like for that to be
+// more subtle and realistic."
+//
+// The mechanism, exactly: `settle_gaze` runs on EVERY settled tick, `Sleep` is
+// a settled pose, and while pointer attention is live the gaze target IS the
+// pointer — which no caret move ever wakes the cat away from, because a
+// pointer is not a keystroke. So a mouse jiggling over a sleeping cat's
+// midline used to re-decide `facing_left` sixty times a second. The block
+// above already states the principle it was violating — "the body never flips
+// at rest, because a flip reads as a twitch where a glance reads as a cat" —
+// and the near branch flipped the body anyway.
+//
+// Three brakes, because one is not enough and the awake chase must not pay for
+// any of them (a walking cat still faces where it is going: that facing comes
+// from `FLIP_SPEED` on the follower, and from `begin_arc` in the air, neither
+// of which is touched):
+//
+//  1. A DEAD BAND around the pet's own midline, inside which the target has no
+//     SIDE at all. Sub-cell jitter across the centre line stops being a signal
+//     rather than becoming a slower signal.
+//  2. A DWELL: the target must hold the far side CONTINUOUSLY before the body
+//     comes round, and any frame it is not committed there rewinds the clock
+//     to zero. This is the one that answers "back and forth" as such — an
+//     oscillation never accumulates, however wide it swings, because it is the
+//     staying that is being measured and not the being-there.
+//  3. DEEP SLEEP DOES NOT TURN AT ALL. Past the breath window this module
+//     already promises a pet "deeply asleep and perfectly still", whose frame
+//     settles so the host can idle to zero. A body flip there is a lie about
+//     the animal and a lie about the frame lane at the same time.
+//
+// A hop-and-turn ANIMATION was weighed and rejected for this change: all 23
+// poses are authored facing right and mirrored by `flip_x`, so a real turn is
+// new art, and a faked one (squashing `scale_x` through zero) would be a new
+// motion vocabulary invented for a single case — and on its own it makes the
+// oscillation WORSE, a cat swivelling like a radar dish. Animation is what you
+// add after the flip has stopped firing, not instead of stopping it.
+
+/// Cells either side of the pet's midline inside which a gaze target has no
+/// side — the settle-turn's hysteresis. Under half a cell is inside the
+/// caret's own cell, so it cannot honestly be called a direction.
+const GAZE_FLIP_BAND: f32 = 0.4;
+/// …and the band a SLEEPING pet uses: over twice as wide, so the pointer must
+/// be somewhere a cat could plausibly have noticed rather than merely on the
+/// other side of its nose.
+const SLEEP_FLIP_BAND: f32 = 1.0;
+/// Seconds a gaze target must HOLD the far side before an awake settled pet
+/// turns to meet it. Six frames: long enough that nothing flips on a single
+/// crossing, short enough that eye contact still reads as prompt.
+const SETTLE_FLIP_DWELL: f32 = 0.10;
+/// …and the dwell a SLEEPING pet demands: more than a second of the pointer
+/// staying put. A cat does not spin to face a mouse pointer; it comes round,
+/// eventually, to something that is still there.
+const SLEEP_FLIP_DWELL: f32 = 1.2;
 /// Quiet (seconds) before the sit melts into the loaf — ~2× [`SIT_AFTER`],
 /// the review's LONG-dwell pose (and its C2 low-profile shape: barely over a
 /// row tall, so a parked cat shades nothing above the prompt).
@@ -326,6 +395,12 @@ const INK_EVICT_MAX: f32 = 4.0;
 /// droop skulking on a failed command) is re-anchored outright, because
 /// walking it back would be a different animal from re-staging a pose.
 const INK_EVICT_SPEED: f32 = 12.0;
+/// How late in an arc a mid-air re-aim may still rebase its launch point.
+/// The rebase solves `from' = (col - to'·u)/(1 - u)`, so the answer runs away
+/// as `u` approaches 1; past this bar the re-aim is dropped and the flight is
+/// allowed to finish, which is the better read anyway — a cat that is already
+/// landing should land, not swerve.
+const REAIM_MAX_U: f32 = 0.85;
 /// Slop (cells) allowed when reading a line WRAP off the caret delta — a
 /// double-width glyph at the margin wraps from `cols - 2`.
 const WRAP_SLOP: f32 = 2.0;
@@ -1097,9 +1172,65 @@ struct Flight {
     big: bool,
 }
 
+/// Which animal the pet is drawn as.
+///
+/// A SKIN, NOT A SECOND ANIMAL. The behaviour layer below is written entirely
+/// against the CAT pose vocabulary — the walk's four beats, the settle ladder,
+/// the leap's three frames — and every species' roster is generated from the
+/// same rig with the same pose idents (`art/pet/poses.py` emits `pet_walk_0`
+/// and `pet_dog_walk_0` from one `Pose`). So a species never changes what the
+/// pet DOES, only which sprite that decision resolves to, and the two rosters
+/// can never drift out of gait sync.
+///
+/// Adding a third animal is a new variant here, a new prefix in `poses.py`, and
+/// nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum PetSpecies {
+    /// The original companion (`cursor_trail_style = "rainbow kitty pet"`).
+    #[default]
+    Cat,
+    /// The dog (`cursor_trail_style = "rainbow dog pet"`).
+    Dog,
+}
+
+impl PetSpecies {
+    /// Map a CAT pose onto this species' equivalent frame.
+    ///
+    /// Resolution is by pose IDENT, through the generated roster's `id`
+    /// strings — never by enum discriminant arithmetic, which would silently
+    /// re-point every pose the moment a new asset lands in the directory and
+    /// shifts the sort order. A species with no counterpart for some pose
+    /// falls back to the cat frame rather than drawing nothing.
+    #[must_use]
+    pub fn skin(self, pose: PetGlyphId) -> PetGlyphId {
+        let Self::Dog = self else { return pose };
+        let cat_id = PET_GLYPHS[pose as usize].id;
+        // Already a dog frame (a re-skin of an already-skinned pose is a no-op).
+        if cat_id.starts_with("pet_dog_") {
+            return pose;
+        }
+        let Some(tail) = cat_id.strip_prefix("pet_") else {
+            return pose;
+        };
+        PET_GLYPH_IDS
+            .iter()
+            .copied()
+            .find(|id| {
+                PET_GLYPHS[*id as usize]
+                    .id
+                    .strip_prefix("pet_dog_")
+                    .is_some_and(|t| t == tail)
+            })
+            .unwrap_or(pose)
+    }
+}
+
 /// The pet's decision layer: a caret follower with a behaviour state machine on
 /// top. `tick` is the whole API; everything else is derived from it.
 pub struct PetBrain {
+    /// Which animal to draw. Pure presentation — see [`PetSpecies`]; the
+    /// behaviour below never reads it, and `emit` is the only consumer.
+    species: PetSpecies,
     /// Position of the pet's LEFT edge / feet, in fractional cells.
     col: f32,
     row: f32,
@@ -1286,6 +1417,20 @@ pub struct PetBrain {
     /// The overshoot is live: the pet blew past its station on purpose and
     /// is trotting back.
     braking: bool,
+    /// The drift-brake's RUN-OUT: the aim past the station, live only until
+    /// the paws reach it. `Some` is what makes the overshoot a place the pet
+    /// runs to rather than a place it is put — see the guard in `tick`.
+    /// `braking` outlives it, so the trot home cannot arm a second brake.
+    brake_over: Option<f32>,
+    /// The pose (and its hold clock) a re-anchor hop owes back on landing.
+    ///
+    /// F1's law is "pose and hold kept, feet moved". Now that the feet move
+    /// by hopping (owner ruling, 2026-08-10 — nothing changes position
+    /// without animating), the hop borrows the pose for its own duration and
+    /// hands it back the moment the paws are down: a sleeper hops out from
+    /// under an arriving line and goes straight back to sleep, a droop
+    /// resumes grieving on ground where the grief can be read.
+    resume: Option<(PetAction, f32)>,
     /// Boredom cooldown (wave 4b): seconds until the next vignette may fire.
     bored_cool: f32,
     /// HIDE-BEHIND-WORDS (wave 4c): the walk target behind a word's ink,
@@ -1330,6 +1475,11 @@ pub struct PetBrain {
     /// the over-the-shoulder peek for a far caret behind the facing.
     sit_front: bool,
     peek: bool,
+    /// The settle-turn's dwell clock (seconds): how long the gaze target has
+    /// held the side the pet is NOT facing, CONTINUOUSLY. Rewound to zero by
+    /// any frame the target is not committed to that side, which is what makes
+    /// a caret or pointer swinging back and forth earn nothing at all.
+    gaze_dwell: f32,
     /// Whether the pet has been seen at all yet (drives the fade-in).
     alpha: f32,
 
@@ -1361,6 +1511,7 @@ pub struct PetBrain {
 impl Default for PetBrain {
     fn default() -> Self {
         Self {
+            species: PetSpecies::Cat,
             col: 0.0,
             row: 0.0,
             speed: 0.0,
@@ -1441,6 +1592,8 @@ impl Default for PetBrain {
             stumble_t: 0.0,
             leg_dist: 0.0,
             braking: false,
+            brake_over: None,
+            resume: None,
             bored_cool: 0.0,
             wriggle_t: 0.0,
             hide_to: None,
@@ -1461,6 +1614,7 @@ impl Default for PetBrain {
             mote_mark: 0,
             sit_front: false,
             peek: false,
+            gaze_dwell: 0.0,
             alpha: 0.0,
             worn: None,
             pending_worn: None,
@@ -1567,6 +1721,25 @@ impl PetBrain {
     /// now, so the export cannot be added here). Until then the documented
     /// default of 0 keeps today's authored-box anchor, and [`LEAD_MAX`] stays
     /// conservative for the same reason.
+    /// Choose which animal the pet is drawn as ([`PetSpecies`]).
+    ///
+    /// Safe to call every frame — it is a plain field write with no state to
+    /// invalidate, which is the point of applying the skin at `emit`: switching
+    /// `rainbow kitty pet` → `rainbow dog pet` in Settings swaps the sprite on
+    /// the very next frame WITHOUT resetting the companion. The pet keeps its
+    /// position, its gait phase, its mood and its sleep clock, so the change
+    /// reads as the same creature changing coat rather than a new pet
+    /// teleporting in mid-stride.
+    pub fn set_species(&mut self, species: PetSpecies) {
+        self.species = species;
+    }
+
+    /// The animal currently being drawn.
+    #[must_use]
+    pub fn species(&self) -> PetSpecies {
+        self.species
+    }
+
     pub fn set_body_left_px(&mut self, px: f32) {
         // NaN.max(0.0) is NaN — a non-finite inset keeps the last good one
         // (codex review, 2026-08-10).
@@ -1599,9 +1772,20 @@ impl PetBrain {
     /// the failure prompt in the gauntlet, a celebration emotionally cheering
     /// a failure (and landing '+' crosses on the user's own glyphs). The pet
     /// cannot reach that emitter from here; it can say when to be quiet.
+    ///
+    /// THE BORROWED DROOP COUNTS. A re-anchor hop replaces the pose with
+    /// `Leap`/`Land` for the half-second it is in the air, so reading the
+    /// action alone would blink this window SHUT mid-grief and open it again
+    /// on landing. That is worse than never having hushed at all: the one
+    /// moment a re-anchor happens is the moment a fresh prompt printed over
+    /// the cat — precisely when the caret-jump fanfare fires, and precisely
+    /// the F4a gauntlet failure (a star ring cheering on the failure prompt).
+    /// A pose the hop OWES BACK is a pose the pet is still in.
     #[must_use]
     pub fn grieving(&self) -> bool {
-        self.pending_sulk || self.action == PetAction::Droop
+        self.pending_sulk
+            || self.action == PetAction::Droop
+            || matches!(self.resume, Some((PetAction::Droop, _)))
     }
 
     /// The ink span of an integer row index, in fractional columns —
@@ -1704,18 +1888,23 @@ impl PetBrain {
         (beside, row)
     }
 
+    /// Is this eviction a RE-ANCHOR (a hop) rather than a step aside (a
+    /// glide)? Two ways to earn the arc: a column displacement past
+    /// [`INK_EVICT_MAX`], or any change of row at all — a cat does not walk
+    /// between lines, it hops them, which is the law the chase has enforced
+    /// since the Enter hop.
+    fn is_re_anchor(from_col: f32, to_col: f32, from_row: f32, to_row: f32) -> bool {
+        (to_col - from_col).abs() > INK_EVICT_MAX || (to_row - from_row).abs() >= 0.5
+    }
+
     /// A grounded pose's step aside: `from` moved toward `to`, at most
-    /// [`INK_EVICT_SPEED`] cells this frame — but only while the whole trip
-    /// is a step aside. A displacement past [`INK_EVICT_MAX`] is the F1
-    /// re-anchor (a pose left behind by output, re-staged where the caret
-    /// now is) and lands outright: gliding it would be a grounded pose
-    /// sliding across the screen on its belly, which is a worse lie than the
-    /// cut it replaced.
+    /// [`INK_EVICT_SPEED`] cells this frame. Only ever called for a trip that
+    /// IS a step aside — anything past [`INK_EVICT_MAX`] is the F1 re-anchor
+    /// and [`Self::is_re_anchor`] routes it to the hop instead, so the
+    /// old one-frame landing here is gone. The clamp survives as a guard: a
+    /// glide never overshoots its stand, however long the frame was.
     fn evict_toward(from: f32, to: f32, dt: f32) -> f32 {
         let delta = to - from;
-        if delta.abs() > INK_EVICT_MAX {
-            return to;
-        }
         let step = INK_EVICT_SPEED * dt.max(0.0);
         if delta.abs() <= step {
             to
@@ -1991,6 +2180,8 @@ impl PetBrain {
             self.land_t = 0.0;
             self.land_span = 0.0;
             self.skid_dir = 0.0;
+            // …and the pose a re-anchor hop owed back: no audience, no debt.
+            self.resume = None;
             // A hidden caret retires the handoff theater outright: the
             // park-until-hidden fallback right above IS the landing now.
             self.handoff_out = None;
@@ -2000,13 +2191,16 @@ impl PetBrain {
             // Micro-life sleeps with the audience gone.
             self.twitch_t = 0.0;
             self.last_burst = false;
-            // No caret, no gaze: a hidden cursor is not a thing to look at.
+            // No caret, no gaze: a hidden cursor is not a thing to look at,
+            // and a dwell it was earning dies with it.
             self.sit_front = false;
             self.peek = false;
+            self.gaze_dwell = 0.0;
             // The wave-4 comedy dies with the audience too.
             self.tennis = false;
             self.stumble_t = 0.0;
             self.braking = false;
+            self.brake_over = None;
             self.leg_dist = 0.0;
             self.wriggle_t = 0.0;
             self.hide_to = None;
@@ -2090,6 +2284,9 @@ impl PetBrain {
             self.flight = None;
             self.land_t = 0.0;
             self.hop_crouch = false;
+            // A re-anchor hop cancelled mid-air owes nothing: reduced motion
+            // has no poses to hand back to, only the station.
+            self.resume = None;
             self.flinch_t = 0.0;
             self.vhat = 0.0;
             self.pending_wall_transit = false;
@@ -2391,13 +2588,17 @@ impl PetBrain {
         // the cheer straddling two inked prompt rows, the droop skulking over
         // the failed command, the wake atop "printf". The moment glyphs
         // invade a grounded footprint, the pose re-anchors to the ink-safe
-        // station — POSITION ONLY: the sleeper keeps its sleep, its quiet and
-        // its released frame lane (anchor math without animation is free), a
-        // hold keeps its clock, and only the droop restarts so grief replays
-        // where it can actually be READ. A live watcher re-stations inside
-        // its own row instead — the hug below owns its row choice. Travel
-        // states are exempt: a flight repositions by construction, and its
-        // aim is already ink-safe at launch.
+        // station — and it TRAVELS there. A step aside glides
+        // ([`Self::evict_toward`]); anything further, or any change of row,
+        // is a HOP, the pet's own vocabulary for changing where it is. The
+        // pose and its hold clock are borrowed for the arc and handed back
+        // on landing (`resume`), so F1's "pose and hold kept, feet moved"
+        // still holds — the sleeper wakes up in mid-air and goes straight
+        // back to sleep on the far side, the droop resumes grieving where
+        // the grief can be READ. A live watcher re-stations inside its own
+        // row instead — the hug below owns its row choice. Travel states are
+        // exempt: a flight repositions by construction, and its aim is
+        // already ink-safe at launch.
         //
         // A SETTLED pose with travel already latched is exempt too, and the
         // exemption is load-bearing: evicting it would snap the pet to the
@@ -2442,17 +2643,45 @@ impl PetBrain {
                 self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
             };
             let moved_off = (safe - self.col).abs() > f32::EPSILON;
-            self.col = Self::evict_toward(self.col, safe, dt);
-            if !watching {
-                self.row = safe_row;
-                // Grief replays where it can be READ — but only once the
-                // pose has ground to replay ON. Restarting the clock when
-                // the law has nowhere to send the pet (a row walled shut on
-                // both sides, its neighbours inked) would pin the droop
-                // forever.
-                if self.action == PetAction::Droop && moved_off {
-                    self.action_t = 0.0;
-                }
+            let safe_row = if watching { self.row } else { safe_row };
+            // Grief replays where it can be READ — but only once the pose has
+            // ground to replay ON. Restarting the clock when the law has
+            // nowhere to send the pet (a row walled shut on both sides, its
+            // neighbours inked) would pin the droop forever. Read BEFORE the
+            // hop below borrows the pose, and folded into what the hop owes
+            // back, so the grief resumes from its top either way.
+            if !watching && self.action == PetAction::Droop && moved_off {
+                self.action_t = 0.0;
+            }
+            if Self::is_re_anchor(self.col, safe, self.row, safe_row) {
+                // THE RE-ANCHOR IS A HOP (owner ruling, 2026-08-10: "when the
+                // kitty teleports without an animation, it looks bad"). It
+                // used to land in ONE frame — up to a screen's width and a
+                // row of it — on the argument that gliding a grounded pose
+                // across the glass on its belly was a worse lie than the cut.
+                // Both are lies; the pet has a third answer and has had it
+                // all along. `flight_shape`'s vertical branch is the same
+                // curve the "a row change is always a hop" arm uses, so a
+                // re-anchor reads as the hop it always should have been,
+                // clamped at [`FLIGHT_MAX`] however far it has to go.
+                //
+                // No gather: the crouch's anticipation is for a jump the pet
+                // CHOSE. This one is the world shoving it off its spot, and a
+                // shoved cat leaves at once — which is also what keeps the
+                // F1 law that a pose may never loiter on the user's words.
+                self.resume = Some((self.action, self.action_t));
+                self.hop_crouch = false;
+                self.big_gather = false;
+                let (dur, arc) = Self::flight_shape((safe - self.col).abs(), true);
+                self.begin_arc(safe, safe_row, dur, arc, false);
+            } else {
+                // A step aside is a step aside: the column glides and the row
+                // does not move at all. `is_re_anchor` already proved the
+                // ladder's row is this one (stands are whole rows, so "within
+                // half a cell" means "the same"), and assigning it anyway
+                // would leave the law with a half-cell of unanimated slack
+                // for no behaviour at all.
+                self.col = Self::evict_toward(self.col, safe, dt);
             }
         }
 
@@ -2559,7 +2788,31 @@ impl PetBrain {
                 let aim = self
                     .station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w)
                     .0;
-                f.to_col = (aim + predict).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                let to = (aim + predict).clamp(0.0, (f32::from(sense.cols) - width).max(0.0));
+                // REBASE, or the re-aim IS a teleport.
+                //
+                // Position on an arc is `from + (to - from)·u`, so moving `to`
+                // under a live `u` moves the cat THIS FRAME by `(to - to')·u`
+                // — mid-flight, that is half the retarget distance in one
+                // tick. Measured by the law test before this line existed: a
+                // Leap crossing 35 cells between two frames, 76.10 -> 41.04,
+                // against a bound of 1.51. A re-aim changes where the arc is
+                // GOING; it may never change where the cat IS.
+                //
+                // Solve for the launch point that keeps the current drawn
+                // position on the new curve at the CURRENT `u` (this runs
+                // before `f.t` advances, so `u` is the frame already on
+                // glass): `from' + (to' - from')·u == col`.
+                let u_now = (f.t / f.dur).clamp(0.0, 1.0);
+                if u_now <= REAIM_MAX_U {
+                    f.from_col = (self.col - to * u_now) / (1.0 - u_now);
+                    f.to_col = to;
+                }
+                // Past the bar the rebase is skipped entirely rather than
+                // clamped: `1 - u` is vanishing there, so the solved launch
+                // point runs away to infinity, and a landing that close is
+                // better served by letting the flight finish and the chase
+                // pick up the new station on its feet.
                 // A re-aimed FIRST bound orphans its second: the split was
                 // computed against the old target, and keeping it would land
                 // the cat at the new station only to bound all the way back
@@ -2621,6 +2874,28 @@ impl PetBrain {
             && let Some((c2, r2)) = self.bound2.take()
         {
             self.begin_big_arc(c2, r2);
+            return self.emit(sense, width);
+        }
+
+        // A RE-ANCHOR hop's landing recovery just expired: the borrowed pose
+        // comes back with its clock, which is what keeps F1's "pose and hold
+        // kept" true across an arc that necessarily replaced the pose to draw
+        // the cat in the air.
+        //
+        // Unconditional, unlike the play flourish below — and that is the
+        // point. This is not a reward the pet has earned and can be talked
+        // out of; it is the state it was already IN, which a hop borrowed for
+        // a third of a second. A latched pounce is not lost by handing it
+        // back: the one-shot holds have always outranked travel ("they hold
+        // the ground for seconds either way"), so the wake stretch plays out
+        // and the pounce fires after it, exactly as it would have if the
+        // world had never inked the cat's spot.
+        if self.action == PetAction::Land
+            && self.land_t <= 0.0
+            && let Some((pose, held)) = self.resume.take()
+        {
+            self.set_action(pose);
+            self.action_t = held;
             return self.emit(sense, width);
         }
 
@@ -2975,27 +3250,54 @@ impl PetBrain {
         self.stride = (self.stride + travelled / stride_cells).rem_euclid(1024.0);
         self.content = (self.content + travelled * CONTENT_PER_CELL).min(1.0);
 
-        // Overshoot guard: a follower must never oscillate around its station
-        // — EXCEPT the drift-brake (wave 4): a long gallop that crosses its
-        // station blows past it by BRAKE_OVERSHOOT on purpose, flips to face
-        // its mistake, and trots back. Once per leg; the guard owns every
-        // other crossing.
-        if (target - self.col).signum() != gap.signum() {
-            if !self.braking
-                && self.pursuit_t.is_none()
-                && self.leg_dist >= BRAKE_DIST
-                && self.speed.abs() > RUN_SPEED
-                && self.content >= SKIP_CONTENT
-            {
-                self.braking = true;
-                self.col = target + BRAKE_OVERSHOOT * gap.signum();
-                self.speed *= 0.15;
-                self.stumble_t = STUMBLE_DUR;
-                self.spawn_dust(width);
-            } else {
-                self.col = target;
-                self.speed *= 0.25;
-            }
+        // THE DRIFT-BRAKE (wave 4): a long gallop that crosses its station
+        // blows past it by [`BRAKE_OVERSHOOT`] on purpose, flips to face its
+        // mistake, and trots back. Once per leg.
+        //
+        // The overshoot is a place the pet RUNS to, never a place it is PUT
+        // (owner ruling, 2026-08-10). Wave 4 assigned the far side of the
+        // station outright, which is up to two cells of pop between two
+        // frames — six times what [`MAX_SPEED`] can legally cover in one —
+        // during the very moment the gallop is meant to read as momentum.
+        // Arming only moves the AIM; the guard below stands down until the
+        // paws get there, and the stumble is the same beat it always was.
+        if !self.braking
+            && (target - self.col).signum() != gap.signum()
+            && self.pursuit_t.is_none()
+            && self.leg_dist >= BRAKE_DIST
+            && self.speed.abs() > RUN_SPEED
+            && self.content >= SKIP_CONTENT
+        {
+            self.braking = true;
+            // Wall-clamped like every other aim: an overshoot the viewport
+            // will not let the paws reach is one the run-out could never end
+            // on, and it would hold the aim off the station indefinitely.
+            self.brake_over = Some(
+                (target + BRAKE_OVERSHOOT * gap.signum())
+                    .clamp(0.0, (f32::from(sense.cols) - width).max(0.0)),
+            );
+            self.speed *= 0.15;
+            self.stumble_t = STUMBLE_DUR;
+            self.spawn_dust(width);
+        }
+        // The run-out is spent the moment the paws reach it: the aim comes
+        // home and the cat trots back. `braking` outlives the run-out (it is
+        // cleared at arrival) so the trot cannot arm a brake of its own and
+        // set the follower wobbling.
+        if let Some(over) = self.brake_over
+            && (over - self.col).abs() <= ARRIVED
+        {
+            self.brake_over = None;
+        }
+
+        // Overshoot guard: a follower must never oscillate around its aim, so
+        // a step that CROSSES the aim stops on it — a clamp, which can only
+        // ever shorten the frame's travel.
+        let aim = self.brake_over.unwrap_or(target);
+        let prev_col = self.col - step;
+        if (aim - self.col).signum() != (aim - prev_col).signum() {
+            self.col = aim;
+            self.speed *= 0.25;
         }
 
         if self.speed.abs() > FLIP_SPEED {
@@ -3008,6 +3310,7 @@ impl PetBrain {
             // a live overshoot is done trotting back (wave 4).
             self.leg_dist = 0.0;
             self.braking = false;
+            self.brake_over = None;
             // BREED HANDOFF: arriving at the EDGE begins the fade — the
             // walk-in home ends here too, and the doors reopen.
             if self.handoff_out.take().is_some() {
@@ -3182,7 +3485,7 @@ impl PetBrain {
                 Some((px, _)) if self.pointer_heat > 0.0 => px,
                 _ => f32::from(cc),
             };
-            self.settle_gaze(gaze_col, width);
+            self.settle_gaze(gaze_col, width, dt);
             // Gauntlet F9: the face-on sit (the hunt-and-peck stare) parks
             // its muzzle CLEAR of the caret cell — one small deterministic
             // scoot at settle-turn time, only when the caret sits to the
@@ -3202,7 +3505,12 @@ impl PetBrain {
                 let clear = (f32::from(cc) + STATION_LEAD + PECK_CLEAR)
                     .min((f32::from(sense.cols) - width).max(0.0));
                 if self.col < clear {
-                    self.col = clear;
+                    // Rationed like the step aside, for the same reason: the
+                    // scoot is usually PECK_CLEAR of a cell and looks like
+                    // nothing either way, but from a stand ARRIVED short of
+                    // the station it is over a cell, and no cell of this cat
+                    // moves without being walked (owner ruling, 2026-08-10).
+                    self.col = Self::evict_toward(self.col, clear, dt);
                 }
             }
             self.tend_motes(width);
@@ -3629,27 +3937,73 @@ impl PetBrain {
     /// tick, so the flags can never go stale against a target that moved
     /// (a caret move resets `quiet` and closes the gaze until the next
     /// settle anyway).
-    fn settle_gaze(&mut self, target_col: f32, width: f32) {
+    ///
+    /// THE BODY'S TURN IS RATIONED; the glance is not. A settled pet's facing
+    /// is the only thing here a jittering target could strobe, so the turn is
+    /// gated by a dead band, a dwell, and — deeply asleep — nothing at all;
+    /// see the [`GAZE_FLIP_BAND`] block for the ruling and the argument. The
+    /// over-the-shoulder `peek` stays instantaneous on purpose: a glance
+    /// costs the animal nothing, which is exactly why it is the answer to a
+    /// target the body should not chase.
+    fn settle_gaze(&mut self, target_col: f32, width: f32, dt: f32) {
         if !self.action.settled() || self.quiet < SETTLE_TURN {
             self.sit_front = false;
             self.peek = false;
+            self.gaze_dwell = 0.0;
             return;
         }
+        let asleep = self.action == PetAction::Sleep;
         let gap = self.col - target_col;
-        let target_left = target_col + 0.5 < self.col + width * 0.5;
+        // Which side of the pet's own midline the target is on — or NEITHER,
+        // inside the dead band, where a sub-cell wobble is not a direction.
+        let off = target_col + 0.5 - (self.col + width * 0.5);
+        let band = if asleep {
+            SLEEP_FLIP_BAND
+        } else {
+            GAZE_FLIP_BAND
+        };
+        let side = if off < -band {
+            Some(true)
+        } else if off > band {
+            Some(false)
+        } else {
+            None
+        };
         self.sit_front = gap.abs() < SIT_FRONT_GAP;
+        let behind = side.is_some_and(|left| left != self.facing_left);
         if self.sit_front {
-            // Eye contact: face the thing you are meeting.
-            self.facing_left = target_left;
+            // Eye contact: face the thing you are meeting — once it has held
+            // still long enough to be worth turning over for.
+            //
+            // The dwell clock measures STAYING, not being, so a target that
+            // keeps changing its mind rewinds it every time it crosses back.
+            // It runs only in HERE, where a turn is actually on the table: a
+            // clock ticking while the pet was only ever going to glance would
+            // hand its whole balance to whatever wandered into range next,
+            // which is the instant flip wearing a longer name.
+            if behind {
+                self.gaze_dwell += dt;
+            } else {
+                self.gaze_dwell = 0.0;
+            }
+            let dwell = if asleep {
+                SLEEP_FLIP_DWELL
+            } else {
+                SETTLE_FLIP_DWELL
+            };
+            // Deep sleep never turns: the pose's whole contract past the
+            // breath window is that the frame has settled for good.
+            let deep = asleep && self.quiet >= SLEEP_AFTER + BREATH_WINDOW;
+            if behind && !deep && self.gaze_dwell >= dwell {
+                self.facing_left = !self.facing_left;
+                self.gaze_dwell = 0.0;
+            }
             self.peek = false;
         } else {
             // Behind the facing ⇒ the over-the-shoulder peek; ahead of it
             // the pet is already looking the right way and simply sits.
-            self.peek = if self.facing_left {
-                !target_left
-            } else {
-                target_left
-            };
+            self.gaze_dwell = 0.0;
+            self.peek = behind;
         }
     }
 
@@ -3963,6 +4317,7 @@ impl PetBrain {
         self.facing_left = f32::from(caret_col) < self.col;
         self.sit_front = false;
         self.peek = false;
+        self.gaze_dwell = 0.0;
         if self.action != PetAction::Perk {
             self.set_action(PetAction::Perk);
         }
@@ -4203,18 +4558,17 @@ impl PetBrain {
                 }
             }
             PetAction::Loaf if self.wriggle_t > 0.0 => {
-                // THE WRIGGLE (wave 4b): rolling around on its back — the
-                // sleep and loaf silhouettes flip-flop on the beat, the
-                // facing swaps with them, and the belly bobs. The roll is
-                // faked from authored frames; a true roll cycle is rig work,
-                // queued for the art pipeline.
+                // THE ROLL (wave 4c art): the authored belly-up cycle —
+                // flop → flat-on-the-back → over-twist and back — dealt on
+                // the wiggle beat, with a whisper of belly bob on top. The
+                // frames carry the squirm now; the code only deals them.
                 let beat = ((WRIGGLE_DUR - self.wriggle_t) / WRIGGLE_BEAT) as u32;
                 let u = (WRIGGLE_DUR - self.wriggle_t) * 9.0;
-                scale_y *= 1.0 + 0.06 * u.sin();
-                if beat.is_multiple_of(2) {
-                    PetGlyphId::PetSleep0
-                } else {
-                    PetGlyphId::PetLoaf
+                scale_y *= 1.0 + 0.04 * u.sin();
+                match beat % 4 {
+                    0 => PetGlyphId::PetRoll0,
+                    2 => PetGlyphId::PetRoll2,
+                    _ => PetGlyphId::PetRoll1,
                 }
             }
             PetAction::Loaf => {
@@ -4398,7 +4752,11 @@ impl PetBrain {
         PetFrame {
             alpha: (self.alpha.clamp(0.0, 1.0) * 255.0) as u8,
             action: self.action,
-            pose,
+            // THE SPECIES SKIN, APPLIED LAST. Everything above chose a CAT
+            // pose; `skin` swaps in the same frame from another species'
+            // roster. Doing it here — at the one place a pose becomes a
+            // frame — is what lets the whole brain stay species-blind.
+            pose: self.species.skin(pose),
             col: self.col,
             row: self.row,
             lift,
@@ -4599,6 +4957,88 @@ impl PetBrain {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// THE SPECIES CONTRACT: every cat pose the brain can choose has a dog
+    /// counterpart, and the mapping is a permutation — distinct poses stay
+    /// distinct. Without both halves a dog could silently fall back to a cat
+    /// frame mid-gait (one wrong sprite in a four-beat walk is a visible
+    /// stutter), which the `unwrap_or(pose)` fallback would otherwise hide.
+    #[test]
+    fn every_cat_pose_has_a_distinct_dog_counterpart() {
+        let cats: Vec<PetGlyphId> = PET_GLYPH_IDS
+            .iter()
+            .copied()
+            .filter(|id| !PET_GLYPHS[*id as usize].id.starts_with("pet_dog_"))
+            .collect();
+        assert!(!cats.is_empty(), "the cat roster must not be empty");
+        // HashSet, not BTreeSet: `PetGlyphId` is codegen (cat_glyphs_codegen
+        // emits `#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]` for all
+        // three glyph enums), and this test wants set semantics, not ordering.
+        // Deriving `Ord` on a generated id enum to satisfy one assertion would
+        // widen the public trait surface of three types and invite code that
+        // depends on variant declaration order — which is emit order, not a
+        // meaningful rank.
+        let mut seen = std::collections::HashSet::new();
+        for cat in cats {
+            let dog = PetSpecies::Dog.skin(cat);
+            let (cat_id, dog_id) = (
+                PET_GLYPHS[cat as usize].id,
+                PET_GLYPHS[dog as usize].id,
+            );
+            assert_ne!(
+                dog, cat,
+                "{cat_id} fell back to the cat frame — no dog counterpart"
+            );
+            assert_eq!(
+                dog_id,
+                &format!("pet_dog_{}", cat_id.strip_prefix("pet_").unwrap()),
+                "{cat_id} mapped to the wrong dog pose"
+            );
+            assert!(seen.insert(dog), "{dog_id} claimed by two cat poses");
+        }
+    }
+
+    /// The cat skin is the identity, and re-skinning an already-skinned pose is
+    /// a no-op — `emit` applies `skin` every frame, so a non-idempotent mapping
+    /// would drift the sprite on each present.
+    #[test]
+    fn skinning_is_identity_for_cats_and_idempotent_for_dogs() {
+        for &id in PET_GLYPH_IDS {
+            assert_eq!(PetSpecies::Cat.skin(id), id, "the cat skin is identity");
+            let dog = PetSpecies::Dog.skin(id);
+            assert_eq!(
+                PetSpecies::Dog.skin(dog),
+                dog,
+                "{} re-skinned to a different pose",
+                PET_GLYPHS[dog as usize].id
+            );
+        }
+    }
+
+    /// Switching species must not disturb the companion: the pet keeps its
+    /// place, its gait phase and its mood, because the skin is applied at
+    /// `emit` rather than by rebuilding the brain.
+    #[test]
+    fn changing_species_preserves_the_pets_state() {
+        let mut pet = PetBrain::default();
+        let t = Instant::now();
+        for i in 0..40 {
+            pet.tick(sense(t + Duration::from_millis(i * 40), Some((4, 10 + i as u16 % 7))));
+        }
+        let before = pet.tick(sense(t + Duration::from_millis(1600), Some((4, 20))));
+        pet.set_species(PetSpecies::Dog);
+        let after = pet.tick(sense(t + Duration::from_millis(1640), Some((4, 20))));
+        assert_eq!(pet.species(), PetSpecies::Dog);
+        assert_eq!(after.action, before.action, "the action must not reset");
+        assert!(
+            (after.col - before.col).abs() < 1.0,
+            "the pet must not teleport when its coat changes"
+        );
+        assert!(
+            PET_GLYPHS[after.pose as usize].id.starts_with("pet_dog_"),
+            "the very next frame must already be a dog"
+        );
+    }
 
     fn sense(now: Instant, caret: Option<(u16, u16)>) -> PetSense {
         PetSense {
@@ -5946,6 +6386,63 @@ mod tests {
         assert!(alphas.len() > 8, "and fade as they go");
     }
 
+    /// [`ZEE_EVERY`] is pinned from BOTH sides, on the real tick loop.
+    ///
+    /// The owner asked for the sleeper's z's more often (it is the pose an
+    /// idle terminal parks on, so it is the one they watch); the cadence has
+    /// to answer that without becoming the swarm the [`ZEE_ALIVE_MAX`] cap
+    /// exists to catch. So: the light-sleep spawn window must fit at least
+    /// five births — at the old 1.6 s it fitted four, and four over ~7.8 s
+    /// reads as intermittent rather than as breathing — while the lane never
+    /// actually reaches the cap, which is what keeps it a drift. The birth
+    /// rate is asserted under WCAG 2.3.1's 3 Hz general-flash bound too: this
+    /// is the crate's photosensitivity budget (see `cursor_rainbow`'s
+    /// twinkle), and a "more often" ask is exactly how one gets spent by
+    /// accident.
+    #[test]
+    fn the_sleep_zees_drift_at_a_breathing_cadence() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (mut t, _) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + 0.02);
+        // Slot-occupancy edges, so a birth is counted once however long the
+        // mote then lives (the sprite array is indexed, and `flatten()` —
+        // which the sibling test uses — would throw the identity away).
+        let mut was_zee = [false; PET_MOTES_MAX];
+        let mut births = 0usize;
+        let mut peak_alive = 0usize;
+        // The whole light-sleep window plus a margin: spawning is cut off at
+        // `SLEEP_AFTER + BREATH_WINDOW - ZEE_LIFE` by the idle-to-zero law.
+        let ticks = ((BREATH_WINDOW + 1.0) / 0.016) as u32;
+        for _ in 0..ticks {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            let mut alive = 0usize;
+            for (slot, m) in f.motes.iter().enumerate() {
+                let zee = matches!(m, Some(s) if s.kind == PetMoteKind::Zee);
+                births += usize::from(zee && !was_zee[slot]);
+                alive += usize::from(zee);
+                was_zee[slot] = zee;
+            }
+            peak_alive = peak_alive.max(alive);
+        }
+        assert!(
+            births >= 5,
+            "the light-sleep window fitted only {births} z's — the tell reads \
+             as intermittent, not as breathing"
+        );
+        assert!(
+            peak_alive < ZEE_ALIVE_MAX,
+            "{peak_alive} z's alive at once reaches the cap: that is a swarm, \
+             not a drift"
+        );
+        let hz = 1.0 / ZEE_EVERY;
+        assert!(
+            hz < 3.0,
+            "z births at {hz} Hz — over WCAG 2.3.1's 3 Hz general-flash bound"
+        );
+    }
+
     /// The purr tell: a settled, contented cat floats ♪ and ♥ motes on the
     /// same lane — and its chest swell is the deepened 5%.
     #[test]
@@ -7112,6 +7609,268 @@ mod tests {
         );
     }
 
+    /// The caret every sleeping-gaze fixture below parks beside.
+    const SLEEPER_CARET: (u16, u16) = (4, 12);
+
+    /// A cat asleep beside [`SLEEPER_CARET`], and the frame it dozed off on.
+    ///
+    /// `hop_first` picks WHICH sleeper, and both are needed because they face
+    /// opposite ways. A cat that simply settles ALWAYS dozes off facing left —
+    /// the station parks it one cell past the caret, so the only thing near
+    /// enough to make eye contact with is behind it on the left. The
+    /// right-facing sleeper is real but arrives the other way: a prompt
+    /// printing under a sleeper re-anchors it with a HOP, and a hop rightward
+    /// sets the travel facing on the way out, so the cat lands still asleep
+    /// with its back to the caret's side of the world.
+    fn a_sleeping_cat(hop_first: bool) -> (PetBrain, Instant, PetFrame) {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let w = art_cols(10, 20);
+        let t = awake(&mut pet, start, SLEEPER_CARET.0, SLEEPER_CARET.1);
+        let (mut t, mut f) = idle(&mut pet, t, SLEEPER_CARET, SLEEP_AFTER + 1.0);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: a sleeping cat");
+        if hop_first {
+            let inked_to = (f.col + w + 3.0) as u16;
+            let spans = vec![(0u16, inked_to); 8];
+            pet.sense_ink(0, &spans, Some(SLEEPER_CARET.0));
+            for _ in 0..60 {
+                t += Duration::from_millis(16);
+                f = pet.tick(sense(t, Some(SLEEPER_CARET)));
+            }
+            assert_eq!(
+                f.action,
+                PetAction::Sleep,
+                "fixture: the hop handed the sleep back"
+            );
+            assert!(!f.facing_left, "fixture: the hop left it facing RIGHT");
+        }
+        (pet, t, f)
+    }
+
+    /// Swing the POINTER back and forth straight across a sleeping cat for
+    /// ~10 s at ~1.5 Hz, ±2.2 cells. Returns `(facing it dozed off with, body
+    /// turns, midline crossings, frames the gaze was in flip range)`.
+    fn swing_over_a_sleeper(hop_first: bool) -> (bool, u32, u32, u32) {
+        let caret = SLEEPER_CARET;
+        let w = art_cols(10, 20);
+        let (mut pet, mut t, f) = a_sleeping_cat(hop_first);
+        let (mid, row, facing0) = (f.col + w * 0.5, f.row, f.facing_left);
+        let (mut flips, mut crossed, mut in_range) = (0u32, 0u32, 0u32);
+        let (mut prev, mut side) = (facing0, 0.0f32);
+        for i in 0..600u16 {
+            let swing = 2.2 * (f32::from(i) * 0.016 * TAU * 1.5).sin();
+            t += Duration::from_millis(16);
+            let f = ptick(&mut pet, t, caret, Some((mid + swing, row)));
+            assert_eq!(
+                f.action,
+                PetAction::Sleep,
+                "fixture: a wandering pointer does not wake it"
+            );
+            if swing.signum() != side.signum() {
+                crossed += 1;
+                side = swing;
+            }
+            if pet.sit_front {
+                in_range += 1;
+            }
+            if f.facing_left != prev {
+                flips += 1;
+                prev = f.facing_left;
+            }
+        }
+        assert!(
+            pet.pointer_heat > 0.0,
+            "fixture: the swinging is fast enough to hold the pet's gaze"
+        );
+        (facing0, flips, crossed, in_range)
+    }
+
+    /// OWNER, 2026-08-12: "when it's sleeping, and the cursor is near it and
+    /// moving back and forth, having the kitty flip instantly looks bad. I'd
+    /// like for that to be more subtle and realistic."
+    ///
+    /// The POINTER is the oscillator, and that is the whole reason the bug
+    /// could exist: a caret move wakes the cat before it can turn it, but a
+    /// mouse is not a keystroke, so a sleeping cat kept re-deciding its facing
+    /// off a wandering pointer sixty times a second.
+    ///
+    /// BOTH doze-off facings are driven, because they are stopped by
+    /// DIFFERENT brakes and one fixture would have pinned only one of them.
+    /// A cat asleep facing LEFT is held by the DEAD BAND: the pointer can
+    /// only get far enough round to its right to count as a side by leaving
+    /// eye-contact range altogether, where the body does not turn at all. A
+    /// cat asleep facing RIGHT genuinely does see the pointer arrive behind
+    /// it, in range, several times a second — and is held by the DWELL,
+    /// because not one of those crossings ever stays.
+    #[test]
+    fn a_cursor_swinging_over_a_sleeping_cat_never_flips_it() {
+        for hop_first in [false, true] {
+            let (facing0, flips, crossed, in_range) = swing_over_a_sleeper(hop_first);
+            // The fixture really does swing over the cat, repeatedly, with the
+            // gaze inside the range where a body turn is even possible…
+            assert!(
+                crossed >= 20,
+                "fixture is inert — the pointer crossed the cat only {crossed} \
+                 times (facing_left {facing0})"
+            );
+            assert!(
+                in_range >= 100,
+                "fixture never reached eye-contact range ({in_range} frames, \
+                 facing_left {facing0}) — the turn branch was never entered"
+            );
+            // …and the sleeping cat does not answer it with its body.
+            assert_eq!(
+                flips, 0,
+                "the sleeping cat (facing_left {facing0}) turned over {flips} \
+                 times chasing the cursor"
+            );
+        }
+    }
+
+    /// The DEAD BAND's own case, which no amount of dwell would cover: a
+    /// pointer that is not swinging across the cat at all but simply SITTING
+    /// on it — a hair behind its nose, held there, moving only up and down so
+    /// the gaze stays live. That target never changes its mind, so the dwell
+    /// clock fills; the only thing standing between a sleeping cat and a
+    /// body-flip at three-fifths of a cell is the band saying that is not a
+    /// direction, it is the middle.
+    #[test]
+    fn a_cursor_resting_on_a_sleeping_cat_is_not_a_side_to_turn_to() {
+        let w = art_cols(10, 20);
+        let (mut pet, mut t, f) = a_sleeping_cat(true);
+        assert!(!f.facing_left, "fixture: asleep facing right");
+        // Just BEHIND the nose — inside the band, well inside eye-contact
+        // range — and pinned there for ten seconds.
+        let px = f.col + w * 0.5 - 0.5 - 0.6;
+        let facing0 = f.facing_left;
+        let (mut flips, mut prev, mut in_range) = (0u32, facing0, 0u32);
+        for i in 0..600u16 {
+            // Vertical only: the pointer is plainly alive (~10 cells/s, over
+            // the gaze-follow bar) without its column ever moving.
+            let py = f.row + 0.8 * (f32::from(i) * 0.016 * TAU * 2.0).sin();
+            t += Duration::from_millis(16);
+            let g = ptick(&mut pet, t, SLEEPER_CARET, Some((px, py)));
+            assert_eq!(g.action, PetAction::Sleep, "fixture: it stays asleep");
+            if pet.sit_front {
+                in_range += 1;
+            }
+            if g.facing_left != prev {
+                flips += 1;
+                prev = g.facing_left;
+            }
+        }
+        assert!(
+            pet.pointer_heat > 0.0,
+            "fixture: the pointer is live, so the gaze is really on it"
+        );
+        assert!(
+            in_range >= 500,
+            "fixture: the pointer sat in eye-contact range ({in_range} frames)"
+        );
+        assert_eq!(
+            flips, 0,
+            "a cursor resting on the cat turned it over {flips} times"
+        );
+    }
+
+    /// Hold the POINTER at `off` cells from a sleeping cat's midline for
+    /// `secs`, alive but with its column pinned, and report the frame index it
+    /// turned over on (if it ever did).
+    fn hover_beside_a_sleeper(
+        pet: &mut PetBrain,
+        start: Instant,
+        at: &PetFrame,
+        off: f32,
+        secs: f32,
+    ) -> Option<u16> {
+        let w = art_cols(10, 20);
+        let px = at.col + w * 0.5 - 0.5 + off;
+        let (mut t, mut turned) = (start, None);
+        let frames = (secs / 0.016) as u16;
+        for i in 0..frames {
+            let py = at.row + 0.8 * (f32::from(i) * 0.016 * TAU * 2.0).sin();
+            t += Duration::from_millis(16);
+            let g = ptick(pet, t, SLEEPER_CARET, Some((px, py)));
+            assert_eq!(g.action, PetAction::Sleep, "fixture: it stays asleep");
+            if g.facing_left != at.facing_left && turned.is_none() {
+                turned = Some(i);
+            }
+        }
+        assert!(pet.pointer_heat > 0.0, "fixture: the pointer stayed live");
+        turned
+    }
+
+    /// The third brake, and the proof the other two did not simply nail the
+    /// cat's head on. A cursor that COMMITS — parked past the dead band,
+    /// behind the cat, and left there — is not an oscillation, and a lightly
+    /// sleeping cat does eventually come round to it: that is the drowsy
+    /// shift the ruling asked for, not the instant flip it forbade. Past the
+    /// breath window it stops even doing that, because a deeply asleep pet is
+    /// the one state this module promises is perfectly still, so the frame
+    /// settles and the host can idle to zero.
+    #[test]
+    fn a_light_sleeper_comes_round_slowly_and_a_deep_one_not_at_all() {
+        // LIGHT sleep: it turns, but only after the dwell has been paid.
+        let (mut pet, t, f) = a_sleeping_cat(true);
+        assert!(!f.facing_left, "fixture: asleep facing right");
+        let turned = hover_beside_a_sleeper(&mut pet, t, &f, -1.6, 3.0)
+            .expect("a light sleeper still notices what stays put");
+        assert!(
+            f32::from(turned) * 0.016 >= SLEEP_FLIP_DWELL,
+            "it came round on frame {turned} — before the dwell was even paid"
+        );
+
+        // DEEP sleep: the same cursor, in the same place, for the same time.
+        let (mut pet, t, _) = a_sleeping_cat(true);
+        let (t, f) = idle(&mut pet, t, SLEEPER_CARET, BREATH_WINDOW + 1.0);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: still asleep");
+        assert!(
+            pet.quiet >= SLEEP_AFTER + BREATH_WINDOW,
+            "fixture: past the breath window (quiet {})",
+            pet.quiet
+        );
+        assert!(!f.facing_left, "fixture: still facing right");
+        assert_eq!(
+            hover_beside_a_sleeper(&mut pet, t, &f, -1.6, 3.0),
+            None,
+            "a deeply asleep cat is perfectly still — it does not turn over"
+        );
+    }
+
+    /// The other half of the ruling: the brakes are on the SETTLED gaze, not
+    /// on the animal. A sleeping cat still wakes, and the moment it is awake
+    /// and walking it faces where it is going on the ordinary
+    /// [`FLIP_SPEED`] rule — no dwell, no dead band, no waiting.
+    #[test]
+    fn the_gaze_brakes_never_reach_the_waking_chase() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 60);
+        let (mut t, f) = idle(&mut pet, t, (4, 60), SLEEP_AFTER + 1.0);
+        assert_eq!(f.action, PetAction::Sleep, "fixture: a sleeping cat");
+        // Whichever way it dozed off, the caret reappears BEHIND it — so the
+        // chase can only reach the caret by turning the body round.
+        let asleep_facing = f.facing_left;
+        let caret = if asleep_facing { 95 } else { 10 };
+        let mut turned = None;
+        for i in 0..180u16 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, caret))));
+            if f.facing_left != asleep_facing && turned.is_none() {
+                turned = Some((i, f.action));
+            }
+        }
+        let (frame, action) = turned.expect("it must turn to chase a caret behind it");
+        assert!(
+            matches!(action, PetAction::Leap | PetAction::Crouch) || !action.settled(),
+            "the turn came from travel, not from the settled gaze (got {action:?})"
+        );
+        assert!(
+            frame < 120,
+            "and it turned while getting under way, not {frame} frames later"
+        );
+    }
+
     /// Drive one straight leftward dash from `from` toward `to` at ~62
     /// cells/s, returning what the pet did along the way.
     fn dash(
@@ -7188,8 +7947,7 @@ mod tests {
         for _ in 0..600 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some((4, 44))));
-            acted |= matches!(f.action, PetAction::Frolic | PetAction::Loaf)
-                || pet.wriggle_t > 0.0;
+            acted |= matches!(f.action, PetAction::Frolic | PetAction::Loaf) || pet.wriggle_t > 0.0;
         }
         assert!(acted, "a bored content cat demands attention");
         assert!(pet.bored_cool > 0.0, "and pays the cooldown for it");
@@ -7340,9 +8098,15 @@ mod tests {
         b > first && a < end
     }
 
-    /// F1, the systemic root: a settled pose whose ground the world has
-    /// typed over re-anchors to blank cells the very next tick — pose and
-    /// hold kept, feet moved.
+    /// F1, the systemic root: a settled pose whose ground the world has typed
+    /// over re-anchors to blank cells — pose and hold kept, feet moved.
+    ///
+    /// The feet now move by HOPPING (owner ruling, 2026-08-10), so the "very
+    /// next tick" clause of the original had to go: no animation finishes in
+    /// 16 ms. What F1 was really buying is intact and is what is asserted
+    /// here — the pose does not LOITER on the user's words (it is airborne on
+    /// the tick the ink lands, no gather, no dawdling), it ends up on blank
+    /// ground, and the settle it was holding is the settle it comes back to.
     #[test]
     fn event_pose_retargets_off_ink() {
         let start = Instant::now();
@@ -7358,23 +8122,35 @@ mod tests {
         let spans = vec![(0u16, inked_to); 6];
         pet.sense_ink(0, &spans, Some(4));
         t += Duration::from_millis(16);
-        let f = pet.tick(sense(t, Some((4, 12))));
+        let f1 = pet.tick(sense(t, Some((4, 12))));
+        assert_eq!(
+            f1.action,
+            PetAction::Leap,
+            "one tick after the ink invades the pose is already leaving, \
+             got {:?}",
+            f1.action
+        );
+        let (_, f2) = idle(&mut pet, t, (4, 12), 1.2);
         assert!(
-            !on_ink(&f, (0, inked_to), w),
-            "one tick after the ink invades, the pose stands on blank cells \
-             (col {}, ink to {inked_to})",
-            f.col
+            !on_ink(&f2, (0, inked_to), w),
+            "and the trip ends on blank cells (col {}, ink to {inked_to})",
+            f2.col
         );
         assert!(
-            f.action.settled(),
+            f2.action.settled(),
             "and the settle survives the move, got {:?}",
-            f.action
+            f2.action
         );
     }
 
     /// F2: the sleeper's anchor follows the prompt. Typing under a sleeping
     /// cat wakes it — and the wake stretch must play on blank ground, not on
     /// top of the words that grew while it slept (b07_wake_009).
+    ///
+    /// Post-ruling the wake and the move are two beats instead of one: the
+    /// stretch is BORROWED by the hop that carries the cat off the words and
+    /// handed back when the paws are down, so the stretch still plays — just
+    /// where it can be seen, which is the whole point of b07_wake_009.
     #[test]
     fn the_sleeper_follows_the_prompt() {
         let start = Instant::now();
@@ -7388,21 +8164,60 @@ mod tests {
         let spans = vec![(0u16, inked_to); 6];
         pet.sense_ink(0, &spans, Some(2));
         t += Duration::from_millis(16);
-        let f = pet.tick(sense(t, Some((2, inked_to))));
-        assert_eq!(f.action, PetAction::Waking, "typing wakes it");
-        assert!(
-            !on_ink(&f, (0, inked_to), w),
-            "and the stretch plays OFF the ink, not atop the fresh words \
-             (col {}, ink to {inked_to})",
-            f.col
+        let f1 = pet.tick(sense(t, Some((2, inked_to))));
+        assert_eq!(
+            pet.resume.map(|(a, _)| a),
+            Some(PetAction::Waking),
+            "typing wakes it, and the hop owes the stretch back"
         );
+        assert_eq!(
+            f1.action,
+            PetAction::Leap,
+            "and it is already off the words"
+        );
+        // The stretch lands where it can be read.
+        let mut stretched_clear = false;
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((2, inked_to))));
+            if f.action == PetAction::Waking {
+                assert!(
+                    !on_ink(&f, (0, inked_to), w),
+                    "the stretch plays OFF the ink, not atop the fresh words \
+                     (col {}, ink to {inked_to})",
+                    f.col
+                );
+                stretched_clear = true;
+            }
+        }
+        assert!(stretched_clear, "the borrowed stretch must actually play");
     }
 
-    /// F2's frame-lane rider: a DEEP sleeper re-anchors instantly and
-    /// silently — position only, the released frame lane stays released
-    /// (anchor math without animation is free).
+    /// F2's frame-lane rider, RE-DECIDED (owner ruling, 2026-08-10).
+    ///
+    /// This test used to assert that a DEEP sleeper re-anchors instantly and
+    /// silently, on the reasoning that anchor math without animation is free
+    /// and a released frame lane should stay released. The sleeper is the one
+    /// case where the new law costs something real, so: it was decided
+    /// AGAINST the exemption, deliberately, because
+    ///
+    ///  * a deep sleeper is not invisible, it is merely still — the host has
+    ///    it fully drawn, and the instant it is re-anchored the next repaint
+    ///    shows it somewhere else. The teleport the owner judged on glass is
+    ///    exactly as visible on a sleeping cat as on a sitting one;
+    ///  * the lane is a question about MOTION, and the honest answer once
+    ///    there is motion to draw is `true`. Its cost is bounded by the arc
+    ///    ([`FLIGHT_MAX`] plus its landing) and is paid on a screen that is
+    ///    already repainting, because the only thing that fires this eviction
+    ///    is output arriving under the cat;
+    ///  * an exemption here would carve the law's hole in precisely the case
+    ///    the owner sees most — a log stream printing under a long-idle cat.
+    ///
+    /// What the test still owns, and the reason it is worth keeping, is that
+    /// the lane comes BACK: a re-anchor may not leave a sleeping cat pinning
+    /// the frame lane forever.
     #[test]
-    fn a_deep_sleep_re_anchor_keeps_the_lane_released() {
+    fn a_deep_sleep_re_anchor_hops_then_gives_the_lane_back() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
         let w = art_cols(10, 20);
@@ -7417,15 +8232,25 @@ mod tests {
         pet.sense_ink(0, &spans, Some(3));
         t += Duration::from_millis(16);
         let f2 = pet.tick(sense(t, Some((3, 12))));
-        assert_eq!(f2.action, PetAction::Sleep, "still asleep");
+        assert_eq!(
+            f2.action,
+            PetAction::Leap,
+            "a shoved cat gets up, got {:?}",
+            f2.action
+        );
+        assert!(pet.needs_frames(), "and the hop is owed frames to draw it");
+        // …and it goes straight back to sleep on the far side, with the lane
+        // released again — the deep sleeper's idle-to-zero is intact.
+        let (_, f3) = idle(&mut pet, t, (3, 12), 1.5);
+        assert_eq!(f3.action, PetAction::Sleep, "asleep again");
         assert!(
-            !on_ink(&f2, (0, inked_to), w),
+            !on_ink(&f3, (0, inked_to), w),
             "re-anchored off the ink (col {})",
-            f2.col
+            f3.col
         );
         assert!(
             !pet.needs_frames(),
-            "and the re-anchor must not un-release the frame lane"
+            "and the lane is released again once the paws are down"
         );
     }
 
@@ -7620,13 +8445,19 @@ mod tests {
         );
     }
 
-    /// The step aside is a little follower, not a cut — but only while it IS
-    /// a step aside. The F1 re-anchor (a pose left behind by output, re-staged
-    /// where the caret now is) still lands outright, because sliding a
-    /// grounded pose across the screen on its belly is a worse lie than the
-    /// cut it replaced.
+    /// The step aside is a little follower; the RE-ANCHOR is a hop.
+    ///
+    /// This test used to assert the opposite of its second half — that a
+    /// displacement past [`INK_EVICT_MAX`] landed in ONE frame, on the
+    /// argument that sliding a grounded pose across the glass on its belly
+    /// was a worse lie than the cut. The owner judged the cut on glass and
+    /// overruled it (2026-08-10: "the curso kitty sometimes teleports if the
+    /// text line suddenly changes… when the kitty teleports without an
+    /// animation, it looks bad"). The belly-slide was never the only other
+    /// answer: the pet has owned a way to change position since the Enter
+    /// hop, and the re-anchor now uses it.
     #[test]
-    fn a_step_aside_glides_and_a_re_anchor_lands() {
+    fn a_step_aside_glides_and_a_re_anchor_hops() {
         let dt = 1.0 / 60.0;
         let step = INK_EVICT_SPEED * dt;
         let mid = PetBrain::evict_toward(10.0, 13.0, dt);
@@ -7638,14 +8469,332 @@ mod tests {
             (PetBrain::evict_toward(10.0, 10.05, dt) - 10.05).abs() < 1e-6,
             "and never overshoots the last fraction of a cell"
         );
+        // The routing law itself: what the glide is allowed to be asked to do.
         assert!(
-            (PetBrain::evict_toward(10.0, 40.0, dt) - 40.0).abs() < 1e-6,
-            "a re-anchor past INK_EVICT_MAX lands in one frame"
+            !PetBrain::is_re_anchor(10.0, 13.0, 4.0, 4.0),
+            "a 3-cell sidestep on one row is a glide"
         );
         assert!(
-            (PetBrain::evict_toward(40.0, 10.0, dt) - 10.0).abs() < 1e-6,
+            PetBrain::is_re_anchor(10.0, 40.0, 4.0, 4.0),
+            "past INK_EVICT_MAX it is a hop"
+        );
+        assert!(
+            PetBrain::is_re_anchor(40.0, 10.0, 4.0, 4.0),
             "in either direction"
         );
+        assert!(
+            PetBrain::is_re_anchor(10.0, 10.0, 4.0, 5.0),
+            "and a row change is a hop however short the column move"
+        );
+    }
+
+    /// …and on the real brain: the eviction that used to CUT now leaves the
+    /// ground. A settled cat with a full-width line printed under it is
+    /// airborne on the tick the ink lands, and every frame of the trip is a
+    /// step a cat could take.
+    #[test]
+    fn a_re_anchor_leaves_the_ground_instead_of_cutting() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let w = art_cols(10, 20);
+        let mut t = awake(&mut pet, start, 6, 58);
+        let (t2, before) = idle(&mut pet, t, (6, 60), SIT_AFTER + 0.4);
+        t = t2;
+        assert!(before.action.settled(), "fixture: a settled cat");
+        // A wide block of output prints across the sitter's row AND its
+        // neighbours, so the ladder has to reach past the paragraph — the F1
+        // re-anchor at range, with the caret never moving (which is what
+        // keeps the big-jump choreography out of this).
+        let spans = vec![(0u16, 80u16); 12];
+        pet.sense_ink(0, &spans, Some(6));
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((6, 60))));
+        assert_eq!(
+            f.action,
+            PetAction::Leap,
+            "the re-anchor leaves the ground, got {:?}",
+            f.action
+        );
+        assert!(
+            (f.col - before.col).abs() < 6.0,
+            "and it is still near where it was on the first frame of the trip \
+             ({} → {})",
+            before.col,
+            f.col
+        );
+        // It gets there, and it gets its pose back with its clock.
+        let (_, after) = idle(&mut pet, t, (6, 60), 1.2);
+        assert!(
+            !on_ink(&after, (0, 80), w),
+            "the trip ends on blank ground (col {})",
+            after.col
+        );
+        assert!(
+            after.action.settled(),
+            "and the borrowed pose is handed back, got {:?}",
+            after.action
+        );
+    }
+
+    // ── THE LAW: nothing moves without moving ──────────────────────────
+
+    /// One 60 fps frame, judged against the law before it is handed back.
+    ///
+    /// `last` carries the previous frame's position AND the previous frame's
+    /// grid; the grid is part of it because a resize moves the coordinate
+    /// space, not the cat, and the viewport clamp in `emit` may take back
+    /// exactly as much as the space moved.
+    ///
+    /// The ceiling is the pet's fastest LEGAL motion for this frame:
+    /// [`MAX_SPEED`] on the ground, and — while a flight owns the position —
+    /// that arc's own interpolation rate, read on BOTH sides of the tick
+    /// because the frame an arc finishes on is still a flown frame.
+    fn lawful_tick(pet: &mut PetBrain, s: PetSense, last: &mut (f32, f32, u16, u16)) -> PetFrame {
+        const DT: f32 = 0.016;
+        let (c0, r0, cols0, rows0) = *last;
+        let w = art_cols(s.cell_w, s.cell_h);
+        let rate = |fl: Option<Flight>| {
+            fl.map_or((0.0, 0.0), |f| {
+                (
+                    (f.to_col - f.from_col).abs() / f.dur,
+                    (f.to_row - f.from_row).abs() / f.dur,
+                )
+            })
+        };
+        let (pre_c, pre_r) = rate(pet.flight);
+        let f = pet.tick(s);
+        let (post_c, post_r) = rate(pet.flight);
+        let give_col = ((f32::from(cols0) - w).max(0.0) - (f32::from(s.cols) - w).max(0.0)).abs();
+        let give_row =
+            (f32::from(rows0.saturating_sub(1)) - f32::from(s.rows.saturating_sub(1))).abs();
+        let col_bound = MAX_SPEED.max(pre_c).max(post_c) * DT + give_col + 1e-3;
+        // Nothing on the GROUND may change row: a row change is always a hop,
+        // so the only row budget is an arc's.
+        let row_bound = pre_r.max(post_r) * DT + give_row + 1e-3;
+        assert!(
+            (f.col - c0).abs() <= col_bound,
+            "the cat teleported {} cells sideways in one frame (bound {col_bound}): \
+             col {c0} → {}, action {:?}",
+            (f.col - c0).abs(),
+            f.col,
+            f.action
+        );
+        assert!(
+            (f.row - r0).abs() <= row_bound,
+            "the cat teleported {} rows in one frame (bound {row_bound}): \
+             row {r0} → {}, action {:?}",
+            (f.row - r0).abs(),
+            f.row,
+            f.action
+        );
+        *last = (f.col, f.row, s.cols, s.rows);
+        f
+    }
+
+    /// THE LAW (owner ruling, 2026-08-10): "when the kitty teleports without
+    /// an animation, it looks bad."
+    ///
+    /// Pinned as a law rather than as a list of cases. A demanding script —
+    /// typing, a line cleared out from under the cat, an ink storm of
+    /// suggested text, a caret hidden and returned somewhere else, a resize
+    /// both ways — is walked at 60 fps, and EVERY frame is checked: the pet's
+    /// displacement never exceeds what its fastest legal motion could have
+    /// covered in that frame. Six case tests cannot say that; this can.
+    ///
+    /// REDUCED MOTION IS EXEMPT, and is excluded here on purpose rather than
+    /// by accident: its whole contract is that the pet simply IS at its
+    /// station, with no motion of any kind in between, so under it every
+    /// caret move is a jump BY DESIGN. `reduced_motion` is never set in this
+    /// script; the reduced-motion tests own that arm.
+    #[test]
+    fn the_cat_never_changes_position_without_animating_it() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = start;
+        // The first sighting materialises at the station (alpha-gated, and
+        // correct: nothing was on the glass to move), so the law is seeded
+        // FROM it rather than applied TO it.
+        let f0 = pet.tick(sense(t, Some((6, 20))));
+        let mut last = (f0.col, f0.row, 100u16, 30u16);
+
+        // 1. TYPING: a long fast run across the pane, ink growing behind it.
+        for k in 0..280u16 {
+            let col = 20 + k % 70;
+            let mut spans = vec![(0u16, 0u16); 20];
+            spans[6] = (0, col);
+            pet.sense_ink(0, &spans, Some(6));
+            t += Duration::from_millis(16);
+            let _ = lawful_tick(&mut pet, sense(t, Some((6, col))), &mut last);
+        }
+
+        // 2. THE LINE CLEAR: the caret snaps home and the row's ink vanishes
+        // between two frames — Claude Code clearing its prompt.
+        for i in 0..120u16 {
+            let spans = vec![(0u16, 0u16); 20];
+            pet.sense_ink(0, &spans, Some(6));
+            t += Duration::from_millis(16);
+            let _ = lawful_tick(&mut pet, sense(t, Some((6, 2 + i % 3))), &mut last);
+        }
+
+        // 3. THE INK STORM: suggested text painting and un-painting under the
+        // cat while the caret sits still.
+        for i in 0..240u16 {
+            let mut spans = vec![(0u16, 0u16); 20];
+            let end = if i % 2 == 0 { 70 } else { 4 };
+            spans[4..9].fill((0, end));
+            pet.sense_ink(0, &spans, Some(6));
+            t += Duration::from_millis(16);
+            let _ = lawful_tick(&mut pet, sense(t, Some((6, 3))), &mut last);
+        }
+
+        // 4. THE CARET HIDE and a return somewhere else entirely.
+        pet.sense_ink(0, &[(0u16, 0u16); 20], Some(6));
+        t += Duration::from_millis(16);
+        let f = lawful_tick(&mut pet, sense(t, None), &mut last);
+        assert!(f.alpha > 100, "fixture: still plainly on the glass");
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            let _ = lawful_tick(&mut pet, sense(t, Some((22, 80))), &mut last);
+        }
+
+        // 5. THE RESIZE, both ways — the one frame where the coordinate space
+        // itself moves under the cat.
+        for (cols, rows, frames) in [(40u16, 12u16, 90), (100, 30, 90)] {
+            for _ in 0..frames {
+                t += Duration::from_millis(16);
+                let mut s = sense(t, Some((6, 20)));
+                s.cols = cols;
+                s.rows = rows;
+                let _ = lawful_tick(&mut pet, s, &mut last);
+            }
+        }
+
+        // 6. …and a long settle, which is where the peck scoot and the
+        // idle vignettes live.
+        for _ in 0..900 {
+            t += Duration::from_millis(16);
+            let _ = lawful_tick(&mut pet, sense(t, Some((6, 20))), &mut last);
+        }
+    }
+
+    /// THE OWNER'S REPRO, 2026-08-10: "the curso kitty sometimes teleports if
+    /// the text line suddenly changes (like in claude code if you clear the
+    /// line) — and there is a suggested text."
+    ///
+    /// The mechanism, isolated: the CARET barely moves, and the row's INK
+    /// changes drastically between frames — which is exactly what a ghost /
+    /// suggested completion does when it paints and un-paints under the cat.
+    /// The old law answered that with a cut of up to a screen's width; every
+    /// frame of the answer is now a step a cat could take.
+    #[test]
+    fn ghost_text_flickering_under_the_cat_never_teleports_it() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 6, 12);
+        let (t2, f) = idle(&mut pet, t, (6, 12), SIT_AFTER + 0.4);
+        t = t2;
+        assert!(
+            f.action.settled(),
+            "fixture: a settled cat beside the prompt"
+        );
+        let mut last = (f.col, f.row, 100u16, 30u16);
+        let mut worst = 0.0f32;
+        for i in 0..600u16 {
+            // The suggestion appears for a beat, then is dismissed: the row
+            // the cat is standing on goes from a stub to nearly the full
+            // width and back, several times a second.
+            let mut spans = vec![(0u16, 0u16); 20];
+            let end = if (i / 12) % 2 == 0 { 90 } else { 13 };
+            spans[6] = (0, end);
+            spans[5] = (0, end);
+            pet.sense_ink(0, &spans, Some(6));
+            t += Duration::from_millis(16);
+            let prev = (last.0, last.1);
+            let f = lawful_tick(&mut pet, sense(t, Some((6, 12))), &mut last);
+            worst = worst
+                .max((f.col - prev.0).abs())
+                .max((f.row - prev.1).abs());
+        }
+        // …and the law is not passing vacuously: the cat really did have to
+        // move, it just never blinked.
+        assert!(
+            worst > 0.01,
+            "fixture is inert — the ink storm never moved the cat at all"
+        );
+    }
+
+    /// [`REAIM_MAX_U`]'s own case, which the law script never reaches: a jump
+    /// arriving in the LAST few frames of an arc.
+    ///
+    /// The rebase solves `from' = (col - to'·u)/(1 - u)`. That denominator is
+    /// the whole reason the bar exists: at `u = 0.99` a two-cell retarget
+    /// throws the solved launch point two hundred cells off the glass, and
+    /// `u = 1.0` divides by zero outright — an infinite `from_col` makes the
+    /// very next `from + (to - from)·u` a NaN, and a NaN column is a cat that
+    /// is nowhere at all. Past the bar the re-aim is DROPPED (a cat that is
+    /// already landing should land), so this asserts the landing stayed where
+    /// the flight aimed it and every frame of the arc stayed finite.
+    #[test]
+    fn a_re_aim_in_the_last_frames_of_an_arc_is_dropped_not_solved() {
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 6, 20);
+        // A pounce: far enough to be a jump, ordinary enough to be one arc.
+        t += Duration::from_millis(16);
+        let _ = pet.tick(sense(t, Some((6, 20 + POUNCE_JUMP as u16 + 4))));
+        let caret = 20 + POUNCE_JUMP as u16 + 4;
+        let mut airborne = 0;
+        while pet.flight.is_none() && airborne < 30 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((6, caret))));
+            airborne += 1;
+        }
+        let f = pet.flight.expect("fixture: the pounce got off the ground");
+        let aimed = f.to_col;
+        // Fly it to the far side of the bar — the window the guard owns.
+        let mut last = pet.col;
+        while pet
+            .flight
+            .is_some_and(|f| (f.t / f.dur).clamp(0.0, 1.0) <= REAIM_MAX_U)
+        {
+            t += Duration::from_millis(16);
+            last = pet.tick(sense(t, Some((6, caret)))).col;
+        }
+        assert!(
+            pet.flight.is_some(),
+            "fixture: still airborne past the bar, with frames left to draw"
+        );
+        // …and NOW the caret jumps clear across the pane.
+        t += Duration::from_millis(16);
+        let f = pet.tick(sense(t, Some((6, 2))));
+        assert!(
+            f.col.is_finite() && f.row.is_finite(),
+            "the dropped re-aim left the cat somewhere real, got {} / {}",
+            f.col,
+            f.row
+        );
+        assert!(
+            (f.col - last).abs() < 2.0,
+            "and it did not swerve on the way down ({last} → {})",
+            f.col
+        );
+        assert_eq!(
+            pet.flight.map(|f| f.to_col),
+            Some(aimed),
+            "the flight keeps the target it was already landing on"
+        );
+        // Every remaining frame of the arc, and the landing itself, is real.
+        for _ in 0..30 {
+            t += Duration::from_millis(16);
+            let prev = last;
+            let f = pet.tick(sense(t, Some((6, 2))));
+            last = f.col;
+            assert!(
+                f.col.is_finite() && (f.col - prev).abs() < 2.0,
+                "the arc finished without a teleport ({prev} → {})",
+                f.col
+            );
+        }
     }
 
     /// F4a: the grief window. From the failure's note to the end of the
@@ -7683,6 +8832,17 @@ mod tests {
     /// fresh prompt prints over re-anchors beside the new caret and RESTARTS
     /// its hold — the sulk is a mood, and a mood interrupted at 0.1 s is a
     /// glitch.
+    ///
+    /// RE-DECIDED with the no-teleport ruling (2026-08-10). This test used to
+    /// demand the droop pose on the very tick the ink arrived, which was only
+    /// ever true because the re-anchor was a CUT — the pose could survive a
+    /// move that took no time. Now the move takes time: the hop borrows the
+    /// pose, and what the test owes is the same F4 promise stated over the
+    /// arc instead of over one frame — the trip is ANIMATED, the pet ends up
+    /// on ground where the grief can be read, the droop comes back, and it
+    /// comes back with a FULL beat. The grief WINDOW is asserted straight
+    /// through, every frame, because a hush that blinks off mid-hop lets the
+    /// fanfare fire on the failure prompt — the F4a gauntlet bug exactly.
     #[test]
     fn grief_replays_beside_the_new_prompt() {
         let start = Instant::now();
@@ -7708,13 +8868,43 @@ mod tests {
         pet.sense_ink(0, &spans, Some(4));
         t += Duration::from_millis(16);
         let f = pet.tick(sense(t, Some((4, inked_to))));
-        assert_eq!(f.action, PetAction::Droop, "the droop survives the move");
-        assert!(
-            !on_ink(&f, (0, inked_to), w),
-            "replayed on blank ground (col {})",
-            f.col
+        // The move is a HOP, not a cut: the pose is airborne, and the hop
+        // owes it back with a clock already rewound to the top of the sulk.
+        assert_eq!(
+            f.action,
+            PetAction::Leap,
+            "the droop LEAVES the words instead of blinking off them"
         );
-        // And it holds its FULL beat again from the re-anchor.
+        assert_eq!(
+            pet.resume,
+            Some((PetAction::Droop, 0.0)),
+            "and the hop owes the droop back, from the top of its beat"
+        );
+        // The window never blinks: the host's hush holds across the arc, and
+        // the pose comes back on ground the grief can be read on.
+        let mut replayed = false;
+        for _ in 0..90 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, inked_to))));
+            assert!(
+                pet.grieving(),
+                "the grief window stays shut over the fanfare for the whole \
+                 trip, got {:?}",
+                f.action
+            );
+            if f.action == PetAction::Droop {
+                assert!(
+                    !on_ink(&f, (0, inked_to), w),
+                    "replayed on blank ground (col {})",
+                    f.col
+                );
+                replayed = true;
+                break;
+            }
+        }
+        assert!(replayed, "the borrowed droop must actually come back");
+        // And it holds its FULL beat again from the re-anchor — measured from
+        // the LANDING, since that is when the restarted clock began.
         let (_, f) = idle(&mut pet, t, (4, inked_to), DROOP_HOLD * 0.8);
         assert_eq!(
             f.action,

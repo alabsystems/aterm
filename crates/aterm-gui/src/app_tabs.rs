@@ -687,15 +687,14 @@ impl App {
         let folded = sessions
             .into_iter()
             .map(|session| self.session_status_indicators(session))
-            .fold(
-                crate::tab_model::TabIndicators::default(),
-                |acc, bits| crate::tab_model::TabIndicators {
+            .fold(crate::tab_model::TabIndicators::default(), |acc, bits| {
+                crate::tab_model::TabIndicators {
                     dirty: acc.dirty,
                     busy: acc.busy || bits.busy,
                     attention: acc.attention,
                     status_attention: acc.status_attention || bits.status_attention,
-                },
-            );
+                }
+            });
         let Some(tab) = self.windows.get_mut(&wid).and_then(|window| {
             let index = window
                 .tab_set
@@ -1394,7 +1393,8 @@ impl App {
         let activity_revision = self
             .title_summary_activity_revision(session)
             .wrapping_add(self.session_status_revision(session));
-        let activity = status_text.or_else(|| self.title_summary_activity(session).map(str::to_owned));
+        let activity =
+            status_text.or_else(|| self.title_summary_activity(session).map(str::to_owned));
         let high_id = ctx
             .timeline
             .lock()

@@ -939,7 +939,10 @@ impl TrailAudio {
     /// Take the cues recorded since the last call (test-only).
     #[cfg(test)]
     pub(crate) fn take_captured_for_test(&mut self) -> Vec<SoundEvent> {
-        self.capture.as_mut().map(std::mem::take).unwrap_or_default()
+        self.capture
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Replace the complete audio host with a freshly resolved active/inert one.

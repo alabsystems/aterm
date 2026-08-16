@@ -52,14 +52,14 @@ use aterm_spec::derive::{
     native_update_attempt_identity_model, native_update_auto_intent_model,
     native_update_channel_scan_model, native_update_disk_transaction_model,
     native_update_hidden_output_quiet_model, native_update_menu_activation_model,
-    native_update_overlap_handoff_model, native_update_status_reconciliation_model,
-    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
-    net_dial_after_grant_model, nova_phase_model, one_shot_peek_model, pad_absorption_model,
-    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
-    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
-    presented_frame_tap_model, proxy_forward_model, rain_band_containment_model,
-    rain_ignition_model, rain_lifecycle_model, rainbow_exit_sampling_model,
-    rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
+    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
+    native_update_status_reconciliation_model, native_update_worker_queue_model,
+    native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
+    one_shot_peek_model, pad_absorption_model, pane_tree_model, path_feed_snapshot_model,
+    per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
+    presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
+    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
     release_channel_floor_model, release_channel_single_head_model,
     release_durable_post_intent_model, release_historical_recovery_model,
@@ -5674,6 +5674,27 @@ fn derived_input_release_pairing_prevents_orphan_csi_u_bytes() {
 /// until Commit. Every rejection kills/reaps before parent resume/teardown. The
 /// legacy one-byte branch is admitted only for an exact, strictly-newer,
 /// zero-history payload.
+/// PER-SESSION ownership across the seamless handoff, which is the half the
+/// overlap model above does not state: it counts readers globally
+/// (`parent_readers + child_readers <= 1`) and never says WHICH process owns
+/// WHICH pty. That distinction is the whole feature — a handoff that keeps the
+/// reader count legal while dropping one session on the floor satisfies the
+/// older model and loses a user's terminal.
+///
+/// So this one carries ownership per session and proves the five properties
+/// that together mean "seamless": no session is ever orphaned, an owner still
+/// holds its master, no master is ever read twice, Commit needs a matching
+/// proof and happens at most once, and rollback stays available until it.
+#[test]
+fn derived_seamless_handoff_ownership_proves_and_catches_orphan_and_double_reader() {
+    let model = native_update_seamless_handoff_ownership_model();
+    assert_proves_and_catches(&model);
+    assert!(
+        aterm_spec::interp::find_deadlock(&model, |_| false).is_none(),
+        "the healthy handoff must always commit, roll back, or settle"
+    );
+}
+
 #[test]
 fn derived_native_update_overlap_handoff_proves_and_catches_ownership_regressions() {
     let model = native_update_overlap_handoff_model();

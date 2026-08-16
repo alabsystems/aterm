@@ -372,8 +372,7 @@ fn paint_eye_dots(
         // the one facing the near eye — and extends OUTWARD: the authored
         // daylight between the pair survives whatever the floor asks for.
         let (kx, anchor_x) = if compressed {
-            let floor_k =
-                EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y / w_px.max(f32::EPSILON);
+            let floor_k = EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y / w_px.max(f32::EPSILON);
             let inner = if near_cx >= cx { x1 } else { x0 };
             ((kx * ratio(&bounds[i])).max(floor_k), inner)
         } else {
@@ -752,12 +751,29 @@ mod tests {
     /// Find a pose by a substring of its authored asset id. Tests address the
     /// roster through the ASSET vocabulary, not through generated variant
     /// spellings, so a codegen rename cannot silently retarget a test.
+    /// The CAT pose named `needle` — `pose("walk_0")` is `pet_walk_0`.
+    ///
+    /// EXACT, not `contains`, and that is not tidiness. The roster carries two
+    /// species since the dog landed, it is ordered by id, and `pet_dog_walk_0`
+    /// sorts before `pet_walk_0` — so a substring match silently handed every
+    /// one of these tests the DOG. That is a false green in the worst
+    /// direction: `face_lod_culls_charm_ink_at_ship_size` asserts a `Pattern`
+    /// layer exists, dogs have no tabby and therefore no `Pattern`, and the
+    /// test failed with "walk pose authors all three charm layers" — a
+    /// complaint about the cat that was really a lookup finding a dog. Pin the
+    /// species in the id and the question the test asks stays the one it means.
+    /// For a dog pose, ask for one: `pose_id("pet_dog_walk_0")`.
     fn pose(needle: &str) -> PetGlyphId {
+        pose_id(&format!("pet_{needle}"))
+    }
+
+    /// The pose with exactly this id, either species.
+    fn pose_id(id: &str) -> PetGlyphId {
         PET_GLYPH_IDS
             .iter()
             .copied()
-            .find(|id| PET_GLYPHS[*id as usize].id.contains(needle))
-            .unwrap_or_else(|| panic!("pet roster has no pose matching `{needle}`"))
+            .find(|g| PET_GLYPHS[*g as usize].id == id)
+            .unwrap_or_else(|| panic!("pet roster has no pose with id `{id}`"))
     }
 
     /// Visual-QA dump for art passes — `#[ignore]`d, so it never runs in CI.
@@ -787,6 +803,13 @@ mod tests {
             "loaf",
             "sit_front",
             "peek_shoulder",
+            // The sleeper earns a slot: it is the pose a long-idle terminal
+            // parks on, so it is the one the owner sees most, and its face is
+            // the one that went out wrong (a fat `closed` lid baking to a dark
+            // bar that read as an OPEN eye). Its two LOD regimes both matter
+            // and both live in this sweep — 48 px keeps the mouth while
+            // collapsing the eyes, 24/36 drop both.
+            "sleep_0",
         ] {
             let p = pose(needle);
             for h in [24u32, 36, 48] {
@@ -1130,9 +1153,7 @@ mod tests {
                         let cy = ((b.1 + b.3) * 0.5 * H as f32).round() as i32;
                         let found = (cy - 2..=cy).find_map(|by| {
                             (cx - 2..=cx)
-                                .find(|&bx| {
-                                    (bx..bx + 2).all(|x| (by..by + 2).all(|y| dark(x, y)))
-                                })
+                                .find(|&bx| (bx..bx + 2).all(|x| (by..by + 2).all(|y| dark(x, y))))
                                 .map(|bx| (bx, by))
                         });
                         match found {
@@ -1154,8 +1175,8 @@ mod tests {
                             // Overlapping authored ranges are one eye drawn
                             // in two strokes — nothing to separate. Probe
                             // only pairs the artist spaced by ≥1 device px.
-                            let gap_n = (bounds[pj].0 - bounds[pi].2)
-                                .max(bounds[pi].0 - bounds[pj].2);
+                            let gap_n =
+                                (bounds[pj].0 - bounds[pi].2).max(bounds[pi].0 - bounds[pj].2);
                             if gap_n * (w as f32) < 1.0 {
                                 continue;
                             }
@@ -1175,8 +1196,7 @@ mod tests {
                             let (l, r) = if ax < bx { (ax, bx) } else { (bx, ax) };
                             let row = (ay + by) / 2 + 1;
                             if l + 2 < r
-                                && !(l + 2..r)
-                                    .any(|x| (row - 1..=row + 1).any(|y| !dark(x, y)))
+                                && !(l + 2..r).any(|x| (row - 1..=row + 1).any(|y| !dark(x, y)))
                             {
                                 failures.push(format!(
                                     "{needle} (dark_bg={dark_bg}): no daylight \

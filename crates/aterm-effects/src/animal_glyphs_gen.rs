@@ -25,6 +25,7 @@ pub enum AnimalGlyphId {
     Bat,
     Bear,
     Bee,
+    Bird,
     Butterfly,
     Camel,
     Cheetah,
@@ -83,6 +84,7 @@ pub enum AnimalGlyphId {
     Squirrel,
     Swan,
     Tiger,
+    Turkey,
     Turtle,
     Whale,
     Wolf,
@@ -95,6 +97,7 @@ pub const ANIMAL_GLYPH_IDS: &[AnimalGlyphId] = &[
     AnimalGlyphId::Bat,
     AnimalGlyphId::Bear,
     AnimalGlyphId::Bee,
+    AnimalGlyphId::Bird,
     AnimalGlyphId::Butterfly,
     AnimalGlyphId::Camel,
     AnimalGlyphId::Cheetah,
@@ -153,6 +156,7 @@ pub const ANIMAL_GLYPH_IDS: &[AnimalGlyphId] = &[
     AnimalGlyphId::Squirrel,
     AnimalGlyphId::Swan,
     AnimalGlyphId::Tiger,
+    AnimalGlyphId::Turkey,
     AnimalGlyphId::Turtle,
     AnimalGlyphId::Whale,
     AnimalGlyphId::Wolf,
@@ -269,6 +273,39 @@ pub const ANIMAL_GLYPHS: &[GlyphDef] = &[
         Layer { role: GlyphRole::Blush, recolor: Recolor::Fixed, fill: 0xF2A25C, paths: &[
             &[PathSeg::Move(998,2420),PathSeg::Cubic(998,2343,1078,2281,1178,2281),PathSeg::Cubic(1277,2281,1357,2343,1357,2420),PathSeg::Cubic(1357,2498,1277,2560,1178,2560),PathSeg::Cubic(1078,2560,998,2498,998,2420),PathSeg::Close],
             &[PathSeg::Move(2739,2420),PathSeg::Cubic(2739,2343,2819,2281,2918,2281),PathSeg::Cubic(3018,2281,3098,2343,3098,2420),PathSeg::Cubic(3098,2498,3018,2560,2918,2560),PathSeg::Cubic(2819,2560,2739,2498,2739,2420),PathSeg::Close],
+        ] },
+    ] },
+    // Bird (bird)
+    GlyphDef { id: "bird", kind: GlyphKind::Head, aspect_x1000: 1212, eye_y: 2048, center_x: 2048, word_top: 4096, layers: &[
+        Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x1B2B45, paths: &[
+            &[PathSeg::Move(819,2420),PathSeg::Cubic(819,1598,1370,931,2048,931),PathSeg::Cubic(2726,931,3277,1598,3277,2420),PathSeg::Cubic(3277,3243,2726,3910,2048,3910),PathSeg::Cubic(1370,3910,819,3243,819,2420),PathSeg::Close],
+            &[PathSeg::Move(1715,1148),PathSeg::Cubic(1459,838,1510,279,1920,155),PathSeg::Cubic(1792,465,1920,776,2176,962),PathSeg::Close],
+            &[PathSeg::Move(2150,962),PathSeg::Cubic(2048,590,2253,155,2611,186),PathSeg::Cubic(2381,434,2330,807,2483,1024),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Coat, recolor: Recolor::Fixed, fill: 0x4E92DD, paths: &[
+            &[PathSeg::Move(922,2420),PathSeg::Cubic(922,1666,1426,1055,2048,1055),PathSeg::Cubic(2670,1055,3174,1666,3174,2420),PathSeg::Cubic(3174,3174,2670,3786,2048,3786),PathSeg::Cubic(1426,3786,922,3174,922,2420),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Detail, recolor: Recolor::Fixed, fill: 0x63A5E8, paths: &[
+            &[PathSeg::Move(1792,1071),PathSeg::Cubic(1600,822,1651,403,1907,295),PathSeg::Cubic(1818,528,1933,776,2112,946),PathSeg::Close],
+            &[PathSeg::Move(2214,931),PathSeg::Cubic(2138,636,2291,310,2522,326),PathSeg::Cubic(2368,481,2317,776,2432,977),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Muzzle, recolor: Recolor::Fixed, fill: 0xEDF4FC, paths: &[
+            &[PathSeg::Move(1280,3103),PathSeg::Cubic(1280,2793,1623,2544,2048,2544),PathSeg::Cubic(2473,2544,2816,2793,2816,3103),PathSeg::Cubic(2816,3413,2473,3662,2048,3662),PathSeg::Cubic(1623,3662,1280,3413,1280,3103),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Nose, recolor: Recolor::Fixed, fill: 0xF59B23, paths: &[
+            &[PathSeg::Move(1843,2777),PathSeg::Line(2253,2777),PathSeg::Cubic(2317,2777,2355,2839,2330,2917),PathSeg::Line(2138,3227),PathSeg::Cubic(2089,3302,2007,3302,1958,3227),PathSeg::Line(1766,2917),PathSeg::Cubic(1741,2839,1779,2777,1843,2777),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Blush, recolor: Recolor::Fixed, fill: 0xF5B8C4, paths: &[
+            &[PathSeg::Move(1165,2607),PathSeg::Cubic(1165,2495,1239,2405,1331,2405),PathSeg::Cubic(1423,2405,1498,2495,1498,2607),PathSeg::Cubic(1498,2718,1423,2808,1331,2808),PathSeg::Cubic(1239,2808,1165,2718,1165,2607),PathSeg::Close],
+            &[PathSeg::Move(2598,2607),PathSeg::Cubic(2598,2495,2673,2405,2765,2405),PathSeg::Cubic(2857,2405,2931,2495,2931,2607),PathSeg::Cubic(2931,2718,2857,2808,2765,2808),PathSeg::Cubic(2673,2808,2598,2718,2598,2607),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Eye, recolor: Recolor::Fixed, fill: 0x2A2430, paths: &[
+            &[PathSeg::Move(1434,2048),PathSeg::Cubic(1434,1921,1503,1815,1587,1815),PathSeg::Cubic(1672,1815,1741,1921,1741,2048),PathSeg::Cubic(1741,2175,1672,2281,1587,2281),PathSeg::Cubic(1503,2281,1434,2175,1434,2048),PathSeg::Close],
+            &[PathSeg::Move(2355,2048),PathSeg::Cubic(2355,1921,2424,1815,2509,1815),PathSeg::Cubic(2593,1815,2662,1921,2662,2048),PathSeg::Cubic(2662,2175,2593,2281,2509,2281),PathSeg::Cubic(2424,2281,2355,2175,2355,2048),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::CatchLight, recolor: Recolor::Fixed, fill: 0xFFFFFF, paths: &[
+            &[PathSeg::Move(1582,1955),PathSeg::Cubic(1582,1918,1608,1887,1638,1887),PathSeg::Cubic(1669,1887,1695,1918,1695,1955),PathSeg::Cubic(1695,1992,1669,2023,1638,2023),PathSeg::Cubic(1608,2023,1582,1992,1582,1955),PathSeg::Close],
+            &[PathSeg::Move(2504,1955),PathSeg::Cubic(2504,1918,2529,1887,2560,1887),PathSeg::Cubic(2591,1887,2616,1918,2616,1955),PathSeg::Cubic(2616,1992,2591,2023,2560,2023),PathSeg::Cubic(2529,2023,2504,1992,2504,1955),PathSeg::Close],
         ] },
     ] },
     // Butterfly (butterfly)
@@ -615,7 +652,7 @@ pub const ANIMAL_GLYPHS: &[GlyphDef] = &[
             &[PathSeg::Move(730,838),PathSeg::Cubic(730,571,906,357,1126,357),PathSeg::Cubic(1347,357,1523,571,1523,838),PathSeg::Cubic(1523,1105,1347,1319,1126,1319),PathSeg::Cubic(906,1319,730,1105,730,838),PathSeg::Close],
             &[PathSeg::Move(896,1024),PathSeg::Cubic(819,1800,1101,2544,1792,2917),PathSeg::Line(2099,3010),PathSeg::Line(2176,2700),PathSeg::Cubic(1562,2420,1421,1831,1523,931),PathSeg::Close],
             &[PathSeg::Move(1382,3134),PathSeg::Cubic(1382,2774,1887,2482,2509,2482),PathSeg::Cubic(3131,2482,3635,2774,3635,3134),PathSeg::Cubic(3635,3494,3131,3786,2509,3786),PathSeg::Cubic(1887,3786,1382,3494,1382,3134),PathSeg::Close],
-            &[PathSeg::Move(3251,2762),PathSeg::Cubic(3686,2513,3866,2110,3891,1645),PathSeg::Cubic(3968,2234,3738,2855,3277,3103),PathSeg::Line(3098,2824),PathSeg::Close],
+            &[PathSeg::Move(3251,2762),PathSeg::Cubic(3635,2544,3814,2203,3840,1800),PathSeg::Cubic(3917,2265,3712,2793,3277,3072),PathSeg::Line(3123,2824),PathSeg::Close],
             &[PathSeg::Move(1869,3413),PathSeg::Line(2227,3413),PathSeg::Line(2227,3848),PathSeg::Line(1869,3848),PathSeg::Close],
             &[PathSeg::Move(2790,3413),PathSeg::Line(3149,3413),PathSeg::Line(3149,3848),PathSeg::Line(2790,3848),PathSeg::Close],
         ] },
@@ -2478,6 +2515,51 @@ pub const ANIMAL_GLYPHS: &[GlyphDef] = &[
         ] },
         Layer { role: GlyphRole::Mouth, recolor: Recolor::Fixed, fill: 0x3A2A20, paths: &[
             &[PathSeg::Move(1766,3103),PathSeg::Cubic(1920,3289,2176,3289,2330,3103),PathSeg::Cubic(2202,3382,1894,3382,1766,3103),PathSeg::Close],
+        ] },
+    ] },
+    // Turkey (turkey)
+    GlyphDef { id: "turkey", kind: GlyphKind::Head, aspect_x1000: 1212, eye_y: 2359, center_x: 2048, word_top: 4096, layers: &[
+        Layer { role: GlyphRole::Outline, recolor: Recolor::Fixed, fill: 0x33200F, paths: &[
+            &[PathSeg::Move(1766,3165),PathSeg::Line(1536,590),PathSeg::Line(2560,590),PathSeg::Line(2330,3165),PathSeg::Close],
+            &[PathSeg::Move(1818,3299),PathSeg::Line(438,1399),PathSeg::Line(1277,686),PathSeg::Line(2278,2908),PathSeg::Close],
+            &[PathSeg::Move(1951,3423),PathSeg::Line(69,2889),PathSeg::Line(417,1722),PathSeg::Line(2145,2783),PathSeg::Close],
+            &[PathSeg::Move(2278,3299),PathSeg::Line(3658,1399),PathSeg::Line(2819,686),PathSeg::Line(1818,2908),PathSeg::Close],
+            &[PathSeg::Move(2145,3423),PathSeg::Line(4027,2889),PathSeg::Line(3679,1722),PathSeg::Line(1951,2783),PathSeg::Close],
+            &[PathSeg::Move(1075,2669),PathSeg::Cubic(1075,2017,1510,1489,2048,1489),PathSeg::Cubic(2586,1489,3021,2017,3021,2669),PathSeg::Cubic(3021,3320,2586,3848,2048,3848),PathSeg::Cubic(1510,3848,1075,3320,1075,2669),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Accessory, recolor: Recolor::Fixed, fill: 0x8A5430, paths: &[
+            &[PathSeg::Move(1843,3103),PathSeg::Line(1638,745),PathSeg::Line(2458,745),PathSeg::Line(2253,3103),PathSeg::Close],
+            &[PathSeg::Move(1879,3246),PathSeg::Line(596,1455),PathSeg::Line(1267,884),PathSeg::Line(2217,2960),PathSeg::Close],
+            &[PathSeg::Move(1979,3336),PathSeg::Line(223,2827),PathSeg::Line(504,1896),PathSeg::Line(2117,2870),PathSeg::Close],
+            &[PathSeg::Move(2217,3246),PathSeg::Line(3500,1455),PathSeg::Line(2829,884),PathSeg::Line(1879,2960),PathSeg::Close],
+            &[PathSeg::Move(2117,3336),PathSeg::Line(3873,2827),PathSeg::Line(3592,1896),PathSeg::Line(1979,2870),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Detail, recolor: Recolor::Fixed, fill: 0xD9772C, paths: &[
+            &[PathSeg::Move(1766,1055),PathSeg::Cubic(1766,866,1892,714,2048,714),PathSeg::Cubic(2204,714,2330,866,2330,1055),PathSeg::Cubic(2330,1244,2204,1396,2048,1396),PathSeg::Cubic(1892,1396,1766,1244,1766,1055),PathSeg::Close],
+            &[PathSeg::Move(796,1424),PathSeg::Cubic(796,1235,922,1083,1078,1083),PathSeg::Cubic(1234,1083,1359,1235,1359,1424),PathSeg::Cubic(1359,1614,1234,1766,1078,1766),PathSeg::Cubic(922,1766,796,1614,796,1424),PathSeg::Close],
+            &[PathSeg::Move(348,2467),PathSeg::Cubic(348,2293,463,2157,604,2157),PathSeg::Cubic(745,2157,860,2293,860,2467),PathSeg::Cubic(860,2641,745,2777,604,2777),PathSeg::Cubic(463,2777,348,2641,348,2467),PathSeg::Close],
+            &[PathSeg::Move(2737,1424),PathSeg::Cubic(2737,1235,2862,1083,3018,1083),PathSeg::Cubic(3174,1083,3300,1235,3300,1424),PathSeg::Cubic(3300,1614,3174,1766,3018,1766),PathSeg::Cubic(2862,1766,2737,1614,2737,1424),PathSeg::Close],
+            &[PathSeg::Move(3236,2467),PathSeg::Cubic(3236,2293,3351,2157,3492,2157),PathSeg::Cubic(3633,2157,3748,2293,3748,2467),PathSeg::Cubic(3748,2641,3633,2777,3492,2777),PathSeg::Cubic(3351,2777,3236,2641,3236,2467),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Coat, recolor: Recolor::Fixed, fill: 0x9C6B42, paths: &[
+            &[PathSeg::Move(1178,2669),PathSeg::Cubic(1178,2085,1567,1614,2048,1614),PathSeg::Cubic(2529,1614,2918,2085,2918,2669),PathSeg::Cubic(2918,3252,2529,3724,2048,3724),PathSeg::Cubic(1567,3724,1178,3252,1178,2669),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Pink, recolor: Recolor::Fixed, fill: 0xD8342C, paths: &[
+            &[PathSeg::Move(1587,3289),PathSeg::Cubic(1587,3115,1679,2979,1792,2979),PathSeg::Cubic(1905,2979,1997,3115,1997,3289),PathSeg::Cubic(1997,3463,1905,3600,1792,3600),PathSeg::Cubic(1679,3600,1587,3463,1587,3289),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Nose, recolor: Recolor::Fixed, fill: 0xF5A623, paths: &[
+            &[PathSeg::Move(1766,2762),PathSeg::Line(2330,2762),PathSeg::Cubic(2381,2762,2394,2833,2363,2911),PathSeg::Line(2150,3258),PathSeg::Cubic(2092,3345,2004,3345,1946,3258),PathSeg::Line(1733,2911),PathSeg::Cubic(1702,2833,1715,2762,1766,2762),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Pink, recolor: Recolor::Fixed, fill: 0xD8342C, paths: &[
+            &[PathSeg::Move(1894,2669),PathSeg::Cubic(1894,2591,2022,2591,2022,2669),PathSeg::Cubic(2022,2746,1984,2777,1958,2839),PathSeg::Cubic(1925,2923,1920,3010,1882,3088),PathSeg::Cubic(1856,3146,1805,3181,1761,3150),PathSeg::Cubic(1715,3119,1710,3053,1736,2994),PathSeg::Cubic(1772,2917,1830,2901,1856,2824),PathSeg::Cubic(1876,2762,1894,2724,1894,2669),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::Eye, recolor: Recolor::Fixed, fill: 0x2A2430, paths: &[
+            &[PathSeg::Move(1421,2358),PathSeg::Cubic(1421,2222,1495,2110,1587,2110),PathSeg::Cubic(1679,2110,1754,2222,1754,2358),PathSeg::Cubic(1754,2495,1679,2607,1587,2607),PathSeg::Cubic(1495,2607,1421,2495,1421,2358),PathSeg::Close],
+            &[PathSeg::Move(2342,2358),PathSeg::Cubic(2342,2222,2417,2110,2509,2110),PathSeg::Cubic(2601,2110,2675,2222,2675,2358),PathSeg::Cubic(2675,2495,2601,2607,2509,2607),PathSeg::Cubic(2417,2607,2342,2495,2342,2358),PathSeg::Close],
+        ] },
+        Layer { role: GlyphRole::CatchLight, recolor: Recolor::Fixed, fill: 0xFFFFFF, paths: &[
+            &[PathSeg::Move(1582,2265),PathSeg::Cubic(1582,2228,1608,2197,1638,2197),PathSeg::Cubic(1669,2197,1695,2228,1695,2265),PathSeg::Cubic(1695,2302,1669,2333,1638,2333),PathSeg::Cubic(1608,2333,1582,2302,1582,2265),PathSeg::Close],
+            &[PathSeg::Move(2504,2265),PathSeg::Cubic(2504,2228,2529,2197,2560,2197),PathSeg::Cubic(2591,2197,2616,2228,2616,2265),PathSeg::Cubic(2616,2302,2591,2333,2560,2333),PathSeg::Cubic(2529,2333,2504,2302,2504,2265),PathSeg::Close],
         ] },
     ] },
     // Turtle (turtle)

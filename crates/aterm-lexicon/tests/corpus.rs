@@ -249,11 +249,14 @@ fn cjk_single_char_is_opt_in() {
 #[test]
 fn cjk_incidental_compounds_suppressed() {
     // Even with single-char matching ON, exception compounds must not fire.
+    // (熊猫 left this list 2026-08-10: it is a POSITIVE panda form now — the
+    // longer compound wins the munch, which suppresses the inner cat just as
+    // hard; see `animal_multilingual::panda_compounds_are_pandas_...`.)
     let on = ScanOptions {
         cjk_single_char: true,
         ..ScanOptions::default()
     };
-    for decoy in ["熊猫", "猫車", "猫背"] {
+    for decoy in ["猫車", "猫背", "招き猫", "海猫"] {
         assert_eq!(
             classes(decoy, &on),
             Vec::<Class>::new(),

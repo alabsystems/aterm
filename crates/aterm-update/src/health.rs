@@ -120,6 +120,27 @@ pub struct Health {
     /// when it clears the acquisition streaks and the apply streak survives.
     #[serde(default)]
     pub last_apply_error: String,
+    /// RFC3339 UTC of [`Self::last_apply_error`] (empty when there is none).
+    ///
+    /// [`Self::last_failure_at`] is any-class: a DNS blip at 21:53 re-dates a
+    /// ledger whose apply lane last actually failed days earlier, and `update
+    /// status` then presents a long-dead streak as fresh (observed on m3,
+    /// 2026-08-14: the "last failure" was a `curl` resolve error, not an
+    /// apply). The apply lane owns its own clock.
+    #[serde(default)]
+    pub last_apply_failure_at: String,
+    /// The build that was RUNNING when the last apply failure was recorded
+    /// (0 when unknown/none) — the apply-streak twin of
+    /// [`Self::last_apply_refusal_build`], and the expiry key
+    /// [`Self::expire_stale_apply_streak`] reads: an apply streak is only
+    /// ever the claim "THIS running build cannot be replaced through the
+    /// lane", and once a DIFFERENT build is running the machine has moved —
+    /// through the channel, a manual install, or a boot swap — so the claim
+    /// is proven stale. Without this, a manually-updated healthy machine
+    /// carried `persistent=true` forever (m3: 2,191 counted failures on an
+    /// up-to-date install).
+    #[serde(default)]
+    pub last_apply_failure_build: u64,
     /// The most recent apply-lane REFUSAL: a verdict that stopped an apply
     /// BEFORE it could fail, in the words of whichever caller refused it.
     ///
@@ -299,20 +320,57 @@ impl Health {
         h
     }
 
-    /// Record that a staged build FAILED to become the running build. `reason` is
-    /// the typed handoff/apply outcome (e.g. `ChildDied`, `AdoptionMismatch`,
-    /// `ActivityRevoked`, `re-exec failed`), stored for `update status`.
-    pub fn record_apply_failure(path: &Path, reason: &str) -> Self {
+    /// Record that a staged build FAILED to become the running build, as
+    /// observed by `current_build`. `reason` is the typed handoff/apply
+    /// outcome (e.g. `ChildDied`, `AdoptionMismatch`, `ActivityRevoked`,
+    /// `re-exec failed`), stored for `update status`.
+    pub fn record_apply_failure(path: &Path, current_build: u64, reason: &str) -> Self {
         Self::record_failure(path, "apply", reason);
         // Mirror the reason into the apply-owned slot so a later acquisition-lane
         // failure cannot overwrite the description of a still-standing apply streak.
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
         h.last_apply_error = reason.chars().take(400).collect();
+        h.last_apply_failure_at = crate::install::now_rfc3339();
+        h.last_apply_failure_build = current_build;
         // A terminal verdict supersedes whatever refusal preceded it: leaving the
         // old "the terminal was busy" standing beside a hard failure would offer
         // an operator two competing answers to one question.
         h.clear_apply_refusal();
+        h.write(path);
+        h
+    }
+
+    /// Expire an apply streak PROVEN STALE by the running build (see
+    /// [`Self::last_apply_failure_build`]): the streak was recorded by a
+    /// different build, so "cannot be made to run" describes a machine state
+    /// that no longer exists. Wired into the check lane, so a machine that
+    /// moved by any means heals within one check interval. A streak whose
+    /// recording build is unknown (0 — a pre-field ledger) expires too: the
+    /// machine cannot prove it stale, but a pre-field ledger also cannot
+    /// prove it FRESH, and the demo-blocking failure mode is a stale streak
+    /// presented as standing (the reverse error self-corrects: a real
+    /// failing lane re-records within one apply attempt).
+    pub fn expire_stale_apply_streak(path: &Path, current_build: u64) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if h.apply_failures == 0 || h.last_apply_failure_build == current_build {
+            return h;
+        }
+        h.apply_failures = 0;
+        h.last_apply_error = String::new();
+        h.last_apply_failure_at = String::new();
+        h.last_apply_failure_build = 0;
+        if h.total_failures() == 0 {
+            h.kind = String::new();
+            h.failing_since = String::new();
+            h.last_failure_at = String::new();
+            h.last_error = String::new();
+        } else if h.kind == "apply" {
+            // Some acquisition streak still stands; let it own the headline.
+            h.kind = String::new();
+            h.last_error = String::new();
+        }
         h.write(path);
         h
     }
@@ -434,8 +492,8 @@ mod tests {
     #[test]
     fn a_healthy_check_never_clears_the_apply_streak() {
         let p = tmp("apply-survives-check");
-        Health::record_apply_failure(&p, "AdoptionMismatch");
-        Health::record_apply_failure(&p, "ActivityRevoked");
+        Health::record_apply_failure(&p, 77, "AdoptionMismatch");
+        Health::record_apply_failure(&p, 77, "ActivityRevoked");
         let h = Health::read(&p);
         assert_eq!(h.apply_failures, 2);
         assert_eq!(h.kind, "apply");
@@ -504,7 +562,7 @@ mod tests {
         assert_eq!(Health::read(&p).last_apply_refusal, quiet);
 
         // A hard failure supersedes it — one standing answer, never two.
-        Health::record_apply_failure(&p, "ChildDied");
+        Health::record_apply_failure(&p, 77, "ChildDied");
         let h = Health::read(&p);
         assert!(!h.apply_refusal_applies_to(812));
         assert!(h.last_apply_refusal.is_empty());
@@ -522,6 +580,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
+    /// An apply streak recorded by a DIFFERENT running build is proven stale
+    /// and expires; the same build's streak stands. The m3 field case: 2,191
+    /// counted failures presented as `persistent=true` on a machine that had
+    /// long since moved to the fixed build by manual install.
+    #[test]
+    fn an_apply_streak_expires_once_a_different_build_is_running() {
+        let p = tmp("apply-expiry");
+        for _ in 0..PERSISTENT_AFTER {
+            Health::record_apply_failure(&p, 77, "handoff proof ended TimedOut");
+        }
+        let h = Health::read(&p);
+        assert!(h.is_persistent());
+        assert_eq!(h.last_apply_failure_build, 77);
+        assert!(!h.last_apply_failure_at.is_empty(), "the lane owns its clock");
+        // Same build still running: the streak is fresh evidence — stands.
+        Health::expire_stale_apply_streak(&p, 77);
+        assert!(Health::read(&p).is_persistent(), "same build ⇒ still standing");
+        // A different build is running: the machine moved, the claim is stale.
+        Health::expire_stale_apply_streak(&p, 78);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 0, "stale streak expires");
+        assert!(!h.is_persistent());
+        assert!(h.last_apply_error.is_empty());
+        assert!(h.last_apply_failure_at.is_empty());
+        assert_eq!(h.last_apply_failure_build, 0);
+        assert!(h.kind.is_empty(), "an expired lane stops owning the headline");
+        // An interleaved acquisition failure keeps ITS OWN streak through the
+        // apply expiry — the lanes never launder each other.
+        Health::record_failure(&p, "network", "dns");
+        Health::record_apply_failure(&p, 78, "ChildDied");
+        Health::expire_stale_apply_streak(&p, 79);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 0);
+        assert_eq!(h.network_failures, 1, "the network streak survives");
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
     /// A stranded apply lane must escalate as loudly as a stranded download lane:
     /// the user-visible symptom (machine does not move to the new version) is the
     /// same, so it drives the same persistent-failure notification.
@@ -529,7 +624,7 @@ mod tests {
     fn a_persistent_apply_streak_is_surfaced_like_a_persistent_pipeline_streak() {
         let p = tmp("apply-persistent");
         for _ in 0..PERSISTENT_AFTER {
-            Health::record_apply_failure(&p, "ChildDied");
+            Health::record_apply_failure(&p, 77, "ChildDied");
         }
         let h = Health::read(&p);
         assert_eq!(h.apply_failures, PERSISTENT_AFTER);
@@ -570,7 +665,10 @@ mod tests {
         // must be named and the count must be its own — never `pipeline_failures`,
         // which is 0 in this state and produced "0 consecutive checks".
         assert_eq!(h.persistent_class(), Some(("manifest", PERSISTENT_AFTER)));
-        assert_eq!(h.pipeline_failures, 0, "the incident's pipeline lane was fine");
+        assert_eq!(
+            h.pipeline_failures, 0,
+            "the incident's pipeline lane was fine"
+        );
     }
 
     /// `stage` strands too: the artifact arrives and then refuses to become a bundle.

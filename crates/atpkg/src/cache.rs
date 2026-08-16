@@ -10,9 +10,27 @@
 //! ONLY when its recorded source == the current fetcher's `source_id`, so a `dir:`
 //! publisher-test cache never satisfies a failed `github:` fetch (the same-source guard).
 //!
-//! Parsing the cache TOML is NOT the verify-before-parse boundary: the extracted
-//! `index_bytes` are only ever handed to `select_index` → `verify_index_with` (sig checked
-//! over exact bytes under the pinned root) → `parse_index`; a forged cache fails that verify.
+//! Parsing the cache TOML is NOT the verify-before-parse boundary: the extracted bytes are
+//! only ever handed to [`crate::select_index`], which admits the cached ROSTER under the
+//! pinned paper master and then verifies the cached index under the machines that roster
+//! still authorizes, before `parse_index` sees a byte. A forged cache fails that chain.
+//!
+//! # The roster is cached WITH its index, and that is what keeps the cache honest
+//!
+//! A cache entry stores the whole candidate — index, index signature, roster, roster
+//! signature — because the index is meaningless without the generation that authorized it.
+//! Storing only the index would have made the cache a downgrade oracle: whoever serves the
+//! index could suppress the roster assets, and a client that fell back to a cached index
+//! plus a freshly-fetched roster would be pairing documents that were never published
+//! together.
+//!
+//! The cached roster is not trusted for being cached. It faces the same `roster_seq`
+//! ratchet (a generation older than the durable floor is refused forever) and the same
+//! `valid_until` window (a cache that outlives the roster's freshness stops working, by
+//! design — that window IS the bound on how long a suppressed roster can keep an old
+//! authorization alive). An entry written before this field existed decodes to EMPTY
+//! roster bytes, which fail admission — fail-closed, and the next successful fetch
+//! replaces it.
 
 use std::fs;
 use std::path::PathBuf;
@@ -26,14 +44,27 @@ use crate::select::Candidate;
 const MAX_CACHE_CANDIDATES: usize = 24;
 const MAX_CACHED_INDEX_BYTES: usize = 5_000_000;
 const MAX_CACHED_SIGNATURE_BYTES: usize = 4_096;
+/// A roster is a few hundred bytes per machine and is capped at 16 machines; 64 KiB is a
+/// ceiling, not a fit. Matches the download cap `net` and `aterm-update` both use.
+const MAX_CACHED_ROSTER_BYTES: usize = 65_536;
 const MAX_INDEX_CACHE_BYTES: usize = 144 * 1024 * 1024;
 
-/// One cached index candidate: its label + base64 index/sig bytes.
+/// One cached index candidate: its label + base64 index/sig bytes + the master-signed
+/// roster published beside it.
+///
+/// The two roster fields are `#[serde(default)]` so a cache written by an older build
+/// still DECODES — and then yields empty roster bytes, which no chain admits. That is the
+/// correct direction: an entry that predates the single root cannot authorize anything,
+/// and it is replaced by the next successful fetch rather than failing the read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedCandidate {
     label: String,
     index_b64: String,
     sig_b64: String,
+    #[serde(default)]
+    roster_b64: String,
+    #[serde(default)]
+    roster_sig_b64: String,
 }
 
 /// The on-disk cache document.
@@ -70,6 +101,8 @@ impl IndexCache {
             || candidates.iter().any(|candidate| {
                 candidate.index_bytes.len() > MAX_CACHED_INDEX_BYTES
                     || candidate.sig.len() > MAX_CACHED_SIGNATURE_BYTES
+                    || candidate.roster_bytes.len() > MAX_CACHED_ROSTER_BYTES
+                    || candidate.roster_sig.len() > MAX_CACHED_SIGNATURE_BYTES
             })
         {
             return; // never overwrite a good cache with an empty success
@@ -84,6 +117,8 @@ impl IndexCache {
                     label: c.label.clone(),
                     index_b64: STANDARD.encode(&c.index_bytes),
                     sig_b64: STANDARD.encode(&c.sig),
+                    roster_b64: STANDARD.encode(&c.roster_bytes),
+                    roster_sig_b64: STANDARD.encode(&c.roster_sig),
                 })
                 .collect(),
         };
@@ -139,7 +174,12 @@ impl IndexCache {
         for c in doc.candidate {
             let index_bytes = STANDARD.decode(c.index_b64.as_bytes()).ok()?;
             let sig = STANDARD.decode(c.sig_b64.as_bytes()).ok()?;
-            if index_bytes.len() > MAX_CACHED_INDEX_BYTES || sig.len() > MAX_CACHED_SIGNATURE_BYTES
+            let roster_bytes = STANDARD.decode(c.roster_b64.as_bytes()).ok()?;
+            let roster_sig = STANDARD.decode(c.roster_sig_b64.as_bytes()).ok()?;
+            if index_bytes.len() > MAX_CACHED_INDEX_BYTES
+                || sig.len() > MAX_CACHED_SIGNATURE_BYTES
+                || roster_bytes.len() > MAX_CACHED_ROSTER_BYTES
+                || roster_sig.len() > MAX_CACHED_SIGNATURE_BYTES
             {
                 return None;
             }
@@ -147,6 +187,8 @@ impl IndexCache {
                 label: c.label,
                 index_bytes,
                 sig,
+                roster_bytes,
+                roster_sig,
             });
         }
         Some(out)
@@ -171,6 +213,8 @@ mod tests {
             label: label.into(),
             index_bytes: vec![1, 2, 3, 0xFF],
             sig: vec![9, 8, 7],
+            roster_bytes: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            roster_sig: vec![4, 5, 6],
         }
     }
 
@@ -184,6 +228,10 @@ mod tests {
         assert_eq!(back[0].label, "v1");
         assert_eq!(back[0].index_bytes, vec![1, 2, 3, 0xFF]);
         assert_eq!(back[0].sig, vec![9, 8, 7]);
+        // The roster rides WITH its index — an entry that lost it could only be paired
+        // with some other generation, which is exactly the substitution to prevent.
+        assert_eq!(back[0].roster_bytes, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(back[0].roster_sig, vec![4, 5, 6]);
         // 0600 on disk — Unix-only mode check.
         #[cfg(unix)]
         {
@@ -203,6 +251,31 @@ mod tests {
             "same-source guard blocks cross-source reuse"
         );
         assert!(c.load("dir:/tmp/reg").is_some());
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// A cache written BEFORE the single-root move (no roster fields) still decodes —
+    /// and decodes to EMPTY roster bytes, which no chain admits. Fail-closed, and
+    /// replaced by the next successful fetch rather than failing the whole read.
+    #[test]
+    fn a_pre_roster_cache_entry_decodes_but_authorizes_nothing() {
+        let p = tmp("legacy");
+        fs::write(
+            &p,
+            "schema = 1\nsource = \"github:o/r\"\nfetched_at = \"\"\n\
+             [[candidate]]\nlabel = \"v1\"\nindex_b64 = \"AQID\"\nsig_b64 = \"CQgH\"\n",
+        )
+        .unwrap();
+        let back = IndexCache::new(p.clone())
+            .load("github:o/r")
+            .expect("an older entry is readable, not a hard failure");
+        assert_eq!(back.len(), 1);
+        assert!(
+            back[0].roster_bytes.is_empty() && back[0].roster_sig.is_empty(),
+            "a pre-roster entry carries no authority at all"
+        );
+        // And empty roster bytes cannot admit: `select_index` skips such a candidate
+        // (proved directly in `select::tests::a_candidate_with_no_roster_is_skipped`).
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

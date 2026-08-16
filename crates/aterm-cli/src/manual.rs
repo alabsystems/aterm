@@ -168,15 +168,10 @@ WHAT IT IS
 
 KEY USAGE
   atpkg list                 installed (program, build) pairs — local, no network
-  atpkg seed                 batteries-included reconcile: on a FIRST RUN (empty store) the
-                             signed BUNDLED SEED the .app ships (Contents/Resources/
-                             toolchain-seed) can fill it with NO network at all — the same
-                             signature gates apply, and a reachable published index still
-                             wins; consent is [packages].auto_install. Then the compiled-in
-                             companions source lane
   atpkg install <program>    verify the signed index, then install/upgrade the pinned build
-  atpkg update [program]     upgrade all (or one) to the channel pin; coherence groups apply
-                             all-or-nothing (the rustc-locked tuple moves together)
+  atpkg update [program]     upgrade all (or one) to the channel pin;
+                             coherence groups apply all-or-nothing (the rustc-locked
+                             tuple moves together)
   atpkg which <tool>         print the store path a tool resolves to (never $PATH)
   atpkg run <tool> [-- args] exec the store binary — what `aterm <tool>` dispatches to
   atpkg doctor | verify      health surface / re-attest the store against the signed root
@@ -187,12 +182,16 @@ WHEN TO REACH FOR IT
   Distinct from `cargo ship`/aterm-release (which CUTS aterm.app itself).
 
 GOTCHAS
-  * INERT BY DEFAULT: a plain `cargo build` bakes no root key, so the network verbs
-    (install/update/sync/rollback) refuse with exit 1. Local read/maintenance verbs
-    (list/which/run/doctor/verify/...) still work. Enable without a rebuild by exporting
-    The root anchor is compiled in (see aterm-update-core::pins); kill switch is ATPKG_DISABLE.
+  * The root anchor is COMPILED IN — a committed constant (aterm-update-core::pins), not a
+    build env var — so a plain `cargo build` is fully armed. The kill switch is
+    ATPKG_DISABLE: set it and the network verbs (install/update/rollback) refuse with
+    exit 1; local read/maintenance verbs (list/which/run/doctor/verify/...) still work.
+  * AUTOMATIC updates ride the windowed app: `aterm --window` runs the update pass on a
+    6h loop (ATPKG_UPDATE_INTERVAL_SECS), and the app's own self-update check is likewise
+    window-only. Headless or CLI-only usage updates NOTHING automatically — run
+    `aterm pkg update` explicitly, or drive it from a scheduler (launchd/cron).
   * Channel is hard-wired to "stable" today; the real verbs are exactly atpkg's match
-    arms (doctor/which/list/run/uninstall/install/update/sync/rollback/pin/gc/verify/...)."#,
+    arms (doctor/which/list/run/uninstall/install/update/rollback/pin/gc/verify/...)."#,
         ),
     },
     Topic {
@@ -219,7 +218,7 @@ KEY USAGE
                                  and ALL selected are proved (an empty report is NOT a proof)
   targo trust doctor | solvers   backend health; expect `ready: true`, `available: 6/6`
   targo / trustc                 ordinary cargo / rustc — drop-in, do NOT verify by default
-  ./x.py build --stage 2         build the compiler from source into build/<host>/stage2/bin
+  aterm pkg install trust        install/upgrade the prebuilt toolchain (signed seed/registry)
 
 WHEN TO REACH FOR IT
   Use `targo trust check` whenever the goal is to compile AND prove real Rust — it is the
@@ -227,12 +226,15 @@ WHEN TO REACH FOR IT
   builds. Reach for a leaf prover (ay/ty/clean/...) directly only to debug that backend.
 
 GOTCHAS
-  * Nothing is on PATH by default and no prebuilt sysroot ships — export
-    build/<host>/stage2/bin or call by full path; a fresh checkout must build first.
+  * INSTALL: a prebuilt, self-contained sysroot SHIPS — `aterm pkg install trust`, or the
+    whole toolset with `aterm pkg install --default-set` (the same act as Settings ▸
+    Packages ▸ Install ALab toolset). trustc/targo then resolve via `aterm trustc` /
+    `aterm targo` (store-pinned, never $PATH) and land on PATH inside aterm-integrated
+    shells. Building from source is NOT a supported install path: trust is
+    coherence-grouped, so atpkg permanently refuses to source-build it (prebuilt-only).
   * An empty/zero-obligation report is not a proof — always gate with `--require proved`.
   * Toolchain is Trust-branded only (trustc/targo/targo-trust/trustfmt); a genesis
-    stage0 is dev-only and is rejected as proof evidence. macOS build:
-    `LIBRARY_PATH=/opt/homebrew/lib python3 x.py build --stage 2`."#,
+    stage0 is dev-only and is rejected as proof evidence."#,
         ),
     },
     Topic {
@@ -820,6 +822,51 @@ mod tests {
         assert!(
             page.contains("ATERM_AI_HINT"),
             "the opt-in AI hint must be documented in the manual"
+        );
+    }
+
+    #[test]
+    fn trust_topic_steers_to_the_prebuilt_install_never_a_source_build() {
+        // FINDING: a prebuilt self-contained sysroot SHIPS (seed + signed registry) and
+        // source-building trust is permanently refused (coherence-grouped ⇒ prebuilt-only,
+        // atpkg's sourcebuild choke point). The primary "how do I install trust" surface
+        // must name the real path and never steer users into an x.py build.
+        let (page, code) = render(Some("trust"), None);
+        assert_eq!(code, 0);
+        assert!(
+            page.contains("aterm pkg install trust"),
+            "must name the shipped install path"
+        );
+        assert!(
+            !page.contains("x.py"),
+            "must not steer users to the refused source-build path"
+        );
+        assert!(
+            page.contains("prebuilt"),
+            "must say the sysroot ships prebuilt"
+        );
+    }
+
+    #[test]
+    fn atpkg_topic_states_the_compiled_anchor_and_the_window_scoped_update_loop() {
+        // FINDING (root anchor): the root key is a committed constant
+        // (aterm-update-core::pins) — the stale "a plain cargo build bakes no root key"
+        // claim must be gone, and the ATPKG_DISABLE kill switch documented.
+        let (page, code) = render(Some("atpkg"), None);
+        assert_eq!(code, 0);
+        assert!(
+            page.contains("COMPILED IN") && page.contains("ATPKG_DISABLE"),
+            "must document the committed anchor and the kill switch"
+        );
+        assert!(
+            !page.contains("bakes no root key"),
+            "the inert-by-default claim is stale"
+        );
+        // FINDING (update scope): both update loops live in the windowed app only, so
+        // the manual must tell headless/CLI users to run `aterm pkg update` themselves.
+        assert!(
+            page.contains("aterm pkg update") && page.contains("scheduler"),
+            "must state the headless/CLI update obligation"
         );
     }
 

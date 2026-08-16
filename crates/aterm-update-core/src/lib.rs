@@ -13,13 +13,17 @@
 //! per-machine [`token`] resolution chain; private-dir hardening
 //! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; the release-tag
 //! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
-//! they cannot disagree about which releases are candidates; and a generic
-//! trust anchors ([`pins`] — committed constants, never build-environment state).
+//! they cannot disagree about which releases are candidates; the trust anchors
+//! ([`pins`] — committed constants, never build-environment state); and the
+//! master-signed machine [`roster`] that turns one paper master key into per-machine
+//! signing authority with attribution and revocation.
 //!
 //! `aterm-update` layers the macOS-only pieces (DMG mount/extract, codesign/spctl
 //! verification, the atomic `RENAME_SWAP` bundle exchange + re-exec, the `.app`
-//! staging layout) on top of these. No crypto crate is pulled in — `sha256_file`
-//! shells `/usr/bin/shasum`, matching the release scripts.
+//! staging layout) on top of these. Content hashing still shells `/usr/bin/shasum`
+//! (`sha256_file`), matching the release scripts; the one crypto dependency is
+//! `ring`'s verify-only Ed25519, used by [`roster`] and shared with the owner-side
+//! minting tool so producer and client cannot drift on what a valid chain is.
 
 // Under the Trust verifier, register the `trust` tool namespace so the
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-out on `Manifest::parse`
@@ -29,6 +33,7 @@
 
 pub mod manifest;
 pub mod pins;
+pub mod roster;
 pub mod tag;
 pub mod token;
 
@@ -46,12 +51,13 @@ pub use http::{
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;
+pub use roster::{Attribution, Machine, Roster, RosterReject, VerifiedRoster, verify_roster};
 pub use sentinel::Sentinel;
 pub use source::{
-    DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO, Source, is_valid_slug, pick_slug,
+    ATPKG_INDEX_OWNER, DEFAULT_OWNER, DEFAULT_REPO, PUBLISH_OWNER, PUBLISH_REPO, Source,
+    is_valid_slug, pick_slug,
 };
 pub use sys::{FileLock, same_volume};
-
 
 /// Emit a non-fatal updater warning to the app log. Routed through `aterm_log` (the
 /// global logger `aterm-gui` installs), with the same `aterm-update:` prefix the

@@ -22,36 +22,55 @@
 //! phases it describes and is no longer true — the modules it called future are
 //! listed above. Fix the sentence, not the reader's expectations, if it drifts again.)
 //!
-//! The anchor is a two-tier Ed25519 trust model that
-//! mirrors `aterm-update`'s notarization pin, but for cross-platform CLI tarballs
-//! where Apple notarization does not transfer (see
-//! `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §8/§13):
+//! # ONE ROOT
 //!
-//! 1. A compile-time-pinned **offline root** public key ([`PINNED_PKG_ROOTKEY`])
-//!    verifies `index.toml` over its **exact raw bytes**.
-//! 2. The root-signed index **delegates** a rotatable **release key**; that key
-//!    verifies each `pkg-*.toml` (again over raw bytes). Re-cutting the index with a
-//!    new release key id is how a compromised release key is revoked without
-//!    shipping a new `aterm` — a deny-list (`revoked_release_keys`) belt-and-suspenders
-//!    the same.
-//! 3. Verification happens **before any parse**, enforced *by construction*: the only
-//!    way to obtain a [`sig::VerifiedBytes`] (which the parser consumes) is to pass
-//!    one of the verify functions. There is no public constructor, so handing
-//!    unverified bytes to the parser does not type-check.
+//! atpkg has no trust root of its own. It shares aterm's: the **paper master**
+//! ([`PKG_TRUST_ANCHORS`], i.e. `aterm_update_core::pins::PAPER_MASTER_PUBKEYS`) signs a
+//! roster of machine keys, and a machine on that roster signs the toolchain index exactly
+//! as it signs a release appcast.
 //!
-//! **Fail-closed-on-empty.** With no root key baked in at build time the manager is
-//! fully inert: [`enabled`] is false and every verify of an index returns
-//! [`sig::Reject::Disabled`] before any crypto runs. A plain `cargo build` installs,
-//! verifies, and trusts nothing.
+//! ```text
+//!   PAPER MASTER  --signs-->  aterm-machines.toml  (the roster: who may sign, who no longer may)
+//!                                     |
+//!                    a rostered machine signs:  index.toml
+//!                    a rostered machine signs:  pkg-<program>-<build>.toml
+//!                                     |
+//!                            index --names--> program repos, channels, pins
+//! ```
+//!
+//! There used to be a SECOND root here — a `PKG_ROOT_PUBKEY` whose secret half lived at
+//! `~/.config/atpkg/root.key`, signing an `index.toml` that in turn delegated a rotatable
+//! release key. Both tiers are retired. The roster supplies the grant AND the deny, and
+//! supplies the deny in minutes (bump the roster) rather than at index-republish latency.
+//! One thing on paper, one revocation story, one document to audit.
+//!
+//! 1. The roster is verified under the pinned master over its **exact raw bytes**, then
+//!    admitted against a durable `roster_seq` ratchet and its own freshness window.
+//! 2. `index.toml` is verified under the machines that roster still authorizes — revoked
+//!    and expired ones having left the candidate set BEFORE any crypto — and then bound to
+//!    the machine that actually signed it (`machine_id` / `roster_seq` live inside the
+//!    signed bytes).
+//! 3. Each `pkg-*.toml` is verified under that same roster generation
+//!    ([`sig::TrustedIndex::verify_pkg`]).
+//! 4. Verification happens **before any parse**, enforced *by construction*: the only way
+//!    to obtain a [`sig::VerifiedBytes`] (which the parser consumes) is through the
+//!    authorization functions. There is no public constructor, so handing unverified bytes
+//!    to the parser does not type-check.
+//!
+//! **Fail-closed-on-empty.** With no master pinned the manager is fully inert:
+//! [`enabled`] is false, [`select_index`] selects nothing (and observes nothing) before
+//! touching a candidate, and
+//! every roster admission returns [`sig::Reject::Disabled`] before any crypto runs. In
+//! THIS tree the master anchor is empty, so a build from this source installs, verifies
+//! and trusts **nothing** until an operator arms it in a reviewed commit — see
+//! `docs/ATPKG-KEY-MANAGEMENT.md`.
 
 pub mod activate;
 pub mod appgate;
 pub mod apply;
-pub mod bundled;
 pub mod cache;
 /// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
 pub mod cli;
-pub mod companions;
 pub mod config;
 pub mod cost;
 pub mod discovery;
@@ -73,10 +92,8 @@ pub mod ops;
 pub mod pin;
 pub mod platform;
 pub mod relocate;
-pub mod seed;
 pub mod select;
 pub mod sig;
-pub mod sourcebuild;
 pub mod status;
 pub mod store;
 pub mod sysroot;
@@ -86,7 +103,6 @@ pub mod verify;
 pub use activate::{activate_channel, atomic_symlink, install_shims};
 pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
-pub use bundled::bundled_seed_dir;
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};
@@ -107,16 +123,18 @@ pub use linkmode::{
     linked_programs, linked_programs_checked, refresh, unlink,
 };
 pub use lock::{StoreLock, StoreLockError, try_lock_store};
+// `parse_index` is deliberately NOT re-exported (and is `pub(crate)`): outside this
+// crate, the only way to a parsed `Index` is `TrustedRoster::authorize_index`, which runs
+// the machine-id bind the raw parse would let a caller skip. See its doc in `manifest`.
 pub use manifest::{
-    Artifact, Channel, Cost, Index, Keys, PkgManifest, Program, SUPPORTED_SCHEMA, parse_index,
-    parse_pkg,
+    Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, parse_pkg,
 };
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
 pub use ops::{active_builds, list_installed, uninstall, which};
-pub use select::{Candidate, Selected, select_index};
+pub use select::{Candidate, Selected, Selection, select_index};
 pub use sig::{
-    Delegation, Floor, Reject, VerifiedBytes, check_freshness, verify_index, verify_index_with,
-    verify_pkg,
+    Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,
+    check_freshness,
 };
 pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
@@ -124,30 +142,47 @@ pub use sysroot::{relocate_sysroot, write_toolchain_version};
 pub use tree::{sha256_file, tree_root};
 pub use verify::{VerifyOutcome, verify_all, verify_program};
 
-// The batteries-included companion-tools surface (docs/COMPANION-TOOLS.md): the source-build
-// (keyless) lane, complementary to the signed `install --default-set` bootstrap.
-pub use companions::{Companion, Manifest as CompanionManifest, SeedPolicy};
-pub use seed::{Ledger as SeedLedger, SeedResult, SkipReason, reconcile_source};
-pub use sourcebuild::{
-    Installed as SourceInstalled, Provenance, SourceBuildError, build_and_install,
+/// The base64 Ed25519 public key(s) of the **paper master** this binary trusts — atpkg's
+/// one and only trust root, shared verbatim with the app update channel.
+///
+/// A committed constant ([`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`]), not a build
+/// env var: what a binary trusts is a property of the source, identical on every machine.
+/// A LIST for the same reason the channel keyset is one — a client that accepts exactly
+/// one master cannot be told about a replacement by a document it would refuse to verify.
+///
+/// EMPTY means unpinned means INERT, and inert grants nothing: no roster verifies, so no
+/// machine is authorized, so no index verifies, so nothing installs. It never means
+/// "accept anything". This tree is ARMED (2026-08-15): the paper master is pinned and
+/// the manager is live.
+///
+/// The master's SECRET half is 52 base32 characters on paper and exists on no
+/// computer; it is typed in only to provision a machine or to revoke one.
+pub const PKG_TRUST_ANCHORS: &[&str] = aterm_update_core::pins::PAPER_MASTER_PUBKEYS;
+
+/// The single-string spelling of [`PKG_TRUST_ANCHORS`]' head, for the surfaces that show
+/// ONE anchor to a human (the GUI's diagnostics row, [`root_key_fingerprint`]).
+///
+/// It is derived, never a second anchor: `""` exactly when the keyset is empty, so
+/// `!PINNED_PKG_ROOTKEY.is_empty()` and `!PKG_TRUST_ANCHORS.is_empty()` answer the same
+/// question and a display surface cannot report "a root is available" while the verifier
+/// considers itself unarmed. Authority is always the LIST — a rotation in flight puts a
+/// second master beside the head, and only the list sees it.
+///
+/// It no longer names `pins::PKG_ROOT_PUBKEY`. That constant is retired: nothing in this
+/// crate reads it, and arming it would arm nothing.
+pub const PINNED_PKG_ROOTKEY: &str = if PKG_TRUST_ANCHORS.is_empty() {
+    ""
+} else {
+    PKG_TRUST_ANCHORS[0]
 };
 
-/// The base64 Ed25519 **root** public key this binary trusts.
-///
-/// A committed constant ([`aterm_update_core::pins::PKG_ROOT_PUBKEY`]), not a build
-/// env var: what a binary trusts is a property of the source, identical on every
-/// machine. Empty disables the manager entirely, fail-closed — with no anchor there
-/// is nothing to trust, so no index ever verifies. The root SECRET key lives only
-/// offline.
-pub const PINNED_PKG_ROOTKEY: &str = aterm_update_core::pins::PKG_ROOT_PUBKEY;
-
-/// Whether the manager is configured to act: a root key must be pinned AND the user
-/// must not have opted out via `ATPKG_DISABLE`. Fail closed — an empty pin is never
+/// Whether the manager is configured to act: a paper master must be pinned AND the user
+/// must not have opted out via `ATPKG_DISABLE`. Fail closed — an empty keyset is never
 /// active. Unlike `aterm-update::enabled` this is **not** macOS-gated: the package
 /// manager is cross-platform.
 #[must_use]
 pub fn enabled() -> bool {
-    !PINNED_PKG_ROOTKEY.is_empty() && std::env::var_os("ATPKG_DISABLE").is_none()
+    !PKG_TRUST_ANCHORS.is_empty() && std::env::var_os("ATPKG_DISABLE").is_none()
 }
 
 /// Effective CLI posture: the compiled root anchor, plus the `ATPKG_DISABLE` kill
@@ -157,32 +192,45 @@ pub fn enabled() -> bool {
 /// `ATPKG_ROOTKEY_OVERRIDE` is GONE. It supplied "the same verification anchor the
 /// verbs consume", so an environment variable could ENABLE an otherwise-unpinned
 /// build — i.e. ambient state decided what the package manager trusted. The anchor
-/// now lives in reviewed source ([`aterm_update_core::pins::PKG_ROOT_PUBKEY`]) and
+/// now lives in reviewed source ([`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`]) and
 /// nothing outside a commit can change it. An alternate package owner commits their
-/// own anchor, which is the same deliberate act, visible in a diff.
+/// own paper master, which is the same deliberate act, visible in a diff.
 ///
 /// `ATPKG_DISABLE` stays: turning the manager OFF is fail-safe, and a kill switch
 /// that only ever subtracts authority cannot be used to grant any.
 #[must_use]
 pub fn manager_enabled() -> bool {
-    manager_enabled_with(PINNED_PKG_ROOTKEY, std::env::var_os("ATPKG_DISABLE").is_some())
+    manager_enabled_with(
+        PKG_TRUST_ANCHORS,
+        std::env::var_os("ATPKG_DISABLE").is_some(),
+    )
 }
 
+/// Pure core of [`manager_enabled`]: armed iff the keyset is non-empty, and never while
+/// disabled. The keyset is the input rather than a single key so this cannot be called
+/// with a head that is present while the list behind it is not.
 #[must_use]
-pub fn manager_enabled_with(pinned: &str, disabled: bool) -> bool {
+pub fn manager_enabled_with(pinned: &[&str], disabled: bool) -> bool {
     !disabled && !pinned.is_empty()
 }
 
-/// A short, dependency-free fingerprint of the pinned root key, so `atpkg doctor` can
-/// show **which** trust root is live (§8). FNV-1a/64 over the pinned base64 string —
-/// purely operator-facing, never a security primitive (the real anchor is the full
-/// pinned key, not this digest). Returns the all-zero seed digest when no key is
-/// pinned.
+/// A short, dependency-free fingerprint of the pinned MASTER keyset, so `atpkg doctor`
+/// can show **which** trust root is live (§8). FNV-1a/64 over every pinned base64 string
+/// in order, separated by a byte base64 cannot contain (`0x1F`) so two different keysets
+/// cannot collide by concatenation — purely operator-facing, never a security primitive
+/// (the real anchor is the keys themselves, not this digest). Returns the all-zero seed
+/// digest when nothing is pinned.
 #[must_use]
 pub fn root_key_fingerprint() -> String {
+    /// Separator: a control byte, so it can never appear inside a base64 key.
+    const SEP: u8 = 0x1F;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in PINNED_PKG_ROOTKEY.as_bytes() {
-        h ^= u64::from(*b);
+    for key in PKG_TRUST_ANCHORS {
+        for b in key.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h ^= u64::from(SEP);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     // Manual rendering of the previous `format!("{h:016x}")` — byte-identical

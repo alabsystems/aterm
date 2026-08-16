@@ -2475,12 +2475,7 @@ mod tests {
             assert_eq!(
                 (after.w, after.h, after.ax, after.ay, after.aw, after.ah),
                 (
-                    before.w,
-                    before.h,
-                    before.ax,
-                    before.ay,
-                    before.aw,
-                    before.ah
+                    before.w, before.h, before.ax, before.ay, before.aw, before.ah
                 ),
                 "thaw resumes the peek exactly where it froze (no mass replay)"
             );

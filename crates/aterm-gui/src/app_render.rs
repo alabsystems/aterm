@@ -1478,239 +1478,6 @@ pub(crate) struct HostVisualState {
     pub(crate) overlay: Option<OverlayGlow>,
 }
 
-/// THE TYPED-KITTY CAMEO on a SINGLE-PANE present — the unsplit twin of
-/// [`App::compose_typed_cameo`], and the reason this is a named function rather
-/// than four lines inline: the pane scope it resolves is the whole point, and
-/// it has to be reachable by a test.
-///
-/// `front_session` is the session whose grid this frame is drawing. The cameo
-/// is emitted ONLY for it.
-///
-/// THE BUG THIS EXISTS TO CLOSE (skeptic's finding, 2026-08-09): the summon
-/// tags every cameo with the session the keystroke landed in
-/// (`App::summon_typed_kitty` passes `Some(session)`), but this renderer used
-/// to pass `None` — and `None` is a WILDCARD in
-/// [`aterm_effects::kitty_cameo::KittyCameo::frame_in_pane`], meaning "any
-/// cameo may draw here". `WordDecorations` is per-WINDOW, not per-tab, and a
-/// tab switch retires nothing, so typing `kitty` in tab A and immediately
-/// selecting tab B teleported the five-second toy onto tab B's grid at tab A's
-/// caret cell. Naming the front session turns the wildcard into an identity
-/// check, so the toy stays in the tab it was summoned in and reappears there
-/// (still bounded by its own clock) if the user switches back inside its life.
-///
-/// The composed path never had this bug — it resolves the pane from the
-/// cameo's OWN tag and draws nothing when that pane is absent from the active
-/// tab's layout — which is exactly the law this brings the unsplit path to.
-///
-/// Returns the frame-fingerprint contribution (0 when nothing was drawn), so a
-/// cameo-free frame stays byte-identical.
-fn present_typed_cameo(
-    ws: &mut WindowState,
-    geom: aterm_effects::word_decorations::EffectGeom,
-    now: Instant,
-    front_session: u64,
-    default_bg: u32,
-    cursor_color: u32,
-    accent: u32,
-) -> u64 {
-    // The scope, authored once and in ONE place: this renderer draws exactly
-    // one session's grid, so it may only present that session's toy.
-    let pane = Some(front_session);
-    let Some(footprint) = ws.word_decos.kitty_cameo_footprint(geom, now, pane) else {
-        return 0;
-    };
-    let colors = cursor_cat_color_key(
-        &ws.input_scratch.cells,
-        geom,
-        footprint,
-        default_bg,
-        cursor_color,
-        accent,
-    );
-    ws.word_decos
-        .kitty_cameo(geom, now, pane, colors, &mut ws.free_scratch)
-        .map_or(0, |f| f.rotate_left(11))
-}
-
-#[cfg(test)]
-mod typed_cameo_scope_tests {
-    //! A TYPED CAMEO BELONGS TO THE SESSION IT WAS SUMMONED IN.
-    //!
-    //! `WordDecorations` — and with it the one live cameo — is per WINDOW, not
-    //! per tab, and a tab switch retires nothing. The only thing keeping one
-    //! tab's toy off another tab's glass is the pane scope the renderer names.
-
-    use std::time::Instant;
-
-    use super::present_typed_cameo;
-    use crate::{App, WindowId};
-
-    fn geom() -> aterm_effects::word_decorations::EffectGeom {
-        aterm_effects::word_decorations::EffectGeom {
-            cell_w: 10,
-            cell_h: 20,
-            rows: 24,
-            cols: 80,
-        }
-    }
-
-    /// Emit for `session` and report how many free sprites landed.
-    fn present_for(app: &mut App, wid: WindowId, session: u64, now: Instant) -> (u64, usize) {
-        let ws = app.windows.get_mut(&wid).expect("window");
-        ws.free_scratch.clear();
-        let fp = present_typed_cameo(
-            ws,
-            geom(),
-            now,
-            session,
-            0x0000_0000,
-            0x00ff_ffff,
-            0x00ff_00ff,
-        );
-        (fp, ws.free_scratch.len())
-    }
-
-    /// THE OWNER-VISIBLE REPRO (skeptic's finding, 2026-08-09): type `kitty` in
-    /// tab A, immediately select tab B, and the five-second toy teleported onto
-    /// tab B at tab A's caret cell.
-    ///
-    /// Both halves are asserted from the SAME live cameo, one frame apart, so
-    /// the silence for tab B cannot come from the toy having expired, failed to
-    /// bake, or never been summoned — the tab A precondition rules each of
-    /// those out immediately before.
-    #[test]
-    fn a_cameo_summoned_in_one_tab_is_never_presented_for_another() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.recompute_sparkle();
-        let now = Instant::now();
-        let session_a = app.front_terminal(wid).expect("front terminal").session;
-        // The REAL input path, so the pane tag under test is the one the
-        // shipping summon actually stamps.
-        for c in "kitty".chars() {
-            app.input(
-                wid,
-                crate::input::InputEvent::Key {
-                    key: aterm_types::keyboard::Key::Character(c),
-                    mods: aterm_types::keyboard::Modifiers::empty(),
-                    base_layout: None,
-                    event_type: aterm_types::keyboard::KeyEventType::Press,
-                },
-                crate::input::Source::Human,
-            );
-        }
-
-        let (fp_a, sprites_a) = present_for(&mut app, wid, session_a, now);
-        assert!(
-            sprites_a > 0 && fp_a != 0,
-            "PRECONDITION: the summoning tab really presents the toy \
-             (sprites={sprites_a}, fp={fp_a})",
-        );
-
-        // A SECOND TAB, with its own session, made front exactly as ⌘T does.
-        let session_b = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session(session_b));
-        assert_ne!(session_a, session_b);
-        assert_eq!(
-            app.front_terminal(wid).expect("front terminal").session,
-            session_b,
-            "PRECONDITION: the new tab is the one on glass now",
-        );
-        assert!(
-            app.windows[&wid]
-                .word_decos
-                .cameo_pane(now)
-                .expect("PRECONDITION: the cameo is still live — a tab switch retires nothing")
-                == Some(session_a),
-            "PRECONDITION: and it still names the tab it was typed in",
-        );
-
-        let (fp_b, sprites_b) = present_for(&mut app, wid, session_b, now);
-        assert_eq!(
-            sprites_b, 0,
-            "the toy must not follow the user into another terminal tab",
-        );
-        assert_eq!(fp_b, 0, "and it must contribute nothing to that tab's frame");
-
-        // …and switching BACK inside its life still finds it, so this is a
-        // scope, not a silent deletion.
-        let (fp_back, sprites_back) = present_for(&mut app, wid, session_a, now);
-        assert!(
-            sprites_back > 0 && fp_back != 0,
-            "the toy is scoped to its tab, not destroyed",
-        );
-    }
-
-    /// AND A TOY NOBODY CAN SEE MUST NOT HOLD THE WINDOW AT 60 fps.
-    ///
-    /// SKEPTIC'S SECOND-ROUND FINDING, 2026-08-09: the emitters were scoped but
-    /// the SCHEDULER was not. `WordDecorations::is_active` answered the
-    /// window-wide question "is a cameo animating", so a toy typed in tab A
-    /// kept `cursor_fx_active` true — and with it the whole terminal-effects
-    /// frame lane — for its full ~5.04 s while the user worked in tab B, where
-    /// both renderers correctly draw nothing. Real cost, zero pixels.
-    ///
-    /// The cameo is summoned through the ENGINE seam rather than the keyboard
-    /// deliberately: `drain_serious_effects` first parks every other latch this
-    /// predicate reads, and typing would recharge the glow and the trail, so
-    /// the lane's verdict would no longer be about the toy. (The input path's
-    /// own wiring is pinned by the test above.)
-    #[test]
-    fn a_cameo_in_a_hidden_tab_does_not_hold_the_effect_frame_lane() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.recompute_sparkle();
-        let now = Instant::now();
-        let session_a = app.front_terminal(wid).expect("front terminal").session;
-        {
-            let ws = app.windows.get_mut(&wid).expect("window");
-            ws.focused = true;
-            ws.drain_serious_effects();
-            assert!(
-                !ws.cursor_fx_active(now, false),
-                "PRECONDITION: with every latch parked the lane is idle, so the \
-                 verdicts below are about the cameo and nothing else"
-            );
-            ws.word_decos.summon_cameo(
-                now,
-                (2, 3),
-                aterm_effects::kitty_registry::KittyLook::for_session(session_a),
-                Some(session_a),
-            );
-            assert!(
-                ws.cursor_fx_active(now, false),
-                "PRECONDITION: in its own tab the toy alone arms the lane"
-            );
-        }
-
-        let session_b = app.next_session_id;
-        app.push_stub_tab(wid, crate::stub_session(session_b));
-        assert_eq!(
-            app.front_terminal(wid).expect("front terminal").session,
-            session_b,
-            "PRECONDITION: the new tab is the one on glass now"
-        );
-        assert!(
-            app.windows[&wid]
-                .word_decos
-                .cameo_pane(now)
-                .is_some_and(|p| p == Some(session_a)),
-            "PRECONDITION: a tab switch retires nothing — the toy is still live \
-             and still names tab A"
-        );
-        assert!(
-            !app.windows[&wid].cursor_fx_active(now, false),
-            "a cameo no renderer will draw must not keep the window presenting"
-        );
-
-        app.switch_tab_in(wid, 0);
-        assert!(
-            app.windows[&wid].cursor_fx_active(now, false),
-            "…and coming back inside its life re-arms it: a scope, not a deletion"
-        );
-    }
-}
-
 fn acknowledge_successful_present(
     state: &mut WindowState,
     app_frame_interval: Duration,
@@ -5400,7 +5167,10 @@ mod pet_pointer_cell_tests {
             None
         );
         // Degenerate metrics never divide.
-        assert_eq!(pet_pointer_cell((5.0, 5.0), (0, 0), (0, 20), (80, 24)), None);
+        assert_eq!(
+            pet_pointer_cell((5.0, 5.0), (0, 0), (0, 20), (80, 24)),
+            None
+        );
     }
 }
 
@@ -5545,19 +5315,30 @@ pub(crate) fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, p
 /// (`KittySing::signature`): the synth derives every per-key axis from it —
 /// the verse melody walk, the root transpose, the mode rotation — so holding
 /// a different key sings a DIFFERENT VERSE of the same celebration, over one
-/// continuous bar grid instead of restarting it.
-fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
+/// continuous bar grid instead of restarting it. `class` and `energy_q` are
+/// the SONG ARC's half of the payload (`KittySing::section_class_now` /
+/// `arc_energy_q`): the section timbre/dynamics and the earned escalation —
+/// energy INHERITS across a key switch, so the build is continuous where
+/// the bar index jumps forward at a section reopen.
+fn sing_riff_event(
+    bar: u64,
+    gain: f32,
+    sig: u32,
+    class: u8,
+    energy_q: u8,
+) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
         style: crate::cursor_glow::GlowStyle::RainbowKitty,
         // The sing-along riff is its own authored song — the
         // `trail_sound_style` override never re-voices it.
         voice: aterm_effects::trail_sound::SoundVoice::Style,
         kind: aterm_effects::trail_sound::SoundGesture::Celebration(
-            // Through the stable constructor (not the variant literal), so
-            // the planned post-shim variant rename touches no call site.
-            aterm_effects::trail_sound::CelebrationGesture::riff_bar(
+            // Through the stable constructor (not the variant literal).
+            aterm_effects::trail_sound::CelebrationGesture::riff_bar_arc(
                 (bar & 0xffff) as u16,
                 sig,
+                class,
+                energy_q,
             ),
         ),
         pan: 0.0,
@@ -5567,6 +5348,58 @@ fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound:
         hue: 0.0,
         gain,
         // Tone-blind like the bonk, and it never feeds the bed.
+        tone: aterm_effects::tone::Tone::Technical,
+        bed: false,
+    }
+}
+
+/// THE DRUMMER'S CUE (`KittySing::take_fill_cue` →
+/// `CelebrationGesture::RiffFillCue`): a committed key switch with runway
+/// announces itself with the authored four-sixteenth fill on the sounding
+/// bar's last beat, WALKING from the departed key (`sig`) into the
+/// arriving one (`sig_next`). The synth quantizes the hits to its OWN
+/// sixteenth grid — this event carries identity, never timing. Same
+/// sound-policy envelope as the riff bar.
+fn sing_fill_event(gain: f32, sig: u32, sig_next: u32) -> aterm_effects::trail_sound::SoundEvent {
+    aterm_effects::trail_sound::SoundEvent {
+        style: crate::cursor_glow::GlowStyle::RainbowKitty,
+        voice: aterm_effects::trail_sound::SoundVoice::Style,
+        kind: aterm_effects::trail_sound::SoundGesture::Celebration(
+            aterm_effects::trail_sound::CelebrationGesture::RiffFillCue { sig, sig_next },
+        ),
+        pan: 0.0,
+        heat: 1.0,
+        hue: 0.0,
+        gain,
+        tone: aterm_effects::tone::Tone::Technical,
+        bed: false,
+    }
+}
+
+/// THE FINALE (`KittySing::take_cadence` ->
+/// `CelebrationGesture::RiffCadence`): one ending bar in the RELEASED
+/// key, gain scaled by the earned energy, the fused clap when the
+/// performance crossed the gate. Same sound-policy envelope as the riff.
+fn sing_cadence_event(
+    gain: f32,
+    sig: u32,
+    energy_q: u8,
+    span_bars: u16,
+) -> aterm_effects::trail_sound::SoundEvent {
+    aterm_effects::trail_sound::SoundEvent {
+        style: crate::cursor_glow::GlowStyle::RainbowKitty,
+        voice: aterm_effects::trail_sound::SoundVoice::Style,
+        kind: aterm_effects::trail_sound::SoundGesture::Celebration(
+            aterm_effects::trail_sound::CelebrationGesture::RiffCadence {
+                sig,
+                energy_q,
+                span_bars,
+            },
+        ),
+        pan: 0.0,
+        heat: 1.0,
+        hue: 0.0,
+        gain,
         tone: aterm_effects::tone::Tone::Technical,
         bed: false,
     }
@@ -5596,6 +5429,12 @@ fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
     !pet_mode || sing > 0.0
 }
 
+/// The pet half of [`flying_kitty_admitted`]: exactly one companion owns a
+/// pet-mode frame, including the song's wind-down.
+fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
+    pet_visible && !flying_kitty_admitted(true, sing)
+}
+
 /// Pin a PET-MODE episode's exit flourish to Plain, on the frame copy the
 /// host is about to draw (the state machine's roll becomes presentation-dead;
 /// no engine state changes). In pet mode the flying companion exists solely
@@ -5612,7 +5451,7 @@ fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) 
 
 #[cfg(test)]
 mod pet_sing_swap_tests {
-    use super::{flying_kitty_admitted, pin_pet_mode_exit, sing_face_live};
+    use super::{flying_kitty_admitted, pet_companion_admitted, pin_pet_mode_exit, sing_face_live};
     use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
 
     /// The pet yields exactly at the S115 face-swap threshold — below it the
@@ -5660,6 +5499,20 @@ mod pet_sing_swap_tests {
         // Outside pet mode the earned flight is untouched by the song.
         assert!(flying_kitty_admitted(false, 0.0));
         assert!(flying_kitty_admitted(false, 1.0));
+    }
+
+    /// Single-pane rendering used to admit both companions during wind-down.
+    #[test]
+    fn pet_and_flying_face_are_never_admitted_together() {
+        for sing in [0.0, 0.1, 0.3299, 0.33, 1.0, f32::NAN] {
+            let flying = flying_kitty_admitted(true, sing);
+            let pet = pet_companion_admitted(true, sing);
+            assert_ne!(
+                pet, flying,
+                "pet mode must choose exactly one companion at sing={sing:?}"
+            );
+        }
+        assert!(!pet_companion_admitted(false, 0.0));
     }
 
     /// A pet-mode summon EXITS PLAIN: whatever flourish the machine rolled,
@@ -5713,11 +5566,8 @@ pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) cat_frame: crate::kitty_cursor::CatFrame,
     /// The PET companion's resolved frame, already ticked for this composed
     /// present (the brain advances outside this path so it can never freeze —
-    /// see the tick site). Emitted only when `pet_visible`; `kitty_alpha` is 0
-    /// whenever it is EXCEPT during the sing-along's admission
-    /// ([`flying_kitty_admitted`]), when the singing face takes the caret —
-    /// the composed path still draws one companion per frame (the pet-first
-    /// return in `compose_cursor_companion` yields while `sing > 0`).
+    /// see the tick site). `pet_visible` already includes the custody gate, so
+    /// it is mutually exclusive with the flying face in pet mode.
     pub(crate) pet: aterm_effects::kitty_pet::PetFrame,
     pub(crate) pet_visible: bool,
     pub(crate) accent: u32,
@@ -5797,9 +5647,8 @@ fn wallpaper_cell_tints(
         for c in 0..cols {
             let x = ((c * 2 + 1) * w / (cols * 2)).min(w - 1);
             let i = (y * w + x) * 4;
-            let px = (u32::from(rgba[i]) << 16)
-                | (u32::from(rgba[i + 1]) << 8)
-                | u32::from(rgba[i + 2]);
+            let px =
+                (u32::from(rgba[i]) << 16) | (u32::from(rgba[i + 1]) << 8) | u32::from(rgba[i + 2]);
             out.push(wallpaper_text_tint_color(px, fallback_fg));
         }
     }
@@ -5837,9 +5686,7 @@ fn wallpaper_text_tint_color(backdrop: u32, fallback_fg: u32) -> Option<[u8; 3]>
     let light_ink = ground <= LIGHT_INK_BELOW;
     let (hue, s, _v) = rgb2hsv(backdrop);
     if s < 0.10 {
-        if wcag_contrast(relative_luminance(fallback_fg), ground)
-            >= WALLPAPER_TINT_CONTRAST_FLOOR
-        {
+        if wcag_contrast(relative_luminance(fallback_fg), ground) >= WALLPAPER_TINT_CONTRAST_FLOOR {
             return None;
         }
         let neutral = if light_ink { 0xF0 } else { 0x20 };
@@ -8376,6 +8223,59 @@ mod motion_policy_tests {
         );
     }
 
+    /// ONE huge present must never shed, no matter how huge. The neighbour test
+    /// above proves a *marginal* lone spike (25 ms against a 24 ms threshold)
+    /// does not trip the latch, but that never exercised the smoothing: a spike
+    /// ~8× the threshold kept the decaying EMA (S/2, S/4, S/8) qualifying for
+    /// the next three instant frames, and that counted as a "sustained run".
+    /// A theme switch manufactures exactly that spike — every window's present
+    /// caches invalidated, every sprite re-baked — which is how "changed the
+    /// color theme to nord [and] all the kitty and rainbow effects went away"
+    /// shipped (owner report, 2026-08-15). The shed qualifier now reads the raw
+    /// sample; this pins the storm-shaped spike, not the marginal one.
+    #[test]
+    fn a_single_spike_present_never_sheds() {
+        use std::time::Duration;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("auto".into());
+        app.system_reduce_motion = false;
+
+        // 60 Hz budget: shed threshold 1.5×16 ≈ 24 ms.
+        let fi = Duration::from_millis(16);
+        let steady = 1_000_000u64; // 1 ms — a healthy frame.
+        let spike = 250_000_000u64; // 250 ms — a theme-reload invalidation storm.
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // A settled, healthy cadence…
+        for i in 0..4 {
+            assert!(!app.note_present_cost(steady, fi, at(i * 16)));
+        }
+        // …one invalidation-storm present…
+        assert!(
+            !app.note_present_cost(spike, fi, at(64)),
+            "the spike itself is not a transition"
+        );
+        // …and the EMA's decay tail (125 → 63 → 31 ms, all over the 24 ms
+        // threshold) must not be mistaken for a sustained overload once the
+        // per-frame cost is instantly healthy again.
+        for i in 0..5 {
+            assert!(
+                !app.note_present_cost(steady, fi, at(80 + i * 16)),
+                "a healthy frame in the EMA's decay tail is not a transition"
+            );
+            assert!(
+                !app.perf_reduced,
+                "a lone spike must never latch the shed, however large"
+            );
+            assert_eq!(
+                app.motion_policy(true),
+                MotionPolicy::Full,
+                "a theme switch never costs the kitty her rainbow"
+            );
+        }
+    }
+
     /// The adaptive loop must include CPU work associated with effect-heavy GPU
     /// submission. A compose-only sample is blind to that slice; folding the
     /// injected encode/submit CPU wall time into the causal sample trips the
@@ -9477,8 +9377,15 @@ impl App {
             }
         } else {
             // Shed only after a sustained run over budget (a lone slow frame — GC, a
-            // resize hitch — must NOT trip it).
-            if ema > PERF_SHED_FACTOR * fi {
+            // resize hitch, a theme-reload invalidation storm — must NOT trip it).
+            // Qualified on the RAW sample, not the EMA: a single huge spike keeps
+            // the decaying EMA (S/2, S/4, S/8 at alpha 0.5) over threshold for the
+            // next few instant frames, which counted as a "sustained run" and shed
+            // the whole kitty/rainbow set on every theme switch (owner report,
+            // 2026-08-15: "changed the color theme to nord [and] all the kitty and
+            // rainbow effects went away"). The EMA still drives the clear
+            // direction above — conservative there is correct.
+            if sample > PERF_SHED_FACTOR * fi {
                 self.perf_run += 1;
             } else {
                 self.perf_run = 0;
@@ -9642,11 +9549,28 @@ impl App {
     }
 
     /// Whether the active trail style asks for the full-body PET companion
-    /// (`cursor_trail_style = "rainbow kitty pet"`) instead of the flying kitty.
-    /// Both spellings resolve to the same `GlowStyle::RainbowKitty` trail —
-    /// mirrors `trail_is_comet`'s style-string idiom.
+    /// (`cursor_trail_style = "rainbow kitty pet"` or `"rainbow dog pet"`)
+    /// instead of the flying kitty. Every spelling resolves to the same
+    /// `GlowStyle::RainbowKitty` trail — mirrors `trail_is_comet`'s
+    /// style-string idiom.
+    ///
+    /// SPECIES-BLIND BY DESIGN: this answers "is the pet drawn at all", which
+    /// is the only question the draw path's gating needs. Which animal is
+    /// [`Self::trail_pet_species`], asked once when the brain is fed.
     pub(crate) fn trail_is_kitty_pet(&self) -> bool {
-        crate::cursor_glow::GlowStyle::style_names_kitty_pet(self.config.cursor_trail_style_raw())
+        crate::cursor_glow::GlowStyle::style_names_any_pet(self.config.cursor_trail_style_raw())
+    }
+
+    /// Which animal the full-body pet is drawn as. Meaningless unless
+    /// [`Self::trail_is_kitty_pet`] — defaults to the cat, so a style string
+    /// that names no pet at all can never select the dog by accident.
+    pub(crate) fn trail_pet_species(&self) -> aterm_effects::kitty_pet::PetSpecies {
+        if crate::cursor_glow::GlowStyle::style_names_dog_pet(self.config.cursor_trail_style_raw())
+        {
+            aterm_effects::kitty_pet::PetSpecies::Dog
+        } else {
+            aterm_effects::kitty_pet::PetSpecies::Cat
+        }
     }
 
     /// Resolve the cadence-comet MOTION-TRAIL config for this frame: the directional
@@ -12219,6 +12143,18 @@ impl App {
                 .serious_mode_policy()
                 .allows(crate::motion::SeriousEffect::StreamFade);
         let fade_ms = self.config.stream_fade_ms_or_default();
+        // ROBI's gates, resolved here beside their siblings (the window
+        // borrow below outlives every later chance to ask the policies).
+        // Motion is asked with focus PINNED TRUE: a resident must stay on the
+        // glass of an unfocused window (he simply freezes — unfocused windows
+        // stop presenting on their own); only a real reduced-motion verdict
+        // (config or OS) removes him.
+        let robi_serious_allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::Robi);
+        let robi_motion_allowed = self
+            .motion_policy(true)
+            .animate(crate::motion::MotionEffect::Robi);
 
         // D-1 early-out. Hold the Terminal mutex only long enough to read the
         // damage epoch + selection + title and, IF we decide to repaint, refill
@@ -12310,9 +12246,8 @@ impl App {
             // engine read that missing binding as "matches every session",
             // which is only ever true of the GEOMETRY. `WordDecorations` is per
             // WINDOW and a tab switch retires nothing, so the wildcard let TAB
-            // A's typed cameo veto the identically-placed ambient cat in TAB B,
-            // and TAB A's edit keystroke license a plain repaint of TAB B to
-            // re-arm a cat that was already spent there (skeptic's third round,
+            // A's edit keystroke license a plain repaint of TAB B to re-arm a
+            // cat that was already spent there (skeptic's third round,
             // 2026-08-09).
             //
             // DECLARED HERE, not beside the tick: the declaration also
@@ -12738,6 +12673,9 @@ impl App {
             // Likewise a pure config read, hoisted above the window borrow: it
             // selects WHICH companion the draw block below emits.
             let pet_mode = self.trail_is_kitty_pet();
+            // …and WHICH animal it draws, hoisted for the same reason (a `Copy`
+            // enum, so the borrow below is unaffected).
+            let pet_species = self.trail_pet_species();
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -12770,7 +12708,7 @@ impl App {
             // O(1) scalar sync from the durable collection (no ledger scan/I/O).
             // It keeps new windows and restored sessions on the latest
             // collected identity. `on_collect` fires from the TYPED path only
-            // (`summon_typed_kitty`); this tick's ambient drain below records
+            // (`record_typed_kitty`); this tick's ambient drain below records
             // to the ledger and can never repoint the companion (owner
             // ruling, 2026-08-07).
             // TWO-PATH RULE (owner: switching character mid-flight is
@@ -12858,9 +12796,49 @@ impl App {
                         // signature drives the verse, root and mode, so
                         // switching which key you hold changes the tune — over
                         // the same bar grid, so the change is seamless rather
-                        // than a restart.
+                        // than a restart. The ARC rides beside it: section
+                        // class + earned energy, inherited across switches.
+                        self.trail_audio.push(sing_riff_event(
+                            bar,
+                            gain,
+                            ws.kitty_sing.signature(),
+                            ws.kitty_sing.section_class_now(),
+                            ws.kitty_sing.arc_energy_q(frame_started),
+                        ));
+                    }
+                }
+                // THE ANNOUNCED SWITCH: drain the drummer's cue
+                // UNCONDITIONALLY (the latch law — a muted riff must not
+                // bank a stale cue for an unmuted later moment), push only
+                // when the riff gate says audible.
+                if let Some((old_sig, new_sig)) = ws.kitty_sing.take_fill_cue()
+                    && let Some(gain) = sing_riff_gain(
+                        ws.focused,
+                        self.config.trail_sounds_or_default(),
+                        self.config.trail_sound_riff_or_default(),
+                        self.config.trail_sound_volume(),
+                    )
+                {
+                    self.trail_audio
+                        .push(sing_fill_event(gain, old_sig, new_sig));
+                }
+                // THE FINALE: consume the cadence exactly once. The audio
+                // push rides the riff gate (muted => no sound, still
+                // consumed); the FIREWORKS are a MOTION contract — they
+                // run for a muted riff, and never under reduced motion
+                // (the fade-only law).
+                if let Some((sig, energy_q, span)) = ws.kitty_sing.take_cadence(frame_started) {
+                    if let Some(gain) = sing_riff_gain(
+                        ws.focused,
+                        self.config.trail_sounds_or_default(),
+                        self.config.trail_sound_riff_or_default(),
+                        self.config.trail_sound_volume(),
+                    ) {
                         self.trail_audio
-                            .push(sing_riff_event(bar, gain, ws.kitty_sing.signature()));
+                            .push(sing_cadence_event(gain, sig, energy_q, span));
+                    }
+                    if motion.animate(crate::motion::MotionEffect::CursorGlow) {
+                        ws.music_notes.fireworks(frame_started, u32::from(span));
                     }
                 }
             } else {
@@ -12871,8 +12849,15 @@ impl App {
             }
             ws.cursor_cat.set_singing(
                 frame_started,
-                sing_drive,
-                ws.kitty_sing.beat(frame_started).unwrap_or(0.0),
+                crate::kitty_cursor::SingSync {
+                    drive: sing_drive,
+                    beat: ws.kitty_sing.beat(frame_started).unwrap_or(0.0),
+                    energy: f32::from(ws.kitty_sing.arc_energy_q(frame_started)) / 200.0,
+                    class: ws.kitty_sing.section_class_now(),
+                    landing: ws.kitty_sing.switch_landing(frame_started),
+                    fill: ws.kitty_sing.fill_beat(frame_started),
+                    bow: ws.kitty_sing.bow_depth(frame_started),
+                },
             );
             let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
             let mut cat_frame = if animate_cat {
@@ -12980,11 +12965,11 @@ impl App {
             //
             // THE SONG TAKES THE CARET ([`sing_face_live`]): while the singing
             // face is live the pet is fed `caret: None` too — it fades out
-            // over its 0.45 s envelope HOLDING POSITION. `pet_visible` is
-            // deliberately NOT flipped: the draw gate below must keep
-            // rendering the fading body. When the drive drops back below the
-            // 0.33 face swap the caret re-feeds, and the pet returns as a NEW
-            // SIGHTING at its keep-ahead station — FADE_IN, no flinch.
+            // over its 0.45 s envelope HOLDING POSITION. `pet_visible` remains
+            // the brain's base gate; [`pet_companion_admitted`] separately
+            // withholds its sprite while the singing face owns the glass.
+            // Below the 0.33 face swap the caret re-feeds, and the pet returns
+            // as a NEW SIGHTING at its keep-ahead station — FADE_IN, no flinch.
             //
             // EXIT-CODE EMPATHY (wave 1): the pet is the SECOND consumer of
             // the LOCK-A completion probe, keyed (session, seq) with its OWN
@@ -13018,9 +13003,9 @@ impl App {
             // never a burst). The AND with `shell_executing` is what keeps
             // keystroke echo from ever perking the cat (`pet_output_burst`).
             let pet_burst = {
-                let advanced = ws.pet_content_seq.is_some_and(|(sid, s)| {
-                    sid == front_terminal.session && content_seq > s
-                });
+                let advanced = ws
+                    .pet_content_seq
+                    .is_some_and(|(sid, s)| sid == front_terminal.session && content_seq > s);
                 ws.pet_content_seq = Some((front_terminal.session, content_seq));
                 pet_output_burst(
                     scrolled_rows > 0,
@@ -13053,6 +13038,10 @@ impl App {
             if ws.cursor_pet.grieving() {
                 ws.cursor_glow.hush_fanfare(frame_started);
             }
+            // The pet's SKIN, re-asserted every frame from the live config so a
+            // Settings change lands on the next frame without resetting the
+            // companion (see `PetBrain::set_species`).
+            ws.cursor_pet.set_species(pet_species);
             let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
                 now: frame_started,
                 caret: if pet_visible && !sing_face_live(sing_drive) {
@@ -13071,12 +13060,16 @@ impl App {
                 output_burst: pet_burst,
                 pointer: pet_pointer,
             });
+            // The brain can begin returning below the face-swap threshold,
+            // but only one companion is put on glass.
+            let pet_on_glass =
+                pet_companion_admitted(pet_visible, cat_frame.sing) && pet_frame.alpha > 0;
             // PETTING (wave 1): stash the body the emitter is about to draw,
             // in FRAME px, for the mouse seam's hit test — and CLEAR it on
             // every frame the pet is not drawn, so a stale rect can never
             // eat a click after a style switch or a fade-out. Post-tick by
             // construction: the rect is THIS frame's body, not last frame's.
-            ws.pet_hit_rect = if pet_visible && pet_frame.alpha > 0 {
+            ws.pet_hit_rect = if pet_on_glass {
                 pet_hit_rect_win(
                     pet_frame.body_px(
                         glow_geom.cw.min(usize::from(u16::MAX)) as u16,
@@ -13210,10 +13203,10 @@ impl App {
                         // body, because its pixel footprint is a ~2.8-col ×
                         // 1.70-row animal standing wherever its brain walked
                         // it, not the flying head's caret-anchored band.
-                        cur.filter(|_| kitty_alpha > 0 || (pet_visible && pet_frame.alpha > 0))
-                            .map(|cell| crate::word_decorations::CompanionOnGlass {
+                        cur.filter(|_| kitty_alpha > 0 || pet_on_glass).map(|cell| {
+                            crate::word_decorations::CompanionOnGlass {
                                 cell,
-                                body_px: (pet_visible && pet_frame.alpha > 0)
+                                body_px: pet_on_glass
                                     .then(|| {
                                         pet_frame.body_px(
                                             effect_geom.cell_w,
@@ -13222,7 +13215,8 @@ impl App {
                                         )
                                     })
                                     .flatten(),
-                            }),
+                            }
+                        }),
                         Some(sel_view),
                         ws.focused,
                         &mut ws.deco_scratch,
@@ -13245,7 +13239,7 @@ impl App {
                     // hello and no companion repoint can start here. The
                     // peeking word-cats themselves still draw. Presenting a
                     // discovery is the TYPED path's alone
-                    // (`summon_typed_kitty`).
+                    // (`record_typed_kitty`).
                     self.kitty_log.observe_ambient(
                         front_terminal.session,
                         ws.word_decos.drain_kitty_sightings(),
@@ -13263,18 +13257,15 @@ impl App {
                     // TTL), and the brain consumes it on the ground next
                     // tick — the latch law's one frame of latency.
                     {
-                        let (word_decos, cursor_pet) =
-                            (&mut ws.word_decos, &mut ws.cursor_pet);
+                        let (word_decos, cursor_pet) = (&mut ws.word_decos, &mut ws.cursor_pet);
                         let bat_on = pet_visible;
                         for cue in word_decos.drain_peek_cues() {
                             if bat_on {
                                 let (x0, x1, y0, y1) = cue.head_px;
                                 cursor_pet.note_peek(
                                     frame_started,
-                                    (x0 + x1) as f32 * 0.5
-                                        / f32::from(effect_geom.cell_w.max(1)),
-                                    (y0 + y1) as f32 * 0.5
-                                        / f32::from(effect_geom.cell_h.max(1)),
+                                    (x0 + x1) as f32 * 0.5 / f32::from(effect_geom.cell_w.max(1)),
+                                    (y0 + y1) as f32 * 0.5 / f32::from(effect_geom.cell_h.max(1)),
                                 );
                             }
                         }
@@ -13335,7 +13326,7 @@ impl App {
                     // sensor, see `kitty_pet::PetSense`), so it keeps behaving
                     // through every trail-config state the glow classifier
                     // early-outs on.
-                    if pet_visible && pet_frame.alpha > 0 {
+                    if pet_on_glass {
                         let colors = ws.cursor_cat.episode_colors().unwrap_or_else(|| {
                             // The footprint must be the rect the pet ACTUALLY
                             // covers, or the contrast ink is resolved against
@@ -13440,8 +13431,16 @@ impl App {
                                     notes: {
                                         ws.music_notes.update(
                                             frame_started,
-                                            cat_frame.sing,
+                                            // ARMED, not the drive: the
+                                            // finale tail streams nothing —
+                                            // the fireworks own the ending.
+                                            ws.kitty_sing.is_armed(frame_started),
                                             ws.kitty_sing.beat(frame_started),
+                                            // The stripe range follows the
+                                            // section class — and flips on
+                                            // the hand-over press itself
+                                            // (the tint pre-echo).
+                                            ws.kitty_sing.section_class_now(),
                                         );
                                         ws.music_notes
                                             .frame_array(frame_started, tick_cfg.reduced_motion)
@@ -13453,29 +13452,6 @@ impl App {
                             }
                         }
                     }
-                    // THE TYPED-KITTY CAMEO (owner, 2026-08-09: "I want THE
-                    // kitty to appear"). Emitted UNCONDITIONALLY of every
-                    // companion gate above it — no `kitty_alpha`, no
-                    // `flying_kitty_admitted`, no pet mode: it is not the
-                    // companion, it answers a keystroke rather than a trail
-                    // style, and it must show for every trail style exactly as
-                    // the summon it replaced did. `kitty_cameo` no-ops when
-                    // nothing is live, so a cameo-free frame stays
-                    // byte-identical.
-                    //
-                    // THE TWIN OF THIS CALL IS `compose_typed_cameo`. The two
-                    // render paths are separate emitters; wiring only one would
-                    // leave the toy invisible in the other layout.
-                    fp ^= present_typed_cameo(
-                        ws,
-                        effect_geom,
-                        frame_started,
-                        front_session,
-                        default_bg_u32,
-                        cursor_color_u32,
-                        glow_cfg.accent,
-                    );
-
                     // THE TYPED DOG (`aterm_effects::dog_cameo`): a VISITOR
                     // popping up BEHIND the cursor, independent of the
                     // companion machinery — it takes the plain presentation
@@ -13484,9 +13460,9 @@ impl App {
                     // Draws in pet mode too: the pet stands at its own
                     // position, the dog trails the caret, so they never
                     // contest pixels.
-                    // THE VISIT RIDES THE SESSION IT WAS TYPED IN (the typed-
-                    // kitty cameo's pane law): a dog summoned in tab A must
-                    // never present on tab B's glass at tab A's caret.
+                    // THE VISIT RIDES THE SESSION IT WAS TYPED IN: a dog
+                    // summoned in tab A must never present on tab B's glass at
+                    // tab A's caret.
                     let dog_alpha = if win_focused
                         && !deco_suspend
                         && sparkle_on
@@ -13563,6 +13539,159 @@ impl App {
                 ws.nova_scratch.clear();
                 0
             };
+            // ROBI THE HELPER ROBOT (`aterm_effects::robi`): the RESIDENT —
+            // walks the typed row, jumping jacks, ladder, tab-bar monkey
+            // bars, tips above his head, forever. DELIBERATELY OUTSIDE the
+            // sparkle-words branch above: he is chrome furniture with his own
+            // top-level key (`robi`), not a word toy, so the sparkle master
+            // must not silence him (and the else arm's scratch clear runs
+            // BEFORE he appends). Once born he is PRESENT AT ALL TIMES: no
+            // focus gate (an unfocused window freezes him mid-pose, it never
+            // hides him), no session gate (he walks whatever tab fronts), no
+            // expiry. Only config-off, serious mode, a real reduced-motion
+            // verdict, load shed — or a click on his body (the dismiss latch,
+            // owner 2026-08-15: "it needs to be easily dismissable") — take
+            // him off the glass. The latch is per window and clears when he
+            // is called by name, so a dismissed Robi stays gone rather than
+            // being re-born by this very block on the next frame.
+            let robi_on = !deco_suspend
+                && self.config.robi_or_default()
+                && robi_serious_allowed
+                && robi_motion_allowed
+                && !ws.robi_dismissed;
+            if !robi_on && ws.robi_show.born() {
+                // Bypass-to-final-state (the matrix-rain rule): no robot, no
+                // leftover bubble state; he is re-born when the gate reopens.
+                ws.robi_show.stop();
+                ws.robi_tip_posted = None;
+                ws.robi_bubble_anchor = None;
+                ws.robi_hit_rect = None;
+            }
+            let robi_fp = if robi_on {
+                if !ws.robi_show.born() {
+                    ws.robi_shows += 1;
+                    ws.robi_show.start(frame_started, ws.robi_shows);
+                }
+                // The same live geometry the sparkle branch hands its
+                // emitters (its `effect_geom` local is scoped to that branch).
+                let effect_geom = crate::word_decorations::EffectGeom {
+                    cell_w: glow_cw as u16,
+                    cell_h: glow_ch as u16,
+                    rows: rows as u16,
+                    cols: cols as u16,
+                };
+                let ch = i32::from(effect_geom.cell_h).max(1);
+                let cw = i32::from(effect_geom.cell_w).max(1);
+                // The monkey-bar hand line: the in-grid tab strip's mid-height
+                // when a strip exists; otherwise the titlebar band (native
+                // chips are AppKit views above the surface, so he swings in
+                // the band beneath them); or just above row 0 when there is
+                // no headroom at all. All pre-splice grid px (negative = above
+                // row 0 — the strip splice owns the shift).
+                let strip_px = i32::from(self.tab_strip_rows) * ch;
+                let head_px = ws.metrics.head as i32;
+                let pad_top_px = ws.metrics.pad_top as i32;
+                let bar_y = if strip_px > 0 {
+                    -strip_px / 2
+                } else if head_px > 0 {
+                    -(pad_top_px + head_px * 9 / 20)
+                } else {
+                    -ch / 3
+                };
+                // Handholds: tab-chip centers when the in-grid strip is up —
+                // he really does swing tab to tab — else an even rhythm.
+                let mut handholds = [0i32; aterm_effects::robi::MAX_HANDHOLDS];
+                let mut count = 0usize;
+                if strip_px > 0 {
+                    for seg in &ws.tab_segments {
+                        if count == handholds.len() {
+                            break;
+                        }
+                        handholds[count] =
+                            (i32::from(seg.start_col) + i32::from(seg.end_col)) * cw / 2;
+                        count += 1;
+                    }
+                }
+                if count < 2 {
+                    let grid_w = i32::from(effect_geom.cols) * cw;
+                    let n = (grid_w / (8 * cw)).clamp(2, aterm_effects::robi::MAX_HANDHOLDS as i32)
+                        as usize;
+                    for (i, hold) in handholds.iter_mut().take(n).enumerate() {
+                        *hold = grid_w * (2 * i as i32 + 1) / (2 * n as i32);
+                    }
+                    count = n;
+                }
+                let sense = aterm_effects::robi::RobiSense {
+                    geom: effect_geom,
+                    cursor: cur.unwrap_or((effect_geom.rows.saturating_sub(1), 0)),
+                    bar_y,
+                    handholds,
+                    handhold_count: count as u8,
+                };
+                let mut robi_fp = 0u64;
+                if let Some(frame) = ws.robi_show.frame(frame_started, &sense) {
+                    // Post each tip once per tip window. The notice slot is
+                    // App-global, so the request is drained OUTSIDE this
+                    // window borrow (see the drain beside `splice_notice`).
+                    match frame.tip {
+                        Some(idx) if ws.robi_tip_posted != Some(idx) => {
+                            ws.robi_tip_posted = Some(idx);
+                            ws.robi_tip_request = Some(idx);
+                        }
+                        None => ws.robi_tip_posted = None,
+                        _ => {}
+                    }
+                    // His speech-bubble anchor: the top of his head in TRAY
+                    // px (post-splice — tray y 0 is the strip's top edge), so
+                    // the tip bubble rides just above him wherever he is.
+                    let body_h = aterm_effects::robi::art_rows(&effect_geom) * ch as f32;
+                    let anchor_frac = match frame.anchor {
+                        aterm_effects::robi::RobiAnchor::Feet => aterm_effects::robi::FEET_FRAC,
+                        aterm_effects::robi::RobiAnchor::Grip => aterm_effects::robi::GRIP_FRAC,
+                    };
+                    let head_top = frame.anchor_y as f32 - body_h * anchor_frac;
+                    ws.robi_bubble_anchor = Some((frame.x as f32, head_top + strip_px as f32));
+                    // His clickable body for the mouse path (the pet-stash
+                    // discipline: fresh every drawn frame, `None` clears).
+                    // The emitter's exact rect — centered on `frame.x`, top
+                    // of head down one body — lifted from tray px into FRAME
+                    // px: the tray origin sits at (pad, pad_top + head), the
+                    // inverse of `notice_click`'s frame→tray step.
+                    let body_w = (body_h * aterm_effects::robi::ART_ASPECT).round();
+                    let pad_px = ws.metrics.pad as f32;
+                    let tray_top = (pad_top_px + head_px) as f32;
+                    let x0 = pad_px + frame.x as f32 - body_w * 0.5;
+                    let y0 = tray_top + head_top + strip_px as f32;
+                    ws.robi_hit_rect = Some((
+                        x0 as i32,
+                        (x0 + body_w) as i32,
+                        y0 as i32,
+                        (y0 + body_h) as i32,
+                    ));
+                    if let Some(emitted) = ws.word_decos.robi(
+                        aterm_effects::word_decorations::RobiShowFrame {
+                            geom: effect_geom,
+                            frame,
+                        },
+                        &mut ws.free_scratch,
+                    ) {
+                        robi_fp = emitted.rotate_left(13);
+                    }
+                    // One-present-ahead wakes ONLY while a scene is actually
+                    // in motion (the dog's clockless rule): his static idle
+                    // stands cost zero wakes — he resumes his rounds on the
+                    // next natural redraw.
+                    if frame.animating
+                        && let Some(window) = ws.os_window.as_ref()
+                    {
+                        window.request_redraw();
+                    }
+                }
+                robi_fp
+            } else {
+                0
+            };
+            let deco_fp = deco_fp ^ robi_fp;
             // VI-1: the on-viewport vi (copy-mode) cursor screen position, if any — used
             // for the RepaintKey (so a vi motion, which damages no grid cell, still
             // forces a repaint), the render override below (same mapping, so they never
@@ -14328,6 +14457,35 @@ impl App {
         // prefers the modal card, so it shows only when no overlay is open. A no-op when
         // the setting is off.
         self.splice_build_badge(id);
+        // ROBI's tip request, drained OUTSIDE the window borrow (the notice is
+        // App-global): post it only into a FREE slot — an expired notice or an
+        // older Robi tip. An update notice is never clobbered by a decoration.
+        if let Some(idx) = self
+            .windows
+            .get_mut(&id)
+            .and_then(|ws| ws.robi_tip_request.take())
+        {
+            let now = std::time::Instant::now();
+            let slot_free = self
+                .notice
+                .as_ref()
+                .is_none_or(|n| n.is_expired(now) || n.is_robi_tip());
+            if slot_free && let Some(tip) = aterm_effects::robi::ROBI_TIPS.get(usize::from(idx)) {
+                let anchor = self.windows.get(&id).and_then(|ws| ws.robi_bubble_anchor);
+                self.notice = Some(crate::notice::TransientNotice::robi_tip(
+                    tip.text, anchor, now,
+                ));
+            }
+        } else if let Some(n) = self.notice.as_mut()
+            && n.is_robi_tip()
+        {
+            // The bubble follows its speaker: refresh the anchor every frame
+            // so a swinging Robi carries his tip with him.
+            let anchor = self.windows.get(&id).and_then(|ws| ws.robi_bubble_anchor);
+            if let Some(a) = anchor {
+                n.set_anchor(Some(a));
+            }
+        }
         // Transient update notice — paint-only, its own slot, priority over the badge.
         self.splice_notice(id);
         // LEVEL-UP rising up-arrow — paint-only, its own slot, priority over the notice
@@ -14926,9 +15084,7 @@ impl App {
         // apply after). SGR-colored text keeps its colors, and cells already
         // claimed by an ink producer (Sparkle Words) KEEP that ink — the
         // user-visible feature wins over the aesthetic tint.
-        if tint_on
-            && let Some(scaled) = ws.wallpaper_scaled.as_ref()
-        {
+        if tint_on && let Some(scaled) = ws.wallpaper_scaled.as_ref() {
             let dfg = [
                 ((default_fg >> 16) & 0xff) as u8,
                 ((default_fg >> 8) & 0xff) as u8,
@@ -14938,8 +15094,7 @@ impl App {
             // cells; the tint fills the default-fg glyph cells between them,
             // preserving the channel's sorted-unique contract.
             let existing = std::mem::take(&mut ws.input_scratch.ink);
-            let mut merged =
-                Vec::with_capacity(existing.len() + rows.saturating_mul(cols) / 4);
+            let mut merged = Vec::with_capacity(existing.len() + rows.saturating_mul(cols) / 4);
             let mut ex = existing.iter().copied().peekable();
             for (r, row) in ws.input_scratch.cells.iter().enumerate().take(rows) {
                 if r > usize::from(u16::MAX) {
@@ -15960,161 +16115,18 @@ impl App {
         // ≤ MAX_INK_CELLS per pane, so this sort is free.
         ws.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
         fp ^= self.compose_cursor_companion(wid, ctx, focus_place);
-        fp ^= self.compose_typed_cameo(wid, ctx, focus_place);
         fp ^= self.compose_typed_dog(wid, ctx, focus_place);
         fp
     }
 
-    /// THE TYPED-KITTY CAMEO on a composed frame — the split twin of the cameo
-    /// arm in `redraw_window`.
-    ///
-    /// Its own function, called BESIDE `compose_cursor_companion` rather than
-    /// inside it, because that function is a chain of early returns owned by
-    /// the companion's gates (pet mode, `kitty_alpha == 0`, a missing focus
-    /// cursor) and the cameo is subject to NONE of them: it answers a
-    /// keystroke, not a trail style. Folding it in there would silently
-    /// suppress the toy in exactly the configurations most likely to be in use.
-    ///
-    /// THE TOY RIDES THE PANE IT WAS TYPED IN — not the focused one.
-    ///
-    /// SKEPTIC'S FINDING, 2026-08-09: this used to emit at `ctx.focus` while
-    /// the engine's one-cat-per-caret VETO
-    /// (`WordDecorations::tick` → `KittyCameo::veto_cell`) is scoped to
-    /// `bind_pane`, i.e. to the pane the word was typed in. Two different
-    /// scopes for one toy: move focus to the other half of a split and the
-    /// veto kept silencing the ambient cat in pane A while nothing at all was
-    /// drawn there. Both sides now ask the SAME question — "does this cameo
-    /// belong to the pane in question?" — which also gives `Cameo::pane` a
-    /// job it is actually read for (it selects the geometry below) rather than
-    /// leaving it a scope check that only ever answered yes.
-    ///
-    /// Emission happens at that pane's geometry and then goes through the one
-    /// `translate_free_into_pane` helper, so a cameo near a divider is cropped
-    /// at it rather than drawn over the neighbour.
-    fn compose_typed_cameo(
-        &mut self,
-        wid: WindowId,
-        ctx: &ComposeDecoCtx<'_>,
-        focus_place: Option<PanePlace>,
-    ) -> u64 {
-        // The sparkle master owns every cat: with it off the engine was
-        // hard-reset above (which retires any live cameo), so there is nothing
-        // to draw and nothing to check.
-        if self.sparkle.is_none() {
-            return 0;
-        }
-        // WHICH PANE OWNS THE TOY. `None` (outer) means no cameo is on glass at
-        // all; `None` (inner) is a cameo summoned by a host that binds no pane,
-        // which has no divider to respect and falls back to the focused place.
-        let Some(cameo_pane) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.word_decos.cameo_pane(ctx.now))
-        else {
-            return 0;
-        };
-        // THE OWNING PANE, resolved ONCE: its place (where the toy draws) and
-        // its terminal (whose text the toy is tinted against) must come from
-        // the SAME leaf, or the sample describes a grid the sprite is not on.
-        let owner = match cameo_pane {
-            Some(session) => ctx.panes.iter().find(|(r, _)| r.session == session),
-            // A cameo summoned by a host that binds no pane has no divider to
-            // respect; it falls back to the focused place, so the focused
-            // pane's terminal is also the right palette source.
-            None => ctx.panes.iter().find(|(r, _)| r.session == ctx.focus),
-        };
-        let place = match cameo_pane {
-            Some(_) => owner.map(|(r, _)| PanePlace {
-                row_off: r.row_off,
-                col_off: r.col_off,
-                rows: r.rows,
-                cols: r.cols,
-                win_rows: ctx.win_rows,
-                win_cols: ctx.win_cols,
-                cell_w: ctx.cell_w,
-                cell_h: ctx.cell_h,
-            }),
-            None => focus_place,
-        };
-        // A cameo whose pane has left the layout draws nothing. `retain_panes`
-        // retires that pane's episodes at the top of this compose, so the toy
-        // is the only thing that could still name it.
-        let Some(place) = place else {
-            return 0;
-        };
-        let owner_term = owner.map(|(_, term)| term.clone());
-        let default_bg = self.theme.bg;
-        let accent = ctx.accent;
-        let cursor_color = ctx.cursor_color;
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return 0;
-        };
-        let geom = crate::word_decorations::EffectGeom {
-            cell_w: ctx.cell_w as u16,
-            cell_h: ctx.cell_h as u16,
-            rows: place.rows,
-            cols: place.cols,
-        };
-        let Some(footprint) = ws
-            .word_decos
-            .kitty_cameo_footprint(geom, ctx.now, cameo_pane)
-        else {
-            return 0;
-        };
-        // THE PALETTE COMES FROM THE TOY'S OWN PANE, ONCE.
-        //
-        // SKEPTIC'S FINDING, 2026-08-09: this used to sample `deco_pane_cells`
-        // as it stood — "whichever pane extracted last this frame", which the
-        // pane loop only refills for panes that RESCANNED. A split cameo was
-        // therefore tinted against a sibling pane's text (wrong contrast, and a
-        // wrong background BAND flips the pale-underlay treatment outright), or
-        // against a stale grid, and the palette is part of the BAKE KEY — so a
-        // buffer that flipped owner between frames also churned the cat atlas
-        // for the toy's whole life.
-        //
-        // Same two-part shape the PET companion beside this already uses: latch
-        // the palette for the episode, and pay for one extraction to get that
-        // one sample right. `cameo_wants_colors` is true for exactly one frame
-        // per cameo, so the ~300 frames that follow take no lock at all.
-        let colors = if ws.word_decos.cameo_wants_colors() {
-            if let Some(term) = owner_term.as_ref() {
-                let mut t = term_lock(term);
-                t.cell_frame_into(
-                    &mut ws.deco_pane_cells,
-                    usize::from(place.rows),
-                    usize::from(place.cols),
-                );
-            }
-            cursor_cat_color_key(
-                &ws.deco_pane_cells.cells,
-                geom,
-                footprint,
-                default_bg,
-                cursor_color,
-                accent,
-            )
-        } else {
-            // Already latched: `kitty_cameo` ignores what we hand it, so hand it
-            // nothing rather than sampling a grid we would then discard.
-            aterm_effects::cat_baker::CatColorKey::default()
-        };
-        ws.pane_free.clear();
-        let fp = ws
-            .word_decos
-            .kitty_cameo(geom, ctx.now, cameo_pane, colors, &mut ws.pane_free);
-        translate_free_into_pane(&mut ws.pane_free, place);
-        ws.free_scratch.extend_from_slice(&ws.pane_free);
-        fp.map_or(0, |f| f.rotate_left(11))
-    }
-
     /// THE TYPED DOG on a composed frame — the split twin of the dog arm in
-    /// `redraw_window`, called BESIDE `compose_typed_cameo` for the same
-    /// reason that one is: the companion's early-return chain (pet mode,
-    /// `kitty_alpha == 0`) does not own the dog, which answers a keystroke.
+    /// `redraw_window`, and its own function beside `compose_cursor_companion`
+    /// for the reason that one is: the companion's early-return chain (pet
+    /// mode, `kitty_alpha == 0`) does not own the dog, which answers a
+    /// keystroke.
     ///
-    /// The dog rides the SESSION it was typed in (`dog_cameo_session`), and —
-    /// unlike the kitty cameo, which re-presents in its own pane wherever
-    /// focus goes — it simply stays invisible while another pane has focus:
+    /// The dog rides the SESSION it was typed in (`dog_cameo_session`), and it
+    /// simply stays invisible while another pane has focus:
     /// the visit is a bounded ~3 s toy anchored to the caret being typed at,
     /// and the caret it knew is gone once focus moves. Emitted at the focused
     /// pane's geometry, then translated and cropped by
@@ -16190,7 +16202,11 @@ impl App {
                 cursor: cell,
                 look,
                 colors,
-                bob: if reduced { 0.0 } else { ws.dog_cameo.bob(ctx.now) },
+                bob: if reduced {
+                    0.0
+                } else {
+                    ws.dog_cameo.bob(ctx.now)
+                },
                 alpha,
             },
             &mut ws.pane_free,
@@ -16317,17 +16333,8 @@ impl App {
         // present (outside this function, which the sparkle master can skip), so
         // this is pure emission.
         //
-        // …except while the SINGING FACE holds the caret: the sing-along
-        // admits the flying kitty in pet mode ([`flying_kitty_admitted`]), so
-        // the pet-first return yields for the song's whole admission. THE
-        // SPLIT-PATH ASYMMETRY, documented and deliberate: this path composes
-        // ONE companion per frame, so the pet returns only once `sing` hits
-        // exactly 0 — slightly LATER than the single-pane path, which draws
-        // the fading pet body and the singing face side by side through the
-        // wind-down crossfade. By the time the pet composes again its caret
-        // has been re-fed since the 0.33 face swap, so it is already mid
-        // fade-in at its keep-ahead station.
-        if ctx.pet_visible && ctx.cat_frame.sing <= 0.0 {
+        // `pet_visible` already carries the shared one-companion custody gate.
+        if ctx.pet_visible {
             return self.compose_pet_companion(wid, ctx, focus_place);
         }
         if ctx.kitty_alpha == 0 {
@@ -16409,8 +16416,15 @@ impl App {
                 pose: ctx.cat_frame.pose,
                 sing: ctx.cat_frame.sing,
                 notes: {
-                    ws.music_notes
-                        .update(ctx.now, ctx.cat_frame.sing, ws.kitty_sing.beat(ctx.now));
+                    ws.music_notes.update(
+                        ctx.now,
+                        // ARMED, not the drive — the finale tail belongs
+                        // to the fireworks (the single-pane twin's law).
+                        ws.kitty_sing.is_armed(ctx.now),
+                        ws.kitty_sing.beat(ctx.now),
+                        // The class-tinted stripes — the pre-echo's tint half.
+                        ws.kitty_sing.section_class_now(),
+                    );
                     ws.music_notes.frame_array(ctx.now, reduced)
                 },
             },
@@ -17149,6 +17163,8 @@ impl App {
         // (a pure config read, hoisted above the `ws` borrow) — and drawable
         // under the same presentation gate the flying kitty takes here.
         let pet_mode = self.trail_is_kitty_pet();
+        // …and WHICH animal it draws, hoisted for the same reason.
+        let pet_species = self.trail_pet_species();
         let pet_visible =
             pet_mode && cat_presentable && sparkle_on && glow_cfg.enabled && sing_style;
         // The pet's WORLD is the focused pane, not the window: it chases that
@@ -17169,170 +17185,205 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, pet_frame) =
+        let (cat_frame, kitty_alpha, riff, fill, cadence, pet_frame) = {
+            let ws = self.windows.get_mut(&wid)?;
+            // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
+            // through the same one verdict (favourite > app > discovery
+            // > session; see `app_kitty::companion_precedence`, resolved
+            // by [`Self::companion_verdict`] above).
+            ws.cursor_cat.set_look(companion_verdict);
+            ws.cursor_cat
+                .set_collection_presentable(now, cat_presentable);
+            // SING-ALONG: the held-key celebration drives the ribbon,
+            // the dance and the singing face through the one canonical metric.
+            let sing_drive = if sing_style {
+                ws.kitty_sing.drive(now)
+            } else {
+                0.0
+            };
+            let mut riff: Option<(u64, f32, u32, u8, u8)> = None;
+            let mut fill: Option<(f32, u32, u32)> = None;
+            let mut cadence: Option<(f32, u32, u8, u16)> = None;
+            if sing_drive > 0.0 {
+                ws.cursor_glow.celebrate(now, sing_drive);
+                if let Some(bar) = ws.kitty_sing.bar(now)
+                    && ws.sing_riff_bar != Some(bar)
+                {
+                    ws.sing_riff_bar = Some(bar);
+                    // `riff_key` reaches the policy AFTER the bar latch
+                    // above, exactly like the single-pane seam: quieting
+                    // the song must not stall the bar grid, or re-enabling
+                    // it mid-celebration would replay a stale bar.
+                    riff =
+                        sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume).map(|gain| {
+                            (
+                                bar,
+                                gain,
+                                ws.kitty_sing.signature(),
+                                ws.kitty_sing.section_class_now(),
+                                ws.kitty_sing.arc_energy_q(now),
+                            )
+                        });
+                }
+                // THE ANNOUNCED SWITCH — the single-pane twin: drain
+                // unconditionally, push (deferred, outside this borrow)
+                // only when audible.
+                if let Some((old_sig, new_sig)) = ws.kitty_sing.take_fill_cue() {
+                    fill = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
+                        .map(|gain| (gain, old_sig, new_sig));
+                }
+                // THE FINALE — the single-pane twin: consume once,
+                // audio behind the gate, fireworks behind motion.
+                if let Some((sig, energy_q, span)) = ws.kitty_sing.take_cadence(now) {
+                    cadence = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
+                        .map(|gain| (gain, sig, energy_q, span));
+                    if animate_cat {
+                        ws.music_notes.fireworks(now, u32::from(span));
+                    }
+                }
+            } else {
+                ws.kitty_sing.settle(now);
+                ws.sing_riff_bar = None;
+            }
+            ws.cursor_cat.set_singing(
+                now,
+                crate::kitty_cursor::SingSync {
+                    drive: sing_drive,
+                    beat: ws.kitty_sing.beat(now).unwrap_or(0.0),
+                    energy: f32::from(ws.kitty_sing.arc_energy_q(now)) / 200.0,
+                    class: ws.kitty_sing.section_class_now(),
+                    landing: ws.kitty_sing.switch_landing(now),
+                    fill: ws.kitty_sing.fill_beat(now),
+                    bow: ws.kitty_sing.bow_depth(now),
+                },
+            );
+            let mut cat_frame = if animate_cat {
+                ws.cursor_cat.frame(now)
+            } else {
+                ws.cursor_cat.static_frame(now)
+            };
+            // PET-MODE EPISODES EXIT PLAIN — the single-pane twin's law
+            // ([`pin_pet_mode_exit`]): the sing-along summon is the only
+            // way this companion appears in pet mode, and admission ends
+            // at drive 0, so no rolled heart/star may outlive it.
+            pin_pet_mode_exit(pet_mode, &mut cat_frame);
+            // `sparkle_on` gates the sprite: with the master off an earned
+            // flight is invisible, so folding its fp would force presents of
+            // unchanged pixels (the invisible-cat wake train).
+            let kitty_enabled = cat_presentable
+                && sparkle_on
+                && (cursor_cat_presentation_enabled(
+                    animate_cat,
+                    glow_cfg.enabled,
+                    glow_cfg.style,
+                    cat_frame.collection_hello,
+                ) || cat_frame.sing > 0.0);
+            // `!pet_mode` for the same reason as the single-pane path: an
+            // un-drawable flying kitty must not fire an exit flourish, move
+            // the RepaintKey, or claim the caret cell from a word-cat.
+            // Same sing-along exception too ([`flying_kitty_admitted`]):
+            // while the song holds the frame the SINGING FACE is the
+            // companion and the pet steps aside — admission spans the
+            // armed hold plus the wind-down, then ends at drive 0.
+            let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
+                cat_frame.alpha
+            } else {
+                0
+            };
+            // THE PET BRAIN TICKS HERE, unconditionally and exactly once per
+            // composed frame — outside `compose_word_decorations`, which
+            // early-returns whenever the sparkle master is off. The scheduler
+            // reads `needs_frames()`, and only `tick` advances it: freezing
+            // the brain anywhere the predicate is still consulted latches a
+            // permanent wake train (the single-pane path learned this the
+            // hard way). A pet that cannot be drawn is fed `caret: None`, so
+            // it fades out and releases the lane honestly.
+            //
+            // THE SONG TAKES THE CARET — the single-pane twin's law
+            // ([`sing_face_live`]): while the singing face is live the pet
+            // is fed `caret: None` too. The base `pet_visible` still ticks
+            // the brain; the custody gate below withholds the sprite until
+            // the flying face releases it. Below the 0.33 face swap the
+            // caret re-feeds and the pet returns at its keep-ahead station.
+            let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
+            // EXIT-CODE EMPATHY (wave 1) — the single-pane dedupe's
+            // split twin, on the pet's OWN (session, seq) latch: a
+            // pane-focus switch re-baselines silently, only a genuinely
+            // new completion in the same session notes the brain, and
+            // the note only latches (the tick below acts). Pass 1's
+            // snapshot is proven valid by the early return above, so
+            // these locals are the focused pane's real probe.
             {
-                let ws = self.windows.get_mut(&wid)?;
-                // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
-                // through the same one verdict (favourite > app > discovery
-                // > session; see `app_kitty::companion_precedence`, resolved
-                // by [`Self::companion_verdict`] above).
-                ws.cursor_cat.set_look(companion_verdict);
-                ws.cursor_cat
-                    .set_collection_presentable(now, cat_presentable);
-                // SING-ALONG: the held-key celebration drives the ribbon,
-                // the dance and the singing face through the one canonical metric.
-                let sing_drive = if sing_style {
-                    ws.kitty_sing.drive(now)
-                } else {
-                    0.0
-                };
-                let mut riff: Option<(u64, f32, u32)> = None;
-                if sing_drive > 0.0 {
-                    ws.cursor_glow.celebrate(now, sing_drive);
-                    if let Some(bar) = ws.kitty_sing.bar(now)
-                        && ws.sing_riff_bar != Some(bar)
-                    {
-                        ws.sing_riff_bar = Some(bar);
-                        // `riff_key` reaches the policy AFTER the bar latch
-                        // above, exactly like the single-pane seam: quieting
-                        // the song must not stall the bar grid, or re-enabling
-                        // it mid-celebration would replay a stale bar.
-                        riff = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
-                            .map(|gain| (bar, gain, ws.kitty_sing.signature()));
-                    }
-                } else {
-                    ws.kitty_sing.settle(now);
-                    ws.sing_riff_bar = None;
-                }
-                ws.cursor_cat
-                    .set_singing(now, sing_drive, ws.kitty_sing.beat(now).unwrap_or(0.0));
-                let mut cat_frame = if animate_cat {
-                    ws.cursor_cat.frame(now)
-                } else {
-                    ws.cursor_cat.static_frame(now)
-                };
-                // PET-MODE EPISODES EXIT PLAIN — the single-pane twin's law
-                // ([`pin_pet_mode_exit`]): the sing-along summon is the only
-                // way this companion appears in pet mode, and admission ends
-                // at drive 0, so no rolled heart/star may outlive it.
-                pin_pet_mode_exit(pet_mode, &mut cat_frame);
-                // `sparkle_on` gates the sprite: with the master off an earned
-                // flight is invisible, so folding its fp would force presents of
-                // unchanged pixels (the invisible-cat wake train).
-                let kitty_enabled = cat_presentable
-                    && sparkle_on
-                    && (cursor_cat_presentation_enabled(
-                        animate_cat,
-                        glow_cfg.enabled,
-                        glow_cfg.style,
-                        cat_frame.collection_hello,
-                    ) || cat_frame.sing > 0.0);
-                // `!pet_mode` for the same reason as the single-pane path: an
-                // un-drawable flying kitty must not fire an exit flourish, move
-                // the RepaintKey, or claim the caret cell from a word-cat.
-                // Same sing-along exception too ([`flying_kitty_admitted`]):
-                // while the song holds the frame the SINGING FACE is the
-                // companion and the pet steps aside — admission spans the
-                // armed hold plus the wind-down, then ends at drive 0.
-                let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
-                    cat_frame.alpha
-                } else {
-                    0
-                };
-                // THE PET BRAIN TICKS HERE, unconditionally and exactly once per
-                // composed frame — outside `compose_word_decorations`, which
-                // early-returns whenever the sparkle master is off. The scheduler
-                // reads `needs_frames()`, and only `tick` advances it: freezing
-                // the brain anywhere the predicate is still consulted latches a
-                // permanent wake train (the single-pane path learned this the
-                // hard way). A pet that cannot be drawn is fed `caret: None`, so
-                // it fades out and releases the lane honestly.
-                //
-                // THE SONG TAKES THE CARET — the single-pane twin's law
-                // ([`sing_face_live`]): while the singing face is live the pet
-                // is fed `caret: None` too, fading out in place with
-                // `pet_visible` untouched; below the 0.33 face swap the caret
-                // re-feeds and the pet returns fresh at its keep-ahead station.
-                let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
-                // EXIT-CODE EMPATHY (wave 1) — the single-pane dedupe's
-                // split twin, on the pet's OWN (session, seq) latch: a
-                // pane-focus switch re-baselines silently, only a genuinely
-                // new completion in the same session notes the brain, and
-                // the note only latches (the tick below acts). Pass 1's
-                // snapshot is proven valid by the early return above, so
-                // these locals are the focused pane's real probe.
-                {
-                    let seq = focus_cmd_done.map_or(0, |(e, _)| e);
-                    let key = (focus, seq);
-                    if ws.pet_last_cmd != Some(key) {
-                        let same_session =
-                            ws.pet_last_cmd.is_some_and(|(sid, _)| sid == focus);
-                        ws.pet_last_cmd = Some(key);
-                        if same_session && let Some((_, code)) = focus_cmd_done {
-                            ws.cursor_pet
-                                .note_command_done(now, code != 0, focus_cmd_dur_ms);
-                        }
+                let seq = focus_cmd_done.map_or(0, |(e, _)| e);
+                let key = (focus, seq);
+                if ws.pet_last_cmd != Some(key) {
+                    let same_session = ws.pet_last_cmd.is_some_and(|(sid, _)| sid == focus);
+                    ws.pet_last_cmd = Some(key);
+                    if same_session && let Some((_, code)) = focus_cmd_done {
+                        ws.cursor_pet
+                            .note_command_done(now, code != 0, focus_cmd_dur_ms);
                     }
                 }
-                // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
-                // split twin: the focused pane's scroll delta, content
-                // clock, Execute LEVEL and live bottom, through the same
-                // `pet_output_burst` conjunction and the same silent
-                // (session, seq) re-baseline on a pane-focus switch.
-                let pet_burst = {
-                    let advanced = ws
-                        .pet_content_seq
-                        .is_some_and(|(sid, s)| sid == focus && focus_content_seq > s);
-                    ws.pet_content_seq = Some((focus, focus_content_seq));
-                    pet_output_burst(
-                        focus_scrolled_rows > 0,
-                        advanced,
-                        focus_shell_exec,
-                        focus_d_off == 0,
-                    )
-                };
-                // POINTER PLAY (wave 2): the single-pane pointer map at the
-                // focused PANE's frame-space origin (`pet_origin` — the same
-                // origin the hit-rect stash uses), bounded by the pane grid.
-                let pet_pointer = pet_pointer_cell(
-                    ws.last_cursor_px,
-                    pet_origin,
-                    (glow_cw, glow_ch),
-                    (usize::from(pane_cols), usize::from(pane_rows)),
-                );
-                // THE INK SEAM (gauntlet F1/F5/F8), split-path twin — NOTE
-                // for the applier: `ws.word_decos` must be bound to the
-                // FOCUSED pane at this point (the pane-park swap); if it is
-                // not, feed empty spans instead of another pane's ink.
-                {
-                    let (spans, live) = ws.word_decos.pet_ink();
-                    ws.cursor_pet.sense_ink(0, spans, live);
-                }
-                // THE GRIEF GATE (gauntlet F4a), split-path twin.
-                if ws.cursor_pet.grieving() {
-                    ws.cursor_glow.hush_fanfare(now);
-                }
-                let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
-                    now,
-                    caret: if pet_visible
-                        && !sing_face_live(sing_drive)
-                        && focus_pane_dims.is_some()
-                    {
-                        (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
-                    } else {
-                        None
-                    },
-                    rows: pane_rows,
-                    cols: pane_cols,
-                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
-                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
-                    reduced_motion: !animate_cat,
-                    output_burst: pet_burst,
-                    pointer: pet_pointer,
-                });
-                // PETTING (wave 1): stash/clear the hit-box post-tick — the
-                // single-pane law verbatim, at the focused pane's origin.
-                ws.pet_hit_rect = if pet_visible && pet_frame.alpha > 0 {
+            }
+            // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
+            // split twin: the focused pane's scroll delta, content
+            // clock, Execute LEVEL and live bottom, through the same
+            // `pet_output_burst` conjunction and the same silent
+            // (session, seq) re-baseline on a pane-focus switch.
+            let pet_burst = {
+                let advanced = ws
+                    .pet_content_seq
+                    .is_some_and(|(sid, s)| sid == focus && focus_content_seq > s);
+                ws.pet_content_seq = Some((focus, focus_content_seq));
+                pet_output_burst(
+                    focus_scrolled_rows > 0,
+                    advanced,
+                    focus_shell_exec,
+                    focus_d_off == 0,
+                )
+            };
+            // POINTER PLAY (wave 2): the single-pane pointer map at the
+            // focused PANE's frame-space origin (`pet_origin` — the same
+            // origin the hit-rect stash uses), bounded by the pane grid.
+            let pet_pointer = pet_pointer_cell(
+                ws.last_cursor_px,
+                pet_origin,
+                (glow_cw, glow_ch),
+                (usize::from(pane_cols), usize::from(pane_rows)),
+            );
+            // THE INK SEAM (gauntlet F1/F5/F8), split-path twin — NOTE
+            // for the applier: `ws.word_decos` must be bound to the
+            // FOCUSED pane at this point (the pane-park swap); if it is
+            // not, feed empty spans instead of another pane's ink.
+            {
+                let (spans, live) = ws.word_decos.pet_ink();
+                ws.cursor_pet.sense_ink(0, spans, live);
+            }
+            // THE GRIEF GATE (gauntlet F4a), split-path twin.
+            if ws.cursor_pet.grieving() {
+                ws.cursor_glow.hush_fanfare(now);
+            }
+            // The pet's SKIN, split-path twin (see the single-pane arm).
+            ws.cursor_pet.set_species(pet_species);
+            let pet_frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+                now,
+                caret: if pet_visible && !sing_face_live(sing_drive) && focus_pane_dims.is_some() {
+                    (focus_vis && !focus_scrolled).then_some(focus_cur_pos)
+                } else {
+                    None
+                },
+                rows: pane_rows,
+                cols: pane_cols,
+                cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
+                cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
+                reduced_motion: !animate_cat,
+                output_burst: pet_burst,
+                pointer: pet_pointer,
+            });
+            // PETTING (wave 1): stash/clear the hit-box post-tick — the
+            // single-pane law verbatim, at the focused pane's origin.
+            ws.pet_hit_rect =
+                if pet_companion_admitted(pet_visible, cat_frame.sing) && pet_frame.alpha > 0 {
                     pet_hit_rect_win(
                         pet_frame.body_px(
                             glow_cw.min(usize::from(u16::MAX)) as u16,
@@ -17344,11 +17395,22 @@ impl App {
                 } else {
                     None
                 };
-                (cat_frame, alpha, riff, pet_frame)
-            };
-        if let Some((bar, gain, sig)) = riff {
-            self.trail_audio.push(sing_riff_event(bar, gain, sig));
+            (cat_frame, alpha, riff, fill, cadence, pet_frame)
+        };
+        if let Some((bar, gain, sig, class, energy_q)) = riff {
+            self.trail_audio
+                .push(sing_riff_event(bar, gain, sig, class, energy_q));
         }
+        if let Some((gain, old_sig, new_sig)) = fill {
+            self.trail_audio
+                .push(sing_fill_event(gain, old_sig, new_sig));
+        }
+        if let Some((gain, sig, energy_q, span)) = cadence {
+            self.trail_audio
+                .push(sing_cadence_event(gain, sig, energy_q, span));
+        }
+        // The brain tick used the base gate; presentation uses the custody gate.
+        let pet_visible = pet_companion_admitted(pet_visible, cat_frame.sing);
         let deco_fp = self.compose_word_decorations(
             wid,
             &ComposeDecoCtx {
@@ -18645,6 +18707,13 @@ impl App {
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
             h.finish()
         };
+        // Post-merge reconciliation: the keys-era notice_tray takes the
+        // reduced-motion amplitude and the chrome clear-rows (the card must
+        // not hide the in-grid tab strip). Derived before the window borrow.
+        let motion = self
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::NoticePill);
+        let clear_rows = self.notice_clear_rows();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -18653,10 +18722,17 @@ impl App {
             .as_ref()
             .is_none_or(|c| c.fp != fp || c.geom != geom_key)
         {
-            let mut tray = crate::notice::notice_tray(notice, &geom, theme, cursor, now);
+            let mut tray =
+                crate::notice::notice_tray(notice, &geom, theme, cursor, now, motion, clear_rows);
             let tray_w = (cols * cw) as f32;
             let (card_x, card_y, card_w, card_h) = tray.card;
-            const PAINT_MARGIN: f32 = 4.0; // covers the soft shadow
+            // THE shadow budget, taken from the module that draws the shadow rather than
+            // restated here. A local `4.0` stood here while `notice::tray_input` grew a
+            // three-layer stack reaching 11 px, so the outer two layers were cropped by
+            // 7 px on every notice — invisible in review because the card itself looked
+            // correct and only the falloff was clipped. `notice::shadow_stays_inside_its_margin`
+            // holds the other end: the layers may not outgrow this number.
+            const PAINT_MARGIN: f32 = crate::notice::SHADOW_MARGIN;
             let x0 = (card_x - PAINT_MARGIN).max(0.0).floor();
             let y0 = (card_y - PAINT_MARGIN).max(0.0).floor();
             let x1 = (card_x + card_w + PAINT_MARGIN).min(tray_w).ceil();
@@ -21703,386 +21779,6 @@ mod split_sparkle_tests {
                 .iter()
                 .any(|s| s.x >= (41 * cw) as i32),
             "and cats in the RIGHT pane — the fix is not the focused pane only"
-        );
-    }
-
-    /// THE TYPED-KITTY CAMEO ON THE COMPOSED PATH (owner ask, 2026-08-09).
-    ///
-    /// The two render paths are SEPARATE emitters, so wiring only
-    /// `redraw_window` would leave the toy invisible in a split — the exact
-    /// class of bug the owner's "sparkle effects are NOT SINGLE PANE ONLY"
-    /// ruling created this module for.
-    ///
-    /// The toy is identified by the engine's OWN FOOTPRINT: it is TEXT-SIZED
-    /// now (owner regression, 2026-08-10 — "go back to the old text kitty!"),
-    /// the same scale class as the ambient cats already on this glass, so
-    /// height cannot discriminate it. The composed frame must contain a sprite
-    /// at exactly the rect `kitty_cameo_footprint` resolves for the compose
-    /// instant, translated by the summoning pane's origin — the right pane of
-    /// this 80-column fixture starts at col 41.
-    #[test]
-    fn split_compose_emits_the_typed_kitty_cameo() {
-        use crate::input::{InputEvent, Source};
-        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-        let t0 = Instant::now();
-        let (mut app, wid, sid) = split_app(t0);
-        compose(&mut app, wid, t0);
-        let t1 = t0 + Duration::from_millis(600);
-        compose(&mut app, wid, t1);
-        let (cw, ch) = app.win_cell_size(wid);
-        // The right pane's own geometry (80 cols, divider at col 40): the
-        // composed emitter draws the cameo at pane-local coordinates and
-        // `translate_free_into_pane` shifts it by the pane origin.
-        let pane_geom = aterm_effects::word_decorations::EffectGeom {
-            cell_w: cw as u16,
-            cell_h: ch as u16,
-            rows: 24,
-            cols: 39,
-        };
-        let toy_sprite = |app: &App, at: Instant| -> Option<(i32, i32, u16, u16)> {
-            let f = app.windows[&wid]
-                .word_decos
-                .kitty_cameo_footprint(pane_geom, at, Some(sid))?;
-            let rect = (f.x + (41 * cw) as i32, f.y, f.w, f.h);
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
-                .iter()
-                .any(|s| (s.x, s.y, s.w, s.h) == rect)
-                .then_some(rect)
-        };
-        assert!(
-            !app.windows[&wid].input_scratch.free_sprites.is_empty(),
-            "PRECONDITION: the split frame already draws ambient cats"
-        );
-        assert!(
-            app.windows[&wid]
-                .word_decos
-                .kitty_cameo_footprint(pane_geom, t1, Some(sid))
-                .is_none(),
-            "PRECONDITION: no toy resolves before the word is typed, so the \
-             footprint match below cannot be satisfied by an ambient sprite"
-        );
-
-        // Type the word for real — the detector only ever sees committed keys.
-        for c in "kitty".chars() {
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(c),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human,
-            );
-        }
-        assert!(
-            app.windows[&wid].word_decos.cameo_live(Instant::now(), None),
-            "PRECONDITION: typing the word summoned a cameo at all"
-        );
-        let t2 = t1 + Duration::from_millis(16);
-        compose(&mut app, wid, t2);
-        let rect = toy_sprite(&app, t2).unwrap_or_else(|| {
-            panic!(
-                "a split frame must emit the typed-kitty cameo at its own \
-                 footprint ({})",
-                channels(&app, wid, t1)
-            )
-        });
-        assert!(
-            i32::from(rect.3) <= 2 * ch as i32,
-            "and the toy is TEXT-sized — inside the two-row band every text \
-             cat lives in (owner, 2026-08-10): {} vs {}",
-            rect.3,
-            2 * ch
-        );
-    }
-
-    /// A SPLIT CAMEO WEARS ITS OWN PANE'S COLOURS.
-    ///
-    /// SKEPTIC'S SECOND-ROUND FINDING, 2026-08-09: the composed emitter sampled
-    /// `deco_pane_cells` as it stood — one scratch buffer the pane loop refills
-    /// only for panes that RESCANNED, so it holds "whichever pane extracted
-    /// last", which on a quiet frame is a pane the toy is not even in. The
-    /// palette is part of the cat's BAKE KEY (`CatColorKey`), so a foreign
-    /// sample does not merely shade the cat slightly wrong: the background BAND
-    /// selects between the pale-underlay and dark-keyline treatments, so a cat
-    /// popped onto a dark pane can be baked for a light one and lose its
-    /// outline entirely.
-    ///
-    /// THE FIXTURE MAKES THE WRONG ANSWER THE AVAILABLE ONE. The LEFT pane is
-    /// flooded with a white background (band 3) and is the only pane that
-    /// rescans; the cameo is summoned in the FOCUSED RIGHT pane, which is dark
-    /// (band 0) and does not rescan at all on the frame that draws the toy. The
-    /// precondition below asserts the shared buffer really is holding the white
-    /// grid at that moment, so a passing verdict cannot come from the two panes
-    /// happening to agree.
-    #[test]
-    fn a_split_cameo_samples_its_own_panes_palette() {
-        use crate::input::{InputEvent, Source};
-        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-        let t0 = Instant::now();
-        let (mut app, wid, sid) = split_app(t0);
-        compose(&mut app, wid, t0);
-        let t1 = t0 + Duration::from_millis(600);
-        compose(&mut app, wid, t1);
-
-        // Flood the LEFT (unfocused) pane with a white background. DECAWM off
-        // so the fill cannot wrap past the pane's real width and scroll.
-        {
-            let term = app.pool.get(0).expect("left pane session").term.clone();
-            let mut t = term_lock(&term);
-            t.process(b"\x1b[?7l\x1b[48;2;255;255;255m");
-            // 39 columns is inside any plausible half of an 80-column window,
-            // so the fill cannot wrap and scroll a default-background row in
-            // under it.
-            for row in 1..=24u16 {
-                t.process(format!("\x1b[{row};1H").as_bytes());
-                t.process(&b" ".repeat(39));
-            }
-        }
-        let t2 = t1 + Duration::from_millis(16);
-        compose(&mut app, wid, t2);
-        // PRECONDITION: the shared scratch now holds the LEFT pane's WHITE grid
-        // over the region the cameo's footprint samples (it is anchored at the
-        // right pane's caret, near the top-left of that pane). The wrong answer
-        // is loaded, present, and a different luminance band.
-        {
-            let cells = &app.windows[&wid].deco_pane_cells.cells;
-            assert!(
-                cells.len() > 4 && cells[0].len() > 12,
-                "PRECONDITION: the shared scratch holds a real grid"
-            );
-            assert!(
-                cells[..5]
-                    .iter()
-                    .all(|row| row[..13].iter().all(|c| c.bg == [255, 255, 255])),
-                "PRECONDITION: it is the LEFT pane's white grid — got {:?}",
-                cells[0][..13].iter().map(|c| c.bg).collect::<Vec<_>>()
-            );
-        }
-
-        // Summon in the FOCUSED (right) pane. Nothing writes to any terminal
-        // here, so no pane's damage epoch advances and the next compose
-        // re-extracts nothing on its own.
-        for c in "kitty".chars() {
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(c),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human,
-            );
-        }
-        let t3 = t2 + Duration::from_millis(16);
-        assert_eq!(
-            app.windows[&wid].word_decos.cameo_pane(t3),
-            Some(Some(sid)),
-            "PRECONDITION: the toy belongs to the focused RIGHT pane"
-        );
-        compose(&mut app, wid, t3);
-        let colors = app.windows[&wid]
-            .word_decos
-            .cameo_colors()
-            .expect("the composed frame latched the cameo's palette");
-        assert_eq!(
-            colors.background, 0,
-            "the toy must be tinted against its OWN dark pane, not the white \
-             grid the shared scratch was holding ({})",
-            channels(&app, wid, t3)
-        );
-
-        // And the latch holds: a later frame cannot re-tint a toy that is
-        // already on glass, however the shared buffer moves under it.
-        compose(&mut app, wid, t3 + Duration::from_millis(16));
-        assert_eq!(
-            app.windows[&wid].word_decos.cameo_colors(),
-            Some(colors),
-            "one palette per toy, for its whole life"
-        );
-    }
-
-    /// THE MUSIC MASTER REACHES THE COMPOSED BONK CALL SITE.
-    ///
-    /// [`super::bonk_sound_gain`]'s own unit tests pin the LAW; this pins that
-    /// the split-pane render path actually feeds it the `trail_sounds` knob
-    /// rather than a hardcoded `true`. It drives the real composed frame with a
-    /// LIVE-but-capturing audio host and reads what the synth was handed.
-    #[test]
-    fn a_composed_frame_stops_bonking_when_music_effects_is_off() {
-        use aterm_effects::trail_sound::{SoundGesture, WordGesture};
-
-        let bonks = |app: &mut App| -> usize {
-            app.trail_audio
-                .take_captured_for_test()
-                .iter()
-                .filter(|ev| matches!(ev.kind, SoundGesture::Words(WordGesture::Bonk)))
-                .count()
-        };
-        // One run of the whole fixture, differing ONLY in the Music-effects
-        // Top Setting, so the delta below cannot come from anything else.
-        let curse_in_a_split = |music: bool| -> usize {
-            let t0 = Instant::now();
-            let (mut app, wid, sid) = split_app(t0);
-            app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
-            app.config.trail_sounds = Some(music);
-            // This scan is what leaves the engine's `last_caret` on the row the
-            // curse is about to be written to — the PLACE half of the typed
-            // witness (`WordDecorations::typed_edit_reached`) is measured
-            // against it, so the curse must be appended at the caret rather
-            // than on a fresh line.
-            compose(&mut app, wid, t0);
-            let term = app.pool.get(sid).expect("pane session").term.clone();
-            term_lock(&term).process(b"fuck");
-            {
-                let ws = app.windows.get_mut(&wid).expect("window");
-                // The TYPED witness the bonk demands: a committed key, not just
-                // a caret parked past the token (a scrolling build log leaves
-                // it there too, and this seam makes a sound).
-                ws.word_decos
-                    .note_typed_edit(t0 + Duration::from_millis(600), Some(sid));
-                // A window inside `RESIZE_SOUND_QUIET` of a reflow drains
-                // silently; the fixture's establishing compose is a reflow.
-                ws.last_resize_at = None;
-            }
-            let mut app = app;
-            compose(&mut app, wid, t0 + Duration::from_millis(600));
-            bonks(&mut app)
-        };
-
-        assert_eq!(
-            curse_in_a_split(true),
-            1,
-            "PRECONDITION: with Music effects ON this fixture really bonks — \
-             without it the assertion below would pass for any reason at all",
-        );
-        assert_eq!(
-            curse_in_a_split(false),
-            0,
-            "Music effects Off must reach the composed bonk call site",
-        );
-    }
-
-    /// EMISSION AND VETO MUST NAME THE SAME PANE (skeptic's finding,
-    /// 2026-08-09).
-    ///
-    /// The toy's one-cat-per-caret VETO is scoped by `bind_pane` — the pane the
-    /// word was typed in — while the composed emitter used to draw at whatever
-    /// pane had FOCUS. Move focus in a split and the two scopes disagreed: the
-    /// veto kept silencing the ambient cat in the pane the toy belonged to
-    /// while the toy itself was drawn nowhere at all.
-    ///
-    /// The probe: type in the focused (RIGHT) pane, then move focus to the LEFT
-    /// pane and compose again. The toy must still be on glass, and still on the
-    /// RIGHT — the pane whose veto is holding its word.
-    #[test]
-    fn a_typed_cameo_keeps_its_own_pane_when_focus_moves() {
-        use crate::input::{InputEvent, Source};
-        use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
-
-        let t0 = Instant::now();
-        let (mut app, wid, sid) = split_app(t0);
-        compose(&mut app, wid, t0);
-        let t1 = t0 + Duration::from_millis(600);
-        compose(&mut app, wid, t1);
-        let (cw, cell_h) = app.win_cell_size(wid);
-        // Every cameo sprite's x, found by the engine's OWN FOOTPRINT: the toy
-        // is TEXT-SIZED now (owner regression, 2026-08-10), so height cannot
-        // discriminate it from the ambient cats — but the exact rect the
-        // emitter draws it at, translated by its summoning pane's origin (the
-        // right pane starts at col 41), can.
-        let pane_geom = aterm_effects::word_decorations::EffectGeom {
-            cell_w: cw as u16,
-            cell_h: cell_h as u16,
-            rows: 24,
-            cols: 39,
-        };
-        let cameo_xs = |app: &App, at: Instant| -> Vec<i32> {
-            let Some(f) = app.windows[&wid]
-                .word_decos
-                .kitty_cameo_footprint(pane_geom, at, Some(sid))
-            else {
-                return Vec::new();
-            };
-            let rect = (f.x + (41 * cw) as i32, f.y, f.w, f.h);
-            app.windows[&wid]
-                .input_scratch
-                .free_sprites
-                .iter()
-                .filter(|s| (s.x, s.y, s.w, s.h) == rect)
-                .map(|s| s.x)
-                .collect()
-        };
-        assert_eq!(
-            app.active_tree(wid).map(crate::pane::PaneTree::focus),
-            Some(sid),
-            "PRECONDITION: the fresh split focuses the NEW (right) pane, so the \
-             keystrokes below land there"
-        );
-        for c in "kitty".chars() {
-            app.input(
-                wid,
-                InputEvent::Key {
-                    key: Key::Character(c),
-                    mods: Modifiers::empty(),
-                    base_layout: None,
-                    event_type: KeyEventType::Press,
-                },
-                Source::Human,
-            );
-        }
-        assert_eq!(
-            app.windows[&wid]
-                .word_decos
-                .cameo_pane(Instant::now())
-                .expect("PRECONDITION: typing the word summoned a cameo"),
-            Some(sid),
-            "PRECONDITION: and the composed host binds panes, so the toy is \
-             scoped to the pane it was typed in"
-        );
-        compose(&mut app, wid, t1 + Duration::from_millis(16));
-        // The right pane starts at col 41 (col 40 is the divider).
-        let right_x0 = (41 * cw) as i32;
-        let focused = cameo_xs(&app, t1 + Duration::from_millis(16));
-        assert!(
-            !focused.is_empty() && focused.iter().all(|&x| x >= right_x0),
-            "PRECONDITION: while its own pane has focus the toy draws there: \
-             {focused:?} (right pane starts at x={right_x0})"
-        );
-
-        // FOCUS MOVES to the left pane. Nothing about the toy changed.
-        let moved = app
-            .active_tree_mut(wid)
-            .is_some_and(|tree| tree.set_focus(0));
-        assert!(moved, "PRECONDITION: focus really moves to the left pane");
-        let active = app.windows[&wid].tabs.active;
-        assert!(app.sync_tab_model_from_layout(wid, active));
-        app.sync_window(wid);
-        assert_eq!(
-            app.active_tree(wid).map(crate::pane::PaneTree::focus),
-            Some(0),
-            "PRECONDITION: and the compose pass will see the LEFT pane focused"
-        );
-
-        compose(&mut app, wid, t1 + Duration::from_millis(32));
-        let unfocused = cameo_xs(&app, t1 + Duration::from_millis(32));
-        assert!(
-            !unfocused.is_empty(),
-            "the toy must stay on glass in the pane that summoned it — its veto \
-             is still silencing that pane's ambient cat ({})",
-            channels(&app, wid, t1)
-        );
-        assert!(
-            unfocused.iter().all(|&x| x >= right_x0),
-            "and it must stay on the RIGHT: emission follows the summoning \
-             pane, never the focus. got {unfocused:?} (right pane starts at \
-             x={right_x0})"
         );
     }
 

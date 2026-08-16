@@ -1139,6 +1139,7 @@ pub(crate) fn config_backend_capability_warnings(
                 config.trail_sound_style.is_some(),
             ),
             (crate::prefs::EDIT_TONE_MELODY, config.tone_melody.is_some()),
+            (crate::prefs::EDIT_ROBI, config.robi.is_some()),
             (
                 crate::prefs::EDIT_TRAIL_SOUND_BED,
                 config.trail_sound_bed.is_some(),

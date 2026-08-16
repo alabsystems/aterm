@@ -757,6 +757,47 @@ impl App {
         true
     }
 
+    /// DISMISSING ROBI (owner, 2026-08-15: "it needs to be easily
+    /// dismissable"): if the last pointer position lands on the robot's drawn
+    /// body (the rect the redraw stashed, padded by [`PET_HIT_SLOP_PX`] — a
+    /// walking robot is no more a checkbox than a walking cat), latch the
+    /// per-window dismiss and CONSUME the press. Returns whether it did.
+    ///
+    /// Same policy and caveats as [`Self::pet_press_at`] directly above:
+    /// chrome wins, the swallowed press is never encoded for a mouse-tracking
+    /// app, and `last_cursor_px` can be stale on the first click after a tab
+    /// switch. The latch — not a bare `RobiShow::stop` — is what keeps him
+    /// gone: the render path re-births any stopped resident whose gates are
+    /// green, so dismissal must BE a gate. Typing his name clears it.
+    fn robi_press_at(&mut self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get(&wid) else {
+            return false;
+        };
+        let Some(rect) = ws.robi_hit_rect else {
+            return false;
+        };
+        let (px, py) = ws.last_cursor_px;
+        let (fx, fy) = self.window_to_frame(wid, px, py);
+        if !pet_rect_hit(rect, fx, fy, PET_HIT_SLOP_PX) {
+            return false;
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.robi_dismissed = true;
+            // The redraw runs the bypass-to-final-state hygiene (stop, clear
+            // tip/bubble/rect); ask for the frame that runs it.
+            if let Some(w) = ws.os_window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        // His in-flight speech bubble leaves with him — a tip hanging five
+        // seconds over a vanished speaker would read as a bug, and the slot
+        // policy already treats a Robi tip as reclaimable.
+        if self.notice.as_ref().is_some_and(|n| n.is_robi_tip()) {
+            self.notice = None;
+        }
+        true
+    }
+
     /// Track which in-grid tab-strip tab the pointer is over, so the `✕` can be a
     /// HOVER-ONLY affordance there exactly as it is on the native macOS strip. Runs
     /// on every `CursorMoved` — including motion that later paths consume — because
@@ -2329,6 +2370,40 @@ impl App {
                 return;
             }
         }
+        // CONFIG-WARNING BANNER: `splice_config_notice` OVERWRITES the top grid rows
+        // IN PLACE — tab strip included, since it paints last — so a press inside its
+        // band is a press on chrome, not on whatever the chrome is standing on. It was
+        // the one occluding surface with no mouse gate (palette, Settings, About, the
+        // Update overlay, the strip, the find bar and the pet all have one), so a click
+        // on a warning about `columns/lines` fell through to `strip_col_at` — and a chip's
+        // `x` under it CLOSES A TAB, PTYs and all, with no confirmation unless it is the
+        // window's last. With the strip off it leaked into a selection, or into a
+        // mouse-tracking TUI's stdin.
+        //
+        // Chrome wins, and the click also DISMISSES the banner — the gesture the user is
+        // already making at a notice they have read. The band is the SAME geometry the
+        // splice paints (`config_notice_tray_floor_y`, `0` = no banner), so the hit region
+        // cannot drift from the pixels, and the no-banner path stays byte-identical.
+        //
+        // Only the PRESS is swallowed: never having set the `reported_buttons` bit, the
+        // matching release is already dropped by the orphan-release guard below, so a
+        // tracking app still sees a balanced button stream (it sees neither half).
+        if pressed && button == WinitMouseButton::Left {
+            let floor = self.config_notice_tray_floor_y(wid);
+            if floor > 0 {
+                let (px, py) = self
+                    .windows
+                    .get(&wid)
+                    .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
+                let (_, fy) = self.window_to_frame(wid, px, py);
+                let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
+                if fy >= top && fy < f64::from(floor) {
+                    self.config_notice = None;
+                    self.request_redraw_all_windows();
+                    return;
+                }
+            }
+        }
         // MIDDLE-CLICK PASTE (X11 PRIMARY): when no app is tracking the mouse, a
         // middle press pastes the PRIMARY selection (the X convention) through the
         // same seam as Ctrl+Shift+V; when tracking is ON it falls through to the
@@ -2395,6 +2470,14 @@ impl App {
         // the pet), above the divider/pane-focus/selection/report layers
         // (all of which the cat's body occludes).
         if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
+            return;
+        }
+        // DISMISSING ROBI (owner, 2026-08-15: "it needs to be easily
+        // dismissable"): a left press on the robot's drawn body sends him
+        // off this window until he is called by name (`robi`/`robot`).
+        // Same chrome-wins layer as the pet directly above — the modals,
+        // strip and find bar cover him; his body occludes the grid.
+        if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
             return;
         }
         // SPLIT-PANE DIVIDER DRAG: a left press ON a divider grabs it to resize the
@@ -4339,10 +4422,7 @@ mod tests {
                 1,
                 "the press latched a pet (note, never act)"
             );
-            assert!(
-                !ws.selecting,
-                "and was consumed before the selection layer"
-            );
+            assert!(!ws.selecting, "and was consumed before the selection layer");
         }
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
         assert!(
@@ -4361,6 +4441,125 @@ mod tests {
             );
             assert!(ws.selecting, "a plain terminal press still selects");
         }
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// DISMISSING ROBI end to end: a left press inside the stashed body rect
+    /// latches the per-window dismiss and is CONSUMED (never a selection);
+    /// the same press outside falls through; and typing his name — the one
+    /// resurrection path — clears the latch.
+    #[test]
+    fn a_click_on_robi_dismisses_him_until_he_is_called_by_name() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // Stash a drawn-robot rect the way the redraw does (frame px,
+        // right/bottom exclusive), well clear of the pet's stash.
+        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((300, 380, 50, 160));
+        app.on_cursor_moved(wid, 340.0, 100.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        {
+            let ws = app.windows.get(&wid).unwrap();
+            assert!(ws.robi_dismissed, "the press latched the dismiss");
+            assert!(!ws.selecting, "and was consumed before the selection layer");
+        }
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            !app.windows.get(&wid).unwrap().selecting,
+            "the orphan release is dropped (press/release stay paired)"
+        );
+        // The control: with the rect cleared (he is off the glass now), the
+        // same press is an ordinary terminal press.
+        app.windows.get_mut(&wid).unwrap().robi_hit_rect = None;
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows.get(&wid).unwrap().selecting,
+            "a click where he used to stand falls through to selection"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        // Calling him by name clears the latch (the only resurrection path).
+        let now = std::time::Instant::now();
+        app.feed_robi_typed(wid, now, &['r', 'o', 'b', 'i']);
+        let ws = app.windows.get(&wid).unwrap();
+        assert!(
+            !ws.robi_dismissed,
+            "typing his name clears the dismiss latch"
+        );
+        assert!(ws.robi_show.born(), "and he is back on the glass");
+    }
+
+    /// THE CONFIG-WARNING BANNER IS CHROME, and chrome wins the press.
+    ///
+    /// `splice_config_notice` overwrites the top grid rows IN PLACE and paints
+    /// LAST, so it covers the tab strip as well — yet it was the one occluding
+    /// surface with no mouse gate. A press on a warning about `columns/lines`
+    /// therefore fell through to whatever it was standing on: a strip chip's `x`
+    /// (which closes a tab outright), a selection, or a mouse-tracking app's
+    /// stdin. It must dismiss the banner and stop there, while the same press
+    /// BELOW the band keeps behaving exactly as it always did.
+    #[test]
+    fn a_click_on_the_config_warning_banner_dismisses_it_and_stops_there() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // Size the row buffer the way a redraw does: the banner's floor is clamped
+        // by `input_scratch`'s row count, so an unsized buffer claims no band at all.
+        {
+            let terminal = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            let ws = app.windows.get_mut(&wid).expect("headless window");
+            let mut term = crate::term_lock(&terminal);
+            term.cell_frame_into(&mut ws.input_scratch, 24, 80);
+        }
+        let warning = || {
+            crate::config_notice::ConfigNotice::new(
+                vec!["columns/lines applies on next launch".to_string()],
+                std::time::Instant::now(),
+            )
+        };
+        app.config_notice = warning();
+        let floor = app.config_notice_tray_floor_y(wid);
+        assert!(floor > 0, "PRECONDITION: the banner must own a band");
+        let (ox, oy) = app.frame_origin(wid);
+        let x = ox as f64 + app.win_pad(wid) as f64 + 2.0;
+        let band_top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+
+        app.on_cursor_moved(wid, x, oy as f64 + band_top + 2.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.config_notice.is_none(),
+            "the press on the banner dismissed it"
+        );
+        assert!(
+            !app.windows.get(&wid).unwrap().selecting,
+            "and was consumed above the selection layer"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            !app.windows.get(&wid).unwrap().selecting,
+            "the orphan release is dropped (press/release stay paired)"
+        );
+
+        // The control: a press one row BELOW the painted band is not the banner's,
+        // so it reaches the terminal and leaves the notice up.
+        app.config_notice = warning();
+        app.on_cursor_moved(wid, x, oy as f64 + f64::from(floor) + 2.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.config_notice.is_some(),
+            "a press under the band must not dismiss what it never touched"
+        );
+        assert!(
+            app.windows.get(&wid).unwrap().selecting,
+            "and still starts an ordinary selection"
+        );
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
     }
 

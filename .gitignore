@@ -72,3 +72,8 @@ update-v2.key
 release.conf
 *.ed25519
 *.ed25519.priv
+
+# Python bytecode from the art rigs (art/**/*.py are authoring tools, not
+# shipped code — their caches are pure build residue).
+__pycache__/
+*.pyc

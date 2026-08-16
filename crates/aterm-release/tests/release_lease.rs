@@ -23,6 +23,9 @@ mod gates;
 #[path = "../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
+#[path = "../src/machines.rs"]
+#[allow(dead_code)]
+mod machines;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
@@ -32,9 +35,6 @@ mod mirror;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -503,6 +503,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
+        signature_machine_id: None,
         release_id: Some(55),
         draft_create_issued: true,
         upload_intents: Vec::new(),

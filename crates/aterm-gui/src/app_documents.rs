@@ -5469,7 +5469,7 @@ mod tests {
             // bounded WouldBlock retry has since been added for the proven
             // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
             // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            // exit. (Root-cause record: git log --grep save-latch-flake)
             panic!("inflight replay save failed: {error}");
         });
 
@@ -5545,7 +5545,7 @@ mod tests {
             // bounded WouldBlock retry has since been added for the proven
             // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
             // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            // exit. (Root-cause record: git log --grep save-latch-flake)
             panic!("inflight replay save failed: {error}");
         });
 
@@ -5622,7 +5622,7 @@ mod tests {
             // bounded WouldBlock retry has since been added for the proven
             // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
             // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            // exit. (Root-cause record: git log --grep save-latch-flake)
             panic!("inflight replay save failed: {error}");
         });
 
@@ -6082,7 +6082,7 @@ mod tests {
             // bounded WouldBlock retry has since been added for the proven
             // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
             // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            // exit. (Root-cause record: git log --grep save-latch-flake)
             panic!("inflight replay save failed: {error}");
         });
         controller.target = controller.requested;
@@ -6149,7 +6149,7 @@ mod tests {
             // bounded WouldBlock retry has since been added for the proven
             // flock-fork-inheritance hazard, but that is MITIGATION, not a proven cure
             // for THIS flake. Surface the message so the next occurrence names its own
-            // exit. See docs/BUG-app-documents-save-latch-flake-2026-07-28.md
+            // exit. (Root-cause record: git log --grep save-latch-flake)
             panic!("inflight replay save failed: {error}");
         });
 

@@ -119,6 +119,16 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         team_id: Some(i.team_id.to_string()),
         pub_date: Some(i.pub_date.to_string()),
         min_build: i.min_build,
+        // ATTRIBUTION is stamped AFTER assembly, by `machines::attribute`, not here.
+        //
+        // Not because it is an afterthought, but because it is a different KIND of fact:
+        // every field above is derived from the build, while these two are derived from
+        // the machine's own minted identity and the master-signed roster that authorizes
+        // it — inputs this pure, fixture-testable assembler deliberately does not resolve.
+        // With the paper master unpinned (the shipped state) they stay `None`, and the
+        // emitted bytes are byte-identical to what this cutter has always produced.
+        machine_id: None,
+        roster_seq: None,
         changelog: Some(body),
     }
 }

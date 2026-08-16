@@ -170,8 +170,8 @@ pub const fn slot_for_source(source: FaceId) -> Option<RecoverySlot> {
         FaceId::Fallback => Some(RecoverySlot::FallbackPick),
         FaceId::SymbolFallback => Some(RecoverySlot::SymbolSlot),
         FaceId::RuntimeFallback => Some(RecoverySlot::RuntimeDecision),
-        // `GameMix` needs no recovery record: the mix face is recomputed from
-        // the code point itself (`game_mix_face_index`, a pure function of `ch`),
+        // `DisplayMix` needs no recovery record: the mix face is recomputed from
+        // the code point itself (`display_mix_face_index`, a pure function of `ch`),
         // so there is no per-code-point write for a reader to disagree with. It
         // is also unreachable from `resolve_chain` — the mix is intercepted
         // ahead of the chain in `glyph_key_inner`, never resolved as a tier.
@@ -180,7 +180,7 @@ pub const fn slot_for_source(source: FaceId) -> Option<RecoverySlot> {
         | FaceId::Procedural
         | FaceId::ColorEmoji
         | FaceId::ColorEmojiMono
-        | FaceId::GameMix => None,
+        | FaceId::DisplayMix => None,
     }
 }
 

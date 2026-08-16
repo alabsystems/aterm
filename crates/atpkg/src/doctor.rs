@@ -60,12 +60,20 @@ pub fn run_with(
         crate::resolve_account(cfg_account).slug()
     );
     if crate::manager_enabled() {
+        // The root is the PAPER MASTER — the same anchor the app updater uses, not a
+        // package-specific key. Naming it here is what lets an operator answer "which
+        // trust root is this build on?" without reading source.
         println!(
-            "doctor: ok — root key pinned (fingerprint {})",
-            crate::root_key_fingerprint()
+            "doctor: ok — paper master pinned (fingerprint {}, {} key(s))",
+            crate::root_key_fingerprint(),
+            crate::PKG_TRUST_ANCHORS.len()
         );
     } else {
-        println!("doctor: warn — disabled/inert (no root key compiled in, or ATPKG_DISABLE set)");
+        println!(
+            "doctor: warn — disabled/inert (no paper master compiled in \
+             (pins::PAPER_MASTER_PUBKEYS is empty), or ATPKG_DISABLE set) — this build \
+             installs nothing"
+        );
     }
     // Loud token provenance (never the token itself): which source of the
     // `$ATPKG_TOKEN` → aterm-update-core chain (env → keychain → 0600 file →
@@ -78,13 +86,6 @@ pub fn run_with(
             "doctor: ok — no GitHub token provisioned (anonymous API: fine for public \
              repos, rate-limited; private fetch overrides need one)"
         ),
-    }
-    // Bundled seed (§9.1): whether this executable ships a sealed offline
-    // registry. Presence is an offer, not trust — its bytes still pass the
-    // identical signed gates, so absence is informational, never a failure.
-    match crate::bundled_seed_dir() {
-        Some(dir) => println!("doctor: ok — bundled seed at {}", dir.display()),
-        None => println!("doctor: ok — no bundled seed (network registry only)"),
     }
 
     // (2) PREFIX / STORE.
@@ -261,9 +262,26 @@ pub fn run_with(
     } else {
         println!("doctor: warn — no status.toml yet (no update has run)");
     }
+    // The build floor is printed WITH the generation that recorded it, because that pair
+    // is the actual gate: a floor stamped with an older generation is re-based by the next
+    // master-signed one rather than obeyed (`sig::BuildFloor`), so a reader who saw only
+    // the number could not tell a binding floor from an inherited one.
+    let build_floor = crate::sig::BuildFloor {
+        index_build: crate::sig::Floor::new(layout.floor()).current(),
+        roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
+    };
     println!(
-        "doctor: last-trusted index_build {}",
-        crate::sig::Floor::new(layout.floor()).current()
+        "doctor: last-trusted index_build {} (recorded under roster_seq {})",
+        build_floor.index_build, build_floor.roster_seq
+    );
+    // The SECOND durable ratchet, shown beside the first because they answer different
+    // questions and move independently: `index_build` is how far the toolchain index has
+    // advanced, `roster_seq` is which generation of the machine roster this store has
+    // accepted. A roster floor that is stuck while machines have been minted or revoked
+    // means this store has not seen a publish since, which is worth being able to see.
+    println!(
+        "doctor: last-trusted roster_seq {}",
+        crate::sig::Floor::new(layout.roster_floor()).current()
     );
 
     // (9) RUSTUP + RELOCATABILITY.

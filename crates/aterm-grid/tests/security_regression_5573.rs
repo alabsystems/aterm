@@ -373,7 +373,10 @@ fn compile_probe_harness_actually_reaches_aterm_grid() {
     match probe_compiles(src) {
         Some(true) => {}
         Some(false) => {
-            let why = last_probe_stderr().lock().expect("probe stderr mutex").clone();
+            let why = last_probe_stderr()
+                .lock()
+                .expect("probe stderr mutex")
+                .clone();
             // Name the environmental causes explicitly: both are toolchain skew
             // on this machine, not a regression in aterm-grid, and both have a
             // remedy that has nothing to do with this crate.

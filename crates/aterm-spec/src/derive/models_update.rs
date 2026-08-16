@@ -1340,3 +1340,343 @@ pub fn native_update_status_reconciliation_model() -> Model {
         ],
     }
 }
+
+/// PER-SESSION ownership discipline of the seamless update handoff, over a
+/// bounded two-session pool.
+///
+/// `native_update_overlap_handoff_model` already models the INTERLEAVING of this
+/// protocol — the atomic arbiter, the kill/reap ordering, the legacy bridge — but
+/// it counts readers GLOBALLY (`parent_readers + child_readers <= 1`) and never
+/// says which process owns which PTY. That abstraction cannot express the one
+/// thing "seamless" actually promises, and it is a promise about a SESSION, not
+/// about an attempt: a shell a person is working in must never end up belonging
+/// to nobody. So this model is per-session, and every invariant below is stated
+/// over a session rather than over the handoff as a whole.
+///
+/// TWO SESSIONS IS THE WHOLE POOL, deliberately. None of the properties are about
+/// cardinality, and two is the smallest pool in which a PARTIAL descriptor
+/// transfer — the shape that orphans a session while the attempt still looks
+/// healthy — differs from a complete one. A wider pool multiplies states and adds
+/// no reachable shape.
+///
+/// THE LINEARIZATION POINT IS `CommitAtomically`, which moves ownership AND exits
+/// the outgoing process in ONE step. That is not a modelling convenience: the
+/// shipping `seamless::commit_and_exit` performs the single atomic `<=PIPE_BUF`
+/// write and `_exit(0)` as one typed operation that cannot return on success.
+/// Splitting it in two would invent an interval in which a live session is owned
+/// by a dead process — an interval the implementation does not have, and whose
+/// invention would make `NoSessionIsEverOrphaned` unprovable for the wrong
+/// reason.
+///
+/// WHY THE OUTGOING PROCESS KEEPS ITS OWN DESCRIPTORS ACROSS THE TRANSFER:
+/// `App::start_unix_update_handoff` hands the candidate `F_DUPFD_CLOEXEC`
+/// DUPLICATES and holds the originals for the whole attempt (`_owned_masters`).
+/// That duplication is what makes rollback possible at all, which is why a
+/// descriptor MOVE is one of the mutants below rather than an implementation
+/// detail.
+///
+/// `Buggy=1` admits, each catchable ALONE: a descriptor move where the shipping
+/// code duplicates; an adoption proof matched over a PARTIAL descriptor set
+/// (whose Commit then orphans the session that never travelled); a Commit with no
+/// proof; a second Commit; an `_exit` that transfers no ownership; a candidate
+/// that unparks its readers before Commit; and a rollback that resumes the
+/// outgoing process's parked readers with no termination warrant. The last two
+/// TOGETHER are the two-readers-on-one-master interleaving the overlap protocol
+/// exists to prevent — silent, unrecoverable, and invisible when it happens —
+/// which is why `NeverTwoReadersOnOneMaster` is a named invariant and not a
+/// comment on the reap path.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_seamless_handoff_ownership_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateSeamlessHandoffOwnership {
+            const Buggy = 0;
+            // phase: 0 Idle, 1 Parked, 2 Captured, 3 CandidateStarted,
+            // 4 DescriptorsTransferred, 5 ProofMatched, 6 Committed,
+            // 7 Resumed, 8 RolledBack.
+            var phase = 0;
+            // The outgoing process: alive, reading, and holding each master.
+            var out_live = 1;
+            var out_readers = 1;
+            var out_holds_a = 1;
+            var out_holds_b = 1;
+            // The candidate: readerless until Commit releases its prebuilt gate.
+            var cand_live = 0;
+            var cand_readers = 0;
+            var cand_holds_a = 0;
+            var cand_holds_b = 0;
+            // owner: 0 NOBODY — an orphaned session, the state this whole model
+            // exists to prove unreachable — 1 the outgoing process, 2 the
+            // candidate.
+            var owner_a = 1;
+            var owner_b = 1;
+            var captured = 0;
+            var proof_matched = 0;
+            // Any mutable pre-Commit admission fact that turned false: a changed
+            // session set or layout, a moved activity epoch, revoked native
+            // safety, a dead PTY peer, a lost Commit channel. They differ in the
+            // string they log and in whether automatic mode may retry; they do
+            // not differ in what they do to ownership, which is what this model
+            // is about.
+            var revoked = 0;
+            // The rollback WARRANT: the candidate is provably terminated, or was
+            // never given anything. Nothing resumes a parked reader without it.
+            var warrant = 0;
+            var resumed = 0;
+            var commits = 0;
+
+            action ParkOutgoingReaders when (phase == 0 && out_readers == 1) {
+                phase = 1;
+                out_readers = 0;
+            }
+            action CaptureCheckpoints when (phase == 1 && captured == 0) {
+                phase = 2;
+                captured = 1;
+            }
+            // A warrant already licensed a rollback, so this attempt is over: it
+            // must not start a candidate it would then have to prove dead again.
+            action StartReaderlessCandidate when (
+                phase == 2 && cand_live == 0 && revoked == 0 && warrant == 0
+            ) {
+                phase = 3;
+                cand_live = 1;
+            }
+            // DUPLICATE, never move: the outgoing process keeps its own masters.
+            action DuplicateDescriptorsToCandidate when (
+                phase == 3 && cand_live == 1 && revoked == 0 &&
+                cand_holds_a == 0 && cand_holds_b == 0
+            ) {
+                phase = 4;
+                cand_holds_a = 1;
+                cand_holds_b = 1;
+            }
+            action MatchAdoptionProof when (
+                phase == 4 && cand_live == 1 && captured == 1 && revoked == 0 &&
+                cand_holds_a == 1 && cand_holds_b == 1 && proof_matched == 0
+            ) {
+                phase = 5;
+                proof_matched = 1;
+            }
+            action RevokeBeforeCommit when (
+                phase > 0 && phase <= 5 && revoked == 0 && commits == 0
+            ) {
+                revoked = 1;
+            }
+            // ONE step: ownership moves and the outgoing process is gone. Owner
+            // is derived from who actually HOLDS the master, so a session the
+            // candidate never received becomes owner 0 — an orphan — rather than
+            // being quietly assumed to have travelled.
+            action CommitAtomically when (
+                phase == 5 && proof_matched == 1 && revoked == 0 && commits == 0 &&
+                cand_live == 1 && out_live == 1 && out_readers == 0
+            ) {
+                phase = 6;
+                commits = 1;
+                owner_a = if cand_holds_a == 1 { 2 } else { 0 };
+                owner_b = if cand_holds_b == 1 { 2 } else { 0 };
+                out_live = 0;
+                out_readers = 0;
+                out_holds_a = 0;
+                out_holds_b = 0;
+            }
+            action CandidateReleasesReaderGate when (
+                phase == 6 && commits == 1 && cand_live == 1 && cand_readers == 0
+            ) {
+                cand_readers = 1;
+            }
+            // Nothing ever left this process, so there is no candidate to prove
+            // anything about — the `HandoffRollbackWarrant::NoCandidate` /
+            // `NeverTransferred` shapes.
+            action ProveNoCandidateExists when (
+                phase > 0 && phase <= 2 && cand_live == 0 && warrant == 0
+            ) {
+                warrant = 1;
+            }
+            action ProveCandidateTerminated when (
+                phase > 2 && phase <= 5 && cand_live == 1 && commits == 0 && warrant == 0
+            ) {
+                cand_live = 0;
+                cand_holds_a = 0;
+                cand_holds_b = 0;
+                warrant = 1;
+            }
+            action ResumeParkedReaders when (
+                phase > 0 && phase <= 5 && warrant == 1 && commits == 0 &&
+                cand_live == 0 && cand_readers == 0 && out_live == 1 &&
+                out_holds_a == 1 && out_holds_b == 1 &&
+                owner_a == 1 && owner_b == 1
+            ) {
+                phase = 7;
+                out_readers = 1;
+                resumed = 1;
+            }
+            action RetireRolledBackAttempt when (phase == 7 && resumed == 1) {
+                phase = 8;
+            }
+            action SettledCommitted when (phase == 6 && cand_readers == 1) {
+                phase = 6;
+            }
+            action SettledRolledBack when (phase == 8) {
+                phase = 8;
+            }
+
+            action BuggyMoveDescriptorsInsteadOfDuplicating when (
+                Buggy == 1 && phase == 3 && cand_live == 1 &&
+                cand_holds_a == 0 && cand_holds_b == 0
+            ) {
+                phase = 4;
+                cand_holds_a = 1;
+                cand_holds_b = 1;
+                out_holds_a = 0;
+                out_holds_b = 0;
+            }
+            action BuggyMatchProofOverAPartialDescriptorSet when (
+                Buggy == 1 && phase == 3 && cand_live == 1 && captured == 1 &&
+                cand_holds_a == 0 && cand_holds_b == 0 && proof_matched == 0
+            ) {
+                phase = 5;
+                cand_holds_a = 1;
+                proof_matched = 1;
+            }
+            action BuggyCommitWithoutProof when (
+                Buggy == 1 && phase == 4 && proof_matched == 0 && commits == 0 &&
+                cand_live == 1 && out_live == 1
+            ) {
+                phase = 6;
+                commits = 1;
+                owner_a = 2;
+                owner_b = 2;
+                out_live = 0;
+                out_readers = 0;
+                out_holds_a = 0;
+                out_holds_b = 0;
+            }
+            action BuggyCommitTwice when (Buggy == 1 && phase == 6 && commits == 1) {
+                commits = 2;
+            }
+            action BuggyExitWithoutTransferringOwnership when (
+                Buggy == 1 && phase > 0 && phase <= 5 && out_live == 1 && commits == 0
+            ) {
+                out_live = 0;
+                out_readers = 0;
+                out_holds_a = 0;
+                out_holds_b = 0;
+            }
+            action BuggyCandidateReadsBeforeCommit when (
+                Buggy == 1 && phase > 3 && phase <= 5 && cand_live == 1 &&
+                cand_holds_a == 1 && cand_readers == 0 && commits == 0
+            ) {
+                cand_readers = 1;
+            }
+            action BuggyResumeWithoutTerminationProof when (
+                Buggy == 1 && phase > 2 && phase <= 5 && cand_live == 1 &&
+                out_live == 1 && out_readers == 0 && commits == 0
+            ) {
+                phase = 7;
+                out_readers = 1;
+                resumed = 1;
+            }
+
+            // THE WHOLE FEATURE. Every session is owned by exactly one LIVE
+            // process at every reachable state — never zero.
+            invariant NoSessionIsEverOrphaned:
+                (if owner_a == 1 {
+                    out_live
+                } else if owner_a == 2 {
+                    cand_live
+                } else {
+                    0
+                }) == 1 &&
+                (if owner_b == 1 {
+                    out_live
+                } else if owner_b == 2 {
+                    cand_live
+                } else {
+                    0
+                }) == 1;
+            // …and that owner still holds the descriptor, so "owned" names a
+            // process that can actually serve the session rather than one that
+            // merely has not been told it lost it.
+            invariant AnOwnerHoldsItsMaster:
+                (if owner_a == 1 {
+                    out_holds_a
+                } else if owner_a == 2 {
+                    cand_holds_a
+                } else {
+                    0
+                }) == 1 &&
+                (if owner_b == 1 {
+                    out_holds_b
+                } else if owner_b == 2 {
+                    cand_holds_b
+                } else {
+                    0
+                }) == 1;
+            // Two readers on one master silently interleave and destroy the
+            // stream. Stated per MASTER — both processes holding a duplicate of
+            // the same open file description is exactly what makes the overlap
+            // window dangerous, and exactly what the readerless candidate plus
+            // the termination warrant rule out.
+            invariant NeverTwoReadersOnOneMaster:
+                (if out_readers == 1 && out_holds_a == 1 && cand_holds_a == 1 {
+                    cand_readers
+                } else {
+                    0
+                }) == 0 &&
+                (if out_readers == 1 && out_holds_b == 1 && cand_holds_b == 1 {
+                    cand_readers
+                } else {
+                    0
+                }) == 0;
+            invariant NoCommitWithoutProof:
+                if commits > 0 {
+                    proof_matched == 1 && captured == 1 && revoked == 0 &&
+                    cand_live == 1 && out_live == 0 && phase > 5
+                } else {
+                    commits == 0
+                };
+            invariant AtMostOneCommitPerAttempt: commits <= 1;
+            // Rollback is AVAILABLE from every pre-Commit state: the outgoing
+            // process is alive, still owns and holds every session, its readers
+            // are parked and restorable, and nothing else is reading. The
+            // reachability half — that `ResumeParkedReaders` really is reachable
+            // from each of those states — is checked in the Tier-1 bind, because
+            // no state predicate can say it.
+            invariant RollbackRemainsAvailableBeforeCommit:
+                if commits == 0 && phase > 0 && phase <= 5 {
+                    out_live == 1 && out_readers == 0 &&
+                    out_holds_a == 1 && out_holds_b == 1 &&
+                    owner_a == 1 && owner_b == 1 && cand_readers == 0
+                } else {
+                    phase <= 8
+                };
+            invariant ResumeRequiresTerminationWarrant:
+                if resumed == 1 {
+                    warrant == 1 && cand_live == 0 && cand_readers == 0 &&
+                    commits == 0 && out_live == 1 &&
+                    owner_a == 1 && owner_b == 1
+                } else {
+                    resumed == 0
+                };
+            invariant CandidateStaysReaderlessUntilCommit:
+                if cand_readers == 1 {
+                    commits > 0 && out_live == 0 && out_readers == 0
+                } else {
+                    cand_readers == 0
+                };
+            invariant ExitedProcessReadsNothing:
+                if out_live == 0 {
+                    out_readers == 0 && out_holds_a == 0 && out_holds_b == 0
+                } else {
+                    out_live == 1
+                };
+            invariant OwnershipBounds:
+                phase <= 8 && out_live <= 1 && out_readers <= 1 &&
+                out_holds_a <= 1 && out_holds_b <= 1 && cand_live <= 1 &&
+                cand_readers <= 1 && cand_holds_a <= 1 && cand_holds_b <= 1 &&
+                owner_a <= 2 && owner_b <= 2 && captured <= 1 &&
+                proof_matched <= 1 && revoked <= 1 && warrant <= 1 &&
+                resumed <= 1 && commits <= 2;
+        }
+    }
+}

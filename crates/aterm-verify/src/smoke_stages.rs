@@ -81,6 +81,7 @@ const POLL_GAP: Duration = Duration::from_millis(100);
 struct Sandbox {
     tmp: PathBuf,
     rundir: PathBuf,
+    cfgdir: PathBuf,
     gui_log: PathBuf,
     child: Option<Child>,
 }
@@ -94,10 +95,25 @@ impl Sandbox {
         std::fs::create_dir_all(rundir.join("aterm")).ok()?;
         chmod_700(&rundir)?;
         chmod_700(&rundir.join("aterm"))?;
+        // The settings dir the engine resolves ($XDG_CONFIG_HOME/aterm/aterm.toml).
+        // Same reason SHELL is forced to /bin/sh below — a gate must not read the
+        // developer's machine — but sharper: this gate DECIDES ON FRAME COUNTS AND
+        // LATENCIES, and the owner's live config sets `cursor_trail_style`, so
+        // without this the pacing smoke measures whatever effect that machine
+        // happens to have enabled. Config resolution has no probe marker, so the
+        // launch env is the only lever; empty (NOT a copy of the caller's) is the
+        // right seed here, because the gate's verdict must be machine-independent.
+        // It closes a write path too: `aterm-ctl` auto-presents the token and
+        // owner scope satisfies `ConfigWrite`, which is how a probe rewrote the
+        // owner's font on 2026-08-10.
+        let cfgdir = tmp.join("cfg");
+        std::fs::create_dir_all(cfgdir.join("aterm")).ok()?;
+        chmod_700(&cfgdir)?;
         let gui_log = tmp.join("gui.log");
         Some(Self {
             tmp,
             rundir,
+            cfgdir,
             gui_log,
             child: None,
         })
@@ -185,6 +201,7 @@ fn bring_up(
     cmd.current_dir(&ctx.root)
         .env("PATH", &ctx.path_env)
         .env("XDG_RUNTIME_DIR", &sb.rundir)
+        .env("XDG_CONFIG_HOME", &sb.cfgdir)
         .env("SHELL", "/bin/sh")
         .stdout(log)
         .stderr(log2);
@@ -233,7 +250,8 @@ fn child_exited(sb: &mut Sandbox) -> bool {
 fn ctl(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) -> String {
     let cmd = Cmd::new(ctl_bin)
         .args(args.iter().copied())
-        .env("XDG_RUNTIME_DIR", &sb.rundir);
+        .env("XDG_RUNTIME_DIR", &sb.rundir)
+        .env("XDG_CONFIG_HOME", &sb.cfgdir);
     capture_reply(&cmd, ctx.exec_env())
 }
 
@@ -241,6 +259,7 @@ fn ctl_quiet(ctx: &Ctx, sb: &Sandbox, ctl_bin: &Path, args: &[&str]) {
     let cmd = Cmd::new(ctl_bin)
         .args(args.iter().copied())
         .env("XDG_RUNTIME_DIR", &sb.rundir)
+        .env("XDG_CONFIG_HOME", &sb.cfgdir)
         .capture(Capture::Silent);
     // `>/dev/null 2>&1` with the status ignored, exactly as the script drove the
     // burst: a dropped keystroke shows up in the pacing counters this stage

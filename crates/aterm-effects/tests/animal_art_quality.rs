@@ -17,9 +17,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use aterm_scene::{PathTransform, Tile, fill_path};
 use aterm_scene::vector::PathCmd;
 use aterm_scene::vector::parse_path;
+use aterm_scene::{PathTransform, Tile, fill_path};
 
 fn animal_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("art/animal")

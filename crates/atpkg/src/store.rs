@@ -146,9 +146,50 @@ impl Layout {
     }
 
     /// `floor` — the `0600` durable high-water `index_build` file (§8).
+    ///
+    /// Read together with [`Self::floor_generation`]; the pair is one value
+    /// ([`crate::sig::BuildFloor`]), because `index_build` is a number a MACHINE chooses and
+    /// a floor set by a machine must not outlive the roster generation that revoked it.
     #[must_use]
     pub fn floor(&self) -> PathBuf {
         self.prefix.join("floor")
+    }
+
+    /// `floor.gen` — the `0600` roster generation that recorded the current [`Self::floor`].
+    ///
+    /// Its own file rather than a second field inside `floor` so the format of `floor` stays
+    /// what it has always been (a bare integer) and a store written by an older build reads
+    /// as "floor from generation 0", which the strictly-newer rule then re-bases on first
+    /// contact — the right answer, since no index that floor ever admitted can verify under
+    /// the single-root chain at all.
+    ///
+    /// Missing or unreadable reads as `0`, which makes the floor bind at a generation no
+    /// real roster carries. That is the fail-closed direction: it never waives a floor for
+    /// the generation that set it.
+    #[must_use]
+    pub fn floor_generation(&self) -> PathBuf {
+        self.prefix.join("floor.gen")
+    }
+
+    /// `roster.floor` — the `0600` durable high-water `roster_seq` file: the replay
+    /// ratchet for the master-signed machine roster that authorizes this store's index.
+    ///
+    /// A SEPARATE file from [`Self::floor`] on purpose. The two counters move
+    /// independently — minting or revoking a machine bumps `roster_seq` without re-cutting
+    /// the index, and re-publishing the index bumps `index_build` without touching the
+    /// roster — so folding them into one high-water would make each one's advance silently
+    /// ratchet the other past documents that are still perfectly current.
+    ///
+    /// It is also deliberately atpkg's OWN file rather than shared with `aterm-update`'s
+    /// ratchet, even though both track the same document: the two live under different
+    /// prefixes with different ownership and lifetimes (uninstalling the toolchain store
+    /// must not reset the app updater's replay defence, or vice versa). A client that has
+    /// updated the app more recently than the toolchain simply carries a higher floor
+    /// there, which costs nothing — each ratchet only ever refuses what IT has already
+    /// seen superseded.
+    #[must_use]
+    pub fn roster_floor(&self) -> PathBuf {
+        self.prefix.join("roster.floor")
     }
 
     /// `store.lock` — the `0600` store-wide single-writer advisory lock file
@@ -222,6 +263,192 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     std::fs::rename(&tmp, &dest)
 }
 
+/// Remove the completeness marker, making `build_dir` read as NOT installed.
+///
+/// Called FIRST when a stage is about to replace a live tree: for the window in which the
+/// old tree is being swapped out and the new one in, the build genuinely is not complete,
+/// and a crash inside that window must leave it re-installable. Best-effort on a missing
+/// marker (that is already the state we want).
+pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
+    let Some(marker) = ready_marker_path(build_dir) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// The sibling scratch directory a stage extracts INTO before it swaps: `<build>.incoming-<pid>`.
+///
+/// Staging never writes into the live `<build>/` tree. The old flow deleted the live tree
+/// and extracted over it, so from the first byte of extraction until the final marker
+/// write the installed toolchain simply did not exist — a Ctrl-C, a crash, or a
+/// disk-full there left the user with no compiler AND (because the marker is a SIBLING
+/// that the delete did not touch) a store that still claimed the build was installed.
+pub(crate) fn incoming_dir(build_dir: &Path) -> Option<PathBuf> {
+    scratch_sibling(build_dir, ".incoming-")
+}
+
+/// The sibling the OUTGOING tree is moved to during a swap: `<build>.superseded-<pid>`.
+/// It exists only between the two renames, and is deleted immediately after.
+pub(crate) fn superseded_dir(build_dir: &Path) -> Option<PathBuf> {
+    scratch_sibling(build_dir, ".superseded-")
+}
+
+/// `<build><suffix><pid>` beside `build_dir`. The pid keeps two stagers of the same build
+/// apart even though the store lock already serializes them — a scratch name that
+/// collides is a scratch name that can be deleted out from under its owner.
+fn scratch_sibling(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
+    let name = crate::call1(std::path::Path::file_name, build_dir)?;
+    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
+    let mut scratch = String::from(name);
+    scratch.push_str(suffix);
+    scratch.push_str(&crate::dec_u64(u64::from(std::process::id())));
+    Some(build_dir.with_file_name(scratch))
+}
+
+/// Which of the two scratch shapes a stage produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scratch {
+    /// `<build>.incoming-<pid>` — the tree being extracted, before it has been verified.
+    Incoming,
+    /// `<build>.superseded-<pid>` — the OUTGOING tree, parked between the two swap renames.
+    Superseded,
+}
+
+/// Recognise stage scratch by the PRODUCER's exact shape: `<build>.incoming-<pid>` or
+/// `<build>.superseded-<pid>`, where `<build>` is a real build number and `<pid>` a
+/// non-empty run of ASCII digits. Returns the build number and the shape.
+///
+/// This is the SINGLE recogniser both sweepers use ([`sweep_stage_scratch`] here and
+/// [`crate::gc`]'s pass), because they authorize the same unguarded `remove_dir_all` inside
+/// a directory the user can also put things in, and a policy that only one half enforces is
+/// not a policy: `18.incoming-drafts/` is not ours to delete, whichever code path meets it.
+pub(crate) fn stage_scratch_of(name: &str) -> Option<(u64, Scratch)> {
+    let (build, rest) = name.split_once('.')?;
+    let build = build.parse::<u64>().ok()?;
+    let (kind, pid) = match rest.strip_prefix("incoming-") {
+        Some(pid) => (Scratch::Incoming, pid),
+        None => (Scratch::Superseded, rest.strip_prefix("superseded-")?),
+    };
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((build, kind))
+}
+
+/// Every stage-scratch sibling of `build_dir`, as `(kind, path)`. Empty when `build_dir` is
+/// not a numeric build under a readable parent.
+fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
+    let (Some(parent), Some(name)) = (
+        build_dir.parent(),
+        build_dir.file_name().and_then(|n| n.to_str()),
+    ) else {
+        return Vec::new();
+    };
+    let Ok(build) = name.parse::<u64>() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let entry_name = entry.file_name();
+            let (found, kind) = stage_scratch_of(entry_name.to_str()?)?;
+            // Siblings of a DIFFERENT build are that build's business, not ours.
+            (found == build).then(|| (kind, entry.path()))
+        })
+        .collect()
+}
+
+/// Recover the one crash window a swap cannot make atomic. `true` when a tree was moved back.
+///
+/// [`crate::install::verify_and_stage`]'s swap moves the outgoing tree to
+/// `<build>.superseded-<pid>` and then moves the verified incoming tree onto `<build>`.
+/// Between those two renames the ONLY copy of the old tree lives under the scratch name. A
+/// SIGKILL, a `^C`, or a power loss there leaves `<build>` absent with exactly one
+/// superseded sibling — and routine housekeeping used to `remove_dir_all` that sibling,
+/// turning a recoverable crash into a permanently deleted toolchain. This is the only place
+/// a plain crash, with no I/O error anywhere, could leave neither the old build nor the new.
+///
+/// The recovery is deliberately NARROW, because a wrong move here is as destructive as the
+/// delete it replaces. It fires only when `<build>` is absent AND exactly one superseded
+/// sibling is present: that is the swap window and nothing else. With `<build>` present the
+/// sibling is genuine leftover (the swap got past its second rename, or its rollback put the
+/// tree back) and must still be swept; with two siblings there is no way to tell which is
+/// the real outgoing tree, and guessing is exactly how live trees get deleted.
+///
+/// It does NOT re-mark the recovered tree. The swap clears the marker before the first
+/// rename, so whether that tree was complete is unrecoverable from disk — leaving it
+/// unmarked means it reads as not-installed and is re-staged, which is honest, whereas
+/// re-marking would promote a tree nothing can vouch for.
+pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
+    // `symlink_metadata`, not `exists()`: a DANGLING symlink at the build path is still
+    // something being there, and "the window" means nothing at all is. Narrower is safer.
+    if std::fs::symlink_metadata(build_dir).is_ok() {
+        return false;
+    }
+    let mut superseded = scratch_siblings(build_dir).into_iter().filter(|(kind, p)| {
+        // A real directory, not a symlink to one: the outgoing tree the swap parked here is
+        // a directory, and anything else is not the state this recovers.
+        *kind == Scratch::Superseded && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+    });
+    let Some((_, old)) = superseded.next() else {
+        return false;
+    };
+    if superseded.next().is_some() {
+        return false; // ambiguous — refuse rather than guess
+    }
+    std::fs::rename(&old, build_dir).is_ok()
+}
+
+/// Delete every stage-scratch sibling of `build_dir` left behind by an earlier run, after
+/// first recovering the swap window ([`recover_interrupted_swap`]) so a crash there does not
+/// get swept as debris.
+///
+/// Safe to sweep unconditionally because every mutating verb holds the store-wide writer
+/// lock ([`crate::lock::try_lock_store`]): if scratch exists when we get here, its owner is
+/// gone. Without this sweep the scratch is INVISIBLE to reclamation — `list_installed`
+/// only counts numeric, marker-bearing dirs, and GC only reclaims what `list_installed`
+/// returns — so a killed install would strand its half-extracted tree on disk forever.
+///
+/// Non-directories at a scratch path are removed too. `remove_dir_all` fails on a regular
+/// file and GC's pass filters to directories, so such an entry was reclaimed by NEITHER
+/// sweeper — it leaked forever, and while it sat there it blocked every swap of that build
+/// by a process holding the same pid.
+pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
+    recover_interrupted_swap(build_dir);
+    for (_, path) in scratch_siblings(build_dir) {
+        // `symlink_metadata`, not `is_dir()`: `remove_dir_all` refuses a SYMLINK to a
+        // directory (it does not follow it — proven by the sweep tests), so dispatching on
+        // the followed type would leave exactly that entry behind forever.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// Flush a directory's metadata so the renames that make up a swap are durable in the
+/// order they were issued. Best-effort: a platform that refuses to open a directory (or an
+/// exotic filesystem) is not a reason to fail an otherwise-good install, and the swap is
+/// crash-CORRECT either way — this only narrows the window in which a power loss can
+/// reorder the marker ahead of the tree.
+pub(crate) fn sync_dir(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
 /// Discard a build entirely: remove its tree AND its sibling completeness marker (the
 /// inverse of a stage + [`mark_build_ready`]). Used to clean up a build that a transaction
 /// STAGED but then ABORTED without activating — leaving it complete-but-inactive would make
@@ -233,8 +460,16 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
 /// prefix. Reclaim therefore goes through [`crate::gc::discard_superseded`], which demands a
 /// [`crate::gc::LiveBuild`] witness and refuses to delete it; making the raw form
 /// crate-private is what stops that call from being *writable* elsewhere. The remaining
-/// in-crate callers ([`crate::flow`], [`crate::sourcebuild`]) are the staged-but-ABORTED
-/// paths, where the build was never activated and so no witness can name it.
+/// in-crate caller ([`crate::flow`]) is the staged-but-ABORTED path, where the build was
+/// never activated and so no witness can name it.
+///
+/// ONE caller IS a `read_dir` fold, and it is the exception that states the rule:
+/// [`crate::gc::run`]'s interrupted-install sweep. A witness is impossible there — an
+/// interrupted FRESH install has no live build for one to be about — so it is guarded on
+/// the CLAIM UNION instead: every authoritative `current` link plus every `bin/` shim
+/// target. That is strictly stronger evidence of not-live than supersession, because it
+/// deletes only trees that NOTHING on disk points into, which is what earns it the right
+/// to name a build number it read out of a directory listing.
 pub(crate) fn discard_build(build_dir: &Path) {
     let _ = std::fs::remove_dir_all(build_dir);
     if let Some(marker) = ready_marker_path(build_dir) {

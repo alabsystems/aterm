@@ -11,6 +11,12 @@ description = "aterm toolchain package manager — the signature anchor: detache
 
 [lib]
 path = "src/lib.rs"
+# The pinned custom `trust` toolchain (rust-toolchain.toml) ships no rustdoc, and a
+# linked custom toolchain cannot `rustup component add` one — so `cargo test`'s
+# doc-test phase aborts the whole run on this tree even with every real test green.
+# This crate's test surface is its inline #[cfg(test)] modules + tests/ (no doc-tests
+# exist to lose), so the phase is off: bare `cargo test` must be able to pass.
+doctest = false
 
 [[bin]]
 name = "atpkg"

@@ -24,18 +24,21 @@ mod gates;
 #[path = "../src/ledger.rs"]
 #[allow(dead_code)]
 mod ledger;
+#[path = "../src/machines.rs"]
+#[allow(dead_code)]
+mod machines;
 #[path = "../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
 #[path = "../src/mirror.rs"]
 #[allow(dead_code)]
 mod mirror;
+#[path = "../src/provision.rs"]
+#[allow(dead_code)]
+mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;
-#[path = "../src/seedpack.rs"]
-#[allow(dead_code)]
-mod seedpack;
 #[path = "../src/sign.rs"]
 #[allow(dead_code)]
 mod sign;
@@ -60,6 +63,7 @@ fn journal() -> Journal {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
+        signature_machine_id: None,
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
@@ -75,6 +79,10 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
     CutCtx {
         // No credentials: this model exercises journal/state transitions, not signing.
         credentials: None,
+        // Tier APPLE inactive, as the shipped anchor is. This model covers the
+        // one-shot POST intents; a resolved Apple tier would be a certificate
+        // this test has no business needing.
+        apple: sign::AppleTier::Inactive,
         repo: root.to_path_buf(),
         dist: root.join("nested/dist"),
         journal_path,
@@ -88,6 +96,11 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         manifest_signed: false,
         signature_required: false,
         signature_pubkey: None,
+        // Unattributed, as every cut from this tree is: the paper master is
+        // unpinned, so no roster authorizes anything and no roster asset ships.
+        signature_machine_id: None,
+        attribution: None,
+        roster: None,
         release_id: None,
         draft_create_issued: false,
         upload_intents: Vec::new(),
@@ -336,4 +349,3 @@ fn strict_draft_delete_never_converges_on_pre_delete_absence() {
     assert!(publish::exact_delete_absence_is_converged(true, false));
     assert!(publish::exact_delete_absence_is_converged(true, true));
 }
-

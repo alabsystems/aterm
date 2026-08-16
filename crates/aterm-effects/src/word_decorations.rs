@@ -385,6 +385,29 @@ pub struct DogCameoFrame {
     pub alpha: u8,
 }
 
+/// One resolved ROBI emission ([`crate::robi`]): the evaluated resident frame
+/// plus the cell metrics. No palette context — Robi's roster is all
+/// `Recolor::Fixed` (a white robot with a cyan glow is his identity), so a
+/// pose at a size is one tile regardless of the terminal's colours.
+#[derive(Clone, Copy, Debug)]
+pub struct RobiShowFrame {
+    pub geom: EffectGeom,
+    /// The resident frame ([`crate::robi::RobiShow::frame`]).
+    pub frame: crate::robi::RobiFrame,
+}
+
+/// A fully hosted robot body: the pose, its dest size, and every vertical
+/// slice's atlas rect (Robi is taller than the 2-row host-tile ceiling, so
+/// one body is 2–3 stacked slices). Held as the last-resolved fallback.
+#[derive(Clone, Copy, Debug)]
+struct RobiBodySlices {
+    w: u16,
+    h: u16,
+    n: u8,
+    /// Per slice: `(ax, ay, slice_h)` in atlas texels.
+    sl: [(u16, u16, u16); 4],
+}
+
 /// Geometry-only inputs for resolving the cursor companion before its local
 /// palette is sampled.
 #[derive(Clone, Copy, Debug)]
@@ -2010,6 +2033,16 @@ pub struct WordDecorations {
     /// deferred-bake tolerance as [`Self::pet_last_tile`], same atlas-scoped
     /// invalidation.
     dog_last_tile: Option<(u16, u16, crate::dog_cameo::DogLook)>,
+    /// The ROBI roster's own exact-size tile cache ([`crate::robi_baker`]) —
+    /// the helper robot's bake path, reaching the screen through the same
+    /// shared-atlas `host_tile` door as the pet and the dog.
+    robi_baker: crate::robi_baker::RobiBaker,
+    /// The last robot BODY that fully resolved (every vertical slice hosted).
+    /// Same deferred-bake tolerance as [`Self::pet_last_tile`], same
+    /// atlas-scoped invalidation — held as a complete slice set only, so a
+    /// budget-starved frame re-draws the whole previous robot rather than
+    /// half of a new one.
+    robi_last_body: Option<RobiBodySlices>,
     /// A USER-supplied cursor sprite (via `cursor_nyan_sprite`), overriding the
     /// built-in CatBaker cat: the decoded native RGBA `(w, h, rgba)` plus a cache
     /// of the last nearest-resample to the current target size `(tw, th, rgba)`.
@@ -2130,21 +2163,6 @@ pub struct WordDecorations {
     /// Pane-parked for the same reason `caret_word` is: it names a cell in ONE
     /// pane's grid.
     last_caret: Option<(u16, u16)>,
-    /// THE TYPED-KITTY CAMEO ([`crate::kitty_cameo`]) — the standalone toy a
-    /// typed feline word summons.
-    ///
-    /// WHY IT LIVES HERE and not beside the companion: this engine owns the cat
-    /// baker and the only free-sprite atlas the host attaches
-    /// ([`Self::free_atlas`]), so the cameo is bakeable and presentable here
-    /// with no second atlas, no second upload, and no second budget.
-    ///
-    /// WHY IT IS NOT PANE-PARKED, unlike `companion_claim` / `caret_word`:
-    /// those are OCCURRENCE IDENTS, which name a specific pane's scan. A cameo
-    /// is a window-wide toy that was summoned by a keystroke into whichever
-    /// pane had focus, and both render paths emit it at the focused pane's
-    /// geometry — so parking it per pane would file it under a pane and then
-    /// never draw it. [`ParkedPane::swap`] deliberately leaves it alone.
-    cameo: crate::kitty_cameo::KittyCameo,
     /// v3 §1.1 alignment scratch: the DP's traceback decisions, one byte per
     /// (old, candidate) cell — [`ALIGN_DECISION_CELLS`] = 66,177 of them.
     ///
@@ -2522,14 +2540,14 @@ impl WordDecorations {
     ///
     /// SKEPTIC'S THIRD-ROUND FINDING, 2026-08-09. `bind_pane` is the composed
     /// host's seam, so an unsplit window left [`Self::bound`] at `None` — and
-    /// `None` was read as a WILDCARD by both session tests the engine owns:
-    /// the cameo's one-cat-per-caret veto ([`Self::tick`]) and the typed-edit
-    /// re-arm witness ([`Self::typed_edit_witness`]). `WordDecorations` is per
-    /// WINDOW and a tab switch retires nothing, so on the unsplit path a toy
-    /// (or a keystroke) belonging to TAB A silently governed TAB B's scan: tab
-    /// A's cameo suppressed the ambient cat at the same cell in tab B, and tab
-    /// A's edit witness licensed a repaint of tab B to re-arm a spent cat —
-    /// the once-per-word rule, reopened across the tab boundary.
+    /// `None` was read as a WILDCARD by every session test the engine owns,
+    /// today the typed-edit re-arm witness ([`Self::typed_edit_witness`]).
+    /// `WordDecorations` is per WINDOW and a tab switch retires nothing, so on
+    /// the unsplit path a keystroke belonging to TAB A silently governed TAB
+    /// B's scan: tab A's edit witness licensed a repaint of tab B to re-arm a
+    /// spent cat — the once-per-word rule, reopened across the tab boundary.
+    /// (The retired typed-kitty cameo's veto was the other wildcard of that
+    /// pair; deleting the cameo removed it rather than repairing it again.)
     ///
     /// "One grid, no divider" is a claim about GEOMETRY. It was never a claim
     /// that every session is the same session, and this is the seam that lets
@@ -2556,12 +2574,12 @@ impl WordDecorations {
     /// can hold a SPLIT tab and an UNSPLIT one at the same time. Switching from
     /// the split tab to the unsplit one left `bound` naming a pane that is not
     /// on glass at all, which is a worse wildcard than the one this seam
-    /// closes: the edit witness then refused the unsplit tab's OWN keystrokes
-    /// (retypes silently stop re-arming) and its cameo lost its veto (the
-    /// double cat comes back). A host declaring "I am driving session S as one
-    /// grid" is stating that any pane binding is over, so the bound pane's
-    /// state is PARKED — exactly as `bind_pane` parks a pane it is switching
-    /// away from, keeping the split tab's episodes for when the user returns —
+    /// closes: the edit witness then refused the unsplit tab's OWN keystrokes,
+    /// so retypes silently stopped re-arming. A host declaring "I am driving
+    /// session S as one grid" is stating that any pane binding is over, so the
+    /// bound pane's state is PARKED — exactly as `bind_pane` parks a pane it is
+    /// switching away from, keeping the split tab's episodes for the user's
+    /// return —
     /// and the live fields are left for the declared session's own rescan.
     ///
     /// AND THE EPISODES BELONG TO THE TAB THAT PRODUCED THEM (the last member
@@ -2744,12 +2762,6 @@ impl WordDecorations {
             wd.done_marks.clear();
             wd.reset_transient_state();
         });
-        // The cameo is window-wide, so it is retired ONCE rather than per pane.
-        // `hard_reset` is the master-off / config-reload hook — "fresh start is
-        // user intent" — and a toy left on glass by a feature that was just
-        // switched off would be the one decoration that survived the off
-        // switch.
-        self.cameo.clear();
     }
 
     /// The shared body of [`reset`](Self::reset) / [`hard_reset`](Self::hard_reset):
@@ -2795,6 +2807,8 @@ impl WordDecorations {
         self.pet_last_tile = None;
         self.dog_baker.clear();
         self.dog_last_tile = None;
+        self.robi_baker.clear();
+        self.robi_last_body = None;
         // §F4.2: pending sightings die with the state.
         self.sightings.clear();
         self.unlogged.clear();
@@ -2982,306 +2996,6 @@ impl WordDecorations {
     /// byte-identical).
     pub fn free_atlas(&mut self) -> Option<std::sync::Arc<aterm_render::SceneAtlas>> {
         self.cat_baker.atlas()
-    }
-
-    // ───────────────────────── the typed-kitty cameo ─────────────────────────
-    //
-    // Owner, 2026-08-09: "When I type 'kitty' I do not want that to make the
-    // CURSOR kitty appear. I want THE kitty to appear." The lifecycle lives in
-    // [`crate::kitty_cameo`]; these are the engine seams that let it be baked,
-    // scheduled, and vetoed alongside the ambient word-cats.
-
-    /// Summon the typed-kitty cameo at `anchor` — the caret cell the completing
-    /// keystroke left behind.
-    ///
-    /// The host calls this on EVERY typed feline completion. The Kitty Log's
-    /// cooldown governs whether a ledger ROW is written; it has never governed
-    /// whether the user gets an answer to what they typed, and a cameo is a
-    /// VIEW, not a discovery — nothing here records a collectible.
-    ///
-    /// `pane` is the split pane the keystroke landed in (`None` for an unsplit
-    /// window): the anchor is a CELL, and cells only mean anything inside one
-    /// pane's grid, so the veto it feeds must not cross a divider.
-    pub fn summon_cameo(
-        &mut self,
-        now: Instant,
-        anchor: (u16, u16),
-        look: KittyLook,
-        pane: Option<u64>,
-    ) {
-        self.cameo.summon(now, anchor, look, pane);
-    }
-
-    /// Whether a cameo is on glass right now IN `pane` — the host's cue to
-    /// emit it. `pane` is the split pane about to draw (`None` for an unsplit
-    /// window); a cameo only ever shows in the pane its word was typed in.
-    #[must_use]
-    pub fn cameo_live(&self, now: Instant, pane: Option<u64>) -> bool {
-        self.cameo.frame_in_pane(now, pane).is_some()
-    }
-
-    /// WHICH PANE a live cameo belongs to — outer `None` means none is on
-    /// glass, inner `None` means it was summoned by a host that binds no pane.
-    ///
-    /// Composed hosts read this to choose the pane geometry they emit at, so
-    /// that the toy's EMISSION scope and its one-cat-per-caret VETO scope
-    /// ([`crate::kitty_cameo::KittyCameo::veto_cell`], which reads the bound
-    /// pane) are the same question rather than two different ones.
-    #[must_use]
-    pub fn cameo_pane(&self, now: Instant) -> Option<Option<u64>> {
-        self.cameo.live_pane(now)
-    }
-
-    /// This frame's cameo presentation (anchor / identity / alpha / offset), or
-    /// `None` when nothing is on glass anywhere. Exposed so a host — and the
-    /// summon seam's own regressions — can assert what the toy is doing without
-    /// reaching through the emitter. Pane-agnostic on purpose: this is "what is
-    /// the cameo", not "what does this pane draw".
-    #[must_use]
-    pub fn cameo_frame(&self, now: Instant) -> Option<crate::kitty_cameo::CameoFrame> {
-        self.cameo.frame(now)
-    }
-
-    /// The REDUCED-MOTION erase wake for a held cameo (`None` under full
-    /// motion, where [`Self::is_active`] owns the frame cadence instead).
-    ///
-    /// Hosts MUST fold this into the same deadline the companion's
-    /// `static_deadline` feeds. Without it a reduced-motion cameo is drawn once
-    /// and then never erased, because nothing else would ever schedule the
-    /// frame that takes it off glass.
-    #[must_use]
-    pub fn cameo_static_deadline(&self, now: Instant) -> Option<Instant> {
-        self.cameo.static_deadline(now)
-    }
-
-    /// [`Self::cameo_static_deadline`], scoped to a cameo whose owning session
-    /// `visible` reports as on glass. See
-    /// [`crate::kitty_cameo::KittyCameo::static_deadline_in`] — a hidden cameo's
-    /// bake retry is a wake TRAIN, not a wake.
-    #[must_use]
-    pub fn cameo_static_deadline_in(
-        &self,
-        now: Instant,
-        visible: impl Fn(u64) -> bool,
-    ) -> Option<Instant> {
-        self.cameo.static_deadline_in(now, visible)
-    }
-
-    /// Whether the live cameo still needs the host to SAMPLE its local palette
-    /// this frame ([`crate::kitty_cameo::KittyCameo::wants_colors`]).
-    ///
-    /// The composed host reads this before deciding to extract the cameo's
-    /// owning pane's grid: the answer is yes for one frame per cameo and no for
-    /// the ~300 that follow.
-    #[must_use]
-    pub fn cameo_wants_colors(&self) -> bool {
-        self.cameo.wants_colors()
-    }
-
-    /// The palette the live cameo LATCHED, for host conformance checks.
-    ///
-    /// Same job as [`Self::kitty_sprite_source_fingerprint`]: the host is the
-    /// half of this contract that can get it wrong — it chooses which pane's
-    /// grid the sample comes from — and without an observable seam a composed
-    /// frame that tinted the toy against the wrong pane looks identical to one
-    /// that got it right.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn cameo_colors(&self) -> Option<CatColorKey> {
-        self.cameo.latched_colors()
-    }
-
-    /// The cameo's dest rect at `now`, or `None` when nothing is on glass.
-    ///
-    /// Split out from [`Self::kitty_cameo`] for the same reason
-    /// [`Self::kitty_cursor_footprint`] is: the host samples the local text
-    /// palette over the footprint the art will actually occupy, and that sample
-    /// has to happen before the bake key is built.
-    #[must_use]
-    pub fn kitty_cameo_footprint(
-        &self,
-        geom: EffectGeom,
-        now: Instant,
-        pane: Option<u64>,
-    ) -> Option<CatFootprint> {
-        let frame = self.cameo.frame_in_pane(now, pane)?;
-        self.cameo_footprint_for(geom, frame)
-    }
-
-    /// The geometry half of the cameo, shared by the footprint probe and the
-    /// emitter so the palette sample and the drawn rect can never disagree.
-    ///
-    /// OWNER REGRESSION, 2026-08-10: *"AHH! the kitty that appears when I type
-    /// 'Kitty' is huge! go back to the old text kitty!"* — clarified: *"like
-    /// how it appears in the regular text."* 0.19.0 sized the cameo at the
-    /// full 2-cell atlas slot ×2.0 dest scale — a ~4-cell creature STANDING on
-    /// the line, ahead of the caret, over the text. That read as a toy on the
-    /// terminal; the owner wanted the cat that lives IN the terminal.
-    ///
-    /// So the word-kitty now obeys the AMBIENT WORD-CAT'S OWN LAW, the one
-    /// presentation the owner was pointing at: a head at §5.2 scale
-    /// ([`cat_hart`] × the identity's age band, fitted by
-    /// [`authored_cat_size`] — the exact sizing [`cat_geometry_for`] applies),
-    /// its authored centre over the anchor cell, its chin slice tucked behind
-    /// the anchor row so the line's ink occludes it. A kitty typed is a kitty
-    /// that fits the line. What still makes it the CAMEO is everything the
-    /// owner did not complain about: it wears the companion/session identity,
-    /// fires on every completion, holds the one-cat-per-caret veto, and lives
-    /// on its own clockless lifecycle.
-    fn cameo_footprint_for(
-        &self,
-        geom: EffectGeom,
-        frame: crate::kitty_cameo::CameoFrame,
-    ) -> Option<CatFootprint> {
-        if self.kitty_disabled || geom.cell_w == 0 || geom.cell_h == 0 {
-            return None;
-        }
-        let look = frame.look.normalized();
-        // THE AMBIENT HEAD LAW, verbatim: base Hart (`1.7·ch`) scaled by the
-        // identity's own age band, fitted to the authored aspect inside the
-        // structural slot. The ambient cat reads its age out of the occurrence
-        // genome; the cameo's identity is its [`KittyLook`], which carries the
-        // same band — so a kitten cameo is small the way a kitten peek is.
-        let desired_h = f32::from(cat_hart(geom.cell_h)) * look.age.scale();
-        let (w, hart) = authored_cat_size(look.variant, desired_h, geom.cell_h);
-        let chin = i32::from(cat_chin(hart));
-        let cw = i32::from(geom.cell_w);
-        let ch = i32::from(geom.cell_h);
-        let grid_w = i32::from(geom.cols) * cw;
-        let grid_h = i32::from(geom.rows) * ch;
-        if grid_w < i32::from(w) {
-            return None; // a grid narrower than the head shows no head
-        }
-        let (row, col) = frame.anchor;
-        // HORIZONTAL: the ambient anchor law with a one-cell word — the
-        // authored visual centre lands on the ANCHOR cell's midpoint, then
-        // clamps inward at the viewport edges. The anchor is the caret cell
-        // the completing keystroke left, i.e. the tail of the word just typed
-        // (the echo may lag a cell or two behind the keystroke; at head scale
-        // a cell either way is invisible) — so the head peeks AT its word,
-        // never stands ahead of it in open space.
-        let mid = i32::from(col) * cw + cw / 2;
-        let center = f32::from(GLYPHS[look.variant as usize].center_x) / f32::from(FIXED_ONE);
-        let x =
-            (mid - (center * f32::from(w)).round() as i32).clamp(0, (grid_w - i32::from(w)).max(0));
-        // VERTICAL: the chin slice tucks behind the anchor row exactly like
-        // the ambient peek — chin at the row's top edge, body in the rows
-        // above. A top row with no room above mirrors DOWN (the ambient
-        // [`PeekDir::Down`] arm): clamping an up-peek would park the head
-        // squarely on the word instead. `dy` (entrance slide + idle bob, in
-        // cells) always moves the head TOWARDS its hidden position behind the
-        // line, whichever side it peeks from, so the entrance reads as the
-        // classic slide-out on both.
-        let body = i32::from(hart) - chin;
-        let dy = (f64::from(frame.dy) * f64::from(ch)).round() as i32;
-        let y_max = (grid_h - i32::from(hart)).max(0);
-        let y = if i32::from(row) * ch < body {
-            ((i32::from(row) + 1) * ch - chin - dy).clamp(0, y_max)
-        } else {
-            (i32::from(row) * ch + chin + dy - i32::from(hart)).clamp(0, y_max)
-        };
-        Some(CatFootprint { x, y, w, h: hart })
-    }
-
-    /// Emit the typed-kitty cameo as ONE free sprite, or nothing.
-    ///
-    /// Call AFTER [`Self::tick`], appending into the same `free` buffer it
-    /// filled — the same contract [`Self::kitty_cursor`] has, and for the same
-    /// reason: the cameo must draw even on frames where the engine's occurrence
-    /// set is EMPTY (a no-echo password prompt echoes nothing, so nothing is
-    /// scanned, so `tick` early-returns before it could emit anything).
-    ///
-    /// Returns a fingerprint the host must fold into the frame fingerprint;
-    /// without it the host's unchanged-frame early-out would swallow the
-    /// entrance, the bob, and the fade.
-    ///
-    /// `None` means nothing was drawn: no live cameo, degenerate metrics, or a
-    /// tile that could not bake within the shared ≤2-bakes-per-frame budget (it
-    /// lands on the next frame, exactly like a word-cat's).
-    pub fn kitty_cameo(
-        &mut self,
-        geom: EffectGeom,
-        now: Instant,
-        pane: Option<u64>,
-        colors: CatColorKey,
-        free: &mut Vec<FreeSprite>,
-    ) -> Option<u64> {
-        let frame = self.cameo.frame_in_pane(now, pane)?;
-        let Some(footprint) = self.cameo_footprint_for(geom, frame) else {
-            // A footprint refusal is PERMANENT for this toy — the kitty
-            // sprite source is Disabled, or the pane cannot hold the head —
-            // unlike a bake-budget miss below, which lands next frame. A
-            // cameo that can never present must not spend its 5 s life
-            // holding the scheduler awake and VETOING the ambient word-cat
-            // that could have answered the keystroke (review, 2026-08-10):
-            // the toy dies here, and with it the wake train and the veto.
-            self.cameo.clear();
-            return None;
-        };
-        // ONE PALETTE FOR THE WHOLE CAMEO. The host samples the local text
-        // colours out of a grid scratch it reuses across panes, so only the
-        // FIRST sample is guaranteed to have come from this toy's own pane
-        // (see `Cameo::colors` and `WordDecorations::cameo_wants_colors`).
-        // Latching it here means a later frame's foreign sample can neither
-        // re-tint the cat nor churn the atlas with a second bake key.
-        let colors = self.cameo.latch_colors(colors);
-        // Prime the baker: `tick` bails before `begin_frame` when no cat-words
-        // are on screen, and the cameo is exactly the case where there are none.
-        self.cat_baker.set_free_tiles(true);
-        if !self.cat_baker_ready {
-            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
-            self.cat_baker_ready = true;
-        }
-        // The tile bakes at its EXACT dest size — NEAREST 1:1 (§5.3), the same
-        // contract as every ambient word-cat — and the footprint's dims never
-        // change over the animation (only x/y ride the slide and the bob), so
-        // the atlas key is stable across the cameo's whole life: the bob and
-        // the fade never rebake.
-        let look = frame.look.normalized();
-        let key = BakeKeyV4 {
-            variant: look.variant,
-            accessory: look.accessory,
-            coat: look.coat,
-            iris: look.iris,
-            colors,
-            w: footprint.w,
-            h: footprint.h,
-            // A cameo does not blink: it is on glass for a couple of seconds
-            // and one eye frame keeps it to a single atlas slot.
-            eyes: EyesFrame::Open,
-        };
-        let tile = self.cat_baker.get_v4(&key)?;
-        let sprite = FreeSprite {
-            x: footprint.x,
-            y: footprint.y,
-            w: footprint.w,
-            h: footprint.h,
-            ax: tile.ax,
-            ay: tile.ay,
-            aw: footprint.w,
-            ah: footprint.h,
-            tint: 0x00FF_FFFF,
-            alpha: frame.alpha,
-            flip_x: false,
-            // UnderText, like the ambient word-cats: the word-kitty peeks from
-            // BEHIND the line it answers, so the text's ink occludes its chin
-            // and it reads as part of the line — owner, 2026-08-10: "like how
-            // it appears in the regular text", not a toy standing in front of
-            // the terminal.
-            z: FreeZ::UnderText,
-            sampler: FreeSampler::Nearest,
-        };
-        free.push(sprite);
-        // The reduced-motion lane schedules ONE erase wake, so it needs to know
-        // the toy actually landed; until it has, the cameo keeps asking for a
-        // retry frame instead of waiting out its hold invisibly.
-        self.cameo.note_drawn();
-        let mut fp = fold_free(0x9E37_79B9_7F4A_7C15, &sprite);
-        fp = fold_u64(fp, self.cat_baker.version());
-        fp = fold_u64(fp, u64::from(colors.accent));
-        fp = fold_u64(fp, u64::from(colors.background));
-        Some(fp)
     }
 
     /// Emit the rare cat flying IN FRONT of the cursor, pulling it forward while
@@ -4003,8 +3717,8 @@ impl WordDecorations {
     /// The typed-word DOG's horizontal trail behind the cursor cell's left
     /// edge, as a fraction of a cell — the mirror of the kitty's
     /// [`Self::KITTY_LEAD_NUM`] lead. The kitty escorts AHEAD of the caret, so
-    /// the visiting dog pops up BEHIND it: the two cameos can never fight over
-    /// the same pixels, and the dog reads as having trotted up to see what is
+    /// the visiting dog pops up BEHIND it: the two can never fight over the
+    /// same pixels, and the dog reads as having trotted up to see what is
     /// being typed.
     const DOG_TRAIL_NUM: i32 = 3;
     const DOG_TRAIL_DEN: i32 = 4;
@@ -4045,8 +3759,10 @@ impl WordDecorations {
         }
         self.dog_baker.begin_frame(geom.cell_w, geom.cell_h);
 
-        // Natural size: the kitty cameo's 1.45-row art height, this breed's
-        // authored aspect, clamped to the host_tile slot (4·ch × 2·ch).
+        // Natural size: 1.45 rows of art height — a shade under the ambient
+        // cat's `cat_hart` (1.7·ch), so the visitor never out-sizes the
+        // resident — at this breed's authored aspect, clamped to the host_tile
+        // slot (4·ch × 2·ch).
         let ch = i32::from(geom.cell_h);
         let cw = i32::from(geom.cell_w);
         let aspect = crate::dog_baker::DogBaker::aspect(look.breed);
@@ -4118,6 +3834,177 @@ impl WordDecorations {
         fp = fold_u64(fp, self.dog_baker.version());
         fp = fold_u64(fp, u64::from(colors.accent));
         fp = fold_u64(fp, u64::from(colors.background));
+        Some(fp)
+    }
+
+    /// Emit the ROBI SHOW ([`crate::robi`]): the robot body at the evaluated
+    /// frame's pose/anchor, plus his ladder as a stack of vertically tiling
+    /// segments.
+    ///
+    /// The bake path is the pet's two-door pattern: poses rasterize into the
+    /// Robi roster's own exact-size cache ([`crate::robi_baker::RobiBaker`]),
+    /// and those texels enter the shared cat atlas through `host_tile`. A miss
+    /// on either door re-emits the LAST resolved body tile instead of blinking
+    /// him out mid-stride (`tick` has first claim on the shared bake budget).
+    /// The ladder draws [`FreeZ::UnderText`] so a paragraph stays readable
+    /// through it; Robi himself walks [`FreeZ::OverText`] like every companion.
+    ///
+    /// `anchor_y`/`bar` positions may be NEGATIVE (above row 0): the host's
+    /// strip splice shifts free sprites down by the strip height, which is
+    /// exactly how Robi reaches the tab bar and the titlebar band.
+    ///
+    /// Call AFTER `tick`, appending into the same `free` buffer it filled.
+    /// Returns a fingerprint fold for the host's early-out, `None` when
+    /// nothing was emitted.
+    pub fn robi(&mut self, show: RobiShowFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
+        let RobiShowFrame { geom, frame } = show;
+        if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+            return None;
+        }
+        self.cat_baker.set_free_tiles(true);
+        if !self.cat_baker_ready {
+            self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+            self.cat_baker_ready = true;
+        }
+        self.robi_baker.begin_frame(geom.cell_w, geom.cell_h);
+
+        let ch = f32::from(geom.cell_h);
+        // THE sizing law — window-scaled, shared with the brain and the host's
+        // bubble anchor (see `crate::robi::art_rows`).
+        let art_rows = crate::robi::art_rows(&geom);
+        // His ladder keeps its authored proportion against his body, so it
+        // grows with him instead of thinning into a wire beside a big robot.
+        let ladder_w_rows = crate::robi::LADDER_W_ROWS * art_rows / crate::robi::ART_ROWS;
+        let mut fp = 0xCBF2_9CE4_8422_2325u64;
+        let mut emitted = false;
+
+        // ── the ladder: a bottom-up stack of tiling segments ──────────────
+        if let Some(ladder) = frame.ladder
+            && ladder.bot_y > ladder.top_y
+        {
+            let lw = (ladder_w_rows * ch).round().max(2.0) as u16;
+            let lh = ((f32::from(lw) / crate::robi::LADDER_ASPECT).round()).max(2.0) as u16;
+            let key = crate::robi_baker::RobiBakeKey {
+                pose: crate::robi_glyphs_gen::RobiGlyphId::RobiLadder,
+                w: lw,
+                h: lh,
+            };
+            let tile = self
+                .robi_baker
+                .tile(&key)
+                .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), lw, lh, rgba));
+            if let Some(t) = tile {
+                let x = ladder.x - i32::from(lw) / 2;
+                let mut y = ladder.bot_y - i32::from(lh);
+                let mut segments = 0u32;
+                while y >= ladder.top_y - i32::from(lh) / 4 && segments < 64 {
+                    let sprite = FreeSprite {
+                        x,
+                        y,
+                        w: lw,
+                        h: lh,
+                        ax: t.ax,
+                        ay: t.ay,
+                        aw: lw,
+                        ah: lh,
+                        tint: 0x00FF_FFFF,
+                        alpha: frame.alpha,
+                        flip_x: false,
+                        z: FreeZ::UnderText,
+                        sampler: FreeSampler::Nearest,
+                    };
+                    free.push(sprite);
+                    fp = fold_free(fp, &sprite);
+                    emitted = true;
+                    y -= i32::from(lh);
+                    segments += 1;
+                }
+            }
+        }
+
+        // ── the robot body ────────────────────────────────────────────────
+        // Natural size: ART_ROWS tall (TALLER than the atlas's 2-row
+        // host-tile ceiling — the whole body bakes as ONE tile in the Robi
+        // cache, then enters the shared atlas as stacked vertical slices,
+        // each under the ceiling, re-assembled at draw time).
+        let h = ((art_rows * ch).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
+        // `4·cell_h` is the shared atlas's slot width (`CatBaker::slot_w`), so
+        // this clamp is the ATLAS CONTRACT, not a taste: a wider tile is
+        // REFUSED by `host_tile` and the body silently stops resolving.
+        // `ART_ROWS_MAX` is chosen to stay inside it — the clamp only ever
+        // catches rounding.
+        let w = ((f32::from(h) * crate::robi::ART_ASPECT).round() as i32)
+            .clamp(1, i32::from(geom.cell_h) * 4)
+            .min(i32::from(u16::MAX)) as u16;
+        let key = crate::robi_baker::RobiBakeKey {
+            pose: frame.pose,
+            w,
+            h,
+        };
+        let max_slice = geom.cell_h.saturating_mul(2).max(1);
+        let resolved: Option<RobiBodySlices> = self.robi_baker.tile(&key).and_then(|rgba| {
+            let mut body = RobiBodySlices {
+                w,
+                h,
+                n: 0,
+                sl: [(0, 0, 0); 4],
+            };
+            let mut y0: u16 = 0;
+            while y0 < h {
+                if usize::from(body.n) == body.sl.len() {
+                    return None; // taller than 4 slices — never with ART_ROWS ≤ 8
+                }
+                let sh = max_slice.min(h - y0);
+                let bytes = &rgba[usize::from(y0) * usize::from(w) * 4
+                    ..usize::from(y0 + sh) * usize::from(w) * 4];
+                let t =
+                    self.cat_baker
+                        .host_tile(key.host_id_slice(u16::from(body.n)), w, sh, bytes)?;
+                body.sl[usize::from(body.n)] = (t.ax, t.ay, sh);
+                body.n += 1;
+                y0 += sh;
+            }
+            Some(body)
+        });
+        if let Some(r) = resolved {
+            self.robi_last_body = Some(r);
+        }
+        let Some(body) = resolved.or(self.robi_last_body) else {
+            return emitted.then_some(fp);
+        };
+
+        // Anchor: feet on the ground line, or hands on the bar line.
+        let anchor_frac = match frame.anchor {
+            crate::robi::RobiAnchor::Feet => crate::robi::FEET_FRAC,
+            crate::robi::RobiAnchor::Grip => crate::robi::GRIP_FRAC,
+        };
+        let top = frame.anchor_y - (f32::from(body.h) * anchor_frac).round() as i32;
+        let x = frame.x - i32::from(body.w) / 2;
+        let mut dy: i32 = 0;
+        for (ax, ay, sh) in body.sl.iter().copied().take(usize::from(body.n)) {
+            let sprite = FreeSprite {
+                x,
+                y: top + dy,
+                w: body.w,
+                h: sh,
+                ax,
+                ay,
+                aw: body.w,
+                ah: sh,
+                tint: 0x00FF_FFFF,
+                alpha: frame.alpha,
+                // Each slice shares x/w, so flipping every slice about its
+                // own rect IS the whole-body mirror.
+                flip_x: frame.flip_x,
+                z: FreeZ::OverText,
+                sampler: FreeSampler::Nearest,
+            };
+            free.push(sprite);
+            fp = fold_free(fp, &sprite);
+            dy += i32::from(sh);
+        }
+        fp = fold_u64(fp, self.cat_baker.version());
+        fp = fold_u64(fp, self.robi_baker.version());
         Some(fp)
     }
 
@@ -4247,8 +4134,9 @@ impl WordDecorations {
     /// keystroke outright once the scan reaches a DIFFERENT pane.
     ///
     /// THE THIRD `bound.is_none()` (sibling sweep, 2026-08-09). The other two —
-    /// the cameo veto and the witness's session test — were genuine wildcards
-    /// and are now [`Self::scan_scope`]. This one is deliberately left alone,
+    /// the retired typed-kitty cameo's veto and the witness's session test —
+    /// were genuine wildcards and became [`Self::scan_scope`] (the cameo is
+    /// gone; the witness's test is still there). This one is left alone,
     /// because the only way to reach it with a MISMATCH is to record a key for
     /// a session the unsplit host is not showing, and the witness above refuses
     /// that key on the session test before the recorded cell is ever consulted.
@@ -5815,36 +5703,18 @@ impl WordDecorations {
         free: &mut Vec<FreeSprite>,
         nova: &mut Vec<GlowQuad>,
     ) -> u64 {
-        // THE CAMEO JOINS THE ONE-CAT-PER-CARET VETO. A live cameo is already
-        // answering the word it was summoned at, so the ambient scanner must
-        // not peek a second cat at that same word — the exact double-cat the
-        // companion's claim was written to stop, arriving through the new
-        // emitter. The cameo's ANCHOR is offered as a companion cell, which
-        // feeds both halves of that rule (the claim below, and the
-        // `caret_on_span` gate in the emission loop) with no second mechanism.
+        // ONE CAT PER CARET. The cell of the animal the host already has on
+        // glass — the cursor companion — feeds both halves of that rule (the
+        // claim below, and the `caret_on_span` gate in the emission loop) so
+        // the word it is answering never also grows its own ambient twin.
         //
-        // The COMPANION still wins when both are up: its cell is the caret the
-        // host is actually drawing at, and `companion_px` (which only a
-        // companion can supply) must stay paired with the cell it describes.
-        //
-        // THE SCOPE IS [`Self::scan_scope`], NOT `self.bound` (skeptic's third
-        // round, 2026-08-09). An unsplit host binds no pane, so `self.bound`
-        // was `None` — the wildcard — and a cameo typed in TAB A therefore
-        // vetoed the identically-placed ambient cat in TAB B, a suppression
-        // that crossed a boundary no cell coordinate spans. The unsplit host
-        // does know its session and now declares it.
-        let cameo_at = self.cameo.veto_cell(now, self.scan_scope());
-        // BOTH cells veto, independently. An earlier draft OR-ed them into one
-        // `Option` and lost the cameo's cell whenever a companion happened to
-        // be on glass — and a companion that has re-targeted a DIFFERENT feline
-        // word leaves the cameo's own word free to grow its ambient twin, which
-        // is the two-cats-per-keystroke bug arriving by another door.
+        // THE TYPED-KITTY CAMEO USED TO OFFER A SECOND CELL HERE and no longer
+        // exists: a typed feline word now gets exactly the cat the on-screen
+        // word gets, centred on the word span, and there is nothing to veto it
+        // against. Owner, 2026-08-12: *"there are now two cats that seem to
+        // appear when I type 'cat'? I want the cat just like in the main
+        // text"* — the second cat WAS the cameo.
         let companion_at = companion.map(|c| c.cell);
-        // The motion policy this host is rendering under, latched BEFORE every
-        // early-out below: a cameo over an EMPTY grid (a no-echo password
-        // prompt scans no words at all) still has to know whether it owns a
-        // frame cadence or a single erase deadline.
-        self.cameo.set_reduced_motion(cfg.reduced_motion);
         out.clear();
         ink.clear();
         free.clear();
@@ -5876,8 +5746,8 @@ impl WordDecorations {
         // every later typed word popped its ambient twin out from under the
         // pet. Bounded scan: `self.occ` is capped at MAX_OCCURRENCES and
         // stops at the first hit.
-        match companion_at.or(cameo_at) {
-            // Neither animal on glass: the episode is over, the claim releases.
+        match companion_at {
+            // No animal on glass: the episode is over, the claim releases.
             None => self.companion_claim = None,
             // Companion on glass: resolve the word it is answering NOW.
             //
@@ -6174,17 +6044,11 @@ impl WordDecorations {
                     // census and the Kitty Log stay untouched — `emit_cat` logs
                     // a sighting only for sprites that actually landed, and the
                     // typed word is already logged synthetically by the host.
-                    // The CAMEO is the third way to be that word (owner,
-                    // 2026-08-09): its anchor is the caret the toy came for, so
-                    // it vetoes on the same span predicate. Checked separately
-                    // from the companion's cell — either animal being there is
-                    // enough, and neither may mask the other.
                     let vetoed_by = |cell: Option<(u16, u16)>| {
                         cell.is_some_and(|c| caret_on_span(c, occ.row, occ.start_col, occ.end_col))
                     };
                     if (companion_at.is_some() && claim == Some(occ.ident))
                         || vetoed_by(companion_at)
-                        || vetoed_by(cameo_at)
                     {
                         break 'graphic;
                     }
@@ -7239,38 +7103,15 @@ impl WordDecorations {
     /// nova window) — the scheduler keeps presenting frames while true, then
     /// drops to a pure wait. Cheap (no config / no scan): reads the deadline
     /// last computed by `tick`.
+    ///
+    /// EVERY ARM IS AN EPISODE, and episodes are pruned against the visible
+    /// layout by `retain_panes` on every composed frame — so an episode that is
+    /// still here is one the host still shows, and there is no per-session
+    /// narrowing left for a scheduler to ask for. There used to be: the
+    /// typed-kitty cameo rode this signal from OUTSIDE `active_until` and could
+    /// outlive a tab switch, which is what the retired `is_active_in` existed
+    /// to filter.
     pub fn is_active(&self, now: Instant) -> bool {
-        // THE TYPED-KITTY CAMEO rides this same signal. It is deliberately
-        // OUTSIDE `active_until`: that field is computed inside `tick`, which
-        // early-returns on an empty occurrence set — and a cameo summoned at a
-        // no-echo prompt has no occurrences at all, so a cameo folded into
-        // `active_until` would paint one frame and freeze. Reduced motion
-        // answers `false` here and arms `cameo_static_deadline` instead.
-        self.cameo.is_active(now) || self.episodes_active(now)
-    }
-
-    /// [`Self::is_active`] with the CAMEO's arm narrowed to a toy whose owning
-    /// session `visible` reports as on glass — THE PREDICATE A SCHEDULER MUST
-    /// USE.
-    ///
-    /// SKEPTIC'S FINDING, 2026-08-09: this engine is per WINDOW and a tab switch
-    /// retires nothing, so a cameo typed in tab A stays live — and globally
-    /// "active" — while the user works in tab B, where no path will ever draw
-    /// it ([`crate::kitty_cameo::KittyCameo::frame_in_pane`] correctly refuses).
-    /// The window therefore held the 60 fps lane awake for the toy's full
-    /// [`crate::kitty_cameo::CAMEO_TOTAL_MS`] to present nothing at all.
-    ///
-    /// The EPISODE arms are deliberately left window-wide: `retain_panes` prunes
-    /// them against the visible layout every composed frame, so an episode that
-    /// is still here is one the host still shows.
-    #[must_use]
-    pub fn is_active_in(&self, now: Instant, visible: impl Fn(u64) -> bool) -> bool {
-        self.cameo.is_active_in(now, visible) || self.episodes_active(now)
-    }
-
-    /// The non-cameo half of [`Self::is_active`]: any pane's episode deadline
-    /// still in the future.
-    fn episodes_active(&self, now: Instant) -> bool {
         self.active_until.is_some_and(|d| now < d)
             || self
                 .parked
@@ -21150,300 +20991,105 @@ mod tests {
         );
     }
 
-    // ─────────────────── the typed-kitty cameo (owner ask A) ───────────────────
+    // ───────── one cat per animal word, centred on the word (owner) ─────────
 
-    /// OWNER REGRESSION, 2026-08-10: *"AHH! the kitty that appears when I type
-    /// 'Kitty' is huge! go back to the old text kitty!"* — clarified: *"like
-    /// how it appears in the regular text."*
+    /// ONE TYPED ANIMAL WORD, ONE CAT — AND IT SITS ON THE WORD'S CENTRE.
     ///
-    /// 0.19.0 drew the typed-word cameo at the full 2-cell atlas slot with a
-    /// further 2.0× dest scale: a ~4-cell creature standing OVER the text,
-    /// ahead of the caret. This pins the restored presentation to the AMBIENT
-    /// WORD-CAT'S OWN LAW — head-scale art, part of the line — so the next
-    /// "make it its own cat" pass cannot silently supersize it again:
+    /// OWNER, 2026-08-12: *"there are now two cats that seem to appear when I
+    /// type 'cat'? I want the cat just like in the main text"*, and *"it needs
+    /// to appear in the center of the word, not to the top right"*.
     ///
-    /// * sized by `cat_hart × age.scale()` through `authored_cat_size`,
-    ///   byte-equal to the §5.2 ambient head law, and structurally inside the
-    ///   two-row text band;
-    /// * NEAREST 1:1 (`aw == w`, `ah == h`) — there is no dest enlargement
-    ///   left to turn back up;
-    /// * `UnderText`, chin slice tucked behind the anchor row, so the line's
-    ///   ink occludes it exactly as it does every cat living in regular text;
-    /// * its authored centre over the ANCHOR cell — it peeks AT the word it
-    ///   answers, never stands ahead of it in open space;
-    /// * and a top-row anchor mirrors DOWN like the ambient `PeekDir::Down`
-    ///   arm instead of parking the head on the word.
+    /// BOTH halves were the TYPED-KITTY CAMEO, a second sprite the engine
+    /// emitted beside this ambient peek. It anchored on the LATCHED CARET — a
+    /// ONE-CELL span at the word's TAIL — so it sat a cell right of centre (two
+    /// for `kitty`) and peeked from the row above: the reported "top right". Its
+    /// one-cat-per-caret veto silenced this peek, but only while the word stayed
+    /// on that latched anchor, so one scroll line took the count from one cat to
+    /// two — and the survivor was always the off-centre one, because the vetoed
+    /// peek's own one-shot kept running underneath (it expired ~3.7 s in while
+    /// the cameo lived to 5.1 s). The cameo is deleted, and this pins what the
+    /// keystroke is answered by now:
+    ///
+    /// * EXACTLY ONE sprite. `push_cat_free` emits one per cat, so a second head
+    ///   can only come from a second emitter — which is precisely the shape of
+    ///   the bug.
+    /// * Its authored visual centre ON THE WORD SPAN'S MIDPOINT, checked for an
+    ///   ODD word (`cat`, 3 cells) and an EVEN one (`cats`, 4). The parities are
+    ///   not decoration: an even span's midpoint falls on a cell BOUNDARY and an
+    ///   odd one's in a cell's middle, so a ±½-cell error in the span arithmetic
+    ///   is invisible on exactly one of them.
+    ///
+    /// Sampled under REDUCED MOTION, where the settled pose is byte-exact: the
+    /// shipping dwell adds `CatIdlePose::breathing`, a ±1 px sway that is the
+    /// cat being alive rather than a change of anchor. The full-motion arm
+    /// therefore asserts the same centre within that one pixel — the anchor law
+    /// is the same law, and the sway is bounded by it.
     #[test]
-    fn the_word_kitty_is_text_scale_head_art_like_the_ambient_peek() {
-        let g = geom20();
-        let t0 = Instant::now();
-        let look = KittyLook::for_session(3);
-        let mut wd = WordDecorations::default();
-
-        let mut free = Vec::new();
-        assert!(
-            wd.kitty_cameo(g, t0, None, CatColorKey::default(), &mut free)
-                .is_none(),
-            "no cameo before the word is typed"
-        );
-        assert!(free.is_empty(), "and no sprite either — byte-identical off");
-
-        let (row, col) = (4u16, 9u16);
-        wd.summon_cameo(t0, (row, col), look, None);
-        // Sample mid-dwell on a whole bob period (`t % CAMEO_BOB_MS == 0`):
-        // the entrance slide is spent and the bob term is exactly zero, so the
-        // REST geometry below is byte-exact rather than tolerance-fuzzed.
-        let rest_at = t0 + Duration::from_millis(2 * crate::kitty_cameo::CAMEO_BOB_MS);
-        let fp = wd
-            .kitty_cameo(g, rest_at, None, CatColorKey::default(), &mut free)
-            .expect("a summoned cameo emits");
-        assert_ne!(fp, 0, "and folds a fingerprint the host cannot early-out");
-        assert_eq!(free.len(), 1, "exactly ONE sprite: the word-kitty");
-        let cat = free[0];
-
-        // THE AMBIENT HEAD LAW, byte for byte: the same size the word-cat
-        // peeking at an on-screen `kitty` of this identity would draw at.
-        let norm = look.normalized();
-        let (law_w, law_h) = authored_cat_size(
-            norm.variant,
-            f32::from(cat_hart(g.cell_h)) * norm.age.scale(),
-            g.cell_h,
-        );
-        assert_eq!(
-            (cat.w, cat.h),
-            (law_w, law_h),
-            "the word-kitty wears the ambient word-cat's own size law"
-        );
-        assert!(
-            i32::from(cat.h) <= 2 * i32::from(g.cell_h),
-            "and stays structurally inside the two-row text band — never pet \
-             scale again: {} vs {}",
-            cat.h,
-            2 * g.cell_h
-        );
-        assert_eq!(
-            (cat.aw, cat.ah),
-            (cat.w, cat.h),
-            "NEAREST 1:1 like every text cat — no dest enlargement exists to \
-             be turned back up"
-        );
-        assert_eq!(
-            cat.z,
-            FreeZ::UnderText,
-            "the word-kitty peeks from BEHIND the line, part of the text"
-        );
-        assert_eq!(cat.alpha, 255, "the dwell is fully opaque, like the peek");
-
-        // AT REST the chin slice sits exactly behind the anchor row's top
-        // edge, and the authored centre lands on the anchor cell's midpoint —
-        // the head peeks AT the word just typed, not ahead of the caret.
-        let (cw, ch) = (i32::from(g.cell_w), i32::from(g.cell_h));
-        assert_eq!(
-            cat.y + i32::from(cat.h),
-            i32::from(row) * ch + i32::from(cat_chin(cat.h)),
-            "the chin slice tucks behind the anchor row"
-        );
-        let mid = i32::from(col) * cw + cw / 2;
-        let center = f32::from(GLYPHS[norm.variant as usize].center_x) / f32::from(FIXED_ONE);
-        assert_eq!(
-            cat.x,
-            mid - (center * f32::from(cat.w)).round() as i32,
-            "the authored centre lands on the anchor cell's midpoint"
-        );
-        assert!(
-            cat.y >= 0
-                && cat.y + i32::from(cat.h) <= i32::from(g.rows) * ch
-                && cat.x >= 0
-                && cat.x + i32::from(cat.w) <= i32::from(g.cols) * cw,
-            "and the whole head is on-grid: {cat:?}"
-        );
-
-        // A TOP-ROW anchor has no rows above: the head mirrors DOWN out from
-        // under the line (the ambient `PeekDir::Down` arm) rather than being
-        // clamp-parked on top of the word it came for.
-        wd.summon_cameo(rest_at, (0, col), look, None);
-        let mut below = Vec::new();
-        let rest_down = rest_at + Duration::from_millis(2 * crate::kitty_cameo::CAMEO_BOB_MS);
-        wd.kitty_cameo(g, rest_down, None, CatColorKey::default(), &mut below)
-            .expect("a top-row cameo still emits");
-        let cat = below[0];
-        assert_eq!(
-            cat.y,
-            ch - i32::from(cat_chin(cat.h)),
-            "on row 0 the chin tucks behind the row's BOTTOM edge and the head \
-             slides out below"
-        );
-    }
-
-    /// ONE CAT PER CARET, extended to the cameo: the word the toy came for must
-    /// not ALSO grow its own ambient peeking cat. Two engines, identical in
-    /// every way but the summon, so the assertion cannot pass because the
-    /// fixture simply never draws cats.
-    #[test]
-    fn a_live_cameo_vetoes_the_ambient_cat_at_its_own_word() {
+    fn one_typed_animal_word_grows_exactly_one_cat_centred_on_its_span() {
         let lex = lex();
         let c = cfg();
+        let mut still = cfg();
+        still.reduced_motion = true;
         let g = geom20();
         let (rows, cols) = (g.rows as usize, g.cols as usize);
-        let t0 = Instant::now();
-        let mut term = Terminal::new(g.rows, g.cols);
-        term.process(b"hello kitty");
-        let sample = t0 + Duration::from_millis(120);
+        let cw = i32::from(g.cell_w);
+        let at = Instant::now() + Duration::from_millis(DWELL_QUIET_MS);
 
-        let mut control = WordDecorations::default();
-        control.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        let occ = feline(&control).clone();
-        let (control_free, _, _) = tick_cat(&mut control, sample, &c, g);
-        assert!(
-            !control_free.is_empty(),
-            "PRECONDITION: without a cameo this word grows its own cat"
-        );
-
-        let mut vetoed = WordDecorations::default();
-        vetoed.rescan(&term, rows, cols, &lex, &c, 1, t0);
-        vetoed.summon_cameo(
-            t0,
-            (occ.row, occ.end_col + 1),
-            KittyLook::for_session(3),
-            None,
-        );
-        let (vetoed_free, _, _) = tick_cat(&mut vetoed, sample, &c, g);
-        assert!(
-            vetoed_free.is_empty(),
-            "one keystroke, one cat: the ambient twin must yield to the toy"
-        );
-    }
-
-    /// THE VETO IS A SESSION SCOPE, NOT A CELL SCOPE — AND AN UNSPLIT WINDOW
-    /// HAS SESSIONS TOO (skeptic's third round, 2026-08-09).
-    ///
-    /// `WordDecorations` is per WINDOW: every tab of an unsplit window shares
-    /// this one engine and one cameo slot, and a tab switch retires neither.
-    /// The unsplit host binds no pane, so the veto's scope argument was `None`
-    /// — the wildcard — and a cameo typed in TAB A therefore suppressed the
-    /// ambient cat at the same cell in TAB B for its whole ~5 s life. A
-    /// suppression bug is silent by construction: what the user sees is a cat
-    /// that simply never came.
-    ///
-    /// TWO ARMS OFF ONE FIXTURE, differing ONLY in the session the scan
-    /// declares ([`WordDecorations::set_scan_session`]), so neither answer can
-    /// come from the grid, the clock, or the anchor:
-    ///
-    /// * scanning the cameo's OWN session ⇒ vetoed (the rule still works, so
-    ///   the fix is a scope rather than a deletion);
-    /// * scanning ANOTHER session ⇒ the cat plays, because tab A's toy is not
-    ///   on tab B's glass and has nothing there to be a second cat of.
-    #[test]
-    fn a_cameo_veto_does_not_cross_the_tab_boundary_on_an_unsplit_window() {
-        let lex = lex();
-        let c = cfg();
-        let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
-        let t0 = Instant::now();
-        let mut term = Terminal::new(g.rows, g.cols);
-        term.process(b"hello kitty");
-        let sample = t0 + Duration::from_millis(120);
-
-        // The tab the word was typed in, and the tab that is on glass now.
-        const TAB_A: u64 = 11;
-        const TAB_B: u64 = 12;
-
-        let scan = |scanning: u64| {
+        // ONE cat per word, its authored centre on the span midpoint, and the
+        // sprite entirely off both viewport edges (a clamped head would satisfy
+        // the centre check by accident at a margin column).
+        let measure = |word: &str, cfg: &DecoConfig, slack: i32| {
+            let t0 = Instant::now();
+            let mut term = Terminal::new(g.rows, g.cols);
+            term.process(format!("the {word} sat").as_bytes());
             let mut wd = WordDecorations::default();
-            wd.rescan(&term, rows, cols, &lex, &c, 1, t0);
+            wd.rescan(&term, rows, cols, &lex, cfg, 1, t0);
             let occ = feline(&wd).clone();
-            // The toy belongs to TAB A, anchored one past its word — the cell
-            // the completing keystroke left the caret on.
-            wd.summon_cameo(
-                t0,
-                (occ.row, occ.end_col + 1),
-                KittyLook::for_session(3),
-                Some(TAB_A),
+            assert_eq!(
+                (occ.start_col, occ.end_col),
+                (4, 4 + word.chars().count() as u16 - 1),
+                "PRECONDITION: {word:?} sits where the fixture typed it"
             );
-            // …and THIS is the tab whose grid the unsplit host is driving.
-            wd.set_scan_session(Some(scanning));
-            let (free, _, _) = tick_cat(&mut wd, sample, &c, g);
-            free.is_empty()
+
+            let (free, _, _) = tick_cat(&mut wd, at, cfg, g);
+            assert_eq!(
+                free.len(),
+                1,
+                "{word:?}: one animal word, ONE cat — got {free:?}"
+            );
+            let cat = free[0];
+            assert!(
+                cat.x > 0 && cat.x + i32::from(cat.w) < i32::from(g.cols) * cw,
+                "PRECONDITION: {word:?}'s head clears both viewport edges, so no \
+                 clamp is standing in for the centring law: {cat:?}"
+            );
+
+            // THE SPAN MIDPOINT FROM FIRST PRINCIPLES: the left edge of the
+            // word's first cell and the right edge of its last. Deliberately NOT
+            // `cat_geometry_for`'s own expression — a test that restates the
+            // implementation cannot catch the implementation drifting.
+            let mid = (i32::from(occ.start_col) + i32::from(occ.end_col) + 1) * cw / 2;
+            let variant = special_variant_v4(occ.genome.magic)
+                .unwrap_or_else(|| cat_variant_v4(occ.genome.gkey));
+            let center = f32::from(GLYPHS[variant as usize].center_x) / f32::from(FIXED_ONE);
+            let drawn_center = cat.x + (center * f32::from(cat.w)).round() as i32;
+            assert!(
+                (drawn_center - mid).abs() <= slack,
+                "{word:?}: the head's authored centre must land on the word's \
+                 midpoint (span {}..={} ⇒ mid {mid} px, drawn {drawn_center} px, \
+                 slack {slack}); {cat:?}",
+                occ.start_col,
+                occ.end_col
+            );
         };
 
-        assert!(
-            scan(TAB_A),
-            "PRECONDITION: in the toy's OWN tab the one-cat-per-caret veto \
-             still stands — this is a scope, not a deletion"
-        );
-        assert!(
-            !scan(TAB_B),
-            "and in another tab it must not stand: tab A's toy is not on tab \
-             B's glass, so tab B's word owes it nothing"
-        );
-    }
-
-    /// THE SCHEDULER SEAM, on the case that actually breaks it: a cameo
-    /// summoned at a NO-ECHO prompt, where the grid holds no words at all and
-    /// `tick` early-returns before it computes `active_until`.
-    ///
-    /// Full motion must keep the frame cadence armed (or the toy paints one
-    /// frame and freezes); reduced motion must expose the one erase deadline
-    /// instead (or it never comes off glass), and must NOT arm a wake train.
-    #[test]
-    fn a_cameo_over_an_empty_grid_still_reaches_both_scheduler_lanes() {
-        let lex = lex();
-        let c = cfg();
-        let mut reduced = c.clone();
-        reduced.reduced_motion = true;
-        let g = geom20();
-        let (rows, cols) = (g.rows as usize, g.cols as usize);
-        let t0 = Instant::now();
-        let blank = Terminal::new(g.rows, g.cols);
-
-        let mut wd = WordDecorations::default();
-        wd.rescan(&blank, rows, cols, &lex, &c, 1, t0);
-        assert!(
-            wd.occ.is_empty(),
-            "PRECONDITION: a no-echo prompt scans no words at all"
-        );
-        assert!(!wd.is_active(t0), "PRECONDITION: and nothing is animating");
-
-        wd.summon_cameo(t0, (1, 1), KittyLook::for_session(3), None);
-        tick_cat(&mut wd, t0, &c, g);
-        assert!(
-            wd.is_active(t0 + Duration::from_millis(200)),
-            "full motion: the cameo keeps the frame cadence armed"
-        );
-        assert!(
-            wd.cameo_static_deadline(t0).is_none(),
-            "full motion owns no erase deadline — the cadence is the lane"
-        );
-
-        // Same engine, demoted to reduced motion on the next tick.
-        tick_cat(&mut wd, t0 + Duration::from_millis(16), &reduced, g);
-        assert!(
-            !wd.is_active(t0 + Duration::from_millis(200)),
-            "reduced motion must never pin a wake train"
-        );
-        // Nothing has been emitted for this engine, so the wake is the BAKE
-        // RETRY (reduced motion has no cadence to retry on its own).
-        assert_eq!(
-            wd.cameo_static_deadline(t0),
-            Some(t0 + Duration::from_millis(crate::kitty_cameo::CAMEO_BAKE_RETRY_MS)),
-            "an undrawn reduced cameo asks for a retry frame"
-        );
-        // Emit it for real; now the only wake owed is the erase.
-        let mut free = Vec::new();
-        wd.kitty_cameo(g, t0, None, CatColorKey::default(), &mut free)
-            .expect("PRECONDITION: the cameo actually bakes here");
-        let deadline = wd
-            .cameo_static_deadline(t0)
-            .expect("reduced motion arms the single erase wake");
-        assert_eq!(
-            deadline,
-            t0 + Duration::from_millis(crate::kitty_cameo::CAMEO_STATIC_HOLD_MS)
-        );
-        assert!(
-            wd.cameo_static_deadline(deadline + Duration::from_millis(1))
-                .is_none(),
-            "and disarms once spent — back to 0% idle"
-        );
+        for word in ["cat", "cats"] {
+            // Reduced motion: the settled pose, so the anchor is byte-exact.
+            measure(word, &still, 0);
+            // Full motion: the same anchor plus the idle sway, whose amplitude
+            // is `clamp(0.06·cell_h, 1, 2) · 0.8` — under 1 px at this cell.
+            measure(word, &c, 1);
+        }
     }
 
     /// ASK C, VERIFIED — where the maneki's enlarged paw can and cannot be seen
@@ -21460,14 +21106,15 @@ mod tests {
     ///   as `special_variant_v4(magic).unwrap_or(head)`, so the maneki does
     ///   appear on screen (1/512 of feline sightings), it is logged with that
     ///   variant, and a collected one becomes `discovery_look` — which is what
-    ///   the cursor companion wears and what the typed cameo is summoned with.
+    ///   the cursor companion wears.
     ///
     /// So the enlarged art IS reachable, and this pins the path end to end: a
-    /// look carrying `SpecManeki` survives `normalized()` and the cameo sizes
-    /// its sprite by the maneki's OWN authored aspect — the widened one, which
-    /// is how the bigger paw reaches glass at all.
+    /// look carrying `SpecManeki` survives `normalized()` and the ONE sizing
+    /// law every cat on glass goes through ([`authored_cat_size`]) fits it by
+    /// the maneki's OWN authored aspect — the widened one, which is how the
+    /// bigger paw reaches glass at all.
     #[test]
-    fn the_enlarged_maneki_is_off_the_session_roster_but_on_the_cameo_path() {
+    fn the_enlarged_maneki_is_off_the_session_roster_but_on_the_discovery_path() {
         use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, HEADS};
         use crate::genome::CatAge;
 
@@ -21487,7 +21134,7 @@ mod tests {
              unreachable through that lane"
         );
 
-        // ── the other half: a COLLECTED maneki reaches the toy ──────────────
+        // ── the other half: a COLLECTED maneki reaches the companion ────────
         let maneki = KittyLook {
             variant: CatGlyphId::SpecManeki,
             // Specials wear no accessory; `normalized` enforces it, and asking
@@ -21543,23 +21190,23 @@ mod tests {
             "the raised paw paints IN FRONT of the whiskers ({whisker} vs {pink})"
         );
 
+        // ── and the WIDENED art is what the SIZING LAW fits by ──────────────
+        // `authored_cat_size` is the single funnel every cat on glass passes
+        // through — the ambient word-cat's `cat_geometry_for` and the
+        // companion's own bake both call it — so asking it directly is asking
+        // what reaches glass, without borrowing another effect's lifecycle to
+        // do it.
         let g = geom20();
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.summon_cameo(t0, (2, 4), maneki, None);
-        let mut free = Vec::new();
-        wd.kitty_cameo(g, t0, None, CatColorKey::default(), &mut free)
-            .expect("a maneki cameo emits");
-        let toy = free[0];
-        // `aw`/`ah` are the BAKED source dims, which `authored_cat_size` derives
-        // straight from the authored aspect.
-        let expect_w = |asp: u16| ((u32::from(toy.ah) * u32::from(asp)) + 500) / 1000;
+        let (w, h) = authored_cat_size(
+            maneki.variant,
+            f32::from(cat_hart(g.cell_h)) * maneki.age.scale(),
+            g.cell_h,
+        );
+        let expect_w = |asp: u16| ((u32::from(h) * u32::from(asp)) + 500) / 1000;
         assert_eq!(
-            u32::from(toy.aw),
+            u32::from(w),
             expect_w(aspect),
-            "the toy is sized by the maneki's own widened aspect: {}x{}",
-            toy.aw,
-            toy.ah
+            "the sprite is sized by the maneki's own widened aspect: {w}x{h}"
         );
         assert_ne!(
             expect_w(aspect),
@@ -21568,19 +21215,6 @@ mod tests {
              a visibly different sprite, so the check above really is reading \
              the new art"
         );
-    }
-
-    /// The master off-switch retires the toy with everything else: a cameo left
-    /// on glass by a feature the user just disabled would be the one decoration
-    /// that survived the off switch.
-    #[test]
-    fn hard_reset_retires_a_live_cameo() {
-        let t0 = Instant::now();
-        let mut wd = WordDecorations::default();
-        wd.summon_cameo(t0, (1, 1), KittyLook::for_session(3), None);
-        assert!(wd.cameo_live(t0, None), "PRECONDITION: the toy is on glass");
-        wd.hard_reset();
-        assert!(!wd.cameo_live(t0, None));
     }
 
     /// A user-supplied sprite ([`WordDecorations::set_kitty_sprite_source`]) overrides the

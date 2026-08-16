@@ -1950,6 +1950,12 @@ fn parse_settings_section_route(input: &str) -> Option<crate::native_settings::S
         "manual config" | "config" => Some(SettingsRoute::Manual),
         "text" | "typography" | "text and fonts" => Some(SettingsRoute::TextFonts),
         "cursor" | "cursor and motion" => Some(SettingsRoute::CursorMotion),
+        // The cat's page. "kitty" alone routes here and NOT to the Kitty Log
+        // (a read-only book with no route): a bare "kitty" from `settings
+        // section …` means the thing walking your cursor.
+        "kitty" | "cat" | "cursor cat" | "cursor pet" | "kitty pet" => {
+            Some(SettingsRoute::CursorKitty)
+        }
         "windows" | "window and tabs" | "window & tabs" => Some(SettingsRoute::WindowTabs),
         "input" | "keyboard" | "keyboard and input" => Some(SettingsRoute::KeyboardInput),
         "update" | "software updates" => Some(SettingsRoute::SoftwareUpdate),
@@ -2254,6 +2260,9 @@ mod video_parse_tests {
         for (alias, route) in [
             ("cursor", SettingsRoute::CursorMotion),
             ("cursor and motion", SettingsRoute::CursorMotion),
+            ("kitty", SettingsRoute::CursorKitty),
+            ("cursor pet", SettingsRoute::CursorKitty),
+            ("cursor kitty", SettingsRoute::CursorKitty),
             ("typography", SettingsRoute::TextFonts),
             ("input", SettingsRoute::KeyboardInput),
             ("update", SettingsRoute::SoftwareUpdate),

@@ -167,7 +167,9 @@ mod tests {
     #[test]
     fn dev_mark_reads_only_an_explicit_true() {
         let plist = |body: &str| {
-            format!("<plist><dict><key>CFBundleVersion</key><string>7</string>{body}</dict></plist>")
+            format!(
+                "<plist><dict><key>CFBundleVersion</key><string>7</string>{body}</dict></plist>"
+            )
         };
         assert!(plist_marks_dev_build(&plist(
             "<key>ATermDevBuild</key><string>true</string>"

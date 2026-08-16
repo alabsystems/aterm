@@ -1159,7 +1159,7 @@ struct RingSlot {
 /// OUTPUT text must never activate or re-dress the cursor companion).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SightingSource {
-    /// The committed keystream (`summon_typed_kitty`): the user did this on
+    /// The committed keystream (`record_typed_kitty`): the user did this on
     /// purpose, so a discovery repoints the companion (favourite permitting)
     /// and is returned for its hello.
     Typed,
@@ -1508,7 +1508,7 @@ impl KittyLogHost {
         }
     }
 
-    /// TYPED drain-site entry point (`summon_typed_kitty`): dedupe, record,
+    /// TYPED drain-site entry point (`record_typed_kitty`): dedupe, record,
     /// and debounce-flush this tick's sightings. A first-ever discovery
     /// repoints the companion (unless a favourite is pinned) and is RETURNED
     /// so the caller can present its hello — the user typed the word, so the
@@ -3323,7 +3323,8 @@ mod tests {
 
     /// The typed contrast pin: everything TYPED stays exactly as it was — a
     /// first-ever typed discovery repoints the companion AND returns the
-    /// unlocked look so `summon_typed_kitty` can present its hello.
+    /// unlocked look, which is `record_typed_kitty`'s cue that the host owes
+    /// one wake for the identity change.
     #[test]
     fn a_typed_discovery_still_repoints_and_reports() {
         let lex = Lexicon::builtin();

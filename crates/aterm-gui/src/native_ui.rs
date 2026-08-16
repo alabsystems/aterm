@@ -565,11 +565,17 @@ pub(crate) struct SliderSpec {
     pub(crate) display_value: String,
 }
 
-/// The `audit_id` naming the Tab Color HSV wheel — the ONE
-/// [`UiContent::Custom`] node with a special paint lowering (an
+/// The `audit_id` naming the Tab Color HSV wheel — one of the TWO
+/// [`UiContent::Custom`] nodes with a special paint lowering (an
 /// [`crate::widget::DrawPrim::HsvDisk`] + the committed-color marker) and a
 /// positional pointer mapping ([`CompiledUi::color_wheel_color_at`]).
 pub(crate) const TAB_COLOR_WHEEL_AUDIT: &str = "settings.tab-color.wheel";
+
+/// The `audit_id` naming the Top Settings rainbow hero banner — the other
+/// custom-paint node ([`crate::settings::paint_rainbow_banner`]): a purely
+/// decorative, static composition (no action, not focusable) whose semantic
+/// label simply names the scenery for accessibility.
+pub(crate) const RAINBOW_BANNER_AUDIT: &str = "settings.home.rainbow";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 
@@ -2816,6 +2822,24 @@ fn paint_compiled_node(
                     fill: rgba(roles.surface, 255),
                     blur: false,
                 });
+                // The Settings surface glows like the terminal it configures:
+                // a dim diagonal spectrum wash over the whole canvas (the
+                // wallpaper treatment, procedurally), with the opaque cards
+                // and rail floating on it. Yields to the high-contrast
+                // preference, where every point of text contrast belongs to
+                // the reader. The wash is static — retained-raster cached.
+                if node.key.as_str() == "settings/app"
+                    && !crate::native_appearance::current_preferences().high_contrast
+                {
+                    crate::settings::paint_settings_aurora(
+                        prims,
+                        rect.x,
+                        rect.y,
+                        rect.width,
+                        rect.height,
+                        roles.surface,
+                    );
+                }
             } else if spec.role == SemanticRole::Navigation {
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
@@ -2838,6 +2862,8 @@ fn paint_compiled_node(
             } else if matches!(spec.style, StyleRef::Primary | StyleRef::Secondary) {
                 // Settings cards are part of the canvas, not floating popovers:
                 // one flat surface and one separator, with no fake drop shadow.
+                // A one-pixel inner light along the top edge is the whole nod
+                // to dimensionality — a material sheen, not an elevation lie.
                 let hero = spec.style == StyleRef::Primary;
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
@@ -2847,7 +2873,7 @@ fn paint_compiled_node(
                     radius: 12.0,
                     fill: rgba(
                         if hero {
-                            mix_rgb(roles.elevated, roles.accent, 0.07)
+                            mix_rgb(roles.elevated, roles.accent, 0.10)
                         } else {
                             roles.elevated
                         },
@@ -2862,7 +2888,16 @@ fn paint_compiled_node(
                     h: (rect.height - 1.0).max(0.0),
                     radius: 12.0,
                     width: 1.0,
-                    color: rgba(if hero { roles.accent } else { roles.separator }, 142),
+                    color: rgba(if hero { roles.accent } else { roles.separator }, 150),
+                });
+                prims.push(DrawPrim::Panel {
+                    x: rect.x + 14.0,
+                    y: rect.y + 1.0,
+                    w: (rect.width - 28.0).max(0.0),
+                    h: 1.0,
+                    radius: 0.5,
+                    fill: rgba(roles.text_primary, 14),
+                    blur: false,
                 });
             } else if spec.style == StyleRef::Code {
                 // A terminal/editor canvas should read as a working surface
@@ -2927,9 +2962,12 @@ fn paint_compiled_node(
             } else if selected {
                 mix_rgb(roles.elevated, roles.accent, 0.13)
             } else if control.state.hovered {
-                mix_rgb(roles.elevated, roles.text_primary, 0.06)
-            } else {
+                mix_rgb(roles.elevated, roles.text_primary, 0.09)
+            } else if navigation {
+                // Rail rows rest flush with the rail; only their states paint.
                 roles.elevated
+            } else {
+                control_rest_fill(&roles)
             };
             if !navigation || selected || control.state.hovered || control.state.pressed {
                 prims.push(DrawPrim::Panel {
@@ -3296,10 +3334,22 @@ fn paint_compiled_node(
             spec.paint(prims, rect, theme, roles);
         }
         UiContent::Custom(spec) => {
-            // The Tab Color wheel is the ONE custom node with a raster lowering:
-            // the shared HSV disk primitive plus a two-tone marker ring at the
-            // committed color's polar position (spec.value = "#rrggbb"). Every
-            // other custom node keeps the plain label projection below.
+            // TWO custom nodes carry a raster lowering; every other custom node
+            // keeps the plain label projection below. The rainbow banner is
+            // pure static decoration — its semantics live entirely on the node.
+            if spec.audit_id == RAINBOW_BANNER_AUDIT {
+                crate::settings::paint_rainbow_banner(
+                    prims,
+                    rect.x,
+                    rect.y,
+                    rect.width,
+                    rect.height,
+                );
+                return;
+            }
+            // The Tab Color wheel: the shared HSV disk primitive plus a
+            // two-tone marker ring at the committed color's polar position
+            // (spec.value = "#rrggbb").
             if spec.audit_id == TAB_COLOR_WHEEL_AUDIT {
                 let geometry = color_wheel_geometry(rect);
                 prims.push(crate::widget::DrawPrim::HsvDisk {
@@ -4536,6 +4586,16 @@ fn column_offset(column: usize, origin: usize) -> usize {
     column.saturating_sub(origin)
 }
 
+/// The resting fill of an INTERACTIVE control. One perceptual step above
+/// `elevated` — controls sit ON cards that are themselves `elevated`, so a
+/// control filled with the card's own color dissolves into it and only its
+/// hairline is left doing the work. The step is small enough that
+/// `text_primary` (contrast-ensured against `surface`) keeps comfortable
+/// margin on top of it.
+fn control_rest_fill(roles: &crate::settings::Roles) -> [u8; 3] {
+    mix_rgb(roles.elevated, roles.text_primary, 0.05)
+}
+
 fn paint_control_surface(
     prims: &mut Vec<crate::widget::DrawPrim>,
     rect: LogicalRect,
@@ -4554,9 +4614,9 @@ fn paint_control_surface(
             if state.pressed {
                 mix_rgb(roles.elevated, roles.accent, 0.16)
             } else if state.hovered {
-                mix_rgb(roles.elevated, roles.text_primary, 0.06)
+                mix_rgb(roles.elevated, roles.text_primary, 0.09)
             } else {
-                roles.elevated
+                control_rest_fill(&roles)
             },
             255,
         ),

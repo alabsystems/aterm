@@ -10361,12 +10361,7 @@ impl GpuRenderer {
         // wallpaper texture (uv == rect / frame dims; identity tint, opaque).
         let wallpaper_quad = |x: f32, y: f32, rw: f32, rh: f32| GlyphInstance {
             rect: [x, y, rw, rh],
-            uv: [
-                x / w as f32,
-                y / h as f32,
-                rw / w as f32,
-                rh / h as f32,
-            ],
+            uv: [x / w as f32, y / h as f32, rw / w as f32, rh / h as f32],
             color: [255, 255, 255, 255],
             // fs_sprite_over blends un-remapped: bg unused.
             bg: [0, 0, 0, 0],
@@ -12440,11 +12435,10 @@ impl GpuRenderer {
         let wallpaper_bind = self.wallpaper_tex.as_ref().map(|s| &s.bind);
 
         let (device, queue) = (&self.ctx.device, &self.ctx.queue);
-        let wallpaper_buf = self.vbufs.wallpaper.upload(
-            device,
-            queue,
-            bytemuck::cast_slice(&self.inst.wallpaper),
-        );
+        let wallpaper_buf =
+            self.vbufs
+                .wallpaper
+                .upload(device, queue, bytemuck::cast_slice(&self.inst.wallpaper));
         let bg_buf = self
             .vbufs
             .bg

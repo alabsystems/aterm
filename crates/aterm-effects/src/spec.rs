@@ -1507,7 +1507,10 @@ mod tests {
             "{error}"
         );
 
-        let cjk_exception = TINY_TRIUMPHS.replacen("\"shipit\"", "\"熊猫\"", 1);
+        // 猫背 (stoop) is a production exceptions.toml suppression. (This
+        // fixture used 熊猫 until 2026-08-10, when the panda graduated from
+        // exception to first-class animal form and stopped erroring here.)
+        let cjk_exception = TINY_TRIUMPHS.replacen("\"shipit\"", "\"猫背\"", 1);
         let error = compile_toy_pack_toml(&cjk_exception)
             .expect_err("a production-scanner CJK exception cannot become a trigger");
         assert!(

@@ -2510,6 +2510,26 @@ const LANDING_LEDE_2: &str =
     "Every theme, cursor effect, font knob, and security switch — one hot-reloaded aterm.toml.";
 const LANDING_FOOT_HINT: &str = "Enter opens the settings  ·  Esc closes";
 
+// ---- §L.5 The rainbow welcome ---------------------------------------------------
+// The landing's welcome flourish: a pastel rainbow arch sweeping in behind the
+// hero and a small twinkling constellation. Purely decorative — no LandingGeom
+// target, so hit-testing never sees any of it.
+/// The rainbow arch's sixth stripe (the blob palette covers the other five).
+const RAINBOW_TEAL: [u8; 3] = [0x21, 0xC2, 0xB7];
+
+/// Animation clock for the landing's scripted entrances: 0 before `start`,
+/// smoothstepping 0→1 over `len` ticks after it. Reduced motion freezes
+/// `landing_phase` at 0 (`tick_landing` never fires there), so phase 0
+/// short-circuits to the RESTING pose (1.0) — the page must never hide its
+/// content from a user who opted out of motion.
+fn entrance(phase: u32, start: u32, len: f32) -> f32 {
+    if phase == 0 {
+        return 1.0;
+    }
+    let t = (phase.saturating_sub(start) as f32 / len).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// Card-relative device-px geometry of the landing page's interactive targets — the
 /// ONE source the painter draws from AND `settings_click` hit-tests with, so a press
 /// lands exactly on the bubble painted under it (the `pane_geom` discipline, §L).
@@ -2586,6 +2606,10 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         w,
         h,
     });
+    // The rainbow arch (§L.5): a wide pastel band cresting behind the hero
+    // column, sweeping in left→right on open. Painted FIRST inside the clip so
+    // the saturated blobs read as the nearer layer where they overlap.
+    paint_rainbow_arch(prims, state.landing_phase, w, h, ch);
     let m = h.min(w);
     let blobs: [([u8; 3], f32, f32, f32, f32); 5] = [
         (BLOB_CORAL, 0.30, -0.08, 0.26, 0.0),
@@ -2616,6 +2640,9 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
             breathe: false,
         });
     }
+    // Star glints (§L.5): a few tiny twinkling crosses in the mint sky around
+    // the hero — alive under motion, a static constellation without it.
+    paint_landing_glints(prims, state.landing_phase, w, h, ch);
     prims.push(DrawPrim::ClipPop);
 
     // The hero type column, centred. One local funnel wrapper (the §2 rule).
@@ -2845,6 +2872,227 @@ fn paint_landing(prims: &mut Vec<DrawPrim>, state: &SettingsState, g: &SettingsG
         LANDING_FOOT_HINT,
         LANDING_HINT,
     );
+}
+
+/// The §L.5 rainbow arch: six translucent stripes of overlapping Dots along a
+/// half-turn centred below the card, red outermost — the settings site's nod to
+/// the rainbow the user lives in. `entrance` sweeps it in left→right; phase 0
+/// (reduced motion, and the open's very first frame) paints it complete.
+fn paint_rainbow_arch(prims: &mut Vec<DrawPrim>, phase: u32, w: f32, h: f32, ch: f32) {
+    let stripes = [
+        BLOB_CORAL,
+        BLOB_MARIGOLD,
+        BLOB_LEAF,
+        RAINBOW_TEAL,
+        BLOB_COBALT,
+        BLOB_VIOLET,
+    ];
+    let sweep = entrance(phase, 4, 22.0);
+    if sweep <= 0.0 {
+        return;
+    }
+    let (cx, cy) = (w * 0.5, h * 0.78);
+    let r0 = h * 0.40;
+    let st = (ch * 0.5).max(4.0);
+    for (i, c) in stripes.iter().enumerate() {
+        // Red is stripe 0 and must land OUTERMOST, so radius descends with i.
+        let r = (r0 + (stripes.len() - 1 - i) as f32 * st).max(1.0);
+        // Dot centres every ~0.8 stripe widths along the arc: near enough to
+        // fuse into a band at this alpha, far enough to stay a bounded count —
+        // and hard-capped at 512 per stripe so a pathological geometry (the
+        // extreme-geometry guard) can never balloon the prim list.
+        let step = ((st * 0.8) / (std::f32::consts::PI * r)).max(1.0 / 512.0);
+        let mut a = 0.0f32;
+        while a <= sweep {
+            let th = std::f32::consts::PI * (1.0 + a);
+            prims.push(DrawPrim::Dot {
+                cx: cx + th.cos() * r,
+                cy: cy + th.sin() * r,
+                r: st * 0.62,
+                color: rgba(*c, 0x3C),
+                breathe: false,
+            });
+            a += step;
+        }
+    }
+}
+
+/// The §L.5 star glints: five fixed twinkling crosses (two hairline Strokes +
+/// a centre Dot — the cameo's prim vocabulary) placed in the mint sky clear of
+/// the hero column. Alpha breathes on the landing phase; frozen phase 0 leaves
+/// each at its own mid-twinkle brightness.
+fn paint_landing_glints(prims: &mut Vec<DrawPrim>, phase: u32, w: f32, h: f32, ch: f32) {
+    let t = phase as f32 / 30.0;
+    let glints: [(f32, f32, f32, [u8; 3], f32); 5] = [
+        (0.235, 0.205, 0.55, BLOB_MARIGOLD, 0.0),
+        (0.755, 0.165, 0.45, BLOB_VIOLET, 1.9),
+        (0.685, 0.335, 0.32, BLOB_MARIGOLD, 3.4),
+        (0.300, 0.345, 0.38, RAINBOW_TEAL, 4.6),
+        (0.505, 0.115, 0.42, BLOB_CORAL, 5.8),
+    ];
+    for (fx, fy, sc, c, off) in glints {
+        let twinkle = 0.5 + 0.5 * (t * 1.7 + off).sin();
+        let a = (0x2A as f32 + twinkle * 96.0) as u8;
+        let (sx, sy) = (fx * w, fy * h);
+        let len = ch * sc;
+        prims.push(DrawPrim::Stroke {
+            x: sx - len,
+            y: sy - 0.75,
+            w: len * 2.0,
+            h: 1.5,
+            radius: 0.75,
+            width: 1.5,
+            color: rgba(c, a),
+        });
+        prims.push(DrawPrim::Stroke {
+            x: sx - 0.75,
+            y: sy - len,
+            w: 1.5,
+            h: len * 2.0,
+            radius: 0.75,
+            width: 1.5,
+            color: rgba(c, a),
+        });
+        prims.push(DrawPrim::Dot {
+            cx: sx,
+            cy: sy,
+            r: len * 0.16,
+            color: rgba(c, a),
+            breathe: false,
+        });
+    }
+}
+
+/// The §L.5 composition as a NATIVE Settings hero banner: the mint world in a
+/// bounded card — a pastel rainbow arch cresting through a small constellation
+/// of star glints. Deliberately STATIC: the native scheduler keeps idle routes
+/// at 0% and this banner never asks for a frame. Painted through the audited
+/// custom-node lowering (`native_ui::RAINBOW_BANNER_AUDIT`); everything clips
+/// to `rect`.
+/// The Settings surface's aurora: the wallpaper treatment, procedurally — a
+/// dim DIAGONAL spectrum wash over the whole canvas, exactly the hue ramp the
+/// user's rainbow terminal wears (`hue ∝ x + y`). Painted as a coarse tile
+/// grid of translucent Panels over the theme surface: at this alpha adjacent
+/// tiles differ by a whisper of hue, so the grid fuses into a smooth wash
+/// while staying a bounded, cache-friendly prim count. Deliberately STATIC.
+pub(crate) fn paint_settings_aurora(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    surface: [u8; 3],
+) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let cols = 112usize;
+    let rows = 64usize;
+    let cw = w / cols as f32;
+    let ch = h / rows as f32;
+    for j in 0..rows {
+        for i in 0..cols {
+            let hue = (i as f32 / cols as f32 + j as f32 / rows as f32) * 0.5;
+            // A gentle value falloff toward the bottom keeps the content zone
+            // calmer than the sky above it.
+            let v = 0.92 - 0.16 * (j as f32 / rows as f32);
+            let c = crate::widget::hsv_to_rgb(hue, 0.86, v);
+            // OPAQUE tiles, pre-mixed into the surface: translucent neighbours
+            // double up wherever they overlap and etch a lattice into the sky;
+            // opaque paint makes the half-pixel seam bleed invisible.
+            prims.push(DrawPrim::Panel {
+                x: x + i as f32 * cw,
+                y: y + j as f32 * ch,
+                w: cw + 0.75,
+                h: ch + 0.75,
+                radius: 0.0,
+                fill: rgba(lerp_rgb(surface, c, 0.30), 0xFF),
+                blur: false,
+            });
+        }
+    }
+}
+
+pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w: f32, h: f32) {
+    prims.push(DrawPrim::Panel {
+        x,
+        y,
+        w,
+        h,
+        radius: 12.0,
+        fill: rgba(LANDING_MINT, 0xFF),
+        blur: false,
+    });
+    prims.push(DrawPrim::Stroke {
+        x,
+        y,
+        w,
+        h,
+        radius: 12.0,
+        width: 1.0,
+        color: rgba(LANDING_LINE, 0xFF),
+    });
+    prims.push(DrawPrim::ClipPush { x, y, w, h });
+    // The rainbow arch, cresting inside the banner from its bottom edge.
+    let stripes = [
+        BLOB_CORAL,
+        BLOB_MARIGOLD,
+        BLOB_LEAF,
+        RAINBOW_TEAL,
+        BLOB_COBALT,
+        BLOB_VIOLET,
+    ];
+    let (acx, acy) = (x + w * 0.5, y + h * 1.12);
+    let r0 = h * 0.58;
+    let st = (h * 0.055).max(3.0);
+    for (i, c) in stripes.iter().enumerate() {
+        let r = (r0 + (stripes.len() - 1 - i) as f32 * st).max(1.0);
+        let step = ((st * 0.8) / (std::f32::consts::PI * r)).max(1.0 / 512.0);
+        let mut a = 0.0f32;
+        while a <= 1.0 {
+            let th = std::f32::consts::PI * (1.0 + a);
+            prims.push(DrawPrim::Dot {
+                cx: acx + th.cos() * r,
+                cy: acy + th.sin() * r,
+                r: st * 0.62,
+                color: rgba(*c, 0x46),
+                breathe: false,
+            });
+            a += step;
+        }
+    }
+    // A small static constellation in the mint sky, both sides of the arch.
+    let glints: [(f32, f32, f32, [u8; 3]); 6] = [
+        (0.070, 0.30, 0.16, BLOB_MARIGOLD),
+        (0.155, 0.62, 0.11, BLOB_VIOLET),
+        (0.330, 0.24, 0.13, RAINBOW_TEAL),
+        (0.660, 0.26, 0.12, BLOB_CORAL),
+        (0.845, 0.58, 0.11, BLOB_LEAF),
+        (0.930, 0.28, 0.15, BLOB_VIOLET),
+    ];
+    for (fx, fy, sc, c) in glints {
+        let (sx, sy) = (x + fx * w, y + fy * h);
+        let len = h * sc;
+        prims.push(DrawPrim::Stroke {
+            x: sx - len,
+            y: sy - 0.75,
+            w: len * 2.0,
+            h: 1.5,
+            radius: 0.75,
+            width: 1.5,
+            color: rgba(c, 0x6E),
+        });
+        prims.push(DrawPrim::Stroke {
+            x: sx - 0.75,
+            y: sy - len,
+            w: 1.5,
+            h: len * 2.0,
+            radius: 0.75,
+            width: 1.5,
+            color: rgba(c, 0x6E),
+        });
+    }
+    prims.push(DrawPrim::ClipPop);
 }
 
 /// The §L.4 kitty cameo painter: a small vector cat built from the EXISTING prim
@@ -3857,6 +4105,10 @@ fn category_tint(sec: prefs::Section, r: &Roles, theme: Theme) -> [u8; 3] {
         // carries the color story.
         prefs::Section::Appearance => lerp_rgb(r.text_secondary, r.text_primary, 0.35),
         prefs::Section::Cursor => r.accent,
+        // Cursor Kitty: the accent pulled toward the cursor's own hue — the
+        // cat's tile reads as a sibling of Cursor's full-strength accent (they
+        // are the same surface split in two) without repeating it exactly.
+        prefs::Section::CursorKitty => lerp_rgb(r.accent, u32_rgb(theme.cursor), 0.45),
         prefs::Section::Typography => u32_rgb(theme.cursor),
         // Window: the selection wash is the theme's "window furniture" tone —
         // distinct from the accent/success families its neighbors wear.
@@ -3960,6 +4212,44 @@ fn category_pictogram(
                 h: s * 0.60,
                 radius: bar_w * 0.3,
                 fill: rgba(on, 0xFF),
+                blur: false,
+            });
+        }
+        // Cursor Kitty: the Kitty Log's peeking-cat silhouette WALKING on a
+        // rainbow rail — the head/ear vocabulary is shared on purpose (both
+        // tiles are the same cat), and the bar under it is what separates the
+        // cursor's companion from the collection book.
+        prefs::Section::CursorKitty => {
+            let hr = s * 0.20; // head radius (smaller than the Log's: it stands ON something)
+            let hy = cy - s * 0.02;
+            let ew = s * 0.13; // ear nub width
+            for side in [-1.0f32, 1.0] {
+                prims.push(DrawPrim::Panel {
+                    x: cx + side * hr * 0.62 - ew * 0.5,
+                    y: hy - hr - s * 0.08,
+                    w: ew,
+                    h: s * 0.17,
+                    radius: ew * 0.35,
+                    fill: rgba(on, 0xFF),
+                    blur: false,
+                });
+            }
+            prims.push(DrawPrim::Dot {
+                cx,
+                cy: hy,
+                r: hr,
+                color: rgba(on, 0xFF),
+                breathe: false,
+            });
+            // The rainbow RAIL it walks: one bar in the tile tint under the cat.
+            let tint = category_tint(sec, r, theme);
+            prims.push(DrawPrim::Panel {
+                x: cx - s * 0.28,
+                y: cy + s * 0.24,
+                w: s * 0.56,
+                h: (s * 0.08).max(1.5),
+                radius: (s * 0.04).max(0.75),
+                fill: rgba(tint, 0xFF),
                 blur: false,
             });
         }
@@ -6875,7 +7165,8 @@ mod tests {
                 );
             }
         }
-        // The six sidebar categories all label too.
+        // Every sidebar category labels too — including the Cursor Kitty pane
+        // added on 2026-08-10, which pushed the strip to eleven rows.
         for sec in prefs::Section::ORDER {
             assert!(
                 t.prims
@@ -6972,25 +7263,33 @@ mod tests {
         );
 
         // Idle: no demo subject. Focusing the row demos the EFFECTIVE style.
+        // The style row lives on the CAT's category since 2026-08-10, and
+        // `action_target` only reports a row whose section is the live category.
         s.pane = SettingsPane::Content;
         assert_eq!(demo_style(&s), None, "a non-trail focus has no demo");
-        s.set_category(prefs::Section::Cursor);
+        s.set_category(prefs::Section::CursorKitty);
         s.selected = idx;
         assert_eq!(
             demo_style(&s),
-            Some("rainbow kitty"),
+            Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE),
             "focus demos the resolved default"
         );
-        // The master toggle demos the selected style too.
+        // The master toggle demos the selected style too — from its own
+        // category, which the trail engine kept.
+        s.set_category(prefs::Section::Cursor);
         s.selected = s
             .fields
             .iter()
             .position(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL)
             .unwrap();
-        assert_eq!(demo_style(&s), Some("rainbow kitty"));
+        assert_eq!(
+            demo_style(&s),
+            Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+        );
 
         // Open the menu and move the highlight: the HIGHLIGHTED (uncommitted)
         // option drives the demo — and only Enter would persist it.
+        s.set_category(prefs::Section::CursorKitty);
         s.selected = idx;
         assert!(s.menu_open());
         let fire = s
@@ -7017,7 +7316,10 @@ mod tests {
         );
         // Esc restores: cancel leaves the effective style in charge again.
         s.menu_cancel();
-        assert_eq!(demo_style(&s), Some("rainbow kitty"));
+        assert_eq!(
+            demo_style(&s),
+            Some(crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+        );
 
         // While filtering (menu closed) the card rests on the default mock: no demo.
         s.searching = true;
@@ -7037,9 +7339,10 @@ mod tests {
 
     #[test]
     fn enum_current_strips_default_placeholder_suffix() {
-        // An unset style seeds None, so display_value is the "rainbow kitty (default)"
-        // placeholder and enum_current strips the suffix to the canonical option —
-        // this is what the "Trail effect" popup chip and the demo lane resolve.
+        // An unset style seeds None, so display_value is the
+        // "rainbow kitty pet (default)" placeholder and enum_current strips the
+        // suffix to the canonical option — this is what the Cursor Kitty page's
+        // companion chip and the demo lane resolve.
         let s = SettingsState::from_config(&cfg());
         let f = s
             .fields
@@ -7047,7 +7350,7 @@ mod tests {
             .find(|f| f.key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
             .unwrap();
         assert!(f.seed.is_none());
-        assert_eq!(enum_current(f), "rainbow kitty");
+        assert_eq!(enum_current(f), crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE);
     }
 
     #[test]
@@ -7390,9 +7693,10 @@ mod tests {
             "at the min rail: no-op"
         );
 
-        // Enum steps backward from the unset default (rainbow kitty, options[1]) to options[0].
+        // Enum steps backward from the unset default (rainbow kitty PET,
+        // options[2] since it became the shipped default) to options[1].
         let (_k, v) = step_edit(by_key(crate::prefs::EDIT_CURSOR_TRAIL_STYLE), -1, false).unwrap();
-        assert_eq!(v.as_deref(), Some("phaser"));
+        assert_eq!(v.as_deref(), Some("rainbow kitty"));
         // …and from options[0] it wraps to the last option.
         let style = |seed: &str| EditField {
             label: "Trail effect",
@@ -7720,7 +8024,7 @@ mod tests {
             caps(prefs::Section::Appearance),
             // Full-coverage growth: the Transparency box, the Wallpaper box
             // (backdrop image + dim), plus one box per decorative nested table
-            // (sparkle words / matrix rain).
+            // (sparkle words / matrix rain) and the Robi helper-robot toggle.
             [
                 "Theme",
                 "Colors",
@@ -7728,7 +8032,8 @@ mod tests {
                 "Transparency",
                 "Wallpaper",
                 "Sparkle words",
-                "Matrix rain"
+                "Matrix rain",
+                "Robi the robot"
             ]
         );
         assert_eq!(
@@ -7753,6 +8058,13 @@ mod tests {
                 "Light & GPU",
                 "Stream fade"
             ]
+        );
+        // The cat's own category (2026-08-10): the companion picker, the rainbow
+        // wake dial, and the sprite art moved off "Trail effect"/"Trail color"
+        // into three boxes that belong to the KITTY rather than the trail engine.
+        assert_eq!(
+            caps(prefs::Section::CursorKitty),
+            ["Companion", "Rainbow wake", "Kitty art"]
         );
         assert_eq!(
             caps(prefs::Section::Typography),
@@ -7848,6 +8160,9 @@ mod tests {
                     .filter(|l| l.key.starts_with("matrix_rain.")),
             )
             .map(|l| l.key)
+            // …and the Robi helper-robot toggle closes the pane (its own
+            // one-key group after the two decorative tables).
+            .chain(std::iter::once(prefs::EDIT_ROBI))
             .collect();
         assert_eq!(controls[head.len()..].to_vec(), expected_tail);
 
@@ -8062,8 +8377,10 @@ mod tests {
         );
     }
 
-    /// The sidebar's pure row map: rows 1-2 hit the search field, six 2-cell category
-    /// bands start at row 4, and nothing at/past the footer row hits.
+    /// The sidebar's pure row map: rows 1-2 hit the search field, the eleven 2-cell
+    /// category bands start at row 4, and nothing at/past the footer row hits.
+    /// Every band below Cursor shifted down two rows when the Cursor Kitty pane was
+    /// inserted at index 2 (2026-08-10) — the map is `4 + 2 * order_index`.
     #[test]
     fn sidebar_hit_maps_rows() {
         assert_eq!(sidebar_hit(1, 38), Some(SidebarHit::Search));
@@ -8082,24 +8399,33 @@ mod tests {
             Some(SidebarHit::Category(prefs::Section::Cursor))
         );
         assert_eq!(
-            sidebar_hit(19, 38),
+            sidebar_hit(8, 38),
+            Some(SidebarHit::Category(prefs::Section::CursorKitty)),
+            "the cat's own band owns rows 8-9"
+        );
+        assert_eq!(
+            sidebar_hit(9, 38),
+            Some(SidebarHit::Category(prefs::Section::CursorKitty))
+        );
+        assert_eq!(
+            sidebar_hit(21, 38),
             Some(SidebarHit::Category(prefs::Section::Security))
         );
         assert_eq!(
-            sidebar_hit(20, 38),
-            Some(SidebarHit::Category(prefs::Section::Packages)),
-            "the 9th category owns rows 20-21"
-        );
-        assert_eq!(
             sidebar_hit(22, 38),
-            Some(SidebarHit::Category(prefs::Section::KittyLog)),
+            Some(SidebarHit::Category(prefs::Section::Packages)),
             "the 10th category owns rows 22-23"
         );
         assert_eq!(
-            sidebar_hit(23, 38),
+            sidebar_hit(24, 38),
+            Some(SidebarHit::Category(prefs::Section::KittyLog)),
+            "the 11th category owns rows 24-25"
+        );
+        assert_eq!(
+            sidebar_hit(25, 38),
             Some(SidebarHit::Category(prefs::Section::KittyLog))
         );
-        assert_eq!(sidebar_hit(24, 38), None, "past the ten categories");
+        assert_eq!(sidebar_hit(26, 38), None, "past the eleven categories");
         assert_eq!(sidebar_hit(37, 38), None, "the footer row never hits");
         assert_eq!(sidebar_hit(5, 6), None, "a too-short card clips the row");
         // The painter clips a category whose FULL 2-cell row does not fit above the
@@ -8107,12 +8433,12 @@ mod tests {
         // either — it used to switch categories on a click over blank sidebar.
         assert_eq!(sidebar_hit(4, 6), None, "top cell of a clipped first row");
         assert_eq!(
-            sidebar_hit(14, 16),
+            sidebar_hit(16, 18),
             None,
-            "Terminal's top cell clips at 16 rows"
+            "Terminal's top cell clips at 18 rows"
         );
         assert_eq!(
-            sidebar_hit(14, 17),
+            sidebar_hit(16, 19),
             Some(SidebarHit::Category(prefs::Section::Terminal)),
             "…and hits again once both its cells fit above the footer"
         );
@@ -8392,7 +8718,7 @@ mod tests {
         assert_eq!(
             sidebar.as_str(),
             "sidebar selected=appearance \
-             sections=[appearance,cursor,typography,window & tabs,input,terminal,performance,security,packages,kitty log]",
+             sections=[appearance,cursor,cursor kitty,typography,window & tabs,input,terminal,performance,security,packages,kitty log]",
         );
         // Group captions interleave BEFORE their fields, exactly as painted:
         // Appearance = Theme (theme, window_theme) then Colors (4 colour rows).

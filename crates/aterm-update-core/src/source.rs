@@ -34,15 +34,29 @@ pub const DEFAULT_REPO: &str = env!("ATERM_DEFAULT_REPO");
 ///
 /// Deliberately separate from [`DEFAULT_OWNER`]. The two were the same string until
 /// the update channel was repointed at a public mirror, and code that means "the
-/// account this project belongs to" must not drift with the channel. The concrete
-/// consumer is atpkg's signed package index, whose trust is ACCOUNT-BOUND (§8: a
-/// different owner requires pinning that owner's root key), so following a mirror
-/// repoint would silently change its trust root.
+/// account this project belongs to" must not drift with the channel. (The package
+/// index reads its own key — [`ATPKG_INDEX_OWNER`] — because binding it here
+/// pointed default installs at the private staging repo; this constant remains
+/// that key's absent-key fallback and the slug atpkg's token chain resolves
+/// against.)
 pub const PUBLISH_OWNER: &str = env!("ATERM_PUBLISH_OWNER");
 
 /// Repository name this project is published under, the companion to
 /// [`PUBLISH_OWNER`] and derived the same way.
 pub const PUBLISH_REPO: &str = env!("ATERM_PUBLISH_REPO");
+
+/// GitHub account the atpkg SIGNED PACKAGE INDEX is published under — stamped by
+/// `build.rs` from its own tracked key, `[workspace.metadata.atpkg] account`,
+/// falling back to [`PUBLISH_OWNER`] only when that key is absent.
+///
+/// A third knob on purpose. [`DEFAULT_OWNER`] is the APP update channel: the
+/// index's trust is ACCOUNT-BOUND (§8), so it must not move when the channel is
+/// repointed at a mirror. [`PUBLISH_OWNER`] is the PRIVATE staging repo: a
+/// default-configured (tokenless) install 404s there, so defaulting the index to
+/// it orphaned every such install from the published registry. The account only
+/// decides where the index BYTES come from; authenticity is the pinned root key
+/// (`pins`), which verifies the same signed index wherever it is hosted.
+pub const ATPKG_INDEX_OWNER: &str = env!("ATERM_ATPKG_INDEX_OWNER");
 
 /// The resolved GitHub release source: `github.com/<owner>/<repo>`. Construct it
 /// with [`Source::resolve`], which applies the precedence
@@ -239,6 +253,36 @@ mod tests {
             let s = Source::resolve(None, None);
             assert_eq!(s.owner, DEFAULT_OWNER);
             assert_eq!(s.repo, DEFAULT_REPO);
+        }
+    }
+
+    #[test]
+    fn atpkg_index_owner_is_the_public_package_org() {
+        // Stamped from `[workspace.metadata.atpkg] account` — NOT from
+        // `repository` (a fall-through would spell the private staging owner
+        // here: the repo no tokenless install can read, so this assert also
+        // tripwires DELETION of the metadata key) and NOT from
+        // `update_channel` (the app knob). The literal holds in BOTH trees:
+        // the publish/ export rewrites the staging owner into the public org
+        // and leaves this value untouched.
+        assert_eq!(ATPKG_INDEX_OWNER, "alabsystems");
+        assert!(is_valid_slug(ATPKG_INDEX_OWNER));
+        // In the private staging tree the index account and the publish owner
+        // MUST differ — binding the index default to the publish owner is the
+        // exact regression that pointed every default-configured install at a
+        // 404 (private) index host. The guard is scoped by SHAPE (publish
+        // owner differs from the compiled update-channel owner — exactly the
+        // split private-staging/public-channel configuration), never by
+        // spelling the staging owner as a literal: the publish/ export
+        // blanket-rewrites that literal into the public org, so a spelled
+        // guard flips to always-true in the exported tree and deterministically
+        // fails there, where publish == channel == index owner is the
+        // documented single-public-repo configuration, not a regression.
+        if PUBLISH_OWNER != DEFAULT_OWNER {
+            assert_ne!(
+                ATPKG_INDEX_OWNER, PUBLISH_OWNER,
+                "the package index must default to a publicly readable account"
+            );
         }
     }
 }

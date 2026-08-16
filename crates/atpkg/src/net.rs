@@ -4,11 +4,15 @@
 //! The production GitHub-Releases [`Fetcher`](crate::flow::Fetcher) (§5/§9) — the network
 //! impl the install flow ([`crate::flow`]) runs against a real repo.
 //!
-//! It lists `…/releases?per_page=20` and, for each release, locates the
-//! `<name>` + `<name>.sig` asset pair, then downloads their bytes through
-//! `aterm-update-core`'s authenticated `curl` plumbing (`api_get`/`download_bytes`/
-//! `download_to` — the SAME proven layer the macOS updater uses). The asset-selection
-//! logic ([`find_pair`]) and the releases-JSON shape ([`Release`]) are **pure and
+//! It lists `…/releases` PAGINATED ([`paged_releases`]: `per_page=100`, up to
+//! [`MAX_RELEASE_PAGES`] pages — the index and app releases share ONE repo, so the index
+//! tag drifts down the listing at the app-release cadence and a single unpaginated page
+//! lost it within days; `aterm-update`'s catalog walk paginates for the same reason) and,
+//! for each release, locates the `<name>` + `<name>.sig` asset pair, then downloads their
+//! bytes through `aterm-update-core`'s authenticated `curl` plumbing
+//! (`api_get`/`download_bytes`/`download_to` — the SAME proven layer the macOS updater
+//! uses). The asset-selection logic ([`find_pair`], [`index_pair_urls`]), the page walk
+//! ([`paged_releases`]), and the releases-JSON shape ([`Release`]) are **pure and
 //! unit-tested**; the network calls themselves are exercised only against a real release
 //! (no fixture can stand in for GitHub), so they are a thin, faithful wrapper.
 //!
@@ -79,6 +83,93 @@ pub fn parse_releases(body: &[u8]) -> Result<Vec<Release>, String> {
 const MANIFEST_CAP: u64 = 5_000_000; // 5 MB
 const SIG_CAP: u64 = 4_096; // an Ed25519 detached sig is 64 bytes; cap generously
 const ARTIFACT_CAP: u64 = 8u64 << 30; // 8 GiB ceiling for a toolchain bundle
+/// A roster is a few hundred bytes per machine and is capped at 16 machines. Same ceiling
+/// `aterm-update`'s armed path uses for the identical asset — one document, one bound.
+const ROSTER_CAP: u64 = 65_536;
+
+/// One release-listing page (GitHub's maximum) and the page-walk safety cap: 10 pages =
+/// 1000 releases, the same bounds as `aterm-update`'s catalog walk (`github.rs`
+/// `PER_PAGE`/`MAX_PAGES`). Load-bearing for updates: app releases and index releases
+/// ride ONE repo, so every app cut pushes the newest `atpkg-index-*` release one row down
+/// — the old single `per_page=20` page lost it in about a week of daily app releases
+/// (2026-08-11 audit: atpkg-index-6 sat at row 11 after 9 days), silently starving every
+/// client of toolchain updates until a republish.
+const RELEASES_PER_PAGE: usize = 100;
+const MAX_RELEASE_PAGES: u64 = 10;
+
+/// How many index-carrying releases [`GithubFetcher::index_candidates`] downloads the
+/// signed pair for, NEWEST FIRST. Bounds what a deep index history costs (two asset
+/// downloads per carrying release, now that the listing spans up to 1000 releases) while
+/// staying BELOW the §14 cache's own candidate cap (`cache::MAX_CACHE_CANDIDATES` = 24),
+/// so a full candidate set is never refused by the cache write. Selection only ever wants
+/// the HIGHEST signed `index_build`, which rides the newest carrying release under the
+/// monotonic publish counter; the floor gate downstream refuses anything older anyway.
+const INDEX_CANDIDATE_CAP: usize = 20;
+
+/// Walk the release listing page by page via `fetch_page(page)` (1-based) until a short
+/// page (the listing is exhausted) or [`MAX_RELEASE_PAGES`]. A mid-walk error fails the
+/// WHOLE listing — a silently truncated catalog would reintroduce the pushed-off-page
+/// blindness this walk exists to close — and an errored listing is never memoized, so a
+/// transient page failure stays retryable.
+fn paged_releases(
+    mut fetch_page: impl FnMut(u64) -> Result<Vec<Release>, String>,
+) -> Result<Vec<Release>, String> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_RELEASE_PAGES {
+        let batch = fetch_page(page)?;
+        let exhausted = batch.len() < RELEASES_PER_PAGE;
+        all.extend(batch);
+        if exhausted {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+/// The four asset URLs one candidate needs, resolved from a release's asset list.
+struct CandidateUrls<'a> {
+    label: &'a str,
+    index: &'a str,
+    index_sig: &'a str,
+    roster: &'a str,
+    roster_sig: &'a str,
+}
+
+/// The URL QUAD of each release carrying a COMPLETE authorization unit — `index.toml`,
+/// its machine signature, AND the master-signed roster beside them — NEWEST FIRST
+/// (listing order), capped at [`INDEX_CANDIDATE_CAP`]. Pure; the download loop above it
+/// stays a thin wrapper.
+///
+/// A release missing ANY of the four contributes no candidate. That is the structural,
+/// free half of "no roster, no authority": there is no shape of published release that
+/// gets an index verified without the generation that authorized its signer, and no
+/// fallback to a roster fetched from somewhere else. Whoever serves the index can withhold
+/// it — they could always refuse to serve bytes — but they cannot get an OLDER root
+/// honoured instead, because none remains.
+fn index_pair_urls(releases: &[Release]) -> Vec<CandidateUrls<'_>> {
+    let mut out = Vec::new();
+    for r in releases {
+        if out.len() >= INDEX_CANDIDATE_CAP {
+            break;
+        }
+        let Some((index, index_sig)) = find_pair(&r.assets, "index.toml") else {
+            continue;
+        };
+        let Some((roster, roster_sig)) =
+            find_pair(&r.assets, aterm_update_core::roster::ROSTER_ASSET)
+        else {
+            continue;
+        };
+        out.push(CandidateUrls {
+            label: r.tag_name.as_str(),
+            index,
+            index_sig,
+            roster,
+            roster_sig,
+        });
+    }
+    out
+}
 
 /// The `(slug, program, build)` triple that fully determines which asset pair a
 /// memoized manifest was downloaded from.
@@ -181,32 +272,37 @@ impl GithubFetcher {
         slug
     }
 
-    /// List the recent releases (newest first) of `slug` (`owner/repo`), memoized for the
-    /// life of this fetcher (see the `releases` field for the cost model).
+    /// List the releases (newest first, PAGINATED via [`paged_releases`]) of `slug`
+    /// (`owner/repo`), memoized for the life of this fetcher (see the `releases` field
+    /// for the cost model — one repo's walk is one request until it exceeds 100 releases).
     ///
-    /// ONLY successes are memoized — an `Err` must stay retryable, so a transient network
-    /// failure is never frozen in. The lock is held ONLY around the map lookup/insert,
-    /// never across the request, so an in-flight fetch can neither block another lane nor
-    /// poison the mutex; a poisoned lock degrades to an uncached (correct) fetch rather
-    /// than panicking.
+    /// ONLY complete successes are memoized — an `Err` on ANY page fails the whole
+    /// listing and must stay retryable, so a transient network failure is never frozen
+    /// in (nor a truncated catalog served as complete). The lock is held ONLY around the
+    /// map lookup/insert, never across the request, so an in-flight fetch can neither
+    /// block another lane nor poison the mutex; a poisoned lock degrades to an uncached
+    /// (correct) fetch rather than panicking.
     fn releases_at(&self, slug: &str) -> Result<std::sync::Arc<Vec<Release>>, String> {
         if let Ok(memo) = self.releases.lock()
             && let Some(hit) = memo.get(slug)
         {
             return Ok(std::sync::Arc::clone(hit));
         }
-        // Manual concat of the previous
-        // `format!("https://api.github.com/repos/{}/releases?per_page=20", ..)`
-        // — byte-identical: the `format!` expansion embeds `fmt::Arguments`
-        // construction (with inlined `unsafe`) that the strict Trust gate cannot
-        // lower and fails closed on.
-        let mut url = String::from("https://api.github.com/repos/");
-        url.push_str(slug);
-        url.push_str("/releases?per_page=20");
-        let list = std::sync::Arc::new(parse_releases(&aterm_update_core::api_get(
-            &url,
-            self.credential(),
-        )?)?);
+        let list = std::sync::Arc::new(paged_releases(|page| {
+            // Manual concat of the previous
+            // `format!("https://api.github.com/repos/{}/releases?…", ..)`
+            // — byte-identical (`dec_u64` renders exactly as `u64`'s `Display`):
+            // the `format!` expansion embeds `fmt::Arguments` construction (with
+            // inlined `unsafe`) that the strict Trust gate cannot lower and fails
+            // closed on.
+            let mut url = String::from("https://api.github.com/repos/");
+            url.push_str(slug);
+            url.push_str("/releases?per_page=");
+            url.push_str(&crate::dec_u64(RELEASES_PER_PAGE as u64));
+            url.push_str("&page=");
+            url.push_str(&crate::dec_u64(page));
+            parse_releases(&aterm_update_core::api_get(&url, self.credential())?)
+        })?);
         if let Ok(mut memo) = self.releases.lock() {
             memo.insert(slug.to_string(), std::sync::Arc::clone(&list));
         }
@@ -229,7 +325,8 @@ impl crate::flow::Fetcher for GithubFetcher {
         // downloads per carrying release. The bytes are returned by value (a few KB of
         // TOML + 64-byte sigs — free next to the network), so the trait signature and
         // every downstream gate are untouched: the same raw bytes still flow through
-        // `select_index` → `verify_index_with` → `parse_index` → floor → freshness.
+        // `select_index` → `admit_roster` → `authorize_index` → `parse_index` → floor →
+        // freshness.
         if let Ok(memo) = self.index.lock()
             && let Some(hit) = memo.as_ref()
         {
@@ -237,17 +334,27 @@ impl crate::flow::Fetcher for GithubFetcher {
         }
         let releases = self.releases(&crate::discovery::index_repo())?;
         let mut out = Vec::new();
-        for r in releases.iter() {
-            if let Some((toml_url, sig_url)) = find_pair(&r.assets, "index.toml") {
-                let index_bytes =
-                    aterm_update_core::download_bytes(toml_url, self.credential(), MANIFEST_CAP)?;
-                let sig = aterm_update_core::download_bytes(sig_url, self.credential(), SIG_CAP)?;
-                out.push(Candidate {
-                    label: r.tag_name.clone(),
-                    index_bytes,
-                    sig,
-                });
-            }
+        // Newest-first, capped ([`index_pair_urls`]): the paginated listing may now span
+        // hundreds of releases, and only the newest carrying releases can win selection.
+        for u in index_pair_urls(&releases) {
+            let index_bytes =
+                aterm_update_core::download_bytes(u.index, self.credential(), MANIFEST_CAP)?;
+            let sig = aterm_update_core::download_bytes(u.index_sig, self.credential(), SIG_CAP)?;
+            // The roster rides the SAME release, so it is fetched here rather than once
+            // per repo: a candidate is an index PLUS the generation that authorized its
+            // signer, and pairing an index with any other generation is the substitution
+            // the per-candidate binding exists to refuse.
+            let roster_bytes =
+                aterm_update_core::download_bytes(u.roster, self.credential(), ROSTER_CAP)?;
+            let roster_sig =
+                aterm_update_core::download_bytes(u.roster_sig, self.credential(), SIG_CAP)?;
+            out.push(Candidate {
+                label: u.label.to_string(),
+                index_bytes,
+                sig,
+                roster_bytes,
+                roster_sig,
+            });
         }
         // Successes only — a partial fetch that errored above never reaches here, so a
         // transient failure stays retryable.
@@ -402,24 +509,28 @@ fn safe_name(n: &str) -> bool {
 
 impl crate::flow::Fetcher for DirFetcher {
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
-        let toml = self.dir.join("index.toml");
-        let sig = self.dir.join("index.toml.sig");
+        let cap = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let read = |name: &str, bound: u64| {
+            crate::metadata_io::read_bounded_regular(&self.dir.join(name), cap(bound))
+        };
+        // A `dir:` registry must publish the SAME complete authorization unit a release
+        // does — index, its machine signature, the roster, the master's signature over the
+        // roster. An offline directory is not a weaker tier: it supplies bytes, never
+        // trust, so a missing roster here is exactly as fatal as a missing roster there.
         match (
-            crate::metadata_io::read_bounded_regular(
-                &toml,
-                usize::try_from(MANIFEST_CAP).unwrap_or(usize::MAX),
-            ),
-            crate::metadata_io::read_bounded_regular(
-                &sig,
-                usize::try_from(SIG_CAP).unwrap_or(usize::MAX),
-            ),
+            read("index.toml", MANIFEST_CAP),
+            read("index.toml.sig", SIG_CAP),
+            read(aterm_update_core::roster::ROSTER_ASSET, ROSTER_CAP),
+            read(aterm_update_core::roster::ROSTER_SIG_ASSET, SIG_CAP),
         ) {
-            (Ok(index_bytes), Ok(sig)) => Ok(vec![Candidate {
+            (Ok(index_bytes), Ok(sig), Ok(roster_bytes), Ok(roster_sig)) => Ok(vec![Candidate {
                 label: "dir".into(),
                 index_bytes,
                 sig,
+                roster_bytes,
+                roster_sig,
             }]),
-            // Missing pair ⇒ no candidates ⇒ select_index None ⇒ NoIndex downstream.
+            // Missing any of the four ⇒ no candidates ⇒ select_index None ⇒ NoIndex.
             _ => Ok(vec![]),
         }
     }
@@ -482,6 +593,13 @@ impl crate::flow::Fetcher for DirFetcher {
 pub struct ChainFetcher {
     primary: Box<dyn crate::flow::Fetcher>,
     secondary: Box<dyn crate::flow::Fetcher>,
+    /// The primary (network) leg's OWN candidates from the latest
+    /// [`crate::flow::Fetcher::index_candidates`] call — `None` when that leg failed.
+    /// What `cacheable_candidates` serves, so the §14 cache write is keyed off the
+    /// network leg without a second fetch, and a seed-leg success can never refresh or
+    /// overwrite the last-good network cache (the cache-masking tooth, adversarial
+    /// review 2026-07-30).
+    primary_candidates: std::sync::Mutex<Option<Vec<Candidate>>>,
 }
 
 impl ChainFetcher {
@@ -491,7 +609,11 @@ impl ChainFetcher {
         primary: Box<dyn crate::flow::Fetcher>,
         secondary: Box<dyn crate::flow::Fetcher>,
     ) -> Self {
-        Self { primary, secondary }
+        Self {
+            primary,
+            secondary,
+            primary_candidates: std::sync::Mutex::new(None),
+        }
     }
 }
 
@@ -500,10 +622,15 @@ impl crate::flow::Fetcher for ChainFetcher {
         // The union of both sides' candidates; a side that errors (offline
         // GitHub, say) contributes nothing rather than failing the other side.
         // BOTH failing is a real error — surface both reasons.
-        match (
-            self.primary.index_candidates(),
-            self.secondary.index_candidates(),
-        ) {
+        let p = self.primary.index_candidates();
+        // Record the network leg's own outcome for `cacheable_candidates` BEFORE the
+        // union — the §14 cache must never absorb secondary-leg (seed) bytes. A
+        // poisoned lock skips the record, which downstream reads as "nothing to
+        // cache": conservative, never wrong.
+        if let Ok(mut memo) = self.primary_candidates.lock() {
+            *memo = p.as_ref().ok().cloned();
+        }
+        match (p, self.secondary.index_candidates()) {
             (Ok(mut a), Ok(b)) => {
                 a.extend(b);
                 Ok(a)
@@ -568,6 +695,25 @@ impl crate::flow::Fetcher for ChainFetcher {
             self.secondary.source_id()
         )
     }
+
+    fn cache_source_id(&self) -> String {
+        // The §14 cache identity is the NETWORK (primary) leg's, not the chain's:
+        // the cache a bootstrap-time chain writes must serve the post-bootstrap
+        // plain-network path (same key), and the `dir:` seed leg must never gain a
+        // cache identity of its own through the chain.
+        self.primary.cache_source_id()
+    }
+
+    fn cacheable_candidates(&self, _resolved: &[Candidate]) -> Option<Vec<Candidate>> {
+        // The network leg's own candidates from THIS call's `index_candidates`
+        // (recorded there), never the union: a seed-leg success must not mask a
+        // network failure into a cache refresh, nor overwrite the last-good
+        // network candidates with sealed-seed bytes.
+        self.primary_candidates
+            .lock()
+            .ok()
+            .and_then(|memo| memo.clone())
+    }
 }
 
 /// Both legs failed; keep both reasons (the second is usually the seed dir,
@@ -619,6 +765,147 @@ mod tests {
     fn malformed_json_fails_closed() {
         assert!(parse_releases(b"not json").is_err());
         assert!(parse_releases(b"{}").is_err()); // object, not the expected array
+    }
+
+    /// A page of `n` empty-asset releases labeled `label-<i>`.
+    fn page(n: usize, label: &str) -> Vec<Release> {
+        (0..n)
+            .map(|i| Release {
+                tag_name: format!("{label}-{i}"),
+                assets: vec![],
+            })
+            .collect()
+    }
+
+    // The page walk that keeps the index findable once app releases push it off the
+    // first page: full pages keep walking (in order), a short page ends the listing,
+    // an error on ANY page fails the WHOLE walk (a silently truncated catalog would
+    // reintroduce the blindness), and the safety cap stops a runaway listing.
+    #[test]
+    fn paged_releases_walks_to_a_short_page_errors_whole_and_caps() {
+        // Short first page: one request, done.
+        let one = paged_releases(|p| {
+            assert_eq!(p, 1, "a short first page ends the walk");
+            Ok(page(3, "only"))
+        })
+        .unwrap();
+        assert_eq!(one.len(), 3);
+
+        // A full page keeps walking; the short second page ends it; order is preserved.
+        let two = paged_releases(|p| match p {
+            1 => Ok(page(RELEASES_PER_PAGE, "full")),
+            2 => Ok(page(2, "tail")),
+            _ => panic!("the walk must stop at the short page"),
+        })
+        .unwrap();
+        assert_eq!(two.len(), RELEASES_PER_PAGE + 2);
+        assert_eq!(two[0].tag_name, "full-0", "newest-first order preserved");
+        assert_eq!(two[RELEASES_PER_PAGE].tag_name, "tail-0");
+
+        // An error mid-walk fails the whole listing (retryable, never truncated).
+        let err = paged_releases(|p| match p {
+            1 => Ok(page(RELEASES_PER_PAGE, "full")),
+            _ => Err("page 2 down".into()),
+        })
+        .unwrap_err();
+        assert!(err.contains("page 2 down"));
+
+        // Runaway listing: the cap bounds the walk.
+        let mut calls = 0u64;
+        let capped = paged_releases(|_| {
+            calls += 1;
+            Ok(page(RELEASES_PER_PAGE, "endless"))
+        })
+        .unwrap();
+        assert_eq!(calls, MAX_RELEASE_PAGES);
+        assert_eq!(capped.len(), RELEASES_PER_PAGE * MAX_RELEASE_PAGES as usize);
+    }
+
+    /// An asset row.
+    fn asset(name: &str, url: String) -> Asset {
+        Asset {
+            name: name.into(),
+            url,
+        }
+    }
+
+    /// A release carrying the COMPLETE authorization unit: index + its machine signature
+    /// AND the master-signed roster.
+    fn quad(tag: &str) -> Release {
+        Release {
+            tag_name: tag.into(),
+            assets: vec![
+                asset("index.toml", format!("u:{tag}")),
+                asset("index.toml.sig", format!("s:{tag}")),
+                asset("aterm-machines.toml", format!("r:{tag}")),
+                asset("aterm-machines.toml.sig", format!("rs:{tag}")),
+            ],
+        }
+    }
+
+    // The candidate scan: releases without the COMPLETE quad are skipped, listing order
+    // (newest first) is preserved, and the downloads are capped BELOW the §14 cache's own
+    // candidate cap so a deep index history can neither balloon the fetch nor make the
+    // cache write refuse a full set.
+    #[test]
+    fn index_pair_urls_skips_incomplete_keeps_order_and_caps() {
+        let bare = |tag: &str| Release {
+            tag_name: tag.into(),
+            assets: vec![],
+        };
+        let releases = vec![bare("v9"), quad("idx-6"), bare("v8"), quad("idx-5")];
+        let urls = index_pair_urls(&releases);
+        let seen: Vec<_> = urls
+            .iter()
+            .map(|u| (u.label, u.index, u.index_sig, u.roster, u.roster_sig))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("idx-6", "u:idx-6", "s:idx-6", "r:idx-6", "rs:idx-6"),
+                ("idx-5", "u:idx-5", "s:idx-5", "r:idx-5", "rs:idx-5"),
+            ]
+        );
+
+        let deep: Vec<Release> = (0..INDEX_CANDIDATE_CAP + 5)
+            .map(|i| quad(&format!("idx-{i}")))
+            .collect();
+        let capped = index_pair_urls(&deep);
+        assert_eq!(capped.len(), INDEX_CANDIDATE_CAP, "downloads are capped");
+        assert_eq!(
+            capped[0].label, "idx-0",
+            "the NEWEST carrying releases are kept"
+        );
+    }
+
+    /// NO ROSTER, NO CANDIDATE. A release with a perfectly good signed index but no
+    /// master-signed roster beside it contributes NOTHING — the structural, free half of
+    /// "the roster is not optional". Whoever serves the index can suppress it and stop
+    /// atpkg installing; what they cannot do is get an older root honoured instead.
+    ///
+    /// Kills the mutation "make the roster lookup an `if let` that falls through": under
+    /// it, every assertion below flips and a rosterless release becomes installable.
+    #[test]
+    fn a_release_without_the_roster_pair_yields_no_candidate() {
+        let mut no_roster = quad("idx-1");
+        no_roster.assets.retain(|a| !a.name.starts_with("aterm-"));
+        assert!(
+            index_pair_urls(std::slice::from_ref(&no_roster)).is_empty(),
+            "an index with no roster beside it is not a candidate"
+        );
+
+        // Half a roster is no roster: the signature alone, or the document alone.
+        let mut sig_only = quad("idx-2");
+        sig_only.assets.retain(|a| a.name != "aterm-machines.toml");
+        assert!(index_pair_urls(std::slice::from_ref(&sig_only)).is_empty());
+        let mut doc_only = quad("idx-3");
+        doc_only
+            .assets
+            .retain(|a| a.name != "aterm-machines.toml.sig");
+        assert!(index_pair_urls(std::slice::from_ref(&doc_only)).is_empty());
+
+        // NON-VACUITY: restore the pair and the very same release is a candidate again.
+        assert_eq!(index_pair_urls(std::slice::from_ref(&quad("idx-1"))).len(), 1);
     }
 
     #[test]
@@ -676,6 +963,10 @@ mod tests {
         let index = std::fs::File::create(d.join("index.toml")).unwrap();
         index.set_len(MANIFEST_CAP + 1).unwrap();
         std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
+        // Publish a roster too, so the empty result below is the OVERSIZE index and not
+        // merely the missing roster — the refusal under test must be the one named.
+        std::fs::write(d.join("aterm-machines.toml"), b"roster").unwrap();
+        std::fs::write(d.join("aterm-machines.toml.sig"), b"sig").unwrap();
         assert!(
             DirFetcher::new(d.clone())
                 .index_candidates()
@@ -699,6 +990,10 @@ mod tests {
         // SAFETY: `index_c` is a live NUL-terminated path in our private fixture.
         assert_eq!(unsafe { libc::mkfifo(index_c.as_ptr(), 0o600) }, 0);
         std::fs::write(d.join("index.toml.sig"), b"sig").unwrap();
+        // Same non-vacuity as above: the roster is present, so an empty candidate set
+        // can only be the FIFO/symlink index being refused.
+        std::fs::write(d.join("aterm-machines.toml"), b"roster").unwrap();
+        std::fs::write(d.join("aterm-machines.toml.sig"), b"sig").unwrap();
         let fetcher = DirFetcher::new(d.clone());
         assert!(fetcher.index_candidates().unwrap().is_empty());
 
@@ -729,15 +1024,24 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             d
         };
-        // Leg A: an index pair + ay's pkg pair. Leg B: an index pair + ny's.
+        // Each leg publishes the COMPLETE authorization unit (index pair + roster
+        // pair) — a `dir:` registry without a roster yields no candidate at all, which
+        // is proved separately; here the union is what is under test, so both legs are
+        // complete. The bytes are opaque: this test is about routing, and the trust
+        // chain runs downstream in `select_index`.
+        let unit = |d: &Path, tag: &[u8], sig: u8| {
+            std::fs::write(d.join("index.toml"), tag).unwrap();
+            std::fs::write(d.join("index.toml.sig"), [sig; 64]).unwrap();
+            std::fs::write(d.join("aterm-machines.toml"), b"roster").unwrap();
+            std::fs::write(d.join("aterm-machines.toml.sig"), [sig; 64]).unwrap();
+        };
+        // Leg A: an index unit + ay's pkg pair. Leg B: an index unit + ny's.
         let a = scratch("a");
-        std::fs::write(a.join("index.toml"), b"schema = 1 # a").unwrap();
-        std::fs::write(a.join("index.toml.sig"), [1u8; 64]).unwrap();
+        unit(&a, b"schema = 2 # a", 1);
         std::fs::write(a.join("pkg-ay-1.toml"), b"pkg a").unwrap();
         std::fs::write(a.join("pkg-ay-1.toml.sig"), [2u8; 64]).unwrap();
         let b = scratch("b");
-        std::fs::write(b.join("index.toml"), b"schema = 1 # b").unwrap();
-        std::fs::write(b.join("index.toml.sig"), [3u8; 64]).unwrap();
+        unit(&b, b"schema = 2 # b", 3);
         std::fs::write(b.join("pkg-ny-2.toml"), b"pkg b").unwrap();
         std::fs::write(b.join("pkg-ny-2.toml.sig"), [4u8; 64]).unwrap();
 
@@ -752,19 +1056,29 @@ mod tests {
         let candidates = chain.index_candidates().unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(
-            candidates[0].index_bytes, b"schema = 1 # a",
+            candidates[0].index_bytes, b"schema = 2 # a",
             "primary first"
         );
-        assert_eq!(candidates[1].index_bytes, b"schema = 1 # b");
+        assert_eq!(candidates[1].index_bytes, b"schema = 2 # b");
         // Primary serves what it has; the fallback serves what primary lacks.
         assert_eq!(chain.pkg_manifest("r", "ay", 1).unwrap().0, b"pkg a");
         assert_eq!(chain.pkg_manifest("r", "ny", 2).unwrap().0, b"pkg b");
         // Both legs missing ⇒ an error carrying both stories.
         let err = chain.pkg_manifest("r", "absent", 9).unwrap_err();
         assert!(err.contains("fallback:"), "both reasons kept: {err}");
-        // The chain's cache identity names both legs, never one alone.
+        // The chain's SOURCE identity names both legs, never one alone…
         let id = chain.source_id();
         assert!(id.starts_with("chain:dir:") && id.contains('+'), "{id}");
+        // …but its §14 CACHE identity is the primary (network) leg's alone, and the
+        // cacheable set is the primary's own candidates — the secondary (seed) leg's
+        // bytes never reach the last-good cache through the union.
+        assert_eq!(
+            chain.cache_source_id(),
+            DirFetcher::new(a.clone()).source_id()
+        );
+        let cacheable = chain.cacheable_candidates(&candidates).unwrap();
+        assert_eq!(cacheable.len(), 1);
+        assert_eq!(cacheable[0].index_bytes, b"schema = 2 # a");
 
         // download_for routes through each leg's OWN download_for (so the
         // primary's per-program [packages.links] fetch override still

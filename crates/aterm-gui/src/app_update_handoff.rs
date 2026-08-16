@@ -16,6 +16,31 @@ use crate::Wake;
 #[cfg(unix)]
 use crate::app_input::paste_order;
 
+// THE SEAMLESSNESS INVARIANT, PROVED BY THE COMPILER — see the sibling
+// `app_update_handoff_island.rs`, which carries the `clean { … }` island and
+// the full account of what it proves and what it does not.
+//
+// WHY IT IS A SIBLING FILE AND NOT INLINE HERE, which is where it lived until
+// 2026-08-12: an island body reaches the Clean parser as a RUST token stream,
+// so a compiler without the Clean surface does not skip the island — it fails
+// to LEX it, reporting `missing \`enum\` for enum definition` at the `clean`
+// keyword. That kills the whole file, and with it every method this module
+// defines. `cfg` cannot help inline, because cfg-stripping happens after the
+// file is parsed; only a `mod` declaration decides whether a file is READ at
+// all. So the island moves behind one, and the gate is `clean_islands` —
+// set in .cargo/config.toml on the native triple, which is exactly the set of
+// lanes that run the Trust toolchain.
+//
+// The lanes this rescues are real and were both broken: the release's
+// x86_64-apple-darwin compat slice and the Windows cfg-validation build both
+// run upstream stable BY DESIGN (Trust has no std for either), and neither
+// could compile aterm-gui at all while the island was inline. The proof is not
+// weakened by this — it is checked on every native build, which is every build
+// that can check it, and a sabotaged protocol still stops the crate compiling.
+#[cfg(clean_islands)]
+#[path = "app_update_handoff_island.rs"]
+mod island;
+
 #[cfg(unix)]
 struct HandoffWorkerJob {
     attempt_id: u64,
@@ -35,10 +60,137 @@ struct HandoffWorkerJob {
     layout_digest: [u8; 32],
     screen_digest: [u8; 32],
     live: Vec<(u64, i32, i32)>,
+    /// The identity triples the adoption proof hashes, which are NOT `live`.
+    ///
+    /// `live` is transport: real descriptor numbers this process can `poll` and
+    /// hand over. The proof's middle term is whatever BOTH sides can compute
+    /// independently, and that depends on how the descriptors travel — the fork
+    /// lane's `execve` copies the table verbatim so the number itself works,
+    /// while `SCM_RIGHTS` installs the receiver's own numbers and the term
+    /// becomes the PTY device (`handoff_rendezvous::pty_device_term`). Keeping
+    /// the two vectors separate is what stops a lane change from silently
+    /// pointing `poll` at a device number.
+    proof_identities: Vec<(u64, i32, i32)>,
+    /// Which transport this attempt chose, decided on the main thread before
+    /// anything parked (see [`out_of_band_lane_refusal`]). macOS-only because
+    /// the alternative to forking is macOS-only; every other unix has exactly
+    /// one lane and carries no field for it.
+    #[cfg(target_os = "macos")]
+    lane: HandoffLane,
+    /// The `.app` ROOT to hand LaunchServices on the out-of-band lane. `None`
+    /// whenever this process is not running from a bundle, which is one of the
+    /// reasons that lane is refused.
+    #[cfg(target_os = "macos")]
+    bundle: Option<std::path::PathBuf>,
     cleanup: HandoffWorkerCleanup,
     cancel: std::sync::mpsc::Receiver<()>,
     arbiter: crate::HandoffAttemptArbiter,
     _owned_masters: Vec<std::os::fd::OwnedFd>,
+}
+
+/// How this attempt hands its descriptors to the successor.
+///
+/// The two lanes are not a preference, and this is not a feature flag: the fork
+/// lane is the only one that exists on a machine without a bundle, and the
+/// out-of-band lane is the only one that produces a successor with a launchd
+/// application job of its own (`tests/handoff_launchd_job.rs`). The choice is
+/// made ONCE, on the main thread, before any reader parks, because it decides
+/// which term the adoption proof hashes — and that term has to be recorded in
+/// the pending attempt the main thread will later re-derive the proof from.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffLane {
+    /// `fork` + `execve`: descriptors travel by inheritance and the proof hashes
+    /// the descriptor NUMBER, which both sides agree on because `execve` copies
+    /// the table verbatim. Every build in the field speaks this and only this.
+    Fork,
+    /// LaunchServices + a single-use `SCM_RIGHTS` rendezvous. The successor is
+    /// launchd's child, so it gets its own application job; the descriptors
+    /// arrive at numbers the receiver's kernel chose, so the proof hashes the
+    /// PTY device instead.
+    OutOfBand,
+}
+
+/// Facts the lane choice is made from. Pure, so the whole decision — including
+/// every reason to fall back — is testable without a bundle, a socket or a
+/// terminal.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandoffLaneFacts {
+    /// This process runs from inside a `.app` whose root we could name. Only a
+    /// bundle gets an `application.<bundle-id>.<hex>` job, which is the entire
+    /// point of the lane.
+    bundled: bool,
+    /// A launcher for this platform is compiled in.
+    launcher_available: bool,
+    /// The composed rendezvous path fits `sun_path` on this machine. It ALMOST
+    /// does not — see `handoff_rendezvous`'s module docs for the 16 bytes of
+    /// headroom `$HOME` has.
+    socket_path_fits: bool,
+    /// The authorized `target_build` is at least this build.
+    ///
+    /// THE ONE GUARD THE RETIRED VERSION ADVERTISEMENT CARRIED. "Presence of the
+    /// transport IS the version" settles old-parent/new-child — a parent with no
+    /// out-of-band code sends `ATERM_SEAMLESS_FDS` and is answered in v1 — and
+    /// says nothing at all about NEW-parent/OLD-child. So the guard moves here,
+    /// to the transport choice: an older successor is never handed descriptors
+    /// it has no code to receive.
+    target_not_older: bool,
+    /// Sessions to hand over.
+    sessions: usize,
+    /// The launch environment can be expressed as a MERGE. A LaunchServices
+    /// launch merges over this process's environment and cannot express a
+    /// removal, so a command that needs one is not representable on this lane.
+    environment_is_a_merge: bool,
+}
+
+/// Why this attempt may NOT take the out-of-band lane, or `None` when it may.
+///
+/// Returning the reason rather than a bare bool is what makes a fallback
+/// diagnosable: "the update applied but the survivor is still an orphan" and
+/// "the update applied through the new lane" look identical from the outside,
+/// and the difference is one of these strings.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn out_of_band_lane_refusal(facts: HandoffLaneFacts) -> Option<&'static str> {
+    if !facts.launcher_available {
+        return Some("this platform has no LaunchServices launcher");
+    }
+    if !facts.bundled {
+        return Some("this process does not run from a .app bundle");
+    }
+    if !facts.socket_path_fits {
+        return Some("the rendezvous path does not fit sun_path on this machine");
+    }
+    if !facts.target_not_older {
+        return Some("the authorized target build is older than this build");
+    }
+    if facts.sessions == 0 || facts.sessions > crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS {
+        return Some("the session count does not fit one descriptor message");
+    }
+    if !facts.environment_is_a_merge {
+        return Some("the launch environment needs a removal a merge cannot express");
+    }
+    None
+}
+
+/// The `.app` ROOT containing `exe`, when there is one.
+///
+/// `<bundle>.app/Contents/MacOS/<bin>` — the same two-levels-up shape
+/// `menu.rs::bundled_resource` uses for `Contents/Resources`, plus one. The
+/// `.app` suffix is CHECKED rather than assumed: `cargo run`, a dev build and
+/// the test harness all live three levels below some directory too, and handing
+/// LaunchServices one of those would turn a wiring mistake into an opaque
+/// launch failure a whole deadline later instead of an immediate fallback.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn app_bundle_root(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let bundle = exe.parent()?.parent()?.parent()?;
+    (bundle
+        .extension()
+        .is_some_and(|extension| extension == "app")
+        && bundle.is_dir())
+    .then(|| bundle.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -274,6 +426,18 @@ enum HandoffRollbackWarrant {
     /// The attempt failed before any candidate was spawned, so nothing outside
     /// this process has ever held a handed-off master.
     NoCandidate,
+    /// A successor was LAUNCHED, but the out-of-band transfer never completed —
+    /// no descriptor of ours left this process, so the successor cannot be
+    /// holding, let alone reading, a handed-off master.
+    ///
+    /// This is the one warrant that does not rest on the candidate being gone,
+    /// and it is sound for a reason the others cannot use: on this lane the
+    /// descriptors move in ONE `sendmsg`, so "the send did not happen" is a
+    /// complete account of what the successor holds. That is strictly stronger
+    /// than what the fork lane can say at the same point, where `execve` has
+    /// already copied the table. Nothing is killed or waited on here — the
+    /// successor discovers the vanished rendezvous, refuses itself, and exits.
+    NeverTransferred,
     /// `wait` consumed the candidate: it terminated and THIS process reaped it.
     /// Available only to its parent, and strictly the best answer — reaping is
     /// what frees the pid, so nothing can recycle it between proof and use.
@@ -411,6 +575,23 @@ impl HandoffCandidate {
     /// zombie still owns — so the stamp read here is provably that child's own.
     fn of_unreaped_child(child: &std::process::Child) -> Self {
         let pid = child.id();
+        Self {
+            pid,
+            birth: read_candidate_birth(pid),
+        }
+    }
+
+    /// Capture the identity of a candidate this process did NOT fork, from the
+    /// pid the kernel attested at the rendezvous accept (`LOCAL_PEERPID`).
+    ///
+    /// The pid is not PINNED the way an unreaped child's is — launchd may reap
+    /// the successor at any moment and free the number — so the stamp read here
+    /// is what turns a recyclable integer back into an identity. Strictly better
+    /// than [`Self::from_bare_pid`], which is what this lane would otherwise be
+    /// reduced to, and the reason `signal_handoff_candidate` may aim a DIRECT
+    /// signal at a launched candidate at all.
+    #[cfg(target_os = "macos")]
+    fn of_attested_peer(pid: u32) -> Self {
         Self {
             pid,
             birth: read_candidate_birth(pid),
@@ -585,6 +766,34 @@ pub(crate) fn contain_own_process_group() -> ProcessGroupContainment {
 /// on that lane an unwitnessed sweep is not merely unproven, it is unsafe, and
 /// the candidate has to arrive with an identity (B2/B4) rather than as a bare
 /// pid.
+/// Is `pid` still a CHILD of this process, and therefore pinned to its number?
+///
+/// `waitid` with `WNOHANG | WNOWAIT` is the only probe that answers without
+/// changing anything: `WNOWAIT` leaves an already-exited child in its waitable
+/// state, so the reaper's own `waitpid` still collects it afterwards. ECHILD is
+/// the discriminator — measured on this platform, it is what both a launchd-owned
+/// process and an already-reaped one answer.
+///
+/// `false` is the safe direction: it only ever withholds a signal.
+#[cfg(unix)]
+fn candidate_is_our_child(pid: libc::pid_t) -> bool {
+    let Ok(id) = libc::id_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: `info` is a zeroed out-parameter of exactly the type waitid fills,
+    // and WNOWAIT means this call consumes no child.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    rc == 0
+}
+
 #[cfg(unix)]
 fn signal_handoff_candidate(candidate: HandoffCandidate) {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
@@ -608,8 +817,30 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
             }
         }
         HandoffCandidateIdentity::Unwitnessed => {
-            // SAFETY: SIGKILL to the candidate's process group.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            // A GROUP KILL IS ONLY SOUND WHILE THE PID IS PINNED, and unwitnessed
+            // means we cannot tell from the candidate alone. The fork lane pins it:
+            // an unreaped child owns its number until it is waited on, so `-pid`
+            // still names the group `pre_exec` put it in. A LAUNCHED candidate is
+            // nobody's child — launchd may reap it at any moment and free the
+            // number — so the same `-pid` can come to name a stranger's group, and
+            // SIGKILL to a stranger is not a best-effort sweep, it is damage.
+            //
+            // The wire cannot answer this: `child_pid` arrives as a bare integer.
+            // So ask the KERNEL instead, at the moment of use, with the one probe
+            // that is both non-destructive and unforgeable. `WNOWAIT` leaves an
+            // exited child waitable — the later `waitpid` still reaps it — and
+            // ECHILD is precisely "not a child of mine", which is precisely
+            // "not pinned".
+            if candidate_is_our_child(pid) {
+                // SAFETY: SIGKILL to the candidate's process group, whose number
+                // the kernel just confirmed is still held by a child of ours.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            } else {
+                aterm_log::warn!(
+                    "handoff candidate {pid} is not our child, so its pid is not pinned and \
+                     -{pid} may name a stranger; skipping the process-group sweep"
+                );
+            }
         }
     }
 }
@@ -668,8 +899,21 @@ fn wait_for_handoff_candidate_to_terminate(candidate: HandoffCandidate) -> Hando
 #[cfg(unix)]
 fn kill_and_reap_handoff_child(
     candidate: HandoffCandidate,
-    child: &mut std::process::Child,
+    handle: &mut HandoffCandidateHandle,
 ) -> HandoffRollbackWarrant {
+    let child = match handle {
+        HandoffCandidateHandle::Forked(child) => child,
+        HandoffCandidateHandle::Launched => {
+            // NOBODY'S `wait` ANSWERS FOR THIS ONE. `waitpid` is not an
+            // authority about somebody else's child (it says `ECHILD`, which is
+            // not evidence of anything), so the outside proof stands in for it —
+            // exactly the substitution B2 built `handoff_candidate_terminated`
+            // for. The signal still goes first, for the same reason it does
+            // below: descendants must be condemned before anything blocks.
+            signal_handoff_candidate(candidate);
+            return wait_for_handoff_candidate_to_terminate(candidate);
+        }
+    };
     // Signal BEFORE any wait, so descendants are already condemned when the
     // direct child is reaped.
     signal_handoff_candidate(candidate);
@@ -688,6 +932,24 @@ fn kill_and_reap_handoff_child(
     // FALLBACK: no `wait` of ours answers for the candidate. Prove it terminated
     // from the outside instead.
     wait_for_handoff_candidate_to_terminate(candidate)
+}
+
+/// WHAT THIS PROCESS MAY DO TO THE CANDIDATE — which is a property of how the
+/// candidate was started, not of what we would like to do.
+///
+/// `Child::wait` is the best reap authority there is: it proves termination AND
+/// consumes the identity in one step, so nothing can recycle the pid between the
+/// proof and its use. It exists only for a process we forked. Modelling that as
+/// a type rather than an `Option<&mut Child>` is what keeps the launched lane
+/// from silently inheriting a `wait` that would answer `ECHILD` and prove
+/// nothing — the compiler makes the caller say which world it is in.
+#[cfg(unix)]
+enum HandoffCandidateHandle {
+    /// Our own `spawn`. `wait` is available and is the preferred warrant.
+    Forked(std::process::Child),
+    /// launchd's, not ours. Nothing here may `wait`, and the warrant comes from
+    /// [`handoff_candidate_terminated`]'s outside proof.
+    Launched,
 }
 
 /// Acquire the worker's unique reaper capability.  Losing to `Committing`
@@ -916,7 +1178,7 @@ fn send_warranted_handoff_failure(
 fn worker_reject_and_reap_handoff_child(
     job: &HandoffWorkerJob,
     proxy: &winit::event_loop::EventLoopProxy<Wake>,
-    child: &mut std::process::Child,
+    handle: &mut HandoffCandidateHandle,
     candidate: HandoffCandidate,
     nonce: &str,
     outcome: crate::UpdateHandoffOutcome,
@@ -925,7 +1187,7 @@ fn worker_reject_and_reap_handoff_child(
     if !worker_claim_handoff_reaper(&job.arbiter) {
         return false;
     }
-    let warrant = kill_and_reap_handoff_child(candidate, child);
+    let warrant = kill_and_reap_handoff_child(candidate, handle);
     let completed = job.arbiter.finish_reap(crate::HandoffReaperOwner::Worker);
     debug_assert!(
         completed,
@@ -1088,8 +1350,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         return;
     };
     let crate::seamless::OutgoingHandoff {
-        manifest_path: path,
-        nonce,
+        manifest_path: mut path,
+        mut nonce,
         fds_wire: wire,
         screen_digest: carried_screen_digest,
     } = outgoing;
@@ -1110,7 +1372,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    let layout_path = std::path::Path::new(&path).with_extension("layout.toml");
+    let mut layout_path = std::path::Path::new(&path).with_extension("layout.toml");
     if crate::restore::write_to(&layout_path, &job.layout).is_err() {
         send_handoff_preparation_failure(
             &job,
@@ -1123,13 +1385,16 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    let Some(expected) = crate::seamless::adoption_proof(
+    let Some(mut expected) = crate::seamless::adoption_proof(
         &nonce,
         job.target_build,
         &job.target_commit,
         &job.layout_digest,
         &job.screen_digest,
-        &job.live,
+        // NOT `job.live` — the term the two sides can both compute depends on
+        // how the descriptors travel. On the fork lane these are the same
+        // vector; on the out-of-band lane the middle field is the PTY device.
+        &job.proof_identities,
     ) else {
         send_handoff_preparation_failure(
             &job,
@@ -1139,7 +1404,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         );
         return;
     };
-    let Some((proof_rd, proof_wr)) = make_cloexec_pipe() else {
+    let Some((mut proof_rd, mut proof_wr)) = make_cloexec_pipe() else {
         send_handoff_preparation_failure(
             &job,
             &proxy,
@@ -1148,7 +1413,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         );
         return;
     };
-    let Some((commit_rd, commit_wr)) = make_cloexec_pipe() else {
+    let Some((mut commit_rd, mut commit_wr)) = make_cloexec_pipe() else {
         send_handoff_preparation_failure(
             &job,
             &proxy,
@@ -1159,6 +1424,60 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     };
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
+    }
+
+    // THE LANE SPLITS HERE, and everything above it is shared: the manifest, the
+    // layout sidecar, the proof, and both private pipes are identical whichever
+    // way the descriptors travel. The out-of-band lane owns its own environment
+    // (it publishes a rendezvous instead of three descriptor numbers) and its own
+    // candidate start, then rejoins at `run_handoff_decision` — which is the
+    // WHOLE of the readiness wait, the ProofReady wake and the decision loop, so
+    // the two lanes cannot drift on the part that decides whether a Commit
+    // happens.
+    #[cfg(target_os = "macos")]
+    {
+        if job.lane == HandoffLane::OutOfBand {
+            // `Some` means the lane refused BEFORE anything moved — no descriptor
+            // sent, no successor launched — and handed everything back so this
+            // attempt can still happen the old way. Forking then costs the
+            // orphaned launchd domain the out-of-band lane exists to avoid, which
+            // is the trade the fork lane already makes, and it beats telling a
+            // user with a staged build that nothing happened.
+            match run_out_of_band_handoff(
+                job,
+                &proxy,
+                OutgoingArtifacts {
+                    manifest_path: path,
+                    layout_path,
+                    nonce,
+                },
+                expected,
+                HandoffChannels {
+                    proof_rd,
+                    proof_wr,
+                    commit_rd,
+                    commit_wr,
+                },
+            ) {
+                None => return,
+                Some(ForkInstead {
+                    job: returned_job,
+                    artifacts,
+                    expected: returned_expected,
+                    channels,
+                }) => {
+                    job = returned_job;
+                    expected = returned_expected;
+                    path = artifacts.manifest_path;
+                    layout_path = artifacts.layout_path;
+                    nonce = artifacts.nonce;
+                    proof_rd = channels.proof_rd;
+                    proof_wr = channels.proof_wr;
+                    commit_rd = channels.commit_rd;
+                    commit_wr = channels.commit_wr;
+                }
+            }
+        }
     }
 
     job.command
@@ -1221,7 +1540,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    // KNOWN DEFECT — the survivor is not a launchd job (macOS).
+    // WHY THIS `spawn` IS STILL HERE, AND WHAT NOW STANDS BESIDE IT.
     //
     // `spawn` makes the successor a fork CHILD of THIS process, and on macOS
     // this process is the process of the launchd job
@@ -1233,51 +1552,42 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     // `hdiutil` fails ENXIO ("Device not configured") — so the process that
     // just applied an update cannot apply the next one — and the same applies
     // to every other framework needing the app's XPC domain (user
-    // notifications, LaunchServices opens).
+    // notifications, LaunchServices opens). `tests/handoff_launchd_job.rs` is
+    // that defect's reproducer and regression guard.
     //
-    // THE FIX is to launch the successor through LaunchServices instead (the
-    // `open -n` equivalent, `NSWorkspace.openApplication` with
-    // `createsNewApplicationInstance`), which mints it its OWN application job.
-    // It is not a local edit: four properties this `spawn` gets for free must be
-    // re-established first. `tests/handoff_launchd_job.rs` states all four and
-    // is the guard — its ignored e2e is today's reproducer and tomorrow's
-    // regression test. Their status here:
+    // THE FIX — launch the successor through LaunchServices so launchd mints it
+    // its OWN application job — is the `HandoffLane::OutOfBand` branch above,
+    // and it needed four properties this `spawn` gets for free. All four now
+    // exist: B1 parent attestation (`seamless::AttestedParent`, the kernel birth
+    // record, because a launched successor has ppid 1 from birth), B2 reap
+    // authority (`HandoffRollbackWarrant` + `HandoffCandidateHandle`, because
+    // `waitpid` answers `ECHILD` about somebody else's child and that is not
+    // evidence of anything), B3 process-group containment
+    // (`contain_own_process_group` on the successor's entry, since no `pre_exec`
+    // hook of ours can run inside a process we did not fork), and B4 transport
+    // (`handoff_rendezvous`, since a LaunchServices launch inherits no
+    // descriptors at all).
     //
-    // * B1 — parent attestation. DONE (0.13): the successor's admission and its
-    //   `_exit(74)` fail-stop no longer read `getppid()`, which a
-    //   LaunchServices-launched process cannot answer (ppid 1 from birth). They
-    //   watch the outgoing process's kernel BIRTH RECORD, published just above
-    //   by `seamless::outgoing_parent_env` — see `seamless::AttestedParent` for
-    //   the property and for what B4's socket adds on top of it.
-    // * B2 — reap authority. DONE (0.14): rollback is licensed by a typed
-    //   `HandoffRollbackWarrant` instead of by `wait` alone. `waitpid` still
-    //   mints one while the candidate IS our fork child — it remains strictly
-    //   the best answer — and when it is not, `kill(pid, 0)` vacancy or a
-    //   disagreeing kernel birth stamp mints the same fact from the outside;
-    //   see `handoff_candidate_terminated` for why those establish what `wait`
-    //   establishes. `ECHILD` is no longer read as evidence of anything, and no
-    //   path resumes a reader without a warrant.
-    // * B3 — process-group containment. The ESTABLISHING half is DONE (0.15):
-    //   the `pre_exec` `setpgid(0, 0)` above has no LaunchServices equivalent,
-    //   so a successor that was launched rather than forked contains itself
-    //   with `contain_own_process_group` on entry — `main_entry` calls it
-    //   before the boot apply, the first thing in that process able to fork a
-    //   ditto/codesign/spctl helper, and a successor that cannot lead its own
-    //   group exits there instead of running update logic. So "every helper is
-    //   inside the group" holds on both launch shapes.
-    //   What does NOT carry over is our KNOWLEDGE of it: `pre_exec` establishes
-    //   the group before `spawn` returns, so this process knows `-pid` is a
-    //   valid handle, whereas a launched successor has no wire on which to
-    //   report its group. Until B4 carries that attestation the sweep on that
-    //   lane is unproven — `signal_handoff_candidate` states exactly what each
-    //   reaper may conclude from it.
-    // * B4 — transport. A LaunchServices launch inherits no descriptors, so the
-    //   three inherited fd channels below — the PTY masters
-    //   (`ATERM_SEAMLESS_FDS`), the readiness pipe, and the Commit pipe — must
-    //   move to an out-of-band `SCM_RIGHTS` transfer over the per-user control
-    //   socket, which also changes what `seamless::adoption_proof` may hash (it
-    //   hashes fd NUMBERS, and `SCM_RIGHTS` does not preserve them).
-    let mut child = match job.command.spawn() {
+    // SO WHY KEEP FORKING? Because the launched lane is refused for four honest
+    // reasons — no `.app` bundle (`cargo run`, a dev binary, the test harness),
+    // a `$HOME` long enough to push the rendezvous past `sun_path`, more panes
+    // than one `SCM_RIGHTS` message carries, and an authorized target build
+    // OLDER than this one (a successor with no out-of-band code must never be
+    // handed descriptors it cannot receive). `out_of_band_lane_refusal` names
+    // which. On every one of those this lane is the only lane, so it stays
+    // exactly as it was: byte-identical behaviour, and the two paths rejoin at
+    // `run_handoff_decision` so nothing about the Commit decision can drift
+    // between them.
+    //
+    // B3's RESIDUAL, on the launched lane only: `pre_exec` establishes the
+    // candidate's process group before `spawn` returns, so on THIS lane
+    // `kill(-pid)` is a valid handle from that instant. A launched successor
+    // contains itself instead, and reports nothing, so there `-pid` is an
+    // unproven sweep — `signal_handoff_candidate` states what each reaper may
+    // conclude. What the rendezvous did close is the identity half: the accept
+    // hands back a kernel-attested `LOCAL_PEERPID`, so the DIRECT signal is
+    // aimed at a corroborated candidate rather than withheld for lack of one.
+    let child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {
             send_handoff_preparation_failure(
@@ -1289,29 +1599,501 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
             return;
         }
     };
-    let child_pid = child.id();
     // Capture the candidate's kernel identity while its pid is still PINNED by
     // being an unreaped child of ours. Every later reap authority reads it, so
     // it has to be taken at the one instant the pid provably names the
-    // candidate; once a LaunchServices launch replaces this `spawn` (B2/B3/B4)
-    // the identity arrives from the successor instead, and nothing downstream
-    // of here changes.
+    // candidate. On the launched lane there is no such pin, and the identity
+    // arrives from the rendezvous accept instead (`of_attested_peer`); nothing
+    // downstream of here can tell the difference.
     let candidate = HandoffCandidate::of_unreaped_child(&child);
+    let mut handle = HandoffCandidateHandle::Forked(child);
     drop(proof_wr);
     drop(commit_rd);
-    let proof_outcome = wait_handoff_ready(
+    run_handoff_decision(
+        &job,
+        &proxy,
+        &nonce,
+        expected,
         &proof_rd,
+        commit_wr,
+        candidate,
+        &mut handle,
+        handoff_ready_deadline(),
+    );
+}
+
+/// The physical artifacts one attempt published, threaded into the out-of-band
+/// lane so its environment can name them exactly as the fork lane's does.
+#[cfg(target_os = "macos")]
+struct OutgoingArtifacts {
+    manifest_path: String,
+    layout_path: std::path::PathBuf,
+    nonce: String,
+}
+
+/// The two private pipes of one attempt, before either end has been given away.
+///
+/// Grouped so the out-of-band lane cannot be handed three of the four by
+/// accident: which END goes to the successor is the whole protocol (the
+/// successor writes the proof and reads the Commit), and a swapped pair would
+/// deadlock in a way that reads as a slow successor.
+#[cfg(target_os = "macos")]
+struct HandoffChannels {
+    proof_rd: std::os::fd::OwnedFd,
+    proof_wr: std::os::fd::OwnedFd,
+    commit_rd: std::os::fd::OwnedFd,
+    commit_wr: std::os::fd::OwnedFd,
+}
+
+/// Everything the out-of-band lane was handed, given back UNUSED so the caller can
+/// fork instead.
+///
+/// A refusal BEFORE the rendezvous is published and the successor launched has
+/// changed nothing: no descriptor has moved, no candidate exists, and the fork lane
+/// below is still perfectly able to carry this attempt. Abandoning the update there
+/// kept the user's windows (every refusal does) but cost them the update for no
+/// reason — on a machine whose LaunchServices refuses us, for as long as it refuses.
+/// So those refusals return this instead of reporting a failure.
+#[cfg(target_os = "macos")]
+struct ForkInstead {
+    job: HandoffWorkerJob,
+    artifacts: OutgoingArtifacts,
+    expected: crate::seamless::AdoptionProof,
+    channels: HandoffChannels,
+}
+
+/// `None` once the attempt is this lane's to finish — committed, rolled back, or
+/// reported. `Some` only for a refusal that happened before anything moved.
+/// The out-of-band lane: bind, launch, accept, transfer — then hand over to the
+/// same decision tail the fork lane uses.
+///
+/// ORDER IS THE DESIGN. The listener is bound BEFORE the launch, because the
+/// successor has to be told a name that already exists; the launch budget is a
+/// slice of the shared readiness deadline, because a launch that never answers
+/// must not eat the whole of it; and the accept then spends what is left,
+/// because the successor's dial happens AFTER its own staged-swap boot apply
+/// (`ditto`/`hdiutil`/`codesign` plus a re-exec) and that is exactly the
+/// interval the fork lane already budgets 15 s for.
+///
+/// EVERY FAILURE BEFORE THE TRANSFER KEEPS THE WINDOWS AND KILLS NOTHING. No
+/// descriptor of ours has left the process, so the successor cannot be a reader;
+/// the rendezvous is dropped (which closes the listener and unlinks the node),
+/// so the successor's dial fails closed and it exits by its own rule rather than
+/// presenting itself as a fresh terminal over sessions this process still owns.
+/// That is why the warrant here is `NeverTransferred` and not a kill-and-prove:
+/// waiting for a successor that is still inside `hdiutil` to die would park the
+/// user's terminal for the length of an update.
+#[cfg(target_os = "macos")]
+fn run_out_of_band_handoff(
+    job: HandoffWorkerJob,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    artifacts: OutgoingArtifacts,
+    expected: crate::seamless::AdoptionProof,
+    channels: HandoffChannels,
+) -> Option<ForkInstead> {
+    use std::os::fd::AsFd as _;
+
+    /// How long LaunchServices gets to answer. An answer normally lands well
+    /// under a second; the rest of the deadline belongs to the dial, which has a
+    /// whole boot apply in front of it.
+    const LAUNCH_ANSWER_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let OutgoingArtifacts {
+        manifest_path,
+        layout_path,
+        nonce,
+    } = artifacts;
+    let HandoffChannels {
+        proof_rd,
+        proof_wr,
+        commit_rd,
+        commit_wr,
+    } = channels;
+
+    // Every refusal down to the transfer is an ordinary PREPARATION failure with
+    // a `NoCandidate` warrant, exactly like a `spawn` that would not start: at
+    // each of them either no successor exists yet, or one exists and has been
+    // given nothing.
+    let Some(bundle) = job.bundle.clone() else {
+        // Not a bundle: nothing has moved, so fork rather than skip the update.
+        // The fork lane needs no bundle, and a machine that cannot be launched
+        // through LaunchServices should still get its update.
+        return Some(ForkInstead {
+            job,
+            artifacts: OutgoingArtifacts {
+                manifest_path,
+                layout_path,
+                nonce,
+            },
+            expected,
+            channels: HandoffChannels {
+                proof_rd,
+                proof_wr,
+                commit_rd,
+                commit_wr,
+            },
+        });
+    };
+    // Bound in its own statement so the borrow of `nonce` provably ends before
+    // the refusal below consumes it — the same reason the transfer's result is
+    // taken before it is matched on.
+    let bound = crate::handoff_rendezvous::Rendezvous::bind(&nonce);
+    let rendezvous = match bound {
+        Ok(rendezvous) => rendezvous,
+        Err(error) => {
+            // A stale node, an unwritable support dir, a path that would not fit
+            // sun_path: none of it has moved a descriptor, and the fork lane needs
+            // no socket at all.
+            aterm_log::warn!(
+                "update apply: handoff rendezvous could not be bound ({error}); forking instead"
+            );
+            return Some(ForkInstead {
+                job,
+                artifacts: OutgoingArtifacts {
+                    manifest_path,
+                    layout_path,
+                    nonce,
+                },
+                expected,
+                channels: HandoffChannels {
+                    proof_rd,
+                    proof_wr,
+                    commit_rd,
+                    commit_wr,
+                },
+            });
+        }
+    };
+    let Some(rendezvous_path) = rendezvous.path().to_str().map(str::to_string) else {
+        aterm_log::warn!("update apply: the handoff rendezvous path is not UTF-8; forking instead");
+        return Some(ForkInstead {
+            job,
+            artifacts: OutgoingArtifacts {
+                manifest_path,
+                layout_path,
+                nonce,
+            },
+            expected,
+            channels: HandoffChannels {
+                proof_rd,
+                proof_wr,
+                commit_rd,
+                commit_wr,
+            },
+        });
+    };
+    // The launch environment is DERIVED from the very `Command` the fork lane
+    // would have used, so argv and every inherited-authority variable are the
+    // same on both lanes by construction rather than by two lists staying in
+    // sync. What differs is only the transport: no descriptor NUMBER appears
+    // here — a launched process inherits none, so those integers would name
+    // whatever LaunchServices left in the successor's table — and a rendezvous
+    // plus its claim secret appear instead.
+    let Some(mut environment) = launch_environment(&job.command) else {
+        // A merged launch cannot express a REMOVAL, and the fork lane can — this is
+        // the one refusal where forking is not merely acceptable but correct.
+        aterm_log::warn!(
+            "update apply: the launch environment needs a removal a merged launch cannot \
+             express; forking instead"
+        );
+        return Some(ForkInstead {
+            job,
+            artifacts: OutgoingArtifacts {
+                manifest_path,
+                layout_path,
+                nonce,
+            },
+            expected,
+            channels: HandoffChannels {
+                proof_rd,
+                proof_wr,
+                commit_rd,
+                commit_wr,
+            },
+        });
+    };
+    environment.push((
+        "ATERM_SEAMLESS_MANIFEST".into(),
+        std::ffi::OsString::from(manifest_path.clone()),
+    ));
+    environment.push(("ATERM_SEAMLESS_NONCE".into(), nonce.clone().into()));
+    // Cloned, not moved: a LaunchServices refusal below hands these back to the
+    // fork lane, which names the same two artifacts. One String and one PathBuf
+    // per attempt is not a cost worth trading a skipped update for.
+    environment.push((
+        "ATERM_SEAMLESS_LAYOUT".into(),
+        layout_path.clone().into_os_string(),
+    ));
+    environment.push((
+        "ATERM_SEAMLESS_TARGET".into(),
+        crate::seamless::encode_target_identity(job.target_build, &job.target_commit).into(),
+    ));
+    environment.push((
+        crate::handoff_rendezvous::ENV_RENDEZVOUS.into(),
+        rendezvous_path.into(),
+    ));
+    environment.push((
+        crate::handoff_rendezvous::ENV_CLAIM.into(),
+        rendezvous.claim().into(),
+    ));
+    for (key, value) in crate::seamless::outgoing_parent_env() {
+        environment.push((key.into(), value.into()));
+    }
+    let arguments = job
+        .command
+        .get_args()
+        .map(std::ffi::OsStr::to_os_string)
+        .collect::<Vec<_>>();
+
+    if handoff_preparation_cancelled(&job, proxy, Some(nonce.clone())) {
+        return None;
+    }
+    let deadline = handoff_ready_deadline();
+    let launched = match crate::app_launch_successor::launch_app_bundle(
+        &bundle,
+        &arguments,
+        &environment,
+        LAUNCH_ANSWER_BUDGET.min(deadline.saturating_duration_since(std::time::Instant::now())),
+    ) {
+        Ok(launched) => Some(launched.pid()),
+        // A TIMEOUT IS NOT A FAILURE, AND TREATING IT AS ONE THREW AWAY A LIVE
+        // SUCCESSOR. Measured on this machine: a bundle's first launch took
+        // longer than this budget to ANSWER, the parent tore the rendezvous down
+        // on the way out, and the successor — which had started, and was correct
+        // — dialed into a closed socket and exited with
+        // "the parent closed the rendezvous". Nothing was lost (that exit is
+        // before any window, by design) except the update.
+        //
+        // The launch answer was never the liveness signal; the DIAL is, which is
+        // what this lane exists to arrange. So a timeout keeps the rendezvous
+        // open for the rest of the deadline and gives up only if nobody arrives.
+        // What is lost is the pid to compare the dialer against, and that is
+        // defence in depth rather than the lock: the claim secret is checked
+        // first, and the socket is 0700 inside a 0700 directory.
+        Err(crate::app_launch_successor::LaunchError::Timeout(_)) => {
+            aterm_log::info!(
+                "update apply: LaunchServices has not answered yet; keeping the rendezvous open \
+                 for the rest of the deadline — the dial is the liveness signal, not the answer"
+            );
+            None
+        }
+        Err(error) => {
+            // A REFUSAL, not a slow answer: nothing was launched, so no successor
+            // can dial and the fork lane is untouched and still able to carry this
+            // attempt. Hand the job back rather than reporting a failure — the
+            // trade is the orphaned launchd domain this lane exists to avoid,
+            // which is exactly the trade the fork lane already makes today, and it
+            // beats not updating at all on a machine LaunchServices refuses.
+            //
+            // The rendezvous is dropped on the way out, which closes the listener
+            // and unlinks the node, so nothing is left for a late dialer to find.
+            aterm_log::warn!(
+                "update apply: LaunchServices refused the successor ({error}); forking instead"
+            );
+            return Some(ForkInstead {
+                job,
+                artifacts: OutgoingArtifacts {
+                    manifest_path,
+                    layout_path,
+                    nonce,
+                },
+                expected,
+                channels: HandoffChannels {
+                    proof_rd,
+                    proof_wr,
+                    commit_rd,
+                    commit_wr,
+                },
+            });
+        }
+    };
+    match launched {
+        Some(pid) => aterm_log::info!(
+            "update apply: launched successor pid {pid} as its own launchd application job; \
+             awaiting its rendezvous dial"
+        ),
+        None => aterm_log::info!("update apply: awaiting the successor's rendezvous dial"),
+    }
+    let peer = match rendezvous.accept_claim(launched, deadline, &|| job.cancel.try_recv().is_ok())
+    {
+        Ok(peer) => peer,
+        Err(crate::handoff_rendezvous::RendezvousError::Cancelled) => {
+            send_warranted_handoff_failure(
+                HandoffRollbackWarrant::NeverTransferred,
+                &job.cleanup,
+                proxy,
+                job.current_build,
+                crate::UpdateHandoffCompletion::failure(
+                    job.attempt_id,
+                    Some(nonce),
+                    launched.map(pid_for_completion),
+                    crate::UpdateHandoffOutcome::ActivityRevoked,
+                    "structural activity revoked the handoff before any descriptor was sent",
+                ),
+            );
+            return None;
+        }
+        Err(error) => {
+            send_warranted_handoff_failure(
+                HandoffRollbackWarrant::NeverTransferred,
+                &job.cleanup,
+                proxy,
+                job.current_build,
+                crate::UpdateHandoffCompletion::failure(
+                    job.attempt_id,
+                    Some(nonce),
+                    launched.map(pid_for_completion),
+                    crate::UpdateHandoffOutcome::TimedOut,
+                    format!("the launched successor never claimed the handoff: {error}"),
+                ),
+            );
+            return None;
+        }
+    };
+    // The identity the whole launched lane rests on, taken at the one instant it
+    // is available: a pid the KERNEL attested for a process we did not fork,
+    // plus the kernel's birth stamp for it. Together they survive pid reuse,
+    // which a bare pid from a completion wire does not.
+    let candidate = HandoffCandidate::of_attested_peer(pid_for_completion(peer.pid()));
+    // `job.live` is `(local_id, child-owned master duplicate, shell pid)`; the
+    // transfer wants `(local_id, shell pid, master)` in the order it will send
+    // them, and that order is what addresses the descriptors on arrival.
+    let sessions = job
+        .live
+        .iter()
+        .map(|(local_id, master, pid)| {
+            // SAFETY: `job` owns these duplicates for the whole attempt
+            // (`_owned_masters`), so the borrow cannot outlive them.
+            (*local_id, *pid, unsafe {
+                std::os::fd::BorrowedFd::borrow_raw(*master)
+            })
+        })
+        .collect::<Vec<_>>();
+    let transfer_failed = peer
+        .transfer(
+            &nonce,
+            &sessions,
+            proof_wr.as_fd(),
+            commit_rd.as_fd(),
+            deadline,
+        )
+        .err();
+    if let Some(error) = transfer_failed {
+        send_warranted_handoff_failure(
+            HandoffRollbackWarrant::NeverTransferred,
+            &job.cleanup,
+            proxy,
+            job.current_build,
+            crate::UpdateHandoffCompletion::failure(
+                job.attempt_id,
+                Some(nonce),
+                Some(candidate.pid),
+                crate::UpdateHandoffOutcome::Rejected,
+                format!("the handoff descriptors could not be delivered: {error}"),
+            ),
+        );
+        return None;
+    }
+    // From here the successor holds copies of everything, so this is the first
+    // instant at which a rollback owes a candidate proof — and from here the
+    // decision is identical to the fork lane's.
+    drop(rendezvous);
+    drop(peer);
+    drop(proof_wr);
+    drop(commit_rd);
+    let mut handle = HandoffCandidateHandle::Launched;
+    run_handoff_decision(
+        &job,
+        proxy,
+        &nonce,
+        expected,
+        &proof_rd,
+        commit_wr,
+        candidate,
+        &mut handle,
+        deadline,
+    );
+    // The attempt reached the shared decision tail, so it is finished either way.
+    None
+}
+
+/// A launched pid in the `u32` shape the completion wire and [`HandoffCandidate`]
+/// use.
+///
+/// The conversion cannot fail in practice — `app_launch_successor` refuses any
+/// pid that is not positive, and the rendezvous only accepts a peer whose
+/// kernel-attested pid equals that one — so this exists for the case where it
+/// somehow does. Zero is the safe answer rather than a wrapped one because every
+/// consumer already refuses it: `signal_handoff_candidate` returns for `pid <= 1`
+/// (0 and -1 are `kill`'s "my whole process group" and "broadcast"), and
+/// `handoff_candidate_terminated` reads a vacancy it can never prove.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn pid_for_completion(pid: i32) -> u32 {
+    u32::try_from(pid).unwrap_or_default()
+}
+
+/// The launch environment a `Command` describes, or `None` when it cannot be
+/// expressed as a MERGE.
+///
+/// `NSWorkspaceOpenConfiguration.environment` MERGES over the launching
+/// process's environment; it cannot REMOVE a variable. `Command::env_remove`
+/// can, and `bind_expected_update_artifact` uses it: a successor that inherits a
+/// stale `ATERM_UPDATE_EXPECTED_*` would authenticate its staged bundle against
+/// the wrong artifact. So a removal that would actually remove something — the
+/// variable is set in THIS process — makes the whole lane unavailable, and the
+/// attempt forks instead. A removal of something not set is a no-op and is
+/// ignored, which is the common case (`env_remove` is called unconditionally).
+#[cfg(target_os = "macos")]
+fn launch_environment(
+    command: &std::process::Command,
+) -> Option<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    let mut pairs = Vec::new();
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => pairs.push((key.to_os_string(), value.to_os_string())),
+            None if std::env::var_os(key).is_some() => return None,
+            None => (),
+        }
+    }
+    Some(pairs)
+}
+
+/// Everything after a candidate exists: the bounded readiness wait, the
+/// ProofReady wake, and the decision loop that ends in Commit or a warranted
+/// rejection.
+///
+/// SHARED BY BOTH LANES ON PURPOSE. This is the part that decides whether the
+/// user's sessions change hands, and it must not be able to differ between a
+/// forked and a launched successor — the only thing that legitimately differs is
+/// HOW the candidate is reaped, and that is `handle`'s job, not this function's.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn run_handoff_decision(
+    job: &HandoffWorkerJob,
+    proxy: &winit::event_loop::EventLoopProxy<Wake>,
+    nonce: &str,
+    expected: crate::seamless::AdoptionProof,
+    proof_rd: &std::os::fd::OwnedFd,
+    commit_wr: std::os::fd::OwnedFd,
+    candidate: HandoffCandidate,
+    handle: &mut HandoffCandidateHandle,
+    deadline: std::time::Instant,
+) {
+    let proof_outcome = wait_handoff_ready(
+        proof_rd,
         expected,
         &job.cancel,
         &job.live.iter().map(|(_, fd, _)| *fd).collect::<Vec<_>>(),
+        deadline,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
         let rejected = worker_reject_and_reap_handoff_child(
-            &job,
-            &proxy,
-            &mut child,
+            job,
+            proxy,
+            handle,
             candidate,
-            &nonce,
+            nonce,
             proof_outcome,
             format!("handoff proof ended {proof_outcome:?}"),
         );
@@ -1322,8 +2104,8 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
     let ready = Wake::UpdateHandoffFinished(crate::UpdateHandoffCompletion {
         attempt_id: job.attempt_id,
-        nonce: Some(nonce.clone()),
-        child_pid: Some(child_pid),
+        nonce: Some(nonce.to_string()),
+        child_pid: Some(candidate.pid),
         outcome: crate::UpdateHandoffOutcome::ProofReady,
         commit_fd: Some(commit_wr),
         reject: Some(reject),
@@ -1335,11 +2117,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         // No main-thread final validation occurred, therefore Commit is impossible.
         // Kill/reap readerless child; never exit as though authority was granted.
         let rejected = worker_reject_and_reap_handoff_child(
-            &job,
-            &proxy,
-            &mut child,
+            job,
+            proxy,
+            handle,
             candidate,
-            &nonce,
+            nonce,
             crate::UpdateHandoffOutcome::Rejected,
             "event loop closed before final handoff admission".to_string(),
         );
@@ -1356,11 +2138,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         // the proof's live-set identity is stale) rejects before Commit.
         if job.cancel.try_recv().is_ok()
             && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
+                job,
+                proxy,
+                handle,
                 candidate,
-                &nonce,
+                nonce,
                 crate::UpdateHandoffOutcome::ActivityRevoked,
                 "structural activity revoked handoff before Commit".to_string(),
             )
@@ -1369,11 +2151,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         }
         if handoff_masters_closed(&job.live)
             && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
+                job,
+                proxy,
+                handle,
                 candidate,
-                &nonce,
+                nonce,
                 crate::UpdateHandoffOutcome::Rejected,
                 "a handed-off PTY session closed before Commit".to_string(),
             )
@@ -1383,11 +2165,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         match rejected.try_recv() {
             Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 if worker_reject_and_reap_handoff_child(
-                    &job,
-                    &proxy,
-                    &mut child,
+                    job,
+                    proxy,
+                    handle,
                     candidate,
-                    &nonce,
+                    nonce,
                     crate::UpdateHandoffOutcome::Rejected,
                     "final handoff admission rejected before Commit".to_string(),
                 ) {
@@ -1398,11 +2180,11 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         }
         if std::time::Instant::now() >= decision_deadline
             && worker_reject_and_reap_handoff_child(
-                &job,
-                &proxy,
-                &mut child,
+                job,
+                proxy,
+                handle,
                 candidate,
-                &nonce,
+                nonce,
                 crate::UpdateHandoffOutcome::Rejected,
                 "main-thread final handoff decision timed out".to_string(),
             )
@@ -1411,6 +2193,61 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+}
+
+/// Ceiling on the DECODE AUTHORITY one capture may hand its successor: the sum,
+/// over every carried session, of twice `dimension_grid_cap`.
+///
+/// This is authority, not memory. `dimension_grid_cap` prices a carried line at
+/// 512 bytes per cell plus 16 KiB of framing precisely so a hostile `meta` cannot
+/// authorize a huge decode, and a real screen encodes an order of magnitude or two
+/// smaller than that ceiling — so this sum overstates what a capture actually
+/// costs by roughly the same factor.
+///
+/// It was 256 MiB, the number the EXACT guards use on REAL bytes, and that made it
+/// the next rung of the same ladder `MAX_HANDOFF_AGGREGATE_GRID_CELLS` was on: one
+/// session carrying 256 lines at 110 columns books ~42 MiB of it, so SEVEN
+/// ordinary panes hard-failed the capture — with no degrade rung at all. Raising
+/// only the cell aggregate would have moved the field failure from five panes to
+/// seven instead of removing it.
+///
+/// 16x that number is the pessimism this pre-check carries over the bound it is
+/// standing in for, so at 4 GiB it goes back to being what it is: a cheap early
+/// refusal for an absurd pool, with a clearer message than the seams downstream.
+/// The exact bound is untouched and still decides — `screen_digest_refs` and
+/// `write_outgoing` both charge `MAX_HANDOFF_AGGREGATE_GRID_BYTES` (256 MiB)
+/// against the REAL serialized bytes before anything is committed or written.
+#[cfg(unix)]
+const MAX_HANDOFF_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Whether one session may spend `optional` on a budget, on top of the
+/// `own_mandatory` it must spend regardless.
+///
+/// `used` is what the pool has already been charged, and `later_mandatory` is the
+/// summed non-degradable cost of every session NOT yet admitted. Overflow is a
+/// refusal, never a wrap.
+///
+/// That last term is the whole point, and it is what both capture budgets were
+/// missing. They were handed out greedily in pool order: the first sessions each
+/// took a full 256 lines of scrollback, and a later session then found no room
+/// even for its VISIBLE screen — which is not degradable, so the capture failed
+/// and the update did not apply, deterministically, on every retry, for anyone
+/// with more than a handful of panes. Reserving the mandatory total up front
+/// inverts that: a session can be refused only when the pool's visible-only total
+/// genuinely exceeds the ceiling, which is what makes "the failure mode is *less
+/// scrollback*, never *the update did not apply*" true rather than aspirational.
+#[cfg(unix)]
+fn optional_carry_fits(
+    used: u64,
+    own_mandatory: u64,
+    optional: u64,
+    later_mandatory: u64,
+    ceiling: u64,
+) -> bool {
+    used.checked_add(own_mandatory)
+        .and_then(|total| total.checked_add(optional))
+        .and_then(|total| total.checked_add(later_mandatory))
+        .is_some_and(|total| total <= ceiling)
 }
 
 impl App {
@@ -1717,10 +2554,13 @@ impl App {
             }
         }
 
-        // Capture owned structural data before parking. These projections perform
-        // no disk I/O; terminal metadata uses try_lock and degrades to empty rather
-        // than waiting behind reflow/compression.
-        let layout = self.capture_restore_manifest();
+        // Capture the session registry BEFORE parking, because this projection can
+        // FAIL: a `WouldBlock` here must return with the terminal completely
+        // untouched, which is only true while no reader has been stopped. It
+        // performs no disk I/O.
+        //
+        // The restore manifest deliberately does NOT travel with it — see the
+        // post-park capture below for why capturing it here revoked the handoff.
         let manifest = match self.store.try_read() {
             Ok(store) => crate::session_store::SessionHandoff::from_store(&store),
             Err(std::sync::TryLockError::Poisoned(poison)) => {
@@ -1766,6 +2606,21 @@ impl App {
                 outer_y: position.map(|point| point.y),
             }
         });
+
+        // PROBED BEFORE THE PARK, and this is the reason: resolving the control
+        // directory can create and `chmod` it, and every instruction between
+        // `park_all_readers` and the capture deadline is spent inside a 20 ms
+        // budget with the user's terminal frozen. The answer cannot change in
+        // that window — it is a function of `$HOME` and this process's pid — so
+        // taking it here costs the attempt nothing and keeps a filesystem
+        // round-trip out of the parked interval. (The rest of the lane decision
+        // is arithmetic plus one `fstat` per session, which is why only this
+        // fact moves.)
+        #[cfg(target_os = "macos")]
+        let rendezvous_path_fits = crate::handoff_rendezvous::rendezvous_path_fits();
+        // Same reasoning, same window: `app_bundle_root` ends in an `is_dir`.
+        #[cfg(target_os = "macos")]
+        let bundle = app_bundle_root(&exe);
 
         // Provision the worker BEFORE readers park. A resource-exhausted thread
         // creation therefore returns with the terminal completely untouched.
@@ -1849,6 +2704,35 @@ impl App {
         // checkpoint: every later session goes straight to visible-only rather than
         // paying an admission probe that the budget has already proven cannot pass.
         let mut history_over_budget = false;
+        // MANDATORY FIRST, OPTIONAL SECOND. Price the visible+alt grids of the WHOLE
+        // POOL before charging any of it, in both budgets. Without this the budgets
+        // are spent greedily in pool order and a later session finds nothing left
+        // for the one thing it cannot degrade — see `optional_carry_fits`. Readers
+        // are parked, so no geometry can move between this pass and the capture loop
+        // below, and the two passes therefore price the same pool.
+        //
+        // An unreadable engine reserves EVERYTHING, i.e. nobody carries scrollback:
+        // the capture loop reports that busy engine itself a moment later, and a
+        // guess made here must never be the optimistic one.
+        let mut cells_reserve = 0_u64;
+        let mut bytes_reserve = 0_u64;
+        for session in self.pool.iter() {
+            let terminal = match session.term.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    cells_reserve = u64::MAX;
+                    bytes_reserve = u64::MAX;
+                    break;
+                }
+            };
+            let (rows, cols) = (terminal.rows(), terminal.cols());
+            let mandatory_bytes =
+                crate::seamless::checkpoint_capture_budget_bytes(rows, cols, 0).unwrap_or(u64::MAX);
+            cells_reserve = cells_reserve
+                .saturating_add(crate::seamless::mandatory_checkpoint_cells(rows, cols));
+            bytes_reserve = bytes_reserve.saturating_add(mandatory_bytes);
+        }
         for session in self.pool.iter() {
             if std::time::Instant::now() >= deadline {
                 capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
@@ -1872,11 +2756,45 @@ impl App {
             // tab to one screen, but it is strictly a bonus: the visible screen is
             // what adoption actually requires. So the depth is chosen per session
             // against the REMAINING time, and collapses to zero once the window is
-            // more than half spent. Failing the handoff to protect scrollback would
-            // trade the whole update for the thing the update was carrying.
+            // more than half spent — and against the REMAINING budget, once the
+            // pool's own mandatory reservation is taken off the top. Failing the
+            // handoff to protect scrollback would trade the whole update for the
+            // thing the update was carrying.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let mut history = if remaining >= HANDOFF_HISTORY_COMFORT && !history_over_budget {
-                crate::seamless::max_handoff_history_lines()
+            let (rows, cols) = (terminal.rows(), terminal.cols());
+            let own_cells = crate::seamless::mandatory_checkpoint_cells(rows, cols);
+            let own_bytes =
+                crate::seamless::checkpoint_capture_budget_bytes(rows, cols, 0).unwrap_or(u64::MAX);
+            // Both reserves now cover only the sessions AFTER this one, so the two
+            // checks below price this session's scrollback against what everybody
+            // still waiting genuinely needs, and never against its own mandatory
+            // cost twice.
+            cells_reserve = cells_reserve.saturating_sub(own_cells);
+            bytes_reserve = bytes_reserve.saturating_sub(own_bytes);
+            let carry = crate::seamless::max_handoff_history_lines();
+            let history_cells = u64::from(cols).saturating_mul(u64::from(carry));
+            let history_bytes = crate::seamless::checkpoint_capture_budget_bytes(rows, cols, carry)
+                .map_or(u64::MAX, |carried| carried.saturating_sub(own_bytes));
+            let history_fits_cells = optional_carry_fits(
+                capture_cells,
+                own_cells,
+                history_cells,
+                cells_reserve,
+                crate::seamless::max_handoff_aggregate_grid_cells(),
+            );
+            let history_fits_bytes = optional_carry_fits(
+                capture_budget,
+                own_bytes,
+                history_bytes,
+                bytes_reserve,
+                MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
+            );
+            let mut history = if remaining >= HANDOFF_HISTORY_COMFORT
+                && !history_over_budget
+                && history_fits_cells
+                && history_fits_bytes
+            {
+                carry
             } else {
                 0
             };
@@ -1886,8 +2804,8 @@ impl App {
             // expensive work this admission must precede.
             let mut per_grid = crate::seamless::admit_checkpoint_dimensions(
                 &mut capture_cells,
-                terminal.rows(),
-                terminal.cols(),
+                rows,
+                cols,
                 history,
                 true,
             );
@@ -1917,8 +2835,8 @@ impl App {
                 history_over_budget = true;
                 per_grid = crate::seamless::admit_checkpoint_dimensions(
                     &mut capture_cells,
-                    terminal.rows(),
-                    terminal.cols(),
+                    rows,
+                    cols,
                     0,
                     true,
                 );
@@ -1938,8 +2856,16 @@ impl App {
                 .and_then(|bytes| bytes.checked_mul(2))
                 .and_then(|bytes| capture_budget.checked_add(bytes))
                 .unwrap_or(u64::MAX);
-            if capture_budget > 256 * 1024 * 1024 {
-                capture_failed = Some("aggregate visible-screen capture exceeded its memory cap");
+            // Same ladder, one budget over. This charge is not degradable here —
+            // the history that would have been dropped was already refused above by
+            // `history_fits`, which prices this ceiling too — so reaching it means
+            // the pool's MANDATORY visible screens alone do not fit, which is a
+            // genuine blocker rather than a carried bonus. Name the authority, not
+            // "memory": nothing here allocates these bytes, they are the decode
+            // ceiling the successor would be granted.
+            if capture_budget > MAX_HANDOFF_CAPTURE_BUDGET_BYTES {
+                capture_failed =
+                    Some("visible-screen capture exceeded the aggregate decode-authority budget");
                 break;
             }
             let Some(checkpoint) = terminal.checkpoint_carry(history as usize) else {
@@ -1962,6 +2888,30 @@ impl App {
             )));
         }
 
+        // POST-PARK, AND DELIBERATELY SO. Every reader is stopped and joined, and
+        // the capture loop above just proved every session's `term` was lockable,
+        // so `restore_session_meta`'s try_lock cannot silently degrade cwd/title
+        // here.
+        //
+        // This used to be captured before the park, and that is a self-inflicted
+        // revocation: `restore_session_meta` returns `(None, String::new())` on a
+        // contended try_lock, and a producing session's reader thread holds its
+        // term mutex for the whole of each `process()` slice. So a busy machine
+        // captured a DEGRADED layout, `collect_handoff_commit_facts` later compared
+        // it against the free post-park projection, `exact_layout` went false, and
+        // the attempt was reported as "window/tab/pane topology changed during
+        // async preparation" — a wrong cause, on a lane (`AutomaticPastGrace`,
+        // `Manual`, `Immediate`) that has no activity guard at all, burning an
+        // `ActivityRevoked` cycle every time. A shell writing OSC 7 during the park
+        // did the same thing with no lock contention involved.
+        //
+        // After the capture loop rather than immediately after `park_all_readers`:
+        // the scrollback-compression worker can still transiently hold a `term`
+        // mutex once readers park, and if it did, the loop above has already
+        // aborted the attempt cleanly ("a terminal engine was busy during handoff
+        // capture") instead of producing a degraded layout here.
+        let layout = self.capture_restore_manifest();
+
         let attempt_id = self.next_update_handoff_id;
         let Some(next_attempt_id) = attempt_id.checked_add(1) else {
             self.rollback_overlap(None, &live);
@@ -1982,6 +2932,55 @@ impl App {
             || crate::build_info::GIT_COMMIT.to_string(),
             |attempt| attempt.target_commit().to_string(),
         );
+        // THE LANE IS DECIDED HERE AND NOWHERE ELSE, and it has to be settled
+        // before the pending attempt is recorded: it selects which term the
+        // adoption proof hashes, and the main thread re-derives that proof from
+        // the pending attempt at Commit time. A lane chosen later would leave
+        // the two halves of one proof speaking different terms — the exact
+        // failure that shows up as an unexplained `AdoptionMismatch`.
+        //
+        // Both arms produce `(lane, proof identities)` together for the same
+        // reason: they are one decision, not two that have to agree.
+        #[cfg(target_os = "macos")]
+        let (lane, proof_identities) = {
+            let facts = HandoffLaneFacts {
+                bundled: bundle.is_some(),
+                // A build for this platform has one compiled in. The fact is
+                // still a field rather than an assumption so the refusal it
+                // guards is reachable from a test.
+                launcher_available: true,
+                socket_path_fits: rendezvous_path_fits,
+                target_not_older: target_build >= build,
+                sessions: adoption.len(),
+                environment_is_a_merge: launch_environment(&command).is_some(),
+            };
+            match out_of_band_lane_refusal(facts) {
+                None => {
+                    match crate::handoff_rendezvous::proof_identities_in_device_terms(&adoption) {
+                        Some(terms) => (HandoffLane::OutOfBand, terms),
+                        // A master that will not answer `fstat` cannot be given a
+                        // device term, and a proof missing one term is a proof over
+                        // a different session set. Forking is exact here rather than
+                        // degraded: the fd-number term needs nothing from the kernel.
+                        None => {
+                            aterm_log::warn!(
+                                "update apply: forking instead of launching — a handed-off PTY would \
+                             not answer fstat, so the out-of-band proof term cannot be computed"
+                            );
+                            (HandoffLane::Fork, adoption.clone())
+                        }
+                    }
+                }
+                Some(reason) => {
+                    aterm_log::info!("update apply: forking instead of launching — {reason}");
+                    (HandoffLane::Fork, adoption.clone())
+                }
+            }
+        };
+        // Every other unix has exactly one transport, so the proof term is the
+        // descriptor number and there is no choice to record.
+        #[cfg(not(target_os = "macos"))]
+        let proof_identities = adoption.clone();
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::failed(
@@ -2012,7 +3011,9 @@ impl App {
             attempt_id,
             nonce: None,
             live: live.clone(),
-            adoption: adoption.clone(),
+            // The PROOF identities, in whichever term this attempt's lane can
+            // prove — see `HandoffWorkerJob::proof_identities`. Never `live`.
+            adoption: proof_identities.clone(),
             child_pid: None,
             mode,
             apply_attempt,
@@ -2051,6 +3052,11 @@ impl App {
             layout_digest,
             screen_digest,
             live: adoption,
+            proof_identities,
+            #[cfg(target_os = "macos")]
+            lane,
+            #[cfg(target_os = "macos")]
+            bundle,
             cleanup,
             cancel: cancelled,
             arbiter,
@@ -2727,20 +3733,47 @@ fn classify_ready_poll(pollfds: &[libc::pollfd]) -> ReadyPollAction {
     ReadyPollAction::NoProgress
 }
 
+/// When this attempt stops waiting for its successor to prove readiness.
+///
+/// A DEADLINE RATHER THAN A TIMEOUT, because on the out-of-band lane the wait
+/// has two stages and they share one budget: the successor has to dial the
+/// rendezvous (behind its whole staged-swap boot apply) and only then paint and
+/// prove. Two independent 15 s timeouts would let a slow successor park the
+/// user's terminal for thirty seconds; one deadline computed once is what makes
+/// "the fork lane's budget" mean the same thing on both lanes. The fork lane
+/// computes it immediately before its single wait, which is exactly where the
+/// function it replaced computed it.
+#[cfg(unix)]
+#[must_use]
+fn handoff_ready_deadline() -> std::time::Instant {
+    // DEFAULT RAISED 15 s → 30 s (2026-08-15). The one deadline covers
+    // LaunchServices latency, first-launch Gatekeeper assessment, the
+    // successor's ENTIRE staged-swap boot apply (ditto/codesign + re-exec),
+    // adoption, and the paint of every window — the codebase's own cold
+    // measurement is 4.5 s with nothing else running, and this machine's
+    // ledger carried a real TimedOut streak whose live failures all landed
+    // under compile load (reproduced on demand: a rehearsal handoff during a
+    // workspace build times out at 15 s and completes with headroom at more).
+    // The cost of a longer deadline is bounded and safe — the parked parent
+    // un-parks on expiry exactly as before — while the cost of a short one is
+    // an update lane that quietly never succeeds on a busy machine.
+    let timeout_ms = std::env::var("ATERM_HANDOFF_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30_000)
+        .clamp(1_000, 120_000);
+    std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms)
+}
+
 #[cfg(unix)]
 fn wait_handoff_ready(
     rd: &std::os::fd::OwnedFd,
     expected: crate::seamless::AdoptionProof,
     cancel: &std::sync::mpsc::Receiver<()>,
     masters: &[i32],
+    deadline: std::time::Instant,
 ) -> crate::UpdateHandoffOutcome {
     use std::os::fd::AsRawFd as _;
-    let timeout_ms = std::env::var("ATERM_HANDOFF_READY_TIMEOUT_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(15_000)
-        .clamp(1_000, 120_000);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
     let mut offset = 0usize;
     let mut pollfds = Vec::with_capacity(masters.len().saturating_add(1));
@@ -2824,14 +3857,181 @@ fn wait_handoff_ready(
 }
 
 #[cfg(all(test, unix))]
+mod capture_budget_reservation_tests {
+    use super::{MAX_HANDOFF_CAPTURE_BUDGET_BYTES, optional_carry_fits};
+    use crate::seamless::{
+        admit_checkpoint_dimensions, checkpoint_capture_budget_bytes, mandatory_checkpoint_cells,
+        max_handoff_aggregate_grid_cells, max_handoff_history_lines,
+    };
+
+    /// Walk a pool of `sessions` identical panes through the producer's
+    /// reserve-then-history rule, charging the REAL admission seam and the REAL
+    /// budgets `start_unix_update_handoff` charges.
+    ///
+    /// The per-session degrade rung is deliberately NOT replicated: if the
+    /// reservation is right, nothing ever needs it, so `Ok` here is the stronger
+    /// claim. `Err(index)` is the session the capture would have refused, which is
+    /// the whole update.
+    fn walk_pool(rows: u16, cols: u16, sessions: u64) -> Result<u64, u64> {
+        let carry = max_handoff_history_lines();
+        let mandatory_cells = mandatory_checkpoint_cells(rows, cols);
+        let mandatory_bytes = checkpoint_capture_budget_bytes(rows, cols, 0)
+            .expect("PRECONDITION: the test geometry must be admissible at all");
+        let history_cells = u64::from(cols) * u64::from(carry);
+        let history_bytes = checkpoint_capture_budget_bytes(rows, cols, carry)
+            .expect("PRECONDITION: the test geometry must be admissible with history")
+            - mandatory_bytes;
+
+        let mut cells_reserve = mandatory_cells * sessions;
+        let mut bytes_reserve = mandatory_bytes * sessions;
+        let mut used_cells = 0_u64;
+        let mut used_bytes = 0_u64;
+        let mut carried = 0_u64;
+        for index in 0..sessions {
+            cells_reserve -= mandatory_cells;
+            bytes_reserve -= mandatory_bytes;
+            let cells_fit = optional_carry_fits(
+                used_cells,
+                mandatory_cells,
+                history_cells,
+                cells_reserve,
+                max_handoff_aggregate_grid_cells(),
+            );
+            let bytes_fit = optional_carry_fits(
+                used_bytes,
+                mandatory_bytes,
+                history_bytes,
+                bytes_reserve,
+                MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
+            );
+            let history = if cells_fit && bytes_fit { carry } else { 0 };
+            let Some(per_grid) =
+                admit_checkpoint_dimensions(&mut used_cells, rows, cols, history, true)
+            else {
+                return Err(index);
+            };
+            used_bytes += per_grid * 2;
+            if used_bytes > MAX_HANDOFF_CAPTURE_BUDGET_BYTES {
+                return Err(index);
+            }
+            carried += u64::from(history != 0);
+        }
+        Ok(carried)
+    }
+
+    /// REGRESSION (the desk that could not update). Both capture budgets used to be
+    /// handed out greedily in pool order: the first sessions each took a full 256
+    /// lines of scrollback, and a later session then found nothing left for its
+    /// MANDATORY visible screen. That is not degradable, so the capture failed and
+    /// the seamless update did not apply — deterministically, on every retry, for
+    /// anyone past a handful of panes (five at the reported geometry).
+    ///
+    /// Twelve, twenty-four and sixty-four panes, at the reported geometry and at a
+    /// maximized one, must all be admitted in full. Carrying less scrollback is an
+    /// allowed answer; refusing the update is not.
+    #[test]
+    fn a_heavy_pool_is_admitted_even_when_it_must_drop_history() {
+        // 49x110 is the window from the field report. 60x200 is a maximized window
+        // on a large display, where one session costs more than twice as much.
+        for (rows, cols) in [(49_u16, 110_u16), (60, 200)] {
+            for sessions in [12_u64, 24, 64] {
+                let carried = walk_pool(rows, cols, sessions).unwrap_or_else(|index| {
+                    panic!(
+                        "session {index} of {sessions} at {rows}x{cols} was refused; a pool \
+                         whose visible screens fit must never cost the update"
+                    )
+                });
+                assert!(
+                    carried > 0,
+                    "{sessions} panes at {rows}x{cols} carried no scrollback at all — the \
+                     reservation must buy the pool a SMALLER carry, not abolish it"
+                );
+            }
+        }
+    }
+
+    /// The exact boundary the reservation establishes: a session is refused if and
+    /// only if the POOL's mandatory visible+alt total genuinely does not fit. The
+    /// count is derived from the constant, so raising the aggregate later moves the
+    /// boundary instead of reddening this test.
+    ///
+    /// The `Err(fits)` is the load-bearing half. Under the old greedy rule the
+    /// refusal landed on an EARLY session — one whose own screen fit perfectly well,
+    /// but whose budget an earlier pane had already spent on optional scrollback.
+    #[test]
+    fn a_pool_is_refused_only_when_its_mandatory_total_does_not_fit() {
+        let (rows, cols) = (60_u16, 200_u16);
+        let fits = max_handoff_aggregate_grid_cells() / mandatory_checkpoint_cells(rows, cols);
+        assert!(
+            walk_pool(rows, cols, fits).is_ok(),
+            "{fits} panes at {rows}x{cols} are exactly what the aggregate holds \
+             visible-only, so every one of them must be admitted"
+        );
+        assert_eq!(
+            walk_pool(rows, cols, fits + 1),
+            Err(fits),
+            "one pane past the visible-only ceiling must be refused, and refused as the \
+             LAST session — never an earlier one that lost its budget to somebody \
+             else's scrollback"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pinnedness_tests {
+    use super::candidate_is_our_child;
+
+    /// THE PRECONDITION FOR A GROUP KILL, and the reason the emergency reaper may
+    /// no longer take it on trust.
+    ///
+    /// `kill(-pid)` is sound only while the number is PINNED to our candidate. A
+    /// fork child pins it — an unreaped child owns its pid until it is waited on.
+    /// A launchd-owned successor does not: it is nobody's child, launchd may reap
+    /// it at any moment, and the freed number can then name a stranger whose
+    /// process GROUP we would be signalling.
+    ///
+    /// So the reaper asks the kernel. This pins the two answers it relies on: a
+    /// live child of ours reads as pinned, and a process that is not our child
+    /// (here, this very process, which is certainly alive) does not — the latter
+    /// standing in for the launchd-owned successor, which no test can conjure.
+    #[test]
+    fn only_a_child_of_ours_pins_its_pid() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a child to own a pid");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits");
+        assert!(
+            candidate_is_our_child(pid),
+            "a live child of ours pins its number, so -pid still names its group"
+        );
+
+        // Not our child: alive, real, and never ours to sweep.
+        let own = libc::pid_t::try_from(std::process::id()).expect("pid fits");
+        assert!(
+            !candidate_is_our_child(own),
+            "a process that is not our child must never license a group kill"
+        );
+        assert!(!candidate_is_our_child(1), "launchd is not ours either");
+
+        // WNOWAIT is load-bearing: the probe must not consume the child, or the
+        // reaper's own wait would block forever on a pid it had already reaped.
+        child.kill().expect("kill the probe child");
+        let status = child.wait().expect("the probe left it waitable");
+        assert!(!status.success(), "it was killed, not exited cleanly");
+    }
+}
+
+#[cfg(all(test, unix))]
 mod handoff_process_group_tests {
     use super::{
-        HandoffCandidate, HandoffCommitFacts, HandoffRejectDelivery, HandoffRollbackWarrant,
-        ProcessGroupContainment, ReadyPollAction, classify_ready_poll, contain_own_process_group,
-        deliver_handoff_rejection, emergency_kill_and_reap_handoff_child,
-        handoff_candidate_terminated, handoff_commit_admitted, handoff_masters_closed,
-        handoff_masters_have_activity, kill_and_reap_handoff_child, make_cloexec_pipe,
-        wait_handoff_ready, worker_claim_handoff_reaper,
+        HandoffCandidate, HandoffCandidateHandle, HandoffCommitFacts, HandoffRejectDelivery,
+        HandoffRollbackWarrant, ProcessGroupContainment, ReadyPollAction, classify_ready_poll,
+        contain_own_process_group, deliver_handoff_rejection,
+        emergency_kill_and_reap_handoff_child, handoff_candidate_terminated,
+        handoff_commit_admitted, handoff_masters_closed, handoff_masters_have_activity,
+        handoff_ready_deadline, kill_and_reap_handoff_child, make_cloexec_pipe, wait_handoff_ready,
+        worker_claim_handoff_reaper,
     };
     use std::io::{BufRead as _, Read as _};
     use std::os::unix::process::CommandExt as _;
@@ -3186,7 +4386,13 @@ mod handoff_process_group_tests {
         assert_eq!(wrote as usize, wire.len(), "one complete proof wire");
         let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[master_rd]),
+            wait_handoff_ready(
+                &proof_rd,
+                expected,
+                &cancel_rx,
+                &[master_rd],
+                handoff_ready_deadline()
+            ),
             crate::UpdateHandoffOutcome::ProofReady,
             "queued shell output must not abort the ready wait"
         );
@@ -3196,7 +4402,13 @@ mod handoff_process_group_tests {
         let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
         cancel_tx.try_send(()).expect("queue cancel poke");
         assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[master_rd]),
+            wait_handoff_ready(
+                &proof_rd,
+                expected,
+                &cancel_rx,
+                &[master_rd],
+                handoff_ready_deadline()
+            ),
             crate::UpdateHandoffOutcome::ActivityRevoked,
             "cancel must carry the typed activity classification"
         );
@@ -3311,8 +4523,9 @@ mod handoff_process_group_tests {
         assert_eq!(unsafe { libc::kill(descendant, 0) }, 0, "descendant live");
 
         let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let mut handle = HandoffCandidateHandle::Forked(child);
         assert_eq!(
-            kill_and_reap_handoff_child(candidate, &mut child),
+            kill_and_reap_handoff_child(candidate, &mut handle),
             HandoffRollbackWarrant::Reaped,
             "our own fork child must be licensed by the strongest authority"
         );
@@ -3388,7 +4601,13 @@ mod handoff_process_group_tests {
         .expect("bounded proof fixture");
         let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
         assert_eq!(
-            wait_handoff_ready(&proof_rd, expected, &cancel_rx, &[]),
+            wait_handoff_ready(
+                &proof_rd,
+                expected,
+                &cancel_rx,
+                &[],
+                handoff_ready_deadline()
+            ),
             crate::UpdateHandoffOutcome::ChildDied,
             "proof EOF detects death without reaping the group leader"
         );
@@ -3407,8 +4626,9 @@ mod handoff_process_group_tests {
         assert_eq!(old_order["descendant_live"], 1);
 
         let candidate = HandoffCandidate::of_unreaped_child(&child);
+        let mut handle = HandoffCandidateHandle::Forked(child);
         assert_eq!(
-            kill_and_reap_handoff_child(candidate, &mut child),
+            kill_and_reap_handoff_child(candidate, &mut handle),
             HandoffRollbackWarrant::Reaped,
             "an exited-but-unreaped fork child is still ours to wait"
         );
@@ -4059,5 +5279,504 @@ mod returned_handoff_completion_lane_tests {
                 "{outcome:?} with a main-thread activity revocation"
             );
         }
+    }
+}
+
+/// THE LANE CHOICE, and every reason it falls back.
+///
+/// This is the decision that says whether the user's next update produces a
+/// survivor with a launchd application job or another pid-1 orphan, and it is
+/// made from facts that are individually cheap and collectively easy to get
+/// wrong. Each test below is one field of [`HandoffLaneFacts`] flipped against
+/// an otherwise-eligible attempt, because a predicate that ignored a field would
+/// otherwise pass every test written against the happy path.
+#[cfg(all(test, target_os = "macos"))]
+mod handoff_lane_tests {
+    use super::{HandoffLaneFacts, app_bundle_root, launch_environment, out_of_band_lane_refusal};
+
+    /// An attempt with nothing wrong with it.
+    fn eligible() -> HandoffLaneFacts {
+        HandoffLaneFacts {
+            bundled: true,
+            launcher_available: true,
+            socket_path_fits: true,
+            target_not_older: true,
+            sessions: 3,
+            environment_is_a_merge: true,
+        }
+    }
+
+    #[test]
+    fn an_eligible_attempt_takes_the_out_of_band_lane() {
+        assert_eq!(out_of_band_lane_refusal(eligible()), None);
+    }
+
+    /// A dev build, `cargo run`, and the test harness all reach the seamless
+    /// lane; none of them is a bundle, and LaunchServices has nothing to start.
+    #[test]
+    fn an_unbundled_process_forks() {
+        let facts = HandoffLaneFacts {
+            bundled: false,
+            ..eligible()
+        };
+        assert!(out_of_band_lane_refusal(facts).is_some());
+    }
+
+    /// THE 16 BYTES. `$HOME` decides whether the rendezvous path fits
+    /// `sun_path`, so on some perfectly ordinary machines this lane simply does
+    /// not exist — and the fallback has to be silent and total rather than a
+    /// bind that fails after the terminal has parked.
+    #[test]
+    fn a_rendezvous_path_that_does_not_fit_forks() {
+        let facts = HandoffLaneFacts {
+            socket_path_fits: false,
+            ..eligible()
+        };
+        assert!(out_of_band_lane_refusal(facts).is_some());
+    }
+
+    /// THE DOWNGRADE GUARD the retired version advertisement carried. "Presence
+    /// of the transport IS the version" closes old-parent/new-child and says
+    /// NOTHING about new-parent/old-child — so an older authorized target must
+    /// fork, or a successor with no rendezvous code is handed descriptors it
+    /// cannot receive and every session is lost to a hang.
+    #[test]
+    fn an_older_authorized_target_forks() {
+        let facts = HandoffLaneFacts {
+            target_not_older: false,
+            ..eligible()
+        };
+        assert!(out_of_band_lane_refusal(facts).is_some());
+    }
+
+    /// The transport, not the protocol, bounds the pool: one `SCM_RIGHTS`
+    /// message carries 64 descriptors and two of them are the pipes.
+    #[test]
+    fn a_pool_too_wide_for_one_message_forks() {
+        let limit = crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS;
+        assert_eq!(
+            out_of_band_lane_refusal(HandoffLaneFacts {
+                sessions: limit,
+                ..eligible()
+            }),
+            None,
+            "exactly the limit still fits"
+        );
+        assert!(
+            out_of_band_lane_refusal(HandoffLaneFacts {
+                sessions: limit + 1,
+                ..eligible()
+            })
+            .is_some(),
+            "one more does not, and must fall back rather than fail at sendmsg"
+        );
+        assert!(
+            out_of_band_lane_refusal(HandoffLaneFacts {
+                sessions: 0,
+                ..eligible()
+            })
+            .is_some(),
+            "an overlap with no sessions is not an overlap"
+        );
+    }
+
+    /// A LaunchServices launch MERGES its environment and cannot remove a
+    /// variable. `bind_expected_update_artifact` removes three, and a successor
+    /// that inherited a stale `ATERM_UPDATE_EXPECTED_*` would authenticate its
+    /// staged bundle against the wrong artifact — so a removal that would
+    /// actually remove something disqualifies the lane.
+    #[test]
+    fn an_environment_that_needs_a_removal_forks() {
+        let facts = HandoffLaneFacts {
+            environment_is_a_merge: false,
+            ..eligible()
+        };
+        assert!(out_of_band_lane_refusal(facts).is_some());
+    }
+
+    /// The predicate that produces that fact, against a real `Command`: a
+    /// removal of something this process does not have is a no-op (which is the
+    /// common case, since `env_remove` is called unconditionally), and a removal
+    /// of something it DOES have is what cannot be expressed.
+    #[test]
+    fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
+        let mut command = std::process::Command::new("/bin/echo");
+        command.env("ATERM_LANE_TEST_KEY", "value");
+        command.env_remove("ATERM_LANE_TEST_ABSENT_KEY_THAT_IS_NOT_SET");
+        let carried = launch_environment(&command).expect("a no-op removal is expressible");
+        assert_eq!(
+            carried,
+            vec![(
+                std::ffi::OsString::from("ATERM_LANE_TEST_KEY"),
+                std::ffi::OsString::from("value")
+            )],
+            "only real assignments travel; a vacuous removal contributes nothing"
+        );
+
+        // The removal now names something this process really carries. Scoped
+        // through the workspace's one lock-scoped env helper so no concurrent
+        // test observes the mutation.
+        aterm_log::env::scoped("ATERM_LANE_TEST_PRESENT_KEY", "set", || {
+            let mut command = std::process::Command::new("/bin/echo");
+            command.env_remove("ATERM_LANE_TEST_PRESENT_KEY");
+            assert!(
+                launch_environment(&command).is_none(),
+                "a merge cannot un-set a variable the launcher's own environment has"
+            );
+        });
+    }
+
+    /// The bundle root is `<bundle>.app/Contents/MacOS/<bin>` and the `.app`
+    /// suffix is CHECKED — a dev binary also sits three levels below something.
+    #[test]
+    fn only_a_dot_app_three_levels_up_is_a_bundle_root() {
+        let temp = std::env::temp_dir().join(format!("aterm-lane-{}", std::process::id()));
+        let bundle = temp.join("aterm.app");
+        let macos = bundle.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).expect("fixture bundle");
+        assert_eq!(
+            app_bundle_root(&macos.join("aterm")).as_deref(),
+            Some(bundle.as_path())
+        );
+
+        let plain = temp.join("target/debug/deps");
+        std::fs::create_dir_all(&plain).expect("fixture dev tree");
+        assert_eq!(
+            app_bundle_root(&plain.join("aterm-gui")),
+            None,
+            "a dev build is three levels below a directory too, and is not a bundle"
+        );
+        assert_eq!(
+            app_bundle_root(std::path::Path::new("aterm")),
+            None,
+            "and a bare name has no three levels at all"
+        );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+}
+
+/// TIER-1 CONFORMANCE for the seamless handoff's PER-SESSION ownership model
+/// ([`aterm_spec::derive::native_update_seamless_handoff_ownership_model`]).
+///
+/// A model that is green with no bind proves a property of the DESCRIPTION of
+/// the handoff, not of the handoff. These tests drive the GENUINE decision
+/// function out of this module over its whole bounded input space and check
+/// that what the shipping code decides is exactly what the model admits.
+///
+/// IT LIVES HERE, INSIDE THE MODULE IT BINDS, on purpose: as a sibling file it
+/// needed ten private items widened to `pub(crate)` — a production diff whose
+/// only consumer was a test, which is exactly how a private seam stops being
+/// private. A child module sees its parent's privates for free.
+///
+/// WHAT IS BOUND, and what is not, because that distinction is the whole value.
+/// Bound: the final Commit admission — the predicate that decides whether an
+/// attempt may transfer ownership at all. Modelled but NOT bound: the physical
+/// surface those decisions gate (the ownership transfer and `_exit` inside
+/// `seamless::commit_and_exit`, the reader park/resume, the `F_DUPFD_CLOEXEC`
+/// duplication), because each either replaces this process or needs a live
+/// event loop with real sessions. Those are the QA-seam tests' job.
+///
+/// Three further binds were written and DELETED rather than shipped: their model
+/// assertions were loop-invariant constants sitting beside the real-code
+/// assertions, which reads as conformance and is not — the model half asserted
+/// the same thing on every iteration regardless of what the code answered. One
+/// honest bind is worth more than four that look thorough.
+#[cfg(all(test, unix))]
+mod ownership_conformance {
+    use super::{HandoffCommitFacts, handoff_commit_admitted, handoff_rejection_activity_shaped};
+    use aterm_spec::derive::{Model, native_update_seamless_handoff_ownership_model};
+    use aterm_spec::interp::{State, admits, with_buggy};
+
+    const TO_DESCRIPTORS_TRANSFERRED: [&str; 4] = [
+        "ParkOutgoingReaders",
+        "CaptureCheckpoints",
+        "StartReaderlessCandidate",
+        "DuplicateDescriptorsToCandidate",
+    ];
+
+    /// The same prefix plus the proof, i.e. the model's `ProofMatched`.
+    const TO_PROOF_MATCHED: [&str; 5] = [
+        "ParkOutgoingReaders",
+        "CaptureCheckpoints",
+        "StartReaderlessCandidate",
+        "DuplicateDescriptorsToCandidate",
+        "MatchAdoptionProof",
+    ];
+
+    /// Fire a deterministic sequence, checking at every step that the model admits
+    /// exactly the named action — never that it admits *something*.
+    fn walk(model: &Model, actions: &[&'static str]) -> State {
+        let mut state = model.init_state();
+        for &action in actions {
+            let next = model.successors(action, &state);
+            assert_eq!(
+                next.len(),
+                1,
+                "{action} must be deterministically enabled at {state:?}"
+            );
+            assert_eq!(admits(model, &state, &next[0]), Some(action));
+            state = next[0].clone();
+        }
+        state
+    }
+
+    fn assert_every_invariant_holds(model: &Model, state: &State) {
+        for invariant in &model.invariants {
+            assert!(
+                model.check_invariant(invariant.name, state),
+                "state violates {}::{}: {state:?}",
+                model.name,
+                invariant.name,
+            );
+        }
+    }
+
+    /// Every reachable state, by BFS over the same successor relation the
+    /// interpreter's own bounded model check uses. Small by construction (two
+    /// sessions, and the protocol is a chain), so the bound is a regression
+    /// tripwire rather than a real limit.
+    fn reachable(model: &Model) -> Vec<State> {
+        let mut seen: std::collections::BTreeSet<State> = std::collections::BTreeSet::new();
+        let mut queue: std::collections::VecDeque<State> = std::collections::VecDeque::new();
+        let init = model.init_state();
+        seen.insert(init.clone());
+        queue.push_back(init);
+        while let Some(state) = queue.pop_front() {
+            for action in &model.actions {
+                for next in model.successors(action.name, &state) {
+                    if seen.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.len() < 20_000,
+            "the ownership model's bounded space regressed to {} states",
+            seen.len()
+        );
+        seen.into_iter().collect()
+    }
+
+    /// Is a state satisfying `goal` reachable from `from`?
+    fn reaches(model: &Model, from: &State, goal: impl Fn(&State) -> bool) -> bool {
+        let mut seen: std::collections::BTreeSet<State> = std::collections::BTreeSet::new();
+        let mut queue: std::collections::VecDeque<State> = std::collections::VecDeque::new();
+        seen.insert(from.clone());
+        queue.push_back(from.clone());
+        while let Some(state) = queue.pop_front() {
+            if goal(&state) {
+                return true;
+            }
+            for action in &model.actions {
+                for next in model.successors(action.name, &state) {
+                    if seen.insert(next.clone()) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn facts_from_bits(bits: u32) -> HandoffCommitFacts {
+        HandoffCommitFacts {
+            exact_sessions: bits & (1 << 0) != 0,
+            exact_layout: bits & (1 << 1) != 0,
+            exact_activity: bits & (1 << 2) != 0,
+            teardown_allows_commit: bits & (1 << 3) != 0,
+            parent_still_parked: bits & (1 << 4) != 0,
+            sessions_alive: bits & (1 << 5) != 0,
+            input_dispatch_fenced: bits & (1 << 6) != 0,
+            egress_settled: bits & (1 << 7) != 0,
+            native_safe: bits & (1 << 8) != 0,
+            proof_exact: bits & (1 << 9) != 0,
+            commit_channel: bits & (1 << 10) != 0,
+        }
+    }
+
+    /// The model's `revoked` is "some mutable pre-Commit admission fact turned
+    /// false". `parent_still_parked` and `proof_exact` are deliberately NOT folded
+    /// into it: the model carries those two as variables of their own
+    /// (`out_readers`, `proof_matched`) because they are the two facts the ownership
+    /// invariants are actually about — who is reading, and what licensed a transfer.
+    fn model_revoked(facts: HandoffCommitFacts) -> bool {
+        !(facts.exact_sessions
+            && facts.exact_layout
+            && facts.exact_activity
+            && facts.teardown_allows_commit
+            && facts.sessions_alive
+            && facts.input_dispatch_fenced
+            && facts.egress_settled
+            && facts.native_safe
+            && facts.commit_channel)
+    }
+
+    /// Project one bounded fact combination onto the model's pre-Commit state.
+    ///
+    /// A projection can express states the healthy model proves unreachable — a
+    /// parent reader that resumed mid-attempt is exactly one — and that is the
+    /// point: the bind then checks that the shipping admission and the model's guard
+    /// refuse the SAME combinations.
+    fn project_commit_facts(
+        transferred: &State,
+        matched: &State,
+        facts: HandoffCommitFacts,
+    ) -> State {
+        let mut state = if facts.proof_exact {
+            matched.clone()
+        } else {
+            transferred.clone()
+        };
+        state.insert("revoked", i64::from(model_revoked(facts)));
+        state.insert("out_readers", i64::from(!facts.parent_still_parked));
+        state
+    }
+
+    /// THE FINAL ADMISSION, exhaustively. `handoff_commit_admitted` is the compiled
+    /// conjunction standing immediately before the attempt-wide Commit CAS, so it —
+    /// and nothing in this file — decides whether a session's ownership moves. All
+    /// 2^11 of its bounded fact combinations are driven through it and through the
+    /// model's `CommitAtomically` guard, and the two must agree combination for
+    /// combination.
+    #[test]
+    fn real_commit_admission_conforms_to_the_ownership_model_over_every_bounded_fact_combination() {
+        let model = native_update_seamless_handoff_ownership_model();
+        let transferred = walk(&model, &TO_DESCRIPTORS_TRANSFERRED);
+        let matched = walk(&model, &TO_PROOF_MATCHED);
+        let mut admitted_combinations = 0usize;
+        let mut refused_parked: std::collections::BTreeSet<State> =
+            std::collections::BTreeSet::new();
+
+        for bits in 0..(1u32 << 11) {
+            let facts = facts_from_bits(bits);
+            let before = project_commit_facts(&transferred, &matched, facts);
+            let admitted = handoff_commit_admitted(facts);
+            let successors = model.successors("CommitAtomically", &before);
+            assert_eq!(
+                admitted,
+                !successors.is_empty(),
+                "the shipping admission and the model's Commit guard disagree for {facts:?}"
+            );
+
+            // An activity-shaped rejection is a REFUSAL first and a retry
+            // classification second: it may never coexist with an admitted Commit,
+            // or the automatic lane would spend budget re-attempting a handoff that
+            // already landed.
+            if handoff_rejection_activity_shaped(facts) {
+                assert!(
+                    !admitted,
+                    "an activity-shaped rejection cannot also be admitted: {facts:?}"
+                );
+            }
+
+            if !admitted {
+                // The parent's own readers are the one fact that does not describe
+                // the attempt's rollback prospects: once a reader has resumed, that
+                // axis of the rollback has already happened. Every refusal with the
+                // readers still parked must have a path back to Resumed.
+                if facts.parent_still_parked {
+                    refused_parked.insert(before);
+                }
+                continue;
+            }
+
+            admitted_combinations += 1;
+            let after = successors[0].clone();
+            assert_eq!(admits(&model, &before, &after), Some("CommitAtomically"));
+            assert_every_invariant_holds(&model, &after);
+            assert_eq!(after["commits"], 1);
+            assert_eq!(after["owner_a"], 2, "session a moved to the candidate");
+            assert_eq!(after["owner_b"], 2, "session b moved to the candidate");
+            assert_eq!(after["out_live"], 0, "the outgoing process exited");
+            assert_eq!(
+                after["cand_readers"], 0,
+                "the candidate's reader gate opens after Commit, never with it"
+            );
+        }
+
+        // ROLLBACK IS AVAILABLE FOR EVERY REFUSAL — genuine or activity-shaped, and
+        // whichever fact turned false. Checked once per DISTINCT projected state
+        // rather than once per fact combination; the projection is many-to-one.
+        assert!(refused_parked.len() > 1, "vacuous refusal projection");
+        for state in &refused_parked {
+            assert!(
+                reaches(&model, state, |candidate| {
+                    candidate["phase"] == 7
+                        && candidate["out_live"] == 1
+                        && candidate["owner_a"] == 1
+                        && candidate["owner_b"] == 1
+                        && candidate["commits"] == 0
+                }),
+                "no rollback path to Resumed from the refused state {state:?}"
+            );
+        }
+
+        // Non-vacuity: the compiled conjunction admits EXACTLY the
+        // all-facts-hold combination, so the sweep above is not passing because
+        // everything happens to be refused.
+        assert_eq!(
+            admitted_combinations, 1,
+            "exactly one bounded combination may authorize a Commit"
+        );
+    }
+
+    /// THE READINESS WAIT'S VERDICT. `classify_ready_poll` is the compiled function
+    /// that turns one `poll` answer into "the adopted set is stale", "read the
+    /// proof", or "yield". Exhausted over every `revents` combination for the proof
+    /// fd and a two-master pool — the same pool cardinality the model carries.
+    #[test]
+    fn every_pre_commit_state_has_a_path_back_to_resumed_with_both_sessions_still_ours() {
+        let model = native_update_seamless_handoff_ownership_model();
+        let states = reachable(&model);
+        assert!(states.len() > 10, "vacuous reachable space");
+
+        let (mut pre_commit, mut committed, mut settled) = (0usize, 0usize, 0usize);
+        for state in &states {
+            assert_every_invariant_holds(&model, state);
+            if state["commits"] > 0 {
+                committed += 1;
+                continue;
+            }
+            if state["phase"] == 7 || state["phase"] == 8 {
+                settled += 1;
+                continue;
+            }
+            if state["phase"] == 0 {
+                continue;
+            }
+            pre_commit += 1;
+            assert!(
+                reaches(&model, state, |candidate| {
+                    candidate["phase"] == 7
+                        && candidate["out_live"] == 1
+                        && candidate["out_readers"] == 1
+                        && candidate["owner_a"] == 1
+                        && candidate["owner_b"] == 1
+                        && candidate["commits"] == 0
+                }),
+                "no rollback path to Resumed from {state:?}"
+            );
+        }
+        assert!(
+            pre_commit > 0 && committed > 0 && settled > 0,
+            "the sweep must see all three lanes: {pre_commit} pre-commit, \
+             {committed} committed, {settled} settled"
+        );
+
+        let buggy = with_buggy(&model, 1);
+        let broken = reachable(&buggy);
+        assert!(
+            broken
+                .iter()
+                .any(|state| !buggy.check_invariant("NoSessionIsEverOrphaned", state)),
+            "the mutant must be able to orphan a session"
+        );
+        assert!(
+            broken
+                .iter()
+                .any(|state| !buggy.check_invariant("NeverTwoReadersOnOneMaster", state)),
+            "the mutant must be able to put two readers on one master"
+        );
     }
 }

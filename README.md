@@ -320,6 +320,12 @@ it as privileged:
 - Network driving is opt-in and uses an authenticated TLS relay; it is not the
   default control path.
 - Capture paths are confined to server-managed runtime directories.
+- Release signing is anchored by a **paper master key** that exists on no
+  computer. It signs only a machine roster, which names one signing key per
+  publishing machine and carries the deny-list that withdraws one. A stolen
+  machine key is therefore revocable by an authority the thief does not hold,
+  and every release states which machine signed it. What a build trusts is a
+  committed constant, never an environment variable.
 
 `--sandbox` adds the macOS network and secret-directory cage. Linux currently
 enforces resource limits plus the capability gate; Windows currently enforces

@@ -107,7 +107,10 @@ pub(crate) enum PollDecision {
     /// machine was actually idle: `false` means the bounded preference window
     /// elapsed while it stayed busy, so the host must take the lane that does
     /// not wait for — or let itself be revoked by — further activity.
-    Attempt { build: u64, quiet: bool },
+    Attempt {
+        build: u64,
+        quiet: bool,
+    },
 }
 
 /// Decide one event-loop poll. Every `Wait` retains the caller-owned intent.

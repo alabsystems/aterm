@@ -54,6 +54,12 @@ mod app_config;
 mod app_input;
 mod app_introspect;
 mod app_kitty;
+/// The LaunchServices lane's launcher: start a `.app` bundle as its OWN launchd
+/// application job — the fix for the fork lane's orphaned XPC domain (see the
+/// note at the `spawn` in `app_update_handoff::run_handoff_worker` and
+/// `tests/handoff_launchd_job.rs`). macOS-only, along with the lane it serves.
+#[cfg(target_os = "macos")]
+mod app_launch_successor;
 mod app_mouse;
 mod app_native;
 #[cfg(feature = "a11y-accesskit")]
@@ -108,6 +114,11 @@ mod control_connection_conformance;
 mod crash_signal;
 #[cfg(windows)]
 mod explorer_win;
+/// The seamless handoff's out-of-band transport: the single-use `SCM_RIGHTS`
+/// rendezvous a parent binds before launching its successor. macOS-only,
+/// because the launched lane and the PTY-device proof term both are.
+#[cfg(target_os = "macos")]
+mod handoff_rendezvous;
 #[cfg(windows)]
 mod hdr_win;
 #[cfg(test)]
@@ -148,7 +159,9 @@ mod keybinding;
 mod keymap;
 /// The Kitty Log (§F4): durable kitty-sighting ledger + settings collection book.
 mod kitty_log;
-/// The typed-"kitty" terminal cameo detector (the Settings §L.4 cameo's twin).
+/// The typed-word detector: feline completions record a Kitty Log sighting,
+/// profanity winces the companion, and `dog` past the typed-a-lot gate pops a
+/// visiting dog.
 mod kitty_summon;
 /// The "level up" update celebration (pulsing border glow + rising up-arrow).
 mod level_up;
@@ -2184,22 +2197,6 @@ enum Wake {
         /// lifecycle, or dismiss the Menu palette through its overlay exit path.
         close: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
-    },
-    /// The batteries-included TOOLCHAIN SEED reported (first launch / first launch after
-    /// an app update added programs). Constructed ONLY by the `atpkg-update` thread
-    /// (`spawn_pkg_update_check`), ONCE per process at most: the launch-time `atpkg seed`
-    /// child's captured stdout carried one of the two STABLE marker lines
-    /// (`atpkg: seed-installed: …` / `atpkg: seed-pending: …` — see
-    /// [`parse_seed_markers`]); a quiet seed posts nothing. `installed` is the bundled
-    /// programs the pass just installed (may be empty when only the consent-pending
-    /// marker matched); `pending` is the human tail of the pending line — present when a
-    /// seed is available but `[packages].auto_install` consent is off. Fire-and-forget
-    /// and safe by construction: the main thread only raises the NON-clickable transient
-    /// status pill (details stay in Settings ▸ Packages, the same truth atpkg records in
-    /// its own `status.toml`) — no install authority crosses this event.
-    PkgSeed {
-        installed: Vec<String>,
-        pending: Option<String>,
     },
 }
 
@@ -5615,7 +5612,7 @@ struct WindowState {
     /// rolling window of this window's recent printed keystrokes (keyed to the
     /// session they were typed into) plus the per-window summon cooldown. Fed
     /// only on the committed key-press path — it never sees screen content, so
-    /// `cat`ing a file full of "kitty" cannot summon the cameo.
+    /// `cat`ing a file full of "kitty" cannot fire it.
     kitty_summon: crate::kitty_summon::TypedKittySummon,
     /// TYPED-word DOG cameo lifecycle (`aterm_effects::dog_cameo`): the
     /// envelope + rolled breed for the canine summon `kitty_summon` fires once
@@ -5623,9 +5620,44 @@ struct WindowState {
     /// recorded anywhere.
     dog_cameo: aterm_effects::dog_cameo::DogCameo,
     /// The session the live dog visit was summoned in — the dog's pane/tab
-    /// scope, the same law the typed-kitty cameo's pane tag enforces: a toy
-    /// summoned in tab A must never present on tab B's glass.
+    /// scope: a visitor summoned in tab A must never present on tab B's glass.
+    /// `WindowState` is per WINDOW and a tab switch retires nothing, so this
+    /// tag is the only thing that keeps it off the wrong grid.
     dog_cameo_session: Option<u64>,
+    /// ROBI THE HELPER ROBOT (`aterm_effects::robi`): the resident's birth
+    /// instant + tip roll; everything else derives per frame. Once born he is
+    /// on the glass at all times (per window — he walks whatever tab fronts);
+    /// `stop` only for config/motion/serious hygiene.
+    robi_show: aterm_effects::robi::RobiShow,
+    /// Lifetime (re)birth counter — the seed fold, so name-summons rotate
+    /// through different tips.
+    robi_shows: u64,
+    /// Rolling lowercase tail of recent printed keystrokes (8 chars), the
+    /// literal `robi`/`robot` summon matcher — no lexicon class, he answers to
+    /// his name. Fed on the committed key-press path only, like the cats.
+    robi_tail: String,
+    /// The tip index the render path wants POSTED as a transient notice —
+    /// written inside the window borrow, drained by the notice owner after it
+    /// ends (the notice is App-global).
+    robi_tip_request: Option<u16>,
+    /// The tip index already posted for the current tip window, so a 60 fps
+    /// cycle does not re-spawn the same bubble every frame.
+    robi_tip_posted: Option<u16>,
+    /// Robi's speech-bubble anchor in tray px — `(x_center, y_top_of_head)`,
+    /// refreshed every drawn frame so his tip bubble rides above his head
+    /// wherever he is (floor, ladder, or hanging off the tab bar).
+    robi_bubble_anchor: Option<(f32, f32)>,
+    /// Robi's body rect in FRAME px, stashed by the render pass for the mouse
+    /// path (the `pet_hit_rect` discipline: written every drawn frame, `None`
+    /// whenever he isn't on the glass — a cleared stash never eats a click).
+    robi_hit_rect: Option<(i32, i32, i32, i32)>,
+    /// THE DISMISS LATCH (owner, 2026-08-15: "it needs to be easily
+    /// dismissable"): a left-click on Robi's body sends him off THIS window
+    /// until he is resummoned by name (`robi`/`robot`) — per window, per
+    /// session, never written to config (the persistent opt-out stays
+    /// `robi = false`). A latch rather than a bare `stop()` because the render
+    /// path immediately re-births any stopped resident whose gates are green.
+    robi_dismissed: bool,
     /// SING-ALONG detector (`aterm_effects::kitty_sing`): the
     /// held-key repeat run, fed on the SAME committed key-press path as
     /// `kitty_summon` (typed provenance only — PTY output and pastes can
@@ -6310,6 +6342,25 @@ struct WindowState {
 }
 
 impl WindowState {
+    /// Whether the notice card is the one ACTUALLY ON GLASS in this window.
+    ///
+    /// The paint-only cards share ONE composited slot, in the order
+    /// `settings_card → level_up_card → notice_card → badge_card` (see
+    /// `App::fold_route_card`), so "a notice is armed" and "a notice is visible" are
+    /// different facts: `App::notice` is global, its card can be absent in this window
+    /// (serious mode, zero columns, a rect the paint region rejected), and even a present
+    /// card is invisible while the level-up flourish owns the slot for the first ~1.1 s of
+    /// the pill's life.
+    ///
+    /// Anything with a SIDE EFFECT must ask this question rather than the model's. The
+    /// click path did not: it hit-tested the pill's rectangle whenever `App::notice` was
+    /// `Some`, so a click on that patch of otherwise-blank terminal — during the level-up
+    /// burst, or in a window whose card never composited — silently applied the update and
+    /// re-execed the whole app.
+    pub(crate) fn notice_is_on_glass(&self) -> bool {
+        self.notice_card.is_some() && self.settings_card.is_none() && self.level_up_card.is_none()
+    }
+
     /// Whether this window is inside the [`RESIZE_SOUND_QUIET`] window: within
     /// that duration of the last APPLIED reflow (`last_resize_at`, stamped by
     /// every interactive resize tick and the trailing drag settle — a live
@@ -6540,15 +6591,14 @@ impl WindowState {
             // same "a correct emitter renders one frame and freezes" rule the
             // word-decoration arm above carries.
             || (animate_cursor_cat && self.cursor_pet.needs_frames())
-            // SCOPED, not blanket (skeptic's finding, 2026-08-09): the typed
-            // cameo rides this same arm, `WordDecorations` is per WINDOW, and a
-            // tab switch retires nothing — so a toy summoned in tab A held this
-            // window at 60 fps for its full ~5.04 s life while the user worked
-            // in tab B, where both renderers correctly refuse to draw it. An
-            // animation nobody can see is not a reason to present.
-            || self
-                .word_decos
-                .is_active_in(now, |session| self.shows_session(session))
+            // Every arm of this predicate is an EPISODE, and `retain_panes`
+            // prunes those against the visible layout on every composed frame,
+            // so an episode still here is one the host still shows. (A
+            // per-session narrowing used to be needed: the retired typed-kitty
+            // cameo rode this arm from outside the episode set and could
+            // outlive a tab switch, holding a window at 60 fps for a toy no
+            // renderer would draw.)
+            || self.word_decos.is_active(now)
             || (!self.is_split()
                 && (self.cursor_rainbow.is_active()
                     || self.cursor_droplet.is_active()
@@ -6587,55 +6637,23 @@ impl WindowState {
     /// The reduced-motion cat's one-shot erase deadline, gated by the same
     /// canonical terminal-front boundary as the animated effects lane.
     ///
-    /// TWO CATS SHARE THIS LANE, on deliberately different gates:
-    ///
-    /// * the CURSOR COMPANION's held collection hello — single-pane only,
-    ///   because `redraw_compose` does not tick the companion's fade machine;
-    /// * the TYPED-KITTY CAMEO ([`aterm_effects::kitty_cameo`]) — emitted on
-    ///   BOTH render paths, so it takes NO `is_split()` gate. Under reduced
-    ///   motion the cameo owns no frame cadence (`is_active` answers `false`),
-    ///   so this deadline is the ONLY thing that will ever schedule the frame
-    ///   that erases it; gating it on layout would leave a split-pane toy
-    ///   painted on glass forever.
-    ///
-    /// The earlier of the two wins: whichever cat has to come off glass first
-    /// sets the wake, and the other is still live when that frame runs.
-    ///
-    /// THE CAMEO ALSO IGNORES `animate_cursor_cat`, which is the companion's
-    /// gate and not a motion policy: the cameo's reduced/animated verdict comes
-    /// from the sparkle engine's OWN `DecoConfig::reduced_motion` — the
-    /// `[sparkle_words] reduced_motion` knob and the per-window motion
-    /// demotion — and those move independently. `cameo_static_deadline` already
-    /// answers `None` unless the engine really is rendering the cameo reduced,
-    /// so a second, unrelated gate here could only produce the failure it
-    /// looks like a safeguard against: one static frame painted and never
-    /// erased. Nor is it focus-gated, for the stream-fade precedent — the
-    /// erase frame that takes a toy off glass must present on an unfocused
-    /// window too.
+    /// ONE CAT IS LEFT ON THIS LANE: the CURSOR COMPANION's held collection
+    /// hello — single-pane only, because `redraw_compose` does not tick the
+    /// companion's fade machine. The typed-kitty cameo used to share it (on no
+    /// `is_split()` gate, since it drew on both render paths) and is gone; the
+    /// sparkle engine's own episodes never took this lane, because reduced
+    /// motion renders them as stills the ordinary rescan already refreshes.
     fn static_cursor_cat_deadline(
         &self,
         now: Instant,
         animate_cursor_cat: bool,
     ) -> Option<Instant> {
         // A window with no front terminal has nothing on glass to erase, so
-        // neither toy can owe a static frame here.
+        // nothing can owe a static frame here.
         self.front_terminal()?;
-        let companion = (!self.is_split() && self.focused && !animate_cursor_cat)
+        (!self.is_split() && self.focused && !animate_cursor_cat)
             .then(|| self.cursor_cat.static_deadline(now))
-            .flatten();
-        // SCOPED for the same reason the frame-cadence arm is, and the
-        // reduced-motion lane is the worse of the two: an unseen cameo never
-        // lands a sprite, so its BAKE-RETRY deadline re-arms every ~16 ms for
-        // the whole hold — a wake train in the mode whose contract is one still
-        // pose and one erase. Hidden means nothing drew it, so nothing has to
-        // erase it; switching back schedules a frame that recomputes this.
-        let cameo = self
-            .word_decos
-            .cameo_static_deadline_in(now, |session| self.shows_session(session));
-        match (companion, cameo) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+            .flatten()
     }
 
     /// Park every clock owned by the shared cursor-effects scheduler. The effect
@@ -6731,32 +6749,6 @@ impl WindowState {
         self.tab_set
             .active()
             .is_some_and(|tab| tab.root.len() > 1 && !tab.zoomed)
-    }
-
-    /// Whether this window is currently DRAWING `session` — the active tab's
-    /// pane leaves, narrowed to the focused pane while that tab is zoomed (a
-    /// zoom composes only that one pane, the same rule
-    /// [`active_tab_displays_session`] applies on the canonical side).
-    ///
-    /// Read off the TERMINAL PROJECTION (`layouts[tabs.active]`) rather than
-    /// the canonical `tab_set`, because only the projection is keyed by SESSION
-    /// — `Tab::root` is a `SplitTree<ViewId>` and knows nothing about session
-    /// ids. Its parked-on-native staleness cannot leak here: every caller gates
-    /// on [`Self::front_terminal`] first, which fails closed on a native front.
-    ///
-    /// The visibility half of the effect-scheduler predicates: engines whose
-    /// state is per WINDOW but whose OUTPUT is per session (the typed-kitty
-    /// cameo) must not arm a wake train for something no renderer will emit.
-    /// A session in another TAB fails here, which is the case that matters —
-    /// nothing retires a cameo on a tab switch.
-    fn shows_session(&self, session: u64) -> bool {
-        self.layouts.get(self.tabs.active).is_some_and(|tree| {
-            if tree.is_zoomed() && tree.len() > 1 {
-                tree.focus() == session
-            } else {
-                tree.contains(session)
-            }
-        })
     }
 
     /// The Settings overlay for this window, if it is the OPEN variant. The accessor shim
@@ -7048,6 +7040,14 @@ impl WindowState {
             kitty_summon: crate::kitty_summon::TypedKittySummon::default(),
             dog_cameo: aterm_effects::dog_cameo::DogCameo::default(),
             dog_cameo_session: None,
+            robi_show: aterm_effects::robi::RobiShow::default(),
+            robi_shows: 0,
+            robi_tail: String::new(),
+            robi_tip_request: None,
+            robi_tip_posted: None,
+            robi_bubble_anchor: None,
+            robi_hit_rect: None,
+            robi_dismissed: false,
             kitty_sing: aterm_effects::kitty_sing::KittySing::default(),
             music_notes: aterm_effects::kitty_sing::MusicNotes::default(),
             sing_riff_bar: None,
@@ -7730,6 +7730,32 @@ type HandoffCommitFd = std::os::fd::OwnedFd;
 #[cfg(not(unix))]
 type HandoffCommitFd = std::convert::Infallible;
 
+/// The middle field of one adopted session's `SessionIdentity`, in whichever
+/// term the transport this process's descriptors arrived on can prove.
+///
+/// One function so the two sides of the choice sit next to each other and a
+/// reader cannot mistake the fd number for a fallback default — it is the term
+/// for a specific transport, not the safe answer. `None` means the term could
+/// not be computed at all, which callers must treat as a withheld proof rather
+/// than as an omitted session (see [`App::maybe_signal_handoff_ready`]).
+#[cfg(unix)]
+#[must_use]
+fn handoff_proof_term(master: i32, device_term: bool) -> Option<i32> {
+    if !device_term {
+        // INHERITED: `execve` copied the parent's descriptor table verbatim, so
+        // the number is a value both sides compute and agree on.
+        return Some(master);
+    }
+    #[cfg(target_os = "macos")]
+    let term = handoff_rendezvous::pty_device_term(master);
+    // No other platform has an out-of-band lane, so nothing can set the flag —
+    // and answering with the fd number here would be answering a question about
+    // a transport that does not exist.
+    #[cfg(not(target_os = "macos"))]
+    let term = None;
+    term
+}
+
 /// One authorized overlap handoff retained while its child boots. The reducer's
 /// exact apply ticket remains owned by `NativeUpdaterService`; this state binds
 /// the asynchronous OS child/result to the session set that was actually parked.
@@ -7737,6 +7763,15 @@ struct PendingUpdateHandoff {
     attempt_id: u64,
     nonce: Option<String>,
     live: Vec<(u64, i32, i32)>,
+    /// The identity triples the adoption proof hashes — NOT `live`.
+    ///
+    /// `live` is transport: real descriptor numbers this process polls. The
+    /// proof's middle term is whatever BOTH sides compute independently, and
+    /// that depends on the lane the attempt chose (descriptor number when the
+    /// successor is forked, PTY device when the descriptors travel over the
+    /// rendezvous). Recorded here because the main thread re-derives the proof
+    /// from this attempt at Commit time, and the two halves of one proof must
+    /// speak the same term.
     adoption: Vec<(u64, i32, i32)>,
     child_pid: Option<u32>,
     mode: native_updater_service::ApplyMode,
@@ -7844,20 +7879,37 @@ fn fold_auto_apply_deadline(
     })
 }
 
-/// The irreversible boot-health request may be queued only after content has
-/// actually reached a drawable. Window allocation is not a health proof: a
+/// The irreversible boot-health request may be queued only after this build has
+/// proven it reached a working engine. WINDOWED, that proof is content actually
+/// reaching a drawable: window allocation is not a health proof, because a
 /// renderer can fail between `attach_os_window` and its first successful present.
+///
+/// HEADLESS has no glass, and the predicate used to say only `!headless && …` —
+/// which was half a design. Headless self-update is a supported lane (the
+/// successor of a headless apply is itself headless), so the trial sentinel
+/// armed at apply time could never be disarmed: every later apply returned
+/// `NotApplicable`, and on the third launch the updater reverted a build that
+/// had demonstrably booted three times. Headless therefore gets its own
+/// checkpoint — see [`App::headless_boot_health_checkpoint`] — instead of no
+/// checkpoint at all.
+///
 /// Kept as one pure production guard so Tier-1 exercises the exact predicate
 /// used by `about_to_wait`.
 #[must_use]
 fn should_dispatch_boot_health_confirmation(
     headless: bool,
+    headless_ready: bool,
     first_present_done: bool,
     already_dispatched: bool,
     retry_due: bool,
     has_os_window: bool,
 ) -> bool {
-    !headless && first_present_done && !already_dispatched && retry_due && has_os_window
+    let checkpoint = if headless {
+        headless_ready
+    } else {
+        first_present_done && has_os_window
+    };
+    checkpoint && !already_dispatched && retry_due
 }
 
 /// A USER metadata change can affect two independent surfaces: the in-grid tab
@@ -8222,7 +8274,7 @@ struct App {
     /// writer thread — never the render path. See [`crate::kitty_log`].
     kitty_log: crate::kitty_log::KittyLogHost,
     /// Monotonic sequence for typed-"kitty" summon idents (see
-    /// [`App::summon_typed_kitty`]). App-wide — not per window — so two
+    /// [`App::record_typed_kitty`]). App-wide — not per window — so two
     /// windows sharing one session can never mint the same `(session, ident)`
     /// episode and lose a granted summon to the Kitty Log's dedupe ring.
     ///
@@ -8308,6 +8360,27 @@ struct App {
     /// this process, and resumes with every shell intact — strictly better
     /// than exiting under a boot that dropped one of its windows.
     handoff_degraded: bool,
+    /// OVERLAP HANDOFF: which TERM the adoption proof's middle field carries,
+    /// decided by the transport this process's descriptors arrived on and by
+    /// nothing else.
+    ///
+    /// `false` — the descriptors were INHERITED, so both sides can hash the
+    /// descriptor NUMBER: `execve` copied the parent's table verbatim and the
+    /// child's master keeps the parent's number. That is the only shape any
+    /// build in the field speaks.
+    ///
+    /// `true` — they arrived over the rendezvous, where the kernel picked our
+    /// numbers and the parent's are meaningless here. The term is the PTY's own
+    /// device (`handoff_rendezvous::pty_device_term`), which is a property of
+    /// the open file description and therefore identical on both sides.
+    ///
+    /// NOT NEGOTIATED, and deliberately not a version byte: a parent can only
+    /// send descriptors out of band if it HAS out-of-band code, so the transport
+    /// this process observed IS the version. Getting this wrong does not corrupt
+    /// anything — it produces a digest the parent refuses (`AdoptionMismatch`),
+    /// the parent rolls back, and every session survives — but it would retire
+    /// the automatic lane, which is why it is derived and never configured.
+    handoff_device_proof_term: bool,
     /// Whether session 0 was re-adopted from a seamless-update handoff. A cold
     /// native-only restore may retire its throwaway bootstrap shell, but an adopted
     /// bootstrap owns a live pre-update shell and must remain reachable even when an
@@ -9960,6 +10033,29 @@ impl App {
     /// the real per-session routing path instead of swapping only one mirror.
     #[cfg(test)]
     fn headless_for_test_with_sink(sink: Arc<SinkWriter>) -> App {
+        // LEDGER ISOLATION (2026-08-15): every headless test process points
+        // the update crate's staging root at its own scratch dir, ONCE. The
+        // unit suite exercises the real apply recorders with fixture strings
+        // ("handoff proof ended TimedOut", current_build 10), and without
+        // this the fixtures were written into ~/Library/Application
+        // Support/aterm/Updates — ~2,125 phantom apply failures on this
+        // machine's REAL health ledger, presented by `update status` as a
+        // persistent streak on a healthy install.
+        static UPDATE_ROOT: std::sync::Once = std::sync::Once::new();
+        UPDATE_ROOT.call_once(|| {
+            let scratch =
+                std::env::temp_dir().join(format!("aterm-test-update-root-{}", std::process::id()));
+            // SAFETY: runs once, at the first harness construction — before
+            // any test in this process touches the update staging root; no
+            // test depends on the variable's prior value. The env-mutation
+            // lint's set-and-restore shape does not apply: this override is
+            // deliberately process-permanent (the whole test process must
+            // stage under scratch), and `Once` already serializes the write.
+            #[allow(env_mutation)]
+            unsafe {
+                std::env::set_var("ATERM_UPDATE_ROOT", &scratch)
+            };
+        });
         let session0 = stub_session_with_sink(0, sink);
         let term = session0.term.clone();
         let master = session0.master;
@@ -10159,6 +10255,7 @@ impl App {
             handoff_reader_gate: None,
             incoming_handoff_pending: false,
             handoff_degraded: false,
+            handoff_device_proof_term: false,
             bootstrap_session_adopted: false,
             quit_capture: None,
             winit_to_window: HashMap::new(),
@@ -11229,6 +11326,23 @@ impl App {
         true
     }
 
+    /// The headless equivalent of "first present": the engine loop is running
+    /// and the control socket is bound. Session 0 and the control thread are
+    /// both created in `main_entry` BEFORE the loop starts, so reaching
+    /// `about_to_wait` with a bound socket is real evidence that this build
+    /// stood a working engine up — not an unconditional disarm.
+    ///
+    /// The `sock_plan.is_none()` arm is load-bearing rather than a convenience:
+    /// [`control_auth::SocketResolution::Disabled`], `NoDir` and `PathTooLong`
+    /// all leave the plan `None` and `sock_bound` false FOREVER, so keying
+    /// purely off the flag would reproduce the exact wedge this checkpoint
+    /// exists to close. With no socket configured, the run loop itself is the
+    /// only boundary there is.
+    #[must_use]
+    fn headless_boot_health_checkpoint(&self) -> bool {
+        self.sock_plan.is_none() || self.sock_bound.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// OVERLAP HANDOFF (incoming side): if this boot carries a readiness fd and
     /// every carried surface is now painted, write the exact adoption proof that
     /// tells the parked parent every expected PTY reached our live pool. Readers
@@ -11286,15 +11400,34 @@ impl App {
         let commit = self.handoff_commit.take();
         #[cfg(unix)]
         {
-            let adopted: Vec<(u64, i32, i32)> = self
+            // The proof's middle field is a TRANSPORT COORDINATE, and which one
+            // depends on how these descriptors arrived — see
+            // `handoff_device_proof_term`. A term that cannot be computed is a
+            // DEGRADE, never a dropped session: a proof over a subset would ask
+            // the parent to commit a set it never authorized, and it would
+            // rightly refuse. Withholding the proof instead leaves the parent to
+            // time out and resume every shell.
+            let adopted = self
                 .pool
                 .iter()
-                .filter_map(|session| {
-                    session
-                        .handoff_local_id
-                        .map(|local_id| (local_id, session.master, session.pid))
+                .filter(|session| session.handoff_local_id.is_some())
+                .map(|session| {
+                    Some((
+                        session.handoff_local_id?,
+                        handoff_proof_term(session.master, self.handoff_device_proof_term)?,
+                        session.pid,
+                    ))
                 })
-                .collect();
+                .collect::<Option<Vec<(u64, i32, i32)>>>();
+            let Some(adopted) = adopted else {
+                self.handoff_degraded = true;
+                self.stop_prepared_handoff_readers(&reader_gate);
+                aterm_log::warn!(
+                    "overlap handoff: an adopted PTY would not yield its proof term; adopted \
+                     readers remain parked and the parent will resume them"
+                );
+                return;
+            };
             let Some(commit) = commit else {
                 self.handoff_degraded = true;
                 self.stop_prepared_handoff_readers(&reader_gate);
@@ -12202,6 +12335,7 @@ impl ApplicationHandler<Wake> for App {
         }
         if should_dispatch_boot_health_confirmation(
             self.headless,
+            self.headless_boot_health_checkpoint(),
             self.first_present_done,
             self.boot_health_confirmation_dispatched,
             self.boot_health_confirmation_retry_at
@@ -14098,22 +14232,6 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
-            // Batteries-included toolchain seed: the atpkg-update thread's one-shot
-            // launch-time `atpkg seed` pass matched a stable stdout marker. Raise the
-            // NON-clickable transient status pill only — details stay in
-            // Settings ▸ Packages (App ▸ Packages… jumps straight there).
-            Wake::PkgSeed { installed, pending } => {
-                if !installed.is_empty() {
-                    self.surface_nonmodal_update_status(&seed_pill_text(&installed));
-                } else if let Some(tail) = pending {
-                    // Consent (`[packages].auto_install`) is off: offer, don't act.
-                    // The full roster stays in the log; the pill points at the switch.
-                    aterm_log::info!("atpkg seed pending: {tail}");
-                    self.surface_nonmodal_update_status(
-                        "⇣ ALab toolchain available — install via Settings ▸ Packages",
-                    );
-                }
-            }
             // `settings` control verb: drive the native Settings tab and reply its open
             // state. The enum variant keeps the historical wire-facing name only.
             Wake::SpawnSession { cwd, reply } => {
@@ -14780,14 +14898,12 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
 /// `atpkg` verifies its own signed channel and is itself inert on a build with no pinned
 /// root key, so this is safe to always spawn for a real `.app`. Interval is
 /// `ATPKG_UPDATE_INTERVAL_SECS` (default 6h; 0 = once — the env override survives the
-/// config gate on purpose: it tunes cadence, never consent). The `update` loop's output
-/// is discarded — atpkg records its own `status.toml` (§9); the ONE-SHOT seed pass is
-/// the exception: its stdout is captured and scanned for the two stable marker lines
-/// ([`parse_seed_markers`]), and a match posts [`Wake::PkgSeed`] through `proxy` so the
-/// first launch can SAY what the batteries-included seed did (or is offering). The gate
-/// reads launch-time config only: flipping the switch takes effect at the next launch
-/// (documented; the loop itself is stateless between passes).
-fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool {
+/// config gate on purpose: it tunes cadence, never consent). The loop's output is
+/// discarded entirely — atpkg records its own `status.toml` (§9), which is the single
+/// truth Settings ▸ Packages reads, so there is nothing for this thread to report back
+/// to the UI. The gate reads launch-time config only: flipping the switch takes effect
+/// at the next launch (documented; the loop itself is stateless between passes).
+fn spawn_pkg_update_check(config: &Config) -> bool {
     if !config.packages_update_loop_enabled() {
         return false;
     }
@@ -14801,27 +14917,6 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(6 * 60 * 60);
-            // First-run / self-heal SEED: reconcile the compiled-in companions manifest
-            // (docs/COMPANION-TOOLS.md — the SOURCE-BUILD, keyless lane, e.g. `ay`) so those
-            // tools are present on first launch and after an app update adds new ones.
-            // Complementary to the signed default-set bootstrap the `update` loop already does.
-            // Idempotent; the source-build lane stays DEFAULT-OFF unless the machine opted in
-            // (`ATPKG_SOURCE_BUILD=1`), so this never builds without consent, and store mutation
-            // is serialized by atpkg's own store-wide lock. Runs once BEFORE the loop, off the
-            // event loop. Stdout is captured for the stable seed markers (stderr stays
-            // discarded — atpkg records its own seed-status.toml); a marker match posts
-            // the one-shot `Wake::PkgSeed`, a quiet seed posts nothing.
-            let seeded = std::process::Command::new(&atpkg)
-                .arg("seed")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output();
-            if let Ok(out) = seeded {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Some((installed, pending)) = parse_seed_markers(&stdout) {
-                    let _ = proxy.send_event(Wake::PkgSeed { installed, pending });
-                }
-            }
             loop {
                 let _ = std::process::Command::new(&atpkg)
                     .arg("update")
@@ -14835,120 +14930,6 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             }
         })
         .is_ok()
-}
-
-/// Scan an `atpkg seed` child's stdout for the two STABLE marker lines the
-/// batteries-included lane prints (crates/atpkg/src/cli.rs `cmd_seed` — the
-/// markers are a cross-crate contract; changing either side blinds the other):
-///
-///   `atpkg: seed-installed: <name>, <name>, …`
-///   `atpkg: seed-pending: <human tail>`
-///
-/// Returns `None` when neither matched (the quiet-seed common case), else
-/// `(installed_names, pending_tail)`. Pure so the contract is unit-testable
-/// without spawning a child.
-fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
-    let mut installed: Vec<String> = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("atpkg: seed-installed: ") {
-            installed.extend(
-                rest.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-            );
-        } else if let Some(rest) = line.strip_prefix("atpkg: seed-pending: ") {
-            let tail = rest.trim();
-            if !tail.is_empty() {
-                pending = Some(tail.to_string());
-            }
-        }
-    }
-    (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
-}
-
-/// The installed-roster pill caption. Extracted from the `Wake::PkgSeed` arm so
-/// the cap and the marker glyph are unit-testable (the arm itself runs only on
-/// the UI thread). The leading "✓" is deliberate: the notice renderer tints the
-/// FIRST character with the accent colour, so without a marker the "A" of
-/// "ALab" would be tinted alone and the word would read as "A Lab".
-fn seed_pill_text(installed: &[String]) -> String {
-    // Cap the roster so the pill stays a pill: ≤5 names, then an ellipsis
-    // standing in for the rest.
-    let mut names = installed
-        .iter()
-        .take(5)
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(", ");
-    if installed.len() > 5 {
-        names.push('…');
-    }
-    format!("✓ ALab toolchain installed: {names}")
-}
-
-/// The seed-marker contract with atpkg (`cmd_seed`'s two stable stdout lines):
-/// pinned here so a wording drift on either side goes red instead of silently
-/// blinding the first-run notice.
-#[cfg(test)]
-mod seed_marker_tests {
-    use super::{parse_seed_markers, seed_pill_text};
-
-    #[test]
-    fn pill_caps_the_roster_and_keeps_its_marker_glyph() {
-        let names = |n: usize| -> Vec<String> {
-            ["ay", "clean", "ny", "trust", "ty", "nn"][..n]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        };
-        // ≤5: every name, no ellipsis.
-        assert_eq!(
-            seed_pill_text(&names(3)),
-            "✓ ALab toolchain installed: ay, clean, ny"
-        );
-        assert_eq!(
-            seed_pill_text(&names(5)),
-            "✓ ALab toolchain installed: ay, clean, ny, trust, ty"
-        );
-        // >5: exactly five, then the ellipsis.
-        assert_eq!(
-            seed_pill_text(&names(6)),
-            "✓ ALab toolchain installed: ay, clean, ny, trust, ty…"
-        );
-        // The marker glyph must lead — the renderer tints the FIRST char, so
-        // losing it makes "ALab" render as "A Lab".
-        assert!(seed_pill_text(&names(1)).starts_with("✓ "));
-    }
-
-    #[test]
-    fn quiet_seed_posts_nothing() {
-        assert_eq!(parse_seed_markers(""), None);
-        assert_eq!(
-            parse_seed_markers("atpkg: ay reused — already installed for 8af5cbb3a7aa\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn installed_marker_yields_the_name_roster() {
-        let out = "atpkg: seed complete (2 ready, 0 failed, 2 companion(s) considered)\n\
-                   atpkg: seed-installed: ay, trust, ty\n";
-        let (installed, pending) = parse_seed_markers(out).unwrap();
-        assert_eq!(installed, ["ay", "trust", "ty"]);
-        assert_eq!(pending, None);
-    }
-
-    #[test]
-    fn pending_marker_yields_the_human_tail() {
-        let out = "atpkg: seed-pending: 3 program(s) ready to install from the bundled seed: \
-                   ay, trust, ty (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg \
-                   install --default-set`)\n";
-        let (installed, pending) = parse_seed_markers(out).unwrap();
-        assert!(installed.is_empty());
-        assert!(pending.unwrap().starts_with("3 program(s) ready"));
-    }
 }
 
 /// Set ONCE in `main` (single-threaded launcher) from `$ATERM_UPDATED_FROM`: `true` when
@@ -15098,7 +15079,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     };
     match boot_apply {
         aterm_update::ApplyOutcome::NotApplicable | aterm_update::ApplyOutcome::NoUpdate => {}
-        other => eprintln!("aterm-gui: update apply: {other:?}"),
+        // BOTH sinks, deliberately. `eprintln!` alone put every boot-lane refusal on a
+        // stderr nobody reads: a Finder-launched .app has no terminal attached, so
+        // "Deferred/Blocked/Failed at boot" — the exact outcomes that explain why an
+        // update the user can SEE staged never applied — left no durable trace anywhere.
+        // The log is the durable one; stderr stays for a TTY launch.
+        ref other => {
+            aterm_log::warn!("update apply (boot): {other:?}");
+            eprintln!("aterm-gui: update apply: {other:?}");
+        }
     }
     // Post-update "leveled-up" handoff: `ATERM_UPDATED_FROM` is set by
     // `apply_staged_update_now` before its re-exec and inherited through the swap above,
@@ -15113,6 +15102,71 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         aterm_log::env::unset("ATERM_UPDATED_FROM");
     }
     let _ = JUST_UPDATED.set(just_updated);
+    // OUT-OF-BAND HANDOFF INTAKE. A successor LaunchServices started is launchd's
+    // child, not the outgoing process's, and inherits NO descriptors — so the PTY
+    // masters, the readiness pipe and the Commit pipe cannot be named by number in
+    // this process's environment. They arrive over the single-use rendezvous the
+    // parent bound before launching us (`crate::handoff_rendezvous`), and the dial
+    // happens HERE for two reasons that both matter:
+    //
+    // * AFTER THE BOOT APPLY. That apply swaps the staged bundle and re-execs, and
+    //   every received descriptor is `FD_CLOEXEC` — dialing earlier would mean
+    //   carrying them across an `execve` through the same clear-and-re-arm dance
+    //   the fork lane needs, for no benefit. The re-exec'd image dials fresh
+    //   instead, and the parent's readiness deadline already budgets for exactly
+    //   this interval (it is what the fork lane waits out too).
+    // * BEFORE `take_incoming`. Publishing the claimed descriptors as the
+    //   ordinary `ATERM_SEAMLESS_FDS` / `ATERM_HANDOFF_*_FD` shape lets the
+    //   existing, unchanged intake do every authentication it already does — the
+    //   manifest join, the exact bijection, the tty backstop, the screen-carry
+    //   digest, the parent birth record. The TRANSPORT changed; nothing that
+    //   decides whether a handoff is legitimate did.
+    //
+    // A FAILED CLAIM EXITS. It does not fall through to a fresh window: the parent
+    // still owns every session this process was going to adopt, and presenting an
+    // empty terminal over them would look to the user exactly like the update
+    // having eaten their work. The parent, meanwhile, never sent a descriptor, so
+    // it rolls back with its readers intact — this is the same fail-closed shape
+    // as the malformed-handoff refusal above, and it is what makes a late dial (one
+    // that arrives after the parent gave up and unlinked the socket) safe.
+    #[cfg(target_os = "macos")]
+    let out_of_band_handoff = handoff_rendezvous::rendezvous_present();
+    #[cfg(not(target_os = "macos"))]
+    let out_of_band_handoff = false;
+    #[cfg(target_os = "macos")]
+    if out_of_band_handoff {
+        /// How long this process will wait on its own dial. Short because every
+        /// slow part is already behind us — the parent is holding the listener
+        /// open and answers immediately, or it has given up and the connect fails
+        /// at once.
+        const CLAIM_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+        // Read, do not consume: `seamless::take_incoming` owns clearing this, and
+        // consuming it here would leave that call unable to authenticate the
+        // manifest it is about to read.
+        let nonce = std::env::var("ATERM_SEAMLESS_NONCE").unwrap_or_default();
+        match handoff_rendezvous::claim_incoming(&nonce, std::time::Instant::now() + CLAIM_BUDGET) {
+            Ok(claimed) => {
+                aterm_log::info!(
+                    "overlap handoff: claimed {} PTY(s) plus the readiness and Commit channels \
+                     over the rendezvous; this successor owns a launchd application job of its own",
+                    claimed.session_count()
+                );
+                claimed.publish();
+            }
+            Err(error) => {
+                // Both destinations deliberately: a launchd-launched app leaves
+                // only the log behind, and stderr is what a developer running the
+                // binary from a shell actually sees.
+                aterm_log::error!(
+                    "overlap handoff: this launch carries a rendezvous but could not claim it \
+                     ({error}); exiting before any window so the outgoing process keeps every \
+                     session"
+                );
+                eprintln!("aterm-gui: overlap handoff could not be claimed: {error}");
+                return;
+            }
+        }
+    }
     // PROOF-CARRYING DSU Rung 1b — SEAMLESS adopt: if this run is an update apply that
     // handed off a live shell (`ATERM_SEAMLESS_*`), authenticate + consume the manifest
     // HERE while single-threaded (env mutation is only sound pre-spawn), and RE-ADOPT the
@@ -15803,7 +15857,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
-    let package_update_loop_running = !headless && spawn_pkg_update_check(&config, proxy.clone());
+    let package_update_loop_running = !headless && spawn_pkg_update_check(&config);
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread
@@ -16368,6 +16422,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_reader_gate,
         incoming_handoff_pending: overlap_channels_present && adopting,
         handoff_degraded: overlap_degraded,
+        // Derived from how the descriptors arrived, never configured. See the
+        // field's docs for why a wrong answer here costs the automatic lane.
+        handoff_device_proof_term: out_of_band_handoff,
         bootstrap_session_adopted: adopting,
         quit_capture: None,
         winit_to_window: HashMap::new(),
@@ -18174,7 +18231,7 @@ mod multi_window_tests {
         };
         let row0: String = ws.input_scratch.cells[0].iter().map(|c| c.ch).collect();
         let row1: String = ws.input_scratch.cells[1].iter().map(|c| c.ch).collect();
-        assert!(row0.contains("notice(s)"), "banner title row: {row0:?}");
+        assert!(row0.contains("1 notice"), "banner title row: {row0:?}");
         assert!(row1.contains("next launch"), "restart-notice row: {row1:?}");
     }
 
@@ -22159,8 +22216,78 @@ mod tests {
     use super::{
         App, DEMO_TICK_INTERVAL, NATIVE_CAPTURE_PRESENT_ATTEMPT_LIMIT, WindowId, find_url_span,
         is_safe_url, native_preview_deadline, native_preview_may_tick, run_capture_present_barrier,
+        should_dispatch_boot_health_confirmation,
     };
     use crate::app_config::Config;
+
+    /// A headless launch runs the whole trial machinery (`apply_staged_if_ready`
+    /// runs before `--headless` is even parsed, and a headless apply's successor
+    /// is headless), but it never attaches an OS window and never presents. With
+    /// the old `!headless && …` guard it therefore had NO health checkpoint: the
+    /// sentinel armed at apply time stayed armed, every later apply came back
+    /// `NotApplicable`, and the third launch reverted a build that had booted
+    /// three times. This pins the replacement boundary — the engine loop reached
+    /// with the control socket bound (or with no socket configured at all).
+    #[test]
+    fn headless_confirms_boot_health_at_the_control_socket_boundary() {
+        use std::sync::atomic::Ordering;
+
+        // Exactly the call site in `about_to_wait`, with the retry due.
+        fn would_dispatch(app: &App) -> bool {
+            should_dispatch_boot_health_confirmation(
+                app.headless,
+                app.headless_boot_health_checkpoint(),
+                app.first_present_done,
+                app.boot_health_confirmation_dispatched,
+                true,
+                app.windows.values().any(|ws| ws.os_window.is_some()),
+            )
+        }
+
+        let mut app = App::headless_for_test();
+        assert!(
+            app.headless,
+            "negative control: this fixture IS the headless lane"
+        );
+        assert!(
+            !app.first_present_done && !app.windows.values().any(|ws| ws.os_window.is_some()),
+            "negative control: the windowed checkpoint is unreachable here, so it \
+             cannot be what disarms the sentinel"
+        );
+
+        // No socket configured (Disabled / NoDir / PathTooLong): the run loop is
+        // the only boundary that exists, and it has been reached.
+        assert!(app.sock_plan.is_none());
+        assert!(
+            would_dispatch(&app),
+            "a socketless headless build must still confirm"
+        );
+
+        // A configured-but-unbound socket is not yet a proof.
+        app.sock_plan = Some(crate::control_auth::SocketPlan {
+            sock_path: "/tmp/aterm-boot-health-test.sock".into(),
+            token_path: std::path::PathBuf::from("/tmp/aterm-boot-health-test.token"),
+            latest_link: None,
+        });
+        app.sock_bound.store(false, Ordering::Release);
+        assert!(
+            !would_dispatch(&app),
+            "an unbound control socket is not a working engine"
+        );
+
+        app.sock_bound.store(true, Ordering::Release);
+        assert!(
+            would_dispatch(&app),
+            "a bound control socket is the headless health proof"
+        );
+
+        // The one-shot latch still governs headless: one confirmation per run.
+        app.boot_health_confirmation_dispatched = true;
+        assert!(
+            !would_dispatch(&app),
+            "the same boundary cannot enqueue a second confirmation"
+        );
+    }
 
     #[test]
     fn serious_mode_drains_fun_state_without_touching_functional_ui() {

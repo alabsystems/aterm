@@ -238,7 +238,8 @@ const HELP_TAIL: &str = concat!(
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground,\n",
-    "              palette [array of #RRGGBB], window_theme, tab_strip_rows.\n",
+    "              palette [array of #RRGGBB], window_theme, tab_strip_rows,\n",
+    "              robi (the tip-sharing helper robot; type robi to summon him).\n",
     "  Window/Tabs descriptive_titles, title_summary_provider, title_summary_model,\n",
     "              title_summary_endpoint, title_summary_token_file,\n",
     "              title_summary_timeout_seconds, title_summary_proxy_mode,\n",
@@ -356,10 +357,11 @@ const STARTER_CONFIG: &str = "\
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
+# robi = true                      # Robi the helper robot lives on your terminal (walks your typed row, ladder up, tab-bar monkey bars, tips above his head); type robi to make him greet you (default ON)
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown (default ON)
-# cursor_trail_style = \"rainbow kitty\"  # rainbow kitty (banded rainbow ribbon; a blinking block twinkles like a little star; DEFAULT; old spellings \"nyan rainbow\"/\"nyan\"/\"rainbow\" still work) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
+# cursor_trail_style = \"rainbow kitty pet\"  # rainbow kitty pet (DEFAULT; the banded rainbow ribbon with the full-body cat that walks, runs and pounces along your line; aliases \"kitty pet\"/\"pet kitty\") | rainbow kitty (the same ribbon under the FLYING kitty head; old spellings \"nyan rainbow\"/\"nyan\"/\"rainbow\" still work) | phaser (full-spectrum additive hue sweep) | comet (cadence-comet body + light crown) | lumen | sparkle | fire | laser | water | beam (steady power-down tube of cool light) | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (default: the theme's cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
