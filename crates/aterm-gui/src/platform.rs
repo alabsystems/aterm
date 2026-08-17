@@ -254,6 +254,24 @@ pub(crate) trait AppRt {
     /// action target the caller keeps alive. `None` off macOS (no menu installed).
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle>;
 
+    /// Create the menu-bar OPERATOR status item (status_item.rs), rendered from
+    /// `glance`, returning the retained handle the caller keeps alive for the
+    /// process lifetime. Default `None`: no status bar exists off macOS.
+    fn install_status_item(
+        &self,
+        _proxy: &EventLoopProxy<Wake>,
+        _glance: &crate::status_item::FleetGlance,
+    ) -> Option<crate::status_item::StatusItemHandle> {
+        None
+    }
+
+    /// Bring another aterm instance's windows to the front by pid (the status
+    /// menu's sibling rows). Default `false`: no cross-instance activation
+    /// exists off macOS yet.
+    fn activate_instance(&self, _pid: u32) -> bool {
+        false
+    }
+
     /// Install the per-window native toolbar (the full-width tab strip + "+"
     /// button) for logical window `wid`, returning the retained backing handle.
     /// `None` off macOS (no toolbar installed).
@@ -845,6 +863,39 @@ impl AppRt for AppRtMacOS {
 
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
         menu::install(proxy)
+    }
+
+    fn install_status_item(
+        &self,
+        proxy: &EventLoopProxy<Wake>,
+        glance: &crate::status_item::FleetGlance,
+    ) -> Option<crate::status_item::StatusItemHandle> {
+        crate::status_item::install(proxy, glance)
+    }
+
+    fn activate_instance(&self, pid: u32) -> bool {
+        // NSRunningApplication is InteriorMutable (not MainThreadOnly), but
+        // this is only ever called on the event-loop turn, keeping the AppKit
+        // call ordered against our own window state. `ActivateAllWindows`
+        // only — `IgnoringOtherApps` is deprecated and inert on macOS 14+.
+        use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: plain AppKit lookup + activation request; a dead pid yields
+        // None and reads as a failed activation, never a crash.
+        unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(pid).is_some_and(
+                |app| {
+                    app.activateWithOptions(
+                        NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+                    )
+                },
+            )
+        }
     }
 
     fn install_toolbar(

@@ -124,7 +124,25 @@ impl DeferredLine {
     /// defines both the length and every element from the row slice, so a
     /// recycled body carries NO state from its previous line: content is
     /// byte-identical to the old `to_vec()`.
-    pub(crate) fn new(row: &Row, extras: ScrolledRowExtras, mut scratch: Vec<Cell>) -> Self {
+    pub(crate) fn new(row: &Row, extras: ScrolledRowExtras, scratch: Vec<Cell>) -> Self {
+        // Box only when there is something to carry — the `None ⟺ empty`
+        // encoding `heap_memory_used` and the materialize readers depend on.
+        Self::new_boxed(row, (!extras.is_empty()).then(|| Box::new(extras)), scratch)
+    }
+
+    /// [`new`](Self::new) for a caller that ALREADY owns the extras in a `Box`.
+    ///
+    /// The tiered scroll-off path pops the evicted row's extras out of
+    /// `ring_extras` as an `Option<Box<ScrolledRowExtras>>` and hands them
+    /// straight here, so the value is never moved out of its box only to be
+    /// re-boxed — one `Box` malloc AND one free removed per extras-carrying
+    /// scrolled line, from inside the PTY reader's `term_lock` hold (the same
+    /// hold the [`CellPool`] exists to keep the allocator out of).
+    pub(crate) fn new_boxed(
+        row: &Row,
+        extras: Option<Box<ScrolledRowExtras>>,
+        mut scratch: Vec<Cell>,
+    ) -> Self {
         let len = row.len();
         scratch.clear();
         if len != 0 {
@@ -133,11 +151,11 @@ impl DeferredLine {
         Self {
             cells: scratch,
             len,
-            extras: if extras.is_empty() {
-                None
-            } else {
-                Some(Box::new(extras))
-            },
+            // `filter` keeps the `None ⟺ empty` encoding exactly as the old
+            // `is_empty()` test did: an empty box is dropped rather than stored,
+            // so `heap_memory_used` (which adds a flat struct size for `Some`)
+            // and the two `materialize` readers see the same shape as before.
+            extras: extras.filter(|b| !b.is_empty()),
             wrapped: row.is_wrapped(),
             layout_version: CELL_LAYOUT_VERSION,
             cached: OnceCell::new(),
@@ -478,6 +496,17 @@ impl LazyBuffer {
         let scratch = self.pool.take();
         self.lines
             .push_back(DeferredLine::new(row, extras, scratch));
+    }
+
+    /// [`push_row`](Self::push_row) for a caller that already owns the extras in
+    /// a `Box` — the tiered scroll-off path, which pops them out of
+    /// `ring_extras`. See [`DeferredLine::new_boxed`]: the box is moved through
+    /// whole instead of being unboxed and re-boxed.
+    #[inline]
+    pub(crate) fn push_row_boxed(&mut self, row: &Row, extras: Option<Box<ScrolledRowExtras>>) {
+        let scratch = self.pool.take();
+        self.lines
+            .push_back(DeferredLine::new_boxed(row, extras, scratch));
     }
 
     /// Number of pending deferred lines.
@@ -856,24 +885,63 @@ impl Grid {
         // entries (complex chars, RGB colors) that bypass the HashMap on the write
         // hot path. is_empty() only checks the HashMap and would silently drop
         // ring-buffer data on scroll.
+        //
+        // NOTE for the next reader: `has_style_id()` is a TEST/KANI-only signal
+        // in practice. `RowFlags::HAS_STYLE_ID` is only ever ORIGINATED by
+        // `row/style_id_write.rs`, which is
+        // `#[cfg(any(test, kani, feature = "testing"))]` (`Row::mark_has_style_id`
+        // has no production caller; `Row::set` merely propagates the bit). So in
+        // the shipped binary this short-circuit rests entirely on
+        // `has_any_data()` — do not build an optimization on the assumption that
+        // a styled production row reports `has_style_id()`.
         if !extras.has_any_data() && !row.has_style_id() {
             return;
         }
 
-        // Pre-size the rgb vectors to the style-id cell count: styled rows
+        // Pre-size the rgb vectors: RGB-overflow rows and style-id rows both
         // otherwise pay repeated growth reallocs (4 → 8 → …) per Vec on the
         // scroll hot path. Counting is one cheap pass over the L1-resident
         // cells; skipped when the (recycled) vectors already have capacity.
-        if row.has_style_id() && result.rgb_fg.capacity() == 0 {
+        //
+        // The gate deliberately does NOT test `row.has_style_id()` (see the note
+        // above: that flag is test/kani-only). Gating on it made this whole block
+        // dead in the shipped binary and left every truecolor row re-growing
+        // `rgb_fg`/`rgb_bg` from capacity 0 — plain truecolor writes go through
+        // `set_rgb_ring_range`, which sets no row flag.
+        //
+        // fg and bg overflow independently (`set_rgb_ring_range` takes them as
+        // separate `Option`s), so count them separately — reserving both from one
+        // combined count would leave wasted capacity riding into the ring for the
+        // line's lifetime, invisible to `DeferredLine::heap_memory_used` (which
+        // accounts extras shallow). The counts are an upper bound (`fg_rgb_for`
+        // can return `None` if the ring evicted the entry); over-reserving by a
+        // few is harmless, and it never under-reserves.
+        if result.rgb_fg.capacity() == 0 || result.rgb_bg.capacity() == 0 {
             let cap_cells = &row.as_slice()[..len];
-            let style_cells = cap_cells
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| !is_spacer(cap_cells, *i) && c.uses_style_id())
-                .count();
-            if style_cells > 0 {
-                result.rgb_fg.reserve(style_cells);
-                result.rgb_bg.reserve(style_cells);
+            let (mut n_fg, mut n_bg) = (0usize, 0usize);
+            for (i, c) in cap_cells.iter().enumerate() {
+                // Mirror the main loop's spacer skip so the reserve matches what
+                // is actually pushed.
+                if is_spacer(cap_cells, i) {
+                    continue;
+                }
+                if c.uses_style_id() {
+                    n_fg += 1;
+                    n_bg += 1;
+                    continue;
+                }
+                if c.fg_needs_overflow() {
+                    n_fg += 1;
+                }
+                if c.bg_needs_overflow() {
+                    n_bg += 1;
+                }
+            }
+            if n_fg > 0 {
+                result.rgb_fg.reserve(n_fg);
+            }
+            if n_bg > 0 {
+                result.rgb_bg.reserve(n_bg);
             }
         }
 

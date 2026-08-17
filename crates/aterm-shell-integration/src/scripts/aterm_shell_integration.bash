@@ -72,10 +72,29 @@ __aterm_osc() {
 __aterm_shell_nonce="${ATERM_SHELL_NONCE:-}"
 unset ATERM_SHELL_NONCE
 
+# Precomputed capability-nonce suffix for OSC 133/633 emissions.
+# The nonce is captured exactly once (above) and the env var is unset on the
+# very next line, so this string is CONSTANT for the life of the shell — there
+# is no in-shell rotation path that could make it stale. Computing it here
+# lets the marker emitters below expand a plain parameter instead of running
+# `$(__aterm_id_suffix)`, which forks a subshell. That mattered: the prompt
+# path fires five markers per command cycle (133;D + 133;A + 133;B from the
+# prompt hooks, 633;E + 133;C from the DEBUG-trap preexec), i.e. five forks of
+# pure dead time between Enter and the command starting. Byte-identical output
+# — same ";id=<hex>" spelling, same empty-string fallback when unnonced.
+# Not exported, exactly like $__aterm_shell_nonce itself, so #8015 (no nonce
+# inheritance by subprocesses) is preserved.
+__aterm_id_suffix_str=""
+if [[ -n "$__aterm_shell_nonce" ]]; then
+    __aterm_id_suffix_str=";id=${__aterm_shell_nonce}"
+fi
+
 # Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
 # Expands to ";id=<64-hex>" when the captured nonce is non-empty, or to
 # the empty string otherwise. Reads from the captured local — never from
 # the environment — so the nonce is not inherited by subprocesses.
+# Kept as the documented helper / external entry point; the hot emitters
+# below use $__aterm_id_suffix_str instead to avoid a fork per marker.
 __aterm_id_suffix() {
     if [[ -n "$__aterm_shell_nonce" ]]; then
         printf ';id=%s' "$__aterm_shell_nonce"
@@ -86,16 +105,39 @@ __aterm_id_suffix() {
 # Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
 # are encoded byte-by-byte as %XX. Setting LC_ALL=C ensures multi-byte
 # UTF-8 characters are split into individual bytes for correct encoding.
+#
+# Runs once per prompt (via __aterm_report_cwd), so it is fork-free by
+# construction: `printf -v` (bash 3.1+, i.e. inside the documented 3.2+
+# floor) writes into a variable instead of spawning a `$(printf ...)`
+# subshell per encoded byte. A path with a single space used to cost a
+# fork; a 4-byte emoji cost four.
 __aterm_urlencode() {
     local LC_ALL=C
-    local string="$1" i char
+    # Fast path: no byte needs encoding, so the loop would copy the string
+    # verbatim. Skip it. (The class is exactly the loop's pass-through class,
+    # so this is the same decision the loop would make for every byte.)
+    if [[ "$1" != *[^a-zA-Z0-9_.~/-]* ]]; then
+        printf '%s' "$1"
+        return
+    fi
+    local string="$1" i char out="" byte
     for ((i = 0; i < ${#string}; i++)); do
         char="${string:i:1}"
         case "$char" in
-            [a-zA-Z0-9_.~/-]) printf '%s' "$char" ;;
-            *) printf '%%%02X' "$(( $(printf '%d' "'$char") & 0xFF ))" ;;
+            [a-zA-Z0-9_.~/-]) out+="$char" ;;
+            # The `& 0xFF` mask is LOAD-BEARING here, not decoration: bash's
+            # `printf '%d' "'<byte>"` yields a SIGNED value for bytes >= 0x80
+            # (0xC3 reads as -61), and every non-ASCII byte of a UTF-8 path
+            # reaches this branch. Without the mask a path like `Ünïcødé/`
+            # would encode as %FFFFFFFFFFFFFFC3… and corrupt the OSC 7 URI.
+            *) printf -v byte '%d' "'$char"
+               printf -v byte '%%%02X' "$(( byte & 0xFF ))"
+               out+="$byte" ;;
         esac
     done
+    # Emitted once rather than streamed per character; the sole caller already
+    # captures the whole result via `cwd=$(__aterm_urlencode "$PWD")`.
+    printf '%s' "$out"
 }
 
 # Report current working directory (OSC 7)
@@ -107,38 +149,51 @@ __aterm_report_cwd() {
 
 # Mark prompt start (OSC 133;A)
 __aterm_mark_prompt_start() {
-    __aterm_osc "133;A$(__aterm_id_suffix)"
+    __aterm_osc "133;A${__aterm_id_suffix_str}"
 }
 
 # Mark command line start (OSC 133;B) - after prompt, before user input
 __aterm_mark_command_start() {
-    __aterm_osc "133;B$(__aterm_id_suffix)"
+    __aterm_osc "133;B${__aterm_id_suffix_str}"
 }
 
 # Mark command execution start (OSC 133;C)
 __aterm_mark_exec_start() {
-    __aterm_osc "133;C$(__aterm_id_suffix)"
+    __aterm_osc "133;C${__aterm_id_suffix_str}"
 }
 
 # Mark command completion (OSC 133;D;exitcode)
 # Takes exit status as $1 (caller must pass it — $? inside a function
 # body reflects the previous statement, not the original command).
 __aterm_mark_exec_finish() {
-    __aterm_osc "133;D;${1}$(__aterm_id_suffix)"
+    __aterm_osc "133;D;${1}${__aterm_id_suffix_str}"
     __aterm_last_command=""
 }
 
 # Encode a string for OSC 633;E (VS Code convention).
 # Backslash-hex encodes semicolons, backslashes, and bytes <= 0x20.
+#
+# Runs once per user command, between Enter and the command actually
+# starting, so it is fork-free. Space is split out of the old
+# `[[:cntrl:]]|' '` arm because it is unconditionally 0x20 — a literal
+# beats a subshell, and spaces are the only member of that arm a real
+# command line ever contains. Control bytes keep the computed form but
+# use `printf -v` instead of a `$(printf ...)` subshell.
 __aterm_encode_cmd() {
     local LC_ALL=C
-    local string="$1" i char result=""
+    local string="$1" i char result="" hex
     for ((i = 0; i < ${#string}; i++)); do
         char="${string:i:1}"
         case "$char" in
             \\) result+="\\\\" ;;
             \;) result+="\\x3b" ;;
-            [[:cntrl:]]|' ') result+=$(printf '\\x%02x' "$(( $(printf '%d' "'$char") & 0xFF ))") ;;
+            ' ') result+="\\x20" ;;
+            # Mask retained verbatim from the pre-fork-free form so the byte
+            # arithmetic is identical for every input (under LC_ALL=C this arm
+            # only ever sees 0x00-0x1F/0x7F, where the mask is a no-op).
+            [[:cntrl:]]) printf -v hex '%d' "'$char"
+                         printf -v hex '\\x%02x' "$(( hex & 0xFF ))"
+                         result+="$hex" ;;
             *) result+="$char" ;;
         esac
     done
@@ -161,7 +216,7 @@ __aterm_preexec() {
     if [[ -z "$__aterm_last_command" ]]; then
         __aterm_last_command="$BASH_COMMAND"
         # Report command text for session memory (OSC 633;E)
-        __aterm_osc "633;E;$(__aterm_encode_cmd "$BASH_COMMAND")$(__aterm_id_suffix)"
+        __aterm_osc "633;E;$(__aterm_encode_cmd "$BASH_COMMAND")${__aterm_id_suffix_str}"
         # Set tab title to running command (OSC 0).
         # Truncate to first 64 chars and strip control characters.
         local cmd="${BASH_COMMAND:0:64}"

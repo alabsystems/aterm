@@ -1097,6 +1097,16 @@ pub struct Renderer {
     /// `mem::take` so each dirty row's plan reuses one allocation instead of a fresh
     /// `Vec<ColumnGlyph>` per row per frame. Mirrors `shapeable_scratch`.
     glyph_plan_scratch: Vec<ColumnGlyph>,
+    /// Which row `glyph_plan_scratch` currently holds the plan for, `None` when it
+    /// is unkeyed. Lets `draw_cursor`'s block cut-out REUSE the plan `render_row_fg`
+    /// already built for the cursor row this frame instead of re-running
+    /// `ligature_break_cols_into` + `row_glyph_plan` over it a second time (on a
+    /// one-dirty-row typing/echo frame that duplicate is the frame's whole planning
+    /// cost). FRAME-SCOPED: both render entry points clear it before any row is
+    /// planned, and it is set ONLY where a plan is stored back into the field —
+    /// including the scroll-apron re-render, which plans a DIFFERENT row (`r + 1`),
+    /// so a hit can never hand the cut-out another row's glyphs.
+    glyph_plan_row: Option<usize>,
     /// Reused per-row run text/char scratch for [`ligature_shaping::plan_row_runs`],
     /// cleared+reused each row instead of a fresh `String`/`Vec<char>` per row per
     /// frame on the shaping path. Mirrors `shapeable_scratch`.
@@ -5069,6 +5079,7 @@ impl Renderer {
             break_mask_scratch: Vec::new(),
             run_boundary_scratch: Vec::new(),
             glyph_plan_scratch: Vec::new(),
+            glyph_plan_row: None,
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
             deco_scratch: Vec::new(),
@@ -7068,11 +7079,22 @@ impl Renderer {
     fn vf_primary_char_raster(&self, ch: char) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         let coords = self.var_coords.as_deref()?;
         let bytes = self.rb_primary_bytes.as_deref()?;
-        let gid = ttf_parser::Face::parse(bytes, 0).ok()?.glyph_index(ch)?.0;
+        // ONE parse for both halves: the cmap lookup and the raster. This used to
+        // parse the face here to resolve the gid, drop it, and let
+        // `varied_glyph_raster` parse the identical bytes a SECOND time — two table
+        // directory walks per rasterized character. Resolving the gid on the
+        // COORD-APPLIED face is byte-identical: ttf-parser's cmap never consults
+        // variation coordinates, so `glyph_index` returns the same `GlyphId` either
+        // way, and the raster body is untouched (same advance, xmin/ymin, coverage).
+        let mut face = ttf_parser::Face::parse(bytes, 0).ok()?;
+        for &(tag, value) in coords {
+            let _ = face.set_variation(ttf_parser::Tag(tag), value);
+        }
+        let gid = face.glyph_index(ch)?.0;
         if gid == 0 {
             return None; // let fontdue draw its own .notdef
         }
-        variation::varied_glyph_raster(bytes, 0, coords, gid, self.px)
+        variation::varied_glyph_raster_with_face(&face, gid, self.px)
     }
 
     /// The `'M'` advance driving `cell_w` at `px` — coordinate-applied
@@ -9548,6 +9570,11 @@ impl Renderer {
         // glyphs (their content is unchanged, so the row diff alone would
         // gate-hit forever).
         self.poll_fallback_parses();
+        // The resident row plan belongs to the PREVIOUS frame (whose `input` is
+        // gone): unkey it before anything can consult it, so `draw_cursor`'s reuse
+        // is frame-scoped by construction. Cleared AFTER the fallback install above,
+        // which is the last thing that can re-route glyphs this frame.
+        self.glyph_plan_row = None;
         let (rows, cols) = (input.rows, input.cols);
         let (w, h) = self.frame_size(rows, cols);
         // Convert (or drop) the WALLPAPER base layer for this frame BEFORE the
@@ -9966,6 +9993,10 @@ impl Renderer {
     )]
     fn full_render(&mut self, wc: &mut WindowCpu, input: &RenderInput, w: usize, h: usize) {
         let rows = input.rows;
+        // Frame-scope the cursor-row plan reuse (see `glyph_plan_row`): the
+        // resident plan describes the previous frame's input until Phase C re-keys
+        // it. This path is also reachable directly (not only via `render_core`).
+        self.glyph_plan_row = None;
         // Capture the routing epoch BEFORE any row rasterizes: a background
         // fallback parse landing MID-frame (rows already drawn used provisional
         // `.notdef` keys) bumps `self.font_epoch` after this, so the cache is
@@ -10357,6 +10388,13 @@ impl Renderer {
         if !atlas_texels_valid(atlas) {
             return;
         }
+        // Per-column NEAREST source-index table for `stamp_free_sprite`, owned by
+        // THIS stack frame (not the `&self` renderer — the free-sprite phases hold
+        // `&self` alongside `&mut pixels`, so a resident field would force a
+        // `&mut self` / `RefCell` refactor of the composite borrow structure for no
+        // gain). One `Vec` per phase call — two per frame — refilled per stamp and
+        // amortized to zero reallocations after the first sprite.
+        let mut xmap: Vec<u32> = Vec::new();
         for r in rows {
             // Row `r`'s band, extended into the top/bottom pad strip at the grid
             // edges (mirroring the GPU scissor's edge extension, which Phase A's
@@ -10386,6 +10424,7 @@ impl Renderer {
                         s,
                         y_lo,
                         y_hi,
+                        &mut xmap,
                     );
                 }
             }
@@ -11318,14 +11357,17 @@ impl Renderer {
             // dilation of this cell's own glyph ink. `false` (no skipping —
             // knob off / no glyph / no ink in the band) leaves the rects
             // untouched, byte-identical to the pre-skip path.
+            // `dm` is this row's already-resolved metrics — the same value the
+            // `_into` wrapper would re-derive per decorated cell.
             let skip = !deco_scratch.is_empty()
-                && self.underline_keep_spans_into(
+                && self.underline_keep_spans_with_metrics(
                     input,
                     r,
                     c,
                     plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell),
                     x,
                     dw,
+                    dm,
                     &mut ink_scratch,
                     &mut keep_spans,
                 );
@@ -11419,13 +11461,14 @@ impl Renderer {
                     selected,
                     sel_bg,
                 );
-                let skip = self.underline_keep_spans_into(
+                let skip = self.underline_keep_spans_with_metrics(
                     input,
                     r,
                     c,
                     plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell),
                     x,
                     dw,
+                    dm,
                     &mut ink_scratch,
                     &mut keep_spans,
                 );
@@ -11456,6 +11499,11 @@ impl Renderer {
         self.ink_scratch = ink_scratch;
         self.keep_spans_scratch = keep_spans;
         self.glyph_plan_scratch = plan;
+        // Key the buffer to the row it now describes, so `draw_cursor` can tell
+        // whether the resident plan is the cursor row's. Set HERE — at the store,
+        // not in the caller — so the scroll-apron re-render (which runs this for
+        // row `r + 1` AFTER the dirty-row loop) re-keys it too.
+        self.glyph_plan_row = Some(r);
     }
 
     /// Coverage-blend the AA undercurl tile over the kept ABSOLUTE-x spans of
@@ -11532,6 +11580,39 @@ impl Renderer {
         ink: &mut Vec<bool>,
         out: &mut Vec<(usize, usize)>,
     ) -> bool {
+        // Cheap guards FIRST, so a caller with the knob off still returns without
+        // resolving any metrics (byte-identical, and no new work on that path).
+        if !self.underline_skip_descenders || dw == 0 {
+            return false;
+        }
+        // `deco_metrics()` is a pure function of the live cell geometry, so
+        // resolving it here is exactly what the body did per call before. Callers
+        // that already hold the frame's value (CPU pass 3 / 3b, which compute it
+        // once per row) take [`Self::underline_keep_spans_with_metrics`] directly
+        // and skip this re-derivation per decorated cell.
+        let dm = self.deco_metrics();
+        self.underline_keep_spans_with_metrics(input, r, c, plan_entry, x0, dw, dm, ink, out)
+    }
+
+    /// [`Self::underline_keep_spans_into`] on ALREADY-RESOLVED decoration metrics
+    /// — the per-row hot-path form. `dm` MUST be `self.deco_metrics()` for this
+    /// same frame (the CPU row passes resolve it once per row and hand it down),
+    /// which makes this byte-identical to the wrapper: the metrics are a pure
+    /// function of the cell geometry, and nothing between the row's resolve and
+    /// this call can change it.
+    #[allow(clippy::too_many_arguments)]
+    fn underline_keep_spans_with_metrics(
+        &mut self,
+        input: &RenderInput,
+        r: usize,
+        c: usize,
+        plan_entry: ColumnGlyph,
+        x0: usize,
+        dw: usize,
+        dm: deco::DecoMetrics,
+        ink: &mut Vec<bool>,
+        out: &mut Vec<(usize, usize)>,
+    ) -> bool {
         if !self.underline_skip_descenders || dw == 0 {
             return false;
         }
@@ -11560,7 +11641,7 @@ impl Renderer {
         let Some(cell) = input.cells.get(r).and_then(|row| row.get(c)) else {
             return false;
         };
-        let band = deco::underline_band(cell.underline, self.cell_h, self.deco_metrics());
+        let band = deco::underline_band(cell.underline, self.cell_h, dm);
         let Some((by0, by1)) = band else {
             return false;
         };
@@ -11592,12 +11673,22 @@ impl Renderer {
         let (ylo, yhi) = (by0 as i32 - 1, by1 as i32 + 1);
         ink.clear();
         ink.resize(dw, false);
+        // The band filter as LOOP BOUNDS instead of a per-row `continue`:
+        // `cy ∈ [ylo, yhi)` ⇔ `gy ∈ [ylo - gy0, yhi - gy0)`, so intersecting that
+        // with `0..gh` visits EXACTLY the rows the `continue` form visited — same
+        // probed texels, same `any`, same spans. `gh` is a bitmap height (bounded
+        // small) so `gh as i32` cannot overflow, and the clamp makes the bounds
+        // total for any `gy0`. An empty range means no glyph row reaches the
+        // dilated band, which is precisely the old `!any` exit — so the majority
+        // no-descender cell ('a', 'c', 'e') now leaves without walking `gh` rows
+        // to prove it.
+        let gy_start = (ylo - gy0).clamp(0, gh as i32) as usize;
+        let gy_end = (yhi - gy0).clamp(0, gh as i32) as usize;
+        if gy_start >= gy_end {
+            return false;
+        }
         let mut any = false;
-        for gy in 0..gh {
-            let cy = gy0 + gy as i32;
-            if cy < ylo || cy >= yhi {
-                continue;
-            }
+        for gy in gy_start..gy_end {
             for gx in 0..gw {
                 if ink_at(gx, gy) {
                     let col = xmin + gx as i32;
@@ -12381,6 +12472,18 @@ impl Renderer {
             }
             let mask = self.deco_mask(d.glyph, bcw, ch);
             let oy = self.grid_top() as isize + (row * self.cell_h) as isize + d.dy as isize;
+            // 1:1 blit — every non-DECDWL row, i.e. the overwhelming majority. The
+            // NEAREST source index reduces to `sx = mx` BIT-for-bit: `mx` and
+            // `mx + 0.5` are exactly representable, the two roundings of
+            // `(mx + 0.5)/rcw * bcw` leave the result within ~1e-4 of `mx + 0.5` for
+            // any admissible cell width, so the truncating cast is exactly `mx`, and
+            // `.min(bcw - 1)` is already a no-op over `mx ∈ 0..bcw`. Hoisting the
+            // test out of the texel loop therefore changes no pixel — it only spares
+            // the common path an f32 divide + multiply + cast per texel. Same idiom
+            // (and same justification) as `stamp_cat_quad`'s `one_to_one` arm; the
+            // scaled arm keeps the exact expression so a doubled row's sample stays
+            // byte-identical to the GPU atlas sampler.
+            let one_to_one = rcw == bcw;
             for my in 0..ch {
                 let py = oy + my as isize;
                 if py < 0 || py as usize >= h {
@@ -12390,9 +12493,12 @@ impl Renderer {
                 for mx in 0..rcw {
                     // NEAREST sample of the base-width sprite, byte-identical to the
                     // GPU atlas sampler: texel = floor(((mx+0.5)/rcw) * bcw). When
-                    // rcw == bcw this is `mx` (the single-width no-op).
-                    let sx =
-                        ((((mx as f32 + 0.5) / rcw as f32) * bcw as f32) as usize).min(bcw - 1);
+                    // rcw == bcw this is `mx` (the single-width no-op), elided above.
+                    let sx = if one_to_one {
+                        mx
+                    } else {
+                        ((((mx as f32 + 0.5) / rcw as f32) * bcw as f32) as usize).min(bcw - 1)
+                    };
                     let cov = mask[my * bcw + sx];
                     if cov == 0 {
                         continue;
@@ -12542,16 +12648,48 @@ impl Renderer {
                 // the cell bg colour. Consult the SAME ligature plan as the
                 // base pass so a block cursor over a ligature glyph cuts out
                 // the ligature glyph (not the per-cell char) — CPU/GPU parity.
-                // Reuse the persistent break-column scratch (mem::take); `_into`
-                // clears it first, so reuse is byte-identical.
-                let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
-                ligature_break_cols_into(input, cr, &self.shaping, &mut break_cols);
                 // Reuse the persistent plan buffer (taken/returned via `mem::take`);
                 // `row_glyph_plan` clears+resizes it, so reuse is byte-identical.
                 let mut plan = std::mem::take(&mut self.glyph_plan_scratch);
-                self.row_glyph_plan(input, cr, &break_cols, &mut plan);
-                // `break_cols`'s last reader is done; return it to its home.
-                self.ligature_break_scratch = break_cols;
+                // …and when Phase C already planned THIS row earlier in THIS frame,
+                // reuse that plan instead of building it a second time. The plan is
+                // a pure function of `(input, row, break_cols)`, and nothing between
+                // the two calls mutates any of them (shaping config, faces and
+                // `input` are all fixed once the frame's phases start), so the
+                // reused plan is the identical plan — it is literally the one the
+                // base pass keyed its glyphs with. The hit is the common case on a
+                // typing/echo frame: `compute_dirty_rows` marks the cursor row dirty
+                // under the same `cur_shown` predicate this branch requires, so
+                // `render_row_fg` has always already planned it; `glyph_plan_row` is
+                // cleared per frame and re-keyed at every store, so a miss (a later
+                // apron row, a plan never built) simply falls through to the
+                // original computation.
+                if self.glyph_plan_row == Some(cr) {
+                    // Pin the reuse in debug/test builds: recompute the plan the old
+                    // way and require it to match, so any future reordering that
+                    // invalidated the key fails a test instead of silently keying the
+                    // cut-out to the wrong glyphs (the class `tests/cursor_ink.rs`
+                    // guards). Release builds carry none of this.
+                    #[cfg(debug_assertions)]
+                    {
+                        let mut dbg_breaks = Vec::new();
+                        ligature_break_cols_into(input, cr, &self.shaping, &mut dbg_breaks);
+                        let mut dbg_plan = Vec::new();
+                        self.row_glyph_plan(input, cr, &dbg_breaks, &mut dbg_plan);
+                        debug_assert_eq!(
+                            plan, dbg_plan,
+                            "cursor-row glyph-plan reuse diverged from a fresh plan"
+                        );
+                    }
+                } else {
+                    // Reuse the persistent break-column scratch (mem::take); `_into`
+                    // clears it first, so reuse is byte-identical.
+                    let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
+                    ligature_break_cols_into(input, cr, &self.shaping, &mut break_cols);
+                    self.row_glyph_plan(input, cr, &break_cols, &mut plan);
+                    // `break_cols`'s last reader is done; return it to its home.
+                    self.ligature_break_scratch = break_cols;
+                }
                 // W4: every cut-out blit is clipped to the cursor rect's x-span,
                 // so a glyph whose ink exits the rect (a ligature spanning its
                 // lead cells, an italic overhang) never has its OUTSIDE ink
@@ -12628,6 +12766,9 @@ impl Renderer {
                     );
                 }
                 self.glyph_plan_scratch = plan;
+                // The buffer round-trips with its key: it still holds `cr`'s plan
+                // (either the reused one or the one just built here).
+                self.glyph_plan_row = Some(cr);
             }
         }
     }
@@ -16397,6 +16538,11 @@ fn stamp_cat_quad<const WHITE_RGB: bool>(
 ///   byte-identical to one whole stamp: `sy` depends only on `dy`;
 /// * v1 is NEAREST-only: `FreeSampler::Linear` is debug-asserted off and
 ///   ignored in release, mirroring the GPU instance build.
+///
+/// `xmap` is a caller-owned scratch buffer for the per-COLUMN source-index table
+/// (cleared and refilled here): `sx` is a pure function of `dx`, so it is the
+/// same on every scanline of the stamp and is computed once per column instead of
+/// once per destination pixel.
 #[allow(clippy::too_many_arguments)]
 fn stamp_free_sprite(
     pixels: &mut [u32],
@@ -16408,6 +16554,7 @@ fn stamp_free_sprite(
     s: &FreeSprite,
     y_lo: usize,
     y_hi: usize,
+    xmap: &mut Vec<u32>,
 ) {
     debug_assert!(
         matches!(s.sampler, FreeSampler::Nearest),
@@ -16445,18 +16592,43 @@ fn stamp_free_sprite(
     // Multiply an 8-bit channel by an 8-bit factor, round-half (`+127`): the
     // integer twin of the GPU's Unorm multiply, exact at factor 255.
     let mul8 = |c: u32, f: u32| -> u32 { (c * f + 127) / 255 };
+    // 1:1 stamp (an unscaled sprite — every resting pet/mote/note frame): the
+    // NEAREST source index reduces to `sx = dx`, `sy = dy` bit-for-bit (the odd
+    // numerator floors to the dest coord; `.min` is a no-op over `dx ∈ 0..aw-1`,
+    // and the clamps above give `dx ∈ [0, dw)`, `dy ∈ [0, dh)`), so the runtime
+    // integer divides are elided on this arm — exactly as the sibling
+    // `stamp_cat_quad` does. The scaled arm keeps the exact divide, so a squashed
+    // /stretched sprite samples the identical texel as before (and as the GPU).
+    let one_to_one = aw == dw && ah == dh;
+    // Per-COLUMN source index, hoisted out of the scanline loop: `sx` depends only
+    // on `dx` (and the fixed `aw`/`dw`/`flip_x`), so it is identical on every row
+    // of this stamp — a pure memoization of a pure function, same texel per pixel.
+    // Divides drop from W·H_band to W_band per stamp (zero on the 1:1 arm).
+    xmap.clear();
+    xmap.extend((px0..xend).map(|px| {
+        let dx = (px as i32 - ox) as usize;
+        let sx0 = if one_to_one {
+            dx
+        } else {
+            (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1)
+        };
+        (if s.flip_x { aw - 1 - sx0 } else { sx0 }) as u32
+    }));
     for py in py0..yend {
         // Dest offset against the UNCLAMPED origin (see the doc above).
         let dy = (py as i32 - oy) as usize;
         // NEAREST source row: pixel-center mapped into the source rect
         // (integer-stepped; at 1:1 this is exactly `dy`).
-        let sy = (((2 * dy + 1) * ah) / (2 * dh)).min(ah - 1);
+        let sy = if one_to_one {
+            dy
+        } else {
+            (((2 * dy + 1) * ah) / (2 * dh)).min(ah - 1)
+        };
         let base = py * w;
         let arow = (s.ay as usize + sy) * atlas.width as usize;
         for px in px0..xend {
-            let dx = (px as i32 - ox) as usize;
-            let sx0 = (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1);
-            let sx = if s.flip_x { aw - 1 - sx0 } else { sx0 };
+            // `xmap` was filled over exactly `px0..xend`, so this index is in range.
+            let sx = xmap[px - px0] as usize;
             let i = (arow + s.ax as usize + sx) * 4;
             let a8 = mul8(atlas.rgba[i + 3] as u32, qa);
             if a8 == 0 {

@@ -15,6 +15,8 @@
 //! typographic beauty — the mirrored film texture comes from `flip_x` at
 //! render time, not from authoring mirrored art.
 
+use std::sync::OnceLock;
+
 use font8x8::{
     BASIC_FONTS, BLOCK_FONTS, BOX_FONTS, GREEK_FONTS, HIRAGANA_FONTS, LATIN_FONTS, MISC_FONTS,
     UnicodeFonts,
@@ -251,6 +253,10 @@ const RECIPES: [&[Stroke]; ROM_GLYPHS] = [
 
 /// The rasterized 1-bit master: 64 glyphs × 48 scanlines, one `u32` of
 /// 24 valid bits per scanline (bit `x` set ⇒ pixel `(x, y)` inked).
+///
+/// `Clone` is a plain `Vec<u32>` copy (~12 KB) — how the material path forks
+/// the memoized decorative master (see [`decorative_master`]).
+#[derive(Clone)]
 pub struct RomMaster {
     rows: Vec<u32>,
 }
@@ -269,8 +275,9 @@ impl RomMaster {
     }
 }
 
-/// Rasterize the whole ROM. Called once at first bake (the master is ~12 KB);
-/// pure integer math, so the bit pattern is identical on every host.
+/// Rasterize the whole ROM (the master is ~12 KB); pure integer math, so the
+/// bit pattern is identical on every host. Engines take it through
+/// [`decorative_master`], which rasterizes at most once per process.
 #[must_use]
 pub fn rasterize_master() -> RomMaster {
     let mut rows = vec![0u32; ROM_GLYPHS * MASTER_H];
@@ -284,6 +291,25 @@ pub fn rasterize_master() -> RomMaster {
         }
     }
     RomMaster { rows }
+}
+
+/// The decorative master, rasterized AT MOST ONCE per process.
+///
+/// [`rasterize_master`] is a pure function of the const recipe table, but it is
+/// not cheap: ~3.4k Bresenham steps × a 4×4 stamp ≈ 55k bounds-checked plots
+/// plus a 12 KB zeroed `Vec`. The material path below rebuilds that same
+/// constant on EVERY charset change (a fresh sample whenever the visible
+/// 128-char set turns over, i.e. routinely while output streams), so the ROM
+/// is memoized here and forked with a 12 KB `memcpy` instead. Every bit of the
+/// master is identical either way, so atlas texels, baker versions, and emit
+/// fingerprints are unchanged.
+///
+/// Process-wide rather than a per-engine resident field: aterm builds one rain
+/// engine per pane, `RomMaster` is `Vec<u32>` only (so `Send + Sync`, sound on
+/// native and wasm alike), and 12 KB is paid once for the whole process.
+pub(crate) fn decorative_master() -> &'static RomMaster {
+    static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
+    DECORATIVE.get_or_init(rasterize_master)
 }
 
 /// The embedded bitmap for one literal material character. The supported
@@ -312,7 +338,10 @@ pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
 /// remains integer-only and byte-identical on every backend.
 #[must_use]
 pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
-    let mut master = rasterize_master();
+    // The decorative tail (slots `chars.len()..64`) is the classic ROM verbatim,
+    // so fork the memoized copy rather than re-rasterizing the constant on every
+    // charset change — byte-identical master, one 12 KB memcpy.
+    let mut master = decorative_master().clone();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
         let Some(bitmap) = material_bitmap(ch) else {
             continue;

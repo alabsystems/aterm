@@ -2707,6 +2707,31 @@ pub struct GpuRenderer {
     // fresh Vec<BgInstance> every frame. Byte-identical: the same instances are built
     // and uploaded; only the backing allocation is reused.
     bloom_glow_scratch: Vec<BgInstance>,
+    // Persistent per-cell resolved-glyph-key scratch for `encode_frame` (mem::take,
+    // like `row_plans`). The atlas-key prepass and the glyph-emission loop ran the
+    // IDENTICAL per-cell derivation — `drawable` + `image_hides_glyph_at`, the
+    // three-arm column plan, `resolve_cell_key` (a cluster binary search plus a
+    // hash probe) and the `shade_phase_key` fold — over the same cells, and the
+    // prepass then threw its answer away. Now it parks the answer here (indexed
+    // `r * cols + c`, `None` for the cells it skipped) and the emission loop reads
+    // it back: same key, so every atlas slot, quad and instance is byte-identical.
+    key_scratch: Vec<Option<GlyphKey>>,
+    // Persistent scratch trio for `build_image_plane` (mem::take, like `row_plans`).
+    // That function runs on EVERY present, and a frame carrying any image used to
+    // malloc + free a fresh distinct-image Vec, dedup set and placement map before
+    // it could even reach its reuse check — the one per-frame path in `encode_frame`
+    // never converted to the scratch pattern. Cleared and refilled in the identical
+    // order each call, so the placement map, its equality check and the packed plane
+    // layout are unchanged. `image_order_scratch` holds live `Arc<ImageData>` clones
+    // while in use and is CLEARED before it is handed back, so a scrolled-off image
+    // is never pinned on the renderer between presents.
+    image_order_scratch: Vec<(
+        std::sync::Arc<aterm_core::grid::extra::ImageData>,
+        usize,
+        usize,
+    )>,
+    image_seen_scratch: FxHashSet<(usize, usize, usize)>,
+    image_placements_scratch: FxHashMap<(usize, usize, usize), (u32, u32, u32)>,
     // TEST/DIAGNOSTIC counters: how many `present_input` frames took the SCISSOR
     // (dirty-row) path vs a FULL repaint. The byte-identity test asserts the
     // scissor path is actually exercised on typing/cursor frames and that
@@ -2930,10 +2955,12 @@ struct Instances {
     /// so an ordered-tree descent per cell was paying an order of magnitude
     /// over a single Fx probe to rediscover the same small set.
     keys: FxHashSet<GlyphKey>,
-    /// First-insertion order of `keys`. Sorted once per frame (a few hundred
-    /// elements) before it reaches `ensure_atlases`, which reproduces exactly
-    /// the old `BTreeSet` iteration order — `GlyphKey`'s `Ord` is load-bearing
-    /// there: atlas packing order must be stable frame to frame.
+    /// First-insertion order of `keys`. Sorted (a few hundred elements) inside
+    /// `ensure_atlases`, on the paths that actually pack — reproducing exactly
+    /// the old `BTreeSet` iteration order, since `GlyphKey`'s `Ord` is
+    /// load-bearing there: atlas packing order must be stable frame to frame.
+    /// The all-resident steady-state frame returns before the sort and observes
+    /// no order at all (this vec is cleared at the top of the next frame).
     key_order: Vec<GlyphKey>,
     bg: Vec<BgInstance>,
     /// Kitty images below the protocol's `INT32_MIN / 2` boundary. Drawn after
@@ -4473,6 +4500,10 @@ impl GpuRenderer {
             curl_spans_scratch: Vec::new(),
             ligature_break_scratch: Vec::new(),
             bloom_glow_scratch: Vec::new(),
+            key_scratch: Vec::new(),
+            image_order_scratch: Vec::new(),
+            image_seen_scratch: FxHashSet::default(),
+            image_placements_scratch: FxHashMap::default(),
             scissor_taken: 0,
             full_repaints: 0,
             tray_uploads: 0,
@@ -5486,16 +5517,30 @@ impl GpuRenderer {
     /// into free space on a small miss, and full-repacking into a fresh texture
     /// only on genuine overflow (or the first frame). Pure GPU/CPU bookkeeping
     /// — the render passes below just bind `mono_res`/`color_res`.
-    fn ensure_atlases(&mut self, keys: &[GlyphKey]) {
+    fn ensure_atlases(&mut self, keys: &mut [GlyphKey]) {
         // Fast path: every requested key already resident in BOTH atlases → the
         // resident textures + bind groups are exactly what this frame needs.
-        // (`resident_keys` is the union packed across both atlases.)
+        // (`resident_keys` is the union packed across both atlases.) Deliberately
+        // BEFORE the sort: this probe is an unordered `resident_keys` membership
+        // test, so it is correct on an unsorted slice — and the steady state (no
+        // new glyph on screen) returns here without ever observing an order, so
+        // the sort below is pure waste on exactly the common frame.
         if self.mono_res.is_some()
             && self.color_res.is_some()
             && keys.iter().all(|k| self.resident_keys.contains(k))
         {
             return;
         }
+
+        // PACKING ORDER. Everything past this point feeds the packers, which
+        // consume `GlyphKey`'s derived `Ord` — the old `BTreeSet` iteration order
+        // — so the atlas layout (and therefore every byte the differentials pin)
+        // stays stable frame to frame. Sorting HERE, strictly before the
+        // `new_keys` filter, keeps both packer inputs ordered: `filter` preserves
+        // order, so `new_keys` reaches `grow_atlas` sorted, and `rebuild_atlases`
+        // gets the sorted full set. Sorting after the filter would silently hand
+        // `grow_atlas` screen order instead.
+        keys.sort_unstable();
 
         // Which keys are genuinely new this frame.
         let new_keys: Vec<GlyphKey> = keys
@@ -5604,11 +5649,18 @@ impl GpuRenderer {
         // Distinct placements: keyed like the CPU cache. Insertion order is
         // deterministic (row-major over the grid), so the packed texture layout
         // is stable frame to frame for the same image set.
-        let mut order: Vec<(
-            std::sync::Arc<aterm_core::grid::extra::ImageData>,
-            usize,
-            usize,
-        )> = Vec::new();
+        //
+        // The three containers are the persistent renderer-owned scratches
+        // (mem::take, like `row_plans`), cleared here and refilled in exactly the
+        // same order: identical contents, no per-frame malloc/free on a path that
+        // runs on every present. They are handed back on ALL FOUR exits below —
+        // missing one silently reverts to per-frame allocation.
+        let mut order = std::mem::take(&mut self.image_order_scratch);
+        let mut seen = std::mem::take(&mut self.image_seen_scratch);
+        let mut placements = std::mem::take(&mut self.image_placements_scratch);
+        order.clear();
+        seen.clear();
+        placements.clear();
         // `input.images` carries one entry per COVERED CELL, not per image, so
         // this walk is O(covered cells) to discover a distinct set that is
         // realistically 1-8 large. Two cheap guards keep that from costing:
@@ -5616,7 +5668,6 @@ impl GpuRenderer {
         // one-slot memo for the previous key — a run of cells covered by the
         // same image is the normal shape, and re-inserting a key the immediately
         // preceding cell already inserted is a no-op by construction.
-        let mut seen: FxHashSet<(usize, usize, usize)> = FxHashSet::default();
         let mut last_key: Option<(usize, usize, usize)> = None;
         for row in &input.images {
             for (_c, image) in row {
@@ -5642,6 +5693,10 @@ impl GpuRenderer {
         if order.is_empty() {
             // No images this frame: drop any prior plane so nothing is bound.
             win.image_plane = None;
+            // Exit 1 of 4 — hand the scratches back (already empty here).
+            self.image_order_scratch = order;
+            self.image_seen_scratch = seen;
+            self.image_placements_scratch = placements;
             return;
         }
 
@@ -5655,8 +5710,6 @@ impl GpuRenderer {
         // image that doesn't fit emits no quad (its bg shows through) — the same
         // graceful fallback a failed decode already uses.
         let max_tex_dim = self.ctx.device.limits().max_texture_dimension_2d;
-        let mut placements: FxHashMap<(usize, usize, usize), (u32, u32, u32)> =
-            FxHashMap::default();
         let mut total_h: u32 = 0;
         let mut max_w: u32 = 0;
         for (image, fp_w, fp_h) in &order {
@@ -5687,6 +5740,13 @@ impl GpuRenderer {
         }
         if placements.is_empty() || max_w == 0 || total_h == 0 {
             win.image_plane = None;
+            // Exit 2 of 4. `order` carries live `Arc<ImageData>` clones, so clear
+            // it before handing it back: the capacity is what we want to keep, not
+            // a reference that would pin a scrolled-off image's bytes.
+            order.clear();
+            self.image_order_scratch = order;
+            self.image_seen_scratch = seen;
+            self.image_placements_scratch = placements;
             return;
         }
 
@@ -5709,6 +5769,12 @@ impl GpuRenderer {
             && p.h == th
             && p.placements == placements
         {
+            // Exit 3 of 4 — the hot path on any frame keeping a steady image on
+            // screen, and now the one that keeps every container's capacity.
+            order.clear();
+            self.image_order_scratch = order;
+            self.image_seen_scratch = seen;
+            self.image_placements_scratch = placements;
             return;
         }
         // Gather each placed footprint's source rows, then pack them in one pass
@@ -5795,9 +5861,20 @@ impl GpuRenderer {
             bind,
             w: tw,
             h: th,
-            placements,
+            // The plane OWNS its placement map (it is the reuse key next frame),
+            // so move it out and give the scratch an empty map back — the
+            // allocation is surrendered only on this rare rebuild path, which is
+            // already packing and uploading a whole texture. Cloning instead would
+            // add an allocation exactly where it hurts most.
+            placements: std::mem::take(&mut placements),
             _pinned_images: pinned_images,
         });
+        // Exit 4 of 4 (fall-through). `order`'s `Arc` clones are dropped here; the
+        // plane pins the images it actually placed via `_pinned_images`.
+        order.clear();
+        self.image_order_scratch = order;
+        self.image_seen_scratch = seen;
+        self.image_placements_scratch = placements;
     }
 
     /// Enable/disable the GPU-only cursor-comet bloom (ON by default — "batteries
@@ -10424,7 +10501,16 @@ impl GpuRenderer {
         // selection-drag full repaint allocates no per-row break Vec after warmup
         // and the plan stays byte-identical. Restored after the loop.
         let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
-        for (r, plan) in row_plans.iter_mut().enumerate() {
+        // Bounded by `vis_rows` like every emission loop below (see the clamp
+        // comment there): a row past the clamped framebuffer emits nothing, so
+        // planning it is pure waste — and this loop does MORE per row than the
+        // loops it feeds (`ligature_break_cols_for_row_into` + `row_glyph_plan`).
+        // Its readers are all bounded the same way: the glyph and decoration loops
+        // are `.take(vis_rows)`, and the cursor cut-out's `row_plans.get(cr)` only
+        // reaches its single consumer under `r == cr` INSIDE a `.take(vis_rows)`
+        // loop, i.e. never when `cr >= vis_rows`. Retaining a stale plan for a
+        // skipped row is already the status quo (the `row_active` skip below).
+        for (r, plan) in row_plans.iter_mut().enumerate().take(vis_rows) {
             if !row_active(r) {
                 continue;
             }
@@ -10506,7 +10592,21 @@ impl GpuRenderer {
 
         let mut keys = std::mem::take(&mut self.inst.keys);
         let mut key_order = std::mem::take(&mut self.inst.key_order);
-        for (r, cells) in rendered.iter().enumerate() {
+        // Per-cell key cache for the glyph-emission loop below (mem::take, like
+        // `row_plans`). Sized to THIS prepass's own bounds — the same `vis_rows`
+        // rows and `cols` columns the emission loop walks — and written on EVERY
+        // path the inner loop reaches, so a bare `resize` suffices: every slot the
+        // emission loop reads was written by this pass in THIS frame at THIS
+        // `cols`, and anything left over from a previous frame's layout is
+        // unreachable.
+        let mut key_scratch = std::mem::take(&mut self.key_scratch);
+        key_scratch.resize(vis_rows * cols, None);
+        // Bounded by `vis_rows` like the emission loops below — a row past the
+        // clamped framebuffer emits no instance, so keying it only inflates this
+        // pass (see the clamp comment above). The emission loop's `key_scratch`
+        // reads are bounded identically, so it can never read past what this pass
+        // wrote.
+        for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
             // A scissored Dirty repaint only re-encodes its dirty rows (the instance
             // loops below skip the rest via `row_active`), so it only needs THOSE
             // rows' atlas keys; the resident atlases already hold the untouched rows'
@@ -10530,56 +10630,82 @@ impl GpuRenderer {
             // keeps the plain `c · rcw` origin below with no per-column lookup.
             let row_uniform = aterm_render::row_is_uniform(input, r);
             for (c, cell) in cells.iter().take(cols).enumerate() {
+                // Cell placement, hoisted ABOVE the drawable test because the
+                // clamped-framebuffer column guard needs it. Term for term the
+                // glyph loop's own placement — including `ccw`, the cell's OWN run
+                // advance rather than the row summary `rcw`: on a mixed DEC row
+                // `line_sizes[r]` is only a summary ("some pane here is a DEC
+                // line") and can disagree with `line_size_run_at`, and a prepass
+                // that skipped a cell the glyph loop still emits would miss its
+                // atlas slot and silently drop the glyph at the `atlas.map.get`
+                // below. Mirroring `ccw` removes that coupling entirely.
+                let (cell_x, ccw) = if row_uniform {
+                    (c * rcw, rcw)
+                } else {
+                    let (x, cw_run, _, _) = aterm_render::cell_x_run(input, r, c, cw);
+                    (x, cw_run)
+                };
+                if clip_cols && pad + cell_x >= w as usize + ccw {
+                    if row_uniform {
+                        break; // off the right edge of the clamped framebuffer — see vis_rows
+                    }
+                    continue; // a mixed row's runs are not monotone in x — see the glyph loop
+                }
+                // The emission loop's cache slot for this cell. Written on EVERY
+                // path from here on (the skips store `None`), which is what lets
+                // the `resize` above skip a full re-initialisation.
+                let slot = &mut key_scratch[r * cols + c];
                 // An image-covered cell skips its glyph (image-vs-glyph
                 // precedence, mirroring the CPU `image_covers` guard), so it
                 // contributes no atlas key — UNLESS the image is z<0 (behind text),
                 // where the glyph still draws (shared `image_hides_glyph_at`).
-                if Self::drawable(cell) && !input.image_hides_glyph_at(r, c) {
-                    // A ligature-owned column contributes the shaped `mono_gid`
-                    // key (matching the CPU plan); other columns the per-cell key.
-                    let key = match plan
-                        .get(c)
-                        .copied()
-                        .unwrap_or(aterm_render::ColumnGlyph::PerCell)
-                    {
-                        aterm_render::ColumnGlyph::Ligated(gid) => {
-                            self.cpu.ligature_key(gid, aterm_render::cell_style(cell))
-                        }
-                        // M4: a collapsed (Cascadia N:1) cell keys the wide glyph's
-                        // per-cell slice tile — IDENTICAL key to the CPU cache, so the
-                        // atlas holds the same cell-local coverage (parity).
-                        aterm_render::ColumnGlyph::LigatedSlice { gid, k, .. } => self
-                            .cpu
-                            .ligature_slice_key(gid, k, aterm_render::cell_style(cell)),
-                        aterm_render::ColumnGlyph::PerCell => {
-                            self.cell_key(input.cluster_at(r, c), cell)
-                        }
-                    };
-                    // Shade dithers key on the cell's ABSOLUTE pixel parity
-                    // (no-op otherwise) — identical fold to the CPU blit and
-                    // the quad-emission loop below, so the atlas holds the
-                    // exact phase variants those quads will reference. The x
-                    // operand must therefore be the SAME origin that loop emits:
-                    // `c · rcw` on a uniform row, the run-relative origin on a
-                    // mixed one (a pane starting mid-row shifts the parity).
-                    let cell_x = if row_uniform {
-                        c * rcw
-                    } else {
-                        aterm_render::cell_x_run(input, r, c, cw).0
-                    };
-                    let key = aterm_render::shade_phase_key(key, pad + cell_x, grid_top + r * ch);
-                    if keys.insert(key) {
-                        key_order.push(key);
+                if !Self::drawable(cell) || input.image_hides_glyph_at(r, c) {
+                    *slot = None;
+                    continue;
+                }
+                // A ligature-owned column contributes the shaped `mono_gid`
+                // key (matching the CPU plan); other columns the per-cell key.
+                let key = match plan
+                    .get(c)
+                    .copied()
+                    .unwrap_or(aterm_render::ColumnGlyph::PerCell)
+                {
+                    aterm_render::ColumnGlyph::Ligated(gid) => {
+                        self.cpu.ligature_key(gid, aterm_render::cell_style(cell))
                     }
-                    // Combining-mark glyphs share the mono atlas.
-                    if input.cluster_at(r, c).is_none()
-                        && let Some(marks) = input.combining_at(r, c)
-                    {
-                        for &m in marks {
-                            let mk = self.cpu.glyph_key(m);
-                            if keys.insert(mk) {
-                                key_order.push(mk);
-                            }
+                    // M4: a collapsed (Cascadia N:1) cell keys the wide glyph's
+                    // per-cell slice tile — IDENTICAL key to the CPU cache, so the
+                    // atlas holds the same cell-local coverage (parity).
+                    aterm_render::ColumnGlyph::LigatedSlice { gid, k, .. } => self
+                        .cpu
+                        .ligature_slice_key(gid, k, aterm_render::cell_style(cell)),
+                    aterm_render::ColumnGlyph::PerCell => {
+                        self.cell_key(input.cluster_at(r, c), cell)
+                    }
+                };
+                // Shade dithers key on the cell's ABSOLUTE pixel parity
+                // (no-op otherwise) — identical fold to the CPU blit and
+                // the quad-emission loop below, so the atlas holds the
+                // exact phase variants those quads will reference. The x
+                // operand must therefore be the SAME origin that loop emits:
+                // `c · rcw` on a uniform row, the run-relative origin on a
+                // mixed one (a pane starting mid-row shifts the parity).
+                let key = aterm_render::shade_phase_key(key, pad + cell_x, grid_top + r * ch);
+                // Park the finished key for the emission loop instead of making it
+                // re-derive the identical value (same plan, same `resolve_cell_key`,
+                // same fold) a few hundred lines below.
+                *slot = Some(key);
+                if keys.insert(key) {
+                    key_order.push(key);
+                }
+                // Combining-mark glyphs share the mono atlas.
+                if input.cluster_at(r, c).is_none()
+                    && let Some(marks) = input.combining_at(r, c)
+                {
+                    for &m in marks {
+                        let mk = self.cpu.glyph_key(m);
+                        if keys.insert(mk) {
+                            key_order.push(mk);
                         }
                     }
                 }
@@ -10594,13 +10720,13 @@ impl GpuRenderer {
         // locals here, so `ensure_atlases`' `&mut self` doesn't alias them; they
         // return to `self.inst` right after.)
         //
-        // Sort ONCE (a few hundred distinct keys) instead of paying a tree
-        // descent per drawable cell: a deduped Vec sorted by `GlyphKey`'s
-        // derived `Ord` is exactly the old `BTreeSet` iteration order, which is
-        // what `build_kind`/`grow_atlas` pack in — so the atlas layout, and
-        // therefore every byte the differentials pin, is unchanged.
-        key_order.sort_unstable();
-        self.ensure_atlases(&key_order);
+        // The deduped Vec is sorted by `GlyphKey`'s derived `Ord` — exactly the
+        // old `BTreeSet` iteration order, which is what `build_kind`/`grow_atlas`
+        // pack in, so the atlas layout (and every byte the differentials pin) is
+        // unchanged — instead of paying a tree descent per drawable cell. The
+        // sort lives INSIDE `ensure_atlases`, past its all-resident early return:
+        // the steady-state frame packs nothing, so nothing observes the order.
+        self.ensure_atlases(&mut key_order);
         self.inst.keys = keys;
         self.inst.key_order = key_order;
         // Build the per-frame inline-image texture (iTerm2 OSC 1337). `&mut self`,
@@ -11060,39 +11186,24 @@ impl GpuRenderer {
                     }
                     continue; // a mixed row's runs are not monotone in x — see above
                 }
-                // Image-covered cells skip their glyph (image-vs-glyph
-                // precedence) — the CPU `image_covers` guard, mirrored. A z<0 image
-                // (behind text) does NOT hide the glyph (shared `image_hides_glyph_at`).
-                if !Self::drawable(cell) || input.image_hides_glyph_at(r, c) {
+                // The atlas prepass above already walked this exact cell — same
+                // rows, same `take(cols)`, same `clip_cols` guard — resolved its
+                // key through the same column plan and `resolve_cell_key`, and
+                // applied the same absolute shade-phase fold. So read that key
+                // back instead of re-deriving it (a second cluster/Fx lookup per
+                // drawable cell). `None` is the prepass's own image-covered /
+                // undrawable skip (the CPU `image_covers` guard, mirrored; a z<0
+                // image does NOT hide the glyph — shared `image_hides_glyph_at`),
+                // so this `continue` reproduces the old guard exactly.
+                //
+                // Strictly safer than re-deriving, too: the cached key is by
+                // construction the one `ensure_atlases` packed, so a background
+                // fallback-font parse landing mid-encode can no longer hand this
+                // loop a key the atlas has never seen (which used to lose the
+                // glyph at the `atlas.map.get` miss below).
+                let Some(key) = key_scratch[r * cols + c] else {
                     continue;
-                }
-                // Cached resolve (the atlas pass above already keyed this char).
-                // Direct `self.cpu` field access (not the `cell_key` method) so
-                // the `mono_res`/`color_res` borrows above stay disjoint. A
-                // ligature-owned column draws the shaped `mono_gid` glyph at the
-                // column origin, IDENTICAL to the CPU plan (parity).
-                let key = match row_plans[r]
-                    .get(c)
-                    .copied()
-                    .unwrap_or(aterm_render::ColumnGlyph::PerCell)
-                {
-                    aterm_render::ColumnGlyph::Ligated(gid) => {
-                        self.cpu.ligature_key(gid, aterm_render::cell_style(cell))
-                    }
-                    // M4: collapsed cell -> the wide glyph's per-cell slice tile,
-                    // emitted as an ordinary cell-local quad (xmin 0, cell_w wide) at
-                    // this column — byte-identical to the CPU slice blit.
-                    aterm_render::ColumnGlyph::LigatedSlice { gid, k, .. } => self
-                        .cpu
-                        .ligature_slice_key(gid, k, aterm_render::cell_style(cell)),
-                    aterm_render::ColumnGlyph::PerCell => {
-                        self.cpu.resolve_cell_key(input.cluster_at(r, c), cell)
-                    }
                 };
-                // The same absolute shade-phase fold as the CPU blit + the
-                // atlas pass above (a no-op for non-shade keys), so this quad
-                // references the atlas slot holding the right dither variant.
-                let key = aterm_render::shade_phase_key(key, pad + cx, grid_top + r * ch);
                 // The scale and anchor THIS cell's quads are emitted under.
                 // Uniform row: the row's, untouched. Mixed row: the CPU
                 // `mixed_cell_place` rule, mirrored term for term — the ENLARGEMENT
@@ -11357,9 +11468,13 @@ impl GpuRenderer {
                 }
             }
         }
-        // Last reader of `row_plans` (the glyph loop) is done; restore the scratch
-        // so its inner-Vec capacities persist into the next frame.
+        // The glyph loop — last reader of `key_scratch`, and the last local borrow
+        // of `row_plans` (its own reads now come from the cached keys; the atlas
+        // prepass is the last site to touch the plans directly) — is done. Restore
+        // both scratches so their capacities persist into the next frame, and so
+        // the decoration loop below can read `self.row_plans` again.
         self.row_plans = row_plans;
+        self.key_scratch = key_scratch;
         // Combining diacritics: overlay each mark's glyph on its base cell, in
         // the cell foreground — appended AFTER the bases so they draw on top,
         // matching the CPU's mark-after-base blit order.

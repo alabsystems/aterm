@@ -15,6 +15,10 @@
 //! Module map (one module per pipeline stage; each doc comment cites its spec
 //! section):
 
+// This machine's OWN Developer ID identity: keypair and CSR born here, certificate
+// imported here, no private key ever crossing a machine boundary. Apple permits no
+// automated path to a Developer ID certificate, so this is the shortest one it allows.
+mod apple;
 mod buildplan;
 mod bundle;
 mod changelog;

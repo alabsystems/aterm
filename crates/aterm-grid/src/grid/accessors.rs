@@ -477,6 +477,22 @@ impl Grid {
         self.storage.horizontal_margins()
     }
 
+    /// Whether DECSLRM margins are narrower than the full row.
+    ///
+    /// The same answer as `!self.horizontal_margins().is_full(self.cols())`,
+    /// but READ rather than re-derived: the grid already maintains this as a
+    /// flag, updated at the only two places margins can move
+    /// (`set_horizontal_margins` / `reset_horizontal_margins`). The derived form
+    /// costs a `cursor_state` load, a `cols` load, a `saturating_sub` and two
+    /// compares — trivial once, but the bulk write path asks the question once
+    /// per bulk call, i.e. thousands of times per MiB of output, purely to pick
+    /// between a batched and a per-glyph writer.
+    #[must_use]
+    #[inline]
+    pub fn has_horizontal_margins(&self) -> bool {
+        self.storage.has_horizontal_margins
+    }
+
     /// Set horizontal margins (DECSLRM, VT420+).
     #[inline]
     pub fn set_horizontal_margins(&mut self, left: u16, right: u16) {

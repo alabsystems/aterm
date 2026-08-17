@@ -280,6 +280,8 @@ impl App {
                         user_title: user_meta.user_title,
                         description: user_meta.description,
                         icon: user_meta.icon,
+                        role: user_meta.role,
+                        attention: user_meta.attention,
                     },
                 ))
             }
@@ -1299,13 +1301,20 @@ impl App {
     /// the OSC title in tab labels) with its description/icon intact. A leaf
     /// with no captured metadata is a no-op (no lock churn on the common path).
     fn seed_restored_user_meta(session: &crate::Session, leaf: &restore::TerminalLeafRestore) {
-        if leaf.user_title.is_none() && leaf.description.is_none() && leaf.icon.is_none() {
+        if leaf.user_title.is_none()
+            && leaf.description.is_none()
+            && leaf.icon.is_none()
+            && leaf.role.is_none()
+            && leaf.attention.is_none()
+        {
             return;
         }
         let mut meta = session.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
         let _ = meta.set("title", leaf.user_title.clone());
         let _ = meta.set("description", leaf.description.clone());
         let _ = meta.set("icon", leaf.icon.clone());
+        let _ = meta.set("role", leaf.role.clone());
+        let _ = meta.set("attention", leaf.attention.clone());
     }
 
     fn restore_native_leaf(
@@ -2251,6 +2260,8 @@ mod tests {
             user_title: Some("release builder".to_string()),
             description: Some("cuts the v0.56 release".to_string()),
             icon: Some("🚀".to_string()),
+            role: Some("operator".to_string()),
+            attention: Some("⚠ waiting on approval".to_string()),
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -2258,6 +2269,8 @@ mod tests {
         assert_eq!(meta.user_title.as_deref(), Some("release builder"));
         assert_eq!(meta.description.as_deref(), Some("cuts the v0.56 release"));
         assert_eq!(meta.icon.as_deref(), Some("🚀"));
+        assert_eq!(meta.role.as_deref(), Some("operator"));
+        assert_eq!(meta.attention.as_deref(), Some("⚠ waiting on approval"));
 
         // A metadata-less leaf leaves an already-seeded ctx untouched (no wipe).
         let bare = restore::TerminalLeafRestore {
@@ -2268,6 +2281,8 @@ mod tests {
             user_title: None,
             description: None,
             icon: None,
+            role: None,
+            attention: None,
         };
         App::seed_restored_user_meta(&session, &bare);
         assert_eq!(
@@ -2288,6 +2303,8 @@ mod tests {
             user_title: Some("  release\n\u{202e}builder  ".to_string()),
             description: Some(format!("cuts\u{2029}the release{}", "x".repeat(1100))),
             icon: Some(format!("\u{2066}{family}\u{2069}")),
+            role: Some("operator\u{200b}".to_string()),
+            attention: Some("  needs\u{2028}human  ".to_string()),
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -2297,6 +2314,16 @@ mod tests {
             meta.icon.as_deref(),
             Some(family),
             "ZWJ cluster stays intact"
+        );
+        assert_eq!(
+            meta.role.as_deref(),
+            Some("operator"),
+            "invisible formatting is stripped from a restored role"
+        );
+        assert_eq!(
+            meta.attention.as_deref(),
+            Some("needshuman"),
+            "line separators are stripped from a restored attention message"
         );
         assert!(
             meta.description.as_ref().is_some_and(|value| {
@@ -2722,6 +2749,8 @@ mod tests {
                         user_title: None,
                         description: None,
                         icon: None,
+                        role: None,
+                        attention: None,
                     }),
                 )),
                 second: Box::new(restore::RestoredSplitTree::leaf(

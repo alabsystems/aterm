@@ -34,9 +34,13 @@ pub const MIN_FREE_DISK_GIB: u64 = 10;
 /// `TRUST_STAGE2_BIN` overrides (same contract as tools/verify.sh); the default
 /// is `$HOME/trust/build/host/stage2/bin`. Resolved to the PHYSICAL path: Trust's
 /// `build/host` is commonly a target-triple symlink and the protected Trust
-/// drivers refuse a symlinked toolchain path. The stock-name rustup bridge
-/// (`~/.rustup/toolchains/trust/bin/{rustc,cargo}`) is gone — the 2026-07-30
-/// purge ships trust-named binaries only, so the gates resolve those directly.
+/// drivers refuse a symlinked toolchain path. The gates resolve the trust-named
+/// binaries directly rather than a PATH `cargo` — correctness does not depend
+/// on the operator's rustup state. (An earlier revision of this comment claimed
+/// the stock-name `{rustc,cargo}` compatibility entries were purged from stage2;
+/// current stage2 builds ship them again, and the rustup `trust` link over the
+/// stage2 dir is exactly what makes `cargo ship …` dispatch into Trust — the
+/// front door `provision` audits. The gates still never rely on it.)
 pub fn trust_stage2_bin() -> Result<PathBuf> {
     // Resolution order, first hit wins. No step requires anyone to remember an
     // environment variable: a toolchain installed by `atpkg install trust` is found

@@ -3908,6 +3908,13 @@ impl App {
                 );
                 self.refresh_serious_mode_queued_projection();
                 let _ = reply.send(response);
+                if key == crate::prefs::EDIT_ROBI {
+                    // The click-dismissal seam holds this reply's receiver;
+                    // settle it NOW — a failure outcome requests no redraw of
+                    // its own, and the banner (plus Robi's return) must not
+                    // wait for the next natural frame.
+                    self.poll_robi_dismissal();
+                }
                 if matches!(&outcome, ConfigPatchOutcome::Applied { undo: Some(_), .. })
                     || reconciled_changed
                     || (serious_mode && authoritative.is_some())
@@ -6166,10 +6173,20 @@ impl App {
     /// title/icon while dirty, busy and attention remain independently visible
     /// if any sibling owns them.
     pub(crate) fn refresh_active_split_presentation(&mut self, wid: WindowId) {
-        let Some((tab_id, focused, leaves)) = self.windows.get(&wid).and_then(|window| {
-            let tab = window.tab_set.active()?;
-            Some((tab.id, tab.focus, tab.root.leaves()))
-        }) else {
+        let Some((tab_id, focused, leaves, stale_title)) =
+            self.windows.get(&wid).and_then(|window| {
+                let tab = window.tab_set.active()?;
+                // The keep-stale rung below is this tab's OWN previous title —
+                // captured here, before any leaf is re-read, because that is the
+                // only value in reach that this same fold wrote.
+                Some((
+                    tab.id,
+                    tab.focus,
+                    tab.root.leaves(),
+                    tab.presentation.title.clone(),
+                ))
+            })
+        else {
             return;
         };
         let mut presentations = Vec::with_capacity(leaves.len());
@@ -6179,10 +6196,41 @@ impl App {
             };
             let presentation = match linked {
                 crate::tab_model::View::Terminal(terminal) => {
-                    let title = self
-                        .pool
-                        .get(terminal.session)
-                        .map(|session| crate::term_lock(&session.term).title().to_string())
+                    // NONBLOCKING + KEEP-STALE: this runs on the winit thread from
+                    // every tab switch/focus change (`sync_window`), and the reader
+                    // thread holds this exact mutex for a whole ingest slice, so a
+                    // blocking `lock()` parks the gesture behind the flooding pane's
+                    // parser.
+                    //
+                    // SAME-RUNG STALENESS. What this fold writes is
+                    // `tab.presentation.title`, deliberately stable model metadata
+                    // (`app_control.rs`) read back as the FALLBACK rung by
+                    // `tab_titles`, `refill_strip_titles`, `window_title_identity`
+                    // and the `tabs` verb — and unlike `tab_title_cache` it is only
+                    // corrected by the next structural sync, so a wrong value can
+                    // linger. This function's rung is the RAW OSC title (or
+                    // `"aterm"`) and nothing else, so on contention the only value
+                    // we may reuse is this tab's own previous title: keeping it
+                    // leaves the field exactly as it was, which is what a blocking
+                    // read that returned the unchanged title would have produced.
+                    // `tab_title_cache` must NOT be consulted here — `tab_titles`
+                    // fills it from `resolved_terminal_title_rung`, so it can hold
+                    // the operator's `meta set title` or the `~`-abbreviated cwd,
+                    // and importing it would persist a foreign rung into the stable
+                    // metadata. A tab with no prior title lands on the same
+                    // `"aterm"` a titleless pane gets, and the next output wake
+                    // re-publishes the true title either way.
+                    let title = match self.pool.get(terminal.session) {
+                        Some(session) => match session.term.try_lock() {
+                            Ok(term) => Some(term.title().to_string()),
+                            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                                Some(poisoned.into_inner().title().to_string())
+                            }
+                            Err(std::sync::TryLockError::WouldBlock) => Some(stale_title.clone()),
+                        },
+                        None => None,
+                    };
+                    let title = title
                         .filter(|title| !title.is_empty())
                         .unwrap_or_else(|| "aterm".to_string());
                     let mut presentation = crate::tab_model::TabPresentation::terminal(title);
@@ -10706,5 +10754,98 @@ mod tests {
         assert!(std::sync::Arc::ptr_eq(&snapshot.assets, &expected_assets));
         assert!(app.config.serious_mode_or_default());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// KEEP-STALE MUST NOT SWAP RUNGS. `refresh_active_split_presentation` owns
+    /// exactly one title rung — the raw OSC title, or `"aterm"` — and writes it
+    /// into `tab.presentation.title`, the deliberately stable model metadata that
+    /// `tab_titles`, `refill_strip_titles`, `window_title_identity` and the `tabs`
+    /// verb all read back as their FALLBACK rung, and which only a later
+    /// structural sync corrects. The window's `tab_title_cache` is a DIFFERENT
+    /// rung: `tab_titles` fills it from `resolved_terminal_title_rung`, so it can
+    /// hold the operator's `meta set title` or the `~`-abbreviated cwd. This pins
+    /// that a contended terminal lock (a flooding pane holds it for a whole ingest
+    /// slice, which is why the read is nonblocking at all) keeps THIS tab's own
+    /// previous title and never imports the tab-label cache.
+    #[test]
+    fn contended_split_presentation_keeps_its_own_title_rung() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        crate::term_lock(&term).process(b"\x1b]0;osc-live\x07");
+
+        let active_title = |app: &App| {
+            app.windows[&wid]
+                .tab_set
+                .active()
+                .expect("active tab")
+                .presentation
+                .title
+                .clone()
+        };
+
+        // Uncontended: the fold publishes its own rung, the live OSC title.
+        app.refresh_active_split_presentation(wid);
+        assert_eq!(active_title(&app), "osc-live");
+
+        // Seed the tab-label cache with a foreign rung — precisely what
+        // `tab_titles` caches for a pane whose shell reported only a cwd.
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .tab_title_cache
+            .insert(0, "~/repo".to_string());
+
+        // Contended: the terminal mutex is held across the whole call, so the
+        // leaf read must take the WouldBlock arm.
+        let flood = crate::term_lock(&term);
+        app.refresh_active_split_presentation(wid);
+        drop(flood);
+
+        assert_eq!(
+            active_title(&app),
+            "osc-live",
+            "contention must keep this tab's own OSC-title rung, never the \
+             tab-label cache's cwd/operator rung"
+        );
+    }
+
+    /// The same contention, on a tab that has no title yet: the pre-audit blocking
+    /// read produced `"aterm"` for a titleless pane, and keep-stale must land on
+    /// the same string rather than resurrecting some other tab's label.
+    #[test]
+    fn contended_split_presentation_without_a_prior_title_falls_back_to_aterm() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .tab_set
+            .active_mut()
+            .expect("active tab")
+            .presentation
+            .title
+            .clear();
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .tab_title_cache
+            .insert(0, "~/repo".to_string());
+
+        let flood = crate::term_lock(&term);
+        app.refresh_active_split_presentation(wid);
+        drop(flood);
+
+        assert_eq!(
+            app.windows[&wid]
+                .tab_set
+                .active()
+                .expect("active tab")
+                .presentation
+                .title,
+            "aterm",
+            "an empty stale title keeps the titleless pane's `aterm`"
+        );
     }
 }

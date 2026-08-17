@@ -293,7 +293,14 @@ impl Grid {
     /// the cell's COMPLEX flag so stale ring slots left by overwritten cells are not
     /// resurrected, and skips cells already HashMap-backed (ZWJ/skin-tone clusters).
     fn migrate_complex_ring_to_extras(&mut self) {
-        let rows = self.storage.rows.len();
+        // Only VISIBLE rows can match: `GridStorage::row` returns `None` for any
+        // index >= `visible_rows`, so the ring-scrollback tail of `rows` was pure
+        // dead work — up to `max_scrollback` (10_000 in the GUI) x cols no-op
+        // probes per rows-only resize, on the main thread under the `term` lock.
+        // `.min(rows.len())` keeps the bound never LARGER than today's, so a
+        // degenerate `visible_rows > rows.len()` state cannot start aliasing
+        // through `row_index`'s `% rows.len()` and migrate a coord twice.
+        let rows = usize::from(self.storage.visible_rows).min(self.storage.rows.len());
         let cols = self.storage.cols;
         for r in 0..rows {
             let row = row_u16(r);

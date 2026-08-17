@@ -364,7 +364,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         Session,
-        "meta -> OK title= user_title= description= icon= cwd= state= (pct-encoded; '-' = unset). `meta set <title|description|icon> <text...>` / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks the OSC title in tab labels; caps: title 120B, description 1024B, icon 64B)",
+        "meta -> OK title= user_title= description= icon= role= attention= cwd= state= (pct-encoded; '-' = unset). `meta set <title|description|icon|role|attention> <text...>` / `meta unset <field>` set or clear the USER metadata (write-gated; user title outranks the OSC title in tab labels; `role operator` names the fleet operator and a non-empty `attention` is the typed needs-human escalation the menu-bar status item badges; caps: title 120B, description 1024B, icon 64B, role 64B, attention 256B)",
     ),
     // `status` is the READ-ONLY Subject+Status record (RFC: Tab Subject &
     // Status §8) — what a session IS and what it is DOING, classified entirely

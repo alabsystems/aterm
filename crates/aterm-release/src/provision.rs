@@ -1,37 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `cargo ship provision --id <machine-id>` — a fresh checkout becomes a publishing
-//! machine in ONE command, with the paper phrase as the only human input.
+//! `cargo ship provision --id <machine-id>` — a checkout becomes a PUBLISHING machine,
+//! with the paper phrase as the only human input.
 //!
-//! The verb is the whole of RELEASING.md § "Promoting a new release machine", welded
-//! together the same way `setup`/`join` welded the retired `master-new`/`machine-mint`/
-//! `roster-verify` trio: each manual step was half a provisioning an operator could get
-//! wrong, so none of them is manual any more.
+//! "Publishing" is the load-bearing word: a machine on the roster builds what it signs,
+//! so the audit proves the whole stack — the self-hosted Trust stage2 toolchain (a real
+//! smoke-compile under the native-lane rustflags, via the same `gates` probes the cut
+//! runs), the trust-named gate drivers (`targo`/`tippy`/`ty`/`trustdoc`), the rustup
+//! front door (`cargo` in this repo dispatches into the linked `trust` toolchain — the
+//! link is a provisioned artifact, not an accident), the stable `x86_64-apple-darwin`
+//! slice of the universal binary, Apple's packaging tools, the Developer ID identity, a
+//! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
+//! channel token. On a machine with none of that, the front door is
+//! `tools/bootstrap-publisher.sh`, which acquires the toolchain and hands off here.
+//!
+//! The order is the safety argument:
 //!
 //!   1. **Seed the roster pair.** `dist/` is gitignored, so a fresh clone has no
-//!      `aterm-machines.toml` — but the pair ships as assets on every channel release,
-//!      and the channel is anonymously readable (a cut invariant, proved by
-//!      `prove_channel_is_anonymously_readable`), so an unauthenticated `curl` of the
-//!      latest release fetches it before any token exists on this machine. Every
-//!      candidate — fetched or already in `dist/` — is verified under the committed
-//!      `pins::PAPER_MASTER_PUBKEYS` before it is compared, and the NEWEST generation
-//!      wins: a local pair ahead of the channel (an unpublished roster edit) is kept,
-//!      never downgraded, which is the same generation-first rule the client runs.
-//!   2. **Mint, in-process.** The `atpkg-keys` join ceremony runs as a library —
-//!      `preflight → verify_master → plan → write_pins → write_rest` — so the master
-//!      phrase is typed once, on `/dev/tty` with echo off, into the same code that
-//!      enforces every leak rule (never argv, never env, never a file), and no second
-//!      binary needs to exist. A machine that already holds `~/.aterm/machine.key`
-//!      skips the mint and is audited instead: the verb is idempotent.
-//!   3. **Audit what software cannot conjure.** The Apple Developer ID certificate's
-//!      private half lives only in another Mac's keychain; the notary credential and
-//!      the GitHub tokens are issued elsewhere. The verb proves what is present and
-//!      names the exact remedy for what is not, ending in a READY TO CUT verdict.
+//!      `aterm-machines.toml` — the pair ships as assets on every channel release, and
+//!      the channel is anonymously readable (a proven cut invariant), so an
+//!      unauthenticated fetch seeds it before any token exists. Every candidate is
+//!      verified under `pins::PAPER_MASTER_PUBKEYS` BEFORE it is compared; the newest
+//!      generation wins and equal generations must be byte-identical (two different
+//!      master-valid rosters at one sequence is a lineage fork — a hard stop, never a
+//!      preference). An unverifiable or half local pair is a hard stop too: this verb
+//!      never overwrites roster state it cannot prove, because the torn copy might be
+//!      the front half of an incumbent's UNPUBLISHED newer generation. When the seed
+//!      does come from the channel, that residual is said out loud: an incumbent
+//!      machine may hold an unpublished edit the channel cannot show us.
+//!   2. **Audit everything, in one pass.** Collect-all reporting: every gap is printed
+//!      with its exact remedy, not just the first.
+//!   3. **Mint LAST, and only on a clean pass.** A roster id is irreversible (an id
+//!      leaves the roster only by revocation), so it is never consumed on a machine
+//!      the audit just proved cannot build or publish. The mint is the `atpkg-keys`
+//!      join ceremony run as a LIBRARY — `preflight → verify_master → plan →
+//!      write_pins → write_rest` — one `/dev/tty` phrase prompt, every leak rule
+//!      intact, no second binary.
 //!
-//! What this verb deliberately does NOT do: generate anything `--id` collides with (the
-//! roster refuses id reuse), transfer any private key between machines (the design
-//! forbids it — revocation is per-id), or touch `pins.rs` (a join never does).
+//! Idempotent: a provisioned machine is audited (its private key actually read and
+//! its derived public key bound through the real `machines::authorize_cut` gate — the
+//! same code a cut runs), never re-minted. `--check` is the explicit no-writes mode, and
+//! that is a whole-verb property, not a flag on the mint: nothing is minted, installed,
+//! imported, tightened or written, and the Apple and notary steps report what they can
+//! observe rather than acquiring anything. Reading is not writing, so it still audits.
 
 #[cfg(unix)]
 use std::path::{Path, PathBuf};
@@ -48,19 +60,23 @@ use crate::ledger::{Error, Result};
 #[cfg(unix)]
 use crate::publish::step;
 #[cfg(unix)]
-use crate::{machines, mirror, publish};
+use crate::{gates, machines, mirror, publish, sign};
 
 /// POSIX-only, exactly like the engine it drives: `atpkg-keys` compiles empty on
 /// Windows (`#![cfg(unix)]`), because the master phrase is read from `/dev/tty`.
 #[cfg(not(unix))]
-pub fn run_provision(_repo: &std::path::Path, _id: &str) -> crate::ledger::Result<()> {
+pub fn run_provision(
+    _repo: &std::path::Path,
+    _id: &str,
+    _check_only: bool,
+) -> crate::ledger::Result<()> {
     Err(crate::ledger::Error::new(
         "provision is POSIX-only: the provisioning engine reads the master phrase from /dev/tty",
     ))
 }
 
 #[cfg(unix)]
-pub fn run_provision(repo: &Path, id: &str) -> Result<()> {
+pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // The same id rules the roster enforces, checked before anything network-shaped.
     atpkg_keys::provision::vet_machine_id(id).map_err(Error::new)?;
 
@@ -72,27 +88,79 @@ pub fn run_provision(repo: &Path, id: &str) -> Result<()> {
              there is no release to seed the roster from and no channel to provision for",
         )
     })?;
-    println!("aterm-release · provision {id} (channel {slug})");
+    let mode = if check_only { " --check (no writes)" } else { "" };
+    println!("aterm-release · provision {id} (channel {slug}){mode}");
+    // No table of contents above the phases. The five names it listed are the five phase
+    // headers printed below it, one at a time, each already carrying `[n/5]` — so it was
+    // the plan said twice, at the top, where the operator is scanning for the first real
+    // line.
+    phase(1, "roster", "the master-signed list of machines allowed to publish");
 
     // ---- 1. the roster pair: newest verified generation into dist/ ----------------
+    let home = std::env::var("HOME").map_err(|_| Error::new("HOME is not set"))?;
     let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
-    let (local, local_warn) = read_local_candidate(&roster_path);
-    if let Some(warn) = local_warn {
-        step("roster", &warn);
+    let kept_path = kept_roster_path(&home);
+    // dist/ is gitignored and `git clean -xdf` sweeps it — but the generation a mint
+    // writes is re-signed LOCALLY and is published only by a later cut, so between the
+    // two it can exist nowhere else on earth. Losing it leaves a machine whose key no
+    // roster names, and the only remedy this tool could offer was "restore from the
+    // machine holding the newest generation", which names no machine on a one- or
+    // two-machine fleet. So a proven copy is kept beside the key it authorizes (below),
+    // and dist/ is restored from it here — re-verified under the paper master by
+    // `read_local_candidate`, exactly like any other pair. A restore is a WRITE into
+    // dist/, so `--check` declines it for the same reason it declines `install_pair`.
+    if !check_only && restore_kept_pair(&kept_path, &roster_path)? {
+        step(
+            "roster",
+            &format!("dist/ was empty — restored this machine's copy from {}", kept_path.display()),
+        );
     }
+    let local = read_local_candidate(&roster_path)?;
     let fetched = fetch_channel_candidate(&slug);
+    let seeded_from_channel = local.is_none() && fetched.is_ok();
     let (chosen, install, how) = choose_candidate(&roster_path, &slug, local, fetched)?;
-    if install {
+    if install && !check_only {
         install_pair(&roster_path, &chosen)?;
     }
-    step("roster", &how);
+    // `how` describes the DECISION, not the write, because under `--check` there is no
+    // write and the line was claiming one ("seeded from the latest channel release") on a
+    // run whose banner says "no writes".
+    step(
+        "roster",
+        &if install && check_only {
+            format!("{how} — not written (--check)")
+        } else {
+            how
+        },
+    );
+    if seeded_from_channel {
+        // The one thing a channel seed cannot see: an incumbent machine holding an
+        // UNPUBLISHED roster edit. Joining the older public generation would mint a
+        // same-sequence fork that de-authorizes the incumbent's — so the residual is
+        // stated before the mint, where stopping is still free.
+        step(
+            "",
+            "note: the channel cannot show an incumbent's UNPUBLISHED roster edit — if \
+             one exists, STOP and copy that machine's dist/ pair here instead",
+        );
+    }
 
-    // ---- 2. this machine's identity: mint once, audit forever ---------------------
-    let home = std::env::var("HOME").map_err(|_| Error::new("HOME is not set"))?;
+    // ---- what this machine already is ---------------------------------------------
+    // No phase header, and no line on success. Every failure here is a hard `Err` carrying
+    // its own message, and the one green line this section printed — "already provisioned
+    // as 'm2' — key read, pubkey matches machine.toml" — is a weaker restatement of the
+    // `authority` line, which proves the same key through the cut's own gate. On an
+    // unprovisioned machine, the case the verb exists for, the section was a numbered
+    // header with nothing under it.
     let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
     let identity_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_PUB_REL);
 
-    let minted = if key_path.exists() {
+    // On a provisioned machine, actually READ the key: `ReleaseCredentials::resolve`
+    // enforces ownership + 0600 and derives the public key from the private bytes, so
+    // a corrupt, world-readable, or unrelated key file fails HERE, not at a cut.
+    let resolved = sign::ReleaseCredentials::resolve(None, repo)?;
+    let mut attributed: Option<roster::Attribution> = None;
+    let already = if key_path.exists() {
         let identity = machines::MachineIdentity::read(&identity_path)?.ok_or_else(|| {
             Error::new(format!(
                 "{} exists but {} is missing — a half-provisioned machine. The pair is \
@@ -111,121 +179,240 @@ pub fn run_provision(repo: &Path, id: &str) -> Result<()> {
                 identity.id, identity.id,
             )));
         }
-        step(
-            "identity",
-            &format!("already provisioned as '{id}' — auditing, not re-minting"),
-        );
+        let derived = resolved
+            .as_ref()
+            .map(sign::ReleaseCredentials::pubkey)
+            .ok_or_else(|| {
+                Error::new(format!(
+                    "{} exists but did not resolve as this machine's signing identity",
+                    key_path.display()
+                ))
+            })?;
+        if derived != identity.pubkey {
+            return Err(Error::new(format!(
+                "the private key at {} derives a DIFFERENT public key than {} records — \
+                 the pair is incoherent (a restored backup? a copied key?). Move both \
+                 aside and provision a fresh id; never sign with a key whose identity \
+                 file lies about it",
+                key_path.display(),
+                identity_path.display(),
+            )));
+        }
+        // The verb's cheapest decisive proof, run BEFORE its two irreversible ones. A
+        // machine that may never publish again — a revoked id, a roster that has lapsed —
+        // used to walk the whole verb first: prompted to spend one of the team's five
+        // permanent Developer ID slots, stored a notary credential, wrote a profile
+        // carrying its signing key, and only then learned at `authority` that an id never
+        // returns. Nothing is repeated by this: the freshly minted case still binds below,
+        // and this attribution is the one printed there.
+        //
+        // Over the pair phase 1 chose, not a fresh read of dist/: they are the same
+        // document — the chosen one was written there moments ago, or was already there —
+        // but `--check` declines that write, so re-reading judged a pair this run did not
+        // pick, and on a swept checkout it died inside the cut's own reader talking about
+        // a `machine_roster` profile key the operator never touched.
+        attributed = Some(authorize(chosen.bytes.clone(), &chosen.sig, derived)?);
+        true
+    } else {
+        false
+    };
+
+    // ---- 2. the FULL audit, before any mint ---------------------------------------
+    // Evaluated one at a time and printed as each finishes, never collected in an array
+    // first: the Apple step ACQUIRES — it can ask before spending a permanent certificate
+    // slot, and can wait for the operator's browser errand — and in an array literal every
+    // check runs before any line is printed, so that question would arrive with nothing
+    // above it to explain itself.
+    //
+    // Walked as numbered phases rather than a flat list, because this verb is a PROCESS
+    // an operator is standing in the middle of, sometimes for minutes at a time: each
+    // phase announces itself, with `[n/5]`, before the lines it owns.
+    let mut checks: Vec<(&'static str, Check)> = Vec::new();
+    let record = |label: &'static str, check: Check, into: &mut Vec<(&'static str, Check)>| {
+        print_check(label, &check);
+        into.push((label, check));
+    };
+    phase(2, "build stack", "the toolchain and SDK a cut compiles with");
+    // The two checks below run only behind a PROVEN stage2. Without one they had nothing
+    // to look at and returned a Skip whose whole content was "see the toolchain line" —
+    // two full lines carrying nothing, in the densest part of the output, directly under
+    // the one line the operator has to act on. And a stage2 that resolves but cannot
+    // compile the native lane has to be replaced either way, which is the same repair a
+    // missing `tippy` would name. The bin dir comes back BESIDE the verdict — the shape
+    // `apple_identity_check` uses — so it is not resolved a second and third time.
+    let (stack, stage2_bin) = toolchain_check(repo);
+    record("toolchain", stack, &mut checks);
+    if let Some(bin) = &stage2_bin {
+        record("verifiers", verifiers_check(bin), &mut checks);
+        record("front door", front_door_check(bin), &mut checks);
+    }
+    record("x86 slice", x86_slice_check(), &mut checks);
+    record("apple sdk", apple_clt_check(), &mut checks);
+
+    phase(3, "Apple certificate", "this machine's own Developer ID identity");
+    // The SHA-1 the profile pins comes back BESIDE the check, not out of it. It used to be
+    // formatted into an English sentence and then scraped back out with a 40-hex regex over
+    // the printed line — and on a machine with two certificates that regex pinned whichever
+    // appeared first in the prose, while the sentence claimed the profile disambiguated.
+    let (apple_check, apple_sha1) = apple_identity_check(id, !check_only);
+    record(crate::apple::APPLE_LABEL, apple_check, &mut checks);
+
+    phase(4, "notary", "the credential Apple's notarization service answers to");
+    record("notary", notary_acquire(!check_only), &mut checks);
+
+    phase(5, "credentials", "the tokens and profile a cut is handed");
+    record("github", gh_check(), &mut checks);
+    record("channel", channel_token_check(&slug, !check_only), &mut checks);
+
+    // The profile is deliberately NOT audited here, and not yet written. It is the one
+    // item provision PRODUCES, and it is produced from the key the mint below writes —
+    // so counting it at this point is a deadlock rather than a gate: the absent profile
+    // defers the mint, and the deferred mint is why the profile is absent. A fresh
+    // machine could never finish, which is the whole claim of the verb. It is written
+    // and reported once, after the mint, where its verdict is already true.
+    let blocking = blockers(&checks);
+    let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
+
+    // ---- 3. mint LAST -------------------------------------------------------------
+    // A roster id is irreversible, so it is never consumed on a machine the audit just
+    // proved cannot build or publish.
+    //
+    // A deferred mint prints NOTHING. It used to say "DEFERRED — minting '<id>' would
+    // consume an irreversible roster id; fix the N item(s) above and re-run. Nothing was
+    // written", four lines above a terminal error saying: fix N, re-run, nothing written.
+    // The mint's absence is exactly what that error means, and the error is the line the
+    // shell shows and the exit code carries.
+    let minted = if already || check_only || blocking > 0 {
         false
     } else {
         mint(repo, id, &roster_path)?;
         true
     };
 
-    // Bind identity to the (possibly just re-signed) roster on disk — the proof that a
-    // cut from this machine would pass `authorize_cut`, and the catch for a `dist/`
-    // that was swept after a join.
-    let identity = machines::MachineIdentity::read(&identity_path)?.ok_or_else(|| {
-        Error::new(format!(
-            "the join reported success but {} is unreadable",
-            identity_path.display()
-        ))
-    })?;
-    let doc = machines::RosterDocument::read(&roster_path)?;
-    let current = admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature)
-        .map_err(|e| Error::new(format!("{}: {e}", roster_path.display())))?;
-    let authority = match membership(&current.roster, &identity.id, &identity.pubkey) {
-        Membership::Listed => format!(
-            "the roster (seq {}) names '{}' with this machine's key",
-            current.roster.roster_seq, identity.id
-        ),
-        Membership::Revoked => {
-            return Err(Error::new(format!(
-                "'{}' is REVOKED on the roster (seq {}) — an id never returns. Move \
-                 ~/.aterm/machine.key and machine.toml aside and provision a new id",
-                identity.id, current.roster.roster_seq,
-            )));
+    // Re-resolved after a mint, because `resolved` was read before the key existed. This
+    // is the key a cut would sign with, so it is the one the profile below is held to.
+    let derived_pubkey = if minted {
+        sign::ReleaseCredentials::resolve(None, repo)?.map(|c| c.pubkey().to_string())
+    } else {
+        resolved.as_ref().map(|c| c.pubkey().to_string())
+    };
+
+    // The key exists by now — the mint just wrote it, or it always did — so the profile
+    // can be written from it and reported ONCE. The write is silent: the check below names
+    // the file and proves it loads, and a `wrote <path>` line above a `<path> loads …`
+    // line is two lines for one fact. A write that FAILS is reported through that same
+    // check, rather than as a first line whose consequence ("no credentials profile at
+    // <path>") is then printed as a second.
+    //
+    // `--check` skips the WRITE and keeps the check: reading a profile is not writing one,
+    // and the profile is the single item a cut is handed directly — an audit-only mode
+    // that stayed silent about it would omit the one line the operator ran it for.
+    if key_path.exists() {
+        let write_failed = if apple_sha1.is_some() && !check_only {
+            crate::apple::write_credentials_profile(id, &roster_path, apple_sha1.as_deref()).err()
+        } else {
+            None
+        };
+        let check = match write_failed {
+            Some(e) => Check::Fail {
+                what: e,
+                fix: "check ownership of ~/.aterm, then re-run".into(),
+            },
+            None => profile_check(&home, id, apple_sha1.as_deref(), derived_pubkey.as_deref()),
+        };
+        record("profile", check, &mut checks);
+    }
+    let (fails, waiting) = tally(&checks);
+
+    if !key_path.exists() {
+        println!();
+        if check_only {
+            let open = gaps(fails, waiting);
+            println!(
+                "CHECK ONLY — unminted; {}",
+                if open.is_empty() {
+                    format!("a real `cargo ship provision --id {id}` would mint")
+                } else {
+                    format!("{open} before a real run mints")
+                }
+            );
+            return Ok(());
         }
-        Membership::WrongKey { rostered } => {
-            return Err(Error::new(format!(
-                "the roster (seq {}) names '{}' with a DIFFERENT key ({}…) than this \
-                 machine holds — either this dist/ pair is stale (copy the newest \
-                 aterm-machines.toml + .sig from the machine that last edited the \
-                 roster) or the id was re-minted elsewhere and this key must be retired",
-                current.roster.roster_seq,
-                identity.id,
-                rostered.chars().take(12).collect::<String>(),
-            )));
-        }
-        Membership::Absent => {
-            return Err(Error::new(format!(
-                "this machine holds a key but the newest roster available here (seq {}) \
-                 does not name '{}' — if the join's re-signed pair was lost (dist/ is \
-                 gitignored and can be swept), restore aterm-machines.toml AND .sig from \
-                 the machine holding the newest generation, or from the release that \
-                 shipped it",
-                current.roster.roster_seq, identity.id,
-            )));
+        // Mint deferred: there is no identity to bind, and the machine is not
+        // provisioned — say so through the exit code too.
+        return Err(Error::new(format!(
+            "{} above — nothing was written and no roster id was spent; re-run `cargo ship \
+             provision --id {id}` once fixed",
+            gaps(fails, waiting)
+        )));
+    }
+
+    // ---- bind the DERIVED key through the real cut gate ---------------------------
+    // `machines::authorize_cut` is the same admission a cut runs: master signature,
+    // schema, freshness horizon, revocation, `not_after`, and the id↔key bind. Passing
+    // it here is the honest meaning of "this machine may sign". A machine that arrived
+    // already provisioned passed this gate before the Apple phase — over the pair phase 1
+    // CHOSE, which `--check` may have declined to write — and carries the answer down to
+    // here, so nothing is proved twice.
+    //
+    // Reaching this arm means the mint just ran, and the mint RE-SIGNS the roster into
+    // dist/ with this machine added: the pair phase 1 chose is the previous generation and
+    // does not name this key. So this one case reads what the join wrote.
+    let attribution = match attributed {
+        Some(a) => a,
+        None => {
+            let pubkey = derived_pubkey.ok_or_else(|| {
+                Error::new("the join reported success but the minted key did not resolve")
+            })?;
+            let doc = machines::RosterDocument::read(&roster_path)?;
+            authorize(doc.bytes, &doc.signature, &pubkey)?
         }
     };
-    step("authority", &authority);
-
-    // ---- 3. the rest of the publishing stack: prove or name the remedy ------------
-    let checks = [
-        ("apple", apple_identity_check()),
-        ("notary", notary_check()),
-        ("github", gh_check()),
-        ("channel", channel_token_check(&slug)),
-    ];
-    for (label, check) in &checks {
-        print_check(label, check);
-    }
-    // Not a pass/fail check because the profile has no conventional path — it is named
-    // on the cut command line. But a keychain-only audit would bless a machine that
-    // still cannot cut: `resolve_apple_tier` requires a profile naming the notarytool
-    // credential, so say so here rather than at minute twenty of a cut.
     step(
-        "profile",
-        "a Tier APPLE cut names a credentials profile (`--release-credentials <path>`, \
-         0600) carrying notary_profile and signing_identity_sha1 — write one now if \
-         this machine has none",
+        "authority",
+        &format!(
+            "authorize_cut passes: '{}' signs under roster seq {}",
+            attribution.machine_id, attribution.roster_seq,
+        ),
     );
 
-    if minted {
-        println!();
-        println!("=== PROPAGATE ===");
-        println!(
-            "  the roster is now at seq {} and lives only in THIS checkout's dist/ — it",
-            current.roster.roster_seq
-        );
-        println!("  becomes authoritative when published: it ships with the next `cargo ship");
-        println!("  cut` and the next `UPLOAD=1 tools/atpkg-index.sh`. Until then, copy");
-        println!("  dist/aterm-machines.toml AND its .sig to every other publishing machine —");
-        println!("  the roster_seq baseline refuses a publish from an older generation.");
+    // Keep this machine's own copy of the generation that just authorized it — written
+    // only now, so what is kept is a pair `authorize_cut` accepted, never a guess. Step 1
+    // restores dist/ from it, which is what makes a swept dist/ self-healing rather than
+    // the one state this verb has no remedy for. Not under `--check`: it is a write.
+    if !check_only {
+        match keep_roster_pair(&roster_path, &kept_path) {
+            Ok(true) => step(
+                "roster",
+                &format!("kept this generation at {} (dist/ is sweepable)", kept_path.display()),
+            ),
+            Ok(false) => {}
+            Err(e) => step("roster", &format!("could not keep a copy: {e}")),
+        }
     }
 
-    let fails = checks
-        .iter()
-        .filter(|(_, c)| matches!(c, Check::Fail { .. }))
-        .count();
-    let skipped = checks
-        .iter()
-        .any(|(_, c)| matches!(c, Check::Skip(_)));
     println!();
-    if fails == 0 {
-        let host = if skipped {
-            " (Apple checks skipped — cuts themselves run on macOS)"
-        } else {
-            ""
-        };
+    if fails + waiting > 0 {
+        return Err(Error::new(format!(
+            "{} above — re-run `cargo ship provision --id {id}` once fixed",
+            gaps(fails, waiting)
+        )));
+    }
+    if host_cannot_cut {
+        // Non-macOS: the roster half is proven, the Apple half cannot exist here.
         println!(
-            "READY TO CUT: yes{host} — `cargo ship cut --dry-run` is the next proof (a \
-             rostered-key cut currently also needs --strand-pre-roster-clients; the cut \
-             names the flag itself when it applies)"
+            "ROSTERED — but cuts run on macOS (Tier APPLE): this machine can sign the \
+             atpkg index, and can never say READY TO CUT"
         );
     } else {
+        // One line, and the command as printed RUNS: the old text spelled the profile
+        // `<profile>` even though the audit had just printed its real path two lines up,
+        // so the one thing the operator came here to copy had to be assembled by hand.
+        // The parenthetical went with it — it explained a flag and then said the cut
+        // names that flag itself.
         println!(
-            "READY TO CUT: not yet — {fails} item(s) above name their remedy; re-run \
-             `cargo ship provision --id {id}` to re-audit"
+            "READY TO CUT — next: cargo ship cut --dry-run --release-credentials {}",
+            Path::new(&home).join(".aterm/release-credentials.toml").display()
         );
     }
     Ok(())
@@ -259,11 +446,22 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<()> {
     )
     .map_err(Error::new)?;
     let seed = phrase.seed();
-    println!(
-        "master fingerprint: {}  (compare with the paper)",
-        seed.fingerprint().map_err(Error::new)?
-    );
-    prov::verify_master(&pre, &seed).map_err(Error::new)?;
+    // The fingerprint is printed HERE and nowhere else. It used to be printed on the way
+    // in, as `master fingerprint: <fp>  (compare with the paper)` — a manual comparison
+    // the tool then performs itself two statements later (this verb only ever runs
+    // `Verb::Join`, never `Setup`, so the operator's eye is never the only check), and a
+    // value `render_report` reprints on its own `anchor  phrase verified against the
+    // committed master (<fp>)` line. The one moment a human needs to read it is this one,
+    // which is also where `verify_master`'s own text — "compare the fingerprint printed
+    // above against the one on your paper" — was pointing at a line that had scrolled by.
+    prov::verify_master(&pre, &seed).map_err(|e| {
+        // Above the refusal, because the refusal's own words are "compare the fingerprint
+        // printed above against the one on your paper".
+        Error::new(match seed.fingerprint() {
+            Ok(fp) => format!("the phrase you typed has fingerprint {fp}\n{e}"),
+            Err(_) => e,
+        })
+    })?;
     let planned = prov::plan(pre, &seed, now_unix()?).map_err(Error::new)?;
     prov::write_pins(&planned).map_err(Error::new)?;
     let report = prov::write_rest(planned).map_err(Error::new)?;
@@ -302,30 +500,44 @@ fn admit_candidate(
     })
 }
 
-/// The pair already in `dist/`, admitted — or `None` with a warning when it exists but
-/// cannot be admitted. Unverifiable local state is deliberately NOT fatal: garbage
-/// authorizes nothing (a torn copy, a half-copied pair), and a verified channel fetch
-/// replacing it is an upgrade from nothing — but it is said out loud, because the torn
-/// copy might be the front half of somebody's newer-generation hand-copy.
+/// The pair already in `dist/`, admitted — or a HARD ERROR when any local roster
+/// state exists that cannot be proven (a half pair, an orphan signature, a body that
+/// fails verification). Local state is never silently overwritten: the torn copy
+/// might be the front half of an incumbent's UNPUBLISHED newer generation, and
+/// destroying it would set up a same-sequence lineage fork. The operator resolves it
+/// by hand — re-copy BOTH files from the source machine, or remove both to accept
+/// the channel's generation.
 #[cfg(unix)]
-fn read_local_candidate(roster_path: &Path) -> (Option<Candidate>, Option<String>) {
-    if !roster_path.exists() {
-        return (None, None);
+fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
+    let sig_path = machines::RosterDocument::signature_path(roster_path);
+    let body = roster_path.exists();
+    let sig = sig_path.exists();
+    if !body && !sig {
+        return Ok(None);
     }
-    let doc = match machines::RosterDocument::read(roster_path) {
-        Ok(doc) => doc,
-        Err(e) => return (None, Some(format!("dist/ pair unusable ({e}) — reseeding"))),
-    };
-    match admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature) {
-        Ok(c) => (Some(c), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "dist/ pair unusable ({e}) — reseeding; if that pair was a fresh hand-copy, \
-                 re-copy BOTH files from the source machine"
-            )),
-        ),
+    if body != sig {
+        let (present, absent) = if body {
+            (roster_path.display(), sig_path.display())
+        } else {
+            (sig_path.display(), roster_path.display())
+        };
+        return Err(Error::new(format!(
+            "half a roster pair: {present} exists but {absent} is missing. The pair is \
+             one authorization document — re-copy BOTH files from the machine that has \
+             them, or remove the stray file to accept the channel release's pair",
+        )));
     }
+    let doc = machines::RosterDocument::read(roster_path)?;
+    let c = admit_candidate(pins::PAPER_MASTER_PUBKEYS, doc.bytes, doc.signature)
+        .map_err(|e| {
+            Error::new(format!(
+                "the dist/ roster pair is unusable: {e}. Refusing to overwrite local \
+                 roster state this tool cannot prove — if it was a hand-copy, re-copy \
+                 BOTH files from the source machine; remove both files to accept the \
+                 channel release's pair instead",
+            ))
+        })?;
+    Ok(Some(c))
 }
 
 /// The latest channel release's pair, fetched anonymously and admitted.
@@ -380,8 +592,11 @@ fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
 }
 
 /// Newest-generation-wins between what `dist/` holds and what the channel serves —
-/// pure, so the rule is testable without a network. Returns the chosen candidate,
-/// whether it must be written into `dist/`, and the transcript line saying why.
+/// pure, so the rule is testable without a network. Equal generations must be
+/// byte-identical: two DIFFERENT master-valid rosters at one sequence is a lineage
+/// fork (each de-authorizes the other's successors), which no preference rule may
+/// paper over. Returns the chosen candidate, whether it must be written into
+/// `dist/`, and the transcript line saying why.
 #[cfg(unix)]
 fn choose_candidate(
     roster_path: &Path,
@@ -399,7 +614,7 @@ fn choose_candidate(
         ))),
         (None, Ok(f)) => {
             let how = format!(
-                "seeded from the latest channel release (roster_seq {})",
+                "the latest channel release's pair is the only one here (roster_seq {})",
                 f.roster.roster_seq
             );
             Ok((f, true, how))
@@ -417,7 +632,7 @@ fn choose_candidate(
                 Ok((
                     f,
                     true,
-                    format!("upgraded the dist/ pair: roster_seq {ls} → {fs} (channel release)"),
+                    format!("the channel release is newer than dist/: roster_seq {ls} → {fs}"),
                 ))
             } else if fs < ls {
                 Ok((
@@ -428,73 +643,151 @@ fn choose_candidate(
                          unpublished roster edit; keeping the newer generation"
                     ),
                 ))
-            } else {
+            } else if l.bytes == f.bytes {
                 Ok((
                     l,
                     false,
-                    format!("the dist/ pair already matches the channel (roster_seq {ls})"),
+                    format!("the dist/ pair is byte-identical to the channel's (roster_seq {ls})"),
                 ))
+            } else {
+                // Same sequence, different bytes: a fork already exists. Nothing this
+                // tool picks would be safe — the master's holder must decide which
+                // lineage is real and republish it.
+                Err(Error::new(format!(
+                    "LINEAGE FORK: the dist/ pair and the channel's both carry roster_seq \
+                     {ls} but their bytes differ — two master-signed rosters at one \
+                     generation de-authorize each other's successors. Do not mint. \
+                     Determine which document is authoritative (compare machine lists \
+                     with the master's holder), put THAT pair in dist/ everywhere, and \
+                     republish it before any further roster edit",
+                )))
             }
         }
     }
 }
 
-/// Write the chosen pair into `dist/` — body then signature, each through a staged
-/// sibling and an atomic rename, so no reader ever sees a half-written file. A crash
-/// between the two renames leaves a mismatched pair, which the next run refuses to
-/// verify and reseeds — torn state self-heals, it never authorizes.
+/// Write the chosen pair into `dist/`: BOTH halves staged and fsynced first, then the
+/// signature promoted, then the body — so at every instant the on-disk pair is either
+/// the old document, unverifiable (torn, self-healing: the next run hard-stops on it
+/// and the operator re-copies or removes), or the new document. Never a silently
+/// half-new pair.
 #[cfg(unix)]
 fn install_pair(roster_path: &Path, c: &Candidate) -> Result<()> {
+    write_pair(roster_path, &c.bytes, &c.sig)
+}
+
+/// The write itself, over bytes that some caller has already proven — `install_pair` for
+/// an admitted candidate, [`keep_roster_pair`] for a pair `authorize_cut` just accepted.
+#[cfg(unix)]
+fn write_pair(roster_path: &Path, bytes: &[u8], sig: &[u8]) -> Result<()> {
     if let Some(dir) = roster_path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::new(format!("create {}: {e}", dir.display())))?;
     }
     let sig_path = machines::RosterDocument::signature_path(roster_path);
-    stage_and_rename(roster_path, &c.bytes)?;
-    stage_and_rename(&sig_path, &c.sig)?;
+    let staged_body = stage(roster_path, bytes)?;
+    let staged_sig = stage(&sig_path, sig)?;
+    promote(&staged_sig, &sig_path)?;
+    promote(&staged_body, roster_path)?;
     Ok(())
 }
 
+/// This machine's durable copy of the roster generation its key is named in — beside the
+/// key itself, in the directory that already holds everything this machine minted for
+/// itself, and outside any checkout a `git clean` can sweep.
 #[cfg(unix)]
-fn stage_and_rename(path: &Path, bytes: &[u8]) -> Result<()> {
+fn kept_roster_path(home: &str) -> PathBuf {
+    Path::new(home).join(".aterm").join("roster").join(roster::ROSTER_ASSET)
+}
+
+/// Copy the pair `authorize_cut` just accepted into `~/.aterm/roster`. `Ok(true)` when a
+/// copy was written, `Ok(false)` when the kept pair is already byte-identical — so a
+/// provisioned machine says this once, not on every audit.
+#[cfg(unix)]
+fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
+    let doc = machines::RosterDocument::read(roster_path)?;
+    if let Ok(kept) = machines::RosterDocument::read(kept_path) {
+        if kept.bytes == doc.bytes && kept.signature == doc.signature {
+            return Ok(false);
+        }
+        // Never DOWNGRADE the copy. If what is kept is a NEWER generation than the
+        // checkout's — a second checkout, a hand-restored older pair — then the checkout
+        // is the stale side and the copy is the only witness to the newer one, which is
+        // precisely the loss this mechanism exists to prevent. Both sequences are read
+        // through `admit_candidate`, so neither is ever taken from unverified bytes.
+        let seq = |bytes: Vec<u8>, sig: Vec<u8>| {
+            admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
+                .ok()
+                .map(|c| c.roster.roster_seq)
+        };
+        let newer_kept = matches!(
+            (
+                seq(kept.bytes, kept.signature),
+                seq(doc.bytes.clone(), doc.signature.clone()),
+            ),
+            (Some(k), Some(d)) if k > d
+        );
+        if newer_kept {
+            return Ok(false);
+        }
+    }
+    write_pair(kept_path, &doc.bytes, &doc.signature)?;
+    Ok(true)
+}
+
+/// Restore `dist/` from the kept copy, and only when dist/ holds NEITHER half.
+///
+/// Local roster state is never overwritten — a half or unverifiable dist/ pair stays
+/// `read_local_candidate`'s hard stop, because the torn file might be the front half of an
+/// incumbent's unpublished generation. In the other direction the kept copy is only a
+/// cache of something the paper master signed, so one that does not verify is ignored
+/// rather than fatal: the channel is still there, and step 1's rule is unchanged either
+/// way. It is re-admitted under `PAPER_MASTER_PUBKEYS` before it is written, exactly like
+/// a pair fetched from the channel.
+#[cfg(unix)]
+fn restore_kept_pair(kept_path: &Path, roster_path: &Path) -> Result<bool> {
+    if roster_path.exists() || machines::RosterDocument::signature_path(roster_path).exists() {
+        return Ok(false);
+    }
+    let Ok(Some(kept)) = read_local_candidate(kept_path) else {
+        return Ok(false);
+    };
+    install_pair(roster_path, &kept)?;
+    Ok(true)
+}
+
+/// Write `bytes` to a staged sibling of `path` and fsync it.
+#[cfg(unix)]
+fn stage(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    use std::io::Write as _;
     let mut staged = path.as_os_str().to_owned();
     staged.push(".provision.tmp");
     let staged = PathBuf::from(staged);
-    std::fs::write(&staged, bytes)
+    let mut f = std::fs::File::create(&staged)
+        .map_err(|e| Error::new(format!("create {}: {e}", staged.display())))?;
+    f.write_all(bytes)
+        .and_then(|()| f.sync_all())
         .map_err(|e| Error::new(format!("write {}: {e}", staged.display())))?;
-    std::fs::rename(&staged, path)
+    Ok(staged)
+}
+
+#[cfg(unix)]
+fn promote(staged: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(staged, path)
         .map_err(|e| Error::new(format!("rename {} into place: {e}", staged.display())))
 }
 
-/// Where this machine's identity stands in a roster. `Revoked` outranks a listing —
-/// the same precedence the client applies.
-#[cfg(unix)]
-enum Membership {
-    Listed,
-    WrongKey { rostered: String },
-    Revoked,
-    Absent,
-}
-
-#[cfg(unix)]
-fn membership(r: &Roster, id: &str, pubkey: &str) -> Membership {
-    if r.revoked.iter().any(|x| x == id) {
-        return Membership::Revoked;
-    }
-    match r.machines.iter().find(|m| m.id == id) {
-        Some(m) if m.pubkey == pubkey => Membership::Listed,
-        Some(m) => Membership::WrongKey {
-            rostered: m.pubkey.clone(),
-        },
-        None => Membership::Absent,
-    }
-}
-
-/// One audit line: proven, missing-with-remedy, or not applicable on this host.
+/// One audit line: proven, missing-with-remedy, or impossible on this host. A `Skip`
+/// is NOT a pass — a host that skips Apple checks can never say READY TO CUT.
 #[cfg(unix)]
 enum Check {
     Pass(String),
     Fail { what: String, fix: String },
+    /// Progress, waiting on the operator — the certificate request is at Apple. Distinct
+    /// from `Fail` because "MISSING" reads as a fault to repair and this is a step to
+    /// take, but it counts against READY TO CUT all the same, and it defers the mint for
+    /// the same reason a Fail does: a roster id is irreversible.
+    Todo { what: String, next: String },
     Skip(String),
 }
 
@@ -502,96 +795,459 @@ enum Check {
 fn print_check(label: &str, c: &Check) {
     match c {
         Check::Pass(msg) => step(label, msg),
-        Check::Skip(msg) => step(label, &format!("skipped — {msg}")),
+        Check::Skip(msg) => step(label, &format!("impossible here — {msg}")),
         Check::Fail { what, fix } => {
             step(label, &format!("MISSING — {what}"));
             step("", &format!("fix: {fix}"));
         }
-    }
-}
-
-/// The Developer ID Application identities for `team_id` in a `security find-identity
-/// -v -p codesigning` listing — pure over the captured output, so it is testable
-/// without a keychain. Returns the 40-hex SHA-1 of each matching line.
-#[cfg(unix)]
-fn devid_identities(listing: &str, team_id: &str) -> Vec<String> {
-    let team_tag = format!("({team_id})");
-    listing
-        .lines()
-        .filter(|l| l.contains("Developer ID Application:") && l.contains(&team_tag))
-        .filter_map(|l| {
-            l.split_whitespace()
-                .find(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit()))
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-/// The one secret `provision` cannot fetch or mint: the Developer ID certificate's
-/// private half exists only in an already-provisioned Mac's keychain, so the remedy is
-/// the one sanctioned transfer in the whole scheme — a passphrase-protected `.p12`,
-/// moved by hand, deleted after import.
-#[cfg(unix)]
-fn apple_identity_check() -> Check {
-    if !cfg!(target_os = "macos") {
-        return Check::Skip("cuts run on macOS (Tier APPLE); no keychain on this host".into());
-    }
-    match Command::new("security")
-        .args(["find-identity", "-v", "-p", "codesigning"])
-        .output()
-    {
-        Err(e) => Check::Fail {
-            what: format!("could not run `security find-identity`: {e}"),
-            fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
-        },
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let ids = devid_identities(&text, pins::APPLE_TEAM_ID);
-            match ids.len() {
-                0 => Check::Fail {
-                    what: format!(
-                        "no `Developer ID Application` certificate for team {} in the keychain",
-                        pins::APPLE_TEAM_ID
-                    ),
-                    fix: "on an already-provisioned Mac: Keychain Access → export the \
-                          Developer ID Application certificate WITH its private key as a \
-                          passphrase-protected .p12 → move it here over scp/AirDrop → \
-                          double-click to import → delete the .p12 from both machines"
-                        .into(),
-                },
-                1 => Check::Pass(format!("Developer ID Application [{}]", ids[0])),
-                n => Check::Pass(format!(
-                    "{n} Developer ID Application certificates — the credentials profile's \
-                     signing_identity_sha1 disambiguates at cut time"
-                )),
-            }
+        Check::Todo { what, next } => {
+            step(label, what);
+            step("", &format!("next: {next}"));
         }
     }
 }
 
+/// The Trust stage2 toolchain, proven by the same probe a cut runs: resolve it
+/// (atpkg store → `$HOME/trust` → `TRUST_STAGE2_BIN`), run `trustc --version`, then
+/// smoke-COMPILE a probe under the exact native-lane rustflags.
+///
+/// Returns the stage2 `bin` dir beside the verdict, because the two checks that follow
+/// need exactly that and nothing else — and because without one there is nothing for them
+/// to look at, so the caller does not run them at all.
+#[cfg(unix)]
+fn toolchain_check(repo: &Path) -> (Check, Option<PathBuf>) {
+    match gates::trustc_probe(repo) {
+        Ok(trustc) => {
+            let bin = trustc.parent().map(Path::to_path_buf);
+            (
+                Check::Pass(format!(
+                    "trust stage2 compiles the native lane ({})",
+                    trustc.display()
+                )),
+                bin,
+            )
+        }
+        // `trustc_probe`'s own error already lists every way to get a toolchain
+        // (gates.rs:64). Repeating them here printed the same three remedies twice in
+        // two consecutive lines, which is how a fixable problem starts looking like two.
+        Err(e) => (
+            Check::Fail {
+                what: e.to_string(),
+                fix: "tools/bootstrap-publisher.sh does it for you".into(),
+            },
+            None,
+        ),
+    }
+}
+
+/// The trust-named drivers the gate and the ship-build run beside `trustc`.
+#[cfg(unix)]
+fn verifiers_check(bin: &Path) -> Check {
+    let missing: Vec<&str> = ["targo", "tippy", "ty", "trustdoc"]
+        .iter()
+        .copied()
+        .filter(|t| !bin.join(t).is_file())
+        .collect();
+    if missing.is_empty() {
+        Check::Pass(format!("targo + tippy + ty + trustdoc present in {}", bin.display()))
+    } else {
+        // Not `bootstrap-publisher.sh`: it resolves an existing stage2 and stops, so it
+        // would report success over exactly this gap. A stage2 missing its tools has to
+        // be replaced or rebuilt.
+        Check::Fail {
+            what: format!("{} missing from {}", missing.join(" + "), bin.display()),
+            fix: "`atpkg install trust`, or rebuild with `[build] tools` carrying clean \
+                  + ty"
+                .into(),
+        }
+    }
+}
+
+/// The rustup front door: `cargo` in this repo must dispatch INTO the trust stage2 —
+/// that is what makes `cargo ship …` a Trust invocation and not stock Cargo. The link
+/// is a provisioned artifact (`rustup toolchain link trust <stage2>`), so it is
+/// audited like one.
+#[cfg(unix)]
+fn front_door_check(bin: &Path) -> Check {
+    let out = Command::new("rustup")
+        .env("RUSTUP_TOOLCHAIN", "trust")
+        .args(["which", "cargo"])
+        .output();
+    let fix = format!(
+        "rustup toolchain link trust {} (then `cargo` in this repo dispatches into the \
+         Trust toolchain via rust-toolchain.toml)",
+        bin.parent().unwrap_or(bin).display()
+    );
+    match out {
+        Ok(o) if o.status.success() => {
+            let path = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // The link must point at a REAL trust toolchain, not a stray dir. The
+            // canonical stage2 and the linked one may be different installs (atpkg
+            // store vs $HOME/trust); what matters is that the linked dir carries trustc.
+            let linked_ok = Path::new(&path)
+                .parent()
+                .map(|bin| bin.join("trustc").is_file() || bin.join("rustc").is_file())
+                .unwrap_or(false);
+            if linked_ok {
+                Check::Pass(format!("rustup 'trust' toolchain linked ({path})"))
+            } else {
+                Check::Fail {
+                    what: format!(
+                        "rustup 'trust' resolves to {path}, which does not look like a \
+                         Trust toolchain bin"
+                    ),
+                    fix,
+                }
+            }
+        }
+        _ => Check::Fail {
+            what: "rustup has no 'trust' toolchain — `cargo` in this repo cannot \
+                   dispatch (rust-toolchain.toml pins channel = \"trust\")"
+                .into(),
+            fix,
+        },
+    }
+}
+
+/// The x86_64 compat slice of the universal binary rides upstream stable.
+#[cfg(unix)]
+fn x86_slice_check() -> Check {
+    if !cfg!(target_os = "macos") {
+        return Check::Skip("universal DMG builds run on macOS".into());
+    }
+    match gates::x86_target_probe() {
+        Ok(()) => Check::Pass("stable x86_64-apple-darwin target installed (universal slice)".into()),
+        // Only the first LINE of the probe's error. It ends with its own two-line
+        // `fix:`/`or:` remedy, and `step` prints one line — so those arrived unlabelled and
+        // mis-indented, breaking the two-column layout, directly above a `fix:` saying the
+        // same two things again. One missing rustup target printed four lines and two
+        // remedy markers.
+        Err(e) => Check::Fail {
+            what: e
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("no x86_64-apple-darwin target")
+                .trim()
+                .to_string(),
+            fix: "`rustup +stable target add x86_64-apple-darwin` — or cut with \
+                  --arm64-only (an explicit, thinner artifact)"
+                .into(),
+        },
+    }
+}
+
+/// Apple's bundle/sign/package command-line tools — the cut shells all of them.
+#[cfg(unix)]
+fn apple_clt_check() -> Check {
+    if !cfg!(target_os = "macos") {
+        return Check::Skip("cuts run on macOS (Tier APPLE)".into());
+    }
+    let missing: Vec<&str> = [
+        "/usr/bin/codesign",
+        "/usr/bin/dsymutil",
+        "/usr/bin/hdiutil",
+        "/usr/bin/lipo",
+        "/usr/bin/ditto",
+        "/usr/bin/xcrun",
+    ]
+    .iter()
+    .copied()
+    .filter(|t| !Path::new(t).is_file())
+    .collect();
+    if missing.is_empty() {
+        Check::Pass("bundle/sign/package command-line tools present".into())
+    } else {
+        Check::Fail {
+            what: format!("missing {}", missing.join(", ")),
+            fix: "xcode-select --install".into(),
+        }
+    }
+}
+
+/// This machine's own Developer ID identity, ACQUIRED rather than copied: [`crate::apple`]
+/// mints the keypair and CSR here and imports the certificate Apple issues against them.
+/// A private key never crosses a machine boundary — the `.p12` transfer this check used to
+/// prescribe is exactly what the rest of the design exists to prevent.
+///
+/// Apple allows no unattended path (see [`crate::apple`] for the three that were measured
+/// and refused), so the acquisition waits for the operator's one browser errand rather
+/// than making them re-run the command.
+///
+/// Returns the identity the credentials profile should pin beside the audit line, because
+/// that is where it came from. It used to be recovered by regex from the printed sentence,
+/// which meant the pin was decided by "whichever SHA-1 appeared first in some prose" — and
+/// the prose it was scraped out of also contains a filesystem path.
+#[cfg(unix)]
+fn apple_identity_check(id: &str, may_change: bool) -> (Check, Option<String>) {
+    match crate::apple::acquire(id, may_change) {
+        crate::apple::Outcome::Ready { ids, note } => {
+            // `ids` holds only SHA-1s, so this count is a count of certificates. `verdict`
+            // proves ids[0] can actually sign, so ids[0] is the one to pin: a profile
+            // naming any other would pin a certificate nothing has demonstrated.
+            let mut msg = match ids.len() {
+                0 => {
+                    return (
+                        Check::Fail {
+                            what: "no Developer ID Application identity after acquisition".into(),
+                            fix: format!("re-run `cargo ship provision --id {id}`"),
+                        },
+                        None,
+                    )
+                }
+                1 => format!("Developer ID Application [{}]", ids[0]),
+                n => format!(
+                    "{n} Developer ID Application certificates; pinning [{}], the one \
+                     proved to sign",
+                    ids[0]
+                ),
+            };
+            if let Some(note) = note {
+                msg.push_str(&format!("; {note}"));
+            }
+            (Check::Pass(msg), Some(ids[0].clone()))
+        }
+        crate::apple::Outcome::Waiting { what, next }
+        | crate::apple::Outcome::Todo { what, next } => (Check::Todo { what, next }, None),
+        crate::apple::Outcome::Blocked { what, fix } => (Check::Fail { what, fix }, None),
+        crate::apple::Outcome::Skipped(why) => (Check::Skip(why), None),
+    }
+}
+
+/// Fail and Todo both block a cut: a machine still waiting on its certificate cannot
+/// publish, and must not consume an irreversible roster id on a half-finished audit.
+#[cfg(unix)]
+fn blockers(checks: &[(&'static str, Check)]) -> usize {
+    let (fails, waiting) = tally(checks);
+    fails + waiting
+}
+
+/// Faults and things merely waiting, counted APART.
+///
+/// `Todo` exists to say "your certificate request is at Apple" — not a fault to repair —
+/// and `print_check` prints it with `next:` rather than `fix:` for exactly that reason.
+/// The summary then lumped both into "N item(s) above name their remedy", so the one place
+/// an operator reads a verdict was the one place the distinction was thrown away: a
+/// piped run with nobody to do the browser errand exited with the word FAILED, and "name
+/// their remedy" is wrong for an item whose remedy is to wait.
+#[cfg(unix)]
+fn tally(checks: &[(&'static str, Check)]) -> (usize, usize) {
+    let count = |f: fn(&Check) -> bool| checks.iter().filter(|(_, c)| f(c)).count();
+    (
+        count(|c| matches!(c, Check::Fail { .. })),
+        count(|c| matches!(c, Check::Todo { .. })),
+    )
+}
+
+/// "1 gap" · "2 gaps, 1 waiting" · "1 waiting" — the summary phrase, singular-aware
+/// because the overwhelmingly common case is one of them and "1 item(s)" reads as a bug.
+#[cfg(unix)]
+fn gaps(fails: usize, waiting: usize) -> String {
+    let mut parts = Vec::new();
+    if fails > 0 {
+        parts.push(format!("{fails} gap{}", if fails == 1 { "" } else { "s" }));
+    }
+    if waiting > 0 {
+        parts.push(format!("{waiting} waiting"));
+    }
+    parts.join(", ")
+}
+
+/// The cut's own admission gate. One spelling, so the pre-Apple check and the post-mint
+/// bind cannot drift apart — including the refusal, which is where the whole value is.
+#[cfg(unix)]
+fn authorize(bytes: Vec<u8>, sig: &[u8], pubkey: &str) -> Result<roster::Attribution> {
+    machines::authorize_cut(pins::PAPER_MASTER_PUBKEYS, bytes, sig, pubkey, now_unix()? as i64)
+    .map_err(|e| {
+        Error::new(format!(
+            "{e}\nprovision: the machine key exists but the roster on disk does not \
+             authorize it — if the join's re-signed pair was lost (dist/ is gitignored \
+             and can be swept), restore aterm-machines.toml AND .sig from the machine \
+             holding the newest generation; if the id was revoked, an id never returns \
+             — move the key pair aside and mint a new one"
+        ))
+    })
+}
+
+/// One numbered phase header, and the only place the plan is stated. `provision` can sit
+/// waiting for a browser errand for minutes, and a process that says where it is is a
+/// process nobody has to guess about — `[3/5]` carries both the position and the length,
+/// which is why the list that used to precede these was pure repetition.
+#[cfg(unix)]
+fn phase(n: usize, name: &str, what: &str) {
+    println!();
+    println!("  [{n}/5] {name} — {what}");
+}
+
+/// Store the notarytool credential if it is absent, then LIVE-check it either way — the
+/// acquisition is only believed once Apple has answered through it.
+#[cfg(unix)]
+fn notary_acquire(may_change: bool) -> Check {
+    match notary_check() {
+        live @ (Check::Pass(_) | Check::Skip(_)) => live,
+        _ => match crate::apple::ensure_notary(may_change) {
+            // Re-run the live check rather than trusting store-credentials' exit status:
+            // the thing a cut needs is a credential Apple answers to.
+            crate::apple::Outcome::Ready { .. } => notary_check(),
+            crate::apple::Outcome::Waiting { what, next }
+            | crate::apple::Outcome::Todo { what, next } => Check::Todo { what, next },
+            crate::apple::Outcome::Blocked { what, fix } => Check::Fail { what, fix },
+            crate::apple::Outcome::Skipped(why) => Check::Skip(why),
+        },
+    }
+}
+
+/// LIVE-tested, not presence-tested: `notarytool history` proves the stored
+/// credential actually authenticates against Apple — a stale password passes a
+/// keychain presence check and fails at minute twenty of a cut.
+///
+/// The profile name is [`crate::apple::NOTARY_PROFILE`], not a literal: it is one name,
+/// written by `write_credentials_profile`, stored by `ensure_notary`, read by the cut and
+/// checked here, and it was spelled out by hand in every one of those places.
 #[cfg(unix)]
 fn notary_check() -> Check {
     if !cfg!(target_os = "macos") {
         return Check::Skip("cuts run on macOS (Tier APPLE); no keychain on this host".into());
     }
-    // notarytool stores its credential as a keychain generic password under this
-    // service name; presence is what a cut needs, the profile name is in the
-    // credentials file.
-    match Command::new("security")
-        .args(["find-generic-password", "-s", "com.apple.gke.notary.tool"])
+    let profile = crate::apple::NOTARY_PROFILE;
+    match Command::new("xcrun")
+        .args(["notarytool", "history", "--keychain-profile", profile])
         .output()
     {
         Ok(out) if out.status.success() => {
-            Check::Pass("a notarytool keychain credential exists".into())
+            Check::Pass(format!("notarytool profile '{profile}' answers (live-checked)"))
         }
-        _ => Check::Fail {
-            what: "no notarytool credential in the keychain".into(),
+        Ok(out) => Check::Fail {
+            what: format!(
+                "notarytool profile '{profile}' did not authenticate: {}",
+                String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .next()
+                    .unwrap_or("(no error line)")
+            ),
             fix: format!(
-                "xcrun notarytool store-credentials notary --apple-id <your-apple-id> \
+                "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
                  --team-id {} (password: an app-specific password from appleid.apple.com)",
                 pins::APPLE_TEAM_ID
             ),
         },
+        Err(e) => Check::Fail {
+            what: format!("could not run xcrun notarytool: {e}"),
+            fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
+        },
+    }
+}
+
+/// The credentials profile a Tier APPLE cut names on its command line. There is no
+/// ambient path at cut time — but provisioning needs a real verdict, so the audit checks
+/// the conventional location and holds what it finds to the CUT'S OWN admission rules.
+///
+/// Validated by calling `sign::ReleaseCredentials::load` — literally the call the cut
+/// makes — instead of re-scanning for a couple of key names. The two-key scan this
+/// replaced proved only that `notary_profile` and `signing_identity_sha1` parsed, while
+/// `load` additionally hard-requires `signing_key` (sign.rs: "the one key of record"),
+/// demands the file be owner-owned with no group/other access (`check_credentials_perms`,
+/// because it holds a private key), and refuses a profile naming two notary credentials.
+/// So a hand-written or restored profile could pass this audit — READY TO CUT, every item
+/// green — and be refused by `cargo ship cut` on its first line. An audit that admits what
+/// the cut rejects is the exact false green this verb exists to abolish, so there is now
+/// one validator, not two.
+#[cfg(unix)]
+fn profile_check(
+    home: &str,
+    id: &str,
+    apple_sha1: Option<&str>,
+    machine_pubkey: Option<&str>,
+) -> Check {
+    if !cfg!(target_os = "macos") {
+        return Check::Skip("cuts run on macOS (Tier APPLE)".into());
+    }
+    let path = Path::new(home).join(".aterm/release-credentials.toml");
+    // provision WRITES this file. It is not one the operator can hand-write: `signing_key`
+    // is a copy of `~/.aterm/machine.key`, which on the run that needs this remedy may not
+    // exist yet. And an existing profile is never clobbered (`create_new`, apple.rs), so
+    // the remedy for a bad one is to move it aside, not to edit it.
+    let rewrite = format!(
+        "move {} aside and re-run `cargo ship provision --id {id}` — provision writes it",
+        path.display()
+    );
+    if !path.exists() {
+        return Check::Fail {
+            what: format!("no credentials profile at {}", path.display()),
+            fix: format!("re-run `cargo ship provision --id {id}` — provision writes it"),
+        };
+    }
+    let creds = match sign::ReleaseCredentials::load(&path) {
+        Ok(c) => c,
+        // `load`'s error already names the file and the exact defect — the missing
+        // `signing_key`, the mode the cut refuses, a key that is not PKCS#8 Ed25519 — in
+        // the words the cut itself would use.
+        Err(e) => return Check::Fail { what: e, fix: rewrite },
+    };
+    // Everything below is what `load` cannot know: the world this run just measured.
+    if creds.notary().is_none() {
+        return Check::Fail {
+            what: format!("{} names no notarytool credential", path.display()),
+            fix: rewrite,
+        };
+    }
+    // Declaring `machine_id` is optional; declaring it WRONG is fatal at cut time, so a
+    // profile carried over from another machine is refused here instead of there.
+    if let Some(declared) = creds.machine_id().filter(|d| *d != id) {
+        return Check::Fail {
+            what: format!("{} declares machine_id = \"{declared}\", not '{id}'", path.display()),
+            fix: rewrite,
+        };
+    }
+    // `signing_key` is a COPY of ~/.aterm/machine.key taken at first write, and the file is
+    // never rewritten (`create_new`, apple.rs) — so nothing re-compares the two. After a
+    // re-mint (the remedy this verb itself prescribes) the profile still holds the RETIRED
+    // key while `authority` below proves the new one, and the cut loads the profile's copy,
+    // not machine.key. So the copy is what has to match.
+    if let Some(mine) = machine_pubkey.filter(|m| creds.pubkey() != *m) {
+        return Check::Fail {
+            what: format!(
+                "{} signs as {}, but this machine's key is {mine}",
+                path.display(),
+                creds.pubkey()
+            ),
+            fix: rewrite,
+        };
+    }
+    // `machine_roster` is frozen at first write as an absolute path into one checkout, and
+    // the cut reads it. dist/ is gitignored and sweepable, so a profile can outlive the
+    // roster it names — this run restored or installed the pair moments ago, and the cut
+    // will look wherever the profile says.
+    if let Some(named) = creds.machine_roster().filter(|r| !r.exists()) {
+        return Check::Fail {
+            what: format!(
+                "{} names a machine_roster that is not there: {}",
+                path.display(),
+                named.display()
+            ),
+            fix: rewrite,
+        };
+    }
+    match (creds.signing_identity_sha1(), apple_sha1) {
+        // The pin and the certificate this run PROVED can sign disagree — a renewal, or a
+        // profile carried over from a machine that was re-certified. `select_devid_identity`
+        // refuses exactly this at cut time, twenty minutes in, and it is the failure the
+        // audit exists to move to the front.
+        (Some(pinned), Some(proved)) if !pinned.eq_ignore_ascii_case(proved) => Check::Fail {
+            what: format!(
+                "{} pins signing_identity_sha1 {pinned}, but this machine signs with {proved}",
+                path.display()
+            ),
+            fix: rewrite,
+        },
+        // An absent pin is NOT a gap: the cut accepts it whenever the keychain holds
+        // exactly one Developer ID Application certificate, and refusing here would be the
+        // mirror of the defect above — the audit rejecting what the cut admits.
+        //
+        // The line claims exactly what was demonstrated: `load` accepted this file. It
+        // does not list the keys, because listing them is what the old check did instead
+        // of proving them.
+        _ => Check::Pass(format!("{} loads under the cut's own rules", path.display())),
     }
 }
 
@@ -611,23 +1267,76 @@ fn gh_check() -> Check {
 }
 
 /// The channel repo is a different org than the dev remote, so `gh`'s default account
-/// cannot publish there — the cut threads a dedicated token from a file.
+/// cannot publish there — the cut threads a dedicated token from a file. Presence AND
+/// mode are checked; push permission itself is proven by the cut's own preflight.
+///
+/// A group/other-readable token is TIGHTENED rather than reported. This verb already
+/// downloads an Apple intermediate CA and imports it into the login keychain, generates
+/// RSA keys, and writes ~/.aterm — against that autonomy budget, printing `chmod 600 <p>`
+/// and then deferring an irreversible mint over one mode bit costs the operator a full
+/// re-run, including a live round trip to Apple's notary service, for one syscall. Under
+/// `--check` it is still only reported: that flag's whole promise is that nothing changes.
 #[cfg(unix)]
-fn channel_token_check(slug: &str) -> Check {
+fn channel_token_check(slug: &str, may_change: bool) -> Check {
     let where_it_lives = publish::channel_token_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.secrets/gh_access_token_alabsystems".into());
+    // "mint", not "copy": a per-machine token revokes per-machine, the same reason the
+    // signing key never travels. That is the design's reason, not the operator's next
+    // action, so it is a comment here and not a second sentence on the remedy line.
+    let fix = format!(
+        "mint a fine-grained PAT (Contents: read/write on {slug}, short expiry) and \
+         write it to {where_it_lives}, mode 600"
+    );
     match publish::channel_token() {
-        Some(_) => Check::Pass("channel token present".into()),
         None => Check::Fail {
             what: format!("no channel token at {where_it_lives}"),
-            fix: format!(
-                "mint a fine-grained PAT (Contents: read/write on {slug}, short expiry) \
-                 and write it to {where_it_lives}, mode 600 — per-machine tokens revoke \
-                 per-machine, same logic as the keys"
-            ),
+            fix,
         },
+        Some(_) => {
+            // The token resolved; now hold its file to the same owner-only standard
+            // as every other credential.
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = publish::channel_token_path();
+            let open = path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.permissions().mode() & 0o077 != 0)
+                .unwrap_or(false);
+            if !open {
+                return Check::Pass("channel token present, owner-only".into());
+            }
+            let tightened = may_change
+                && path.is_some_and(|p| {
+                    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).is_ok()
+                });
+            if tightened {
+                Check::Pass("channel token present (tightened to 0600)".into())
+            } else {
+                Check::Fail {
+                    what: format!("{where_it_lives} is group/other-accessible"),
+                    fix: format!("chmod 600 {where_it_lives}"),
+                }
+            }
+        }
     }
+}
+
+/// The Developer ID Application identities for `team_id` in a `security find-identity
+/// -v -p codesigning` listing — pure over the captured output, so it is testable
+/// without a keychain. Returns the 40-hex SHA-1 of each matching line.
+#[cfg(unix)]
+pub(crate) fn devid_identities(listing: &str, team_id: &str) -> Vec<String> {
+    let team_tag = format!("({team_id})");
+    listing
+        .lines()
+        .filter(|l| l.contains("Developer ID Application:") && l.contains(&team_tag))
+        .filter_map(|l| {
+            l.split_whitespace()
+                .find(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 #[cfg(unix)]
@@ -685,8 +1394,12 @@ mod tests {
     }
 
     fn signed_candidate(seq: u64) -> (String, Vec<u8>, Vec<u8>) {
+        signed_candidate_with(seq, vec![machine("m3", 0x42)])
+    }
+
+    fn signed_candidate_with(seq: u64, machines: Vec<Machine>) -> (String, Vec<u8>, Vec<u8>) {
         let s = seed();
-        let r = roster_with(seq, vec![machine("m3", 0x42)], vec![]);
+        let r = roster_with(seq, machines, vec![]);
         let bytes = r.to_toml().expect("valid roster").into_bytes();
         let sig = s.sign(&bytes).expect("sign");
         (s.pubkey_b64().expect("pubkey"), bytes, sig)
@@ -731,15 +1444,14 @@ mod tests {
         assert!(!install);
         assert!(how.contains("AHEAD"), "{how}");
 
-        // equal → keep local
+        // equal AND byte-identical → keep local
         let (_, b, s) = signed_candidate(4);
-        let local = admit_candidate(&[&master], b, s).unwrap();
-        let (_, b, s) = signed_candidate(4);
+        let local = admit_candidate(&[&master], b.clone(), s.clone()).unwrap();
         let fetched = admit_candidate(&[&master], b, s).unwrap();
         let (_, install, how) =
             choose_candidate(path, "o/r", Some(local), Ok(fetched)).unwrap();
         assert!(!install);
-        assert!(how.contains("matches"), "{how}");
+        assert!(how.contains("byte-identical"), "{how}");
 
         // nothing local, fetch ok → install
         let (_, b, s) = signed_candidate(2);
@@ -767,19 +1479,47 @@ mod tests {
     }
 
     #[test]
-    fn membership_is_id_and_key_and_revocation_outranks_a_listing() {
-        let r = roster_with(
-            4,
-            vec![machine("m3", 0x42), machine("dead", 0x01)],
-            vec!["dead".into()],
-        );
-        assert!(matches!(membership(&r, "m3", &pubkey_of(0x42)), Membership::Listed));
-        assert!(matches!(
-            membership(&r, "m3", &pubkey_of(0x43)),
-            Membership::WrongKey { .. }
-        ));
-        assert!(matches!(membership(&r, "dead", &pubkey_of(0x01)), Membership::Revoked));
-        assert!(matches!(membership(&r, "m9", &pubkey_of(0x42)), Membership::Absent));
+    fn equal_generation_with_different_bytes_is_a_lineage_fork_and_a_hard_stop() {
+        let (master, b, s) = signed_candidate_with(4, vec![machine("m3", 0x42)]);
+        let local = admit_candidate(&[&master], b, s).unwrap();
+        let (_, b, s) = signed_candidate_with(4, vec![machine("m3", 0x42), machine("mx", 0x43)]);
+        let fetched = admit_candidate(&[&master], b, s).unwrap();
+        let err = choose_candidate(
+            Path::new("dist/aterm-machines.toml"),
+            "o/r",
+            Some(local),
+            Ok(fetched),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LINEAGE FORK"), "{err}");
+        assert!(err.contains("Do not mint"), "{err}");
+    }
+
+    #[test]
+    fn local_roster_state_that_cannot_be_proven_is_a_hard_stop_not_a_reseed() {
+        let dir = std::env::temp_dir().join(format!("provision-local-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aterm-machines.toml");
+
+        // Half pair: body without signature.
+        std::fs::write(&path, b"schema = 1\n").unwrap();
+        let err = read_local_candidate(&path).unwrap_err().to_string();
+        assert!(err.contains("half a roster pair"), "{err}");
+
+        // Orphan signature: signature without body.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(machines::RosterDocument::signature_path(&path), [0u8; 64]).unwrap();
+        let err = read_local_candidate(&path).unwrap_err().to_string();
+        assert!(err.contains("half a roster pair"), "{err}");
+
+        // Full pair that does not verify: hard stop, never treated as absent.
+        std::fs::write(&path, b"schema = 1\n").unwrap();
+        let err = read_local_candidate(&path).unwrap_err().to_string();
+        assert!(err.contains("Refusing to overwrite"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -799,6 +1539,182 @@ mod tests {
             ]
         );
         assert!(devid_identities("", "TEAMIDXXXX").is_empty());
+    }
+
+    /// A fresh Ed25519 keypair as base64 PKCS#8 — the shape `signing_key` carries — with
+    /// the public identity it derives, which is what the audit compares against the key
+    /// this machine actually holds.
+    fn signing_key_b64() -> (String, String) {
+        use ring::signature::KeyPair as _;
+        let rng = ring::rand::SystemRandom::new();
+        let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("keypair");
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(doc.as_ref()).expect("keypair");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        (b64.encode(doc.as_ref()), b64.encode(pair.public_key().as_ref()))
+    }
+
+    /// The audit must refuse exactly what the cut refuses. Each profile below is a way
+    /// the old two-key scan reported "carries the Tier APPLE keys" — and READY TO CUT —
+    /// about a file `cargo ship cut` rejects on its first line.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_profile_audit_refuses_what_the_cut_refuses() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = std::env::temp_dir().join(format!("provision-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".aterm")).unwrap();
+        let path = home.join(".aterm/release-credentials.toml");
+        let home_s = home.to_str().unwrap().to_string();
+        let sha1 = "0".repeat(40);
+
+        let write = |body: &str, mode: u32| {
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let refusal = |c: Check| match c {
+            Check::Fail { what, .. } => what,
+            Check::Pass(msg) => panic!("expected a refusal, got PASS: {msg}"),
+            _ => panic!("expected a refusal"),
+        };
+
+        let (key, pubkey) = signing_key_b64();
+        let mine = Some(pubkey.as_str());
+
+        // Absent: the remedy is this tool, never a hand-written file.
+        let Check::Fail { what, fix } = profile_check(&home_s, "m9", Some(&sha1), mine) else {
+            panic!("an absent profile is a gap");
+        };
+        assert!(what.contains("no credentials profile"), "{what}");
+        assert!(fix.contains("provision writes it"), "{fix}");
+
+        // What the OLD remedy told the operator to write: its two keys, and nothing
+        // else. It passed the audit and died at `credentials_signing_key`.
+        write(
+            &format!("notary_profile = \"notary\"\nsigning_identity_sha1 = \"{sha1}\"\n"),
+            0o600,
+        );
+        let what = refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        assert!(what.contains("signing_key"), "{what}");
+
+        let good = format!(
+            "signing_key = \"{key}\"\nmachine_id = \"m9\"\nnotary_profile = \"notary\"\n\
+             signing_identity_sha1 = \"{sha1}\"\n"
+        );
+        // The mode the cut refuses — it holds a private key (a restore under umask 022).
+        write(&good, 0o644);
+        let what = refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        assert!(what.contains("group/other-accessible"), "{what}");
+
+        // A pin naming a certificate this machine does not hold: the renewal case, which
+        // `select_devid_identity` refuses twenty minutes into a cut.
+        write(&good, 0o600);
+        let what = refusal(profile_check(&home_s, "m9", Some(&"1".repeat(40)), mine));
+        assert!(what.contains("pins signing_identity_sha1"), "{what}");
+
+        // A profile carried over from another machine.
+        let what = refusal(profile_check(&home_s, "m8", Some(&sha1), mine));
+        assert!(what.contains("machine_id"), "{what}");
+
+        // The profile's `signing_key` is a COPY, frozen at first write. After a re-mint it
+        // is the RETIRED key — and it is the one the cut loads, so the roster that
+        // authorizes ~/.aterm/machine.key does not authorize this file.
+        let (_, other) = signing_key_b64();
+        let what = refusal(profile_check(&home_s, "m9", Some(&sha1), Some(&other)));
+        assert!(what.contains("this machine's key is"), "{what}");
+
+        // A roster path that no longer exists: dist/ is gitignored and sweepable, and the
+        // cut reads whatever the profile names.
+        write(
+            &format!("{good}machine_roster = \"{}\"\n", home.join("gone/roster.toml").display()),
+            0o600,
+        );
+        let what = refusal(profile_check(&home_s, "m9", Some(&sha1), mine));
+        assert!(what.contains("machine_roster"), "{what}");
+
+        // Everything the loader demands, agreeing with the world this run measured.
+        write(&good, 0o600);
+        assert!(matches!(
+            profile_check(&home_s, "m9", Some(&sha1), mine),
+            Check::Pass(_)
+        ));
+        // No pin is not a gap: the cut accepts that whenever one certificate is installed.
+        write(
+            &format!("signing_key = \"{key}\"\nnotary_profile = \"notary\"\n"),
+            0o600,
+        );
+        assert!(matches!(
+            profile_check(&home_s, "m9", Some(&sha1), mine),
+            Check::Pass(_)
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `Todo` is "your certificate request is at Apple", not a fault, and the summary is
+    /// the one line an operator reads as a verdict. It used to call both FAILED.
+    #[test]
+    fn waiting_on_apple_is_counted_apart_from_a_fault() {
+        let fail = || Check::Fail { what: String::new(), fix: String::new() };
+        let todo = || Check::Todo { what: String::new(), next: String::new() };
+        let checks = vec![
+            ("a", fail()),
+            ("b", todo()),
+            ("c", Check::Pass(String::new())),
+        ];
+        assert_eq!(tally(&checks), (1, 1));
+        assert_eq!(gaps(1, 1), "1 gap, 1 waiting");
+        // Singular-aware: "1 item(s)" in the commonest case reads as a bug.
+        assert_eq!(gaps(1, 0), "1 gap");
+        assert_eq!(gaps(2, 0), "2 gaps");
+        assert_eq!(gaps(0, 1), "1 waiting");
+        // Both still defer the mint — a roster id is irreversible either way.
+        assert_eq!(blockers(&checks), 2);
+    }
+
+    /// The generation a mint writes lives only in gitignored `dist/` until some later cut
+    /// publishes it, so a `git clean -xdf` in between can destroy the only copy of a
+    /// roster whose certificate slot is already spent.
+    #[test]
+    fn the_authorized_generation_is_kept_outside_the_sweepable_checkout() {
+        let dir = std::env::temp_dir().join(format!("provision-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dist = dir.join("dist").join("aterm-machines.toml");
+        let home = dir.join("home");
+        let kept = kept_roster_path(home.to_str().unwrap());
+
+        // Nothing kept, nothing local: a no-op, not an error.
+        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+
+        let (master, bytes, sig) = signed_candidate(6);
+        let c = admit_candidate(&[&master], bytes, sig).unwrap();
+        install_pair(&dist, &c).unwrap();
+
+        // The pair `authorize_cut` accepted is copied beside the key it authorizes…
+        assert!(keep_roster_pair(&dist, &kept).unwrap());
+        let (a, b) = (
+            machines::RosterDocument::read(&dist).unwrap(),
+            machines::RosterDocument::read(&kept).unwrap(),
+        );
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.signature, b.signature);
+        // …once: a provisioned machine does not repeat the line on every audit.
+        assert!(!keep_roster_pair(&dist, &kept).unwrap());
+
+        // dist/ still holds a pair, so nothing is restored over it.
+        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+
+        // Swept. The kept copy is re-admitted under `PAPER_MASTER_PUBKEYS` before it is
+        // written — this fixture is signed by a synthetic master, so it is IGNORED rather
+        // than installed, and rather than turned into a hard error: the channel is still
+        // a source, and a cache that cannot be proven is not one.
+        std::fs::remove_file(&dist).unwrap();
+        std::fs::remove_file(machines::RosterDocument::signature_path(&dist)).unwrap();
+        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        assert!(!dist.exists());
+
+        // A torn kept copy is ignored for the same reason, and never propagated.
+        std::fs::remove_file(machines::RosterDocument::signature_path(&kept)).unwrap();
+        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use aterm_search::MAX_SEARCH_MATCHES;
 use winit::event_loop::EventLoopProxy;
 
 use super::{
-    DimsSnapshot, control_media, cursor_style_name, image_payload, json_escape, json_ok,
-    json_str_field, pct_encode, visible_char,
+    DimsSnapshot, control_media, cursor_style_name, image_payload, json_ok, json_str_field,
+    pct_encode, visible_char,
 };
 use crate::{Wake, term_lock};
 
@@ -918,15 +918,26 @@ pub(crate) fn cmd_search(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     }
     match search_full_history(term, pat, case_sensitive, is_regex) {
         Ok(search) => {
+            // Function-local (like the other `Write` uses in this file) so it can
+            // never shadow an `io::Write` elsewhere in the module.
+            use std::fmt::Write as _;
             let incomplete = if search.results.incomplete {
                 " incomplete"
             } else {
                 ""
             };
             let mut out = format!("OK {}{incomplete}\n", search.results.matches.len());
+            // One buffer, sized once: a match line ("<row> <col> <len>\n") is ~16
+            // bytes typical, and the result set is capped at MAX_SEARCH_MATCHES
+            // (100_000) => at most ~2.4 MB, so this can neither overflow nor run
+            // away. The old shape allocated a throwaway `String` per match purely
+            // to memcpy it in, and grew `out` by ~17 doubling reallocs on a broad
+            // pattern. Bytes on the wire are unchanged.
+            out.reserve(search.results.matches.len() * 24);
             for m in &search.results.matches {
                 // m.line is the ABSOLUTE row (the index is keyed by absolute row).
-                out.push_str(&format!("{} {} {}\n", m.line, m.start_col, m.len()));
+                // `writeln!` into a String is infallible, so the Result is moot.
+                let _ = writeln!(out, "{} {} {}", m.line, m.start_col, m.len());
             }
             out
         }
@@ -1646,25 +1657,54 @@ pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
 /// `cmd_text` emits, the cursor/dims mirror the `cursor`/`dims` verbs, and `seq`
 /// is the engine `content_seq` (so an agent can diff frames without re-reading).
 pub(crate) fn cmd_text_json(term: &Arc<Mutex<Terminal>>) -> String {
-    let t = term_lock(term);
-    let rows = t.rows() as usize;
-    let cols = t.cols();
-    let mut row_items: Vec<String> = Vec::with_capacity(rows);
-    for r in 0..rows {
-        row_items.push(format!("\"{}\"", json_escape(&visible_row(&t, r))));
+    // GATHER under ONE lock hold, SERIALIZE with the lock released — the shape the
+    // styled frame already uses. Every field is read inside the single hold, so the
+    // reply still describes one instant; the escaping and JSON assembly are pure
+    // string work over owned data, and doing them under the mutex made the PTY
+    // reader's `process()` and the frame snapshot queue behind a screen read.
+    let (rows_text, c, vis, style, rows, cols, seq) = {
+        let t = term_lock(term);
+        let rows = t.rows() as usize;
+        let rows_text: Vec<String> = (0..rows).map(|r| visible_row(&t, r)).collect();
+        (
+            rows_text,
+            t.cursor(),
+            t.cursor_visible(),
+            cursor_style_name(t.cursor_style()),
+            rows,
+            t.cols(),
+            t.content_seq(),
+        )
+    };
+    // ONE buffer, written straight through. The retired shape allocated a quoting
+    // `format!` + a `json_escape` per row, then copied the WHOLE payload three more
+    // times (the `join`, the outer `format!`, and `json_ok`'s own `format!`).
+    // Byte-identical: `json_escape` is `json_escape_into` into a fresh String, and
+    // `json_ok` is exactly this `"OK 1\n"` prefix + `"\n"` suffix.
+    let mut out = String::with_capacity(rows * (cols as usize + 8) + 128);
+    out.push_str("OK 1\n");
+    out.push_str("{\"rows\":[");
+    for (i, row) in rows_text.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        crate::control::json_escape_into(&mut out, row);
+        out.push('"');
     }
-    let c = t.cursor();
-    let vis = t.cursor_visible();
-    let style = cursor_style_name(t.cursor_style());
-    json_ok(&format!(
-        "{{\"rows\":[{}],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
-         \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{}}}",
-        row_items.join(","),
-        c.row,
-        c.col,
-        json_str_field("style", style),
-        t.content_seq(),
-    ))
+    {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "],\"cursor\":{{\"row\":{},\"col\":{},\"visible\":{vis},{}}},\
+             \"dims\":{{\"rows\":{rows},\"cols\":{cols}}},\"seq\":{seq}}}",
+            c.row,
+            c.col,
+            json_str_field("style", style),
+        );
+    }
+    out.push('\n');
+    out
 }
 
 /// `cursor --json` -> `{"row":R,"col":C,"visible":bool,"style":"<name>"}`.
@@ -1874,9 +1914,9 @@ pub(crate) fn styled_image_json(anchor_r: usize, anchor_c: usize, img: &ImageDat
 
 /// One cell's raw material for [`serialize_styled_frame`]: the resolved
 /// [`RenderCell`] plus the three grid-side fields it does not carry — the
-/// combining-aware grapheme, the raw `WIDE` lead flag (`cell_attrs`, NOT the
-/// resolved `RenderCell::wide`), and the OSC 8 hyperlink target. All copied
-/// under the terminal lock; serialized without it.
+/// combining-aware grapheme, the raw `WIDE` lead flag (the live cell's own flag
+/// bit, NOT the resolved `RenderCell::wide`), and the OSC 8 hyperlink target. All
+/// copied under the terminal lock; serialized without it.
 struct StyledCellSnap {
     cell: RenderCell,
     glyph: String,
@@ -1983,22 +2023,51 @@ pub(crate) fn gather_styled_frame(t: &Terminal) -> StyledFrameSnapshot {
     let blank = t.implicit_blank_render_cell();
     let mut cells: Vec<Vec<StyledCellSnap>> = Vec::with_capacity(rows);
     let mut line_sizes: Vec<&'static str> = Vec::with_capacity(rows);
+    // Both hyperlink fields come from ONE `Grid::cell_extra` entry, and that
+    // lookup is `CellExtras::get` — a probe of the extras MAP alone, which
+    // `is_empty()` reports on directly. So with no extras anywhere on screen the
+    // per-cell probe is provably `None` for every cell, and the whole rows*cols
+    // hash-probe sweep collapses to this single bool (the same gate
+    // `images_row_into` and `stale_extras_pair` already use). `t` is borrowed
+    // immutably for the gather, so the map cannot change underneath it.
+    let any_extras = !t.grid().extras().is_empty();
     for r in 0..rows {
         // LIVE frame (offset-INDEPENDENT): colours+attrs from `render_row_at_screen`,
         // glyph from the live `cell_grapheme`, wide-lead from the live raw grid flag
         // (`RenderCell::wide` means the RIGHT-HALF continuation), and the
-        // offset-blind `hyperlink_at` — so all four reads share one live frame and
-        // never stitch a scrolled-back row's colours onto a live glyph.
+        // offset-blind extras probe (exactly what `hyperlink_at`/`hyperlink_id_at`
+        // do internally) — so all four reads share one live frame and never stitch
+        // a scrolled-back row's colours onto a live glyph.
         let rendered = t.render_row_at_screen(r);
+        // ONE live-row handle for the whole row. `screen_row_view` is the
+        // offset-INDEPENDENT twin of `visible_row_view` (and resolves through the
+        // same `row_at_screen` the retired per-column `cell_attrs` call did), so the
+        // live-frame contract above is unchanged — it is just resolved once per row
+        // instead of once per column.
+        let view = t.grid().screen_row_view(r as u16);
         let mut row_cells: Vec<StyledCellSnap> = Vec::with_capacity(cols);
         for c in 0..cols {
             let rc = rendered.get(c).copied();
+            // ONE extras probe for both hyperlink fields: `hyperlink_at` and
+            // `hyperlink_id_at` are literally this same `cell_extra` lookup, read
+            // twice, and both fields fall out of the one `&CellExtra`.
+            let extra = if any_extras {
+                t.grid().cell_extra(r as u16, c as u16)
+            } else {
+                None
+            };
             row_cells.push(StyledCellSnap {
                 cell: rc.unwrap_or(blank),
                 glyph: t.cell_grapheme(r, c).unwrap_or_default(),
-                wide_lead: cell_attrs(t.grid(), r, c).contains(CellFlags::WIDE),
-                hyperlink: t.hyperlink_at(r as u16, c as u16).map(str::to_string),
-                hyperlink_id: t.hyperlink_id_at(r as u16, c as u16).map(str::to_string),
+                // Raw WIDE lead bit straight off the live cell. Identical to the
+                // retired `cell_attrs(..).contains(WIDE)`, not an approximation:
+                // `attrs_to_cell_flags` can never emit WIDE (`StyleAttrs` carries no
+                // width bit), so in the style-interned branch WIDE could only have
+                // come from the cell's own inline flags — the very bit read here —
+                // and a missing cell yields `false` on both paths.
+                wide_lead: view.cell(c as u16).is_some_and(|cell| cell.is_wide()),
+                hyperlink: extra.and_then(|e| e.hyperlink()).map(|u| u.to_string()),
+                hyperlink_id: extra.and_then(|e| e.hyperlink_id()).map(|u| u.to_string()),
             });
         }
         cells.push(row_cells);

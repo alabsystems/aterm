@@ -132,7 +132,25 @@ pub fn fill_path(
     }
     // Flatten every path to device-space edges; track the union bbox.
     let mut bbox = BBox::empty();
-    let mut edges: Vec<Edge> = Vec::new();
+    // Size the edge list up front. It otherwise doubles from empty to several
+    // hundred entries on EVERY call — one call per glyph layer per bake, ×5 for the
+    // haloed outline/whisker layers — paying a realloc+memcpy at each doubling step.
+    // Every command contributes at most one edge except `Cubic`, which flattens to
+    // `n` segments (`flatten_cubic` bounds `n` at 64; it is small single digits at
+    // glyph curvature and FLATTEN_TOL), so 4-per-cubic is a cheap first fit that
+    // costs at most one growth on a big layer. `reserve` is a pure allocation hint:
+    // it cannot change which edges get pushed, only how often the `Vec` grows, so
+    // the raster is untouched.
+    let est = paths.iter().fold(0usize, |n, p| {
+        p.iter().fold(n, |n, cmd| {
+            let e = match *cmd {
+                PathCmd::Cubic(..) => 4,
+                _ => 1,
+            };
+            n.saturating_add(e)
+        })
+    });
+    let mut edges: Vec<Edge> = Vec::with_capacity(est);
     for (pid, p) in paths.iter().enumerate() {
         flatten_path(p, pid as u32, t, &mut bbox, &mut edges);
     }
@@ -268,25 +286,39 @@ pub fn fill_path_fixed(
     }
     const INV_FIXED: f32 = 1.0 / FIXED_ONE as f32;
     let c = |v: u16| f32::from(v) * INV_FIXED;
-    // Lower each fixed-point subpath to `PathCmd`s in the shared 0..1 frame, then reuse
-    // the exact `fill_path` core (one small alloc per bake — the drawlists are const, so
-    // this stays off any `Eq`'d key path).
-    let lowered: Vec<Vec<PathCmd>> = paths
-        .iter()
-        .map(|p| {
-            p.iter()
-                .map(|seg| match *seg {
-                    PathSeg::Move(x, y) => PathCmd::Move(c(x), c(y)),
-                    PathSeg::Line(x, y) => PathCmd::Line(c(x), c(y)),
-                    PathSeg::Cubic(x1, y1, x2, y2, x, y) => {
-                        PathCmd::Cubic(c(x1), c(y1), c(x2), c(y2), c(x), c(y))
-                    }
-                    PathSeg::Close => PathCmd::Close,
-                })
-                .collect()
-        })
-        .collect();
-    let refs: Vec<&[PathCmd]> = lowered.iter().map(Vec::as_slice).collect();
+    // Lower each fixed-point path to `PathCmd`s in the shared 0..1 frame, then reuse
+    // the exact `fill_path` core (the drawlists are const, so this stays off any
+    // `Eq`'d key path).
+    //
+    // The lowering is 1:1 — exactly one `PathCmd` per `PathSeg` — so it goes into ONE
+    // exactly-sized flat buffer and the per-path slices are cut back out of it by
+    // offset: two allocations per call instead of one `Vec` per path plus the outer
+    // `Vec` plus the ref list. The per-path GROUPING is preserved exactly (each `refs`
+    // entry is still one whole path, in the original order) — `fill_path` fills
+    // even-odd PER PATH and unions ACROSS paths, so handing it one merged slice would
+    // turn overlapping subpaths into holes. Same `f32` expression applied to the same
+    // values in the same order as before, so the commands are bit-identical and the
+    // raster is unchanged.
+    let total = paths.iter().fold(0usize, |n, p| n.saturating_add(p.len()));
+    let mut flat: Vec<PathCmd> = Vec::with_capacity(total);
+    for p in paths {
+        flat.extend(p.iter().map(|seg| match *seg {
+            PathSeg::Move(x, y) => PathCmd::Move(c(x), c(y)),
+            PathSeg::Line(x, y) => PathCmd::Line(c(x), c(y)),
+            PathSeg::Cubic(x1, y1, x2, y2, x, y) => {
+                PathCmd::Cubic(c(x1), c(y1), c(x2), c(y2), c(x), c(y))
+            }
+            PathSeg::Close => PathCmd::Close,
+        }));
+    }
+    let mut refs: Vec<&[PathCmd]> = Vec::with_capacity(paths.len());
+    let mut off = 0usize;
+    for p in paths {
+        let end = off.saturating_add(p.len());
+        // Always in range — `flat` was built from exactly these lengths, in order.
+        refs.push(flat.get(off..end).unwrap_or(&[]));
+        off = end;
+    }
     fill_path(tile, &refs, rgb, alpha, t);
 }
 

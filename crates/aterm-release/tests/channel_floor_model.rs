@@ -7,6 +7,9 @@
 
 // The release crate is intentionally binary-only. As in `resume.rs`, mount the
 // pipeline modules so the test drives the exact production functions.
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

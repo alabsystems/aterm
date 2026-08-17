@@ -55,6 +55,29 @@
 //! along a floor they are supposed to be pushing against. Distance-driven feet
 //! cannot: half a stride is half a cell, at every speed, forever.
 //!
+//! ## The breed handoff (two kitties on glass)
+//!
+//! The pet's LOOK — the `(coat, iris)` pair the host syncs from the companion
+//! verdict — is latched per appearance ([`PetBrain::sync_look`]): a differing
+//! verdict PARKS while the pet is visible. A park that stays stable through
+//! [`HANDOFF_DEBOUNCE`] (an app identity flips shell→app→shell around every
+//! command, and short flips must dissolve unseen) earns the HANDOFF: the pet
+//! swaps to the new look IN PLACE — position, gait, mood and sleep carried
+//! through exactly like a species reskin — while a **departing body** wearing
+//! the OLD look spawns where it stood and runs off toward the nearest edge on
+//! its side of the caret, fading out as it goes. For a moment the outgoing
+//! kitty and the incoming one are genuinely both on screen; that is the show
+//! (owner ask, 2026-08-15: "multiple kitties per screen while they are
+//! running a swap").
+//!
+//! Departing bodies are scripted transients, not second brains: each is a
+//! pure function of its spawn record and the brain's own clock (clockless,
+//! dieless, bounded by [`DEPART_MAX`]), resolved into [`PetFrame::departures`]
+//! and drawn by the emitter as extra sprites. At most [`PET_DEPARTURES_MAX`]
+//! ride at once — rapid identity churn drops the OLDEST, never the newest.
+//! The instant paths stay instant: reduced motion, a hidden pet, and the
+//! zero-alpha land all swap with no theater and spawn no body.
+//!
 //! ## Clocklessness and determinism
 //!
 //! Like every engine in this crate, [`PetBrain::tick`] takes an injected `now`
@@ -799,16 +822,34 @@ const BAT_TTL: f32 = 1.5;
 const BAT_HOLD: f32 = 0.6;
 
 /// BREED HANDOFF: a look sync parked mid-appearance ([`PetBrain::sync_look`])
-/// must have stayed STABLE this long before the walk-out fires — an app
+/// must have stayed STABLE this long before the handoff fires — an app
 /// identity flips shell→app→shell around every command round-trip, and a
-/// pet that marched off screen at each prompt would be a metronome, not an
+/// ghost body sprinting off at every prompt would be a metronome, not an
 /// animal. Short flips clear the park (and its clock) long before this.
 const HANDOFF_DEBOUNCE: f32 = 2.5;
-/// The costume change's fade at the edge (seconds) — deliberately faster
-/// than [`FADE_OUT`]: the pet is EXITING on purpose, not dissolving. At
-/// zero the existing land-at-zero-alpha law fires and the worn look lands;
-/// the walk back in is a new sighting on the normal [`FADE_IN`].
+/// The departing body's tail fade (seconds) — deliberately faster than
+/// [`FADE_OUT`]: the old kitty is EXITING on purpose, not dissolving. The
+/// fade covers the last stretch of the run (or the whole visit, when the
+/// body spawns already at its edge).
 const EDGE_FADE: f32 = 0.25;
+/// The departing body's run speed toward its exit edge (cells/sec) — a
+/// purposeful sprint between [`RUN_SPEED`] and [`MAX_SPEED`]: fast enough to
+/// be gone in about a second on an ordinary grid, slow enough that the run
+/// cycle still reads as feet.
+const DEPART_SPEED: f32 = 18.0;
+/// Hard ceiling on a departing body's life (seconds). A body that cannot
+/// reach its edge in time (a very wide grid) fades where it is instead —
+/// the departure is strictly finite BY CONSTRUCTION, so it can never pin
+/// `needs_frames` past its own window (the idle-to-zero law).
+const DEPART_MAX: f32 = 2.0;
+
+/// THE CAP on concurrent departing bodies — the documented "multiple kitties
+/// per screen" bound. Rapid tab cycling may layer departures; past this many
+/// the OLDEST is dropped (its story was nearly over anyway), never the
+/// newest. Three is deliberate: with the [`HANDOFF_DEBOUNCE`] pacing swaps,
+/// even pathological churn never needs more, and the cap is the defensive
+/// law that keeps the lane bounded whatever future seams spawn from.
+pub const PET_DEPARTURES_MAX: usize = 3;
 
 /// IDLE MICRO-LIFE, constraint-first: everything here lives INSIDE the
 /// existing lane-hot windows, so idle-to-zero survives by construction.
@@ -921,6 +962,55 @@ struct Mote {
     dir: f32,
     /// Deterministic scatter index (a serial, not a die roll).
     seed: u8,
+}
+
+/// One resolved DEPARTING BODY for this frame (the breed handoff's outgoing
+/// kitty — see the module's handoff section). The emitter draws it exactly
+/// like the live body — the same feet-anchored dest law via a synthetic
+/// [`PetFrame`] through [`PetFrame::body_px`] — but wearing the OLD
+/// `(coat, iris)` pair carried here, which is the whole point: the pet body's
+/// look IS only those two ramp indices, so the ghost differs in nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PetDepartureSprite {
+    /// The run-cycle frame, already species-skinned (a dog departs as a dog).
+    pub pose: PetGlyphId,
+    /// Left edge in fractional columns / feet row — [`PetFrame`] semantics.
+    pub col: f32,
+    pub row: f32,
+    pub facing_left: bool,
+    /// 0..=255 fade envelope; the emitter multiplies the pet's own alpha in.
+    pub alpha: u8,
+    /// The OUTGOING look's ramp indices.
+    pub coat: u8,
+    pub iris: u8,
+}
+
+/// One live departing body's birth record (brain-side; the sprite is a pure
+/// function of this record and `PetBrain::clock` — no per-frame mutation, no
+/// wall clock, no randomness, exactly the [`Mote`] discipline).
+#[derive(Clone, Copy, Debug)]
+struct Departure {
+    /// `PetBrain::clock` at the swap instant.
+    born: f64,
+    /// The look the pet was wearing when the handoff fired.
+    coat: u8,
+    iris: u8,
+    /// Where the body spawned (the live pet's feet at that instant)…
+    from_col: f32,
+    row: f32,
+    /// …and the exit edge column it runs to (the clamp limit or 0.0, chosen
+    /// on the pet's side of the caret at spawn — the exit never crosses your
+    /// cursor).
+    edge: f32,
+}
+
+impl Departure {
+    /// Seconds this visit lasts: the run to the edge plus the tail fade,
+    /// hard-capped at [`DEPART_MAX`] (a body that cannot make its edge in
+    /// time fades mid-run instead of overstaying).
+    fn life(&self) -> f32 {
+        ((self.edge - self.from_col).abs() / DEPART_SPEED + EDGE_FADE).min(DEPART_MAX)
+    }
 }
 
 /// What the pet is doing. The art frame for a given action comes from
@@ -1051,6 +1141,13 @@ pub struct PetFrame {
     /// `None`-padded, bounded, allocation-free. Rides the frame so both host
     /// render paths carry it with zero extra plumbing.
     pub motes: [Option<PetMoteSprite>; PET_MOTES_MAX],
+    /// The BREED HANDOFF's departing bodies, resolved for this frame —
+    /// `None`-padded, capped at [`PET_DEPARTURES_MAX`]. Riding the frame (the
+    /// mote lane's precedent) is what makes every consumer honest for free:
+    /// the single-pane present, the composed present and both capture splices
+    /// all draw whatever the frame carries, so a ghost can never exist on one
+    /// surface and not another.
+    pub departures: [Option<PetDepartureSprite>; PET_DEPARTURES_MAX],
 }
 
 impl PetFrame {
@@ -1089,6 +1186,23 @@ impl PetFrame {
                 q(m.scale, 64.0),
                 q(m.rot, 64.0),
                 u64::from(m.alpha),
+            ] {
+                h ^= value;
+                h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            }
+        }
+        // The departing bodies fold for the same reason: a ghost sprinting
+        // off beside a settled pet is often the only change on glass, and
+        // the early-out must not swallow its exit (the motes lesson).
+        for d in self.departures.iter().flatten() {
+            for value in [
+                d.pose as u64,
+                q(d.col, 64.0),
+                q(d.row, 64.0),
+                u64::from(d.facing_left),
+                u64::from(d.alpha),
+                u64::from(d.coat),
+                u64::from(d.iris),
             ] {
                 h ^= value;
                 h = h.wrapping_mul(0x0000_0100_0000_01B3);
@@ -1493,19 +1607,12 @@ pub struct PetBrain {
     pending_worn: Option<(u8, u8)>,
     /// BREED HANDOFF (wave 2): when (free-running clock seconds) the CURRENT
     /// parked pair was parked — the [`HANDOFF_DEBOUNCE`] anchor. Restamped
-    /// whenever the park changes, cleared when it dissolves or lands, and
-    /// re-stamped by a cancelled walk so the theater retries later.
+    /// whenever the park changes, cleared when it dissolves or lands.
     handoff_parked_clock: Option<f64>,
-    /// The walk-out is under way toward this edge column: the chase target
-    /// is overridden until the pet arrives there (walk/run only — the
-    /// standing-gap pounce doors stay shut for the whole trip).
-    handoff_out: Option<f32>,
-    /// At the edge, fading down at [`EDGE_FADE`]; at zero the parked look
-    /// lands (the land-at-zero-alpha law) and the walk back in begins.
-    handoff_fade: bool,
-    /// Walking back in from the edge wearing the new cat: the standing-gap
-    /// doors stay shut until arrived, so the return READS as a walk.
-    handoff_in: bool,
+    /// The live departing bodies (the handoff's outgoing kitties), each a
+    /// self-expiring birth record resolved per frame — the mote lane's shape,
+    /// capped at [`PET_DEPARTURES_MAX`] with oldest-drops-first overflow.
+    departures: [Option<Departure>; PET_DEPARTURES_MAX],
 }
 
 impl Default for PetBrain {
@@ -1619,9 +1726,7 @@ impl Default for PetBrain {
             worn: None,
             pending_worn: None,
             handoff_parked_clock: None,
-            handoff_out: None,
-            handoff_fade: false,
-            handoff_in: false,
+            departures: [None; PET_DEPARTURES_MAX],
         }
     }
 }
@@ -2182,11 +2287,11 @@ impl PetBrain {
             self.skid_dir = 0.0;
             // …and the pose a re-anchor hop owed back: no audience, no debt.
             self.resume = None;
-            // A hidden caret retires the handoff theater outright: the
-            // park-until-hidden fallback right above IS the landing now.
-            self.handoff_out = None;
-            self.handoff_fade = false;
-            self.handoff_in = false;
+            // A hidden caret retires the handoff outright: the park landed
+            // (or will land) at zero alpha above, and departing bodies are
+            // dropped, not parked — no audience, no theater (the wave-1
+            // rule), and nothing left to pin `needs_frames` on a hidden cat.
+            self.departures = [None; PET_DEPARTURES_MAX];
             self.handoff_parked_clock = None;
             // Micro-life sleeps with the audience gone.
             self.twitch_t = 0.0;
@@ -2208,23 +2313,7 @@ impl PetBrain {
             self.enter_settled(dt);
             return self.emit(sense, width);
         };
-        if self.handoff_fade {
-            // BREED HANDOFF (wave 2): the fast fade at the edge. At zero
-            // the land-at-zero-alpha law fires — the SAME take as the
-            // no-caret arm above — and the walk back in begins as a new
-            // sighting on the normal FADE_IN ramp.
-            self.alpha = (self.alpha - dt / EDGE_FADE).max(0.0);
-            if self.alpha == 0.0 {
-                if let Some(pair) = self.pending_worn.take() {
-                    self.worn = Some(pair);
-                }
-                self.handoff_parked_clock = None;
-                self.handoff_fade = false;
-                self.handoff_in = true;
-            }
-        } else {
-            self.alpha = (self.alpha + dt / FADE_IN).min(1.0);
-        }
+        self.alpha = (self.alpha + dt / FADE_IN).min(1.0);
 
         // First sighting: materialise at the station rather than sliding in from
         // the origin.
@@ -2318,15 +2407,14 @@ impl PetBrain {
             self.twitch_t = 0.0;
             self.last_burst = false;
             // BREED HANDOFF under reduced motion: the parked look applies
-            // IMMEDIATELY (the walk is theater; the costume is state), and
-            // no edge trip ever fires.
+            // IMMEDIATELY (the departure is theater; the costume is state),
+            // and no departing body ever spawns — or survives a mid-flight
+            // switch into reduced motion.
             if let Some(pair) = self.pending_worn.take() {
                 self.worn = Some(pair);
             }
             self.handoff_parked_clock = None;
-            self.handoff_out = None;
-            self.handoff_fade = false;
-            self.handoff_in = false;
+            self.departures = [None; PET_DEPARTURES_MAX];
             self.action = if self.quiet >= SLEEP_AFTER {
                 PetAction::Sleep
             } else {
@@ -2566,22 +2654,6 @@ impl PetBrain {
         let (target, target_row) =
             self.station_safe((cr, cc), sense.cols, sense.rows, width, sense.cell_w);
 
-        // BREED HANDOFF (wave 2): the walk-out owns the chase target while
-        // it lasts — straight out along the current row to the chosen edge.
-        // A park that dissolved mid-walk (the app flipped home) cancels the
-        // theater; the ordinary chase then walks the pet back unbothered.
-        if self.handoff_out.is_some() && self.pending_worn.is_none() {
-            self.handoff_out = None;
-        }
-        let (target, target_row) = match self.handoff_out {
-            Some(edge) => (edge, self.row),
-            None => (target, target_row),
-        };
-        // While walking OUT or back IN, the standing-gap doors stay shut:
-        // the trip must READ as a walk (a latched caret jump still acts —
-        // and cancels the walk-out in `on_move` — work first, always).
-        let handoff_walking = self.handoff_out.is_some() || self.handoff_in;
-
         // ── the ink eviction (gauntlet F1, the systemic root) ──────────────
         // A grounded pose froze its feet while prompts printed and typing ran
         // UNDER it: the notice-gather on "jumpline", the groom on the W's,
@@ -2609,8 +2681,6 @@ impl PetBrain {
         // keep their eviction even with travel latched, because they hold
         // the ground for seconds either way.
         if self.flight.is_none()
-            && !handoff_walking
-            && !self.handoff_fade
             && !(self.action.settled() && (self.pending_pounce || self.pending_big_jump))
             && matches!(
                 self.action,
@@ -2698,7 +2768,6 @@ impl PetBrain {
             && !self.watch_spent
             && !self.pending_pounce
             && !self.pending_big_jump
-            && !handoff_walking
             && self.flight.is_none()
             && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
             && let Some(live) = self.ink_live_row()
@@ -2729,7 +2798,6 @@ impl PetBrain {
         let (target, target_row) = if self.pursuit_t.is_some()
             && !self.pending_pounce
             && !self.pending_big_jump
-            && !handoff_walking
             && self.flight.is_none()
             && let Some((px, py)) = self.last_pointer
         {
@@ -2752,7 +2820,6 @@ impl PetBrain {
         let (target, target_row) = if let Some(dest) = self.hide_to
             && !self.pending_pounce
             && !self.pending_big_jump
-            && !handoff_walking
             && self.flight.is_none()
         {
             if (dest - self.col).abs() <= ARRIVED {
@@ -3135,15 +3202,6 @@ impl PetBrain {
             _ => {}
         }
 
-        // BREED HANDOFF: at the edge the pet stands and fades — the costume
-        // change happens out of sight (the alpha ramp at the top of this
-        // tick is what is draining; this arm just plants the feet).
-        if self.handoff_fade {
-            self.speed = 0.0;
-            self.set_action_keep(PetAction::Stand);
-            return self.emit(sense, width);
-        }
-
         let gap = target - self.col;
 
         // ── the screen-crossing jump ───────────────────────────────────────
@@ -3155,9 +3213,7 @@ impl PetBrain {
         // already perked perks first, and the gather begins when that hold
         // has played out.
         if (self.pending_big_jump
-            || (!handoff_walking
-                && self.pursuit_t.is_none()
-                && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
+            || (self.pursuit_t.is_none() && gap.abs() >= BIG_GAP_FRAC * f32::from(sense.cols)))
             && gap.abs() > ARRIVED
         {
             // On ink the notice is SKIPPED outright (gauntlet F1): the perk
@@ -3196,9 +3252,7 @@ impl PetBrain {
         // far side. Consumed here (after every hold) like the pounce latch.
         if self.pending_wall_transit {
             self.pending_wall_transit = false;
-            // Never during a handoff trip: the walk-out ignores stations,
-            // and the walk-in re-derives the wall when it arrives.
-            if !handoff_walking && gap.abs() > ARRIVED {
+            if gap.abs() > ARRIVED {
                 self.hop_crouch = false;
                 self.begin_arc(target, target_row, WALL_HOP_DUR, WALL_HOP_ARC, false);
                 return self.emit(sense, width);
@@ -3214,7 +3268,7 @@ impl PetBrain {
         // paws (that is what makes it a chase) — only a latched caret intent
         // may still fly.
         if (self.pending_pounce
-            || (!handoff_walking && self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
+            || (self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
             && gap.abs() > ARRIVED
         {
             self.pending_pounce = false;
@@ -3311,15 +3365,6 @@ impl PetBrain {
             self.leg_dist = 0.0;
             self.braking = false;
             self.brake_over = None;
-            // BREED HANDOFF: arriving at the EDGE begins the fade — the
-            // walk-in home ends here too, and the doors reopen.
-            if self.handoff_out.take().is_some() {
-                self.handoff_fade = true;
-                self.speed = 0.0;
-                self.set_action_keep(PetAction::Stand);
-                return self.emit(sense, width);
-            }
-            self.handoff_in = false;
             // The wave-1 stimuli are consumed HERE — on the ground, below
             // every caret-travel intent (flight, hop, wall transit, pounce,
             // big jump) and after every one-shot hold, exactly like the
@@ -3353,29 +3398,44 @@ impl PetBrain {
             if self.consume_pointer_pounce(&sense, width) {
                 return self.emit(sense, width);
             }
-            // BREED HANDOFF (wave 2): a parked look that has stayed stable
-            // through the debounce earns the walk-out — ranked below every
-            // toy (the costume can wait a beat) and above the ambient
-            // watch. Round-trip flips cleared the park (and its clock) long
-            // before this could fire; a sleeper keeps its coat (waking a
-            // cat for a costume change is backwards — the next wake or
-            // hide lands it).
-            if self.pending_worn.is_some()
+            // BREED HANDOFF (the module's handoff section): a parked look
+            // that has stayed stable through the debounce lands NOW, on the
+            // ground — the pet reskins in place (position, gait, mood and
+            // sleep clock all carried, exactly like a species swap) and the
+            // OLD look leaves as a departing body spawned at its feet, run
+            // off toward the nearest edge on the pet's side of the caret
+            // (the exit never crosses your cursor). Ranked below every toy
+            // (the costume can wait a beat) and above the ambient watch.
+            // Round-trip flips cleared the park (and its clock) long before
+            // this could fire; a sleeper keeps its coat (waking a cat for a
+            // costume change is backwards — the next wake or hide lands it).
+            // Deliberately NOT a `return`: the swap is bookkeeping plus a
+            // ghost, never a pose — it steals no beat from the ladder.
+            if let Some(pair) = self.pending_worn
                 && !matches!(self.action, PetAction::Sleep | PetAction::Waking)
                 && self
                     .handoff_parked_clock
                     .is_some_and(|at| self.clock - at >= f64::from(HANDOFF_DEBOUNCE))
             {
-                // The nearest edge ON THE PET'S SIDE of the caret: the
-                // exit never walks through your cursor.
                 let limit = (f32::from(sense.cols) - width).max(0.0);
-                let edge = if self.col >= f32::from(cc) {
-                    limit
-                } else {
-                    0.0
-                };
-                self.handoff_out = Some(edge);
-                return self.emit(sense, width);
+                let edge = if self.col >= f32::from(cc) { limit } else { 0.0 };
+                let old = self.worn.unwrap_or(pair);
+                self.worn = Some(pair);
+                self.pending_worn = None;
+                self.handoff_parked_clock = None;
+                // A swap between identical pairs (only possible via the
+                // `unwrap_or` above on a never-dressed pet) spawns no ghost:
+                // two identical kitties on glass would read as a render bug.
+                if old != pair {
+                    self.spawn_departure(Departure {
+                        born: self.clock,
+                        coat: old.0,
+                        iris: old.1,
+                        from_col: self.col,
+                        row: self.row,
+                        edge,
+                    });
+                }
             }
             // Post-chase dignity (wave 3): an owed groom is consumed on the
             // ground below every toy and above the ambient watch — the
@@ -3597,15 +3657,6 @@ impl PetBrain {
                 }
                 return;
             }
-        }
-
-        // BREED HANDOFF (wave 2): any real caret move — jump OR retreat, a
-        // fright is work too — cancels a walk-out in progress. Checked
-        // BEFORE the reaction ladder below, because the retreat arm returns
-        // early. The park keeps (the park-until-hidden fallback still lands
-        // it) and the debounce restarts, so the theater retries later.
-        if dc.abs() >= POUNCE_JUMP && self.handoff_out.take().is_some() {
-            self.handoff_parked_clock = Some(self.clock);
         }
 
         let woke = self.action == PetAction::Sleep;
@@ -4467,6 +4518,75 @@ impl PetBrain {
         out
     }
 
+    /// BREED HANDOFF: admit one departing body, dropping the OLDEST when the
+    /// lane is full — [`PET_DEPARTURES_MAX`] is the documented cap, and the
+    /// newest ghost is the one whose story the user just caused.
+    fn spawn_departure(&mut self, d: Departure) {
+        let slot = match self.departures.iter().position(Option::is_none) {
+            Some(free) => free,
+            None => {
+                // Full: evict the oldest birth (its story was nearly over).
+                let mut oldest = 0;
+                let mut oldest_born = f64::INFINITY;
+                for (i, live) in self.departures.iter().enumerate() {
+                    if let Some(a) = live
+                        && a.born < oldest_born
+                    {
+                        oldest_born = a.born;
+                        oldest = i;
+                    }
+                }
+                oldest
+            }
+        };
+        self.departures[slot] = Some(d);
+    }
+
+    /// Resolve the departing bodies for this frame — a pure function of each
+    /// birth record and `self.clock` (clockless, dieless): the body runs from
+    /// its spawn column toward its edge at [`DEPART_SPEED`] on the RUN cycle
+    /// (feet driven by distance covered, the gait law), holds at the edge if
+    /// it gets there early, and fades over the visit's last [`EDGE_FADE`].
+    /// Expired slots free themselves here, exactly like the mote lane.
+    fn resolve_departures(&mut self) -> [Option<PetDepartureSprite>; PET_DEPARTURES_MAX] {
+        let mut out = [None; PET_DEPARTURES_MAX];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let Some(d) = self.departures[i] else { continue };
+            let t = (self.clock - d.born) as f32;
+            let life = d.life();
+            if !(0.0..life).contains(&t) {
+                self.departures[i] = None;
+                continue;
+            }
+            let span = (d.edge - d.from_col).abs();
+            let dir = if d.edge < d.from_col { -1.0 } else { 1.0 };
+            let run = (DEPART_SPEED * t).min(span);
+            let fade_start = life - EDGE_FADE;
+            let alpha = if t <= fade_start {
+                1.0
+            } else {
+                (1.0 - (t - fade_start) / EDGE_FADE).clamp(0.0, 1.0)
+            };
+            // Distance-driven feet (the module's gait law — wall-clock feet
+            // moon-walk), on the run cycle's own stride.
+            let stride = run / RUN_STRIDE_CELLS;
+            let frame = ((stride.rem_euclid(1.0) * Self::CYCLE_RUN.len() as f32) as usize)
+                .min(Self::CYCLE_RUN.len() - 1);
+            *slot = Some(PetDepartureSprite {
+                // The species skin applies here for the same reason the live
+                // body applies it at emit: the record stays species-blind.
+                pose: self.species.skin(Self::CYCLE_RUN[frame]),
+                col: d.from_col + dir * run,
+                row: d.row,
+                facing_left: dir < 0.0,
+                alpha: (alpha * 255.0) as u8,
+                coat: d.coat,
+                iris: d.iris,
+            });
+        }
+        out
+    }
+
     fn set_action(&mut self, a: PetAction) {
         if a != self.action {
             self.action = a;
@@ -4766,6 +4886,7 @@ impl PetBrain {
             purr,
             under_ink: self.hiding,
             motes: self.resolve_motes(),
+            departures: self.resolve_departures(),
         }
     }
 
@@ -4811,27 +4932,25 @@ impl PetBrain {
     /// While the fade envelope is at zero (or the pet has never been dressed)
     /// there is nothing on screen to protect, so the sync applies
     /// immediately. While the pet is visible, a differing verdict PARKS: the
-    /// walking cat keeps its coat, and the parked pair lands once the
-    /// envelope returns to zero (`tick`'s no-caret arm). The host re-syncs
-    /// every emission, so the parking slot always holds the latest verdict,
-    /// never a stale intermediate. A typed discovery in pet mode therefore
-    /// latches SILENTLY for the next appearance — the pet has no
-    /// collection-hello presentation, by design.
+    /// walking cat keeps its coat, and the parked pair lands either at the
+    /// debounced BREED HANDOFF (the in-place swap with a departing body —
+    /// the module's handoff section) or once the envelope returns to zero
+    /// (`tick`'s no-caret arm). The host re-syncs every emission, so the
+    /// parking slot always holds the latest verdict, never a stale
+    /// intermediate. A typed discovery in pet mode therefore latches
+    /// SILENTLY for the next appearance — the pet has no collection-hello
+    /// presentation, by design.
     pub fn sync_look(&mut self, coat: u8, iris: u8) -> (u8, u8) {
         let pair = (coat, iris);
         match self.worn {
             Some(worn) if self.alpha > 0.0 => {
                 let park = (pair != worn).then_some(pair);
                 if park != self.pending_worn {
-                    // BREED HANDOFF (wave 2): a NEW park (or a changed one)
-                    // restarts the walk-out debounce; a park that dissolved
-                    // (the round-trip flip came home) cancels any theater
-                    // already under way — the walk was FOR that costume.
+                    // BREED HANDOFF: a NEW park (or a changed one) restarts
+                    // the swap debounce; a park that dissolved (the
+                    // round-trip flip came home) clears the clock — no swap,
+                    // no ghost, exactly as if nothing had ever been asked.
                     self.handoff_parked_clock = park.is_some().then_some(self.clock);
-                    if park.is_none() {
-                        self.handoff_out = None;
-                        self.handoff_fade = false;
-                    }
                 }
                 self.pending_worn = park;
                 worn
@@ -4843,6 +4962,18 @@ impl PetBrain {
                 pair
             }
         }
+    }
+
+    /// The `(coat, iris)` the CURRENT appearance is wearing — what
+    /// [`Self::sync_look`] latched, exposed read-only so a host surface that
+    /// NAMES the cat (the pet's hover label) can tell whether the identity it
+    /// resolved is the one actually on glass: a parked handoff lags the
+    /// verdict by design, and a label that trusted the raw verdict would name
+    /// the incoming kitty while the outgoing one is still drawn. `None` until
+    /// the host first dresses the pet.
+    #[must_use]
+    pub fn worn_look(&self) -> Option<(u8, u8)> {
+        self.worn
     }
 
     /// Whether the pet needs the host's 60 fps lane this frame — the
@@ -4920,12 +5051,14 @@ impl PetBrain {
         {
             return true;
         }
-        // The wave-2 handoff: a live walk-out or edge fade animates, and a
-        // parked look on an AWAKE pet pins the lane just long enough for
-        // the debounce to fire (bounded: debounce + walk + fade). A parked
-        // look on a SLEEPER pins nothing — idle-to-zero outranks costume
-        // theater, and the next wake or hide lands the look instead.
-        if self.handoff_out.is_some() || self.handoff_fade {
+        // The breed handoff: a live departing body animates for its strictly
+        // finite visit ([`DEPART_MAX`] hard cap — the lane releases the tick
+        // after the last ghost expires), and a parked look on an AWAKE pet
+        // pins the lane just long enough for the debounce to fire (bounded:
+        // debounce + one departure). A parked look on a SLEEPER pins
+        // nothing — idle-to-zero outranks costume theater, and the next wake
+        // or hide lands the look instead.
+        if self.departures.iter().any(Option::is_some) {
             return true;
         }
         if self.pending_worn.is_some() && self.action != PetAction::Sleep {
@@ -5666,6 +5799,7 @@ mod tests {
             purr: 0.0,
             under_ink: false,
             motes: [None; PET_MOTES_MAX],
+            departures: [None; PET_DEPARTURES_MAX],
         };
         for _ in 0..80 {
             t += Duration::from_millis(16);
@@ -7411,10 +7545,10 @@ mod tests {
         assert_eq!(f1.fp(), f2.fp(), "deep sleep is byte-stable — the 2327 law");
     }
 
-    // ── wave 2: the breed handoff walk-out/walk-in ──────────────────────
+    // ── wave 2: the breed handoff (in-place swap + departing body) ──────
 
     #[test]
-    fn a_parked_look_walks_out_and_back() {
+    fn a_debounced_park_swaps_in_place_and_a_departing_body_runs_off() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
         let t = awake(&mut pet, start, 4, 48);
@@ -7427,27 +7561,66 @@ mod tests {
         );
         let w = art_cols(10, 20);
         let station = PetBrain::station(50, 100, w);
-        let (mut walked_out, mut vanished, mut returned) = (false, false, false);
+        let mut ghost_frames = 0u32;
+        let mut ghost_first: Option<f32> = None;
+        let mut ghost_last = 0.0f32;
+        let mut swap_frame_moved = false;
+        let mut swapped = false;
+        let mut prev_col = None::<f32>;
+        let mut last_departures_live = false;
         for _ in 0..600 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some((4, 50))));
-            if (f.col - station).abs() > 20.0 {
-                walked_out = true;
+            // THE LIVE PET IS UNBOTHERED: never fades, never leaves its post —
+            // the swap is a reskin in place, not a trip.
+            assert_eq!(f.alpha, 255, "the live pet never fades during a handoff");
+            assert!(
+                (f.col - station).abs() < 4.0,
+                "…and never leaves its station ({} vs {station})",
+                f.col
+            );
+            let worn = pet.sync_look(9, 4); // the host's per-frame re-sync
+            let live: Vec<_> = f.departures.iter().flatten().collect();
+            assert!(live.len() <= 1, "one swap spawns exactly one ghost");
+            if let Some(d) = live.first() {
+                ghost_frames += 1;
+                assert_eq!(
+                    (d.coat, d.iris),
+                    (3, 1),
+                    "the ghost wears the OUTGOING look"
+                );
+                assert_eq!(
+                    worn,
+                    (9, 4),
+                    "…while the live pet already wears the incoming one"
+                );
+                if ghost_first.is_none() {
+                    ghost_first = Some(d.col);
+                    // The swap tick did not teleport the live pet.
+                    if let Some(p) = prev_col {
+                        swap_frame_moved = (f.col - p).abs() > 0.01;
+                    }
+                }
+                ghost_last = d.col;
             }
-            if f.alpha == 0 {
-                vanished = true;
-            }
-            if vanished && f.alpha == 255 && (f.col - station).abs() <= ARRIVED + 0.5 {
-                returned = true;
-            }
+            swapped |= worn == (9, 4);
+            prev_col = Some(f.col);
+            last_departures_live = f.departures.iter().any(Option::is_some);
         }
-        assert!(walked_out, "the debounced park walks the pet to the edge");
-        assert!(vanished, "the edge fade reaches zero");
-        assert!(returned, "and the pet walks back in, home at its station");
-        assert_eq!(
-            pet.sync_look(9, 4),
-            (9, 4),
-            "the new appearance wears the parked look"
+        assert!(swapped, "the debounced park lands the new look");
+        assert!(!swap_frame_moved, "the swap never moves the live pet");
+        let first = ghost_first.expect("the swap spawned a departing body");
+        assert!(
+            ghost_last > first + 10.0,
+            "the ghost genuinely ran toward its edge ({first} → {ghost_last})"
+        );
+        assert!(
+            ghost_frames >= 30 && ghost_frames <= (DEPART_MAX / 0.016) as u32 + 4,
+            "the visit is brief and strictly bounded ({ghost_frames} frames)"
+        );
+        assert!(
+            !last_departures_live,
+            "every departing body has fully retired by the end"
         );
     }
 
@@ -7475,55 +7648,58 @@ mod tests {
                 f.col
             );
             assert_eq!(f.alpha, 255, "and never fades it");
+            assert!(
+                f.departures.iter().all(Option::is_none),
+                "…and never spawns a departing body"
+            );
         }
     }
 
+    /// WORK OUTRANKS THEATER: a screen-crossing caret jump landing right at
+    /// the debounce boundary is served FIRST — no swap and no ghost while the
+    /// pet is airborne — and the handoff fires at the next arrival, spawning
+    /// the departing body at the pet's NEW station.
     #[test]
-    fn typing_cancels_the_exit() {
+    fn a_caret_jump_is_served_before_the_swap() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
-        let t = awake(&mut pet, start, 4, 48);
+        let t = awake(&mut pet, start, 4, 10);
         assert_eq!(pet.sync_look(3, 1), (3, 1));
-        let (mut t, _) = idle(&mut pet, t, (4, 50), 0.2);
-        let _ = pet.sync_look(9, 4);
-        // Wait out the debounce and let the walk genuinely begin.
-        let w = art_cols(10, 20);
-        let station = PetBrain::station(50, 100, w);
-        let mut walking = false;
+        let (mut t, _) = idle(&mut pet, t, (4, 12), 0.2);
+        assert_eq!(pet.sync_look(9, 4), (3, 1), "fixture: the repoint parks");
+        // Sit through MOST of the debounce, then jump the caret across the
+        // screen: the choreography (perk → wiggle → bound) straddles the
+        // 2.5 s mark, so the swap becomes due while the pet is mid-trip.
+        let (t2, _) = idle(&mut pet, t, (4, 12), HANDOFF_DEBOUNCE - 0.3);
+        t = t2;
+        let mut saw_flight = false;
+        let mut ghost_after_flight = false;
         for _ in 0..400 {
             t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 50))));
-            if (f.col - station).abs() > 4.0 {
-                walking = true;
-                break;
+            let f = pet.tick(sense(t, Some((4, 90))));
+            let worn = pet.sync_look(9, 4);
+            if f.action.airborne() {
+                saw_flight = true;
+                assert_eq!(worn, (3, 1), "no swap mid-air — work first, always");
+                assert!(
+                    f.departures.iter().all(Option::is_none),
+                    "and no ghost spawns mid-air"
+                );
+            }
+            if let Some(d) = f.departures.iter().flatten().next() {
+                ghost_after_flight = true;
+                assert!(saw_flight, "the ghost is born only after the trip");
+                assert_eq!(worn, (9, 4), "the ghost's birth IS the swap");
+                assert_eq!((d.coat, d.iris), (3, 1), "it wears the old look");
+                assert!(
+                    d.col > 50.0,
+                    "…and spawned at the pet's NEW station, not the old one ({})",
+                    d.col
+                );
             }
         }
-        assert!(walking, "fixture: the walk-out is under way");
-        // A caret move ≥ POUNCE_JUMP: work cancels the theater — no vanish,
-        // and the pet serves the caret FIRST. (The debounce restarts, so
-        // the retry is a full 2.5 s away — everything below happens before
-        // it can fire again.)
-        let mut min_alpha = 255u8;
-        let mut reached = false;
-        let station2 = PetBrain::station(30, 100, w);
-        for _ in 0..140 {
-            t += Duration::from_millis(16);
-            let f = pet.tick(sense(t, Some((4, 30))));
-            min_alpha = min_alpha.min(f.alpha);
-            if (f.col - station2).abs() <= ARRIVED + 0.5 {
-                reached = true;
-            }
-        }
-        assert_eq!(min_alpha, 255, "the exit never fades once cancelled");
-        assert!(
-            reached,
-            "the pet served the caret first, inside the retry debounce"
-        );
-        assert_eq!(
-            pet.sync_look(9, 4),
-            (3, 1),
-            "the park keeps — the fallback (or the retry) still lands it"
-        );
+        assert!(saw_flight, "fixture: the jump really flew the pet");
+        assert!(ghost_after_flight, "the handoff fired at the next arrival");
     }
 
     #[test]
@@ -7550,6 +7726,97 @@ mod tests {
             (9, 4),
             "the parked look applied immediately — theater is motion, \
              the costume is state"
+        );
+        assert!(
+            f.departures.iter().all(Option::is_none),
+            "no departing body under reduced motion — departures are theater"
+        );
+    }
+
+    /// The departure lane's cap: at most [`PET_DEPARTURES_MAX`] ghosts ride
+    /// at once, overflow drops the OLDEST, and expiry frees every slot —
+    /// after which the lane pins no frames (idle-to-zero holds).
+    #[test]
+    fn departures_cap_at_the_documented_bound_and_drop_the_oldest() {
+        let mut pet = PetBrain::default();
+        for k in 0..4u8 {
+            pet.clock = f64::from(k) * 0.1;
+            pet.spawn_departure(Departure {
+                born: pet.clock,
+                coat: k,
+                iris: 0,
+                from_col: 10.0,
+                row: 4.0,
+                edge: 90.0,
+            });
+        }
+        let live: Vec<u8> = pet
+            .resolve_departures()
+            .iter()
+            .flatten()
+            .map(|d| d.coat)
+            .collect();
+        assert_eq!(live.len(), PET_DEPARTURES_MAX, "the cap holds");
+        assert!(
+            !live.contains(&0) && [1, 2, 3].iter().all(|c| live.contains(c)),
+            "the OLDEST ghost was the one dropped ({live:?})"
+        );
+        // Expiry frees the lane and releases the frame cadence.
+        pet.clock += f64::from(DEPART_MAX) + 0.1;
+        let gone = pet.resolve_departures();
+        assert!(gone.iter().all(Option::is_none), "all visits expired");
+        assert!(
+            pet.departures.iter().all(Option::is_none),
+            "…and their slots are freed, not parked"
+        );
+        assert!(
+            !pet.needs_frames(),
+            "no lingering animating=true once the ghosts are gone"
+        );
+    }
+
+    /// A departing body is a PURE FUNCTION of (birth record, clock): two
+    /// brains resolving the same record at the same clocks agree byte for
+    /// byte, the run is monotone toward the edge, and the tail fades to zero
+    /// inside [`DEPART_MAX`] — clockless determinism, no dice at tick time.
+    #[test]
+    fn a_departing_body_is_a_pure_function_of_its_record() {
+        let record = Departure {
+            born: 5.0,
+            coat: 7,
+            iris: 2,
+            from_col: 20.0,
+            row: 6.0,
+            edge: 94.0,
+        };
+        let mut a = PetBrain::default();
+        let mut b = PetBrain::default();
+        for pet in [&mut a, &mut b] {
+            pet.clock = 5.0;
+            pet.spawn_departure(record);
+        }
+        let mut prev_col = record.from_col - 0.001;
+        let mut faded = false;
+        for step in 0..=((DEPART_MAX / 0.05) as u32 + 2) {
+            let clock = 5.0 + f64::from(step) * 0.05;
+            a.clock = clock;
+            b.clock = clock;
+            let (ra, rb) = (a.resolve_departures(), b.resolve_departures());
+            match (&ra[0], &rb[0]) {
+                (Some(da), Some(db)) => {
+                    assert_eq!(da, db, "same record + clock ⇒ same sprite");
+                    assert!(da.col >= prev_col, "the run is monotone");
+                    assert!(!da.facing_left, "…and faces its edge");
+                    prev_col = da.col;
+                }
+                (None, None) => faded = true,
+                _ => panic!("the two brains disagree about expiry"),
+            }
+        }
+        assert!(faded, "the visit ends inside DEPART_MAX");
+        assert!(
+            prev_col > record.from_col + 10.0,
+            "the body genuinely travelled ({prev_col})"
         );
     }
 

@@ -181,21 +181,63 @@ impl ColrCanvas<'_> {
         }
         const SS: usize = 4;
         let (w, h) = (self.w, self.h);
-        for py in 0..h {
-            let mut cov = vec![0.0f32; w];
+        // Flatten the contours into ONE edge list per layer instead of re-walking
+        // the Vec-of-Vec (with its `% n` wrap) for each of the h×SS sample lines.
+        // The closing edge still comes from the `contour[(i + 1) % n]` rule, so
+        // contour closure is preserved, and edges are emitted in the SAME
+        // contour-then-index order — the per-scanline crossings are therefore
+        // pushed in the same order and the STABLE `sort_by` below yields the
+        // identical ordering. Horizontal edges are dropped: `y0 == y1` can never
+        // satisfy the straddle test `(y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy)`
+        // (one endpoint would have to be both ≤ and > sy), so removing them is
+        // exact. A NaN endpoint makes `y0 == y1` false, so such an edge is KEPT and
+        // still fails the test, exactly as before.
+        let mut edges: Vec<(f32, f32, f32, f32)> = Vec::new();
+        // The layer's y extent, folded from the same edges. `f32::min`/`max` ignore
+        // NaN, so a NaN endpoint cannot poison the range (and its edge can never
+        // cross a scanline anyway).
+        let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        for contour in &contours {
+            let n = contour.len();
+            for i in 0..n {
+                let (x0, y0) = contour[i];
+                let (x1, y1) = contour[(i + 1) % n];
+                if y0 == y1 {
+                    continue;
+                }
+                edges.push((x0, y0, x1, y1));
+                min_y = min_y.min(y0).min(y1);
+                max_y = max_y.max(y0).max(y1);
+            }
+        }
+        if edges.is_empty() {
+            return;
+        }
+        // Scan only the rows the layer's y extent can reach. OUTSIDE that range no
+        // edge satisfies the straddle test for any sample line, so `xs` would be
+        // empty, `wind` would stay 0, `add_span` would never run and `cov` would
+        // stay all-zero — and the `c > 0.0` guard already suppresses every `blend`
+        // for a zero row. So the skipped rows wrote nothing: this is exact, not an
+        // approximation. The 1-row margin absorbs the +0.125/+0.875 sample offsets.
+        // Float→int casts saturate (and NaN → 0), so a degenerate extent collapses
+        // to an empty range rather than wrapping.
+        let py_lo = (min_y - 1.0).floor().max(0.0) as usize;
+        let py_hi = ((max_y + 1.0).ceil().max(0.0) as usize).min(h);
+        // Both scratch buffers are hoisted out of the loops and reused: `fill(0.0)`
+        // is exactly the old fresh `vec![0.0f32; w]`, and `clear()` + the identical
+        // push sequence is exactly the old fresh `Vec` — only the capacity survives.
+        let mut cov = vec![0.0f32; w];
+        let mut xs: Vec<(f32, i32)> = Vec::new();
+        for py in py_lo..py_hi {
+            cov.fill(0.0);
             for s in 0..SS {
                 let sy = py as f32 + (s as f32 + 0.5) / SS as f32;
                 // Collect (x, winding-dir) crossings of all edges at scanline sy.
-                let mut xs: Vec<(f32, i32)> = Vec::new();
-                for contour in &contours {
-                    let n = contour.len();
-                    for i in 0..n {
-                        let (x0, y0) = contour[i];
-                        let (x1, y1) = contour[(i + 1) % n];
-                        if (y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy) {
-                            let t = (sy - y0) / (y1 - y0);
-                            xs.push((x0 + t * (x1 - x0), if y1 > y0 { 1 } else { -1 }));
-                        }
+                xs.clear();
+                for &(x0, y0, x1, y1) in &edges {
+                    if (y0 <= sy && y1 > sy) || (y1 <= sy && y0 > sy) {
+                        let t = (sy - y0) / (y1 - y0);
+                        xs.push((x0 + t * (x1 - x0), if y1 > y0 { 1 } else { -1 }));
                     }
                 }
                 xs.sort_by(|a, b| a.0.total_cmp(&b.0));

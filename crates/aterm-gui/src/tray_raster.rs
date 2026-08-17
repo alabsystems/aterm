@@ -972,6 +972,13 @@ impl ChromeFonts {
             self.semantic_resolution.clone(),
             elapsed_ms,
         );
+        // Parking the active renderer IS a change of what a fork would contain:
+        // `semantic` and `semantic_identity` both just went to `None`. The
+        // install/cache-hit callers bump the epoch immediately afterwards, but
+        // the pre-request park in `ensure_semantic_candidate` did not — which
+        // left `semantic_ready_epoch` briefly unable to witness the removal.
+        // Bumping here makes the epoch a TOTAL key over the fork's inputs.
+        self.semantic_ready_epoch = self.semantic_ready_epoch.wrapping_add(1);
     }
 
     /// Ensure the exact candidate authored by one preview is active. Family
@@ -1127,17 +1134,78 @@ fn semantic_font_snapshot_locked(
     }
 }
 
+/// One captured semantic fork: `(candidate, ready_epoch, fork)` — the memo key
+/// followed by the renderer it produced (`None` when that key resolved to "no
+/// semantic font"). Named because the inline spelling trips
+/// `clippy::type_complexity` under the workspace's `-D warnings`.
+type SemanticForkMemo = (crate::widget::SemanticFontCandidate, u64, Option<Rc<Renderer>>);
+
+thread_local! {
+    /// The last semantic fork this thread captured, keyed by
+    /// `(candidate, snapshot.ready_epoch)`.
+    ///
+    /// A fork is NOT cheap: `Renderer::fork_semantic_surface` re-parses the
+    /// whole primary face (`fontdue::Font::from_bytes`, again for the real bold
+    /// sibling) plus its metric/feature tables. [`prepare_semantic_font`] runs
+    /// on EVERY native compile and every preview tick while a Settings page is
+    /// front, so an animating preview paid two full font parses per frame for a
+    /// value that never differs between them.
+    ///
+    /// Reusing the `Rc` is byte-identical to handing each compilation its own
+    /// copy: the captured renderer is immutable by construction —
+    /// [`PreparedSemanticFont::fork`] takes `&self` and every consumer forks its
+    /// own private mutable renderer off it — so nothing can observe the sharing
+    /// (identity is never compared; `PartialEq`/`Debug` see only
+    /// `renderer.is_some()`).
+    ///
+    /// `snapshot.ready_epoch` folds `semantic_ready_epoch` with the
+    /// identity-match and pending bits, so it moves on every transition that can
+    /// change what a fork contains; the candidate is part of the key because
+    /// those two bits are computed against it. Thread-local because `Renderer`
+    /// is deliberately thread-bound (`Rc`, `!Send`) — and because it then
+    /// matches the per-thread test font store's isolation exactly.
+    static SEMANTIC_FORK_MEMO: std::cell::RefCell<Option<SemanticForkMemo>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Host-only request/poll/capture seam. The returned snapshot owns an isolated
 /// fork and is the sole semantic-font input allowed past `ViewCx`.
 pub(crate) fn prepare_semantic_font(
     candidate: &crate::widget::SemanticFontCandidate,
 ) -> PreparedSemanticFont {
     let mut fonts = lock_fonts();
+    // The request/poll transition and the snapshot run on EVERY call, memo hit
+    // or not: the former drives the worker convergence and the latter is paint
+    // identity. Only the fork itself is memoized.
     let _ = fonts.ensure_semantic_candidate(candidate);
     let snapshot = semantic_font_snapshot_locked(&fonts, candidate);
-    let renderer = fonts
-        .semantic_renderer_fork_for(candidate, 14.0, aterm_render::Theme::default())
-        .map(Rc::new);
+    let memoized = SEMANTIC_FORK_MEMO.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|(memo_candidate, memo_epoch, renderer)| {
+                (memo_candidate == candidate && *memo_epoch == snapshot.ready_epoch)
+                    .then(|| renderer.clone())
+            })
+    });
+    let renderer = match memoized {
+        Some(renderer) => renderer,
+        None => {
+            let renderer = fonts
+                .semantic_renderer_fork_for(candidate, 14.0, aterm_render::Theme::default())
+                .map(Rc::new);
+            // Release the chrome-font mutex before the thread-local write: the
+            // memo needs nothing from it, and the lock scope stays minimal.
+            drop(fonts);
+            let memo = renderer.clone();
+            SEMANTIC_FORK_MEMO.with(|slot| {
+                // A `None` fork is cached too — a candidate with no installable
+                // renderer must not re-attempt the fork every frame, and the
+                // epoch moves the moment one lands.
+                *slot.borrow_mut() = Some((candidate.clone(), snapshot.ready_epoch, memo));
+            });
+            renderer
+        }
+    };
     PreparedSemanticFont {
         candidate: candidate.clone(),
         snapshot,
@@ -1947,6 +2015,115 @@ fn cov(d: f32) -> f32 {
     (0.5 - d).clamp(0.0, 1.0)
 }
 
+/// How many rendered terminal specimens one thread retains. A Settings page
+/// paints one specimen per live preview, so two entries make the animating
+/// steady state a pure hit (and still absorb a second window) while keeping the
+/// retained pixel buffers bounded.
+const SPECIMEN_FRAME_CACHE_ENTRIES: usize = 2;
+
+/// One retained specimen render.
+struct SpecimenFrameEntry {
+    /// Fingerprint of every renderer input except the fork source.
+    key: u64,
+    /// The exact `Rc` the frame was forked from, held WEAKLY on purpose: a weak
+    /// handle keeps the `Rc` allocation reserved — so no later fork can be
+    /// handed the same address and silently alias this entry — without keeping
+    /// the forked `Renderer` (and its parsed faces) alive.
+    source: std::rc::Weak<Renderer>,
+    frame: Rc<aterm_render::Frame>,
+}
+
+thread_local! {
+    /// Most-recently-used first. Thread-local because `Renderer`/`Frame` travel
+    /// by `Rc` here, and because it then matches the per-thread test font
+    /// store: a libtest worker can never observe another worker's entry.
+    static SPECIMEN_FRAMES: std::cell::RefCell<Vec<SpecimenFrameEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A TOTAL fingerprint of everything [`Canvas::terminal_specimen`] feeds the
+/// renderer, except the two identities matched separately: the fork source
+/// (compared by pointer beside this key) and the engine snapshot (represented
+/// by `input_fingerprint`, which `settings_preview::build_terminal_specimen_input`
+/// builds as a total function of the snapshot it returns).
+///
+/// Every field must appear here. Omitting one — a variation axis, `stem_gamma`,
+/// the device scale — would paint stale pixels after a settings tweak, which is
+/// exactly the WYSIWYG contract this specimen exists to honour.
+fn terminal_specimen_frame_key(spec: &TerminalSpecimenSpec, scale: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    spec.input_fingerprint.hash(&mut hash);
+    // The fork source's generation. Pointer identity proves it is the same
+    // `Rc`; the epoch additionally moves on every host transition that changes
+    // what a fork of that generation contains.
+    spec.prepared_font.snapshot.ready_epoch.hash(&mut hash);
+    // `Theme` is not `Hash`; these four colours are the whole value.
+    spec.theme.fg.hash(&mut hash);
+    spec.theme.bg.hash(&mut hash);
+    spec.theme.cursor.hash(&mut hash);
+    spec.theme.selection.hash(&mut hash);
+    // `scale` is keyed alongside `font_px` because it reaches `activate_px` and
+    // the three rounded `* scale` metric adjustments below it: a fractional or
+    // Retina scale change re-rasterizes even at an identical logical size.
+    scale.to_bits().hash(&mut hash);
+    spec.font_px.to_bits().hash(&mut hash);
+    spec.line_height.to_bits().hash(&mut hash);
+    spec.baseline_adjust.hash(&mut hash);
+    spec.underline_position.hash(&mut hash);
+    spec.underline_thickness.hash(&mut hash);
+    spec.underline_skip_descenders.hash(&mut hash);
+    spec.synthetic_styles.hash(&mut hash);
+    spec.text_blending.hash(&mut hash);
+    spec.font_thicken.hash(&mut hash);
+    spec.stem_gamma.to_bits().hash(&mut hash);
+    // `SemanticVariation` stores its value as bits, so the whole request hashes
+    // exactly.
+    spec.variations.hash(&mut hash);
+    spec.ligatures.hash(&mut hash);
+    spec.merged_ligatures.hash(&mut hash);
+    spec.cursor_break_ligatures.hash(&mut hash);
+    spec.minimum_contrast.to_bits().hash(&mut hash);
+    spec.selection_foreground.hash(&mut hash);
+    spec.selection_inactive.hash(&mut hash);
+    hash.finish()
+}
+
+/// The retained frame for `key` forked from exactly `source`, promoted to
+/// most-recently-used.
+fn cached_specimen_frame(
+    key: u64,
+    source: Option<&Rc<Renderer>>,
+) -> Option<Rc<aterm_render::Frame>> {
+    let source = source?;
+    SPECIMEN_FRAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        let hit = entries.iter().position(|entry| {
+            entry.key == key && std::ptr::eq(entry.source.as_ptr(), Rc::as_ptr(source))
+        })?;
+        let entry = entries.remove(hit);
+        let frame = Rc::clone(&entry.frame);
+        entries.insert(0, entry);
+        Some(frame)
+    })
+}
+
+fn retain_specimen_frame(key: u64, source: &Rc<Renderer>, frame: &Rc<aterm_render::Frame>) {
+    SPECIMEN_FRAMES.with(|slot| {
+        let mut entries = slot.borrow_mut();
+        entries.insert(
+            0,
+            SpecimenFrameEntry {
+                key,
+                source: Rc::downgrade(source),
+                frame: Rc::clone(frame),
+            },
+        );
+        entries.truncate(SPECIMEN_FRAME_CACHE_ENTRIES);
+    });
+}
+
 impl Canvas {
     fn round_rect(&mut self, x: f32, y: f32, w: f32, h: f32, r: f32, c: [u8; 4]) {
         let (cx, cy, hx, hy) = (x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0);
@@ -2241,6 +2418,28 @@ impl Canvas {
     /// Render a complete bounded terminal snapshot with the shipping CPU
     /// renderer, then composite its exact opaque frame into the semantic card.
     fn terminal_specimen(&mut self, x: f32, y: f32, spec: &TerminalSpecimenSpec, scale: f32) {
+        // This is by far the most expensive prim in the tray: the fork below is
+        // a full `fontdue` re-parse of the primary face (and a second one for
+        // its real bold sibling) inside `fork_semantic_surface`, and
+        // `render_input` then renders a whole mini terminal frame from cold
+        // glyph/layout caches. An animating Settings preview re-rasterizes at
+        // frame rate with every one of those inputs unchanged, so the finished
+        // frame is memoized instead of recomputed.
+        //
+        // A hit is the same computation replayed: the key is total over what
+        // reaches the renderer, the fork source is matched by POINTER identity
+        // rather than by value, and the frame itself does not depend on `x`/`y`
+        // (the blit below is a pure read that places it).
+        let key = terminal_specimen_frame_key(spec, scale);
+        let source = spec.prepared_font.renderer.as_ref();
+        if let Some(frame) = cached_specimen_frame(key, source) {
+            self.blit_terminal_frame(
+                &frame,
+                (x * scale).round() as i32,
+                (y * scale).round() as i32,
+            );
+            return;
+        }
         let Some(mut renderer) = spec.prepared_font.fork(spec.font_px * scale, spec.theme) else {
             return;
         };
@@ -2282,7 +2481,10 @@ impl Canvas {
         renderer.set_selection_fg(spec.selection_foreground);
         renderer.set_selection_inactive(spec.selection_inactive);
         renderer.activate_px(spec.font_px * scale);
-        let frame = renderer.render_input(&spec.input);
+        let frame = Rc::new(renderer.render_input(&spec.input));
+        if let Some(source) = source {
+            retain_specimen_frame(key, source, &frame);
+        }
         self.blit_terminal_frame(
             &frame,
             (x * scale).round() as i32,

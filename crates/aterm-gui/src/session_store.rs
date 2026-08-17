@@ -96,16 +96,22 @@ pub struct SessionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen: Option<ScreenCarry>,
     /// USER metadata (session-metadata stage 1; schema-1 additive, absent
-    /// tolerated): the operator-set title/description/icon (`meta set …`) ride
-    /// the handoff so a seamless re-exec re-materializes the session under the
-    /// SAME operator-chosen identity — the OSC title above is the engine's, this
-    /// is the user's.
+    /// tolerated): a sanitized projection of the operator-set title/
+    /// description/icon/role/attention (`meta set …`) for manifest
+    /// inspection. HONEST SCOPE: adoption re-seeds user meta from the LAYOUT
+    /// sidecar's restore leaves (`seed_restored_user_meta`), not from these
+    /// fields — they are a write-side record, kept in lockstep with the leaf
+    /// carrier so external readers of the manifest see the same identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
 }
 
 /// The screen half of the seamless handoff: the checkpoint's scalar projection
@@ -223,6 +229,8 @@ impl SessionHandoff {
                         user_title: meta.user_title.clone(),
                         description: meta.description.clone(),
                         icon: meta.icon.clone(),
+                        role: meta.role.clone(),
+                        attention: meta.attention.clone(),
                     }
                 })
                 .collect(),

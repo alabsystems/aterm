@@ -286,20 +286,33 @@ impl<C> RelayShared<C> {
 /// `Ok(false)` means it is merely out of decrypted bytes for now. Decryption
 /// happens when TLS records are fed in, so buffered plaintext can exist before
 /// the relay has read a single byte itself.
-fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>) -> io::Result<bool>
+///
+/// `tmp` is a CALLER-OWNED staging buffer, allocated once per relay and reused
+/// across calls. It used to be a `[0u8; 4096]` declared INSIDE the loop, which
+/// re-ran the 4 KiB zero-init on every iteration — ~5 iterations per 16 KiB TCP
+/// read, so ~20 KiB of zeroing per 16 KiB relayed, on top of the copy into
+/// `plain`. The array's address escapes into `reader().read`, which fills only a
+/// dynamic prefix, so neither DSE nor LICM can remove that memset; hoisting it
+/// out of the callee is the only way. Reuse is bit-identical: `read` never reads
+/// prior buffer contents, and only `tmp[..k]` is ever consumed, so bytes left
+/// over from an earlier call are never observable.
+fn drain_decrypted<C, S>(conn: &mut C, plain: &mut Vec<u8>, tmp: &mut [u8]) -> io::Result<bool>
 where
     C: std::ops::DerefMut + std::ops::Deref<Target = rustls::ConnectionCommon<S>>,
     S: rustls::SideData,
 {
     loop {
-        let mut tmp = [0u8; 4096];
-        match conn.reader().read(&mut tmp) {
+        // The mutable borrow of `tmp` ends with the call, so the copy out below
+        // sits after the match rather than inside an arm — same arms, same
+        // ordering, same returns.
+        let k = match conn.reader().read(tmp) {
             Ok(0) => return Ok(true),
-            Ok(k) => plain.extend_from_slice(&tmp[..k]),
+            Ok(k) => k,
             Err(e) if is_would_block(&e) => return Ok(false),
             Err(e) if is_normal_close(&e) => return Ok(true),
             Err(e) => return Err(e),
-        }
+        };
+        plain.extend_from_slice(&tmp[..k]);
     }
 }
 
@@ -517,6 +530,11 @@ where
     // holds no lock; ingest + decrypt hold it only for buffer work.
     let mut tls_in = [0u8; 16 * 1024];
     let mut plain: Vec<u8> = Vec::with_capacity(16 * 1024);
+    // Staging buffer `drain_decrypted` copies rustls' plaintext through, sized to
+    // the same granularity as `tls_in`. Owned HERE, not by the callee, so the
+    // whole relay pays its zero-init once instead of once per drain iteration
+    // (see `drain_decrypted`); both drain sites below are on this one thread.
+    let mut tls_plain = [0u8; 16 * 1024];
     let mut fatal_down = false;
 
     // DRAIN BEFORE THE FIRST BLOCK. A peer's first application record routinely
@@ -532,7 +550,7 @@ where
     let mut drained_eof = false;
     {
         let mut g = shared.lock();
-        match drain_decrypted(&mut g.conn, &mut plain) {
+        match drain_decrypted(&mut g.conn, &mut plain, &mut tls_plain) {
             Ok(eof) => drained_eof = eof,
             Err(e) => {
                 g.record_err(e);
@@ -608,7 +626,7 @@ where
                     break 'down;
                 }
             }
-            match drain_decrypted(&mut g.conn, &mut plain) {
+            match drain_decrypted(&mut g.conn, &mut plain, &mut tls_plain) {
                 Ok(eof) => clean_eof = eof,
                 Err(e) => {
                     g.record_err(e);

@@ -38,6 +38,23 @@ fn take_warm_find_block_steps() -> usize {
 /// 3 failures = conclusive evidence of persistent corruption.
 pub(crate) const QUARANTINE_THRESHOLD: u8 = 3;
 
+/// Decompressed-block cache slots.
+///
+/// TWO, not one. A render frame walks the visible rows top-to-bottom, which
+/// maps to ASCENDING scrollback indices, so a viewport straddling a block
+/// boundary used to thrash a single-slot cache: miss on block B (the slot held
+/// B+1 from the previous frame) → full LZ4 decode + page deserialization, cross
+/// the boundary → miss on B+1 → a second full decode, frame ends holding B+1 →
+/// the next frame repeats it exactly. A viewport spans at most two blocks
+/// (`DEFAULT_BLOCK_SIZE` is 100 lines), so two slots turn that steady state
+/// into hits. More slots would only help walk-back and cost more bookkeeping.
+const CACHE_SLOTS: usize = 2;
+
+/// The decompressed-block cache itself: one `(block_index, lines)` pair per
+/// slot, `None` while the slot is cold. Named because the inline spelling trips
+/// `clippy::type_complexity`, which this crate denies via `clippy::all`.
+type BlockCache = RefCell<[Option<(usize, Vec<Line>)>; CACHE_SLOTS]>;
+
 /// A compressed block of lines (LZ4).
 // Skip (propagates to the derive-generated impls — the checker consults the
 // impl subject for macro-generated items): the derived Clone's field clones
@@ -161,8 +178,11 @@ pub(crate) struct WarmTier {
     /// Cumulative line counts: `cumulative[i]` = total lines in blocks `0..=i`.
     /// These are physical counts (not adjusted for front_offset).
     cumulative_lines: Vec<usize>,
-    /// Cache of last decompressed block: `(block_index, lines)`.
-    last_block_cache: RefCell<Option<(usize, Vec<Line>)>>,
+    /// Cache of recently decompressed blocks: `(block_index, lines)` per slot,
+    /// filled round-robin. See [`CACHE_SLOTS`] for why there is more than one.
+    last_block_cache: BlockCache,
+    /// Round-robin write cursor into `last_block_cache`.
+    cache_next: Cell<usize>,
     /// Running total for `memory_used()` (diagnostic: includes cache + index).
     bytes_used: Cell<usize>,
     /// Reclaimable compressed block storage only (budget enforcement).
@@ -178,7 +198,8 @@ impl WarmTier {
             line_count: 0,
             front_offset: 0,
             cumulative_lines: Vec::new(),
-            last_block_cache: RefCell::new(None),
+            last_block_cache: RefCell::new([const { None }; CACHE_SLOTS]),
+            cache_next: Cell::new(0),
             bytes_used: Cell::new(std::mem::size_of::<Self>()),
             budgeted_bytes: 0,
         }
@@ -361,11 +382,15 @@ impl WarmTier {
         };
         let line_in_block = physical_idx.saturating_sub(block_start);
 
-        // Check cache first.
+        // Check cache first — scan every slot; hit semantics are unchanged, a
+        // straddling viewport just stops evicting the block it is about to
+        // read again.
         {
             let cache = self.last_block_cache.borrow();
-            if let Some((cached_idx, ref lines)) = *cache
-                && cached_idx == block_idx
+            if let Some((_, lines)) = cache
+                .iter()
+                .flatten()
+                .find(|(cached_idx, _)| *cached_idx == block_idx)
             {
                 let Some(line) = lines.get(line_in_block).cloned() else {
                     return Err(super::ScrollbackError::Io(std::io::Error::new(
@@ -499,9 +524,30 @@ impl WarmTier {
     }
 
     fn cache_block(&self, block_idx: usize, lines: Vec<Line>) {
+        // TOTAL-before → TOTAL-after, deliberately: with more than one slot the
+        // delta is NOT the inserted entry's own size, because filling a slot
+        // also drops whatever it held. `bytes_used` must stay equal to
+        // `recompute_memory_used()` (which sums every slot via `cached_bytes`),
+        // or the accounting-drift assert in `scrollback_accounting.rs` fires.
+        // Both `cached_bytes()` calls sit OUTSIDE the `borrow_mut` scope: it
+        // borrows the same `RefCell`.
         let old_cache_bytes = self.cached_bytes();
-        let new_cache_bytes = Self::cache_lines_bytes(&lines);
-        *self.last_block_cache.borrow_mut() = Some((block_idx, lines));
+        {
+            let mut cache = self.last_block_cache.borrow_mut();
+            let slot = self.cache_next.get() % CACHE_SLOTS;
+            // `slot < CACHE_SLOTS` by construction, so the `else` arm is
+            // unreachable; skipping the fill there is a no-op under that
+            // invariant (the cache is a pure memo — a missed fill only costs a
+            // later decompression) and keeps the write index-panic-free.
+            if let Some(entry) = cache.get_mut(slot) {
+                *entry = Some((block_idx, lines));
+            }
+            // Saturating: `slot` is already < CACHE_SLOTS, so this cannot
+            // overflow on any real path (same strict-gate idiom as the byte
+            // counters above); the modulo keeps the cursor in range regardless.
+            self.cache_next.set(slot.saturating_add(1) % CACHE_SLOTS);
+        }
+        let new_cache_bytes = self.cached_bytes();
         self.bytes_used.set(Self::adjust_bytes(
             self.bytes_used.get(),
             old_cache_bytes,
@@ -509,9 +555,15 @@ impl WarmTier {
         ));
     }
 
+    /// Drop EVERY cached block.
+    ///
+    /// Clear-all is an invariant, not laziness: `pop_front`/`push_front`
+    /// renumber every block, so a surviving entry keyed by its old index would
+    /// serve the WRONG scrollback lines. Never make this selective.
     fn clear_cache(&self) {
         let old_cache_bytes = self.cached_bytes();
-        *self.last_block_cache.borrow_mut() = None;
+        *self.last_block_cache.borrow_mut() = [const { None }; CACHE_SLOTS];
+        self.cache_next.set(0);
         self.bytes_used
             .set(self.bytes_used.get().saturating_sub(old_cache_bytes));
     }
@@ -521,10 +573,14 @@ impl WarmTier {
     // is single-threaded and never re-entrantly borrowed; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
     fn cached_bytes(&self) -> usize {
-        self.last_block_cache
-            .borrow()
-            .as_ref()
-            .map_or(0, |(_, lines)| Self::cache_lines_bytes(lines))
+        // Saturating fold over every slot (see `cache_lines_bytes` for the
+        // idiom rationale).
+        let cache = self.last_block_cache.borrow();
+        let mut total = 0usize;
+        for (_, lines) in cache.iter().flatten() {
+            total = total.saturating_add(Self::cache_lines_bytes(lines));
+        }
+        total
     }
 
     fn cache_lines_bytes(lines: &[Line]) -> usize {

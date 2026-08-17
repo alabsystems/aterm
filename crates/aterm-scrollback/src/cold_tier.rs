@@ -11,8 +11,26 @@
 
 use super::line::{Line, deserialize_page_lines};
 use super::tier::WarmBlock;
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+
+/// Decompressed-page cache slots — the cold twin of the warm tier's
+/// `CACHE_SLOTS`, and for the same reason.
+///
+/// TWO, not one. A render frame walks the visible rows top-to-bottom, which
+/// maps to ASCENDING scrollback indices, so a viewport straddling a page
+/// boundary used to thrash a single-slot cache: miss on page P (the slot held
+/// P+1 from the previous frame) → full decode + page deserialization, cross the
+/// boundary → miss on P+1 → a second full decode, frame ends holding P+1 → the
+/// next frame repeats it exactly. A viewport spans at most two pages, so two
+/// slots turn that steady state into hits.
+const CACHE_SLOTS: usize = 2;
+
+/// The decompressed-page cache itself: one `(page_index, lines)` pair per slot,
+/// `None` while the slot is cold. Named because the inline spelling trips
+/// `clippy::type_complexity`, which this crate denies via `clippy::all`.
+type PageCache = RefCell<[Option<(usize, Vec<Line>)>; CACHE_SLOTS]>;
 
 #[cfg(test)]
 thread_local! {
@@ -80,8 +98,11 @@ pub(crate) struct ColdTier {
     /// Cumulative line counts: `cumulative[i]` = total *physical* lines in pages `0..=i`.
     /// Unchanged by front_offset — get_line adjusts indices before lookup.
     cumulative_lines: Vec<usize>,
-    /// Cache of last decompressed page: `(page_index, lines)`.
-    last_page_cache: RefCell<Option<(usize, Vec<Line>)>>,
+    /// Cache of recently decompressed pages: `(page_index, lines)` per slot,
+    /// filled round-robin. See [`CACHE_SLOTS`] for why there is more than one.
+    last_page_cache: PageCache,
+    /// Round-robin write cursor into `last_page_cache`.
+    cache_next: Cell<usize>,
     /// Running total for `compressed_size()`.
     bytes_used: usize,
     /// Lines logically consumed from the first page. Avoids decompression
@@ -97,7 +118,8 @@ impl ColdTier {
             pages: VecDeque::new(),
             line_count: 0,
             cumulative_lines: Vec::new(),
-            last_page_cache: RefCell::new(None),
+            last_page_cache: RefCell::new([const { None }; CACHE_SLOTS]),
+            cache_next: Cell::new(0),
             bytes_used: 0,
             front_offset: 0,
         }
@@ -191,11 +213,15 @@ impl ColdTier {
         };
         let line_in_page = physical_idx.saturating_sub(page_start);
 
-        // Check cache first.
+        // Check cache first — scan every slot; hit semantics are unchanged, a
+        // straddling viewport just stops evicting the page it is about to read
+        // again.
         {
             let cache = self.last_page_cache.borrow();
-            if let Some((cached_idx, ref lines)) = *cache
-                && cached_idx == page_idx
+            if let Some((_, lines)) = cache
+                .iter()
+                .flatten()
+                .find(|(cached_idx, _)| *cached_idx == page_idx)
             {
                 let Some(line) = lines.get(line_in_page).cloned() else {
                     return Err(super::ScrollbackError::Io(std::io::Error::new(
@@ -225,8 +251,36 @@ impl ColdTier {
                 ),
             )));
         };
-        *self.last_page_cache.borrow_mut() = Some((page_idx, lines));
+        self.cache_page(page_idx, lines);
         Ok(Some(line))
+    }
+
+    /// Insert a decompressed page into the next round-robin cache slot.
+    fn cache_page(&self, page_idx: usize, lines: Vec<Line>) {
+        let mut cache = self.last_page_cache.borrow_mut();
+        let slot = self.cache_next.get() % CACHE_SLOTS;
+        // `slot < CACHE_SLOTS` by construction, so the `else` arm is
+        // unreachable; skipping the fill there is a no-op under that invariant
+        // (the cache is a pure memo — a missed fill only costs a later
+        // decompression) and keeps the write index-panic-free.
+        if let Some(entry) = cache.get_mut(slot) {
+            *entry = Some((page_idx, lines));
+        }
+        // Saturating: `slot` is already < CACHE_SLOTS, so this cannot overflow
+        // on any real path; the modulo keeps the cursor in range regardless.
+        self.cache_next.set(slot.saturating_add(1) % CACHE_SLOTS);
+    }
+
+    /// Drop EVERY cached page.
+    ///
+    /// Clear-all is an invariant, not laziness: every mutation that reaches
+    /// here renumbers pages (`pop_front`, `pop_front_batch`, byte eviction,
+    /// back-truncation), so a surviving entry keyed by its old index would
+    /// serve the WRONG scrollback lines. Never make this selective — and route
+    /// every invalidation site through this one helper.
+    fn clear_cache(&self) {
+        *self.last_page_cache.borrow_mut() = [const { None }; CACHE_SLOTS];
+        self.cache_next.set(0);
     }
 
     /// Find the page containing the given line index via binary search.
@@ -281,7 +335,7 @@ impl ColdTier {
         }
 
         // Invalidate cache — page indices shifted.
-        *self.last_page_cache.borrow_mut() = None;
+        self.clear_cache();
 
         logical_lines
     }
@@ -337,7 +391,7 @@ impl ColdTier {
         }
 
         // Invalidate cache — page indices shifted.
-        *self.last_page_cache.borrow_mut() = None;
+        self.clear_cache();
 
         evicted_lines
     }
@@ -471,7 +525,7 @@ impl ColdTier {
                 _ => self.cumulative_lines.clear(),
             }
             // Invalidate cache — page indices shifted.
-            *self.last_page_cache.borrow_mut() = None;
+            self.clear_cache();
         }
     }
 
@@ -486,7 +540,7 @@ impl ColdTier {
         self.pages.clear();
         self.line_count = 0;
         self.cumulative_lines.clear();
-        *self.last_page_cache.borrow_mut() = None;
+        self.clear_cache();
         self.bytes_used = 0;
         self.front_offset = 0;
     }

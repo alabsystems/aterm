@@ -10,10 +10,13 @@
 //!
 //! * [`SessionMeta`] — the USER-settable identity a driver (human or agent)
 //!   stamps on a session over the control socket (`meta set title|description|
-//!   icon …`): a display title that OUTRANKS the OSC 0/2 title in tab labels, a
-//!   free-text description, and an icon token. Orthogonal to the engine's OSC
-//!   title (which programs keep rewriting): this is what the OPERATOR calls the
-//!   session, not what the running program does.
+//!   icon|role|attention …`): a display title that OUTRANKS the OSC 0/2 title
+//!   in tab labels, a free-text description, an icon token, a typed `role`
+//!   (`operator` designates the fleet operator), and a typed `attention`
+//!   escalation message (non-empty ⇒ the menu-bar status item badges).
+//!   Orthogonal to the engine's OSC title (which programs keep rewriting):
+//!   this is what the OPERATOR calls the session, not what the running
+//!   program does.
 //! * [`SessionTimeline`] — a bounded, drop-oldest ring of lifecycle events
 //!   (`spawned`, `state-change`, `title-change`, `cwd-change`, `meta-change`),
 //!   modeled on [`crate::turn_ledger::TurnLedger`] (same cap, same monotonic-ms
@@ -45,6 +48,14 @@ pub(crate) const META_TITLE_MAX: usize = 120;
 pub(crate) const META_DESCRIPTION_MAX: usize = 1024;
 /// Byte cap for `meta set icon` (after trim) — an emoji / short token.
 pub(crate) const META_ICON_MAX: usize = 64;
+/// Byte cap for `meta set role` (after trim) — a short role token. The one
+/// recognized value today is `operator` (the menu-bar status item keys on it);
+/// other values are stored verbatim for future roles.
+pub(crate) const META_ROLE_MAX: usize = 64;
+/// Byte cap for `meta set attention` (after trim) — a one-line needs-human
+/// message. NON-EMPTY means the session is escalating: the status item badges
+/// the menu bar and lists the message. Unset it once the human has acted.
+pub(crate) const META_ATTENTION_MAX: usize = 256;
 
 /// True for characters that must never reach native/window chrome from USER
 /// metadata. `char::is_control` covers C0/C1 (including every ASCII line break
@@ -128,9 +139,9 @@ pub(crate) const TIMELINE_CAP: usize = 512;
 /// the clamp only guards a pathological title/cwd from bloating the ring.
 const MAX_PAYLOAD: usize = 256;
 
-/// The user-settable per-session metadata (`meta set`/`meta unset`). All three
-/// are `None` until a driver sets them; `user_title` (when set + non-empty)
-/// outranks the live OSC title in tab labels and stays until unset.
+/// The user-settable per-session metadata (`meta set`/`meta unset`). All
+/// fields are `None` until a driver sets them; `user_title` (when set +
+/// non-empty) outranks the live OSC title in tab labels and stays until unset.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SessionMeta {
     /// Operator-chosen display title — the TOP rung of the tab-label chain.
@@ -139,13 +150,25 @@ pub struct SessionMeta {
     pub description: Option<String>,
     /// Icon token (emoji or short name); reserved for the strip/UI stage.
     pub icon: Option<String>,
+    /// TYPED role token. `operator` designates the fleet operator to the
+    /// menu-bar status item (which falls back to the legacy `operator: …`
+    /// title convention only when no session carries the typed role).
+    pub role: Option<String>,
+    /// TYPED needs-human escalation: non-empty ⇒ this session wants a human,
+    /// and the value is the one-line reason shown in the status-item menu.
+    /// Replaces the legacy `⚠`-title convention (still honored as fallback).
+    pub attention: Option<String>,
 }
 
 impl SessionMeta {
     /// Whether ANY field is set — the `sessions` listing's `meta=<1|0>` bit.
     #[must_use]
     pub fn any_set(&self) -> bool {
-        self.user_title.is_some() || self.description.is_some() || self.icon.is_some()
+        self.user_title.is_some()
+            || self.description.is_some()
+            || self.icon.is_some()
+            || self.role.is_some()
+            || self.attention.is_some()
     }
 
     /// The named field's current value (`None` for an unknown field name —
@@ -156,6 +179,8 @@ impl SessionMeta {
             "title" => self.user_title.as_deref(),
             "description" => self.description.as_deref(),
             "icon" => self.icon.as_deref(),
+            "role" => self.role.as_deref(),
+            "attention" => self.attention.as_deref(),
             _ => None,
         }
     }
@@ -169,6 +194,51 @@ impl SessionMeta {
             .and_then(|value| sanitize_metadata_value(field, value))
     }
 
+    /// [`Self::presentation_value`] without the allocation: writes the canonical
+    /// value into `out` and returns whether the field is set (and non-empty
+    /// after the policy). `out` is left UNTOUCHED when the answer is `false`, so
+    /// a caller may pass a resident slot holding a stale value it wants kept —
+    /// which is exactly what the tab-strip refill's try-lock fallback needs.
+    ///
+    /// This exists for the render path: `presentation_value` allocates TWO
+    /// `String`s (the char filter's collect plus the trim's `to_string`) per set
+    /// field per tab, on a function that runs before the redraw early-out.
+    pub(crate) fn presentation_value_into(&self, field: &str, out: &mut String) -> bool {
+        let Some(cap) = Self::cap(field) else {
+            return false;
+        };
+        let Some(value) = self.get(field) else {
+            return false;
+        };
+        // Fixpoint of `sanitize_presentation_line`: nothing to filter (so the
+        // `collect` would reproduce `value`), nothing to trim, and within the
+        // cap (so the early `to_string` arm returns `value` verbatim). Every
+        // production writer goes through `set`, which sanitizes, so this is the
+        // steady-state path — one scan, zero allocations.
+        if value.len() <= cap
+            && value.trim().len() == value.len()
+            && !metadata_has_forbidden_formatting(value)
+        {
+            if value.is_empty() {
+                return false;
+            }
+            out.clear();
+            out.push_str(value);
+            return true;
+        }
+        // Non-canonical (an older in-process caller, a hand-edited manifest):
+        // the exact sanitizer as before, byte-for-byte. This arm is the
+        // bidi-override / invisible-character guard and must not be dropped.
+        match sanitize_metadata_value(field, value) {
+            Some(sanitized) => {
+                out.clear();
+                out.push_str(&sanitized);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A canonical bounded copy suitable for restore/handoff persistence.
     #[must_use]
     pub(crate) fn sanitized(&self) -> Self {
@@ -176,6 +246,8 @@ impl SessionMeta {
             user_title: self.presentation_value("title"),
             description: self.presentation_value("description"),
             icon: self.presentation_value("icon"),
+            role: self.presentation_value("role"),
+            attention: self.presentation_value("attention"),
         }
     }
 
@@ -186,6 +258,8 @@ impl SessionMeta {
             "title" => Some(META_TITLE_MAX),
             "description" => Some(META_DESCRIPTION_MAX),
             "icon" => Some(META_ICON_MAX),
+            "role" => Some(META_ROLE_MAX),
+            "attention" => Some(META_ATTENTION_MAX),
             _ => None,
         }
     }
@@ -198,6 +272,8 @@ impl SessionMeta {
             "title" => &mut self.user_title,
             "description" => &mut self.description,
             "icon" => &mut self.icon,
+            "role" => &mut self.role,
+            "attention" => &mut self.attention,
             _ => return None,
         };
         // Callers exposed to the user reject unsafe/over-cap values so the
@@ -211,7 +287,7 @@ impl SessionMeta {
     }
 }
 
-/// The three USER-metadata fields as a CLOSED type. Everything past the wire
+/// The USER-metadata fields as a CLOSED type. Everything past the wire
 /// PARSE boundary carries this instead of a `&str` name, which removes two
 /// hazards by construction: the unknown-field case stops being reachable, and
 /// the `meta-change` record no longer has to re-map a borrowed name onto a
@@ -224,6 +300,10 @@ pub(crate) enum MetaField {
     Description,
     /// `icon` — an emoji / short token for the strip.
     Icon,
+    /// `role` — typed role token (`operator` is the recognized value).
+    Role,
+    /// `attention` — typed needs-human escalation message (non-empty ⇒ badge).
+    Attention,
 }
 
 impl MetaField {
@@ -235,6 +315,8 @@ impl MetaField {
             "title" => Self::Title,
             "description" => Self::Description,
             "icon" => Self::Icon,
+            "role" => Self::Role,
+            "attention" => Self::Attention,
             _ => return None,
         })
     }
@@ -248,6 +330,8 @@ impl MetaField {
             Self::Title => "title",
             Self::Description => "description",
             Self::Icon => "icon",
+            Self::Role => "role",
+            Self::Attention => "attention",
         }
     }
 
@@ -258,6 +342,8 @@ impl MetaField {
             Self::Title => META_TITLE_MAX,
             Self::Description => META_DESCRIPTION_MAX,
             Self::Icon => META_ICON_MAX,
+            Self::Role => META_ROLE_MAX,
+            Self::Attention => META_ATTENTION_MAX,
         }
     }
 }
@@ -446,7 +532,12 @@ impl SessionTimeline {
 
     /// Events with `id > after`, oldest-first (ids only ever append increasing,
     /// so this is a suffix). `None` = all retained events.
-    pub fn since(&self, after: Option<u64>) -> impl Iterator<Item = &TimelineEvent> {
+    ///
+    /// Double-ended so a caller that only wants the newest few can walk backwards
+    /// instead of materializing the whole retained deque; the concrete iterator
+    /// (a filtered `VecDeque::iter`) already was, only the opaque type hid it.
+    /// `DoubleEndedIterator: Iterator`, so every existing caller is unaffected.
+    pub fn since(&self, after: Option<u64>) -> impl DoubleEndedIterator<Item = &TimelineEvent> {
         self.events
             .iter()
             .filter(move |e| after.is_none_or(|a| e.id > a))
@@ -686,7 +777,18 @@ mod tests {
         assert_eq!(SessionMeta::cap("title"), Some(META_TITLE_MAX));
         assert_eq!(SessionMeta::cap("description"), Some(META_DESCRIPTION_MAX));
         assert_eq!(SessionMeta::cap("icon"), Some(META_ICON_MAX));
+        assert_eq!(SessionMeta::cap("role"), Some(META_ROLE_MAX));
+        assert_eq!(SessionMeta::cap("attention"), Some(META_ATTENTION_MAX));
         assert_eq!(SessionMeta::cap("colour"), None);
+        // The typed keys round-trip like the original three and flip any_set.
+        assert_eq!(m.set("role", Some("operator".into())), Some(true));
+        assert_eq!(m.get("role"), Some("operator"));
+        assert!(m.any_set());
+        assert_eq!(m.set("attention", Some("needs human: approval".into())), Some(true));
+        assert_eq!(m.get("attention"), Some("needs human: approval"));
+        assert_eq!(m.set("role", None), Some(true));
+        assert_eq!(m.set("attention", None), Some(true));
+        assert!(!m.any_set());
     }
 }
 
@@ -807,8 +909,7 @@ mod meta_atomicity_tests {
         let tl = ctx.timeline.lock().unwrap();
         let last = tl
             .since(None)
-            .filter(|e| e.kind == "meta-change")
-            .last()
+            .rfind(|e| e.kind == "meta-change")
             .expect("changes were recorded");
         assert_eq!(
             last.payload,

@@ -799,22 +799,39 @@ pub(crate) fn layout_visible_blocks(
     let sample_start = anchor_index.saturating_sub(32);
     let sample_end = sample_start.saturating_add(64).min(document.blocks.len());
     let sample = &document.blocks[sample_start..sample_end];
-    let mean_height = sample
+    // Measuring a block is O(its text) — the estimator decodes up to 128 KiB of
+    // chars per call — and the mean sample straddles the anchor, so it measures
+    // exactly the blocks the visible loop below is about to measure again.
+    // Retain the sample's heights instead of discarding them: the estimator is
+    // a pure function of (block, width) and the width is fixed for this call,
+    // so a retained height is bit-identical to the recomputed one.
+    let sample_heights = sample
         .iter()
         .map(|block| estimated_block_height(block, viewport_width))
-        .sum::<f32>()
-        / sample.len().max(1) as f32;
+        .collect::<Vec<_>>();
+    let mean_height = sample_heights.iter().sum::<f32>() / sample.len().max(1) as f32;
     let total_height = mean_height * document.blocks.len() as f32;
     let start = anchor_index;
-    let total_anchor_rows = block_visual_rows(&document.blocks[anchor_index], viewport_width);
+    let measured_height = |index: usize, block: &MarkdownBlock| {
+        index
+            .checked_sub(sample_start)
+            .and_then(|offset| sample_heights.get(offset).copied())
+            .unwrap_or_else(|| estimated_block_height(block, viewport_width))
+    };
+    let total_anchor_rows = block_visual_rows_for_height(
+        &document.blocks[anchor_index],
+        measured_height(anchor_index, &document.blocks[anchor_index]),
+    );
     let visual_row = visual_row.min(total_anchor_rows.saturating_sub(1));
     let mut y = 0.0;
     let limit = viewport_height + 320.0;
     let mut blocks = Vec::new();
     for (index, block) in document.blocks.iter().enumerate().skip(start) {
-        let total_visual_rows = block_visual_rows(block, viewport_width);
         let row = if index == anchor_index { visual_row } else { 0 };
-        let full_height = estimated_block_height(block, viewport_width);
+        let full_height = measured_height(index, block);
+        // The row count is derived from the height this block already has, so
+        // the block's text is decoded once per layout rather than twice.
+        let total_visual_rows = block_visual_rows_for_height(block, full_height);
         let skipped = row as f32 * block_visual_row_height(block);
         let height = (full_height - skipped).max(VISUAL_BLOCK_GAP + 1.0);
         if y >= limit {
@@ -841,7 +858,13 @@ pub(crate) fn layout_visible_blocks(
 /// canonical unit for wheel/page navigation and the typed Markdown painter's
 /// `visual_row` window.
 pub(crate) fn block_visual_rows(block: &MarkdownBlock, viewport_width: f32) -> usize {
-    let height = estimated_block_height(block, viewport_width);
+    block_visual_rows_for_height(block, estimated_block_height(block, viewport_width))
+}
+
+/// The same row count from a height the caller has already measured. Splitting
+/// the arithmetic out keeps `estimated_block_height` — an O(block text) decode —
+/// to one call per block per layout pass; the arithmetic itself is unchanged.
+fn block_visual_rows_for_height(block: &MarkdownBlock, height: f32) -> usize {
     let padding = block_visual_padding(block);
     ((height - padding).max(1.0) / block_visual_row_height(block))
         .ceil()
@@ -893,16 +916,33 @@ pub(crate) fn move_visual_rows(
     if document.blocks.is_empty() {
         return MarkdownLocation::default();
     }
+    // One measurement slot for the block the traversal is standing on. Each
+    // step revisits it: the entry clamp measures the starting block that the
+    // loop then measures again, and the forward arm re-measures the block it
+    // has just filled before stepping off it. `block_visual_rows` is O(block
+    // text), and the row count for a given (block, width) never changes inside
+    // one traversal, so the retained value is the identical number.
+    let mut measured: Option<(usize, usize)> = None;
+    let mut visual_rows_of = |index: usize| -> usize {
+        if let Some((cached_index, rows)) = measured
+            && cached_index == index
+        {
+            return rows;
+        }
+        let rows = block_visual_rows(&document.blocks[index], viewport_width);
+        measured = Some((index, rows));
+        rows
+    };
     let mut block = block_at_source(document, location.source_anchor).unwrap_or(0);
     let mut row = location
         .visual_row
-        .min(block_visual_rows(&document.blocks[block], viewport_width).saturating_sub(1));
+        .min(visual_rows_of(block).saturating_sub(1));
     if delta == isize::MIN {
         return MarkdownLocation::new(document.blocks[0].source().start, 0);
     }
     if delta == isize::MAX {
         block = document.blocks.len() - 1;
-        row = block_visual_rows(&document.blocks[block], viewport_width).saturating_sub(1);
+        row = visual_rows_of(block).saturating_sub(1);
         return MarkdownLocation::new(source_anchor_for_visual_row(document, block, row), row);
     }
     let mut remaining = delta.unsigned_abs().min(100_000);
@@ -914,13 +954,13 @@ pub(crate) fn move_visual_rows(
                 remaining -= step;
             } else if block > 0 {
                 block -= 1;
-                row = block_visual_rows(&document.blocks[block], viewport_width).saturating_sub(1);
+                row = visual_rows_of(block).saturating_sub(1);
                 remaining -= 1;
             } else {
                 break;
             }
         } else {
-            let last = block_visual_rows(&document.blocks[block], viewport_width).saturating_sub(1);
+            let last = visual_rows_of(block).saturating_sub(1);
             if row < last {
                 let step = remaining.min(last - row);
                 row += step;

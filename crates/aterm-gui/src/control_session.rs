@@ -26,7 +26,7 @@ use crate::{SessionCtx, term_lock};
 /// so this never holds the registry lock across a `Terminal` lock.
 ///
 /// `meta=<1|0>` (session-metadata stage 1) is a TRAILING additive token: `1` iff
-/// any USER metadata (`meta set title|description|icon`) is set, so a fleet
+/// any USER metadata (`meta set title|description|icon|role|attention`) is set, so a fleet
 /// driver knows which sessions to `@<sid> meta` without N round-trips. Safe to
 /// append: the title token before it is pct-encoded (never contains a space) and
 /// the one shipping parser (aterm-ctl `ls`) prints the line verbatim, keying only
@@ -1194,15 +1194,19 @@ pub(crate) fn cmd_history(ctx: &SessionCtx, rest: &str) -> String {
 /// * bare `meta` (Read): one status line joining the ENGINE identity (live OSC
 ///   title, reported cwd, lifecycle state) with the USER identity (`meta set`
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
-///   cwd=<pct|-> state=<s>`. Every free-text value is pct-encoded so the reply is
-///   always ONE line; `-` marks an unset optional.
-/// * `meta set <title|description|icon> <text...>` (write-escalated by the
-///   dispatch gate): stamp the operator's identity on the session. Byte caps
-///   (after trim): title ≤ 120, description ≤ 1024, icon ≤ 64 — over-cap is a
-///   hard ERR, never a silent truncation (the caller must know its label was
-///   refused). C0/C1, line separators, bidi controls, and spoof-relevant
-///   invisible format characters are rejected rather than
-///   silently stored. The user title OUTRANKS the OSC title in tab labels.
+///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`. Every free-text
+///   value is pct-encoded so the reply is always ONE line; `-` marks an unset
+///   optional.
+/// * `meta set <title|description|icon|role|attention> <text...>`
+///   (write-escalated by the dispatch gate): stamp the operator's identity on
+///   the session. Byte caps (after trim): title ≤ 120, description ≤ 1024,
+///   icon ≤ 64, role ≤ 64, attention ≤ 256 — over-cap is a hard ERR, never a
+///   silent truncation (the caller must know its label was refused). C0/C1,
+///   line separators, bidi controls, and spoof-relevant invisible format
+///   characters are rejected rather than silently stored. The user title
+///   OUTRANKS the OSC title in tab labels. `role operator` designates the
+///   fleet operator to the menu-bar status item; a non-empty `attention` is
+///   the typed needs-human escalation it badges and lists.
 /// * `meta unset <field>` — clear a field (labels fall back down the chain).
 ///
 /// Returns `(reply, changed)`: `changed` is `true` only when a stored value
@@ -1223,13 +1227,13 @@ pub(crate) fn cmd_meta(
         Some("set") => {
             let Some(field) = toks.next() else {
                 return (
-                    "ERR usage: meta set <title|description|icon> <text...>\n".to_string(),
+                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n".to_string(),
                     false,
                 );
             };
             let Some(typed) = MetaField::parse(field) else {
                 return (
-                    "ERR unknown meta field (title|description|icon)\n".to_string(),
+                    "ERR unknown meta field (title|description|icon|role|attention)\n".to_string(),
                     false,
                 );
             };
@@ -1247,7 +1251,7 @@ pub(crate) fn cmd_meta(
                 // On the wire `meta set title ""` is a USAGE ERROR, never a
                 // clear: clearing has its own explicit `meta unset` form.
                 Err(MetaWriteError::Empty) => (
-                    "ERR usage: meta set <title|description|icon> <text...>\n".to_string(),
+                    "ERR usage: meta set <title|description|icon|role|attention> <text...>\n".to_string(),
                     false,
                 ),
                 Err(MetaWriteError::ForbiddenFormatting) => (
@@ -1267,7 +1271,7 @@ pub(crate) fn cmd_meta(
             };
             let Some(field) = MetaField::parse(field) else {
                 return (
-                    "ERR unknown meta field (title|description|icon)\n".to_string(),
+                    "ERR unknown meta field (title|description|icon|role|attention)\n".to_string(),
                     false,
                 );
             };
@@ -1306,13 +1310,22 @@ fn meta_status(
         g.by_local(session)
             .map_or_else(|| "-".to_string(), |h| h.state.as_str().to_string())
     };
-    let opt = |v: Option<&str>| v.map_or_else(|| "-".to_string(), pct_encode);
+    // A STORED value of exactly "-" must not read back as the unset sentinel:
+    // pct_encode leaves '-' verbatim, so it is escaped here ("%2D") — any
+    // percent-decoder recovers it, and `-` stays unambiguous as "unset".
+    let opt = |v: Option<&str>| match v {
+        None => "-".to_string(),
+        Some("-") => "%2D".to_string(),
+        Some(v) => pct_encode(v),
+    };
     format!(
-        "OK title={} user_title={} description={} icon={} cwd={} state={state}\n",
+        "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
         opt(meta.icon.as_deref()),
+        opt(meta.role.as_deref()),
+        opt(meta.attention.as_deref()),
         opt(cwd.as_deref()),
     )
 }

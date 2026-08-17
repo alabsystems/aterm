@@ -2015,6 +2015,43 @@ mod tests {
             .expect("write transitional ledger");
     }
 
+    /// THE NAMESPACE FENCE, pinned where it CAN be: the collection book's
+    /// `glyph_label` names (they name COLLECTED specials/accessories) and the
+    /// registry's kitty NAMES (they name APP kitties) are different
+    /// namespaces and must never share a word. The registry's own hygiene
+    /// test pins its signature-table half but cannot see this crate's label
+    /// table (`glyph_label` lives downstream of aterm-effects), so this half
+    /// of the law lives here, beside the labels, through the registry's
+    /// read-only [`aterm_effects::kitty_registry::kitty_name_bank`] door.
+    #[test]
+    fn glyph_labels_stay_out_of_the_kitty_name_namespace() {
+        let bank = aterm_effects::kitty_registry::kitty_name_bank();
+        // The signature names, reached through the same public door the
+        // labels must stay clear of — the id list is the registry's own
+        // pinned canonical coverage.
+        let signatures: Vec<&str> = ["shell", "claude", "codex", "agy", "aider", "gemini", "cursor"]
+            .into_iter()
+            .map(aterm_effects::kitty_registry::kitty_name)
+            .collect();
+        let mut labeled = 0;
+        for def in GLYPHS {
+            if def.kind == GlyphKind::Head {
+                continue; // heads share the one summary row; no label of their own
+            }
+            let label = glyph_label(def.id);
+            labeled += 1;
+            assert!(
+                !bank.contains(&label),
+                "{label:?} names a collected glyph AND rides the app-name bank"
+            );
+            assert!(
+                !signatures.contains(&label),
+                "{label:?} names a collected glyph AND a flagship app kitty"
+            );
+        }
+        assert!(labeled >= 11, "the fence must cover every authored label");
+    }
+
     fn write_precollectibles_rewrite(path: &Path, log: &KittyLog) {
         let mut old = log.clone();
         old.collectibles.clear();

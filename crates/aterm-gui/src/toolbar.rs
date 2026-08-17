@@ -123,8 +123,9 @@ pub use non_macos::{
 
 use crate::tab_bar::TabStripMetadata;
 
-/// Whether `next` differs from `current` only by the animation phase of the
-/// conventional leading braille busy spinner used by Codex and similar TUIs.
+/// Whether `next` differs from `current` only by the animation phase of a
+/// conventional leading busy spinner: the braille `dots` cycle used by Codex
+/// and similar TUIs, or the circle-fill "moon" cycle used by Claude Code.
 ///
 /// The semantic suffix remains byte-identical. Chrome can therefore keep one stable
 /// busy frame instead of asking AppKit to relayout the window title, tab label,
@@ -141,7 +142,7 @@ pub(crate) fn busy_spinner_phase_only_change(current: &str, next: &str) -> bool 
     )
 }
 
-fn busy_spinner_title_parts(title: &str) -> Option<(char, &str)> {
+pub(crate) fn busy_spinner_title_parts(title: &str) -> Option<(char, &str)> {
     let mut chars = title.chars();
     let frame = chars.next()?;
     let suffix = chars.as_str();
@@ -151,7 +152,9 @@ fn busy_spinner_title_parts(title: &str) -> Option<(char, &str)> {
 #[must_use]
 fn is_busy_spinner_frame(ch: char) -> bool {
     // cli-spinners' `dots` sequence, which is also the sequence Codex exposes in its
-    // OSC title while work is in flight.
+    // OSC title while work is in flight; plus the circle-fill "moon" phases
+    // ◐◑◒◓◔◕ that Claude Code animates at ~1Hz. Any two distinct in-set frames
+    // coalesce, across families too — same busy state, same semantic suffix.
     matches!(
         ch,
         '\u{280b}'
@@ -164,6 +167,7 @@ fn is_busy_spinner_frame(ch: char) -> bool {
             | '\u{2827}'
             | '\u{2807}'
             | '\u{280f}'
+            | '\u{25d0}'..='\u{25d5}'
     )
 }
 
@@ -445,6 +449,20 @@ mod shared_tests {
         assert!(!busy_spinner_phase_only_change("⠋aterm", "⠙aterm"));
         assert!(!busy_spinner_phase_only_change("⣿ aterm", "⠋ aterm"));
         assert!(!busy_spinner_phase_only_change("prefix ⠋", "prefix ⠙"));
+
+        // Claude Code's circle-fill "moon" spinner coalesces the same way.
+        let moons = ["◐ Claude Code", "◓ Claude Code", "◑ Claude Code", "◒ Claude Code"];
+        for pair in moons.windows(2) {
+            assert!(busy_spinner_phase_only_change(pair[0], pair[1]));
+        }
+        assert!(busy_spinner_phase_only_change("◔ task", "◕ task"));
+        // Cross-family frames coalesce too: same busy state, same suffix.
+        assert!(busy_spinner_phase_only_change("⠋ aterm", "◐ aterm"));
+        // The busy→idle handoff (✳ is not a spinner frame) is always recorded,
+        // as are suffix changes and missing separators.
+        assert!(!busy_spinner_phase_only_change("◑ Claude Code", "✳ Claude Code"));
+        assert!(!busy_spinner_phase_only_change("◐ aterm", "◑ project"));
+        assert!(!busy_spinner_phase_only_change("◐aterm", "◑aterm"));
     }
 
     #[test]

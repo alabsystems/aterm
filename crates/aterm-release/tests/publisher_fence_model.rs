@@ -6,6 +6,9 @@
 //! stopped; production must reject any residual stale guard's later mutation and
 //! exact-token cleanup authority.
 
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

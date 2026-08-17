@@ -46,9 +46,31 @@ export ATERM_SUITE_VERSION="${ATERM_SUITE_VERSION:-}"
 typeset -g __aterm_in_command=0
 typeset -g __aterm_report_host="${HOST:-${HOSTNAME:-localhost}}"
 
-# OSC escape sequences
+# OSC escape sequences.
+#
+# `printf '%s'` — NOT `print -n` — because zsh's `print` without `-r` expands
+# escape sequences in its ARGUMENT, and the argument here is the whole
+# already-expanded payload. That silently undid every escape the callers below
+# construct. Verified on the wire: `__aterm_encode_cmd` correctly turned a
+# command line `a<ESC>b<BEL>c;d e` into `a\x1bb\x07c\x3bd\x20e`, and `print -n`
+# converted those escapes straight back into RAW 0x1b / 0x07 bytes inside the
+# OSC 633;E payload — the embedded BEL terminates the OSC string early and the
+# remaining bytes are parsed as fresh input, which is exactly the OSC break-out
+# the encoder exists to prevent.
+#
+# The OSC 0 title path was worse. `${title//[[:cntrl:]]/}` strips control BYTES,
+# but a command whose LITERAL text reads `echo \e]52;c;aGVsbG8=\a` contains no
+# control bytes for that guard to strip — `print` then manufactured the ESC and
+# BEL itself, smuggling a live OSC 52 clipboard write out of the tab title.
+#
+# `printf` never interprets a `%s` argument, which is why the bash script — which
+# always spelled it `printf '\033]%s\a' "$1"` — was never affected; this is now
+# the identical spelling. zsh's `printf` is a builtin, so the frame still costs
+# no fork. `print -rn --` is NOT a sufficient fix on its own: `-r` would also
+# stop the leading `\e` and trailing `\a` of the frame itself from being
+# interpreted, emitting a literal backslash-e instead of an OSC introducer.
 __aterm_osc() {
-    print -n "\e]${1}\a"
+    printf '\033]%s\a' "$1"
 }
 
 # Capture the capability nonce into a shell-local so we can immediately
@@ -67,10 +89,29 @@ __aterm_osc() {
 typeset -g __aterm_shell_nonce="${ATERM_SHELL_NONCE:-}"
 unset ATERM_SHELL_NONCE
 
+# Precomputed capability-nonce suffix for OSC 133/633 emissions.
+# The nonce is captured exactly once (above) and the env var is unset on the
+# very next line, so this string is CONSTANT for the life of the shell — there
+# is no in-shell rotation path that could make it stale. Computing it here
+# lets the marker emitters below expand a plain parameter instead of running
+# `$(__aterm_id_suffix)`, which forks a subshell. That mattered: the prompt
+# path fires five markers per command cycle (133;D + 133;A from precmd, 133;B
+# from zle-line-init, 633;E + 133;C from preexec), i.e. five forks of pure
+# dead time around every command. Byte-identical output — same ";id=<hex>"
+# spelling, same empty-string fallback when unnonced. `typeset -g` (not
+# `export`), exactly like $__aterm_shell_nonce itself, so #8015 (no nonce
+# inheritance by subprocesses) is preserved.
+typeset -g __aterm_id_suffix_str=""
+if [[ -n "$__aterm_shell_nonce" ]]; then
+    __aterm_id_suffix_str=";id=${__aterm_shell_nonce}"
+fi
+
 # Capability-nonce suffix for OSC 133/633 emissions (#7960, #7987, #8015).
 # Expands to ";id=<64-hex>" when the captured nonce is non-empty, or to
 # the empty string otherwise. Reads from the captured local — never from
 # the environment — so the nonce is not inherited by subprocesses.
+# Kept as the documented helper / external entry point; the hot emitters
+# below use $__aterm_id_suffix_str instead to avoid a fork per marker.
 __aterm_id_suffix() {
     if [[ -n "$__aterm_shell_nonce" ]]; then
         print -rn -- ";id=${__aterm_shell_nonce}"
@@ -81,14 +122,28 @@ __aterm_id_suffix() {
 # Unreserved chars (A-Z a-z 0-9 - _ . ~ /) pass through; all others
 # are encoded byte-by-byte as %XX. LC_ALL=C ensures multi-byte UTF-8
 # characters are split into individual bytes for correct encoding.
+#
+# Runs once per prompt (via __aterm_report_cwd), so it is fork-free by
+# construction: `printf -v` writes into a variable instead of spawning a
+# `$(printf ...)` subshell per encoded byte. A path with a single space used
+# to cost a fork; a 4-byte emoji cost four. No `& 0xFF` mask is needed (or
+# present, historically): unlike bash, zsh's `printf '%d' "'<byte>"` returns
+# the UNSIGNED byte value (195 for 0xC3), so `%02X` is already correct.
 __aterm_urlencode() {
     local LC_ALL=C
-    local string="$1" i char encoded=""
+    # Fast path: no byte needs encoding, so the loop would copy the string
+    # verbatim. Skip it. (The class is exactly the loop's pass-through class,
+    # so this is the same decision the loop would make for every byte.)
+    if [[ "$1" != *[^a-zA-Z0-9_.~/-]* ]]; then
+        print -rn -- "$1"
+        return
+    fi
+    local string="$1" i char encoded="" hex
     for ((i = 1; i <= ${#string}; i++)); do
         char="${string[$i]}"
         case "$char" in
             [a-zA-Z0-9_.~/-]) encoded+="$char" ;;
-            *) encoded+=$(printf '%%%02X' "'$char") ;;
+            *) printf -v hex '%%%02X' "'$char"; encoded+="$hex" ;;
         esac
     done
     print -rn -- "$encoded"
@@ -103,22 +158,22 @@ __aterm_report_cwd() {
 
 # Mark prompt start (OSC 133;A)
 __aterm_mark_prompt_start() {
-    __aterm_osc "133;A$(__aterm_id_suffix)"
+    __aterm_osc "133;A${__aterm_id_suffix_str}"
 }
 
 # Mark command line start (OSC 133;B)
 __aterm_mark_command_start() {
-    __aterm_osc "133;B$(__aterm_id_suffix)"
+    __aterm_osc "133;B${__aterm_id_suffix_str}"
 }
 
 # Mark command execution start (OSC 133;C)
 __aterm_mark_exec_start() {
-    __aterm_osc "133;C$(__aterm_id_suffix)"
+    __aterm_osc "133;C${__aterm_id_suffix_str}"
 }
 
 # Mark command completion (OSC 133;D;exitcode)
 __aterm_mark_exec_finish() {
-    __aterm_osc "133;D;$1$(__aterm_id_suffix)"
+    __aterm_osc "133;D;$1${__aterm_id_suffix_str}"
 }
 
 # precmd - runs before each prompt
@@ -159,15 +214,23 @@ __aterm_precmd() {
 
 # Encode a string for OSC 633;E (VS Code convention).
 # Backslash-hex encodes semicolons, backslashes, and bytes <= 0x20.
+#
+# Runs once per user command, between Enter and the command actually
+# starting, so it is fork-free. Space is split out of the old
+# `[[:cntrl:]]|' '` arm because it is unconditionally 0x20 — a literal
+# beats a subshell, and spaces are the only member of that arm a real
+# command line ever contains. Control bytes keep the computed form but
+# use `printf -v` instead of a `$(printf ...)` subshell.
 __aterm_encode_cmd() {
     local LC_ALL=C
-    local string="$1" i char encoded=""
+    local string="$1" i char encoded="" hex
     for ((i = 1; i <= ${#string}; i++)); do
         char="${string[$i]}"
         case "$char" in
             \\) encoded+="\\\\" ;;
             \;) encoded+="\\x3b" ;;
-            [[:cntrl:]]|' ') encoded+=$(printf '\\x%02x' "'$char") ;;
+            ' ') encoded+="\\x20" ;;
+            [[:cntrl:]]) printf -v hex '\\x%02x' "'$char"; encoded+="$hex" ;;
             *) encoded+="$char" ;;
         esac
     done
@@ -179,7 +242,7 @@ __aterm_preexec() {
     __aterm_in_command=1
 
     # Report command text for session memory (OSC 633;E)
-    __aterm_osc "633;E;$(__aterm_encode_cmd "$1")$(__aterm_id_suffix)"
+    __aterm_osc "633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}"
 
     # Set tab title to running command (OSC 0).
     # Truncate to first 64 chars and strip control characters.

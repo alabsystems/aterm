@@ -131,26 +131,44 @@ impl Terminal {
         // the whole line per row — the same memory-amplification DoS closed in
         // `get_line_text`, reachable via the control `search` path. Legitimate lines
         // are far under the ceiling, so this never changes indexed content.
+        //
+        // Fed STREAMING, not collected: `index_visible_content` only does
+        // `for (offset, line) in lines.into_iter().enumerate()` — no length, no
+        // random access, no second pass — and `index_line` stores its own
+        // `to_string()` copy, so materializing a `Vec<String>` first bought
+        // nothing but a second simultaneous residency of the WHOLE scrollback
+        // text (plus a 24-byte spine per line) on top of the index being built.
+        // Behavior is unchanged: the same lines are enumerated in the same order
+        // and keyed at `base + offset`, so the line set, absolute-row keys and
+        // eviction/INCOMPLETE semantics — and therefore every `SearchMatch`
+        // coordinate — are identical. The only difference is that the
+        // `get_history_line` reads now interleave with trigram insertion instead
+        // of all preceding it, which nothing can observe: `get_history_line`
+        // takes `&self`, so the grid cannot mutate (nor `content_gen` bump)
+        // mid-build. The `legacy_results` oracle test below deliberately keeps
+        // the collect form and asserts result equality — it is this change's
+        // regression guard.
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
-        let history: Vec<String> = (0..scrollback)
-            .map(|i| {
+        let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
+        search.index_visible_content(
+            hist_base,
+            (0..scrollback).map(|i| {
                 grid.get_history_line(i)
                     .map(|l| line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES))
                     .unwrap_or_default()
-            })
-            .collect();
-        let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-        search.index_visible_content(hist_base, &history);
+            }),
+        );
 
         // Visible rows 0..rows → absolute oldest + scrollback + r. Combining-aware
         // `get_line_text` so accents / ZWJ clusters survive (FIDELITY I-1).
         // `rows` is a u16, so `i32::from` is lossless (mirrors the legacy
-        // `r as i32` where `r` was a u16-bounded usize).
-        let visible: Vec<String> = (0..rows)
-            .map(|r| self.get_line_text(i32::from(r), None).unwrap_or_default())
-            .collect();
+        // `r as i32` where `r` was a u16-bounded usize). Streamed for the same
+        // reason as the history above.
         let vis_base = hist_base.saturating_add(scrollback);
-        search.index_visible_content(vis_base, &visible);
+        search.index_visible_content(
+            vis_base,
+            (0..rows).map(|r| self.get_line_text(i32::from(r), None).unwrap_or_default()),
+        );
 
         search
     }

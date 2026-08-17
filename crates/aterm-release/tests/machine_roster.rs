@@ -29,6 +29,9 @@
 // The release crate is a binary on purpose (the spec's §9 file plan has no lib.rs), so
 // the integration tests compile the modules under test directly. publish.rs reaches every
 // stage through `crate::`, hence the full mount list.
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

@@ -8,7 +8,7 @@
 //! renderer-native Settings surface: every route lives in an aterm tab and
 //! emits typed host effects through [`crate::native_ui`].
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -2684,21 +2684,32 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
         .filter(|field| field_match_score_in(field, &query, &mut scratch).is_some())
         .count();
     native
-        + usize::from(global_search && manual_search_match_count(view, &query) > 0)
+        // Only ever compared against zero here, so the boolean twin answers it
+        // without materializing (and dropping) the whole match set.
+        + usize::from(global_search && manual_search_has_match(view, &query))
         + if modified_only {
-            authored_manual_overrides(view).len()
+            // One row per selected key, so the key set's length IS the row
+            // count — the labels and value previews are pure render decoration.
+            authored_manual_override_keys(view).len()
         } else {
             0
         }
 }
 
-/// Return the authored leaves/opaque structures that the native Modified rows
+/// Select the authored leaves/opaque structures that the native Modified rows
 /// do not represent. `ConfigSnapshot::values` also contains intermediate table
 /// projections; suppressing a parent when a descendant exists prevents one
 /// `[packages]` header from masquerading as seven independent overrides.
 /// Unknown keys intentionally survive as Manual overrides for forward
 /// compatibility, but never gain a guessed destructive action.
-fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
+///
+/// The selection lives apart from the row decoration because global search
+/// needs the same bounded key set without paying for a label and a value
+/// preview per key. Both callers must consume this one selector: the
+/// single-result handoff into Manual reveals `matches[0]`, so a second
+/// hand-written predicate that drifted from this one would silently reveal the
+/// wrong key. Keys arrive already sorted — `raw_values` is a `BTreeMap`.
+fn authored_manual_override_keys(view: &SettingsViewState) -> Vec<&str> {
     let represented = view
         .legacy
         .fields
@@ -2706,6 +2717,8 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
         .filter(|field| settings_field_is_visible(field.key, true, false))
         .map(|field| field.key)
         .collect::<BTreeSet<_>>();
+    // Borrowed, not cloned: both this scan and the range probe below only read
+    // `raw_values`, so the grouped parents never need owned copies.
     let grouped_structures = view
         .raw_values
         .keys()
@@ -2718,17 +2731,21 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                 )
             })
         })
-        .cloned()
+        .map(String::as_str)
         .collect::<Vec<_>>();
-    let mut overrides = view
-        .raw_values
+    view.raw_values
         .keys()
+        .map(String::as_str)
         .filter(|key| {
-            let key = key.as_str();
-            let grouped_parent = grouped_structures.iter().any(|parent| parent == key);
-            let grouped_descendant = grouped_structures
-                .iter()
-                .any(|parent| key.starts_with(&format!("{parent}.")));
+            let key = *key;
+            let grouped_parent = grouped_structures.contains(&key);
+            // `strip_prefix` asks the same question the old `format!("{parent}.")`
+            // prefix did — is `key` under `parent`? — without allocating one
+            // throwaway `String` per (key x grouped structure) pair.
+            let grouped_descendant = grouped_structures.iter().any(|parent| {
+                key.strip_prefix(*parent)
+                    .is_some_and(|rest| rest.starts_with('.'))
+            });
             !grouped_descendant
                 && !represented.contains(key)
                 // These historical storage keys are faithfully represented by
@@ -2738,21 +2755,37 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                 // A table projection is structural, not another setting, when
                 // one of its authored descendants is already present.
                 && (grouped_parent || {
+                    // Built lazily — a grouped parent never needs it — and now
+                    // MOVED into the range bound instead of cloned for it. The
+                    // membership test is the same `starts_with("{key}.")`,
+                    // spelled against `key` so the prefix need not outlive the
+                    // range. Ranging from `key` itself instead would be wrong:
+                    // any sibling byte below '.' sorts between "key" and "key.".
                     let prefix = format!("{key}.");
-                    !view
-                        .raw_values
-                        .range(prefix.clone()..)
-                        .next()
-                        .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
+                    !view.raw_values.range(prefix..).next().is_some_and(
+                        |(candidate, _)| {
+                            candidate
+                                .strip_prefix(key)
+                                .is_some_and(|rest| rest.starts_with('.'))
+                        },
+                    )
                 })
         })
+        .collect()
+}
+
+/// Decorate the selected override keys with the label, preview, and reset
+/// affordance the Modified route paints.
+fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
+    let mut overrides = authored_manual_override_keys(view)
+        .into_iter()
         .map(|key| {
             let schema = crate::native_config_language::config_schema_entry(key);
             let retired = crate::native_config_language::retired_config_key(key);
             let compatibility = retired.is_none() && native_compatibility_only_key(key);
             let raw = view.raw_values.get(key).map_or("", String::as_str);
             ManualOverride {
-                key: key.clone(),
+                key: key.to_string(),
                 label: retired.map_or_else(
                     || {
                         if compatibility {
@@ -2932,6 +2965,66 @@ fn manual_reset_schema_entry(
         .filter(|entry| entry.manual_reset_safe)
 }
 
+/// Visit every schema entry global search surfaces as a Manual match, in
+/// registry order, stopping as soon as `visit` returns `false`.
+///
+/// The two consumers below share this one sweep so the counted set and the
+/// "is there anything at all" answer cannot disagree about a single key.
+fn for_each_manual_schema_match(
+    query: &str,
+    mut visit: impl FnMut(&'static crate::native_config_language::ConfigSchemaEntry) -> bool,
+) {
+    let mut scratch = String::new();
+    for entry in crate::native_config_language::config_schema() {
+        if crate::native_config_language::is_compatibility_only_key(entry.key) {
+            continue;
+        }
+        if entry.native_scalar && settings_field_is_visible(entry.key, false, true) {
+            continue;
+        }
+        if crate::native_config_language::config_schema_match_score(entry, query, &mut scratch)
+            .is_none()
+        {
+            continue;
+        }
+        if !visit(entry) {
+            return;
+        }
+    }
+}
+
+/// Visit every authored override key global search surfaces as a Manual match,
+/// stopping as soon as `visit` returns `false`.
+fn for_each_authored_manual_match(
+    view: &SettingsViewState,
+    query: &str,
+    mut visit: impl FnMut(&str) -> bool,
+) {
+    // The key selector, not the decorated rows: this path reads only `.key`, so
+    // building a label and a value preview per authored override would be pure
+    // waste on every keystroke while search is active.
+    let mut folded = String::new();
+    for key in authored_manual_override_keys(view) {
+        // Schema membership decides this on its own and now costs a binary
+        // search, so it runs before the fold and the substring/subsequence
+        // scan, which touch every byte of the key. Both tests are pure, so the
+        // order between them is not observable.
+        if crate::native_config_language::config_schema_entry(key).is_some()
+            && !crate::native_config_language::is_compatibility_only_key(key)
+        {
+            continue;
+        }
+        // One reused buffer instead of a fresh `to_ascii_lowercase` per key.
+        // `char::to_ascii_lowercase` leaves non-ASCII untouched exactly as the
+        // byte-wise `str::to_ascii_lowercase` did.
+        folded.clear();
+        folded.extend(key.chars().map(|character| character.to_ascii_lowercase()));
+        if (folded.contains(query) || is_subsequence(query, &folded)) && !visit(key) {
+            return;
+        }
+    }
+}
+
 /// Manual-only config keys participate in global search without pretending
 /// they have an audited native control. The exact bounded key set also carries
 /// a single-result handoff into Manual, so the count and reveal target cannot
@@ -2940,31 +3033,44 @@ fn manual_search_matching_keys(view: &SettingsViewState, query: &str) -> Vec<Str
     if query.is_empty() {
         return Vec::new();
     }
-    let mut scratch = String::new();
-    let mut matches = crate::native_config_language::config_schema()
-        .iter()
-        .filter(|entry| !crate::native_config_language::is_compatibility_only_key(entry.key))
-        .filter(|entry| !entry.native_scalar || !settings_field_is_visible(entry.key, false, true))
-        .filter(|entry| {
-            crate::native_config_language::config_schema_match_score(entry, query, &mut scratch)
-                .is_some()
-        })
-        .map(|entry| entry.key.to_string())
-        .collect::<BTreeSet<_>>();
-    for authored in authored_manual_overrides(view) {
-        let key = authored.key.to_ascii_lowercase();
-        if (key.contains(query) || is_subsequence(query, &key))
-            && (crate::native_config_language::config_schema_entry(&authored.key).is_none()
-                || crate::native_config_language::is_compatibility_only_key(&authored.key))
-        {
-            matches.insert(authored.key);
-        }
-    }
+    let mut matches = BTreeSet::new();
+    for_each_manual_schema_match(query, |entry| {
+        matches.insert(entry.key.to_string());
+        true
+    });
+    for_each_authored_manual_match(view, query, |key| {
+        matches.insert(key.to_string());
+        true
+    });
     matches.into_iter().collect()
 }
 
 fn manual_search_match_count(view: &SettingsViewState, query: &str) -> usize {
     manual_search_matching_keys(view, query).len()
+}
+
+/// Boolean twin of `manual_search_matching_keys` for the one caller that only
+/// asks whether Manual contributes its single summary row. Authored overrides
+/// can only ADD keys to the set, so an early `true` from the schema sweep is
+/// the same answer the fully materialized set would give — and it skips the
+/// authored scan entirely.
+fn manual_search_has_match(view: &SettingsViewState, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let mut found = false;
+    for_each_manual_schema_match(query, |_| {
+        found = true;
+        false
+    });
+    if found {
+        return true;
+    }
+    for_each_authored_manual_match(view, query, |_| {
+        found = true;
+        false
+    });
+    found
 }
 
 /// The form surface is curated independently from the parser/Manual metadata.
@@ -9885,7 +9991,13 @@ fn settings_fields_page(
             field_match_score_in(field, &query, &mut scratch).map(|score| (score, index, field))
         })
         .collect();
-    fields.sort_by_key(|(score, index, field)| {
+    // `sort_by_key` re-evaluates the key on every comparison, and this key is
+    // not cheap: `section_of`/`group_of` are long chains of slice `contains`
+    // scans plus a large string `match`, and `order_index` is a linear
+    // `position`. `sort_by_cached_key` is likewise stable and builds each key
+    // exactly once, so with the trailing `*index` tiebreaker the row order is
+    // bit-identical — only the number of key evaluations changes.
+    fields.sort_by_cached_key(|(score, index, field)| {
         (
             *score,
             prefs::section_of(field.key).order_index(),
@@ -9988,11 +10100,49 @@ fn settings_fields_page(
         SettingsWidth::Medium => 48.0,
         SettingsWidth::Wide => 64.0,
     };
-    let group_footnote_extra = |group: &str| {
-        prefs::group_footnote(group).map_or(0.0, |note| {
+    // Both measurements below are pure functions of (group or caption,
+    // `group_text_width`), and `group_text_width` is fixed for this whole call,
+    // so the compact fitting probes that follow re-derive identical values for
+    // inputs differing only in a scalar `used` offset. Each measurement takes
+    // the process-global font lock and walks the text per grapheme, so the
+    // repeats are the expensive part. Memoize them for the duration of the
+    // call: every fit/height decision, and therefore the painted tree, is
+    // byte-identical. A linear scan beats hashing here — one page shows a
+    // handful of groups. The heading memo is keyed on the FULL caption, never
+    // the group name: under global search one semantic group legitimately
+    // appears under several sections with differently measured captions.
+    let footnote_extra_memo: RefCell<Vec<(&'static str, f32)>> = RefCell::new(Vec::new());
+    let heading_fits_memo: RefCell<Vec<(String, bool)>> = RefCell::new(Vec::new());
+    let group_footnote_extra = |group: &'static str| {
+        let cached = footnote_extra_memo
+            .borrow()
+            .iter()
+            .find(|(cached, _)| *cached == group)
+            .map(|(_, extra)| *extra);
+        if let Some(extra) = cached {
+            return extra;
+        }
+        let extra = prefs::group_footnote(group).map_or(0.0, |note| {
             let lines = group_footnote_lines(note, group_text_width).len();
             lines as f32 * group_footnote_line_height() + lines.saturating_sub(1) as f32 * 2.0 + 4.0
-        })
+        });
+        footnote_extra_memo.borrow_mut().push((group, extra));
+        extra
+    };
+    let group_heading_fits = |caption: &str| {
+        let cached = heading_fits_memo
+            .borrow()
+            .iter()
+            .find(|(cached, _)| cached.as_str() == caption)
+            .map(|(_, fits)| *fits);
+        if let Some(fits) = cached {
+            return fits;
+        }
+        let fits = settings_group_heading_fits(caption, group_text_width);
+        heading_fits_memo
+            .borrow_mut()
+            .push((caption.to_string(), fits));
+        fits
     };
     let page_gap = settings_page_gap(state, width, cx.viewport);
     let showcase_height = if show_renderer_preview_now {
@@ -10046,7 +10196,9 @@ fn settings_fields_page(
     };
     let visible_field_capacity = |start: usize, mut used: f32, show_group_labels: bool| {
         let mut visible = 0usize;
-        let mut previous_group: Option<(usize, &str)> = None;
+        // Group captions are registry literals, which is what lets the memos
+        // above key on them without cloning.
+        let mut previous_group: Option<(usize, &'static str)> = None;
         for (_, _, field) in fields.iter().skip(start) {
             let group = (
                 prefs::section_of(field.key).order_index(),
@@ -10056,13 +10208,22 @@ fn settings_fields_page(
             let extra = width.row_height()
                 + 4.0
                 + if new_group {
-                    let caption = if global_search {
-                        format!("{} · {}", prefs::section_of(field.key).label(), group.1)
-                    } else {
-                        group.1.to_string()
-                    };
-                    (if show_group_labels && settings_group_heading_fits(&caption, group_text_width)
-                    {
+                    // Only global search decorates the caption with its
+                    // section, so the plain route measures the group name in
+                    // place instead of allocating a copy of it per probe. The
+                    // measure itself stays behind `show_group_labels`, exactly
+                    // as the `&&` short-circuit had it.
+                    let caption_fits = show_group_labels
+                        && if global_search {
+                            group_heading_fits(&format!(
+                                "{} · {}",
+                                prefs::section_of(field.key).label(),
+                                group.1
+                            ))
+                        } else {
+                            group_heading_fits(group.1)
+                        };
+                    (if caption_fits {
                         group_heading_height()
                     } else {
                         // The group card retains its padding and semantic
@@ -10418,8 +10579,9 @@ fn settings_fields_page(
             .collect();
         let footnote = group_footnote_node(group, &group_anchor, group_text_width);
         let footnote_height = footnote.as_ref().map_or(0.0, |(_, height)| height + 4.0);
-        let show_group_caption =
-            show_group_labels && settings_group_heading_fits(&caption, group_text_width);
+        // Same memo the fitting probes filled: the render pass measures the very
+        // captions they already measured, at the same `group_text_width`.
+        let show_group_caption = show_group_labels && group_heading_fits(&caption);
         let height = if show_group_caption {
             group_heading_height() + rows.len() as f32 * (width.row_height() + 4.0)
         } else {

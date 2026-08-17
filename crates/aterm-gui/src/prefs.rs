@@ -4491,7 +4491,13 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     // Group the rows by section LAST (after every push), stably so within-section build
     // order is preserved. This is the single ordering the painter, scroll, and hit-test
     // all see; the overlay renders a header before each section's controls.
-    fields.sort_by_key(|f| section_of(f.key).order_index());
+    //
+    // `sort_by_cached_key` (not `sort_by_key`) because `section_of` is a linear scan over
+    // ~88 key constants plus three slice `contains` passes, and `sort_by_key` re-runs the
+    // key closure twice per comparison (~2,500 evaluations for ~170 rows). The cached form
+    // evaluates it once per row and is documented stable, so the within-section ordering
+    // above is byte-identical.
+    fields.sort_by_cached_key(|f| section_of(f.key).order_index());
     fields
 }
 

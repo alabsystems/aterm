@@ -452,8 +452,12 @@ pub fn emit_super(
 ///
 /// The emitter's structural cap is 160 wash rows plus at most 120 ring / 26
 /// crown / 12 charge pieces, with only the small crown/ring subset sharing a
-/// row.  This allocation-free overlap sweep is therefore much smaller than a
-/// pixel raster and remains in the few-dozen-microsecond engine budget.
+/// row.  Overlap is a strictly PER-ROW relation, so the sweep is row-bucketed
+/// ([`peak_additive_channel`]) and costs `Σ_r m_r³` over the per-row quad
+/// populations `m_r` — tens of thousands of integer compares on the worst
+/// shock frame, far below a pixel raster and inside the engine's per-frame
+/// budget.  (The pre-bucketing form re-scanned the WHOLE slice at both inner
+/// levels — `filter` skips nothing — which cost `n · Σ_r m_r²` instead.)
 fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     let peak = peak_additive_channel(quads);
     if peak <= MAX_VIEWPORT_OVERLAY {
@@ -464,25 +468,43 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     }
 }
 
+/// The exact peak aggregate RGB channel over the probe points of `quads`.
+///
+/// Every quad is confined to ONE cell row by [`QuadSink::push`], so a quad can
+/// only ever overlap quads on its own row: bucketing by row leaves the probed
+/// `(px, py)` set and each probe's summed subset exactly as the whole-slice
+/// scan's `q.row == x_edge.row` filters selected them (those filters skipped
+/// nothing — they re-walked all `n` quads at both inner levels).  `peak` is a
+/// max of order-independent `u32` sums (≤ 900 quads × 255 cannot overflow), so
+/// the value — and therefore every colour [`scale_rgb_floor`] derives from it,
+/// and every emitted byte — is bit-identical to the unbucketed sweep.
 fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
+    // A SIDE permutation: the emitted `GlowQuad` order is observable (the
+    // stream is uploaded verbatim and byte-compared by the GPU nova parity
+    // suite), so `quads` itself is never reordered.  ≤ `S_MAX_BOUND` entries,
+    // i.e. one ~7 KB scratch per episode frame.
+    let mut by_row: Vec<&GlowQuad> = quads.iter().collect();
+    by_row.sort_unstable_by_key(|q| q.row);
     let mut peak = 0u32;
-    for x_edge in quads {
-        let px = u32::from(x_edge.x);
-        for y_edge in quads.iter().filter(|q| q.row == x_edge.row) {
-            let py = u32::from(y_edge.y);
-            let mut sum = [0u32; 3];
-            for q in quads.iter().filter(|q| q.row == x_edge.row) {
-                if px >= u32::from(q.x)
-                    && px < u32::from(q.x) + u32::from(q.w)
-                    && py >= u32::from(q.y)
-                    && py < u32::from(q.y) + u32::from(q.h)
-                {
-                    sum[0] += (q.color >> 16) & 0xff;
-                    sum[1] += (q.color >> 8) & 0xff;
-                    sum[2] += q.color & 0xff;
+    for row in by_row.chunk_by(|a, b| a.row == b.row) {
+        for x_edge in row {
+            let px = u32::from(x_edge.x);
+            for y_edge in row {
+                let py = u32::from(y_edge.y);
+                let mut sum = [0u32; 3];
+                for q in row {
+                    if px >= u32::from(q.x)
+                        && px < u32::from(q.x) + u32::from(q.w)
+                        && py >= u32::from(q.y)
+                        && py < u32::from(q.y) + u32::from(q.h)
+                    {
+                        sum[0] += (q.color >> 16) & 0xff;
+                        sum[1] += (q.color >> 8) & 0xff;
+                        sum[2] += q.color & 0xff;
+                    }
                 }
+                peak = peak.max(sum.into_iter().max().unwrap_or(0));
             }
-            peak = peak.max(sum.into_iter().max().unwrap_or(0));
         }
     }
     peak

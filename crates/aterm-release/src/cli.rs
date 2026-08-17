@@ -47,17 +47,25 @@ USAGE
                            an older release: they do not miss this update, they
                            never update again.
 
-  cargo ship provision --id <machine-id>
-                           make THIS machine a publisher in one command: seed
-                           the newest master-signed roster pair from the channel
-                           release into dist/, run the join ceremony in-process
-                           (the paper phrase, typed once on the terminal, is the
-                           only input), then audit the rest of the publishing
-                           stack — Apple identity, notary credential, gh auth,
-                           channel token — naming the exact remedy for anything
-                           missing. Idempotent: on a provisioned machine it
-                           audits instead of minting. Ends in a READY TO CUT
-                           verdict.
+  cargo ship provision --id <machine-id> [--check]
+                           make THIS machine a publisher: seed the newest
+                           master-signed roster pair from the channel release
+                           into dist/, audit the WHOLE publishing stack — the
+                           Trust stage2 toolchain (real smoke-compile), the
+                           targo/tippy/ty drivers, the rustup front door, the
+                           stable x86_64 slice, Apple identity + live-tested
+                           notary credential, the credentials profile, gh auth,
+                           channel token — each gap with its exact remedy, and
+                           only on a CLEAN pass mint this machine's key via the
+                           join ceremony (the paper phrase, typed once, is the
+                           only input; a roster id is irreversible and is never
+                           consumed on a machine that cannot release).
+                           Idempotent: a provisioned machine is audited and
+                           bound through the real authorize_cut gate, never
+                           re-minted. Ends in a READY TO CUT verdict.
+                           On a machine with no toolchain at all, start with
+                           tools/bootstrap-publisher.sh instead.
+        --check            audit only: no mint, no dist/ writes, exit 0
 
   cargo ship status        version · ledger tail · dangling claims · newest
                            published build
@@ -84,6 +92,7 @@ pub enum Cmd {
     },
     Provision {
         id: String,
+        check: bool,
     },
     Status,
     Recover {
@@ -132,6 +141,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "cut" => parse_cut(&mut it),
         "provision" => {
             let mut id: Option<String> = None;
+            let mut check = false;
             while let Some(flag) = it.next() {
                 match flag {
                     "--id" => {
@@ -144,6 +154,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                                 .to_string(),
                         );
                     }
+                    "--check" => check = true,
                     other => return Err(format!("unknown provision flag {other:?}")),
                 }
             }
@@ -151,7 +162,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 "provision needs --id <machine-id> — the roster name this machine signs \
                  under (e.g. cargo ship provision --id m2)",
             )?;
-            Ok(Cmd::Provision { id })
+            Ok(Cmd::Provision { id, check })
         }
         "status" => {
             if let Some(extra) = it.next() {
@@ -334,7 +345,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
-        Cmd::Provision { id } => crate::provision::run_provision(&repo_root()?, &id),
+        Cmd::Provision { id, check } => crate::provision::run_provision(&repo_root()?, &id, check),
         Cmd::Status => verify::run_status(&repo_root()?),
         Cmd::Recover {
             version,

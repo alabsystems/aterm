@@ -19,7 +19,9 @@ use crate::grapheme::ColumnMap;
 /// per-query working set) and drives navigation off the smallest decoded list,
 /// membership-checking the rest with a binary search. The compressed store is
 /// not seekable, so the decode is what makes both directions — and the
-/// double-ended reverse walk — cheap without a per-probe decode.
+/// double-ended reverse walk — cheap without a per-probe decode. The driver is
+/// picked by the O(1) compressed count and range-bounded BEFORE the filters are
+/// decoded, so a bound that empties it costs no decode at all.
 pub(super) enum CandidateSource {
     /// Empty source.
     Empty,
@@ -47,28 +49,50 @@ pub(super) enum CandidateSource {
     RangeRev(std::iter::Rev<Range<u32>>),
 }
 
-/// Decode the posting lists and split off the smallest as the navigation
-/// driver. The candidate SET (values present in EVERY list) is independent of
-/// which list drives, so choosing the smallest is a pure cost optimization that
-/// preserves byte-identical results.
-fn decode_smallest_first(postings: &[&SparseBitmap]) -> Option<(Vec<u32>, Vec<Vec<u32>>)> {
+/// Split the smallest posting list off as the navigation driver, decoding ONLY
+/// that one and leaving the rest borrowed. The candidate SET (values present in
+/// EVERY list) is independent of which list drives, so choosing the smallest is
+/// a pure cost optimization that preserves byte-identical results.
+///
+/// `SparseBitmap::len()` is O(1) on the compressed form (it reads the cached
+/// count), so the driver is identified without decoding anything — the same
+/// sort-by-len-first trick `SearchIndex::intersect_trigrams` already uses. The
+/// remaining lists stay compressed so the caller can range-bound the driver
+/// FIRST and skip decoding them entirely when the bound leaves nothing to
+/// probe.
+fn split_smallest_first(
+    mut postings: Vec<&SparseBitmap>,
+) -> Option<(Vec<u32>, Vec<&SparseBitmap>)> {
     if postings.is_empty() {
         return None;
     }
-    let mut decoded: Vec<Vec<u32>> = postings.iter().map(|bitmap| bitmap.to_vec()).collect();
-    decoded.sort_unstable_by_key(Vec::len);
-    let primary = decoded.remove(0);
-    Some((primary, decoded))
+    // Ascending by size: the driver is the shortest list to walk, and the
+    // filters keep the cheapest rejector first for the `.all()` probe in
+    // `next_candidate`.
+    postings.sort_unstable_by_key(|bitmap| bitmap.len());
+    let primary = postings.remove(0).to_vec();
+    Some((primary, postings))
 }
 
 impl CandidateSource {
     /// Build a lazy ascending intersection from borrowed posting lists.
     pub(super) fn from_postings_forward(postings: Vec<&SparseBitmap>, from_line: u32) -> Self {
-        let Some((mut primary, filters)) = decode_smallest_first(&postings) else {
+        let Some((mut primary, rest)) = split_smallest_first(postings) else {
             return Self::Empty;
         };
         let start = primary.partition_point(|&v| v < from_line);
         primary.drain(..start);
+        // Bound the driver BEFORE decoding the filters. The filters are only
+        // ever membership-probed by a yielded candidate, so with no candidates
+        // left (an anchored find past the last hit, or the wrap leg of a
+        // directed find) their decode is pure waste — hundreds of KB of
+        // `Vec<u32>` allocated and dropped untouched for a common trigram over a
+        // deep index. An empty `FilteredForward` and `Empty` are
+        // indistinguishable through `next_candidate`, the enum's only method.
+        if primary.is_empty() {
+            return Self::Empty;
+        }
+        let filters: Vec<Vec<u32>> = rest.into_iter().map(SparseBitmap::to_vec).collect();
         Self::FilteredForward {
             candidates: primary.into_iter(),
             filters,
@@ -77,11 +101,16 @@ impl CandidateSource {
 
     /// Build a lazy descending intersection from borrowed posting lists.
     pub(super) fn from_postings_backward(postings: Vec<&SparseBitmap>, before_line: u32) -> Self {
-        let Some((mut primary, filters)) = decode_smallest_first(&postings) else {
+        let Some((mut primary, rest)) = split_smallest_first(postings) else {
             return Self::Empty;
         };
         let end = primary.partition_point(|&v| v < before_line);
         primary.truncate(end);
+        // Bound first, decode second — see `from_postings_forward`.
+        if primary.is_empty() {
+            return Self::Empty;
+        }
+        let filters: Vec<Vec<u32>> = rest.into_iter().map(SparseBitmap::to_vec).collect();
         Self::FilteredBackward {
             candidates: primary.into_iter(),
             filters,

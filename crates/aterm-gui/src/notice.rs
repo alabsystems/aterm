@@ -17,6 +17,11 @@
 //!   * [`NoticeKind::UpdateStatus`] — the background lane reporting for itself. Quiet by
 //!     construction: a HOLLOW badge, no chevron, not clickable-to-apply.
 //!
+//! Two decorations borrow the widget wholesale: ROBI's tip bubble
+//! ([`NoticeKind::RobiTip`], anchored over the speaker) and the PET's hover
+//! identity label ([`NoticeKind::PetLabel`], anchored over the pet and held
+//! open by hover rather than TTL — see [`TransientNotice::hold_open`]).
+//!
 //! GLOBAL (App-level), painted into every window like `config_notice` — and it borrows the
 //! SAME timed-lifecycle shape (`is_expired` + `deadline`), but renders through the SACRED
 //! `settings_card`/`badge_card` composite path as pure [`DrawPrim`]s (native chrome, NOT
@@ -97,6 +102,30 @@ pub(crate) enum NoticeKind {
     /// bubble half of his show. Not clickable; it fades like every notice. The bank
     /// is `&'static`, so the variant borrows rather than clones.
     RobiTip { text: &'static str },
+    /// The PET's hover identity label (owner ask, 2026-08-15: "when you mouse
+    /// over the kitty, you should get the program it corresponds to and the
+    /// kitty's name") — an anchored bubble like Robi's tip, but its lifecycle
+    /// is HOVER, not TTL: the render drain re-pins it every hovered frame
+    /// ([`TransientNotice::hold_open`]) and drops it on mouse-out; the TTL
+    /// clock only ever runs as the self-healing fallback when refreshes stop
+    /// arriving. Never clickable, and its clicks are special-cased in
+    /// `App::notice_click` so a press still PETS the cat underneath.
+    PetLabel {
+        /// The program half (`"claude"`, `"shell"`, a basename).
+        program: String,
+        /// The kitty's deterministic name
+        /// ([`aterm_effects::kitty_registry::kitty_name`]) — or `""` when the
+        /// name half is SUPPRESSED because the cat on glass is not that
+        /// identity's kitty (a parked handoff, a pinned favourite, the
+        /// session cat riding — `App::pet_label_identity`'s honesty
+        /// decision); the card then renders program-only, no dangling
+        /// separator.
+        name: &'static str,
+        /// The window whose hover owns this label — only that window's hover
+        /// lifecycle (or its route losing the pet) may retire it, so one
+        /// window's un-hovered redraws never blink out another's label.
+        wid: crate::WindowId,
+    },
 }
 
 /// A single transient, self-expiring notice.
@@ -144,11 +173,28 @@ impl TransientNotice {
         }
     }
 
-    /// Refresh the speech-bubble anchor (Robi moves; his bubble follows).
-    /// Meaningful only for [`NoticeKind::RobiTip`]; ignored otherwise so an
-    /// update pill can never be dragged around by decoration state.
+    /// The pet's hover label, anchored over the pet's head (tray px, the
+    /// RobiTip convention).
+    pub(crate) fn pet_label(
+        program: String,
+        name: &'static str,
+        wid: crate::WindowId,
+        anchor: (f32, f32),
+        now: Instant,
+    ) -> Self {
+        Self {
+            kind: NoticeKind::PetLabel { program, name, wid },
+            spawned: now,
+            anchor: Some(anchor),
+        }
+    }
+
+    /// Refresh the speech-bubble anchor (the speaker moves; the bubble
+    /// follows). Meaningful only for the anchored kinds (Robi's tips and the
+    /// pet label); ignored otherwise so an update pill can never be dragged
+    /// around by decoration state.
     pub(crate) fn set_anchor(&mut self, anchor: Option<(f32, f32)>) {
-        if self.is_robi_tip() {
+        if self.is_robi_tip() || self.is_pet_label() {
             self.anchor = anchor;
         }
     }
@@ -158,6 +204,51 @@ impl TransientNotice {
     /// by a decoration).
     pub(crate) fn is_robi_tip(&self) -> bool {
         matches!(self.kind, NoticeKind::RobiTip { .. })
+    }
+
+    /// Whether this is the pet's hover label.
+    pub(crate) fn is_pet_label(&self) -> bool {
+        matches!(self.kind, NoticeKind::PetLabel { .. })
+    }
+
+    /// The window whose hover owns this pet label (`None` for every other
+    /// kind) — the drain's retire gate.
+    pub(crate) fn pet_label_owner(&self) -> Option<crate::WindowId> {
+        match self.kind {
+            NoticeKind::PetLabel { wid, .. } => Some(wid),
+            _ => None,
+        }
+    }
+
+    /// Whether this pet label already reads `program — name` (the drain
+    /// replaces the label when the identity under the pointer changes).
+    pub(crate) fn pet_label_matches(&self, program: &str, name: &str) -> bool {
+        match &self.kind {
+            NoticeKind::PetLabel {
+                program: p,
+                name: n,
+                ..
+            } => p == program && *n == name,
+            _ => false,
+        }
+    }
+
+    /// HOVER LIFECYCLE (pet label only): re-pin `spawned` so a label that is
+    /// still hovered never enters the exit tail — once the entrance has
+    /// played, elapsed is held at exactly [`ENTER`] (alpha 1.0, at rest, and
+    /// the next deadline a distant fade-start wake rather than a per-frame
+    /// pin). Called by the render drain every hovered frame; when the
+    /// refreshes STOP (a route with no drain, a missed edge), the ordinary
+    /// TTL clock resumes from here and the label self-heals by fading out.
+    pub(crate) fn hold_open(&mut self, now: Instant) {
+        if !self.is_pet_label() {
+            return;
+        }
+        if now.duration_since(self.spawned) >= ENTER
+            && let Some(pin) = now.checked_sub(ENTER)
+        {
+            self.spawned = pin;
+        }
     }
 
     /// Whether this notice is `UpdateReady` (the clickable variant).
@@ -249,6 +340,11 @@ impl TransientNotice {
                 3u8.hash(&mut h);
                 text.hash(&mut h);
             }
+            NoticeKind::PetLabel { program, name, .. } => {
+                4u8.hash(&mut h);
+                program.hash(&mut h);
+                name.hash(&mut h);
+            }
         }
         // Quantize BOTH animated quantities so a moving card re-rasterizes on each step
         // while a held one hashes stable. 48 steps over a ≤0.8s ramp is finer than the
@@ -304,6 +400,20 @@ impl TransientNotice {
             // (no separator), so narrow windows elide it instead of dropping
             // the half that carries the advice.
             NoticeKind::RobiTip { text } => format!("\u{2699} {text}"),
+            // The heart takes the badge (petting's own iconography); the
+            // grammar carries the hierarchy — the PROGRAM is the title (the
+            // state: whose kitty this is), the NAME the detail, so a narrow
+            // window drops the name before it garbles the program. A
+            // suppressed name (`""` — the cat on glass is not this identity's
+            // kitty) renders program-only, like Robi's all-title tip: never
+            // a dangling separator.
+            NoticeKind::PetLabel { program, name, .. } => {
+                if name.is_empty() {
+                    format!("\u{2661} {program}")
+                } else {
+                    format!("\u{2661} {program} \u{2014} {name}")
+                }
+            }
         }
     }
 }
@@ -424,6 +534,10 @@ impl Tone {
             // legibility-conditioned below): friendly, and never mistakable
             // for the actionable accent.
             NoticeKind::RobiTip { .. } => Self::Celebrate,
+            // The pet label too: a friendly nameplate, never the actionable
+            // accent and never a chevron — the label must not advertise a
+            // click it will not honour.
+            NoticeKind::PetLabel { .. } => Self::Celebrate,
         }
     }
 
@@ -1305,6 +1419,103 @@ mod tests {
         );
         assert!(!Tone::of(&status, Some("\u{2191}")).filled());
         assert_eq!(Tone::of(&status, Some("\u{2713}")), Tone::Success);
+    }
+
+    /// THE PET'S HOVER LABEL: reads "program — name" through the authored
+    /// grammar (heart badge, program as the title — the state — and the name
+    /// as the droppable detail), and NEVER advertises a click: no chevron,
+    /// not the actionable kind, celebration tone like Robi's bubble.
+    #[test]
+    fn a_pet_label_reads_program_then_name_and_never_advertises_a_click() {
+        let now = t0();
+        let n = TransientNotice::pet_label(
+            "claude".into(),
+            "Clementine",
+            crate::WindowId(0),
+            (160.0, 140.0),
+            now,
+        );
+        assert!(n.is_pet_label());
+        assert!(!n.is_update_ready(), "never the clickable kind");
+        assert_eq!(n.pet_label_owner(), Some(crate::WindowId(0)));
+        assert!(n.pet_label_matches("claude", "Clementine"));
+        assert!(!n.pet_label_matches("codex", "Clementine"));
+        let p = caption_parts(&n.text());
+        assert_eq!(p.marker.as_deref(), Some("\u{2661}"), "the heart badge");
+        assert_eq!(p.title, "claude", "the program is the state");
+        assert_eq!(p.detail.as_deref(), Some("Clementine"));
+        // A SUPPRESSED name (`""` — the cat on glass is not this identity's
+        // kitty) degrades to the program alone: no dangling separator, and
+        // the empty detail never reaches the caption grammar.
+        let bare =
+            TransientNotice::pet_label("claude".into(), "", crate::WindowId(0), (160.0, 140.0), now);
+        let bp = caption_parts(&bare.text());
+        assert_eq!(bp.marker.as_deref(), Some("\u{2661}"));
+        assert_eq!(bp.title, "claude", "program-only when the name is suppressed");
+        assert_eq!(bp.detail, None, "no empty detail, no dangling separator");
+        let t = notice_tray(&n, &geom(), Theme::default(), [0, 255, 0], now + ENTER, 1.0, 0.0);
+        assert_eq!(
+            t.prims
+                .iter()
+                .filter(|p| matches!(p, DrawPrim::Line { .. }))
+                .count(),
+            0,
+            "no chevron — the label must not advertise a click"
+        );
+        // The anchor rides the card like Robi's tip: anchored placement, and
+        // `set_anchor` is honoured for this kind.
+        let mut n = n;
+        n.set_anchor(Some((300.0, 200.0)));
+        let (x, y, w, _) = notice_rect(&n, &geom(), now + ENTER, 1.0, 0.0);
+        assert!(w > 0.0);
+        assert!(
+            (x + w * 0.5 - 300.0).abs() < 1.0,
+            "centered over its anchor ({x} + {w}/2 vs 300)"
+        );
+        assert!(y < 200.0, "…and sits above the pet's head");
+    }
+
+    /// HOVER, NOT TTL: `hold_open` re-pins a hovered label at full presence
+    /// indefinitely — and the moment the refreshes stop, the ordinary clock
+    /// resumes and the label self-heals by expiring on schedule.
+    #[test]
+    fn hold_open_pins_a_hovered_label_until_the_refreshes_stop() {
+        let start = t0();
+        let mut n = TransientNotice::pet_label(
+            "shell".into(),
+            "Boots",
+            crate::WindowId(0),
+            (100.0, 80.0),
+            start,
+        );
+        // Hovered for three whole TTLs: alpha stays pinned at 1.0.
+        let mut now = start;
+        for _ in 0..30 {
+            now += TTL / 10 * 3;
+            n.hold_open(now);
+            assert_eq!(n.alpha(now), 1.0, "held open at full presence");
+            assert!(!n.is_expired(now), "…and never expires while hovered");
+        }
+        // The entrance is respected: a hold during the ramp does not skip it.
+        let fresh = {
+            let mut f = TransientNotice::pet_label(
+                "shell".into(),
+                "Boots",
+                crate::WindowId(0),
+                (100.0, 80.0),
+                now,
+            );
+            f.hold_open(now + ENTER / 2);
+            f
+        };
+        let mid = fresh.alpha(now + ENTER / 2);
+        assert!(mid > 0.0 && mid < 1.0, "the entrance still plays ({mid})");
+        // Refreshes stop: the standard TTL clock runs out from the last pin.
+        assert!(n.is_expired(now + TTL));
+        // Other kinds never hold: the update pill's clock is sacred.
+        let mut pill = TransientNotice::update_ready("1".into(), 1, start);
+        pill.hold_open(start + TTL);
+        assert!(pill.is_expired(start + TTL), "hold_open is label-only");
     }
 
     /// The pictogram sits on a themed disc whose luminance is not knowable ahead of

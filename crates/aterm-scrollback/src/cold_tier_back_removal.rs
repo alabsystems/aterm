@@ -186,7 +186,7 @@ impl ColdTier {
             total += page.line_count;
             self.cumulative_lines.push(total);
         }
-        *self.last_page_cache.borrow_mut() = None;
+        self.clear_cache();
 
         Ok(())
     }

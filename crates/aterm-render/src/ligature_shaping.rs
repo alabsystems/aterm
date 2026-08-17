@@ -471,6 +471,15 @@ pub fn shape_ligature_run_with_face(
     // Map each output glyph to its INPUT char by `cluster` (the byte offset we
     // pushed). For a per-char run on a monospace font the clusters are the char
     // boundaries in order; build a glyph id per char position.
+    let n = run_chars.len();
+    // ALL-ASCII FAST PATH: when the run's byte length equals its char count every
+    // char is one byte, so the byte offset table would be exactly `0, 1, 2, …` and
+    // the cluster IS the char index — `binary_search(&cluster)` returns
+    // `Ok(cluster)` iff `cluster < n` and `Err` otherwise, which is precisely the
+    // branch below. The ligature runs this path exists for (`=>`, `!=`, `->`, `::`)
+    // are all-ASCII, so the table and its allocation are now only built for the
+    // mixed-width fallback.
+    let ascii = run.len() == n;
     // The table is STRICTLY INCREASING by construction (every entry is the
     // previous plus a non-zero `len_utf8`), so the lookup is a binary search,
     // not a linear `position` scan: the run length is bounded only by `cols`,
@@ -478,21 +487,36 @@ pub fn shape_ligature_run_with_face(
     // blob, one-line JSON) turned an O(n) probe per output glyph into O(n²)
     // per run on every ShapedRunCache miss — i.e. on every newly scrolled-in
     // line. Same unique `Ok(idx)` `position` returned, same `Err` → bail.
-    let mut byte_to_idx: Vec<usize> = Vec::with_capacity(run_chars.len());
-    let mut b = 0usize;
-    for ch in run_chars {
-        byte_to_idx.push(b);
-        b += ch.len_utf8();
+    let mut byte_to_idx: Vec<usize> = Vec::new();
+    if !ascii {
+        byte_to_idx.reserve_exact(n);
+        let mut b = 0usize;
+        for ch in run_chars {
+            byte_to_idx.push(b);
+            b += ch.len_utf8();
+        }
     }
-    let mut gids = vec![0u16; run_chars.len()];
+    // ONE buffer where there used to be two (`gids` + `out`): start every column at
+    // `Some(0)` — the old `vec![0u16; n]` zero fill — overwrite with the shaped gid
+    // here, then demote the UNCHANGED columns to `None` in the cmap pass below. The
+    // values written are identical to the old two-buffer form, one allocation less.
+    let mut out: Vec<Option<u16>> = vec![Some(0u16); n];
     for info in infos {
         let gid = u16::try_from(info.glyph_id).ok()?;
         let cluster = info.cluster as usize;
         // Find the char index whose byte offset == this cluster.
-        let Ok(idx) = byte_to_idx.binary_search(&cluster) else {
-            return None; // cluster didn't land on a char boundary — bail to per-cell
+        let idx = if ascii {
+            if cluster >= n {
+                return None; // cluster past the run's chars — bail to per-cell
+            }
+            cluster
+        } else {
+            let Ok(idx) = byte_to_idx.binary_search(&cluster) else {
+                return None; // cluster didn't land on a char boundary — bail to per-cell
+            };
+            idx
         };
-        gids[idx] = gid;
+        out[idx] = Some(gid);
     }
     // PER-COLUMN accept: a column is `Some(gid)` (drawn as the shaped primary glyph)
     // ONLY when shaping CHANGED its glyph vs the plain cmap glyph; otherwise it is
@@ -506,12 +530,15 @@ pub fn shape_ligature_run_with_face(
     // A ligature like `=>` legitimately changes BOTH cells (wide glyph + placeholder),
     // so both stay `Some`. If NO column changed there is nothing to draw specially —
     // return None so the whole run is byte-identical to the per-cell path.
-    let mut out: Vec<Option<u16>> = vec![None; run_chars.len()];
     let mut any_changed = false;
-    for (idx, &ch) in run_chars.iter().enumerate() {
+    for (slot, &ch) in out.iter_mut().zip(run_chars) {
         let cmap = face.glyph_index(ch).map_or(0, |g| g.0);
-        if gids[idx] != cmap {
-            out[idx] = Some(gids[idx]);
+        // Every column is `Some` here (the `Some(0)` fill above), so `*slot ==
+        // Some(cmap)` is exactly the old `gids[idx] == cmap` test; the unchanged
+        // columns are demoted to `None` and the changed ones keep their shaped gid.
+        if *slot == Some(cmap) {
+            *slot = None;
+        } else {
             any_changed = true;
         }
     }

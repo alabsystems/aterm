@@ -37,6 +37,9 @@
 // lib.rs), so the integration tests compile the modules under test directly.
 // publish.rs reaches every pipeline stage through `crate::`, hence the full
 // mount list — the same one tests/resume.rs and the model tests carry.
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

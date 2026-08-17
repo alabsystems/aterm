@@ -165,8 +165,8 @@ pub struct AtermGpuTerminal {
     // can RE-APPLY them to the fresh GPU CPU face it builds from `font_bytes`
     // (which lacks the fallbacks); fonts injected before init would otherwise be
     // lost. Empty until the host calls `set_fallback_font` / `set_emoji_font`.
-    // INTERNED Arc (shared across panes via aterm_render::intern_font_bytes) so this
-    // reinit-retention copy isn't a per-pane ~180MB (emoji) / ~100MB (CJK) duplicate.
+    // INTERNED Arc (shared across panes via aterm_render::intern_font_bytes_slice) so
+    // this reinit-retention isn't a per-pane ~180MB (emoji) / ~100MB (CJK) duplicate.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     fallback_font: Option<std::sync::Arc<Vec<u8>>>,
     // ADDITIONAL fallback faces appended via `add_fallback_font` (most-preferred
@@ -470,7 +470,11 @@ impl AtermGpuTerminal {
             gpu.renderer.set_fallback_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
-        self.fallback_font = Some(aterm_render::intern_font_bytes(bytes.to_vec()));
+        // Borrowed-slice intern: identical lookup + identical returned Arc, but it
+        // allocates ONLY for a genuinely new blob. Panes 2..N inject the same OS
+        // face, so the owned twin's `to_vec` was a ~100MB copy that the store then
+        // memcmp'd against the existing entry and dropped (wasm memory never shrinks).
+        self.fallback_font = Some(aterm_render::intern_font_bytes_slice(bytes));
         // set_* RESETS the chain, so any previously appended extras are gone.
         self.fallback_chain_extra.clear();
         Ok(())
@@ -488,8 +492,9 @@ impl AtermGpuTerminal {
             gpu.renderer.add_fallback_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
+        // Borrowed intern (see `set_fallback_font`): no copy once the blob is known.
         self.fallback_chain_extra
-            .push(aterm_render::intern_font_bytes(bytes.to_vec()));
+            .push(aterm_render::intern_font_bytes_slice(bytes));
         Ok(())
     }
 
@@ -497,12 +502,26 @@ impl AtermGpuTerminal {
     /// ColorEmoji colour path. Same wiring as [`set_fallback_font`]. No-throw
     /// (the `String` Err surfaces as a catchable JS exception).
     pub fn set_emoji_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.cpu.set_color_font_bytes(bytes.to_vec())?;
+        // Intern ONCE up front and install/retain that shared Arc, mirroring the
+        // `_registered` twin below. The old shape paid THREE full ~180MB copies of
+        // the same slice (CPU install, GPU install, retention) where the last two
+        // were pure waste: `set_color_font_bytes` already interned the blob, so the
+        // retention intern only memcmp'd a fresh copy against that very entry and
+        // dropped it. `set_color_font_arc` runs the identical `ttf_parser` validation
+        // and ends in the identical `install_color_font`, so the no-throw contract
+        // and the installed face are unchanged — only the copies are gone. (A
+        // MALFORMED blob now lands in the intern store before validation rejects it,
+        // exactly as `register_font` above already does; no new class of retention.)
+        let arc = aterm_render::intern_font_bytes_slice(bytes);
+        self.cpu.set_color_font_arc(arc.clone())?;
         if let Some(gpu) = self.gpu.as_mut() {
+            // The live GPU face still takes its own copy (no Arc twin on
+            // GpuRenderer yet) — rare, since the worker seeds fonts before `init`,
+            // so `gpu` is None during pane builds.
             gpu.renderer.set_emoji_font_bytes(bytes.to_vec())?;
             gpu.win.invalidate_present();
         }
-        self.emoji_font = Some(aterm_render::intern_font_bytes(bytes.to_vec()));
+        self.emoji_font = Some(arc);
         Ok(())
     }
 
@@ -516,7 +535,8 @@ impl AtermGpuTerminal {
             gpu.renderer.set_bold_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
-        self.bold_font = Some(aterm_render::intern_font_bytes(bytes.to_vec()));
+        // Borrowed intern (see `set_fallback_font`): no copy once the blob is known.
+        self.bold_font = Some(aterm_render::intern_font_bytes_slice(bytes));
         Ok(())
     }
 
@@ -531,7 +551,8 @@ impl AtermGpuTerminal {
             gpu.renderer.set_symbol_font_bytes(bytes)?;
             gpu.win.invalidate_present();
         }
-        self.symbol_font = Some(aterm_render::intern_font_bytes(bytes.to_vec()));
+        // Borrowed intern (see `set_fallback_font`): no copy once the blob is known.
+        self.symbol_font = Some(aterm_render::intern_font_bytes_slice(bytes));
         Ok(())
     }
 
@@ -2284,10 +2305,13 @@ impl AtermGpuTerminal {
         for bytes in &self.fallback_chain_extra {
             cpu.add_fallback_bytes(bytes)?;
         }
-        if let Some(bytes) = self.emoji_font.as_deref() {
-            // The transient Vec clone is re-interned to the shared Arc inside
-            // set_color_font_bytes, so no persistent per-pane duplicate remains.
-            cpu.set_color_font_bytes(bytes.clone())?;
+        if let Some(arc) = self.emoji_font.as_ref() {
+            // Retained field is ALREADY an interned Arc, so install the SHARED blob
+            // directly. The `_bytes` twin would deep-copy the ~180MB colour face only
+            // for its own `intern_font_bytes` to memcmp it against this very entry and
+            // drop it — same validation, same `install_color_font`, same Arc installed,
+            // minus one full alloc+memcpy+memcmp per pane (wasm memory never shrinks).
+            cpu.set_color_font_arc(std::sync::Arc::clone(arc))?;
         }
         // Re-apply a bold face injected before init (the fresh face lacks it).
         if let Some(bytes) = self.bold_font.as_deref() {

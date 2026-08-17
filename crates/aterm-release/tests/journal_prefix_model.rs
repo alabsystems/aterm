@@ -5,6 +5,9 @@
 //! Every one of the 2^12 done-membership subsets is checked against production;
 //! only the 13 canonical prefixes may persist or reload.
 
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

@@ -62,15 +62,21 @@ impl Grid {
                 self.storage.ring_head = 0;
             }
             lines.reserve(ring_scrollback);
+            // Borrow the stored extras instead of cloning them: the callee takes
+            // `&ScrolledRowExtras`, and `ring_extras` is a field disjoint from
+            // `rows`, so both reads are shared borrows of `self.storage`. Cloning
+            // meant up to six Vec mallocs + memcpys (plus `Arc<str>` refcount
+            // atomics) per ring row purely to hand over a reference — on a path
+            // that runs under the `term` lock on every width change. One empty
+            // default (no allocation) covers the `None` rows; same idiom as
+            // `try_get_history_line`. Declared AFTER the `rotate_left` above so
+            // the shared borrows never overlap the `&mut`.
+            let no_extras = super::ScrolledRowExtras::default();
             for i in 0..ring_scrollback {
-                let extras = self
-                    .storage
-                    .ring_history_extras(i)
-                    .cloned()
-                    .unwrap_or_default();
+                let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
                 lines.push(Self::row_to_line_with_stored_extras(
                     &self.storage.rows[i],
-                    &extras,
+                    extras,
                 ));
             }
             // Drop the scrollback rows; keep only the visible window.

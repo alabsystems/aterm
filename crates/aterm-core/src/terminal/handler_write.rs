@@ -272,6 +272,28 @@ impl TerminalHandler<'_> {
         // Cache ambiguous-width mode for the entire bulk run.
         let cjk = self.modes.ambiguous_width_double;
 
+        // DECSLRM (a non-full left/right margin span) forces the wide-run
+        // batchers off, because they are NOT grid-identical to the per-char
+        // path under one: `Grid::margin_clamped_ecols` clamps the row's column
+        // limit to `margins.right + 1` only while the cursor sits INSIDE
+        // [left, right], and the batchers derive that limit ONCE per row while
+        // the per-char writers re-derive it before EVERY glyph. With the cursor
+        // placed left of `margins.left` (DECSLRM itself homes to column 0), a
+        // wide run that crosses into the span therefore keeps the UNCLAMPED
+        // limit for the whole row in the batched form: it writes straight past
+        // `margins.right`, blanks a different BCE wrap tail, and wraps in a
+        // different column than the identical bytes fed one at a time. That is
+        // exactly the chunked-process equivalence invariant, so the batchers
+        // are used only where they provably agree. The predicate is the same
+        // one the grid uses to arm its margin-aware slow paths
+        // (`has_horizontal_margins`), and it is now READ from the grid's own
+        // maintained flag rather than re-derived here — zero per glyph, and one
+        // bool load rather than two accessor reads plus a compare per bulk call.
+        // That re-derivation measured: it is the residual ~1.7% on
+        // `engine_throughput/cjk`, which is the only corpus that reaches this
+        // function (ASCII takes the disjoint `print_ascii_bulk` lane).
+        let margins_active = self.grid.has_horizontal_margins();
+
         // Pre-compute style state once for the entire run.
         let colors = self.style.cached_colors();
         let flags = if self.style.protected {
@@ -297,14 +319,29 @@ impl TerminalHandler<'_> {
             // mixed-width and defers to the table (see char_width).
             // Latin Supplement through Spacing Modifiers (U+00A0-U+02FF) are width 1.
             // Everything else goes through the per-character slow path.
-            if (0x3000..0xA000).contains(&cp) {
-                // CJK Unified Ideographs (U+4E00-U+9FFF) are uniformly wide; the
-                // lower part of the block (U+3000-U+4DFF) is mixed-width, so
-                // classify those individually via the authoritative `char_width`
-                // (which honors `cjk`) and only fold genuine width-2 cells into
-                // the batched wide run. This keeps the print path in lockstep
-                // with the table-based reflow/materialize/fill paths.
-                if cp < 0x4E00 {
+            //
+            // The wide-run batcher below LEADS on any of the three width-2
+            // families it can extend across — CJK Unified Ideographs, the
+            // width-2 subset of U+3000-U+4DFF, and Hangul Syllables — so the
+            // lead gate here matches the run-extension predicate below exactly.
+            // (A Hangul lead used to fall through to a per-syllable write, which
+            // meant pure-Hangul runs — i.e. all Korean text — never batched,
+            // while Hangul in a CJK-led run always did.) The grid is the same
+            // either way ONLY because `margins_active` sends the run down the
+            // per-glyph writer whenever DECSLRM is armed; outside that,
+            // `write_wide_run_autowrap` is the batched form of repeated
+            // `write_wide_autowrap_fast`. See the `margins_active` note above.
+            if (0x3000..0xA000).contains(&cp) || (0xAC00..0xD7A4).contains(&cp) {
+                // CJK Unified Ideographs (U+4E00-U+9FFF) and Hangul Syllables
+                // (U+AC00-U+D7A3) are uniformly wide; the lower part of the CJK
+                // block (U+3000-U+4DFF) is mixed-width, so classify those
+                // individually via the authoritative `char_width` (which honors
+                // `cjk`) and only fold genuine width-2 cells into the batched
+                // wide run. This keeps the print path in lockstep with the
+                // table-based reflow/materialize/fill paths. The test is spelled
+                // as a closed range (not `cp < 0x4E00`) so it stays correct if a
+                // block below U+3000 is ever added to the lead gate above.
+                if (0x3000..0x4E00).contains(&cp) {
                     match char_width(c, cjk) {
                         0 => {
                             // Zero-width CJK combining marks (U+302A-302D tone
@@ -328,7 +365,10 @@ impl TerminalHandler<'_> {
                         _ => {}
                     }
                 }
-                // BMP CJK width-2: find run of consecutive width-2 CJK/Hangul chars
+                // BMP width-2: find the run of consecutive width-2 chars drawn
+                // from the same three families as the lead gate — CJK Unified
+                // Ideographs, the width-2 subset of U+3000-U+4DFF, and Hangul
+                // Syllables.
                 let run_start = i;
                 i += 1;
                 while i < chars.len() {
@@ -342,15 +382,20 @@ impl TerminalHandler<'_> {
                         break;
                     }
                 }
-                // Batch write the entire CJK/Hangul run
-                self.grid
-                    .write_wide_run_autowrap(&chars[run_start..i], colors, flags);
+                // Batch write the entire CJK/Hangul run — unless DECSLRM is
+                // armed, where only the per-glyph writer re-derives the
+                // margin clamp per column and so matches fragmented input.
+                if margins_active {
+                    for &wc in &chars[run_start..i] {
+                        self.grid.write_wide_autowrap_fast(wc, colors, flags);
+                    }
+                } else {
+                    self.grid
+                        .write_wide_run_autowrap(&chars[run_start..i], colors, flags);
+                }
                 last_graphic = Some(chars[i - 1]);
                 self.transient.last_combining_was_zwj = false;
                 continue;
-            } else if (0xAC00..0xD7A4).contains(&cp) {
-                // Hangul Syllables — always width 2
-                self.grid.write_wide_autowrap_fast(c, colors, flags);
             } else if cp > 0xFFFF {
                 // Non-BMP (emoji, math symbols, etc.)
                 let width = char_width(c, cjk);
@@ -418,13 +463,29 @@ impl TerminalHandler<'_> {
                             break;
                         }
                     }
-                    // Batch write mixed wide run — handles BMP and non-BMP
-                    self.grid.write_mixed_wide_run_autowrap(
-                        &chars[run_start..i],
-                        colors,
-                        flags,
-                        complex_flags,
-                    );
+                    // Batch write mixed wide run — handles BMP and non-BMP.
+                    // `write_mixed_wide_run_autowrap` derives its margin clamp
+                    // once per row exactly like `write_wide_run_autowrap`, so
+                    // it carries the same DECSLRM divergence and is gated the
+                    // same way; the fallback mirrors `write_char_core`'s
+                    // width-2 fast path per glyph (COMPLEX flags for non-BMP).
+                    if margins_active {
+                        for &wc in &chars[run_start..i] {
+                            if (wc as u32) > 0xFFFF {
+                                self.grid
+                                    .write_emoji_autowrap_fast(wc, colors, complex_flags);
+                            } else {
+                                self.grid.write_wide_autowrap_fast(wc, colors, flags);
+                            }
+                        }
+                    } else {
+                        self.grid.write_mixed_wide_run_autowrap(
+                            &chars[run_start..i],
+                            colors,
+                            flags,
+                            complex_flags,
+                        );
+                    }
                     last_graphic = Some(chars[i - 1]);
                     continue;
                 }

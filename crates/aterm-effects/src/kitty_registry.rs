@@ -11,6 +11,11 @@
 //! `Genome.magic` (raw magic would grow the log file without bound). The
 //! fallback CAUSE is its own dimension ([`KittyShownAs`]), never conflated
 //! with the type.
+//!
+//! This file also owns the kitty NAME namespace (owner ask, 2026-08-15): the
+//! hand-picked [`signature_name`] table and the [`KITTY_NAME_BANK`] hash bank
+//! behind the one public draw door [`kitty_name`] — the name half of the
+//! pet's hover label (aterm-gui `App::pet_label_identity`).
 
 use aterm_lexicon::LangSet;
 
@@ -61,6 +66,104 @@ const SESSION_LOOK_SALT: u64 = 0x7365_7373_4B69_7400;
 /// seeds (`b"appKitt\0"` as big-endian ASCII), so "the claude cat" can never
 /// collide with a session kitty by hash coincidence of the input spaces.
 const APP_LOOK_SALT: u64 = 0x6170_704B_6974_7400;
+
+/// Salt keeping app kitty NAMES in their own genome namespace (`b"appName\0"`
+/// as big-endian ASCII) — disjoint from [`APP_LOOK_SALT`] on purpose: reusing
+/// the look salt would make the name draw correlate bit-for-bit with the breed
+/// axes (identical `gkey`), and the law here is one documented ASCII salt per
+/// identity namespace.
+const APP_NAME_SALT: u64 = 0x6170_704E_616D_6500;
+
+/// THE NAME BANK for [`kitty_name`]'s hash path: 64 short cat names — exactly
+/// 2⁶, so a single unbiased [`crate::genome::field`] draw indexes it with no
+/// modulo skew. Wide enough that two everyday tools rarely share a name;
+/// collisions between different ids are ACCEPTED (a name is a nameplate, not
+/// an identity key — the breed axes already distinguish the cats).
+///
+/// Hygiene, pinned by `name_bank_is_wide_short_and_duplicate_free`: no
+/// duplicates, nothing over 8 chars, and no overlap with the hand-picked
+/// [`signature_name`] table (a flagship's name stays a flagship's). The
+/// matching no-overlap law for the collection book's `glyph_label` names (a
+/// different namespace — those name COLLECTED specials, not apps) cannot be
+/// pinned from this crate (`glyph_label` lives DOWNSTREAM in aterm-gui's
+/// `kitty_log`), so the bank is exposed read-only through [`kitty_name_bank`]
+/// and that pin lives beside the label table instead
+/// (`glyph_labels_stay_out_of_the_kitty_name_namespace`).
+const KITTY_NAME_BANK: [&str; 64] = [
+    "Pixel", "Widget", "Gizmo", "Pepper", "Olive", "Clover", "Maple", "Ginger", "Nutmeg", "Pickle",
+    "Noodle", "Waffle", "Pretzel", "Bagel", "Pudding", "Tofu", "Pinto", "Cocoa", "Espresso",
+    "Latte", "Chai", "Pesto", "Basil", "Sage", "Juniper", "Hazel", "Poppy", "Marble", "Domino",
+    "Checkers", "Patches", "Freckle", "Smudge", "Doodle", "Scribble", "Inky", "Jinx", "Whiskers",
+    "Mittens", "Slippers", "Velvet", "Satin", "Shadow", "Comet", "Nova", "Orbit", "Quark",
+    "Photon", "Fig", "Plum", "Peach", "Mango", "Kiwi", "Truffle", "Wasabi", "Miso", "Ramen",
+    "Sushi", "Bento", "Taco", "Churro", "Crumpet", "Scone", "Tuna",
+];
+
+/// The whole name bank, read-only — exposed ONLY so downstream name tables
+/// can pin their half of the no-overlap law against it (the collection book's
+/// `glyph_label` test in aterm-gui, which this crate cannot see); the bank
+/// itself stays private and [`kitty_name`] stays the one draw door.
+#[must_use]
+pub fn kitty_name_bank() -> &'static [&'static str] {
+    &KITTY_NAME_BANK
+}
+
+/// SIGNATURE NAMES — hand-picked for every id the canonical table spells out
+/// ([`canonical_app_id`]), chosen from character rather than hash luck, the
+/// same way [`flagship_look`] hand-picks the flagship breeds. Coverage is
+/// deliberately the WHOLE canonical list: `aider`/`gemini`/`cursor` have no
+/// flagship breed (their looks stay hash-derived), but a first-class id whose
+/// NAME could reshuffle if the bank grew would feel like a stranger.
+///
+/// The picks:
+///   • `shell` — **Boots**: the charcoal tuxedo that lives at the prompt; the
+///     first thing you put on, every session.
+///   • `claude` — **Clementine**: the bright-ginger coat, a warm terracotta
+///     fruit of a cat (and it even echoes the "Cl…" of Claude).
+///   • `codex` — **Vector**: the level, precise gaze — a direction and a
+///     magnitude, nothing wasted.
+///   • `agy` — **Sprout**: the adolescent band, the youngest tool in the
+///     pack, still growing.
+///   • `aider` — **Buddy**: the pair-programming aide; the cat that sits with
+///     you while you work.
+///   • `gemini` — **Castor**: the brighter of the Gemini twins.
+///   • `cursor` — **Blink**: what a cursor does all day.
+fn signature_name(app_id: &str) -> Option<&'static str> {
+    Some(match app_id {
+        "shell" => "Boots",
+        "claude" => "Clementine",
+        "codex" => "Vector",
+        "agy" => "Sprout",
+        "aider" => "Buddy",
+        "gemini" => "Castor",
+        "cursor" => "Blink",
+        _ => return None,
+    })
+}
+
+/// THE APP KITTY'S NAME (owner spec, 2026-08-15: hovering the pet shows "the
+/// program it corresponds to and the kitty's name"): a deterministic name for
+/// a canonical app id from [`canonical_app_id`] — same app ⇒ same name, on
+/// every machine, forever, by construction (the exact idiom of
+/// [`KittyLook::for_app`]: nothing to persist, nothing to sync).
+///
+/// The canonical ids wear the hand-picked [`signature_name`]s; every other
+/// app draws from [`KITTY_NAME_BANK`] by `form_hash` under [`APP_NAME_SALT`]
+/// — its own namespace, so the name can never correlate with the breed draw.
+///
+/// "Forever" is TEST-PINNED for both halves: the signature table by
+/// `signature_names_are_pinned_distinct_and_cover_the_canonical_ids`, and the
+/// hash path by `hash_path_names_are_pinned_forever` (golden draws — a bank
+/// reorder or salt change fails loudly instead of silently renaming every
+/// non-canonical app across builds).
+#[must_use]
+pub fn kitty_name(app_id: &str) -> &'static str {
+    if let Some(name) = signature_name(app_id) {
+        return name;
+    }
+    let gkey = crate::genome::mix(aterm_lexicon::form_hash(app_id) ^ APP_NAME_SALT);
+    KITTY_NAME_BANK[crate::genome::field(gkey, 0, 6) as usize]
+}
 
 /// Launcher tokens that are TRANSPARENT to app identity: when the first word
 /// of a commandline is one of these, the app is whatever comes next. The
@@ -746,6 +849,127 @@ mod tests {
         for n in 0..64 {
             let name = format!("tool{n}");
             assert_eq!(KittyLook::for_app(&name).accessory, None, "{name}");
+        }
+    }
+
+    /// The signature names are FIXED (never hash luck) and pairwise distinct,
+    /// and they cover EXACTLY the ids the canonical table spells out — pinned
+    /// so a bank refactor that would silently rename the claude cat fails
+    /// loudly instead.
+    #[test]
+    fn signature_names_are_pinned_distinct_and_cover_the_canonical_ids() {
+        let expect = [
+            ("shell", "Boots"),
+            ("claude", "Clementine"),
+            ("codex", "Vector"),
+            ("agy", "Sprout"),
+            ("aider", "Buddy"),
+            ("gemini", "Castor"),
+            ("cursor", "Blink"),
+        ];
+        let mut names = Vec::new();
+        for (id, name) in expect {
+            assert_eq!(kitty_name(id), name, "{id} wears its hand-picked name");
+            names.push(name);
+        }
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), expect.len(), "signature names are distinct");
+    }
+
+    /// Canonicalization reaches the signature name from every argv form: the
+    /// same normalization pipeline that folds `claude.exe` onto the claude
+    /// BREED folds it onto the claude NAME.
+    #[test]
+    fn canonicalized_forms_share_the_signature_name() {
+        for (cmdline, name) in [
+            ("/usr/local/bin/Claude --resume", "Clementine"),
+            (r"C:\Tools\Codex.exe run", "Vector"),
+            ("zsh -l", "Boots"),
+            ("sudo env FOO=bar gemini", "Castor"),
+        ] {
+            let base = app_basename(cmdline).expect("fixture names a program");
+            assert_eq!(
+                kitty_name(canonical_app_id(&base)),
+                name,
+                "{cmdline:?} reaches its flagship's name"
+            );
+        }
+    }
+
+    /// An unknown app's name is hash-derived and STABLE (a pure function of
+    /// the id), always drawn from the bank, and the draw genuinely spreads
+    /// across it (the 6-bit field is not vacuously stuck).
+    #[test]
+    fn unknown_app_name_is_bank_drawn_and_stable() {
+        assert_eq!(kitty_name("somenewtool"), kitty_name("somenewtool"));
+        let mut seen = std::collections::BTreeSet::new();
+        for n in 0..256 {
+            let id = format!("tool{n}");
+            let name = kitty_name(&id);
+            assert!(
+                KITTY_NAME_BANK.contains(&name),
+                "{id} drew {name}, which is not in the bank"
+            );
+            seen.insert(name);
+        }
+        assert!(
+            seen.len() >= 48,
+            "256 ids should reach most of the 64-name bank — hit {}",
+            seen.len()
+        );
+    }
+
+    /// THE FOREVER PIN for the hash path: [`kitty_name`]'s doc promises
+    /// "same app ⇒ same name, on every machine, forever" — a promise the
+    /// other assertions cannot hold up (in-run self-equality, bank
+    /// membership and spread are all invariant under a bank permutation or a
+    /// salt change, either of which would reshuffle every non-canonical
+    /// app's name across builds with every test green). These are today's
+    /// exact draws; if this fails, the draw pipeline (bank order,
+    /// [`APP_NAME_SALT`], `genome::mix`/`field`) changed and every unpinned
+    /// kitty was just renamed — a BREAKING change to the promise, not a
+    /// refactor.
+    #[test]
+    fn hash_path_names_are_pinned_forever() {
+        for (id, name) in [
+            // `somenewtool` and `rg` COLLIDE on Espresso today — kept as a
+            // pair on purpose: the doc's "collisions are accepted" clause,
+            // pinned alongside the stability it qualifies.
+            ("somenewtool", "Espresso"),
+            ("cargo", "Poppy"),
+            ("rg", "Espresso"),
+            ("python3", "Truffle"),
+        ] {
+            assert_eq!(kitty_name(id), name, "{id} must keep its name forever");
+        }
+    }
+
+    /// Bank hygiene: no duplicates, nothing empty or over 8 chars, and no
+    /// overlap with the signature table (a flagship's name stays exclusive).
+    /// The bank's SIZE is compile-time pinned by its `[&str; 64]` type — 2⁶,
+    /// so the single `field(gkey, 0, 6)` draw is unbiased by construction.
+    #[test]
+    fn name_bank_is_wide_short_and_duplicate_free() {
+        let mut dedup = KITTY_NAME_BANK.to_vec();
+        dedup.sort_unstable();
+        dedup.dedup();
+        assert_eq!(dedup.len(), KITTY_NAME_BANK.len(), "no duplicate names");
+        for name in KITTY_NAME_BANK {
+            assert!(
+                !name.is_empty() && name.chars().count() <= 8,
+                "{name:?} is not a short cat name"
+            );
+            assert!(
+                name.chars().next().is_some_and(char::is_uppercase),
+                "{name:?} should read as a proper name"
+            );
+        }
+        for id in ["shell", "claude", "codex", "agy", "aider", "gemini", "cursor"] {
+            assert!(
+                !KITTY_NAME_BANK.contains(&kitty_name(id)),
+                "{id}'s signature name must not also be a bank ticket"
+            );
         }
     }
 

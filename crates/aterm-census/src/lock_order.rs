@@ -1819,12 +1819,22 @@ fn scan_fn(
         let opens = i32::try_from(line.matches('{').count()).unwrap_or(0);
         let closes = i32::try_from(line.matches('}').count()).unwrap_or(0);
         let depth_end = depth + opens - closes;
-        // 1. `drop(var)` ends a guard's life explicitly.
-        live.retain(|g| {
-            g.var.as_ref().is_none_or(|v| {
-                !line.contains(&format!("drop({v})")) && !line.contains(&format!("drop(&{v})"))
-            })
-        });
+        // 1. `drop(var)` ends a guard's life explicitly. Both needles begin with
+        //    the literal `drop(`, so a line without it cannot end any guard: the
+        //    cheap constant-needle test replaces two heap `String`s + two
+        //    two-way `StrSearcher`s per live named guard. The `live.is_empty()`
+        //    test comes FIRST and is what keeps this honest — `live` is empty on
+        //    the overwhelming majority of the corpus's lines, and paying a
+        //    `StrSearcher` construction on every one of them to save allocations
+        //    on the few percent that hold a guard is the anti-pattern documented
+        //    on the guard-helper scan above.
+        if !live.is_empty() && line.contains("drop(") {
+            live.retain(|g| {
+                g.var.as_ref().is_none_or(|v| {
+                    !line.contains(&format!("drop({v})")) && !line.contains(&format!("drop(&{v})"))
+                })
+            });
+        }
         // 2. Shadowing: a `let g = …` rebind drops the prior guard named `g`.
         let kind = classify_line(line);
         if let LineKind::Let(Some(var)) = &kind {

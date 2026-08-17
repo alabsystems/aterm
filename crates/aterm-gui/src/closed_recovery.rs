@@ -228,6 +228,8 @@ mod tests {
             user_title: None,
             description: None,
             icon: None,
+            role: None,
+            attention: None,
         })
     }
 

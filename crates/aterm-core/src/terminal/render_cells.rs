@@ -565,13 +565,22 @@ impl Terminal {
         if visible_row >= grid.rows() {
             return;
         }
+        // A Kitty Unicode placeholder can only resolve to a stored image, and
+        // `placeholder_image_ref` ends in `self.transient.kitty_images.get(&id)?`
+        // — so with no images transmitted it is provably `None` for every cell.
+        // Hoisting the emptiness test skips its `resolved_char` probe entirely;
+        // `transient` cannot change under this `&self` borrow, so the gate is
+        // behaviour-identical.
+        let has_kitty = !self.transient.kitty_images.is_empty();
         for col in 0..grid.cols() {
             let Some(extra) = grid.cell_extra(visible_row, col) else {
                 continue;
             };
             if let Some(image) = extra.image() {
                 out.push((col as usize, image.clone()));
-            } else if let Some(iref) = self.placeholder_image_ref(visible_row, col, extra) {
+            } else if has_kitty
+                && let Some(iref) = self.placeholder_image_ref(visible_row, col, extra)
+            {
                 // Kitty Unicode placeholder cell: synthesize an ImageRef so it rides
                 // the same (pixel-tested) render path as a direct placement.
                 out.push((col as usize, iref));
@@ -613,6 +622,15 @@ impl Terminal {
         // entries already filtered; clamp to both the caller's `rows` and the
         // grid's own extent (they can differ during a resize).
         let max_row = rows.min(usize::from(grid.rows()));
+        // With no transmitted Kitty images, `placeholder_image_ref` is provably
+        // `None` for every entry (its only `Some` return threads through
+        // `self.transient.kitty_images.get(&image_id)?`), so the whole
+        // placeholder branch — a `resolved_char` row lookup + cell read PER
+        // non-image extra, i.e. per hyperlink, combining mark and underline
+        // colour on screen — is dead work. Hoist the emptiness test out of the
+        // loop: it is a pure `&self` read and `transient` cannot change while
+        // this borrow is live, so the emitted rows are byte-identical.
+        let has_kitty = !self.transient.kitty_images.is_empty();
         for (coord, extra) in grid.extras().iter() {
             let r = usize::from(coord.row);
             if r >= max_row || coord.col >= grid.cols() {
@@ -620,7 +638,9 @@ impl Terminal {
             }
             if let Some(image) = extra.image() {
                 images[r].push((usize::from(coord.col), image.clone()));
-            } else if let Some(iref) = self.placeholder_image_ref(coord.row, coord.col, extra) {
+            } else if has_kitty
+                && let Some(iref) = self.placeholder_image_ref(coord.row, coord.col, extra)
+            {
                 // Kitty Unicode placeholder cell: synthesize an ImageRef so it
                 // rides the same (pixel-tested) render path as a direct placement.
                 images[r].push((usize::from(coord.col), iref));

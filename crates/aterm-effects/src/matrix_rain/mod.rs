@@ -48,7 +48,7 @@ use field::{
     dither, dither_epoch, glyph_epoch, glyph_from_epoch, trail_level,
 };
 pub use field::{MAX_RAIN_ADD, MAX_RAIN_QUADS, MAX_RAIN_TEXELS, quad_cap};
-use rom::{RomMaster, rasterize_master};
+use rom::{RomMaster, decorative_master};
 
 /// Readability ceiling on any rain coverage (body, head, halo) — the
 /// `cursor_trail::READABLE_ALPHA_CAP` precedent, pinned by test.
@@ -735,7 +735,7 @@ impl MatrixRain {
             return;
         }
         self.material_chars.clear();
-        self.rom = Some(rom::rasterize_master());
+        self.rom = Some(decorative_master().clone());
         self.baker.restart();
         self.last_bake_tick = None;
     }
@@ -1308,7 +1308,7 @@ impl MatrixRain {
                 // never mix new slot indices with old/blank atlas tiles.
                 self.finish_material_bake();
             } else if !self.baker.complete() && (ticked || self.last_bake_tick != Some(self.tick)) {
-                let rom = self.rom.get_or_insert_with(rasterize_master);
+                let rom = self.rom.get_or_insert_with(|| decorative_master().clone());
                 self.baker.bake_tiles(rom);
                 self.last_bake_tick = Some(self.tick);
             }

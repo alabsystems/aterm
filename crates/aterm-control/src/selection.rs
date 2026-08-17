@@ -18,7 +18,7 @@ use aterm_core::selection::{SelectionSide, SelectionType, SmartSelection};
 use aterm_core::terminal::Terminal;
 
 use crate::host::SessionHost;
-use crate::wire::{json_ok, json_str_field, pct_encode, visible_char};
+use crate::wire::{json_ok, json_str_field, pct_encode_into, visible_char};
 
 /// The host does not resolve the target sid. Unreachable from a dispatcher that
 /// resolves the session before dispatch (aterm-gui's does); it exists so a
@@ -92,6 +92,7 @@ pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String 
 /// OSC 133 (see the `shell_integration` injection); empty otherwise.
 pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use aterm_core::terminal::BlockState;
+    use std::fmt::Write as _;
     host.with_terminal(sid, |t: &Terminal| {
         let all: Vec<_> = t.all_blocks().collect();
         let slice: &[_] = match rest.trim().parse::<usize>() {
@@ -111,8 +112,16 @@ pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
             let exit = b
                 .exit_code
                 .map_or_else(|| "-".to_string(), |c| c.to_string());
-            out.push_str(&format!(
-                "block {} {} exit={} prompt={} cmd={} out={} end={} cwd={} cmdline={}\n",
+            // Write the line DIRECTLY into the response buffer. The `format!`
+            // this replaces allocated a whole line `String` per block — plus one
+            // per percent-encoded field — purely to be copied in and dropped,
+            // and this loop runs up to `OUTPUT_BLOCKS_MAX` (1000) times while
+            // holding the terminal lock the render path contends for. The
+            // format string is unchanged, merely split at the two encoded
+            // fields, so the emitted bytes are identical.
+            let _ = write!(
+                out,
+                "block {} {} exit={} prompt={} cmd={} out={} end={} cwd=",
                 b.id,
                 state,
                 exit,
@@ -120,9 +129,11 @@ pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
                 opt_row(b.command_start_row),
                 opt_row(b.output_start_row),
                 opt_row(b.end_row),
-                pct_encode(b.working_directory.as_deref().unwrap_or("")),
-                pct_encode(b.commandline.as_deref().unwrap_or("")),
-            ));
+            );
+            pct_encode_into(&mut out, b.working_directory.as_deref().unwrap_or(""));
+            out.push_str(" cmdline=");
+            pct_encode_into(&mut out, b.commandline.as_deref().unwrap_or(""));
+            out.push('\n');
         }
         out
     })
@@ -223,7 +234,19 @@ pub fn cmd_wait(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     // its single-slot notify pending, so the first `wait` below cannot miss it.
     let sub = host.subscribe(sid);
     loop {
-        let Some((newest, _)) = host.with_terminal(sid, scan_blocks) else {
+        // Only the ENTRY check above needs `in_flight`; from here on the loop
+        // wants the newest completion and nothing else. `scan_blocks` walks
+        // every block with no early exit, and this runs once per output BURST
+        // (hundreds/sec under a flood) while holding the terminal lock the PTY
+        // and render paths contend for — so ask the engine for the newest
+        // `Complete` directly. Ids are monotonic and blocks iterate oldest-first
+        // with `current_block` last, so the last `Complete` forward (what
+        // `scan_blocks` returned) is the first `Complete` backward (what
+        // `newest_completed_block` returns): the same block, hence the same
+        // `OK complete <id> exit=...` bytes.
+        let Some(newest) = host.with_terminal(sid, |t: &Terminal| {
+            t.newest_completed_block().map(|b| (b.id, b.exit_code))
+        }) else {
             return NO_SESSION.to_string();
         };
         if let Some((id, exit)) = newest

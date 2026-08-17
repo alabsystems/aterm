@@ -977,8 +977,26 @@ pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
     })
 }
 
+/// Resolve one schema key.
+///
+/// Every per-keystroke Manual path (completion, validation, hover help) and the
+/// Settings Modified route resolve keys one at a time, so the ~217-entry
+/// registry is searched through a once-built key-sorted index rather than
+/// rescanned linearly on each lookup. Keys are unique — pinned by
+/// `one_schema_registry_covers_native_manual_and_table_shapes_without_duplicates`
+/// — so the binary search returns exactly the entry the former first-match
+/// `find` returned.
 pub(crate) fn config_schema_entry(key: &str) -> Option<&'static ConfigSchemaEntry> {
-    config_schema().iter().find(|entry| entry.key == key)
+    static INDEX: OnceLock<Vec<&'static ConfigSchemaEntry>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut entries = config_schema().iter().collect::<Vec<_>>();
+        entries.sort_unstable_by_key(|entry| entry.key);
+        entries
+    });
+    index
+        .binary_search_by(|entry| entry.key.cmp(key))
+        .ok()
+        .map(|position| index[position])
 }
 
 /// The same rank used by Settings global search, exported from the schema
@@ -3553,8 +3571,49 @@ pub(crate) fn decorate_projection(
     projection: &mut EditorViewportProjection,
     analysis: &ConfigAnalysis,
 ) {
-    for line in &mut projection.lines {
-        for span in &analysis.syntax {
+    // Windowed, not reordered. `lex_toml` lexes one source line at a time, so
+    // every span lies inside a single source line and `analysis.syntax` is a
+    // run of per-source-line blocks in strictly increasing line order (only the
+    // order *within* a block is scrambled: `lex_line` pushes the comment span
+    // ahead of the key/value spans it follows). `project_viewport_with` emits
+    // one projected line per source line, also strictly increasing. Those two
+    // facts let each line scan a bounded window while pushing exactly the same
+    // subsequence in exactly the same order a full rescan would — push order is
+    // observable, both in paint prim order and in the compiled-UI fingerprint.
+    let mut cursor = 0usize;
+    for index in 0..projection.lines.len() {
+        let window_start = projection.lines[index].source.start;
+        // The one-window-per-source-line precondition, checked where it is spent:
+        // consecutive windows are separated by at least the newline between their
+        // source lines. A soft-wrap projection would put two windows *inside* one
+        // source line and quietly invalidate the `scan_end` terminator below.
+        // `viewport_projection_emits_one_window_per_source_line` pins the producer.
+        debug_assert!(
+            index == 0 || projection.lines[index - 1].source.end < window_start,
+            "decorate_projection requires one projected window per source line"
+        );
+        // Every later window starts further right, so a span that already ends
+        // at or before this one's start is dead for the whole rest of the
+        // projection. Ends are not monotone inside a block, so this can stall
+        // early — that only ever means scanning more, never scanning less.
+        while cursor < analysis.syntax.len() && analysis.syntax[cursor].bytes.end <= window_start {
+            cursor += 1;
+        }
+        // The next projected line begins on the next source line, so every span
+        // of *this* source line starts before it: stopping there cannot drop a
+        // span that intersects this window. Using the window's own end instead
+        // would be wrong — on a horizontally sliced line the comment span sits
+        // ahead of the key span it starts after, so an end-of-window terminator
+        // would truncate the block before reaching the key.
+        let scan_end = projection
+            .lines
+            .get(index + 1)
+            .map_or(usize::MAX, |next| next.source.start);
+        let line = &mut projection.lines[index];
+        for span in &analysis.syntax[cursor..] {
+            if span.bytes.start >= scan_end {
+                break;
+            }
             if let Some(bytes) = relative_intersection(&line.source, &span.bytes) {
                 line.syntax.push(EditorSyntaxSpan {
                     bytes,
@@ -3562,6 +3621,9 @@ pub(crate) fn decorate_projection(
                 });
             }
         }
+        // Diagnostics stay a full sweep: `diagnostic_intersection` has a
+        // zero-width clamp fallback that is not a pure intersection, and
+        // MAX_DIAGNOSTICS keeps the set tiny.
         for diagnostic in &analysis.diagnostics {
             if let Some(bytes) =
                 diagnostic_intersection(&line.source, &diagnostic.bytes, &line.text)
@@ -6527,5 +6589,180 @@ sty"#;
             line.syntax.len() <= analysis.syntax.len()
                 && line.diagnostics.len() <= analysis.diagnostics.len()
         );
+    }
+
+    /// A config document whose every line is one of the shapes that can trip the
+    /// windowed decoration: a bare comment, a table header, keys with a trailing
+    /// comment (the span `lex_line` pushes AHEAD of the key it follows), a
+    /// multibyte value, an empty line, and a line long enough that the projection
+    /// must slice it horizontally instead of starting at column zero.
+    fn projection_pin_source() -> String {
+        let wide = "wide ".repeat(80);
+        format!(
+            "# aterm config\n\
+             [window]\n\
+             font_px = 18   # trailing comment after a key\n\
+             title = \"α terminal ✨\"   # multibyte value\n\
+             \n\
+             opacity = 0.85\n\
+             notes = \"{wide}\"   # forces a horizontally sliced window\n\
+             [window.padding]\n\
+             left = 4\n"
+        )
+    }
+
+    /// Every projection shape the config editor can hand `decorate_projection`:
+    /// each scroll anchor and caret position, across the geometry envelope that
+    /// actually changes the window — the row budget, and the column budget that
+    /// turns on horizontal slicing.
+    fn for_each_config_projection(
+        source: &str,
+        mut inspect: impl FnMut(&EditorViewportProjection),
+    ) {
+        let mut store = crate::document_store::DocumentStore::new();
+        let document = store.open("mem://config-projection".to_string(), source.to_string());
+        let mut workspace = crate::native_editor::EditorWorkspace::new();
+        let mut view = workspace
+            .attach(
+                &mut store,
+                document,
+                crate::document_store::DocumentViewId(91),
+            )
+            .expect("attaching a freshly opened in-memory document cannot fail");
+        for anchor in (0..=source.len()).step_by(23) {
+            for caret in (0..=source.len()).step_by(37) {
+                view.viewport_anchor = anchor;
+                view.selections = vec![crate::native_editor::Selection::caret(caret)];
+                for (rows, columns) in
+                    [(1usize, 4usize), (3, 12), (7, 40), (usize::MAX, usize::MAX)]
+                {
+                    inspect(&crate::native_editor::project_viewport(
+                        source, &view, rows, columns,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The precondition `decorate_projection`'s windowed scan spends, written as a
+    /// predicate so the pin below can prove itself with a negative control:
+    /// consecutive rows are consecutive SOURCE lines, and are therefore separated
+    /// by at least the newline between them.
+    fn one_window_per_source_line(projection: &EditorViewportProjection) -> bool {
+        projection.lines.windows(2).all(|pair| {
+            pair[1].number == pair[0].number + 1 && pair[0].source.end < pair[1].source.start
+        })
+    }
+
+    /// One projected row over an arbitrary byte window of `source` — the shape a
+    /// soft-wrap projection would emit, which the real projector never does.
+    fn projected_window(
+        source: &str,
+        number: usize,
+        bytes: Range<usize>,
+    ) -> crate::native_editor::EditorViewportLine {
+        crate::native_editor::EditorViewportLine {
+            number,
+            column_start: bytes.start,
+            text: source[bytes.clone()].to_string(),
+            source: bytes,
+            selections: Vec::new(),
+            carets: Vec::new(),
+            syntax: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// The cross-module precondition `decorate_projection`'s windowed scan spends:
+    /// `project_viewport_with` emits exactly ONE window per source line, so the
+    /// next projected row starts after every span of this one and is a sound scan
+    /// terminator. Soft wrap — two windows inside one source line — would land
+    /// `lines[i + 1].source.start` mid-line, where the comment span `lex_line`
+    /// pushes ahead of the key span it follows trips the `break` and the key
+    /// highlighting silently vanishes on wrapped rows with a trailing comment.
+    /// Pin the producer here so that feature breaks THIS test, loudly, instead of
+    /// the decoration, invisibly.
+    #[test]
+    fn viewport_projection_emits_one_window_per_source_line() {
+        let source = projection_pin_source();
+        let mut sliced_windows = 0usize;
+        for_each_config_projection(&source, |projection| {
+            for line in &projection.lines {
+                assert!(
+                    !line.text.contains('\n'),
+                    "a projected window must stay inside one source line: {line:?}"
+                );
+                // A window that does not begin right after a newline began mid
+                // source line: that is the horizontal slice, the only shape where
+                // a span can start left of the window it belongs to.
+                if line.source.start > 0 && source.as_bytes()[line.source.start - 1] != b'\n' {
+                    sliced_windows += 1;
+                }
+            }
+            assert!(
+                one_window_per_source_line(projection),
+                "decorate_projection stops each row's scan at `lines[i + 1].source.start`, \
+                 which is only a sound terminator while every source line owns exactly one \
+                 window: {projection:?}"
+            );
+        });
+        assert!(
+            sliced_windows > 0,
+            "negative control: the grid must actually produce horizontally sliced \
+             windows, otherwise it never exercises the mid-line case"
+        );
+        // Negative control for the predicate itself: the shape soft wrap would
+        // emit — two windows inside source line 1 — must be REJECTED, otherwise
+        // the pin above could never fail for the reason it was written.
+        let wrapped = EditorViewportProjection {
+            first_line: 1,
+            total_lines: 1,
+            lines: vec![
+                projected_window(&source, 1, 0..7),
+                projected_window(&source, 1, 7..14),
+            ],
+        };
+        assert!(
+            !one_window_per_source_line(&wrapped),
+            "a two-window-per-source-line projection must not satisfy the precondition"
+        );
+    }
+
+    /// The windowed scan has to push exactly the subsequence a full rescan would,
+    /// in exactly the same order — push order is observable both in paint prim
+    /// order and in the compiled-UI fingerprint. Oracle the optimization against
+    /// the naive sweep over the whole projection grid, so a terminator or cursor
+    /// change that drops (or reorders) a span fails here.
+    #[test]
+    fn windowed_decoration_matches_a_full_sweep() {
+        let source = projection_pin_source();
+        let analysis = analyze(&source);
+        assert!(
+            !analysis.syntax.is_empty(),
+            "the pinned source must actually lex to spans"
+        );
+        for_each_config_projection(&source, |projection| {
+            let mut decorated = projection.clone();
+            decorate_projection(&mut decorated, &analysis);
+            for (line, original) in decorated.lines.iter().zip(&projection.lines) {
+                let swept: Vec<EditorSyntaxSpan> = analysis
+                    .syntax
+                    .iter()
+                    .filter_map(|span| {
+                        relative_intersection(&original.source, &span.bytes).map(|bytes| {
+                            EditorSyntaxSpan {
+                                bytes,
+                                class: span.class,
+                            }
+                        })
+                    })
+                    .collect();
+                assert_eq!(
+                    line.syntax, swept,
+                    "windowed scan diverged from the full sweep on {:?}",
+                    original.source
+                );
+            }
+        });
     }
 }

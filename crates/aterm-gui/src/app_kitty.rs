@@ -17,9 +17,14 @@
 //!
 //! THE PRECEDENCE LAW lives in [`companion_precedence`]; the per-pane cache
 //! lives in [`AppKittySlot`] on `SessionCtx`.
+//!
+//! Every identity also carries the kitty's NAME
+//! ([`aterm_effects::kitty_registry::kitty_name`] — deterministic from the
+//! same canonical id as the breed), consumed by the pet's hover label
+//! ("claude — Clementine"; see `App::pet_label_identity`).
 
 use aterm_core::terminal::{BlockState, OutputBlock};
-use aterm_effects::kitty_registry::{KittyLook, app_basename, canonical_app_id};
+use aterm_effects::kitty_registry::{KittyLook, app_basename, canonical_app_id, kitty_name};
 
 /// The shell-integration loader's load-once guard variable — the env var the
 /// shipped zsh/bash scripts check (`[[ -n … ]] && return`) and then `export`.
@@ -36,9 +41,9 @@ use aterm_effects::kitty_registry::{KittyLook, app_basename, canonical_app_id};
 pub(crate) const SHELL_INTEGRATION_LOADED_GUARD: &str = "ATERM_SHELL_INTEGRATION_INSTALLED";
 
 /// The resolved app identity of one pane: canonical id, the raw basename it
-/// came from (diagnostics — `id` may canonicalize it), and the breed the id
-/// resolves to. The look is a pure function of `id`, carried here so the
-/// render rung never re-hashes per frame.
+/// came from (diagnostics — `id` may canonicalize it), the breed the id
+/// resolves to, and the kitty's name. The look and name are pure functions
+/// of `id`, carried here so the render rung never re-hashes per frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppIdentity {
     /// Canonical app id (`"claude"`, `"shell"`, or the raw basename).
@@ -47,6 +52,10 @@ pub struct AppIdentity {
     pub basename: String,
     /// The resolved breed for `id`.
     pub look: KittyLook,
+    /// The kitty's deterministic name for `id` (the hover label's other
+    /// half) — `&'static` because every name lives in the registry's
+    /// signature table or bank.
+    pub name: &'static str,
 }
 
 /// Per-session cache for the pane's app identity, keyed by
@@ -85,7 +94,13 @@ fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
             let basename = app_basename(block.commandline.as_deref().unwrap_or(""))?;
             let id = canonical_app_id(&basename).to_owned();
             let look = KittyLook::for_app(&id);
-            Some(AppIdentity { id, basename, look })
+            let name = kitty_name(&id);
+            Some(AppIdentity {
+                id,
+                basename,
+                look,
+                name,
+            })
         }
         // At the prompt — before, while, and after typing a command — the
         // user is talking to the SHELL. That is the app.
@@ -105,6 +120,7 @@ fn shell_identity() -> AppIdentity {
         id: "shell".to_owned(),
         basename: "shell".to_owned(),
         look: KittyLook::for_app("shell"),
+        name: kitty_name("shell"),
     }
 }
 
@@ -175,6 +191,25 @@ mod tests {
         assert_eq!(ident.id, "claude");
         assert_eq!(ident.basename, "claude");
         assert_eq!(ident.look, KittyLook::for_app("claude"));
+    }
+
+    /// Every resolved identity carries the deterministic kitty NAME beside
+    /// the breed — the hover label's other half, from the same canonical id.
+    #[test]
+    fn identities_carry_the_deterministic_kitty_name() {
+        let mut slot = AppKittySlot::default();
+        let ident = slot
+            .resolve(Some(&block(
+                BlockState::Executing,
+                Some("/usr/local/bin/claude --resume"),
+            )))
+            .expect("an executing commandline names the app");
+        assert_eq!(ident.name, kitty_name("claude"));
+        assert_eq!(ident.name, "Clementine", "the flagship signature name");
+        let ident = slot
+            .resolve(Some(&block(BlockState::PromptOnly, None)))
+            .expect("a prompt is the shell");
+        assert_eq!(ident.name, kitty_name("shell"));
     }
 
     /// Executing with no commandline claims nothing (the session kitty rides),

@@ -6,7 +6,7 @@
 //! CONTEXT MENU say about a session.
 //!
 //! Stage 1 ([`crate::session_timeline`]) gave every session a user identity
-//! (`meta set title|description|icon`) and a bounded lifecycle timeline. This
+//! (`meta set title|description|icon|role|attention`) and a bounded lifecycle timeline. This
 //! module turns those — plus the generated live activity, the engine's cwd, and
 //! the registry's lifecycle state — into TWO renderings of the SAME facts:
 //!
@@ -206,8 +206,14 @@ pub(crate) fn due_cache_batch(
         return Vec::new();
     }
     // Keep only the earliest `budget` candidates while scanning: a synchronized
-    // thousand-tab expiry still allocates O(Budget), never O(due entries).
-    let mut due: Vec<(u64, u64)> = Vec::with_capacity(budget.min(cache.len()));
+    // thousand-tab expiry still allocates O(Budget), never O(due entries). The
+    // buffer starts empty rather than pre-reserved because the push guard below
+    // is what enforces that bound — reserving up front only moved the same
+    // O(Budget) allocation earlier, and this runs on every event-loop park where
+    // the overwhelmingly common answer (30 s TTL) is "nothing due", so the
+    // lazy shape leaves the park allocation-free. Selection order and the
+    // returned value are unchanged.
+    let mut due: Vec<(u64, u64)> = Vec::new();
     for (session, entry) in cache {
         let expiry = cache_expiry_ms(entry);
         if expiry > now_ms {

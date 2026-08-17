@@ -24,6 +24,7 @@
 //! strip is spliced ABOVE the terminal content in the composed `RenderInput`
 //! only; the session grids are never shifted.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
@@ -1346,13 +1347,80 @@ fn image_data(primitives: &[TabIconPrimitive], color: [u8; 3], cols: u16) -> Arc
     })
 }
 
+/// Memo key for one rasterized strip glyph.
+///
+/// It names EXACTLY the inputs the pixels are a function of, so a hit is
+/// bit-identical to a fresh rasterization: [`tab_icon_primitives`] is a `const fn`
+/// of the kind alone, and [`status_primitives`] reads only `status_count` /
+/// `has_status_kind`, i.e. the three status bools. NOTHING else on
+/// [`TabStripMetadata`] may reach the pixels — see
+/// `memoized_strip_glyphs_match_a_fresh_raster_for_every_key`, which fails loudly
+/// if that ever stops being true. The two variants also keep the `cols` split
+/// (`ICON_COLS` vs 1) structural rather than incidental: an icon entry can never
+/// be handed to the status call site, and both renderers' image-cache keys embed
+/// `cols * cell_w`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IconKey {
+    Icon(TabIconKind, [u8; 3]),
+    Status {
+        dirty: bool,
+        busy: bool,
+        attention: bool,
+        color: [u8; 3],
+    },
+}
+
+/// Hard cap on the memo: 16 × 4 KiB = 64 KiB. The live key space is 4 icon kinds
+/// + 8 status bit combinations × the handful of strip colours in play, and FIFO
+///   eviction keeps a theme cycle (which mints new colours) provably bounded.
+const ICON_MEMO_CAP: usize = 16;
+
+thread_local! {
+    /// Paint is main-thread only, so a thread-local avoids both a global lock on
+    /// the paint path and a signature change to [`paint_strip_with_metadata`]. A
+    /// `Vec` beats a `HashMap` at this size and keeps the eviction bound obvious.
+    static ICON_MEMO: RefCell<Vec<(IconKey, Arc<ImageData>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Reuse the `Arc<ImageData>` of a glyph we have already rasterized.
+///
+/// Skipping the ~16 k coverage samples is the smaller half. The real win is that
+/// the SAME `Arc` survives a strip rebuild: both renderers key their decoded-image
+/// caches on `Arc` identity (`aterm_gpu::GpuImageCache::get` by `Arc::ptr_eq`, and
+/// `aterm_render`'s `ImageCache` likewise), so a fresh `Arc` per rebuild was a
+/// guaranteed miss that re-decoded the raster, churned an 8-entry GPU cache
+/// holding genuine user inline images, and — because placements are keyed on
+/// `Arc::as_ptr` — defeated the `image_plane` reuse fast path, repacking the whole
+/// stacked plane every time a spinner ticked in a tab title.
+///
+/// Sharing one image across frames is already the normal state here (the strip
+/// cache's HIT path re-uses the very same images every present), nothing mutates
+/// through these `Arc`s, and no consumer branches on their strong count — so
+/// stable identity cannot change observable output.
+fn memoized_image(key: IconKey, build: impl FnOnce() -> Arc<ImageData>) -> Arc<ImageData> {
+    ICON_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if let Some((_, image)) = memo.iter().find(|(entry, _)| *entry == key) {
+            return image.clone();
+        }
+        let image = build();
+        if memo.len() >= ICON_MEMO_CAP {
+            memo.remove(0);
+        }
+        memo.push((key, image.clone()));
+        image
+    })
+}
+
 fn append_icon_images(
     images: &mut Vec<(usize, ImageRef)>,
     start_col: u16,
     kind: TabIconKind,
     color: [u8; 3],
 ) {
-    let image = image_data(tab_icon_primitives(kind), color, ICON_COLS);
+    let image = memoized_image(IconKey::Icon(kind, color), || {
+        image_data(tab_icon_primitives(kind), color, ICON_COLS)
+    });
     for cell_col in 0..ICON_COLS {
         images.push((
             usize::from(start_col + cell_col),
@@ -1371,11 +1439,20 @@ fn append_status_image(
     metadata: TabStripMetadata,
     color: [u8; 3],
 ) {
-    let primitives = status_primitives(metadata);
+    // Built lazily so a memo hit skips `status_primitives`' `Vec` as well.
+    let image = memoized_image(
+        IconKey::Status {
+            dirty: metadata.dirty,
+            busy: metadata.busy,
+            attention: metadata.attention,
+            color,
+        },
+        || image_data(&status_primitives(metadata), color, 1),
+    );
     images.push((
         usize::from(col),
         ImageRef {
-            image: image_data(&primitives, color, 1),
+            image,
             cell_row: 0,
             cell_col: 0,
         },
@@ -2140,6 +2217,50 @@ mod tests {
             None,
             "a terminal cannot represent an app icon"
         );
+    }
+
+    /// [`IconKey`] must name EVERY input the raster depends on. If a later change
+    /// makes `status_primitives` (or `tab_icon_primitives`) read a field the key
+    /// omits, the memo would silently serve the WRONG glyph — the one real risk of
+    /// caching these pixels, and a purely visual bug no other test would catch.
+    /// Walk every reachable key (4 icon kinds and all 8 status bit combinations,
+    /// each in two colours) through the real `append_*` entry points and demand a
+    /// fresh rasterization of the same inputs, byte for byte.
+    #[test]
+    fn memoized_strip_glyphs_match_a_fresh_raster_for_every_key() {
+        let kinds = [
+            TabIconKind::Settings,
+            TabIconKind::Markdown,
+            TabIconKind::Editor,
+            TabIconKind::Recovery,
+        ];
+        for color in [[213u8, 219, 255], [255, 180, 64]] {
+            for kind in kinds {
+                let mut images = Vec::new();
+                append_icon_images(&mut images, 0, kind, color);
+                let expected = rasterize_icon(tab_icon_primitives(kind), color);
+                assert_eq!(images.len(), usize::from(ICON_COLS));
+                for (_, placed) in &images {
+                    assert_eq!(placed.image.bytes, expected, "{kind:?} in {color:?}");
+                    assert_eq!(placed.image.cols, ICON_COLS, "{kind:?} keeps its footprint");
+                }
+            }
+            for bits in 0..8u8 {
+                let metadata = TabStripMetadata {
+                    icon: None,
+                    dirty: bits & 0b001 != 0,
+                    busy: bits & 0b010 != 0,
+                    attention: bits & 0b100 != 0,
+                    closable: true,
+                };
+                let mut images = Vec::new();
+                append_status_image(&mut images, 0, metadata, color);
+                let expected = rasterize_icon(&status_primitives(metadata), color);
+                let placed = &images[0].1;
+                assert_eq!(placed.image.bytes, expected, "{metadata:?} in {color:?}");
+                assert_eq!(placed.image.cols, 1, "status marks stay one cell wide");
+            }
+        }
     }
 
     #[test]

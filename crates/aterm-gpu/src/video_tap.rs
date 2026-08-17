@@ -551,6 +551,23 @@ fn mapped_to_rgba8(
         }
     };
 
+    // Byte-indexed sRGB→linear decode table for the 2×2 box filter below. Every
+    // `fetch` return path yields channels in 0..=255 (the 8-bit swizzle,
+    // `display_p3_to_srgb8`, and `srgb8_from_linear` for f16 all quantize to a
+    // byte), so `decode[n]` is EXACTLY what `srgb_to_linear(n as f32 / 255.0)`
+    // returns for that same n — this is a bit-identical substitution, not an
+    // approximation. It trades 12 `powf` per OUTPUT pixel (4 samples × 3
+    // channels) for 256 `powf` per frame, which matters because the harvest runs
+    // synchronously on the present thread. The encode side keeps its `powf`:
+    // `srgb8_from_linear` produces the stored pixel byte and its rounding is a
+    // pinned parity artifact. Only the downsampling path decodes, so the table
+    // is skipped otherwise.
+    let decode: [f32; 256] = if half_res {
+        std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0))
+    } else {
+        [0.0; 256]
+    };
+
     for dy in 0..dh {
         for dx in 0..dw {
             let pixel = if half_res {
@@ -570,7 +587,7 @@ fn mapped_to_rgba8(
                         let premul_linear: f32 = samples
                             .iter()
                             .map(|sample| {
-                                let linear = srgb_to_linear(sample[channel] as f32 / 255.0);
+                                let linear = decode[sample[channel] as usize];
                                 linear * sample[3] as f32
                             })
                             .sum();

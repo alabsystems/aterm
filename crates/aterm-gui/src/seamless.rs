@@ -2706,6 +2706,8 @@ mod tests {
                         user_title: None,
                         description: None,
                         icon: None,
+                        role: None,
+                        attention: None,
                     })),
                     focused_path: Vec::new(),
                     zoomed: false,
@@ -3928,6 +3930,8 @@ mod tests {
                 user_title: None,
                 description: None,
                 icon: None,
+                role: None,
+                attention: None,
             });
             live.push((local_id, master, 4000 + index as i32));
             let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
@@ -4670,6 +4674,8 @@ mod f4_adoption_proof_asymmetry {
                             user_title: None,
                             description: None,
                             icon: None,
+                            role: None,
+                            attention: None,
                         },
                     ))),
                     second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -4681,6 +4687,8 @@ mod f4_adoption_proof_asymmetry {
                             user_title: None,
                             description: None,
                             icon: None,
+                            role: None,
+                            attention: None,
                         },
                     ))),
                 },

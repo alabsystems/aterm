@@ -356,6 +356,24 @@ pub fn varied_glyph_raster(
     for &(tag, value) in coords {
         let _ = face.set_variation(ttf_parser::Tag(tag), value);
     }
+    varied_glyph_raster_with_face(&face, gid, px)
+}
+
+/// [`varied_glyph_raster`] on an ALREADY-PARSED face — the hot-path form. The
+/// raster is identical; only the `Face::parse` + `set_variation` replay moves to
+/// the caller, which can amortize it (e.g. a caller that must resolve the gid
+/// through the same face's cmap first, instead of parsing the bytes twice).
+///
+/// The caller is responsible for building `face` at the correct collection
+/// `index` and applying the variation coords BEFORE calling this — the byte-slice
+/// [`varied_glyph_raster`] wrapper above does exactly that. (Same convention as
+/// `ligature_shaping::shape_ligature_run_with_face`.)
+#[must_use]
+pub fn varied_glyph_raster_with_face(
+    face: &ttf_parser::Face,
+    gid: u16,
+    px: f32,
+) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
     let upem = f32::from(face.units_per_em());
     if upem <= 0.0 || !px.is_finite() || px <= 0.0 {
         return None;

@@ -1542,13 +1542,20 @@ mod tests {
             out.log
         );
 
-        // Regress the aggregator: drop the parked-shard chain from the scan.
+        // Regress the aggregator: drop the parked-shard contribution from the
+        // scan. The aggregator no longer CHAINS every parked shard's whole
+        // episode map onto its live walk (that was `O(panes × total episodes)`
+        // per presented frame); each shard now carries an O(1) burst-mutex
+        // summary re-derived at its one choke point, and the aggregator folds
+        // those summaries in. The obligation is unchanged — the aggregate must
+        // still be computed over ALL shards, not just the bound one — so the
+        // demonstration deletes the fold, which is exactly today's spelling of
+        // "this scan sees one pane only".
         mutate(
             &root,
             "crates/aterm-effects/src/word_decorations.rs",
-            "        for ep in self\n            .persist\n            .values()\n            \
-             .chain(self.parked.values().flat_map(|p| p.persist.values()))\n        {",
-            "        for ep in self.persist.values() {",
+            "        for p in self.parked.values() {",
+            "        for p in std::iter::empty::<&ParkedPane>() {",
         );
         let out = run_scope_census_over(&root, SCOPE_CLAIMS, SCOPE_STANDING_FINDINGS);
         assert!(

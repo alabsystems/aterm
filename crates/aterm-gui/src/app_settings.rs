@@ -215,7 +215,26 @@ impl App {
     /// this is the live provider/locality/readiness/error projection. The update
     /// is equality-gated and only redraws windows whose view actually changed.
     pub(crate) fn sync_settings_title_summary_health(&mut self) {
-        let health = self.title_summary_health();
+        // This runs once per event-loop park (`retry_title_observations`), and
+        // the common case is that no Settings view exists anywhere. Settings is
+        // a process-singleton controller, so NO live instance proves no window
+        // presents it: the per-window/per-tab walk below (one `leaves()` heap
+        // allocation per tab) and the health projection (up to four `String`
+        // clones plus two schedule scans) are then both pure waste.
+        //
+        // `instance_by_kind` scans the handful of live native apps and
+        // allocates nothing, and it is conservative in the safe direction: an
+        // instance with no attached view merely falls through to the walk,
+        // which then finds no target exactly as it does today. It is NOT
+        // `settings_tab_open()` — that helper re-runs this very walk, so
+        // guarding with it would double the cost in the case that matters.
+        if self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::Settings)
+            .is_none()
+        {
+            return;
+        }
         let targets = self
             .windows
             .keys()
@@ -225,6 +244,14 @@ impl App {
                     .map(|(_, _, _, view)| (wid, view))
             })
             .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        // Hoisted below the target search: with no target the whole body was
+        // already a no-op, so the projection's allocations bought nothing.
+        // `title_summary_health()` is `&self` and side-effect-free, which is
+        // what makes the reorder behaviour-identical.
+        let health = self.title_summary_health();
         for (wid, view) in targets {
             let changed = match self.native_runtime.view_state_mut(view) {
                 Some(crate::native_app::AppViewState::Settings(state)) => {

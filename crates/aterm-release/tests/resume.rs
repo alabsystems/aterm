@@ -12,6 +12,9 @@
 // lib.rs), so the integration tests compile the modules under test directly.
 // publish/verify pull in every pipeline stage through `crate::`, hence the
 // full mount list.
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
@@ -2521,11 +2524,25 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(parse(&["status"]).unwrap(), cli::Cmd::Status);
     assert_eq!(
         parse(&["provision", "--id", "m2"]).unwrap(),
-        cli::Cmd::Provision { id: "m2".into() }
+        cli::Cmd::Provision {
+            id: "m2".into(),
+            check: false
+        }
+    );
+    assert_eq!(
+        parse(&["provision", "--id", "m2", "--check"]).unwrap(),
+        cli::Cmd::Provision {
+            id: "m2".into(),
+            check: true
+        }
     );
     assert!(
         cli::USAGE.contains("provision --id"),
         "help must document the one-command machine provisioning verb"
+    );
+    assert!(
+        cli::USAGE.contains("--check"),
+        "help must document the no-writes audit rehearsal"
     );
     assert!(
         cli::USAGE.contains(publish::RECOVERY_STOPPED_PROCESS_FLAG),

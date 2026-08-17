@@ -214,16 +214,44 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
         let release_id = release_id.ok_or_else(|| {
             Error::new("production release scan row has no immutable GitHub release ID")
         })?;
-        let before = publish::release_object_by_id(slug, release_id)?;
-        publish::validate_release_object_tag_state(before.as_ref(), release_id, tag, false)?;
-        let before = before.expect("validated release object is present");
+        // Each END of the download bracket is ONE read of the release object:
+        // the release identity and the exact-name asset binding come out of the
+        // same JSON document, so asking for them separately paid two `gh` cold
+        // starts and two round trips AND left the pair skewed in time. The
+        // checks below are run in exactly the order the two separate reads
+        // imposed, so error precedence is unchanged.
+        let before = publish::release_object_and_asset_identity(slug, release_id, asset)?;
+        publish::validate_release_object_tag_state(
+            before.release.as_ref(),
+            release_id,
+            tag,
+            false,
+        )?;
+        let before_asset = before.asset;
+        let before = before.release.expect("validated release object is present");
         if identities.insert(release_id, before.clone()).is_some() {
             return Err(Error::new(format!(
                 "release ID {release_id} appeared more than once in the authoritative listing"
             )));
         }
-        let bytes = publish::download_release_asset_for_release_id(slug, release_id, asset)?;
-        let after = publish::release_object_by_id(slug, release_id)?;
+        let before_asset = before_asset.ok_or_else(|| missing_release_asset(release_id, asset))?;
+        // The recheck runs after the transfer and BEFORE the asset identities
+        // are compared, so `after` is the very snapshot the asset recheck saw:
+        // asset drift is still reported before object drift, exactly as when
+        // the object re-read was a separate call after the download.
+        let mut after: Option<publish::ReleaseObjectIdentity> = None;
+        let bytes = publish::download_release_asset_with_identity_and_recheck(
+            slug,
+            asset,
+            before_asset,
+            || {
+                let observed = publish::release_object_and_asset_identity(slug, release_id, asset)?;
+                after = observed.release;
+                observed
+                    .asset
+                    .ok_or_else(|| missing_release_asset(release_id, asset))
+            },
+        )?;
         if after.as_ref() != Some(&before) {
             return Err(Error::new(format!(
                 "release ID {release_id} identity changed during authoritative manifest download"
@@ -231,6 +259,30 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
         }
         Ok(bytes)
     })?;
+    // On an exhaustive scan every remaining release's fetch+download round ran
+    // since any given release's bracketed before/after pair, so the whole
+    // captured set is re-read once more: concurrent channel mutation during the
+    // long scan must fail the scan, not return a torn view. ONE paginated
+    // listing settles that for every captured ID, and it is STRICTLY STRONGER
+    // than the per-ID re-reads it replaces — those were themselves skewed
+    // across the minutes they took, so they never proved a single consistent
+    // instant. It is also one `gh` process instead of one per release; the
+    // codebase already batches this way for tag commits
+    // (`publish::assert_remote_historical_tag_commits`). Nothing between here
+    // and the comparison below touches the network, so the snapshot is still
+    // taken strictly after the last download. The stop-early replay fetches
+    // exactly one manifest and its own pair already brackets that only transfer.
+    //
+    // The batch is restricted to the IDs this scan captured — see
+    // [`captured_identity_rows`]. The per-ID re-reads it replaces only ever
+    // touched those IDs, and the listing carries releases the scan deliberately
+    // skipped, under a parser that fails closed on shapes the scan tolerates.
+    let live_identities = if stop_early {
+        None
+    } else {
+        let captured_ids: std::collections::BTreeSet<u64> = identities.keys().copied().collect();
+        Some(release_identity_listing(slug, &captured_ids)?)
+    };
     for published in &mut found {
         let release_id = published.release_id.ok_or_else(|| {
             Error::new("production published identity has no immutable release ID")
@@ -241,18 +293,14 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
                 "release ID {release_id} has no captured immutable identity"
             ))
         })?;
-        // On an exhaustive scan every remaining release's fetch+download round
-        // ran since this release's bracketed before/after pair, so re-read once
-        // more: concurrent channel mutation during the long scan must fail the
-        // scan, not return a torn view. The stop-early replay fetches exactly
-        // one manifest and its own pair already brackets that only transfer.
-        if !stop_early {
-            let observed = publish::release_object_by_id(slug, release_id)?;
-            if observed.as_ref() != Some(captured) {
-                return Err(Error::new(format!(
-                    "release ID {release_id} identity changed after manifest validation"
-                )));
-            }
+        // A missing entry is a release deleted mid-scan; a differing entry is a
+        // release edited mid-scan. Both are the torn view this refuses to return.
+        if let Some(live) = &live_identities
+            && live.get(&release_id) != Some(captured)
+        {
+            return Err(Error::new(format!(
+                "release ID {release_id} identity changed after manifest validation"
+            )));
         }
         publish::validate_release_object_tag_state(
             Some(captured),
@@ -263,6 +311,87 @@ fn scan_published_snapshot(slug: &str, stop_early: bool) -> Result<Vec<Published
         published.release = Some(captured.clone());
     }
     Ok(found)
+}
+
+/// The exact refusal [`publish::release_asset_identity_for_release_id`] raises,
+/// kept verbatim now that the scan resolves the binding through the fused
+/// release-object/asset read instead of that helper.
+fn missing_release_asset(release_id: u64, name: &str) -> Error {
+    Error::new(format!(
+        "release ID {release_id} has 0 assets named {name:?}; expected exactly one"
+    ))
+}
+
+/// The `wanted` release objects as the channel currently exposes them, by
+/// immutable ID, from a single paginated listing.
+///
+/// `publish::release_identity_jq(true)` emits byte-identical
+/// [`publish::ReleaseObjectIdentity`] rows to the exact-ID program — `tests/resume.rs`
+/// pins that equivalence — so a row read here compares against a captured
+/// snapshot on exactly the same four fields the per-ID read compared.
+fn release_identity_listing(
+    slug: &str,
+    wanted: &std::collections::BTreeSet<u64>,
+) -> Result<std::collections::BTreeMap<u64, publish::ReleaseObjectIdentity>> {
+    const PER_PAGE: usize = 100;
+    const MAX_PAGES: u32 = 10;
+    let mut observed = std::collections::BTreeMap::new();
+    for page in 1..=MAX_PAGES {
+        let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
+        let out = gh_retry(&["api", &path, "--jq", publish::release_identity_jq(true)])?;
+        let text = out.stdout_utf8();
+        // Pagination is driven by what GitHub RETURNED, never by what survived
+        // the ID filter below — otherwise one page of uninteresting releases
+        // would end the walk before the captured ones were seen.
+        let page_len = text.lines().count();
+        let captured = captured_identity_rows(&text, wanted);
+        let rows = publish::parse_release_object_identity_rows(&captured)?;
+        for row in rows {
+            observed.insert(row.id, row);
+        }
+        if page_len < PER_PAGE {
+            break;
+        }
+        if page == MAX_PAGES {
+            return Err(Error::new(format!(
+                "release identity listing reached the {MAX_PAGES}-page safety cap before exhaustion"
+            )));
+        }
+    }
+    Ok(observed)
+}
+
+/// The `wanted` releases' rows, selected out of one page of the channel's full
+/// identity listing before the strict parser sees them.
+///
+/// The listing endpoint returns EVERY release object in the repo, but only the
+/// IDs this scan captured are ever compared, and
+/// [`publish::parse_release_object_identity_rows`] fails closed on an empty tag
+/// or target. Those two facts collide: [`scan_release_page`] deliberately
+/// TOLERATES exactly that shape — a draft created in the GitHub web UI without
+/// picking a tag comes back as `tag_name: ""`, and the scan skips it at the
+/// `release.draft` guard, so `ship status`/`yank` succeed today. Handing the
+/// whole page to the strict parser would turn that unrelated release into a
+/// hard failure of a read-only command, so the strict parse is restricted to
+/// the rows the scan actually captured — precisely the set the per-ID re-reads
+/// this batch replaced used to touch.
+///
+/// Restricting the batch never loosens the check. For a captured ID the parse
+/// stays exactly as strict as the per-ID read was; a row whose own ID field is
+/// unreadable cannot be attributed to a captured release at all, so dropping it
+/// leaves that ID ABSENT from the live map and the comparison in
+/// [`scan_published_snapshot`] reports the scan as torn. Fail-closed either way
+/// — the only thing that changes is whose malformation can fail us.
+fn captured_identity_rows(page: &str, wanted: &std::collections::BTreeSet<u64>) -> String {
+    page.lines()
+        .filter(|line| {
+            line.split('\t')
+                .next()
+                .and_then(|id| id.parse::<u64>().ok())
+                .is_some_and(|id| wanted.contains(&id))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The canonical version a candidate tag names: `"v0.2.0"` → `"0.2.0"`.
@@ -1544,4 +1673,68 @@ fn slug_of(repo: &Path) -> Result<String> {
             "Cargo.toml [workspace.package] repository is not an exact GitHub OWNER/REPO URL",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One page of `release_identity_jq(true)` output, exactly as `gh` hands it
+    /// over: id, tag, draft, target, tab-separated. Release 9 is the shape the
+    /// GitHub web UI produces when a draft is created without picking a tag.
+    const PAGE_WITH_A_TAGLESS_DRAFT: &str = "9\t\ttrue\tmain\n12\tv0.3.0\tfalse\tabc123\n";
+
+    /// The regression the row filter exists to stop. The exhaustive scan skips
+    /// that tagless draft outright (`release.draft` guard in
+    /// [`scan_release_page`], over the tolerant [`parse_release_metadata`]), so
+    /// `ship status`/`yank` succeed with it in the repo. Feeding the whole page
+    /// to the strict identity parser would have made that unrelated release
+    /// abort the batched recheck of the releases the scan DID capture.
+    #[test]
+    fn an_unrelated_tagless_draft_cannot_abort_the_batched_recheck() {
+        // Unfiltered the page really is fatal — this is what makes the filter
+        // load-bearing rather than decorative.
+        assert!(publish::parse_release_object_identity_rows(PAGE_WITH_A_TAGLESS_DRAFT).is_err());
+        let wanted = std::collections::BTreeSet::from([12]);
+        let selected = captured_identity_rows(PAGE_WITH_A_TAGLESS_DRAFT, &wanted);
+        let rows = publish::parse_release_object_identity_rows(&selected)
+            .expect("the captured rows alone must parse");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 12);
+        assert_eq!(rows[0].tag, "v0.3.0");
+        assert!(!rows[0].draft);
+        assert_eq!(rows[0].target_commitish, "abc123");
+    }
+
+    /// Narrowing the batch must not SOFTEN it. When the malformed row belongs to
+    /// a release this scan captured, the strict parse still refuses — that ID's
+    /// identity is authority for a destructive yank.
+    #[test]
+    fn a_captured_row_that_is_malformed_still_fails_closed() {
+        let wanted = std::collections::BTreeSet::from([9, 12]);
+        let selected = captured_identity_rows(PAGE_WITH_A_TAGLESS_DRAFT, &wanted);
+        let err = publish::parse_release_object_identity_rows(&selected)
+            .expect_err("an empty tag on a CAPTURED release is still fatal");
+        assert!(
+            err.to_string().contains("empty/zero identity field"),
+            "{err}"
+        );
+    }
+
+    /// A row we cannot even attribute is dropped rather than parsed: it cannot
+    /// be one of ours, because ours are identified by numeric ID. The captured
+    /// ID is then simply absent from the live map and
+    /// [`scan_published_snapshot`] reports the scan as torn — the same refusal a
+    /// mid-scan deletion earns. An empty selection is not itself an error.
+    #[test]
+    fn a_row_with_an_unreadable_id_is_dropped_not_parsed() {
+        let page = "not-a-number\tv0.3.0\tfalse\tabc123\n";
+        let wanted = std::collections::BTreeSet::from([12]);
+        assert_eq!(captured_identity_rows(page, &wanted), "");
+        assert!(
+            publish::parse_release_object_identity_rows("")
+                .expect("an empty selection parses")
+                .is_empty()
+        );
+    }
 }

@@ -196,8 +196,9 @@ pub(crate) struct ActivitySample {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Evidence {
     /// A phase pinned explicitly by the user. Outranks everything. No surface
-    /// writes one yet (session metadata carries title/description/icon only),
-    /// so the branch is live but unfed — see RFC §9's remaining work.
+    /// writes one yet (session metadata carries title/description/icon/role/
+    /// attention — none of them a phase pin), so the branch is live but
+    /// unfed — see RFC §9's remaining work.
     pub(crate) pin: Option<Phase>,
     pub(crate) shell: Option<ShellEvidence>,
     pub(crate) lifecycle: Option<Lifecycle>,

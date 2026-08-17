@@ -36,6 +36,24 @@
 //! handholds sit ([`RobiSense::handholds`]) — tab-chip centers when a strip
 //! exists, an even rhythm otherwise — so the brain never needs to know which
 //! tab flavour is on screen.
+//!
+//! ## Caret avoidance
+//!
+//! The caret's ROW is his floor; its COLUMN is the user's workspace. Every
+//! stationary ground scene — the jumping jacks, both idle stands, the long
+//! rest — keeps his body center at least [`caret_clearance`] away from the
+//! caret column's center: the per-cycle stage marks are pushed to the nearer
+//! edge of that exclusion zone (the far edge when the grid margin leaves the
+//! nearer side no room; unchanged when the grid is too narrow for either),
+//! and since the walks TARGET those marks, he also aims away with no
+//! special-casing. Still a pure function of `(birth, seed, now, sense)`: the
+//! zone is re-derived from the live caret on every evaluation, so a caret
+//! arriving under a resting Robi displaces him on the next natural redraw —
+//! typing is what repaints, so no wake is armed and the zero-cost-idle
+//! contract holds. Exempt on purpose: mid-walk positions (strolling PAST the
+//! typist is fine; loitering on the word being typed is not) and the whole
+//! ladder/climb/bars arc — the ladder must stay planted on `holds[0]`, and
+//! up there he is above the text anyway.
 
 use web_time::Instant;
 
@@ -81,6 +99,19 @@ pub fn art_rows(geom: &EffectGeom) -> f32 {
 /// Authored pose viewbox aspect (width ÷ height) — `robi.py`'s 128 × 176.
 pub const ART_ASPECT: f32 = 128.0 / 176.0;
 
+/// The caret-avoidance half-width in grid px: how far Robi's body CENTER
+/// must stay from the caret column's center while he loiters on the ground
+/// (see the module doc's "Caret avoidance"). Half his body width plus two
+/// cells — at that distance his nearest edge clears a full two columns of
+/// whatever is being typed, close enough to keep the user company, far
+/// enough that he never squats on the word under the cursor. Shared with the
+/// tests so the law is pinned in one place, like [`art_rows`].
+#[must_use]
+pub fn caret_clearance(geom: &EffectGeom) -> i32 {
+    let body_w = (art_rows(geom) * ART_ASPECT * f32::from(geom.cell_h)).round() as i32;
+    body_w / 2 + 2 * i32::from(geom.cell_w).max(1)
+}
+
 /// Fraction of the pose viewbox height where standing feet rest
 /// (`GROUND / VB_H` in `robi.py`).
 pub const FEET_FRAC: f32 = 170.0 / 176.0;
@@ -88,6 +119,58 @@ pub const FEET_FRAC: f32 = 170.0 / 176.0;
 /// Fraction of the pose viewbox height where a hanging hand grips
 /// (`GRIP_Y / VB_H` in `robi.py`).
 pub const GRIP_FRAC: f32 = 10.0 / 176.0;
+
+/// Robi's drawn-body SIZE in px for a viewport — `(w, h)`: `h` is the
+/// rounded [`art_rows`] height, `w` follows [`ART_ASPECT`] under the shared
+/// atlas's `4·cell_h` slot cap (`CatBaker::slot_w`). The cap is the ATLAS
+/// CONTRACT, not a taste: a wider tile is REFUSED by `host_tile` and the
+/// body silently stops resolving — [`ART_ROWS_MAX`] is chosen to stay
+/// inside it, so the clamp only ever catches rounding. ONE copy of the law,
+/// the pet's `body_px` discipline: the emitter (`WordDecorations::robi`)
+/// bakes with it and the host's dismiss hit-box derives from it, so the
+/// click box IS the sprite, not a model of it.
+#[must_use]
+pub fn body_size_px(geom: &EffectGeom) -> (u16, u16) {
+    let h = ((art_rows(geom) * f32::from(geom.cell_h)).round() as i32)
+        .clamp(1, i32::from(u16::MAX)) as u16;
+    let slot = (i32::from(geom.cell_h) * 4).max(1);
+    let w = ((f32::from(h) * ART_ASPECT).round() as i32)
+        .clamp(1, slot)
+        .min(i32::from(u16::MAX)) as u16;
+    (w, h)
+}
+
+/// Place a `w × h` body at an evaluated frame's anchor: the dest rect
+/// `(x0, x1, y0, y1)` (right/bottom exclusive, grid px) — top from the
+/// anchor fraction ([`FEET_FRAC`] / [`GRIP_FRAC`]), `frame.x` a CENTER.
+/// Split from [`body_px`] because the emitter must place the RESOLVED tile
+/// with the same law — on a bake miss that is `robi_last_body` at the
+/// PREVIOUS size, the one accepted transient.
+#[must_use]
+pub fn body_rect_px(frame: &RobiFrame, w: u16, h: u16) -> (i32, i32, i32, i32) {
+    let anchor_frac = match frame.anchor {
+        RobiAnchor::Feet => FEET_FRAC,
+        RobiAnchor::Grip => GRIP_FRAC,
+    };
+    let top = frame.anchor_y - (f32::from(h) * anchor_frac).round() as i32;
+    let x0 = frame.x - i32::from(w) / 2;
+    (x0, x0 + i32::from(w), top, top + i32::from(h))
+}
+
+/// Robi's LIVE drawn body for one evaluated frame, in grid px —
+/// [`body_size_px`] placed by [`body_rect_px`]: exactly the dest rect the
+/// emitter draws when the bake resolves at the current size. `None` when
+/// nothing is on glass (`alpha == 0`) or the cell metrics are degenerate —
+/// the same frames the emitter draws nothing for, which is what clears a
+/// host's stashed hit-box.
+#[must_use]
+pub fn body_px(frame: &RobiFrame, geom: &EffectGeom) -> Option<(i32, i32, i32, i32)> {
+    if frame.alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
+        return None;
+    }
+    let (w, h) = body_size_px(geom);
+    Some(body_rect_px(frame, w, h))
+}
 
 /// Ladder tile aspect (width ÷ height) — `robi.py`'s 48 × 32 segment.
 pub const LADDER_ASPECT: f32 = 48.0 / 32.0;
@@ -394,28 +477,61 @@ impl RobiShow {
         // The "textbox" ground: the bottom edge of the caret's row.
         let ground = (i32::from(sense.cursor.0) + 1) * ch;
 
+        // Caret avoidance (module doc): a ground mark inside the exclusion
+        // zone around the caret column steps to the nearer zone edge, the far
+        // edge when `clamp_x` pulls the nearer one back inside, and stays put
+        // only when the grid is too narrow to honor either side.
+        let caret_cx = i32::from(sense.cursor.1) * cw + cw / 2;
+        let clearance = caret_clearance(&g);
+        let avoid_x = |x: i32| -> i32 {
+            let x = clamp_x(x);
+            if (x - caret_cx).abs() >= clearance {
+                return x;
+            }
+            let (near, far) = if x <= caret_cx {
+                (caret_cx - clearance, caret_cx + clearance)
+            } else {
+                (caret_cx + clearance, caret_cx - clearance)
+            };
+            let near = clamp_x(near);
+            if (near - caret_cx).abs() >= clearance {
+                return near;
+            }
+            let far = clamp_x(far);
+            if (far - caret_cx).abs() >= clearance {
+                return far;
+            }
+            x
+        };
+
         let cycle = t / CYCLE_MS;
         let p = t % CYCLE_MS;
 
         // Per-cycle stage marks (deterministic wander): where he does the
-        // jacks and where he rests, as grid fractions.
+        // jacks and where he rests, as grid fractions. Caret-avoided — these
+        // are exactly the spots he LOITERS on, and they double as the walk
+        // targets, so avoidance here steers the walks away too.
         let frac = |c: u64, salt: u64| -> f32 {
             (genome::mix(self.seed ^ c.rotate_left(11) ^ salt) % 1000) as f32 / 1000.0
         };
-        let x_jacks = clamp_x(((0.30 + 0.40 * frac(cycle, 1)) * grid_w as f32) as i32);
-        let x_rest = clamp_x(((0.50 + 0.40 * frac(cycle, 2)) * grid_w as f32) as i32);
+        let x_jacks = avoid_x(((0.30 + 0.40 * frac(cycle, 1)) * grid_w as f32) as i32);
+        let x_rest = avoid_x(((0.50 + 0.40 * frac(cycle, 2)) * grid_w as f32) as i32);
         // Where this cycle's opening walk starts: the previous cycle's rest
-        // spot — or, on the very first cycle, the right edge (his entrance).
+        // spot (avoided the same way, so the cycle seam has no position pop)
+        // — or, on the very first cycle, the right edge (his entrance).
         let x_from = if cycle == 0 {
             (grid_w - margin).max(margin)
         } else {
-            clamp_x(((0.50 + 0.40 * frac(cycle - 1, 2)) * grid_w as f32) as i32)
+            avoid_x(((0.50 + 0.40 * frac(cycle - 1, 2)) * grid_w as f32) as i32)
         };
 
         // Handholds (the host guarantees at least two).
         let n = usize::from(sense.handhold_count).clamp(1, MAX_HANDHOLDS);
         let holds = &sense.handholds[..n];
         let x_ladder = clamp_x(holds[0]);
+        // Where he stands once he is back on the floor after the bars: the
+        // last hold's column, stepped aside if the caret waits beneath it.
+        let x_land = avoid_x(holds[n - 1]);
         let bar_y = sense.bar_y;
 
         let ladder_full = RobiLadder {
@@ -518,9 +634,13 @@ impl RobiShow {
         } else if p < DROP_END {
             let pr = fraction(p, BARS_END, DROP_END);
             let y = lerp_i(hang_feet, ground, pr * pr);
+            // He hops off SIDEWAYS when the caret waits below the last hold —
+            // the drop lands on `x_land`, so the following stand needs no
+            // corrective shuffle (with the caret elsewhere this lerp is a
+            // constant and the drop is byte-identical to the straight fall).
             (
                 RobiGlyphId::RobiJacks0,
-                clamp_x(holds[n - 1]),
+                lerp_i(clamp_x(holds[n - 1]), x_land, pr),
                 y,
                 RobiAnchor::Feet,
                 false,
@@ -530,7 +650,7 @@ impl RobiShow {
         } else if p < IDLE_2_END {
             (
                 RobiGlyphId::RobiStand,
-                clamp_x(holds[n - 1]),
+                x_land,
                 ground,
                 RobiAnchor::Feet,
                 false,
@@ -539,7 +659,7 @@ impl RobiShow {
             )
         } else if p < WANDER_END {
             let pr = fraction(p, IDLE_2_END, WANDER_END);
-            let x0 = clamp_x(holds[n - 1]);
+            let x0 = x_land;
             let x = lerp_i(x0, x_rest, pr);
             (
                 walk_pose(p),
@@ -717,6 +837,59 @@ mod tests {
         }
     }
 
+    /// THE body law, pinned the way the pet pins `PetFrame::body_px`: the
+    /// SAME functions the emitter bakes and places by are what a host's
+    /// dismiss hit-box reads, so this test is what keeps the click box from
+    /// drifting off the drawn robot when the clamp or an anchor changes.
+    #[test]
+    fn body_px_is_the_emitters_body_law() {
+        let g = sense().geom; // 10×20 cells, 30 rows ⇒ art_rows = ART_ROWS
+        // h = round(3.2·20) = 64, w = round(64·128/176) = 47 — inside the
+        // 4·cell_h = 80 px atlas slot.
+        assert_eq!(body_size_px(&g), (47, 64));
+        let stand = RobiFrame {
+            pose: RobiGlyphId::RobiStand,
+            x: 500,
+            anchor_y: 580,
+            anchor: RobiAnchor::Feet,
+            flip_x: false,
+            alpha: 255,
+            ladder: None,
+            tip: None,
+            animating: false,
+        };
+        // Feet: top = anchor_y − round(64·FEET_FRAC) = 580 − 62; center-x.
+        assert_eq!(body_px(&stand, &g), Some((477, 524, 518, 582)));
+        // Grip hangs him from the hands — a bar ABOVE row 0 keeps its
+        // negative overhang (the host's strip splice owns the shift):
+        // top = −10 − round(64·GRIP_FRAC) = −14.
+        let hang = RobiFrame {
+            anchor: RobiAnchor::Grip,
+            anchor_y: -10,
+            ..stand
+        };
+        assert_eq!(body_px(&hang, &g), Some((477, 524, -14, 50)));
+        // Not-on-glass frames have NO body — the `None` is what clears a
+        // host's stash — and degenerate metrics never divide.
+        assert_eq!(body_px(&RobiFrame { alpha: 0, ..stand }, &g), None);
+        let dead = EffectGeom { cell_w: 0, ..g };
+        assert_eq!(body_px(&stand, &dead), None);
+        // The atlas cap is structural across every reachable viewport.
+        for rows in 1u16..=400 {
+            let g = EffectGeom {
+                cell_w: 10,
+                cell_h: 20,
+                rows,
+                cols: 100,
+            };
+            let (w, _) = body_size_px(&g);
+            assert!(
+                i32::from(w) <= 4 * 20,
+                "rows={rows}: a {w}px-wide body overflows the atlas slot"
+            );
+        }
+    }
+
     fn show(base: Instant) -> RobiShow {
         let mut s = RobiShow::default();
         s.start(base, 7);
@@ -879,6 +1052,86 @@ mod tests {
                 assert!(f.x >= 0 && f.x <= grid_w, "t={t}: x={} escapes", f.x);
             }
         }
+    }
+
+    /// CARET AVOIDANCE: every scene where he LOITERS on the ground — the
+    /// jumping jacks, both idle stands, the long rest — keeps his body center
+    /// at least [`caret_clearance`] from the caret column's center, wherever
+    /// the caret is and whichever cycle's marks are in play.
+    #[test]
+    fn stationary_scenes_stay_out_of_the_typists_column() {
+        let base = t0();
+        let s = show(base);
+        let clearance = caret_clearance(&sense().geom);
+        // One probe inside each stationary window: jacks, idle-1, idle-2, rest.
+        let probes = [5_000u64, 12_000, 40_000, 60_000];
+        for col in [0u16, 10, 25, 40, 55, 70, 85, 99] {
+            let mut se = sense();
+            se.cursor = (28, col);
+            let caret_cx = i32::from(col) * 10 + 5;
+            for cycle in 0..4u64 {
+                for off in probes {
+                    let f = s.frame(at(base, cycle * CYCLE_MS + off), &se).unwrap();
+                    assert!(
+                        (f.x - caret_cx).abs() >= clearance,
+                        "cycle {cycle} t+{off} col {col}: x={} loiters within \
+                         {clearance}px of caret center {caret_cx}",
+                        f.x
+                    );
+                }
+            }
+        }
+    }
+
+    /// CARET AVOIDANCE is PURE and keeps the zero-wake idle contract: park
+    /// the caret exactly where he would otherwise rest and he stands aside —
+    /// still `animating == false`, and two probes of the identical sense
+    /// seconds apart evaluate to the identical static frame.
+    #[test]
+    fn a_caret_parked_under_a_resting_robi_displaces_him_purely() {
+        let base = t0();
+        let s = show(base);
+        let mut far = sense();
+        far.cursor = (28, 0);
+        // Where he rests with the caret far away…
+        let rest = s.frame(at(base, 60_000), &far).unwrap();
+        assert!(!rest.animating, "the long rest is static");
+        // …then park the caret in that very column.
+        let col = (rest.x / 10) as u16;
+        let mut under = sense();
+        under.cursor = (28, col);
+        let clearance = caret_clearance(&under.geom);
+        let caret_cx = i32::from(col) * 10 + 5;
+        let a = s.frame(at(base, 60_000), &under).unwrap();
+        let b = s.frame(at(base, 74_000), &under).unwrap();
+        assert!(
+            (a.x - caret_cx).abs() >= clearance,
+            "x={} still loiters on the caret at {caret_cx}",
+            a.x
+        );
+        assert_ne!(a.x, rest.x, "the parked caret really displaced him");
+        assert!(!a.animating, "displacement must not arm wakes");
+        assert_eq!(a.pose, b.pose);
+        assert_eq!(
+            (a.x, a.anchor_y, a.alpha, a.animating),
+            (b.x, b.anchor_y, b.alpha, b.animating),
+            "identical sense ⇒ identical static frame"
+        );
+    }
+
+    /// The ladder/climb arc is EXEMPT from caret avoidance: the ladder must
+    /// stay planted on `holds[0]` even with the caret right beneath it (up
+    /// there he is above the text anyway).
+    #[test]
+    fn the_ladder_stays_planted_even_with_the_caret_beneath_it() {
+        let base = t0();
+        let s = show(base);
+        let mut se = sense();
+        // holds[0] = 60 ⇒ column 6's center (65) is well inside the zone.
+        se.cursor = (28, 6);
+        let climb = s.frame(at(base, 22_000), &se).unwrap();
+        assert_eq!(climb.x, 60, "the climb tracks the first handhold");
+        assert_eq!(climb.ladder.expect("ladder while climbing").x, 60);
     }
 
     /// The bank keeps its promises: enough variety in every category, the

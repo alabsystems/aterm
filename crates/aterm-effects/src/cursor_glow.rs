@@ -3685,9 +3685,24 @@ pub struct CursorGlow {
     last_type: Option<Instant>,
     /// Deterministic spark/ember PRNG state.
     rng: u32,
-    /// Reused each frame by [`Self::emit_comet`] as the swept-cell run builder, so the
-    /// animated comet reuses one resident nested Vec instead of allocating a fresh
-    /// `Vec<Vec<CometSample>>` every redraw. `comet_run` is the in-progress run.
+    /// Reused each frame by [`Self::emit_comet`] and [`Self::emit_custom`] as the
+    /// swept-cell run builder, so the animated beam reuses one resident nested Vec
+    /// instead of allocating a fresh `Vec<Vec<CometSample>>` every redraw.
+    /// `comet_run` is the in-progress run.
+    ///
+    /// The INNER buffers are pooled too: each emitter `clear()`s the existing
+    /// entries in place (never `comet_runs.clear()`, which would free them) and
+    /// publishes a finished run by SWAPPING it with the pooled entry at the live
+    /// watermark — so `comet_run` always comes back holding an already-allocated,
+    /// already-emptied buffer instead of the capacity-0 `Vec` a `mem::take` would
+    /// leave behind. Entries past the emitter's local `runs_len` watermark are
+    /// spares from earlier frames, which is why every consumer reads
+    /// `&comet_runs[..runs_len]` rather than the whole spine. Growth is bounded by
+    /// runs ≤ sparks ≤ [`Self::MAX_SPARKS`].
+    ///
+    /// Shared between the two emitters on purpose: `tick` takes exactly ONE of the
+    /// two arms per frame and both clear on entry, so a style switch cannot leak
+    /// samples across frames.
     comet_runs: Vec<Vec<CometSample>>,
     comet_run: Vec<CometSample>,
     /// Reused by [`Self::emit_water`] for the curved wake spine. Keeping this
@@ -3696,6 +3711,9 @@ pub struct CursorGlow {
     /// Reused by [`Self::emit_bolts`] (Laser strikes) for the per-bolt polyline,
     /// so a strike frame allocates nothing after the first growth.
     bolt_verts: Vec<BeamVertex>,
+    /// Reused by [`Self::emit_comet`]'s Laser arm for the per-layer filament
+    /// polyline, so a laser frame allocates nothing after the first growth.
+    comet_verts: Vec<BeamVertex>,
     /// Live OUTGOING style crossfades (≤ [`Self::FADE_CAP`], oldest dropped) —
     /// see [`OutgoingFade`] and the STYLE SWITCH contract in [`Self::tick`].
     /// Empty in steady state: the no-switch tick path pays ONE `is_empty` test,
@@ -10604,9 +10622,17 @@ impl CursorGlow {
         // stale older group never connects across empty space. Each sample carries
         // its time-faded coverage and path position (tail 0 → head 1, for the hue
         // ramp). A fully-faded tail cell breaks the colour, not the run.
-        // Reuse the resident run-builder scratch (outer spine capacity kept) instead
-        // of allocating a fresh nested Vec every animated frame.
-        self.comet_runs.clear();
+        // Reuse the resident run-builder scratch (spine AND per-run sample buffers
+        // kept) instead of allocating a fresh nested Vec every animated frame:
+        // clearing each entry in place keeps its heap buffer, where the old
+        // `comet_runs.clear()` dropped every inner `Vec` and forced the next frame
+        // to grow each run back from capacity 0. `runs_len` is the live watermark —
+        // entries past it are emptied spares, so every consumer below reads
+        // `..runs_len`, never the whole spine.
+        for r in &mut self.comet_runs {
+            r.clear();
+        }
+        let mut runs_len = 0usize;
         self.comet_run.clear();
         let mut prev: Option<(u16, u16)> = None;
         let mut head_cov = 0u8;
@@ -10720,7 +10746,15 @@ impl CursorGlow {
                     .max((s.col as i32 - pc as i32).abs())
                     > 1;
                 if far && !self.comet_run.is_empty() {
-                    self.comet_runs.push(std::mem::take(&mut self.comet_run));
+                    if runs_len == self.comet_runs.len() {
+                        self.comet_runs.push(Vec::new());
+                    }
+                    // SWAP, not `take`: the pooled (already-cleared) buffer at the
+                    // watermark comes back into `comet_run`, so the next run starts
+                    // with capacity instead of reallocating from zero.
+                    let (runs, cur_run) = (&mut self.comet_runs, &mut self.comet_run);
+                    std::mem::swap(&mut runs[runs_len], cur_run);
+                    runs_len += 1;
                 }
             }
             let (x, y) = center(s.row, s.col);
@@ -10739,9 +10773,14 @@ impl CursorGlow {
             head_cov = cov;
         }
         if !self.comet_run.is_empty() {
-            self.comet_runs.push(std::mem::take(&mut self.comet_run));
+            if runs_len == self.comet_runs.len() {
+                self.comet_runs.push(Vec::new());
+            }
+            let (runs, cur_run) = (&mut self.comet_runs, &mut self.comet_run);
+            std::mem::swap(&mut runs[runs_len], cur_run);
+            runs_len += 1;
         }
-        if self.comet_runs.is_empty() {
+        if runs_len == 0 {
             return;
         }
         // Connect the head run to the LIVE cursor cell so the beam visibly attaches
@@ -10756,7 +10795,10 @@ impl CursorGlow {
         if let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
-            && let Some(last) = self.comet_runs.last_mut()
+            // The LIVE head run is at `runs_len - 1` (non-zero: the guard above
+            // returned otherwise) — NOT `last_mut()`, which under the pool would
+            // hand back a stale spare from an earlier, longer frame.
+            && let Some(last) = self.comet_runs.get_mut(runs_len - 1)
             && let Some(head) = last.last().copied()
         {
             let (_, y) = center(cr, cc);
@@ -10809,7 +10851,7 @@ impl CursorGlow {
         // (rails' falloff dies right at the row edge), and dark ink under
         // the skirts only ever darkens — never lifts toward the ground.
         if !cfg.dark_theme {
-            for run in &self.comet_runs {
+            for run in &self.comet_runs[..runs_len] {
                 for s in run {
                     // Radius-scale peak: strong while the spark is fresh,
                     // culled by push_halo_over's perceptual floor (<96) about
@@ -10893,7 +10935,14 @@ impl CursorGlow {
         // is a clean diagonal, not a stair-stepped polyline of cell centres.
         let straighten = cwf.max(chf) * 0.8;
 
-        for r in &self.comet_runs {
+        // The Laser arm's per-layer filament polyline. Taken via the same
+        // `mem::take` idiom `tick` uses for the halo/patch/bolt scratches (a
+        // `&mut self.comet_verts` binding cannot live across the loop: the body
+        // calls `self.comet_color`, a whole-`self` shared borrow). Taken HERE —
+        // past every early return above — so no exit path can drop the capacity,
+        // and restored unconditionally right after the loop.
+        let mut comet_verts = std::mem::take(&mut self.comet_verts);
+        for r in &self.comet_runs[..runs_len] {
             if r.len() < 2 {
                 // A lone swept cell (e.g. a single move with the cursor hidden): a
                 // small soft dot, not a full blocky cell.
@@ -10929,9 +10978,13 @@ impl CursorGlow {
                         (1.5, 0.95, 0.10, 0.0),  // beam body
                         (0.6, 1.00, 0.26, 0.42), // white-hot filament, hotter to the head
                     ];
-                    let mut bverts: Vec<BeamVertex> = Vec::with_capacity(r.len());
+                    // The polyline buffer is the resident `comet_verts` scratch
+                    // taken above (it was a fresh `Vec::with_capacity(r.len())`
+                    // per run per frame). `clear()` below already resets it at the
+                    // top of every layer pass and `comet_beam` only ever reads the
+                    // filled prefix, so the emitted quads are byte-identical.
                     for &(tmul, cmul, mbase, mpos) in &LASER_CORE {
-                        bverts.clear();
+                        comet_verts.clear();
                         for s in r {
                             let style = self.comet_color(cfg, s.pos);
                             let color = if mbase > 0.0 || mpos > 0.0 {
@@ -10939,7 +10992,7 @@ impl CursorGlow {
                             } else {
                                 style
                             };
-                            bverts.push(BeamVertex {
+                            comet_verts.push(BeamVertex {
                                 x: s.x,
                                 y: s.y,
                                 color,
@@ -10949,7 +11002,7 @@ impl CursorGlow {
                         comet_beam(
                             out,
                             geom.beam_clip(),
-                            &bverts,
+                            &comet_verts,
                             core_thick * tmul,
                             1,
                             straighten,
@@ -11007,6 +11060,9 @@ impl CursorGlow {
                 }
             }
         }
+        // Restore the filament scratch UNCONDITIONALLY (no exit path lies between
+        // the take and here), so its capacity survives to the next frame.
+        self.comet_verts = comet_verts;
     }
 
     /// Resolve a **Trail Pack** ramp at path position `pos` (0 tail → 1 head).
@@ -11065,9 +11121,14 @@ impl CursorGlow {
     /// `cfg.pack`. Every custom sample flows through this function's own
     /// emission funnels, where the structural legibility ceiling
     /// ([`Self::CUSTOM_COV_CAP`]) is applied — a pack cannot bypass it.
+    ///
+    /// Takes `&mut self` solely so the beam funnel can reuse the resident
+    /// `comet_runs`/`comet_run` scratch the built-in twin already uses (the two
+    /// arms are mutually exclusive per frame and both clear on entry); every
+    /// helper it calls is still `&self`.
     #[allow(clippy::too_many_arguments)]
     fn emit_custom(
-        &self,
+        &mut self,
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
@@ -11088,8 +11149,16 @@ impl CursorGlow {
             // but the fade envelope is the PACK's and every sample coverage is
             // hard-clamped to the structural ceiling. This CometSample builder is
             // the sole beam funnel — a pack cannot emit a sample past the cap.
-            let mut runs: Vec<Vec<CometSample>> = Vec::new();
-            let mut run: Vec<CometSample> = Vec::new();
+            // Reuse the SAME resident run-builder scratch the built-in twin uses
+            // (this arm used to build a whole nested `Vec` from scratch every
+            // frame). Clearing each pooled entry in place is MANDATORY, not
+            // optional: without it the previous frame's samples would render as a
+            // ghost beam. `runs_len` is the live watermark — see the field doc.
+            for r in &mut self.comet_runs {
+                r.clear();
+            }
+            let mut runs_len = 0usize;
+            self.comet_run.clear();
             let mut prev: Option<(u16, u16)> = None;
             let mut head_cov = 0u8;
             for s in &self.sparks {
@@ -11136,12 +11205,19 @@ impl CursorGlow {
                         .abs()
                         .max((s.col as i32 - pc as i32).abs())
                         > 1;
-                    if far && !run.is_empty() {
-                        runs.push(std::mem::take(&mut run));
+                    if far && !self.comet_run.is_empty() {
+                        if runs_len == self.comet_runs.len() {
+                            self.comet_runs.push(Vec::new());
+                        }
+                        // SWAP, not `take`: the pooled (already-cleared) buffer at
+                        // the watermark comes back into `comet_run`.
+                        let (runs, cur_run) = (&mut self.comet_runs, &mut self.comet_run);
+                        std::mem::swap(&mut runs[runs_len], cur_run);
+                        runs_len += 1;
                     }
                 }
                 let (x, y) = center(s.row, s.col);
-                run.push(CometSample {
+                self.comet_run.push(CometSample {
                     x,
                     y,
                     cov,
@@ -11150,15 +11226,25 @@ impl CursorGlow {
                 prev = Some(here);
                 head_cov = cov;
             }
-            if !run.is_empty() {
-                runs.push(run);
+            if !self.comet_run.is_empty() {
+                if runs_len == self.comet_runs.len() {
+                    self.comet_runs.push(Vec::new());
+                }
+                let (runs, cur_run) = (&mut self.comet_runs, &mut self.comet_run);
+                std::mem::swap(&mut runs[runs_len], cur_run);
+                runs_len += 1;
             }
             // Bridge the head run to the live cursor cell while adjacent, exactly
             // as `emit_comet` does (the streak visibly leaves the cursor).
+            // The `runs_len > 0` test reproduces the old `runs.last_mut()`
+            // exactly — the chain short-circuits when no run was published this
+            // frame — and indexing the watermark rather than `last_mut()` keeps a
+            // stale pooled spare from an earlier, longer frame out of the bridge.
             if let Some((cr, cc)) = cur
                 && (cr as usize) < geom.rows
                 && (cc as usize) < geom.cols
-                && let Some(last) = runs.last_mut()
+                && runs_len > 0
+                && let Some(last) = self.comet_runs.get_mut(runs_len - 1)
                 && let Some(head) = last.last().copied()
             {
                 let (_, y) = center(cr, cc);
@@ -11194,7 +11280,7 @@ impl CursorGlow {
                 } else {
                     0.38
                 };
-                for r in &runs {
+                for r in &self.comet_runs[..runs_len] {
                     for s in r {
                         let peak = ((s.cov as f32) * 1.9).min(230.0) as u8;
                         let color =
@@ -11222,7 +11308,7 @@ impl CursorGlow {
                     }
                 }
             } else {
-                for r in &runs {
+                for r in &self.comet_runs[..runs_len] {
                     if r.len() < 2 {
                         if let Some(s0) = r.first() {
                             let s = core_px.max(2.0) as i32;
@@ -11258,7 +11344,7 @@ impl CursorGlow {
             if p.channels.bed && !light_veil {
                 let w = (cwf as i32).max(1);
                 let h = (chf as i32).max(1);
-                for r in &runs {
+                for r in &self.comet_runs[..runs_len] {
                     for s in r {
                         let cov = ((s.cov as f32) * 0.30).min(Self::CUSTOM_COV_CAP * 0.45) as u8;
                         if cov == 0 {

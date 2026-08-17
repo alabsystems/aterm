@@ -1128,7 +1128,15 @@ pub fn render_report(r: &Report) -> Vec<String> {
     let mut out = Vec::new();
 
     out.push(String::new());
-    out.push("=== DONE (working tree only — a commit makes it durable) ===".to_string());
+    // The commit caveat is a fact about SETUP, which is the only verb that edits the
+    // working tree (the MASTER_ANCHOR append in `plan()`). A join leaves `pins_text`
+    // None, writes nothing git tracks, and has nothing to commit — so it does not
+    // carry the caveat, and does not send the operator to an empty `git diff`.
+    out.push(if r.pins_changed {
+        "=== DONE (working tree only — a commit makes it durable) ===".to_string()
+    } else {
+        "=== DONE ===".to_string()
+    });
     if r.verb == Verb::Setup {
         out.push(concat(&[
             "  anchor  pins::PAPER_MASTER_PUBKEYS = ",
@@ -1138,7 +1146,7 @@ pub fn render_report(r: &Report) -> Vec<String> {
         ]));
     } else {
         out.push(concat(&[
-            "  anchor  proved: your phrase derives the committed master (fingerprint ",
+            "  anchor  phrase verified against the committed master (",
             &r.master_fingerprint,
             ")",
         ]));
@@ -1146,7 +1154,7 @@ pub fn render_report(r: &Report) -> Vec<String> {
     out.push(concat(&[
         "  key     ",
         &r.paths.key,
-        "  minted, SECRET, 0600, stays on this machine  (pub ",
+        "  0600, stays on this machine  (pub ",
         &r.machine_pubkey,
         ")",
     ]));
@@ -1155,11 +1163,14 @@ pub fn render_report(r: &Report) -> Vec<String> {
         &r.paths.roster,
         " + .sig  seq ",
         &r.roster_seq.to_string(),
-        ", valid until ",
-        &r.roster_valid_until,
-        ", machines: ",
+        "  (",
         &r.roster_machines.join(", "),
+        ")",
     ]);
+    // A sentinel expiry is not news. A real one is, so it still gets its clause.
+    if r.roster_valid_until != crate::roster_ops::VALID_UNTIL_FOREVER {
+        roster.push_str(&concat(&["  valid until ", &r.roster_valid_until]));
+    }
     if r.roster_was_fresh {
         roster.push_str(
             " — the ONLY roster this master signs; a second at the same seq forks it \
@@ -1179,7 +1190,7 @@ pub fn render_report(r: &Report) -> Vec<String> {
     out.push(concat(&[
         "  keyset  pins::UPDATE_CHANNEL_PUBKEYS unchanged (",
         &r.channel_after.len().to_string(),
-        " keys) — the ROSTER is what authorizes '",
+        ") — the roster authorizes '",
         &r.id,
         "'",
     ]));
@@ -1191,7 +1202,11 @@ pub fn render_report(r: &Report) -> Vec<String> {
         step += 1;
         concat(&["  ", &step.to_string(), ". ", &s])
     };
-    out.push(numbered(concat(&["review: git diff -- ", &r.paths.pins])));
+    // Steps 1 and 2 are about a working-tree edit, so they exist only when there IS one.
+    // Printing them on a join sends the operator to an empty diff and a no-op commit.
+    if r.pins_changed {
+        out.push(numbered(concat(&["review: git diff -- ", &r.paths.pins])));
+    }
     if r.verb == Verb::Setup {
         out.push(numbered(
             "delete the tripwire tests that assert an empty anchor:".to_string(),
@@ -1207,7 +1222,9 @@ pub fn render_report(r: &Report) -> Vec<String> {
                 .to_string(),
         );
     }
-    out.push(numbered("commit — durable from here".to_string()));
+    if r.pins_changed {
+        out.push(numbered("commit — durable from here".to_string()));
+    }
     if r.machine_is_committed_head {
         out.push(numbered(concat(&[
             "cut from this machine — '",
@@ -1229,16 +1246,15 @@ pub fn render_report(r: &Report) -> Vec<String> {
             ", or from '",
             &r.id,
             "' with --strand-pre-roster-clients (asserts no pre-roster client is left \
-             to strand: they verify only the compiled-in head and never update again)",
+             to strand)",
         ]));
         out.push(numbered(line));
     }
-    out.push(numbered(
-        "after any join/machine-revoke: copy the re-signed roster to every publishing \
-         machine before its next cut — a stale roster publishes a release the updated \
-         fleet refuses"
-            .to_string(),
-    ));
+    out.push(numbered(concat(&[
+        "copy ",
+        &r.paths.roster,
+        " + .sig to every other publishing machine — a cut from an older roster is refused",
+    ])));
     out
 }
 

@@ -189,7 +189,11 @@ fn truncate_back_lines_aborts_on_corrupt_boundary_page() {
         let old_bytes = page.compressed.len();
         page.compressed = vec![0x28, 0xB5, 0x2F, 0xFD];
         cold.bytes_used = cold.bytes_used.saturating_sub(old_bytes) + page.compressed.len();
-        *cold.last_page_cache.borrow_mut() = None;
+        // Same intent as the former direct `last_page_cache = None` write: drop
+        // every cached decompressed page so the next read re-decompresses the
+        // corrupted bytes. The cache is now multi-slot, so go through the
+        // single invalidation helper.
+        cold.clear_cache();
     }
     let compressed_after_corruption = cold.compressed_size();
     assert!(

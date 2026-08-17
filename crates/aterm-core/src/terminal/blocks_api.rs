@@ -303,6 +303,41 @@ impl Terminal {
         self.shell.output_blocks.back()
     }
 
+    /// The newest block in state [`Complete`](crate::terminal::BlockState::Complete),
+    /// current block INCLUDED — the O(1) form of "walk `all_blocks()` and keep the
+    /// last `Complete` you see", which is what the `wait` verb re-evaluates on
+    /// every PTY output burst while holding the terminal lock.
+    ///
+    /// Equivalent to that forward walk by construction: `all_blocks()` yields the
+    /// archived blocks oldest-first and then `current_block`, so the LAST
+    /// `Complete` forward is the FIRST `Complete` backward. Checking
+    /// `current_block` first mirrors [`block_at_row`](Self::block_at_row) /
+    /// `last_successful_block` and makes the common case (a command that just
+    /// emitted OSC 133;D, before the next prompt's A archives it) a single
+    /// compare instead of a scan of up to `OUTPUT_BLOCKS_MAX` blocks.
+    ///
+    /// Distinct from [`last_completed_block`](Self::last_completed_block), which
+    /// is the newest ARCHIVED (row-SEALED) block: that one deliberately excludes
+    /// the current block because an open `end_row` truncates a TEXT read. This
+    /// one reads only `id`/`exit_code`/`state`, which are final at D, so the
+    /// unsealed extent does not matter.
+    ///
+    /// `&self` on purpose (CM-A3): iterates `VecDeque` in reverse, never
+    /// `make_contiguous`.
+    #[must_use]
+    pub fn newest_completed_block(&self) -> Option<&OutputBlock> {
+        if let Some(block) = &self.shell.current_block
+            && block.is_complete()
+        {
+            return Some(block);
+        }
+        self.shell
+            .output_blocks
+            .iter()
+            .rev()
+            .find(|b| b.is_complete())
+    }
+
     /// Clear all output blocks.
     ///
     /// This does not affect the current shell state, only clears the history

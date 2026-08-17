@@ -98,7 +98,7 @@ impl From<u16> for StyleId {
 /// The `StyleTable` interns styles so identical combinations share memory.
 ///
 /// The default style is white text on black background with no attributes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Style {
     /// Foreground color.
@@ -107,6 +107,49 @@ pub struct Style {
     pub bg: Color,
     /// Style attributes.
     pub attrs: StyleAttrs,
+}
+
+/// Hand-written `Hash`: two hasher rounds instead of nine.
+///
+/// `#[derive(Hash)]` hashes field by field, so a `Style` (two 4-byte `Color`s
+/// plus a `u16` bitflag) issued eight `write_u8` calls plus one `write_u16`.
+/// `FxHasher::add_to_hash` is `hash = (hash + i) * K` — a serially dependent
+/// multiply — so that was a 9-long dependency chain of ~3-cycle multiplies
+/// before the SwissTable probe on `StyleTable`'s L3 map even started. The
+/// struct is 10 bytes of plain data, so two writes carry exactly the same
+/// information.
+///
+/// Behaviour-neutral: this hashes precisely the bytes the derived `PartialEq`
+/// compares (no field dropped, no two distinct keys collapsed), so `Hash` stays
+/// consistent with `Eq`. The only consumer is `StyleTable`'s intern map, which
+/// is never iterated (`compact()` rebuilds it from the order-stable `styles`
+/// Vec), and no `Style` hash is persisted or asserted anywhere.
+impl std::hash::Hash for Style {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Exhaustive destructuring is LOAD-BEARING: adding a field to `Style`
+        // or to `Color` must fail to compile here rather than silently drop it
+        // from the hash. A Hash/Eq inconsistency would break intern dedup, walk
+        // the table toward `u16::MAX`, and make `insert_new_style` degrade new
+        // styles to `StyleId::DEFAULT` — a visible colour bug.
+        let Self { fg, bg, attrs } = *self;
+        let Color {
+            r: fg_r,
+            g: fg_g,
+            b: fg_b,
+            a: fg_a,
+        } = fg;
+        let Color {
+            r: bg_r,
+            g: bg_g,
+            b: bg_b,
+            a: bg_a,
+        } = bg;
+        state.write_u64(u64::from_le_bytes([
+            fg_r, fg_g, fg_b, fg_a, bg_r, bg_g, bg_b, bg_a,
+        ]));
+        state.write_u16(attrs.bits());
+    }
 }
 
 impl Default for Style {

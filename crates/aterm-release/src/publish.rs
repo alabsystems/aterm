@@ -3650,6 +3650,120 @@ pub fn release_object_by_id(slug: &str, id: u64) -> Result<Option<ReleaseObjectI
     Ok(Some(identity.clone()))
 }
 
+/// One point-in-time answer to BOTH halves of a download-bracket end.
+#[derive(Debug)]
+pub struct ReleaseObjectAndAsset {
+    /// `None` only when the release object itself is absent (HTTP 404), exactly
+    /// as [`release_object_by_id`] reports it.
+    pub release: Option<ReleaseObjectIdentity>,
+    /// `(asset id, size)`, or `None` when the release carries no asset with the
+    /// requested exact name — the same answer
+    /// [`release_asset_identity_for_release_id_optional`] gives.
+    pub asset: Option<(u64, u64)>,
+}
+
+/// The fused bracket read's jq. Each row is tagged with its kind so the two
+/// existing parsers keep owning their own row shapes: the fields after `R` are
+/// byte-identical to [`RELEASE_IDENTITY_OBJECT_JQ`] and the fields after `A` to
+/// the asset-identity program in
+/// [`release_asset_identity_for_release_id_optional`]. `.assets[]?` matches the
+/// release-scan listing's spelling; on a release with no assets both spellings
+/// yield zero rows, i.e. "no such asset".
+const RELEASE_OBJECT_AND_ASSETS_JQ: &str = r#"(["R", .id, .tag_name,
+      (.draft | tostring), .target_commitish] | @tsv),
+    (.assets[]? | ["A", .name, (.id | tostring), (.size | tostring)] | @tsv)"#;
+
+/// Split a [`RELEASE_OBJECT_AND_ASSETS_JQ`] response into the two row blocks its
+/// tags name, stripping the tag so each block is exactly what its parser has
+/// always been handed. An untagged or unknown row fails closed: the fused read
+/// must never silently degrade into "this release has no assets".
+fn split_release_object_and_asset_rows(rows: &str) -> Result<(String, String)> {
+    let mut object_rows = String::new();
+    let mut asset_rows = String::new();
+    for (index, line) in rows.lines().enumerate() {
+        let (kind, fields) = line.split_once('\t').ok_or_else(|| {
+            Error::new(format!("malformed fused GitHub release row {}", index + 1))
+        })?;
+        let block = match kind {
+            "R" => &mut object_rows,
+            "A" => &mut asset_rows,
+            _ => {
+                return Err(Error::new(format!(
+                    "fused GitHub release row {} has unknown kind {kind:?}",
+                    index + 1
+                )));
+            }
+        };
+        block.push_str(fields);
+        block.push('\n');
+    }
+    Ok((object_rows, asset_rows))
+}
+
+/// The immutable release-object identity AND the exact-name asset binding, from
+/// ONE read of `repos/{slug}/releases/{id}`.
+///
+/// Both facts live in the same JSON document, so the authoritative manifest scan
+/// used to spawn two `gh` processes — two cold starts and two HTTPS round trips
+/// — per end of every download bracket. Worse, the pair was SKEWED in time: a
+/// mutation landing between the two reads was invisible to both checks. Fusing
+/// them is therefore strictly tighter as well as strictly cheaper: each bracket
+/// end is now a single point-in-time snapshot.
+///
+/// The checks a caller runs on the result, and their order, are deliberately
+/// left to the caller so the existing scan's error precedence is unchanged.
+pub fn release_object_and_asset_identity(
+    slug: &str,
+    release_id: u64,
+    name: &str,
+) -> Result<ReleaseObjectAndAsset> {
+    let endpoint = format!("repos/{slug}/releases/{release_id}");
+    let args = [
+        "api",
+        endpoint.as_str(),
+        "--jq",
+        RELEASE_OBJECT_AND_ASSETS_JQ,
+    ];
+    // A 404 is an ANSWER here, not a failure, so it must not burn the retry
+    // budget (seven seconds of backoff to re-learn an absent release) — that is
+    // `release_object_by_id`'s rule, and this call inherits it. Any OTHER
+    // non-zero exit is the transient flake the asset-identity read absorbed
+    // here has always retried through `gh_retry`, so it still retries.
+    let out = gh_raw(&args)?;
+    let out = if out.success() {
+        out
+    } else {
+        let stderr = out.stderr_utf8();
+        if stderr.contains("HTTP 404") || stderr.contains("Not Found") {
+            return Ok(ReleaseObjectAndAsset {
+                release: None,
+                asset: None,
+            });
+        }
+        gh_retry(&args)?
+    };
+    let (object_rows, asset_rows) = split_release_object_and_asset_rows(&out.stdout_utf8())?;
+    let rows = parse_release_object_identity_rows(&object_rows)?;
+    let [identity] = rows.as_slice() else {
+        return Err(Error::new(format!(
+            "exact GitHub release ID {release_id} returned {} identity rows",
+            rows.len()
+        )));
+    };
+    if identity.id != release_id {
+        return Err(Error::new(format!(
+            "exact GitHub release endpoint {release_id} returned foreign ID {}",
+            identity.id
+        )));
+    }
+    let asset =
+        parse_release_asset_identity_rows(&asset_rows, &format!("release-ID:{release_id}"), name)?;
+    Ok(ReleaseObjectAndAsset {
+        release: Some(identity.clone()),
+        asset,
+    })
+}
+
 pub fn validate_release_object_capability(
     observed: Option<&ReleaseObjectIdentity>,
     expected_id: u64,
@@ -3840,7 +3954,11 @@ pub fn download_release_asset_for_release_id(
     })
 }
 
-fn download_release_asset_with_identity_and_recheck(
+/// The bracketed transfer itself. Exposed to the crate (not just to
+/// [`download_release_asset_for_release_id`]) so the authoritative scan can hand
+/// in a recheck that reads the asset binding and the release-object identity in
+/// ONE call — see [`release_object_and_asset_identity`].
+pub(crate) fn download_release_asset_with_identity_and_recheck(
     slug: &str,
     name: &str,
     before: (u64, u64),

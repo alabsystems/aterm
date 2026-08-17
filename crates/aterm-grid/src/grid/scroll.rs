@@ -514,12 +514,16 @@ impl Grid {
         let oldest = self.storage.ring_head;
         self.storage.push_ring_extras(new_extras);
 
-        let extras = self
-            .storage
-            .ring_extras
-            .pop_front()
-            .flatten()
-            .map_or_else(Default::default, |b| *b);
+        // Keep the push-then-pop ORDER: with a zero-sized ring (`ring_sb == 0`)
+        // it is an identity that hands this row's own freshly extracted extras
+        // straight to `push_row_boxed`, and it is what keeps
+        // `ring_extras.len() == ring_buffer_scrollback()`. Only the BOX is now
+        // carried through whole — the popped `Option<Box<..>>` is exactly the
+        // value `DeferredLine` wants to store, so unboxing it here just to have
+        // `DeferredLine::new` re-box it cost one malloc + one free per
+        // extras-carrying scrolled line inside the reader's `term_lock` hold.
+        // When `!has_scrollback` the box is simply dropped below, as before.
+        let extras = self.storage.ring_extras.pop_front().flatten();
 
         // Lazy scrollback promotion: snapshot the row as a DeferredLine
         // (O(cells) memcpy) instead of the O(cols) row_to_line conversion.
@@ -535,7 +539,7 @@ impl Grid {
         if has_scrollback {
             self.storage
                 .lazy_buffer
-                .push_row(&self.storage.rows[oldest], extras);
+                .push_row_boxed(&self.storage.rows[oldest], extras);
         }
 
         let evicted_page = self.storage.rows[oldest].page_id();

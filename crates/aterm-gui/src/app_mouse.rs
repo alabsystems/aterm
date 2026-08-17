@@ -63,6 +63,11 @@ pub(crate) fn press_starts_selection(tracking: bool, option_held: bool) -> bool 
 /// pixels of grace keeps an honest aim from sliding off a paw mid-walk.
 pub(crate) const PET_HIT_SLOP_PX: i32 = 4;
 
+/// How far outside Robi's drawn body (frame px, each side) a click still
+/// counts as a dismissal. The pet's grace, for the pet's reason: a strolling
+/// robot is not a checkbox.
+pub(crate) const ROBI_HIT_SLOP_PX: i32 = 4;
+
 /// Whether a pointer at `(x, y)` (frame px) lands on the pet's drawn body
 /// `rect` (`(x0, x1, y0, y1)`, right/bottom exclusive), padded by `slop` on
 /// every side. Pure — the petting seam's hit test, unit-testable without a
@@ -103,6 +108,29 @@ thread_local! {
     static PANE_DRAG_APPLIED_AT: Cell<Option<(WindowId, Instant)>> = const { Cell::new(None) };
     /// Window with a coalesced (skipped) drag step awaiting the release flush.
     static PANE_DRAG_PENDING: Cell<Option<WindowId>> = const { Cell::new(None) };
+}
+
+/// The window geometry EVERY pointer↔cell mapping needs, derived once.
+///
+/// All four fields are pure reads of window `wid`'s settled metrics, but `cell`
+/// goes through `Backend::cell_geometry`, which for a variable primary face
+/// re-parses the whole font file and re-applies its variation axes on each call
+/// (`aterm_render`'s own comment there notes it runs ≥2×/frame plus once per
+/// mouse-motion event). Every helper used to derive its own copy —
+/// `pixel_to_cell` → `window_to_frame` → `frame_origin` alone did it twice — so
+/// one `CursorMoved` re-derived identical geometry 4–8×.
+///
+/// Nothing can change it inside one event handler, so the motion path derives it
+/// once and threads this `Copy` snapshot through the `*_with` seams. The
+/// zero-argument wrappers stay for the ~80 cold call sites, and each of them now
+/// derives exactly once as well.
+#[derive(Clone, Copy)]
+struct PointerGeometry {
+    /// `(cell_w, cell_h)` in device px.
+    cell: (usize, usize),
+    pad: usize,
+    pad_top: usize,
+    head: usize,
 }
 
 impl App {
@@ -262,14 +290,48 @@ impl App {
     /// keeping mouse handling byte-identical. Used to translate window mouse coords
     /// into the focused pane's local grid (its engine expects pane-local cells).
     pub(crate) fn focused_pane_origin(&self, wid: WindowId) -> (u16, u16) {
+        if self.active_tab_is_single_focused_pane(wid) {
+            return (0, 0);
+        }
         self.active_visible_leaf_plan(wid)
-            .and_then(|plan| plan.leaf(plan.focused).cloned())
-            .map_or((0, 0), |leaf| {
+            // `LogicalRect` is `Copy`, so lift the four scalars out instead of
+            // cloning the whole `VisibleLeaf` (and with it another `SplitPath`
+            // `Vec`) just to read them.
+            .and_then(|plan| plan.leaf(plan.focused).map(|leaf| leaf.rect))
+            .map_or((0, 0), |rect| {
                 (
-                    leaf.rect.origin.y.round().max(0.0) as u16,
-                    leaf.rect.origin.x.round().max(0.0) as u16,
+                    rect.origin.y.round().max(0.0) as u16,
+                    rect.origin.x.round().max(0.0) as u16,
                 )
             })
+    }
+
+    /// `true` when window `wid`'s active tab is one single, focused pane — i.e.
+    /// when [`Self::active_visible_leaf_plan`] would allocate a plan whose answer
+    /// is already known.
+    ///
+    /// It is known exactly: `Tab::visible_plan`'s zoom branch requires
+    /// `root.len() > 1`, so a one-leaf tree always takes `plan_into`, which gives
+    /// that sole leaf the sanitized bounds verbatim — `(0, 0, cols.max(1),
+    /// rows.max(1))` — and `contains(focus)` on a one-leaf tree means that leaf IS
+    /// `plan.focused`, so `plan.leaf(plan.focused)` cannot miss and fall through to
+    /// the no-plan default. Both `len` and `contains` are allocation-free walks
+    /// over a single node (same precedent as `active_tab_contains_native`).
+    fn active_tab_is_single_focused_pane(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active())
+            .is_some_and(|tab| tab.root.len() == 1 && tab.root.contains(tab.focus))
+    }
+
+    /// `plan.leaves.len() > 1` for window `wid`'s active tab, without building the
+    /// plan: `Tab::visible_plan` plans every leaf except when zoom collapses a
+    /// multi-leaf tab to its focused one, so the two forms agree on every input.
+    fn active_tab_has_multiple_visible_panes(&self, wid: WindowId) -> bool {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active())
+            .is_some_and(|tab| tab.root.len() > 1 && !tab.zoomed)
     }
 
     /// The FOCUSED pane's full rect `(row_off, col_off, rows, cols)` in window `wid`'s
@@ -283,14 +345,22 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return (0, 0, 0, 0);
         };
+        if self.active_tab_is_single_focused_pane(wid) {
+            // Exactly what the plan yields for a lone pane: its rect IS the
+            // sanitized window bounds. The `.max(1)` is load-bearing — the bounds
+            // are built from `rows.max(1)`/`cols.max(1)`, so a bare `(ws.rows,
+            // ws.cols)` would disagree with today at `rows == 0`. The no-active-tab
+            // default below stays unmaxed; that is a different case.
+            return (0, 0, ws.rows.max(1), ws.cols.max(1));
+        }
         self.active_visible_leaf_plan(wid)
-            .and_then(|plan| plan.leaf(plan.focused).cloned())
-            .map_or((0, 0, ws.rows, ws.cols), |leaf| {
+            .and_then(|plan| plan.leaf(plan.focused).map(|leaf| leaf.rect))
+            .map_or((0, 0, ws.rows, ws.cols), |rect| {
                 (
-                    leaf.rect.origin.y.round().max(0.0) as u16,
-                    leaf.rect.origin.x.round().max(0.0) as u16,
-                    (leaf.rect.size.height.round() as u16).max(1),
-                    (leaf.rect.size.width.round() as u16).max(1),
+                    rect.origin.y.round().max(0.0) as u16,
+                    rect.origin.x.round().max(0.0) as u16,
+                    (rect.size.height.round() as u16).max(1),
+                    (rect.size.width.round() as u16).max(1),
                 )
             })
     }
@@ -611,15 +681,35 @@ impl App {
     /// this). With `pad == 0` && `tab_strip_rows == 0` && `head == 0` this is
     /// byte-identical to the pre-strip mapping.
     pub(crate) fn pixel_to_cell(&self, wid: WindowId, x: f64, y: f64) -> (u16, u16) {
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let pad_top = self.win_pad_top(wid);
-        let head = self.win_head(wid);
+        // One derivation, shared with the nested `window_to_frame`: this used to
+        // resolve the cell geometry twice for the same answer.
+        self.pixel_to_cell_with(wid, self.pointer_geometry(wid), x, y)
+    }
+
+    /// Window `wid`'s [`PointerGeometry`]. The one place the four reads happen.
+    fn pointer_geometry(&self, wid: WindowId) -> PointerGeometry {
+        PointerGeometry {
+            cell: self.win_cell_size(wid),
+            pad: self.win_pad(wid),
+            pad_top: self.win_pad_top(wid),
+            head: self.win_head(wid),
+        }
+    }
+
+    /// [`Self::pixel_to_cell`] against geometry the caller already derived.
+    fn pixel_to_cell_with(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> (u16, u16) {
+        let (cw, ch) = geom.cell;
         let (rows, cols) = self
             .windows
             .get(&wid)
             .map_or((0, 0), |ws| (ws.rows, ws.cols));
-        let (x, y) = self.window_to_frame(wid, x, y);
+        let (x, y) = self.window_to_frame_with(wid, geom, x, y);
         pixel_to_term_cell(
             x,
             y,
@@ -628,9 +718,9 @@ impl App {
             rows,
             cols,
             self.tab_strip_rows,
-            pad,
-            pad_top,
-            head,
+            geom.pad,
+            geom.pad_top,
+            geom.head,
         )
     }
 
@@ -641,8 +731,14 @@ impl App {
     /// `((window_row, window_col), (pane_row, pane_col))`. Shared by the normal
     /// motion path and the About-modal gate: the modal swallows motion, but must
     /// not leave a STALE cell for the first click after a keyboard close.
-    fn refresh_mouse_cell(&mut self, wid: WindowId, x: f64, y: f64) -> ((u16, u16), (u16, u16)) {
-        let (row, col) = self.pixel_to_cell(wid, x, y);
+    fn refresh_mouse_cell(
+        &mut self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> ((u16, u16), (u16, u16)) {
+        let (row, col) = self.pixel_to_cell_with(wid, geom, x, y);
         let (ro, co, prows, pcols) = self.focused_pane_rect(wid);
         let lr = row.saturating_sub(ro).min(prows.saturating_sub(1));
         let lc = col.saturating_sub(co).min(pcols.saturating_sub(1));
@@ -663,16 +759,25 @@ impl App {
     /// frame extent the presenters use, including independent top/bottom padding,
     /// so pointer geometry and pixels can't disagree in the settled state.
     pub(crate) fn frame_origin(&self, wid: WindowId) -> (i64, i64) {
+        // Both bail-outs below are geometry-free, so answer them BEFORE paying for
+        // `pointer_geometry` — an unattached window keeps its `(0, 0)` for free,
+        // exactly as when this function derived the geometry itself.
+        if !self.windows.get(&wid).is_some_and(|ws| ws.win_px.is_some()) {
+            return (0, 0);
+        }
+        self.frame_origin_with(wid, self.pointer_geometry(wid))
+    }
+
+    /// [`Self::frame_origin`] against geometry the caller already derived.
+    fn frame_origin_with(&self, wid: WindowId, geom: PointerGeometry) -> (i64, i64) {
         let Some(ws) = self.windows.get(&wid) else {
             return (0, 0);
         };
         let Some(size) = ws.win_px else {
             return (0, 0);
         };
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let pad_top = self.win_pad_top(wid);
-        let head = self.win_head(wid);
+        let (cw, ch) = geom.cell;
+        let (pad, pad_top, head) = (geom.pad, geom.pad_top, geom.head);
         let composed_rows = usize::from(ws.rows).saturating_add(usize::from(self.tab_strip_rows));
         let frame_w = usize::from(ws.cols)
             .saturating_mul(cw)
@@ -697,22 +802,57 @@ impl App {
         ((x - ox as f64).max(0.0), (y - oy as f64).max(0.0))
     }
 
+    /// [`Self::window_to_frame`] against geometry the caller already derived.
+    fn window_to_frame_with(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> (f64, f64) {
+        let (ox, oy) = self.frame_origin_with(wid, geom);
+        ((x - ox as f64).max(0.0), (y - oy as f64).max(0.0))
+    }
+
     /// If pixel position `(x, y)` lands in window `wid`'s tab-strip region (the top
     /// `tab_strip_rows` pixel rows), return its strip COLUMN; otherwise `None` (the
     /// click is in the terminal region and maps to a cell as usual). Always `None`
     /// when the strip is disabled. Used by the mouse handlers to intercept strip
     /// clicks BEFORE the focused-pane cell mapping.
     pub(crate) fn strip_col_at(&self, wid: WindowId, x: f64, y: f64) -> Option<u16> {
+        // Keep the disabled-strip bail BEFORE the derivation (it is the macOS
+        // default, and this used to be answered without touching the font).
         if !self.tab_strip_enabled() {
             return None;
         }
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let pad_top = self.win_pad_top(wid);
-        let head = self.win_head(wid);
+        self.strip_col_at_with(wid, self.pointer_geometry(wid), x, y)
+    }
+
+    /// [`Self::strip_col_at`] against geometry the caller already derived.
+    fn strip_col_at_with(
+        &self,
+        wid: WindowId,
+        geom: PointerGeometry,
+        x: f64,
+        y: f64,
+    ) -> Option<u16> {
+        if !self.tab_strip_enabled() {
+            return None;
+        }
+        let (cw, ch) = geom.cell;
         let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols);
-        let (x, y) = self.window_to_frame(wid, x, y);
-        strip_col_for_pixel(x, y, cw, ch, cols, self.tab_strip_rows, pad, pad_top, head)
+        let (x, y) = self.window_to_frame_with(wid, geom, x, y);
+        strip_col_for_pixel(
+            x,
+            y,
+            cw,
+            ch,
+            cols,
+            self.tab_strip_rows,
+            geom.pad,
+            geom.pad_top,
+            geom.head,
+        )
     }
 
     /// PETTING THE PET (wave 1): if the last pointer position lands on the
@@ -757,18 +897,78 @@ impl App {
         true
     }
 
-    /// DISMISSING ROBI (owner, 2026-08-15: "it needs to be easily
-    /// dismissable"): if the last pointer position lands on the robot's drawn
-    /// body (the rect the redraw stashed, padded by [`PET_HIT_SLOP_PX`] — a
-    /// walking robot is no more a checkbox than a walking cat), latch the
-    /// per-window dismiss and CONSUME the press. Returns whether it did.
+    /// `CursorLeft` — the pointer left the window: mouse-out for the pet's
+    /// hover label. `last_cursor_px` deliberately freezes at its final
+    /// in-window position (the press paths' documented staleness caveat), so
+    /// clearing the latch alone would not survive its own dismissal:
+    /// `clear_pet_label` requests a redraw, the redraw runs the label drain,
+    /// and the drain re-derives hover from the frozen pixel — a pointer that
+    /// left ACROSS the pet would re-latch and pin the label up forever (no
+    /// further mouse event arrives once the pointer is outside). Poisoning
+    /// the SOURCE — `pointer_in_window`, the one input `pet_hover_anchor`
+    /// gates on — is what makes the mouse-out stick.
+    pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        ws.pointer_in_window = false;
+        if std::mem::replace(&mut ws.pet_hovered, false) {
+            self.clear_pet_label(wid);
+        }
+    }
+
+    /// Retire the pet's hover label IF window `wid`'s hover owns it — the
+    /// ownership gate is what keeps another window's un-hovered redraws from
+    /// blinking out a label the pointer is still earning elsewhere.
+    pub(crate) fn clear_pet_label(&mut self, wid: WindowId) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.pet_label_owner() == Some(wid))
+        {
+            self.notice = None;
+            self.request_redraw_all_windows();
+        }
+    }
+
+    /// DISMISSING ROBI: if the last pointer position lands on Robi's drawn
+    /// body (the rect the redraw stashed post-tick, padded by
+    /// [`ROBI_HIT_SLOP_PX`]), send him away and CONSUME the press. Returns
+    /// whether it did — the caller stops routing on `true`.
     ///
-    /// Same policy and caveats as [`Self::pet_press_at`] directly above:
-    /// chrome wins, the swallowed press is never encoded for a mouse-tracking
-    /// app, and `last_cursor_px` can be stale on the first click after a tab
-    /// switch. The latch — not a bare `RobiShow::stop` — is what keeps him
-    /// gone: the render path re-births any stopped resident whose gates are
-    /// green, so dismissal must BE a gate. Typing his name clears it.
+    /// "Away" means CONFIG-OFF: the press writes `robi = false` through the
+    /// same versioned, compare-and-swap settings lane the Settings toggle
+    /// uses ([`Self::queue_control_settings_field`]), so `aterm.toml` records
+    /// the choice and he stays gone until the user re-enables `robi` in
+    /// Settings. The live policy is deliberately NOT flipped here — the
+    /// Serious Mode discipline: only the durable completion replaces
+    /// `self.config`. What retires him NOW is the pending-dismissal latch
+    /// (`App::robi_dismissal`), armed here and consulted by the render gate:
+    /// every window retires him on its very next frame, and while the latch
+    /// holds, the closed gate keeps `robi_hit_rect` cleared — the STRUCTURAL
+    /// guarantee that a double-click cannot queue a second write (the spent
+    /// rect alone never was one: any animating frame between the two presses
+    /// re-stashed it). Stopping the show optimistically WITHOUT the latch
+    /// would be worse, not better: the gate still reads the old config on
+    /// the next frame and would re-birth him for one awkward fade-in.
+    ///
+    /// Nothing about the write is fire-and-forget: a synchronous refusal (no
+    /// event-loop proxy, no persistence worker) is surfaced immediately as a
+    /// config-notice banner with no latch armed, and the held reply receiver
+    /// is settled by [`Self::poll_robi_dismissal`] — an async failure (an
+    /// OCC conflict with an external `aterm.toml` edit, a rejection, an
+    /// indeterminate persist) banners the same way and RELEASES the latch,
+    /// so Robi walks back on: visible proof the click did not stick, with
+    /// the banner saying why.
+    ///
+    /// A press on his TIP BUBBLE is not a dismissal: the bubble is the
+    /// app-global transient notice (`TransientNotice::robi_tip`), and
+    /// `notice_click` consumes a press on any visible card EARLIER in
+    /// `on_mouse_input`'s chain — an ordering this seam depends on, pinned
+    /// by `a_press_on_robis_tip_bubble_dismisses_the_bubble_not_the_robot`.
+    ///
+    /// Same chrome-wins policy and stale-`last_cursor_px` caveat as
+    /// [`Self::pet_press_at`].
     fn robi_press_at(&mut self, wid: WindowId) -> bool {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
@@ -778,24 +978,82 @@ impl App {
         };
         let (px, py) = ws.last_cursor_px;
         let (fx, fy) = self.window_to_frame(wid, px, py);
-        if !pet_rect_hit(rect, fx, fy, PET_HIT_SLOP_PX) {
+        if !pet_rect_hit(rect, fx, fy, ROBI_HIT_SLOP_PX) {
             return false;
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.robi_dismissed = true;
-            // The redraw runs the bypass-to-final-state hygiene (stop, clear
-            // tip/bubble/rect); ask for the frame that runs it.
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
+            ws.robi_hit_rect = None;
+        }
+        let (reply, outcome) = std::sync::mpsc::channel();
+        self.queue_control_settings_field(
+            crate::prefs::EDIT_ROBI.to_string(),
+            Some("false".to_string()),
+            reply,
+        );
+        match outcome.try_recv() {
+            // Synchronous refusal: nothing is in flight, so there is no
+            // latch to arm — he stays on glass and the banner says why.
+            Ok(Err(error)) => {
+                self.surface_native_config_lane_error(format!("Robi was not dismissed: {error}"));
+            }
+            // Already durable (never in practice — the lane is async): skip
+            // straight to waiting for the config generation.
+            Ok(Ok(_)) => {
+                self.robi_dismissal = Some(crate::RobiDismissal::AwaitingConfig);
+                self.request_redraw_all_windows();
+            }
+            // Queued: arm the latch, HOLDING the reply receiver so the
+            // completion always has a reader, and repaint — the render gate
+            // retires him on the NEXT frame in every window.
+            Err(_) => {
+                self.robi_dismissal = Some(crate::RobiDismissal::InFlight(outcome));
+                self.request_redraw_all_windows();
             }
         }
-        // His in-flight speech bubble leaves with him — a tip hanging five
-        // seconds over a vanished speaker would read as a bug, and the slot
-        // policy already treats a Robi tip as reclaimable.
-        if self.notice.as_ref().is_some_and(|n| n.is_robi_tip()) {
-            self.notice = None;
-        }
         true
+    }
+
+    /// Settle ROBI's in-flight click-dismissal (`App::robi_dismissal`, armed
+    /// by [`Self::robi_press_at`]). Called on every COMPOSED frame — before
+    /// any route reads the render gate; a redraw that early-outs without
+    /// drawing polls nothing — and again right at the settings lane's
+    /// completion publish (`publish_native_config_origin` hooks the `robi`
+    /// key), so neither branch waits on a lucky frame:
+    ///
+    /// * a FAILURE reply — OCC conflict, rejection, indeterminate persist —
+    ///   releases the latch and banners through the lane's own surfacing
+    ///   seam ([`Self::surface_native_config_lane_error`]): Robi walks back
+    ///   on, and the click that did nothing is never silent;
+    /// * a SUCCESS reply holds the latch (`AwaitingConfig`) until the new
+    ///   generation replaces `self.config` — from then on `robi = false` is
+    ///   the config itself and the latch is redundant, so it releases rather
+    ///   than linger to override a later Settings re-enable.
+    pub(crate) fn poll_robi_dismissal(&mut self) {
+        if let Some(crate::RobiDismissal::InFlight(outcome)) = &self.robi_dismissal {
+            match outcome.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Ok(Ok(_)) => self.robi_dismissal = Some(crate::RobiDismissal::AwaitingConfig),
+                Ok(Err(error)) => {
+                    self.robi_dismissal = None;
+                    self.surface_native_config_lane_error(format!(
+                        "Robi was not dismissed: {error}"
+                    ));
+                }
+                // The lane dropped the request without ever replying — treat
+                // it as the failure it is rather than latching him off on a
+                // write nobody performed.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.robi_dismissal = None;
+                    self.surface_native_config_lane_error(
+                        "Robi was not dismissed: the settings lane dropped the request"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if self.robi_dismissal.is_some() && !self.config.robi_or_default() {
+            self.robi_dismissal = None;
+        }
     }
 
     /// Track which in-grid tab-strip tab the pointer is over, so the `✕` can be a
@@ -807,11 +1065,11 @@ impl App {
     /// default), and it only requests a redraw when the hovered TAB changes, so
     /// sweeping the pointer across one tab costs nothing. The redraw is what
     /// re-runs `splice_tab_strip_with`, whose cache key carries the hover.
-    fn track_strip_hover(&mut self, wid: WindowId, x: f64, y: f64) {
+    fn track_strip_hover(&mut self, wid: WindowId, geom: PointerGeometry, x: f64, y: f64) {
         if !self.tab_strip_enabled() {
             return;
         }
-        let hovered = self.strip_col_at(wid, x, y).and_then(|col| {
+        let hovered = self.strip_col_at_with(wid, geom, x, y).and_then(|col| {
             let segs = self
                 .windows
                 .get(&wid)
@@ -1335,10 +1593,18 @@ impl App {
     }
 
     pub(crate) fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
+        // Frame-space pointer for the pet hover latch below — computed before
+        // the `ws` borrow (`window_to_frame` reads `&self`).
+        let (fx, fy) = self.window_to_frame(wid, x, y);
+        let mut hover_left_pet = false;
         // Remember the raw pixel position so a follow-up button press can tell
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.last_cursor_px = (x, y);
+            // Motion events only arrive while the pointer is inside the
+            // window — re-arm the hover probe's staleness gate that
+            // `CursorLeft` cleared.
+            ws.pointer_in_window = true;
             // POINTER PURSUIT (wave 3): the brain is its own motion sensor,
             // but it only senses on a TICK — and with the frame lane
             // released, mouse motion alone never produced one, so the pet
@@ -1355,8 +1621,36 @@ impl App {
             {
                 w.request_redraw();
             }
+            // THE HOVER LATCH (the pet's identity label): exactly the petting
+            // seam's arithmetic — the stashed live body, padded by the same
+            // slop — change-gated like `track_strip_hover`. The render drain
+            // (`App::drain_pet_hover_label`) owns posting the label and
+            // re-verifies this latch per drawn frame (the pet moves under a
+            // still pointer); this edge just wakes a frame and clears
+            // promptly on mouse-out.
+            let hovered = ws
+                .pet_hit_rect
+                .is_some_and(|rect| pet_rect_hit(rect, fx, fy, PET_HIT_SLOP_PX));
+            if hovered != ws.pet_hovered {
+                ws.pet_hovered = hovered;
+                hover_left_pet = !hovered;
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+            }
         }
-        self.track_strip_hover(wid, x, y);
+        if hover_left_pet {
+            self.clear_pet_label(wid);
+        }
+        // Derive the window's pointer geometry ONCE for the whole event. Every
+        // consumer below used to re-derive it (4× on the macOS default, 8–10× with
+        // the in-grid strip on and a selection drag live), and each derivation
+        // re-parses a variable primary face. Nothing between here and the last use
+        // can move it: only `ws.metrics` / the backend's face carry it, and the one
+        // handler-reachable mutation of either (`drag_divider` → `resize_panes`)
+        // returns immediately after, before any later use.
+        let geom = self.pointer_geometry(wid);
+        self.track_strip_hover(wid, geom, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
             return;
@@ -1378,7 +1672,7 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.about().is_some())
         {
-            self.refresh_mouse_cell(wid, x, y);
+            self.refresh_mouse_cell(wid, geom, x, y);
             let _ = self.on_about_motion(wid, x, y);
             return;
         }
@@ -1387,11 +1681,13 @@ impl App {
         // visual wash, pointer cursor, semantics, and later press activation;
         // never leak motion into the parked PTY beneath the app.
         if let Some((_, view)) = self.active_native_view(wid) {
-            if self
-                .active_visible_leaf_plan(wid)
-                .is_some_and(|plan| plan.leaves.len() > 1)
-            {
-                self.refresh_mouse_cell(wid, x, y);
+            // The plan's leaf count WITHOUT building a plan per motion event:
+            // `Tab::visible_plan` collapses to a single leaf exactly when the tab
+            // is zoomed with more than one leaf, so `len() > 1 && !zoomed` equals
+            // `plan.leaves.len() > 1` for every input (and a missing window or
+            // active tab makes both sides false, matching the `is_some_and`).
+            if self.active_tab_has_multiple_visible_panes(wid) {
+                self.refresh_mouse_cell(wid, geom, x, y);
             }
             let dragging_editor = self
                 .native_runtime
@@ -1404,7 +1700,7 @@ impl App {
                 let _ =
                     self.native_editor_pointer_select(wid, target_view, byte, true, visible_lines);
             }
-            let native_hover = if self.strip_col_at(wid, x, y).is_some() {
+            let native_hover = if self.strip_col_at_with(wid, geom, x, y).is_some() {
                 None
             } else {
                 self.retained_native_leaf_at_pointer(wid, x, y).and_then(
@@ -1487,7 +1783,7 @@ impl App {
         // While the pointer is over the tab strip, it is NOT over the terminal grid:
         // show the default cursor and do not report a mouse-move to any pane's app
         // (the strip is GUI chrome). A no-op when the strip is disabled.
-        if self.strip_col_at(wid, x, y).is_some() {
+        if self.strip_col_at_with(wid, geom, x, y).is_some() {
             if let Some(ws) = self.windows.get_mut(&wid)
                 && (ws.hover_pointer || ws.native_text_cursor)
             {
@@ -1504,11 +1800,11 @@ impl App {
             // selection drag is active; arms `next_autoscroll`, and the repeat tick grows
             // the selection from the last in-grid cell. (macOS strip default is 0 → never
             // reached.)
-            self.selection_autoscroll(wid, y);
+            self.selection_autoscroll_with(wid, geom, y);
             return;
         }
         // The window cell is cached by the helper; the seam below consumes pane-local.
-        let (_, (lr, lc)) = self.refresh_mouse_cell(wid, x, y);
+        let (_, (lr, lc)) = self.refresh_mouse_cell(wid, geom, x, y);
         // SPLIT-PANE DIVIDER DRAG: while a divider is held, motion resizes the split
         // (relayout + repaint) and short-circuits the selection / mouse-report path —
         // the drag is GUI chrome, not terminal input. A no-op when none is held.
@@ -1526,15 +1822,14 @@ impl App {
         // shift-click press (which has no pixel position of its own) can
         // anchor by the half that was pressed. Subtract the `pad` inset first so
         // the half-split lines up with the (padded) cell, matching `pixel_to_cell`.
-        let (cw, ch) = self.win_cell_size(wid);
+        let (cw, ch) = geom.cell;
         let cw = cw.max(1);
         let ch = ch.max(1);
         // W1: strip the leading remainder bands first (window→frame), THEN the
         // `pad` inset, so the half-split lines up with the on-glass (banded,
         // padded) cell — matching `pixel_to_cell`.
-        let (fx, fy) = self.window_to_frame(wid, x, y);
-        let win_pad = self.win_pad(wid);
-        let gx = (fx - win_pad as f64).max(0.0) as usize;
+        let (fx, fy) = self.window_to_frame_with(wid, geom, x, y);
+        let gx = (fx - geom.pad as f64).max(0.0) as usize;
         let side = if (gx % cw) * 2 >= cw {
             SelectionSide::Right
         } else {
@@ -1549,7 +1844,7 @@ impl App {
         let strip_px = self.tab_strip_rows as usize * ch;
         // The chrome headroom sits above the pad on the y-axis (x carries none),
         // matching `pixel_to_term_cell`'s `pad_top + head` inset.
-        let gy = (fy - (self.win_pad_top(wid) + self.win_head(wid)) as f64).max(0.0) as usize;
+        let gy = (fy - (geom.pad_top + geom.head) as f64).max(0.0) as usize;
         let gy = gy.saturating_sub(strip_px);
         let px_off = crate::input::PixelOffset {
             x: (gx % cw) as u16,
@@ -1584,7 +1879,7 @@ impl App {
         // freshly-revealed edge row. A no-op when no selection drag is active or the
         // pointer is inside the grid. `row`/`col` are already clamped to the grid by
         // `pixel_to_cell`, so the edge row is 0 (top) or rows-1 (bottom).
-        self.selection_autoscroll(wid, y);
+        self.selection_autoscroll_with(wid, geom, y);
         self.input(
             wid,
             InputEvent::MouseMove {
@@ -1694,6 +1989,12 @@ impl App {
     /// unit-testable); `scroll_display` clamps at the history ends, so dragging past
     /// the oldest/newest line is harmless.
     pub(crate) fn selection_autoscroll(&mut self, wid: WindowId, y: f64) -> bool {
+        let geom = self.pointer_geometry(wid);
+        self.selection_autoscroll_with(wid, geom, y)
+    }
+
+    /// [`Self::selection_autoscroll`] against geometry the caller already derived.
+    fn selection_autoscroll_with(&mut self, wid: WindowId, geom: PointerGeometry, y: f64) -> bool {
         let (selecting, rows) = match self.windows.get(&wid) {
             Some(ws) => (ws.selecting, ws.rows),
             None => return false,
@@ -1705,15 +2006,15 @@ impl App {
             }
             return false;
         }
-        let ch = self.win_cell_size(wid).1.max(1);
+        let ch = geom.cell.1.max(1);
         // The chrome headroom stacks above the pad on the y-axis, so the grid's
         // top edge is `head + pad_top + strip_px` — fold it into the pad inset the
         // pure edge math subtracts (head == 0 && pad_top == pad is byte-identical).
-        let pad = self.win_pad_top(wid) + self.win_head(wid);
+        let pad = geom.pad_top + geom.head;
         let strip_px = self.tab_strip_rows as usize * ch;
         // W1: window→frame first, so the grid's top/bottom edges account for the
         // leading remainder band like every other pointer consumer.
-        let (_, y) = self.window_to_frame(wid, 0.0, y);
+        let (_, y) = self.window_to_frame_with(wid, geom, 0.0, y);
         let lines = crate::app_render::selection_autoscroll_lines(y, pad, strip_px, ch, rows);
         if lines == 0 {
             // Pointer is back inside the grid → stop auto-scrolling.
@@ -2421,6 +2722,20 @@ impl App {
                 return;
             }
         }
+        // DISMISSING ROBI: a left press on the robot's drawn body queues the
+        // `robi = false` write and stops HERE (see [`Self::robi_press_at`]
+        // for the persist policy and the latch). Chrome-wins like the petting
+        // seam below, but ABOVE the tab strip and the find bar: both of those
+        // are spliced CELLS, and Robi is stamped `FreeZ::OverText` across the
+        // whole composed frame — spliced strip rows included — so on the
+        // monkey bars he visibly hangs IN FRONT of the chips, and a press on
+        // his head must dismiss him, not switch (or close!) the tab his body
+        // is covering. Still below the modals and the notice card, which
+        // composite over the finished frame at present time — and his own
+        // tip bubble IS that notice card, consumed by `notice_click` above.
+        if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
+            return;
+        }
         // TAB STRIP: a left press in the strip region (top `tab_strip_rows` rows)
         // switches / closes / opens a tab and stops there — it never reaches the
         // terminal selection / pane-focus path. A no-op when the strip is disabled
@@ -2470,14 +2785,6 @@ impl App {
         // the pet), above the divider/pane-focus/selection/report layers
         // (all of which the cat's body occludes).
         if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid) {
-            return;
-        }
-        // DISMISSING ROBI (owner, 2026-08-15: "it needs to be easily
-        // dismissable"): a left press on the robot's drawn body sends him
-        // off this window until he is called by name (`robi`/`robot`).
-        // Same chrome-wins layer as the pet directly above — the modals,
-        // strip and find bar cover him; his body occludes the grid.
-        if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
             return;
         }
         // SPLIT-PANE DIVIDER DRAG: a left press ON a divider grabs it to resize the
@@ -4444,52 +4751,6 @@ mod tests {
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
     }
 
-    /// DISMISSING ROBI end to end: a left press inside the stashed body rect
-    /// latches the per-window dismiss and is CONSUMED (never a selection);
-    /// the same press outside falls through; and typing his name — the one
-    /// resurrection path — clears the latch.
-    #[test]
-    fn a_click_on_robi_dismisses_him_until_he_is_called_by_name() {
-        use crate::{App, WindowId};
-        use winit::event::{ElementState, MouseButton as WinitMouseButton};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        // Stash a drawn-robot rect the way the redraw does (frame px,
-        // right/bottom exclusive), well clear of the pet's stash.
-        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((300, 380, 50, 160));
-        app.on_cursor_moved(wid, 340.0, 100.0);
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        {
-            let ws = app.windows.get(&wid).unwrap();
-            assert!(ws.robi_dismissed, "the press latched the dismiss");
-            assert!(!ws.selecting, "and was consumed before the selection layer");
-        }
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        assert!(
-            !app.windows.get(&wid).unwrap().selecting,
-            "the orphan release is dropped (press/release stay paired)"
-        );
-        // The control: with the rect cleared (he is off the glass now), the
-        // same press is an ordinary terminal press.
-        app.windows.get_mut(&wid).unwrap().robi_hit_rect = None;
-        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
-        assert!(
-            app.windows.get(&wid).unwrap().selecting,
-            "a click where he used to stand falls through to selection"
-        );
-        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
-        // Calling him by name clears the latch (the only resurrection path).
-        let now = std::time::Instant::now();
-        app.feed_robi_typed(wid, now, &['r', 'o', 'b', 'i']);
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(
-            !ws.robi_dismissed,
-            "typing his name clears the dismiss latch"
-        );
-        assert!(ws.robi_show.born(), "and he is back on the glass");
-    }
-
     /// THE CONFIG-WARNING BANNER IS CHROME, and chrome wins the press.
     ///
     /// `splice_config_notice` overwrites the top grid rows IN PLACE and paints
@@ -4578,5 +4839,482 @@ mod tests {
         let ws = app.windows.get(&wid).unwrap();
         assert_eq!(ws.cursor_pet.pending_pets(), 0, "nothing to pet");
         assert!(ws.selecting, "the press reached the selection layer");
+    }
+
+    /// DISMISSING ROBI, chrome-wins end to end: a left press inside the
+    /// stashed body rect is CONSUMED (never a selection), spends the rect
+    /// immediately, and routes the `robi = false` intent into the versioned
+    /// settings lane — which the headless harness (no event-loop proxy)
+    /// refuses synchronously, so the refusal surfacing as a config-notice
+    /// banner is the proof the persist path was really invoked (and a
+    /// refusal arms NO latch: he stays, the banner says why). The same press
+    /// outside the padded rect still runs the ordinary selection gesture.
+    #[test]
+    fn a_click_on_robi_dismisses_him_and_never_selects() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((100, 200, 100, 160));
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        {
+            let ws = app.windows.get(&wid).unwrap();
+            assert!(!ws.selecting, "consumed before the selection layer");
+            assert_eq!(ws.robi_hit_rect, None, "the rect is spent by the press");
+        }
+        assert!(
+            app.config_notice.is_some(),
+            "the persist attempt reached the settings lane (headless refusal is surfaced)"
+        );
+        assert!(
+            app.robi_dismissal.is_none(),
+            "a synchronous refusal arms no latch — nothing is in flight"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            !app.windows.get(&wid).unwrap().selecting,
+            "the orphan release is dropped (press/release stay paired)"
+        );
+        // The control: the same gesture outside the padded rect selects (the
+        // notice claims no band here — headless leaves `input_scratch` unsized).
+        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some((100, 200, 100, 160));
+        app.on_cursor_moved(wid, 420.0, 300.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows.get(&wid).unwrap().selecting,
+            "a plain terminal press still selects"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// DISMISSING ROBI: a cleared stash (Robi not drawn) can never eat a
+    /// click — the guard for stale rects after the gate closes.
+    #[test]
+    fn no_rect_no_robi_the_click_falls_through() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(app.windows.get(&wid).unwrap().robi_hit_rect, None);
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        let ws = app.windows.get(&wid).unwrap();
+        assert!(ws.selecting, "the press reached the selection layer");
+        assert!(
+            app.config_notice.is_none(),
+            "and no dismissal was ever attempted"
+        );
+    }
+
+    /// DISMISSING ROBI, the latch's settlement law (`poll_robi_dismissal`):
+    /// a FAILED lane completion releases the latch AND banners (a click that
+    /// did nothing is never silent — Robi walks back on as visible proof); a
+    /// SUCCESSFUL one holds it until `robi = false` is the live config (else
+    /// the gate would read the old `robi = true` in the completion-to-
+    /// generation gap and re-birth him), then releases so it can never
+    /// override a later Settings re-enable.
+    #[test]
+    fn the_dismissal_latch_settles_by_lane_outcome() {
+        use crate::{App, RobiDismissal};
+
+        let mut app = App::headless_for_test();
+        // Failure completion (the OCC-conflict shape): banner + release.
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
+        tx.send(Err("save conflict for robi at config revision 7".to_string()))
+            .unwrap();
+        app.poll_robi_dismissal();
+        assert!(
+            app.robi_dismissal.is_none(),
+            "a failed write releases the latch — Robi returns"
+        );
+        assert!(
+            app.config_notice.is_some(),
+            "…and the failure is surfaced, never silent"
+        );
+        // A still-pending write keeps the latch armed…
+        app.config_notice = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.robi_dismissal = Some(RobiDismissal::InFlight(rx));
+        app.poll_robi_dismissal();
+        assert!(
+            matches!(app.robi_dismissal, Some(RobiDismissal::InFlight(_))),
+            "an empty channel settles nothing"
+        );
+        // …a success holds it (config still says `robi = true`)…
+        tx.send(Ok("saved: robi = false".to_string())).unwrap();
+        app.poll_robi_dismissal();
+        assert!(
+            matches!(app.robi_dismissal, Some(RobiDismissal::AwaitingConfig)),
+            "success waits for the generation, not the reply"
+        );
+        assert!(app.config_notice.is_none(), "success needs no banner");
+        // …and it releases the moment the dismissal IS the live config.
+        app.config.robi = Some(false);
+        app.poll_robi_dismissal();
+        assert!(app.robi_dismissal.is_none(), "the landed config owns the gate");
+    }
+
+    /// DISMISSING ROBI vs HIS OWN BUBBLE: the tip bubble is the app-global
+    /// transient notice, and `notice_click` runs EARLIER in `on_mouse_input`
+    /// than `robi_press_at` — so a press on the bubble dismisses the bubble
+    /// and never costs the robot, even where the card overlaps his padded
+    /// body (it sits right over his head). This pins the one ordering fact
+    /// unique to Robi; reorder the chrome chain and this test names the
+    /// regression: a bubble tap would write `robi = false`.
+    #[test]
+    fn a_press_on_robis_tip_bubble_dismisses_the_bubble_not_the_robot() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A tip mid-hold (past the entrance ramp, so it is clickable),
+        // anchored the way the redraw anchors it: over the speaker.
+        let spawned = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.notice = Some(crate::notice::TransientNotice::robi_tip(
+            aterm_effects::robi::ROBI_TIPS[0].text,
+            Some((160.0, 140.0)),
+            spawned,
+        ));
+        // On glass in this window (what the splice records when it paints).
+        app.windows.get_mut(&wid).unwrap().notice_card = Some(crate::SettingsCard {
+            rgba: Vec::new(),
+            pw: 0,
+            ph: 0,
+            dx: 0,
+            dy: 0,
+            fp: 0,
+            geom: 0,
+        });
+        // Resolve the card's live rect through the SAME seams the click path
+        // reads, and aim for its center.
+        let now = std::time::Instant::now();
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f32;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f32;
+        let geom = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: app.win_font_px(wid),
+            cols: app.windows.get(&wid).unwrap().cols as usize,
+            panel_rows: 0,
+        };
+        let motion = app
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::NoticePill);
+        let (rx, ry, rw, rh) = crate::notice::notice_rect(
+            app.notice.as_ref().unwrap(),
+            &geom,
+            now,
+            motion,
+            app.notice_clear_rows(),
+        );
+        assert!(rw > 0.0 && rh > 0.0, "the card must be drawable to be clickable");
+        let (click_x, click_y) = (f64::from(pad + rx + rw * 0.5), f64::from(top + ry + rh * 0.5));
+        // Robi's stashed body DIRECTLY under that same point: if the bubble
+        // did not win by order, this press would dismiss him.
+        let body = (
+            click_x as i32 - 20,
+            click_x as i32 + 20,
+            click_y as i32 - 20,
+            click_y as i32 + 20,
+        );
+        app.windows.get_mut(&wid).unwrap().robi_hit_rect = Some(body);
+        app.on_cursor_moved(wid, click_x, click_y);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(app.notice.is_none(), "the press dismissed the bubble");
+        let ws = app.windows.get(&wid).unwrap();
+        assert_eq!(
+            ws.robi_hit_rect,
+            Some(body),
+            "…and never reached the robot (the rect is not spent)"
+        );
+        assert!(
+            app.robi_dismissal.is_none(),
+            "no `robi = false` write was queued"
+        );
+        assert!(!ws.selecting, "and no selection started");
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// THE PET'S HOVER LABEL vs THE PET: the deliberate INVERSE of Robi's
+    /// bubble ordering. `notice_click` runs before `pet_press_at`, so the
+    /// label carves out an early `false` wherever the press lands on the
+    /// pet's padded body — a press on the cat must still PET the cat — while
+    /// a press on the card but OFF the cat is swallowed (no dismissal, no
+    /// selection, nothing leaks toward the PTY).
+    #[test]
+    fn a_press_through_the_pets_label_still_pets_the_cat() {
+        use crate::{App, WindowId};
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let spawned = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.notice = Some(crate::notice::TransientNotice::pet_label(
+            "shell".into(),
+            "Boots",
+            wid,
+            (160.0, 140.0),
+            spawned,
+        ));
+        app.windows.get_mut(&wid).unwrap().notice_card = Some(crate::SettingsCard {
+            rgba: Vec::new(),
+            pw: 0,
+            ph: 0,
+            dx: 0,
+            dy: 0,
+            fp: 0,
+            geom: 0,
+        });
+        // Resolve the card's live rect through the SAME seams the click path
+        // reads (the robi-bubble test's recipe).
+        let now = std::time::Instant::now();
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f32;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f32;
+        let geom = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px: app.win_font_px(wid),
+            cols: app.windows.get(&wid).unwrap().cols as usize,
+            panel_rows: 0,
+        };
+        let motion = app
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::NoticePill);
+        let (rx, ry, rw, rh) = crate::notice::notice_rect(
+            app.notice.as_ref().unwrap(),
+            &geom,
+            now,
+            motion,
+            app.notice_clear_rows(),
+        );
+        assert!(rw > 0.0 && rh > 0.0, "the card must be drawable");
+        let (click_x, click_y) = (f64::from(pad + rx + rw * 0.5), f64::from(top + ry + rh * 0.5));
+        // The pet's body directly under the card's center: the press must
+        // fall THROUGH the label and stroke the cat.
+        let body = (
+            click_x as i32 - 20,
+            click_x as i32 + 20,
+            click_y as i32 - 20,
+            click_y as i32 + 20,
+        );
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some(body);
+        assert!(
+            !app.notice_click(wid, click_x, click_y),
+            "the label yields to the cat under it"
+        );
+        app.on_cursor_moved(wid, click_x, click_y);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        let ws = app.windows.get(&wid).unwrap();
+        assert!(!ws.selecting, "the press never reached the selection layer");
+        // The positive half of the title: the press did not merely avoid the
+        // card and the selection layer — it genuinely PETTED the cat. Without
+        // this pin, a seam between `notice_click` and `pet_press_at` that
+        // swallowed the press would pass every assertion above while petting
+        // silently died under the label.
+        assert_eq!(
+            ws.cursor_pet.pending_pets(),
+            1,
+            "the press fell THROUGH the card and stroked the cat"
+        );
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.is_pet_label()),
+            "…and the label was not dismissed (its lifecycle is hover)"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        // Off the cat but on the card: swallowed quietly — consumed, kept.
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect =
+            Some((body.0 + 900, body.1 + 900, body.2, body.3));
+        assert!(
+            app.notice_click(wid, click_x, click_y),
+            "a press the card visually caught is consumed"
+        );
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.is_pet_label()),
+            "…without dismissing the label"
+        );
+    }
+
+    /// THE HOVER LIFECYCLE, end to end on the live seams: pointing at the
+    /// stashed pet body latches the hover and the render drain posts the
+    /// identity label — both halves, because the fixture gives the pane a
+    /// REAL shell claim and dresses the pet in the shell pair (the honesty
+    /// gate: a name is only claimed for the cat actually on glass); the pet
+    /// moving out from under the still pointer retires it; and `CursorLeft`
+    /// is mouse-out too.
+    #[test]
+    fn hovering_the_pet_posts_the_identity_label_and_mouse_out_retires_it() {
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A real shell block (the app_kitty fixture bytes) and the pet
+        // dressed in the shell pair, so the identity on glass IS the shell's
+        // kitty and the label may claim the name half.
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        crate::term_lock(&term).process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let shell = aterm_effects::kitty_registry::KittyLook::for_app("shell");
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .cursor_pet
+            .sync_look(shell.coat, shell.iris);
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((100, 200, 100, 160));
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        assert!(
+            app.windows.get(&wid).unwrap().pet_hovered,
+            "the motion latch sees the padded body"
+        );
+        app.drain_pet_hover_label(wid);
+        let n = app.notice.as_ref().expect("the drain posted the label");
+        assert!(n.is_pet_label());
+        assert_eq!(n.pet_label_owner(), Some(wid));
+        assert!(
+            n.pet_label_matches("shell", "Boots"),
+            "a prompt is the shell, and the shell's own kitty is on glass — \
+             both halves are honest (got {:?})",
+            n.text()
+        );
+        // The pet walks out from under the still pointer: the drain's
+        // re-verification retires the label without any mouse event.
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((400, 500, 100, 160));
+        app.drain_pet_hover_label(wid);
+        assert!(app.notice.is_none(), "the drain re-verifies per frame");
+        assert!(!app.windows.get(&wid).unwrap().pet_hovered);
+        // CursorLeft is mouse-out: a stale in-window pointer position must
+        // not pin the label after the pointer left the window.
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((100, 200, 100, 160));
+        app.drain_pet_hover_label(wid);
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_pet_label()));
+        app.on_cursor_left(wid);
+        assert!(app.notice.is_none(), "CursorLeft retires the label");
+        // An update notice is never clobbered by a hover: the label waits.
+        app.notice = Some(crate::notice::TransientNotice::update_ready(
+            "1".into(),
+            1,
+            std::time::Instant::now(),
+        ));
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.is_update_ready()),
+            "the update pill owns the slot; the label waits its turn"
+        );
+    }
+
+    /// MOUSE-OUT MUST SURVIVE THE REDRAW IT SCHEDULES: `clear_pet_label`
+    /// itself requests a redraw of every window, and `redraw_window` runs the
+    /// label drain unconditionally — so a drain that could re-derive hover
+    /// from the frozen `last_cursor_px` (whose only writer is `CursorMoved`)
+    /// would re-latch `pet_hovered` and re-post the label one frame after
+    /// every `CursorLeft` dismissal, pinning it forever with the pointer
+    /// outside the window (no further mouse event ever arrives to clear it).
+    /// This pins the staleness gate (`WindowState::pointer_in_window`) that
+    /// closes the loop — and that the gate does not overreach: motion back
+    /// into the window re-arms hover as before.
+    #[test]
+    fn cursor_left_dismissal_survives_the_drain_of_its_own_redraw() {
+        use crate::{App, WindowId};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((100, 200, 100, 160));
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.drain_pet_hover_label(wid);
+        assert!(app.notice.as_ref().is_some_and(|n| n.is_pet_label()));
+        app.on_cursor_left(wid);
+        assert!(app.notice.is_none(), "CursorLeft retires the label");
+        assert!(!app.windows.get(&wid).unwrap().pet_hovered);
+        // clear_pet_label itself requests a redraw of every window, and the
+        // redraw path runs the drain unconditionally — this is that frame.
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice.is_none(),
+            "the label must STAY retired after the pointer left the window"
+        );
+        assert!(!app.windows.get(&wid).unwrap().pet_hovered);
+        // The pointer returns: motion re-arms the source, and hover works
+        // exactly as before — the gate suppresses staleness, not hovering.
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice.as_ref().is_some_and(|n| n.is_pet_label()),
+            "a pointer back inside the window earns the label again"
+        );
+    }
+
+    /// THE HONESTY DECISION pinned end to end (`App::pet_label_identity`):
+    /// the label's NAME half is claimed only while the cat on glass IS the
+    /// resolved identity's kitty. A pane flipping shell → claude updates the
+    /// program half immediately, but Clementine's name appears only once the
+    /// worn pair lands (a live handoff parks the incoming pair for seconds —
+    /// never "claude — Clementine" over a cat still wearing the tuxedo); and
+    /// an Executing block with NO commandline posts no label at all rather
+    /// than claim "shell" while an unknown command runs.
+    #[test]
+    fn the_label_never_names_a_kitty_that_is_not_on_glass() {
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        // A real shell claim, the pet dressed in the shell pair: both halves.
+        crate::term_lock(&term).process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        let shell = aterm_effects::kitty_registry::KittyLook::for_app("shell");
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_pet.sync_look(shell.coat, shell.iris);
+            ws.pet_hit_rect = Some((100, 200, 100, 160));
+        }
+        app.on_cursor_moved(wid, 150.0, 130.0);
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.pet_label_matches("shell", "Boots")),
+            "the identity's kitty is on glass: program AND name"
+        );
+        // The pane flips to claude while the cat still wears the shell pair
+        // (a live handoff would park the swap): program-only, no Clementine.
+        crate::term_lock(&term).process(b"claude\x1b]633;E;claude\x07\r\n\x1b]133;C\x07");
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.pet_label_matches("claude", "")),
+            "mid-handoff the name half is suppressed"
+        );
+        // The handoff lands (an undrawn headless pet re-dresses immediately):
+        // the name arrives with the cat that owns it.
+        let claude = aterm_effects::kitty_registry::KittyLook::for_app("claude");
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .cursor_pet
+            .sync_look(claude.coat, claude.iris);
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.pet_label_matches("claude", "Clementine")),
+            "landed: the cat on glass is Clementine"
+        );
+        // An Executing block with NO commandline claims nothing: the label
+        // retires rather than lie about what is running.
+        crate::term_lock(&term)
+            .process(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07");
+        app.drain_pet_hover_label(wid);
+        assert!(
+            app.notice.is_none(),
+            "no claim, no card — silence over a plausible lie"
+        );
+        assert!(
+            app.windows.get(&wid).unwrap().pet_hovered,
+            "…while the hover latch stays honest for the next claim"
+        );
     }
 }

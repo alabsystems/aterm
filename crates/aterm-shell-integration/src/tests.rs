@@ -581,6 +581,165 @@ fn test_fish_encode_cmd_emits_no_raw_control_bytes() {
     );
 }
 
+// ─── The OSC frame writer must not re-interpret its payload ──────────────
+//
+// `__aterm_osc` wraps an already-built payload in `ESC ] … BEL`. It must copy
+// that payload through byte-for-byte. zsh's `print` WITHOUT `-r` does not: it
+// expands escape sequences in its argument, which silently undid every escape
+// `__aterm_encode_cmd` had just produced and re-materialized the exact raw
+// ESC/BEL bytes the encoder exists to remove. bash always spelled the writer
+// `printf '\033]%s\a' "$1"` (a `%s` argument is never interpreted) and was
+// never affected, so the two shells being byte-equal here is the real check.
+
+/// Command line for the frame-writer probe. It carries two independent
+/// break-out attempts:
+///   * raw ESC (0x1b) and BEL (0x07) bytes, which `__aterm_encode_cmd` must
+///     hex-escape and the frame writer must then leave as escapes; and
+///   * the LITERAL text `\e]52;c;aGVsbG8=\a` — ordinary printable characters,
+///     so the tab title's `${…//[[:cntrl:]]/}` guard has no control byte to
+///     strip. Only a frame writer that expands escapes can turn that text into
+///     a real nested OSC 52 clipboard write.
+#[cfg(unix)]
+const OSC_PROBE_CMDLINE: &str = "a\u{1b}b\u{7}c;d e\\f \\e]52;c;aGVsbG8=\\a";
+
+/// OSC 633;E for [`OSC_PROBE_CMDLINE`]: every reserved byte still spelled as
+/// the decoder's backslash escape, and exactly one BEL — the terminator.
+#[cfg(unix)]
+const OSC_PROBE_EXPECTED_633: &str = concat!(
+    "\u{1b}]633;E;",
+    r"a\x1bb\x07c\x3bd\x20e\\f\x20\\e]52\x3bc\x3baGVsbG8=\\a",
+    "\u{7}"
+);
+
+/// OSC 0 title for [`OSC_PROBE_CMDLINE`]: the control bytes are stripped
+/// (`a<ESC>b<BEL>c` → `abc`) and the literal `\e`/`\a` text stays literal.
+#[cfg(unix)]
+const OSC_PROBE_EXPECTED_TITLE: &str =
+    concat!("\u{1b}]0;", r"abc;d e\f \e]52;c;aGVsbG8=\a", "\u{7}");
+
+/// Drive the two emissions `preexec` performs, through the real
+/// `__aterm_osc` frame writer, and return the raw stdout bytes.
+///
+/// The snippet is spelled identically for bash and zsh — both write command
+/// substitution as `$(…)` and control-stripping as `${v//[[:cntrl:]]/}` — so
+/// the same source line is exercised in both shells.
+#[cfg(unix)]
+fn run_osc_wire_probe(
+    shell: &str,
+    args: &[&str],
+    cleanup: &str,
+    script_name: &str,
+) -> Vec<u8> {
+    let script = format!(
+        "{}/src/scripts/{script_name}",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let command = format!(
+        "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {cleanup}; \
+         __aterm_osc \"633;E;$(__aterm_encode_cmd \"$ATERM_TEST_INPUT\")\"; \
+         __aterm_osc \"0;${{ATERM_TEST_INPUT//[[:cntrl:]]/}}\""
+    );
+    let output = shell_command(shell)
+        .args(args)
+        .arg("-c")
+        .arg(&command)
+        .env("ATERM_TEST_SCRIPT", script)
+        .env("ATERM_TEST_INPUT", OSC_PROBE_CMDLINE)
+        // No nonce: the probe pins the frame bytes, and a ";id=<hex>" tail
+        // would just pad every expected string without exercising anything.
+        .env_remove("ATERM_SHELL_NONCE")
+        .output()
+        .unwrap_or_else(|error| panic!("spawn {shell} for OSC frame-writer probe: {error}"));
+    assert!(
+        output.status.success(),
+        "{shell} OSC frame-writer probe should succeed; stdout: {:?}; stderr: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+#[cfg(unix)]
+fn assert_osc_wire_is_escape_transparent(shell: &str, wire: &[u8]) {
+    let expected = format!("{OSC_PROBE_EXPECTED_633}{OSC_PROBE_EXPECTED_TITLE}");
+    // `ends_with`, not `==`: an interactive bash may prefix stdout with its
+    // readline meta-mode probe on some hosts. Everything the writer emits is
+    // pinned exactly; only a leading terminal-init blob is tolerated.
+    assert!(
+        wire.ends_with(expected.as_bytes()),
+        "{shell} OSC frames must reproduce the payload byte-for-byte;\n  expected suffix: {:?}\n  got:             {:?}",
+        expected,
+        String::from_utf8_lossy(wire)
+    );
+    // The break-out itself, stated directly: no nested OSC introducer may
+    // appear anywhere on the wire. Under the `print -n` writer this failed —
+    // stdout carried a real `ESC ]52;c;aGVsbG8=` clipboard write.
+    assert!(
+        !wire.windows(5).any(|w| w == b"\x1b]52;"),
+        "{shell} must not smuggle a nested OSC 52 out of the frame; got: {:?}",
+        String::from_utf8_lossy(wire)
+    );
+    // ...and the 633;E payload must carry no raw ESC/BEL, so the sequence
+    // cannot terminate before its own BEL. Everything between the introducer
+    // and the first BEL is the payload.
+    const INTRODUCER: &str = "\u{1b}]633;E;";
+    let after_introducer = &wire[wire.len() - expected.len() + INTRODUCER.len()..];
+    let payload_len = after_introducer
+        .iter()
+        .position(|&b| b == 0x07)
+        .expect("OSC 633;E must be BEL-terminated");
+    let payload = &after_introducer[..payload_len];
+    assert!(
+        !payload.contains(&0x1b) && !payload.contains(&0x07),
+        "{shell} 633;E payload must carry no raw ESC/BEL; got: {:?}",
+        String::from_utf8_lossy(payload)
+    );
+}
+
+/// Static guard (host-portable, mirrors the fish one above): the frame writers
+/// must stay on `printf`, whose `%s` argument is copied verbatim. Reverting zsh
+/// to `print -n` — which expands escapes in its argument — silently re-opens the
+/// break-out on hosts where the functional probe below cannot run.
+#[test]
+fn test_osc_frame_writers_use_printf() {
+    for (name, script) in [("zsh", scripts::ZSH), ("bash", scripts::BASH)] {
+        assert!(
+            script.contains("__aterm_osc() {\n    printf '\\033]%s\\a' \"$1\"\n}"),
+            "{name} __aterm_osc must frame with printf '%%s' so the payload is \
+             copied byte-for-byte (zsh's `print` without -r expands escapes in \
+             its argument and re-materializes raw ESC/BEL inside the OSC string)"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_bash_osc_frame_writer_preserves_payload_escapes() {
+    let wire = run_osc_wire_probe(
+        bash_shell(),
+        &["--noprofile", "--norc", "-i"],
+        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "aterm_shell_integration.bash",
+    );
+    assert_osc_wire_is_escape_transparent("bash", &wire);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_zsh_osc_frame_writer_preserves_payload_escapes() {
+    let Some(zsh) = zsh_shell() else {
+        eprintln!("SKIP: no zsh on this host");
+        return;
+    };
+    let wire = run_osc_wire_probe(
+        zsh,
+        &["-f", "-i"],
+        "add-zsh-hook -d precmd __aterm_precmd 2>/dev/null || true; add-zsh-hook -d preexec __aterm_preexec 2>/dev/null || true",
+        "aterm_shell_integration.zsh",
+    );
+    assert_osc_wire_is_escape_transparent("zsh", &wire);
+}
+
 #[test]
 fn test_prepare_writes_scripts() {
     let dir = aterm_tempfile::tempdir().unwrap();
@@ -918,12 +1077,16 @@ fn test_fish_script_defines_id_suffix_helper() {
 #[test]
 fn test_bash_mark_functions_invoke_id_suffix() {
     let script = scripts::BASH;
-    // Every 133 A/B/C/D emission MUST include the id suffix.
+    // Every 133 A/B/C/D emission MUST include the id suffix. The suffix is
+    // precomputed at source time into $__aterm_id_suffix_str (the nonce is
+    // immutable after capture), so the emitters expand a parameter instead of
+    // forking `$(__aterm_id_suffix)` five times per command cycle. The bytes
+    // on the wire are unchanged; only the spelling of the substring moved.
     for expected in [
-        r#""133;A$(__aterm_id_suffix)""#,
-        r#""133;B$(__aterm_id_suffix)""#,
-        r#""133;C$(__aterm_id_suffix)""#,
-        r#""133;D;${1}$(__aterm_id_suffix)""#,
+        r#""133;A${__aterm_id_suffix_str}""#,
+        r#""133;B${__aterm_id_suffix_str}""#,
+        r#""133;C${__aterm_id_suffix_str}""#,
+        r#""133;D;${1}${__aterm_id_suffix_str}""#,
     ] {
         assert!(
             script.contains(expected),
@@ -933,19 +1096,28 @@ fn test_bash_mark_functions_invoke_id_suffix() {
     }
     // OSC 633;E must also carry the nonce.
     assert!(
-        script.contains(r#""633;E;$(__aterm_encode_cmd "$BASH_COMMAND")$(__aterm_id_suffix)""#),
+        script.contains(r#""633;E;$(__aterm_encode_cmd "$BASH_COMMAND")${__aterm_id_suffix_str}""#),
         "bash script must emit OSC 633;E with id suffix"
+    );
+    // ...and the precomputed suffix must actually be derived from the captured
+    // shell-local nonce, or the emissions above would carry an empty tail.
+    assert!(
+        script.contains(r#"__aterm_id_suffix_str=";id=${__aterm_shell_nonce}""#),
+        "bash script must precompute the id suffix from the captured nonce"
     );
 }
 
 #[test]
 fn test_zsh_mark_functions_invoke_id_suffix() {
     let script = scripts::ZSH;
+    // As in bash: the suffix is precomputed once at source time into
+    // $__aterm_id_suffix_str so the five per-command-cycle markers expand a
+    // parameter rather than forking `$(__aterm_id_suffix)`. Same wire bytes.
     for expected in [
-        r#""133;A$(__aterm_id_suffix)""#,
-        r#""133;B$(__aterm_id_suffix)""#,
-        r#""133;C$(__aterm_id_suffix)""#,
-        r#""133;D;$1$(__aterm_id_suffix)""#,
+        r#""133;A${__aterm_id_suffix_str}""#,
+        r#""133;B${__aterm_id_suffix_str}""#,
+        r#""133;C${__aterm_id_suffix_str}""#,
+        r#""133;D;$1${__aterm_id_suffix_str}""#,
     ] {
         assert!(
             script.contains(expected),
@@ -954,8 +1126,12 @@ fn test_zsh_mark_functions_invoke_id_suffix() {
         );
     }
     assert!(
-        script.contains(r#""633;E;$(__aterm_encode_cmd "$1")$(__aterm_id_suffix)""#),
+        script.contains(r#""633;E;$(__aterm_encode_cmd "$1")${__aterm_id_suffix_str}""#),
         "zsh script must emit OSC 633;E with id suffix"
+    );
+    assert!(
+        script.contains(r#"__aterm_id_suffix_str=";id=${__aterm_shell_nonce}""#),
+        "zsh script must precompute the id suffix from the captured nonce"
     );
 }
 

@@ -412,7 +412,7 @@ impl ReleaseCredentials {
 /// value is NOT absent: writing `notary_profile = ""` is a mistake with a silent
 /// failure mode (the tier would look configured and then behave as if it were not),
 /// so it is refused by name.
-fn credentials_value<'a>(text: &'a str, want: &str) -> Result<Option<&'a str>, String> {
+pub(crate) fn credentials_value<'a>(text: &'a str, want: &str) -> Result<Option<&'a str>, String> {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {

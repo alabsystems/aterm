@@ -83,15 +83,19 @@ pub(crate) struct TerminalLeafRestore {
     pub local_id: Option<u64>,
     /// USER session metadata (session-metadata stage 1; additive, absent
     /// tolerated by older manifests): the operator's `meta set` title/
-    /// description/icon, captured at quit and RE-SEEDED onto the respawned
-    /// session so restore keeps the operator-chosen identity (the `title`
-    /// above is the engine/OSC one — a different datum).
+    /// description/icon/role/attention, captured at quit and RE-SEEDED onto
+    /// the respawned session so restore keeps the operator-chosen identity
+    /// (the `title` above is the engine/OSC one — a different datum).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
 }
 
 impl TerminalLeafRestore {
@@ -110,6 +114,14 @@ impl TerminalLeafRestore {
             .icon
             .as_deref()
             .and_then(|value| crate::session_timeline::sanitize_metadata_value("icon", value));
+        self.role = self
+            .role
+            .as_deref()
+            .and_then(|value| crate::session_timeline::sanitize_metadata_value("role", value));
+        self.attention = self
+            .attention
+            .as_deref()
+            .and_then(|value| crate::session_timeline::sanitize_metadata_value("attention", value));
     }
 
     fn user_metadata_is_canonical(&self) -> bool {
@@ -122,6 +134,8 @@ impl TerminalLeafRestore {
         canonical("title", &self.user_title)
             && canonical("description", &self.description)
             && canonical("icon", &self.icon)
+            && canonical("role", &self.role)
+            && canonical("attention", &self.attention)
     }
 }
 
@@ -748,6 +762,8 @@ impl RestoredTab {
                         user_title: None,
                         description: None,
                         icon: None,
+                        role: None,
+                        attention: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -1523,6 +1539,8 @@ metadata = "opaque=copy-me"
                     user_title: None,
                     description: None,
                     icon: None,
+                    role: None,
+                    attention: None,
                 },
             ))),
         };
@@ -1544,6 +1562,8 @@ metadata = "opaque=copy-me"
             user_title: None,
             description: None,
             icon: None,
+            role: None,
+            attention: None,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
             root = RestoredSplitTree::Split {
@@ -1559,6 +1579,8 @@ metadata = "opaque=copy-me"
                         user_title: None,
                         description: None,
                         icon: None,
+                        role: None,
+                        attention: None,
                     },
                 ))),
             };

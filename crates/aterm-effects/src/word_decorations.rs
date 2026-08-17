@@ -2020,11 +2020,29 @@ pub struct WordDecorations {
     /// the pet costs the atlas one slot per resident pose and nothing at all
     /// when the pet is off.
     pet_baker: crate::pet_baker::PetBaker,
-    /// The last pet tile that actually resolved: `(ax, ay, pose)`. Held so a
-    /// frame whose bake was deferred re-draws the previous pose instead of
-    /// dropping the sprite (see [`WordDecorations::pet_cursor`]). Cleared with
-    /// the atlas, so it can never name a tile that no longer exists.
-    pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId)>,
+    /// The last pet tile that actually resolved: `(ax, ay, pose, coat,
+    /// iris)`. Held so a frame whose bake was deferred re-draws the previous
+    /// pose instead of dropping the sprite (see
+    /// [`WordDecorations::pet_cursor`]) — and LOOK-KEYED: the fallback is
+    /// consulted only while the held tile wears THIS frame's `(coat, iris)`,
+    /// so the breed handoff's swap frame can never re-emit the OLD coat
+    /// beside its own old-look ghost under bake pressure (two identical
+    /// cats — the exact appearance the brain's `old != pair` guard exists to
+    /// prevent). Cleared with the atlas, so it can never name a tile that no
+    /// longer exists.
+    pet_last_tile: Option<(u16, u16, crate::pet_glyphs_gen::PetGlyphId, u8, u8)>,
+    /// The breed handoff's DEPARTING bodies each hold their own last-resolved
+    /// tile `(ax, ay)`, one per brain slot — deliberately NOT sharing
+    /// [`Self::pet_last_tile`]: two different bake keys ping-ponging one slot
+    /// would strobe both bodies exactly while both are animating. Same
+    /// deferred-bake tolerance, same atlas-scoped invalidation. The held pair
+    /// is not keyed to WHICH departure owns the slot; safe today because
+    /// ghost births are spaced by the handoff debounce (2.5 s) while a ghost
+    /// lives at most `kitty_pet::DEPART_MAX` (2.0 s), so a slot is always
+    /// swept `None` (clearing the hold below) before it can be reborn — if
+    /// either constant ever closes that gap, key the hold by the departure's
+    /// `born` stamp.
+    pet_depart_tiles: [Option<(u16, u16)>; crate::kitty_pet::PET_DEPARTURES_MAX],
     /// The DOG roster's own exact-size tile cache ([`crate::dog_baker`]) — the
     /// typed-word dog cameo's bake path, reaching the screen through the same
     /// shared-atlas `host_tile` door as the pet.
@@ -2317,6 +2335,53 @@ struct ParkedPane {
     /// Parked because it is a CELL in one pane's grid — pane B's caret is not
     /// evidence about pane A's words (see [`WordDecorations::last_caret`]).
     last_caret: Option<(u16, u16)>,
+    /// DERIVED, not parked state: this shard's §3.2 burst-mutex summary — the
+    /// LATEST end instant among its granted-but-unfinished burst windows, and
+    /// the same restricted to SUPERNOVA windows. Both are recomputed by
+    /// [`Self::swap`], the only path into or out of a parked shard, so they can
+    /// never be stale: a parked map is unreachable except through `swap`, and
+    /// the LIVE map is re-summarized the moment it parks again.
+    ///
+    /// [`WordDecorations::super_prepass`] used to CHAIN every parked shard's
+    /// whole episode map onto its own persist walk — once per bound pane per
+    /// presented frame, i.e. O(panes × total episodes) to conclude, in the
+    /// steady state, that no burst is live. Reading a max end instead is EXACT,
+    /// not conservative: over a set of windows `busy == (now < max(end))`, and
+    /// `until`/`super_until` are that same max, so the per-episode test and the
+    /// max-end test agree entry for entry (no `now` is folded in here — the
+    /// liveness comparison stays at the read site).
+    burst_end_max: Option<Instant>,
+    super_end_max: Option<Instant>,
+}
+
+/// The §3.2b supernova's MUTEX-OCCUPANCY window, TIER-AWARE upward: a Nuke
+/// holds the mutex — and keeps emitting — for its full 3600 ms, and the window
+/// never goes BELOW the classic 2400 ms (the emitter has no short Flash arc; it
+/// would snap off mid-shockwave, so a Flash keeps occupying — and presenting —
+/// the classic window it always has).
+fn super_window_of(tier: supernova::SuperTier) -> Duration {
+    Duration::from_millis(supernova::total_ms(tier).max(supernova::SUPER_TOTAL_MS))
+}
+
+/// The instant a granted burst window ENDS — the §3.2 burst-mutex predicate,
+/// factored out so `super_prepass`'s live-map walk and [`ParkedPane`]'s parked
+/// summary cannot drift apart. `None` when the episode holds no window at all:
+/// finished (`nova_done`), never granted (`nova_start` unset), or a burst kind
+/// that does not take the mutex. The mutex is TWO-WAY, so a live CLASSIC nova
+/// (its genome-derived window still running) counts exactly like a supernova.
+fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
+    if ep.nova_done {
+        return None;
+    }
+    let start = ep.nova_start?;
+    let win = match ep.burst_kind {
+        Some(BurstKind::SuperNova) if ep.burst_roll => super_window_of(ep.burst_tier),
+        Some(BurstKind::Nova) => {
+            Duration::from_millis(u64::from(nova_features(ep.genome.gkey).duration_ms))
+        }
+        _ => return None,
+    };
+    Some(start + win)
 }
 
 impl ParkedPane {
@@ -2360,6 +2425,32 @@ impl ParkedPane {
         std::mem::swap(&mut self.companion_claim, &mut wd.companion_claim);
         std::mem::swap(&mut self.caret_word, &mut wd.caret_word);
         std::mem::swap(&mut self.last_caret, &mut wd.last_caret);
+        // `self.persist` now holds whichever map just became PARKED (this is a
+        // symmetric exchange, so that is true in both directions). Re-derive the
+        // burst-mutex summary from it here, at the ONE choke point — no dirty
+        // flag, no invalidation protocol, and no way for the thaw / eviction /
+        // early-`nova_done` edges to desynchronize it, because those can only
+        // ever touch the LIVE map, which is re-summarized on its next park.
+        let (any_end, super_end) = self.burst_summary();
+        self.burst_end_max = any_end;
+        self.super_end_max = super_end;
+    }
+
+    /// This shard's §3.2 burst-mutex summary, recomputed from `self.persist`:
+    /// `(max end over any granted burst window, the same over SUPERNOVA windows
+    /// only)`. Deliberately `now`-free — see the field docs.
+    fn burst_summary(&self) -> (Option<Instant>, Option<Instant>) {
+        let (mut any, mut sup) = (None::<Instant>, None::<Instant>);
+        for ep in self.persist.values() {
+            let Some(end) = burst_mutex_end(ep) else {
+                continue;
+            };
+            any = Some(any.map_or(end, |m: Instant| m.max(end)));
+            if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
+                sup = Some(sup.map_or(end, |m: Instant| m.max(end)));
+            }
+        }
+        (any, sup)
     }
 }
 
@@ -2805,6 +2896,7 @@ impl WordDecorations {
         // …and the animal roster's, for the same reasons again.
         self.animal_baker.clear();
         self.pet_last_tile = None;
+        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
         self.dog_baker.clear();
         self.dog_last_tile = None;
         self.robi_baker.clear();
@@ -3351,6 +3443,12 @@ impl WordDecorations {
     /// Returns `None` (drawing nothing this frame) when the pet is invisible or
     /// its tile has not baked yet — the shared two-bake budget may already be
     /// spent on word-cats, and the pose lands on the next frame.
+    ///
+    /// Besides the live body and its motes, this also draws the breed
+    /// handoff's DEPARTING bodies ([`crate::kitty_pet::PetFrame::departures`])
+    /// — each an extra `FreeSprite` in the OLD look's `(coat, iris)`, with
+    /// its own per-slot held tile. Because they ride the frame, every caller
+    /// (single-pane, composed, capture) carries them with zero plumbing.
     pub fn pet_cursor(&mut self, frame: PetCursorFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
         let PetCursorFrame {
             geom,
@@ -3407,42 +3505,56 @@ impl WordDecorations {
             .pet_baker
             .tile(&key)
             .and_then(|rgba| self.cat_baker.host_tile(host, nat_w, nat_h, rgba))
-            .map(|t| (t.ax, t.ay, key.pose));
+            .map(|t| (t.ax, t.ay, key.pose, coat, iris));
         if let Some(r) = resolved {
             self.pet_last_tile = Some(r);
         }
-        let (ax, ay, _) = resolved.or(self.pet_last_tile)?;
-
-        // Dest rect: squash/stretch about the FEET (see the doc note) —
-        // computed by [`crate::kitty_pet::PetFrame::body_px`], the SAME rect
-        // hosts hand back to `tick` as the companion's pixel-yield box
-        // ([`CompanionOnGlass::body_px`]). One copy of the math, so the box
-        // the word-cats yield to is the body the pet actually draws.
-        let (x0, x1, y0, y1) = pet.body_px(geom.cell_w, geom.cell_h, geom.cols)?;
-        let sprite = FreeSprite {
-            x: x0,
-            y: y0,
-            w: (x1 - x0).clamp(1, i32::from(u16::MAX)) as u16,
-            h: (y1 - y0).clamp(1, i32::from(u16::MAX)) as u16,
-            ax,
-            ay,
-            aw: nat_w,
-            ah: nat_h,
-            tint: 0x00FF_FFFF,
-            alpha: pet.alpha,
-            flip_x: pet.facing_left,
-            // HIDE-BEHIND-WORDS (wave 4c): while the brain says it is
-            // hiding, the pet drops UNDER the glyphs — the word draws over
-            // the cat's body and stays readable in front of it (the ink
-            // law's under-exception: legibility wins because the TEXT is on
-            // top), with the ears and crown poking above the line.
-            z: if pet.under_ink {
-                FreeZ::UnderText
-            } else {
-                FreeZ::OverText
-            },
-            sampler: FreeSampler::Nearest,
-        };
+        // LOOK-KEYED fallback: a held tile in a DIFFERENT `(coat, iris)` is
+        // refused. On the handoff's swap frame under bake pressure the live
+        // body therefore skips THIS frame — the old-look ghost born on the
+        // same tick is already standing on the same spot, so the glass still
+        // shows exactly one cat and the new look lands next frame — instead
+        // of re-emitting the old coat beside its own ghost (two identical
+        // cats, the render bug the brain's `old != pair` guard exists to
+        // prevent). The motes and the departing bodies below draw either way.
+        let body_tile = resolved.or_else(|| {
+            self.pet_last_tile
+                .filter(|&(.., held_coat, held_iris)| (held_coat, held_iris) == (coat, iris))
+        });
+        let sprite = body_tile.and_then(|(ax, ay, ..)| {
+            // Dest rect: squash/stretch about the FEET (see the doc note) —
+            // computed by [`crate::kitty_pet::PetFrame::body_px`], the SAME
+            // rect hosts hand back to `tick` as the companion's pixel-yield
+            // box ([`CompanionOnGlass::body_px`]). One copy of the math, so
+            // the box the word-cats yield to is the body the pet actually
+            // draws.
+            let (x0, x1, y0, y1) = pet.body_px(geom.cell_w, geom.cell_h, geom.cols)?;
+            Some(FreeSprite {
+                x: x0,
+                y: y0,
+                w: (x1 - x0).clamp(1, i32::from(u16::MAX)) as u16,
+                h: (y1 - y0).clamp(1, i32::from(u16::MAX)) as u16,
+                ax,
+                ay,
+                aw: nat_w,
+                ah: nat_h,
+                tint: 0x00FF_FFFF,
+                alpha: pet.alpha,
+                flip_x: pet.facing_left,
+                // HIDE-BEHIND-WORDS (wave 4c): while the brain says it is
+                // hiding, the pet drops UNDER the glyphs — the word draws
+                // over the cat's body and stays readable in front of it (the
+                // ink law's under-exception: legibility wins because the
+                // TEXT is on top), with the ears and crown poking above the
+                // line.
+                z: if pet.under_ink {
+                    FreeZ::UnderText
+                } else {
+                    FreeZ::OverText
+                },
+                sampler: FreeSampler::Nearest,
+            })
+        });
 
         // ── the pet's mote lane ─────────────────────────────────────────────
         // Landing dust, sleep z's, purr notes — tiny free-floating accents on
@@ -3493,17 +3605,106 @@ impl WordDecorations {
                 sampler: FreeSampler::Nearest,
             });
         }
+        // ── the departing bodies (the breed handoff's outgoing kitties) ────
+        // Each ghost draws exactly like the live body — the same two-door
+        // bake (its own [`crate::pet_baker::PetBakeKey`], whose key-derived
+        // `host_id` lets two looks coexist in the atlas without aliasing)
+        // and the same feet-anchored dest law, via a synthetic [`PetFrame`]
+        // through the ONE `body_px` rect — wearing its OWN old `(coat,
+        // iris)`. Per-SLOT held tiles (`pet_depart_tiles`) carry a bake-
+        // budget miss without strobing: routing two live bake keys through
+        // `pet_last_tile` would ping-pong it exactly while both bodies
+        // animate. Ghosts push FIRST, so they run off BEHIND the live pet.
+        let mut depart_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_DEPARTURES_MAX] =
+            [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        for (i, slot) in depart_sprites.iter_mut().enumerate() {
+            let Some(d) = pet.departures[i] else {
+                self.pet_depart_tiles[i] = None;
+                continue;
+            };
+            // The ghost rides the live pet's own presence envelope too: if
+            // the pet is fading off the glass, its ghosts fade with it.
+            let alpha = (u16::from(d.alpha) * u16::from(pet.alpha) / 255) as u8;
+            if alpha == 0 {
+                continue;
+            }
+            let key = crate::pet_baker::PetBakeKey {
+                pose: d.pose,
+                coat: d.coat,
+                iris: d.iris,
+                colors,
+                w: nat_w,
+                h: nat_h,
+            };
+            let resolved = self
+                .pet_baker
+                .tile(&key)
+                .and_then(|rgba| self.cat_baker.host_tile(key.host_id(), nat_w, nat_h, rgba))
+                .map(|t| (t.ax, t.ay));
+            if let Some(r) = resolved {
+                self.pet_depart_tiles[i] = Some(r);
+            }
+            let Some((ax, ay)) = resolved.or(self.pet_depart_tiles[i]) else {
+                continue; // budget spent, nothing held yet: lands next frame
+            };
+            let ghost = crate::kitty_pet::PetFrame {
+                alpha,
+                action: pet.action,
+                pose: d.pose,
+                col: d.col,
+                row: d.row,
+                lift: 0.0,
+                facing_left: d.facing_left,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                purr: 0.0,
+                under_ink: false,
+                motes: [None; crate::kitty_pet::PET_MOTES_MAX],
+                departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
+            };
+            let Some((x0, x1, y0, y1)) = ghost.body_px(geom.cell_w, geom.cell_h, geom.cols) else {
+                continue;
+            };
+            *slot = Some(FreeSprite {
+                x: x0,
+                y: y0,
+                w: (x1 - x0).clamp(1, i32::from(u16::MAX)) as u16,
+                h: (y1 - y0).clamp(1, i32::from(u16::MAX)) as u16,
+                ax,
+                ay,
+                aw: nat_w,
+                ah: nat_h,
+                tint: 0x00FF_FFFF,
+                alpha,
+                flip_x: d.facing_left,
+                z: FreeZ::OverText,
+                sampler: FreeSampler::Nearest,
+            });
+        }
+        for g in depart_sprites.iter().flatten() {
+            free.push(*g);
+        }
         for m in mote_sprites.iter().flatten() {
             free.push(*m);
         }
-        free.push(sprite);
+        if let Some(s) = sprite {
+            free.push(s);
+        }
 
-        let mut fp = fold_free(0xCBF2_9CE4_8422_2325, &sprite);
+        let mut fp = 0xCBF2_9CE4_8422_2325;
+        if let Some(s) = &sprite {
+            fp = fold_free(fp, s);
+        }
         // The motes fold too: a drifting mote over a perfectly still sleeper
         // is often the ONLY change on glass, and the host's early-out must
         // not swallow it.
         for m in mote_sprites.iter().flatten() {
             fp = fold_free(fp, m);
+        }
+        // And the departing bodies, for the same reason: a ghost sprinting
+        // off beside a settled pet is often the only change on glass.
+        for g in depart_sprites.iter().flatten() {
+            fp = fold_free(fp, g);
         }
         fp = fold_u64(fp, self.cat_baker.version());
         fp = fold_u64(fp, self.pet_baker.version());
@@ -3926,16 +4127,12 @@ impl WordDecorations {
         // Natural size: ART_ROWS tall (TALLER than the atlas's 2-row
         // host-tile ceiling — the whole body bakes as ONE tile in the Robi
         // cache, then enters the shared atlas as stacked vertical slices,
-        // each under the ceiling, re-assembled at draw time).
-        let h = ((art_rows * ch).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-        // `4·cell_h` is the shared atlas's slot width (`CatBaker::slot_w`), so
-        // this clamp is the ATLAS CONTRACT, not a taste: a wider tile is
-        // REFUSED by `host_tile` and the body silently stops resolving.
-        // `ART_ROWS_MAX` is chosen to stay inside it — the clamp only ever
-        // catches rounding.
-        let w = ((f32::from(h) * crate::robi::ART_ASPECT).round() as i32)
-            .clamp(1, i32::from(geom.cell_h) * 4)
-            .min(i32::from(u16::MAX)) as u16;
+        // each under the ceiling, re-assembled at draw time). ONE copy of
+        // the sizing law — [`crate::robi::body_size_px`], which also caps
+        // the width at the atlas slot (`4·cell_h`, the structural contract)
+        // and which the host's dismiss hit-box reads, so the click box can
+        // never drift from the sprite (the pet's `body_px` discipline).
+        let (w, h) = crate::robi::body_size_px(&geom);
         let key = crate::robi_baker::RobiBakeKey {
             pose: frame.pose,
             w,
@@ -3973,13 +4170,12 @@ impl WordDecorations {
             return emitted.then_some(fp);
         };
 
-        // Anchor: feet on the ground line, or hands on the bar line.
-        let anchor_frac = match frame.anchor {
-            crate::robi::RobiAnchor::Feet => crate::robi::FEET_FRAC,
-            crate::robi::RobiAnchor::Grip => crate::robi::GRIP_FRAC,
-        };
-        let top = frame.anchor_y - (f32::from(body.h) * anchor_frac).round() as i32;
-        let x = frame.x - i32::from(body.w) / 2;
+        // Anchor: feet on the ground line, or hands on the bar line — the
+        // SAME placement law the hit-box uses ([`crate::robi::body_rect_px`]),
+        // applied to the RESOLVED body: on a bake miss that is
+        // `robi_last_body` at the PREVIOUS size, the accepted transient a
+        // host's click slop absorbs.
+        let (x, _, top, _) = crate::robi::body_rect_px(&frame, body.w, body.h);
         let mut dy: i32 = 0;
         for (ax, ay, sh) in body.sl.iter().copied().take(usize::from(body.n)) {
             let sprite = FreeSprite {
@@ -5237,7 +5433,7 @@ impl WordDecorations {
         // rebuild five short-lived Vecs on every redraw.
         let mut done = [false; MAX_OCCURRENCES];
         let mut group = [0usize; MAX_OCCURRENCES];
-        let mut old_keys = [0u64; PERSIST_CAP];
+        let mut unseen = [(FormId::UNKNOWN, 0u64); PERSIST_CAP];
         let mut winner: [Option<usize>; MAX_OCCURRENCES] = [None; MAX_OCCURRENCES];
         let mut matched = [false; PERSIST_CAP];
         // The 66 KB decision plane is the one buffer too big to sit on the
@@ -5250,6 +5446,23 @@ impl WordDecorations {
         }
         let mut prev_scores = [AlignScore::default(); MAX_OCCURRENCES + 1];
         let mut curr_scores = [AlignScore::default(); MAX_OCCURRENCES + 1];
+        // OLD-SET INDEX, built ONCE. The per-group old set is exactly the
+        // unseen episodes carrying that group's `form_id`, and `form_id` IS the
+        // group key — so a single `(form_id, key)` pass plus a sort turns what
+        // was a full `persist` walk PER GROUP (O(groups × PERSIST_CAP)) into one
+        // walk plus a binary search per group. Same bounded-stack discipline as
+        // the rest of this scratch: `persist.len() <= PERSIST_CAP` is the
+        // invariant `insert_persist_bounded` maintains on every exit, so the
+        // unseen subset always fits in one `PERSIST_CAP` array.
+        let mut unseen_len = 0usize;
+        for (&key, ep) in &self.persist {
+            if ep.seen_seq != seq {
+                debug_assert!(unseen_len < PERSIST_CAP);
+                unseen[unseen_len] = (ep.form_id, key);
+                unseen_len += 1;
+            }
+        }
+        unseen[..unseen_len].sort_unstable_by_key(|&(f, _)| f);
         for i in 0..pending.len() {
             if done[i] {
                 continue;
@@ -5270,16 +5483,23 @@ impl WordDecorations {
             // exact-seed/context edges run first; recent leftovers are needed
             // for the weak visual-continuity arm below.
             self.align_old.clear();
-            let mut old_keys_len = 0usize;
-            for (&key, ep) in &self.persist {
-                if ep.form_id == form_id && ep.seen_seq != seq {
-                    debug_assert!(old_keys_len < PERSIST_CAP);
-                    old_keys[old_keys_len] = key;
-                    old_keys_len += 1;
-                }
-            }
-            for &k in &old_keys[..old_keys_len] {
-                if let Some(ep) = self.persist.remove(&k) {
+            let lo = unseen[..unseen_len].partition_point(|&(f, _)| f < form_id);
+            let hi = unseen[lo..unseen_len].partition_point(|&(f, _)| f == form_id) + lo;
+            for &(_, k) in &unseen[lo..hi] {
+                // The map MUTATED during earlier groups: a rekey collision can
+                // replace a key's occupant with an already-adopted episode, and
+                // an eviction can drop it. The index is a CANDIDATE LIST, not a
+                // decision — re-check the exact predicate the per-group scan
+                // used to apply, so the membership set is identical entry for
+                // entry. (Collection ORDER is irrelevant: `align_old` is sorted
+                // below by the total key `(last_row, last_col, key)` — the
+                // order-independence invariant on `persist`'s field doc.)
+                if self
+                    .persist
+                    .get(&k)
+                    .is_some_and(|ep| ep.form_id == form_id && ep.seen_seq != seq)
+                    && let Some(ep) = self.persist.remove(&k)
+                {
                     self.align_old.push((k, ep));
                 }
             }
@@ -6638,31 +6858,10 @@ impl WordDecorations {
                 _ => {}
             }
         }
-        // Scrolled-off mid-peek completion: the flag loop above only walks
-        // VISIBLE occurrences, so a Cat episode whose word scrolled off
-        // mid-peek could never reach `peek_done` off-screen — its lifecycle
-        // hung for the whole grace TTL (10 s) even though the animation's
-        // wall clock (≤ 4.6 s) had long finished. Finish it here against the
-        // latched `peek_total`. Paused episodes are exempt (their clock is
-        // suspended by design: if the word scrolls back within grace and the
-        // rows are clear, the peek resumes); reduced motion keeps its
-        // engine-wide "flags never advance" rule.
-        if !cfg.reduced_motion {
-            let seq = self.rescan_seq;
-            for ep in self.persist.values_mut() {
-                if ep.seen_seq != seq
-                    && ep.shown_as == Some(KittyShownAs::Cat)
-                    && ep.peek_started
-                    && !ep.peek_done
-                    && ep.peek_pause.is_none()
-                    && let Some(ps) = ep.phase_start
-                    && now.saturating_duration_since(ps).as_millis() as u64 >= ep.peek_total
-                {
-                    ep.peek_done = true;
-                }
-            }
-        }
-        self.stamp_spent_marks();
+        // The two off-screen/whole-map passes (scrolled-off mid-peek completion
+        // and the in-place ledger stamp) are FUSED into one walk of `persist` —
+        // see [`Self::stamp_spent_marks`].
+        self.stamp_spent_marks(now, cfg.reduced_motion);
     }
 
     /// Stamp the done mark of every episode whose graphic one-shot has RUN TO
@@ -6716,11 +6915,49 @@ impl WordDecorations {
     /// key on rekey was considered and rejected: that key may belong to an
     /// older, genuinely departed episode, and dropping its guard would let an
     /// extra cat replay, which is the bug.
-    fn stamp_spent_marks(&mut self) {
+    ///
+    /// FUSED WITH THE SCROLLED-OFF SWEEP. This walk also finishes a Cat episode
+    /// whose word scrolled off mid-peek (see the block comment on the sweep
+    /// below), which used to be a SECOND unconditional full walk of `persist`
+    /// immediately before this one, on every deco tick. The fusion is exactly
+    /// equivalent because both passes are per-entry independent: the sweep
+    /// writes only `peek_done` on the entry it is visiting and never
+    /// inserts/removes, so iteration order is unchanged and the stamp check
+    /// observes each episode in precisely the state the separate sweep would
+    /// have left it in; [`mark_done`] reads only `ident ^ ep.ctx_fp`, neither of
+    /// which the sweep touches, so the sequence of LRU inserts — and therefore
+    /// the LRU ordering — is byte-identical. The stamp deliberately stays
+    /// OUTSIDE the `reduced_motion` guard (born-done births set their done flags
+    /// regardless of motion policy), which is why the branch lives inside the
+    /// loop rather than wrapping it.
+    fn stamp_spent_marks(&mut self, now: Instant, reduced_motion: bool) {
+        let seq = self.rescan_seq;
         // Disjoint field borrows: the ledger is written from a walk of the
         // episode map, and `done_marks` is a sibling field.
         let marks = &mut self.done_marks;
         for (ident, ep) in &mut self.persist {
+            // Scrolled-off mid-peek completion: the visible-occurrence flag loop
+            // in `episode_prepass` only walks VISIBLE occurrences, so a Cat
+            // episode whose word scrolled off mid-peek could never reach
+            // `peek_done` off-screen — its lifecycle hung for the whole grace TTL
+            // (10 s) even though the animation's wall clock (≤ 4.6 s) had long
+            // finished. Finish it here against the latched `peek_total`. Paused
+            // episodes are exempt (their clock is suspended by design: if the
+            // word scrolls back within grace and the rows are clear, the peek
+            // resumes); reduced motion keeps its engine-wide "flags never
+            // advance" rule.
+            if !reduced_motion
+                && ep.seen_seq != seq
+                && ep.shown_as == Some(KittyShownAs::Cat)
+                && ep.peek_started
+                && !ep.peek_done
+                && ep.peek_pause.is_none()
+                && let Some(ps) = ep.phase_start
+                && now.saturating_duration_since(ps).as_millis() as u64 >= ep.peek_total
+            {
+                ep.peek_done = true;
+            }
+            // The in-place ledger stamp proper (see the doc above).
             if !ep.ledger_stamped && ep.one_shot_started() {
                 mark_done(marks, *ident, ep);
                 ep.ledger_stamped = true;
@@ -6793,16 +7030,6 @@ impl WordDecorations {
         }
         self.prune_ignitions(now);
         let mut until: Option<Instant> = None;
-        // The occupancy window is TIER-AWARE upward (§3.2b): a Nuke holds the
-        // mutex — and keeps emitting — for its full 3600 ms. The flat
-        // SUPER_TOTAL_MS here used to truncate every mushroom cloud at
-        // 2400 ms (its cap/stem fade never rendered), leave a ~1.2 s dead gap
-        // before the ember, and let the next grant overlap the cloud's tail.
-        // The window never goes BELOW the classic 2400 ms: the emitter has no
-        // short Flash arc (it would snap off mid-shockwave), so a Flash keeps
-        // occupying — and presenting — the classic window it always has.
-        let win_of =
-            |tier| Duration::from_millis(supernova::total_ms(tier).max(supernova::SUPER_TOTAL_MS));
         // Any already-granted, still-running window occupies the mutex even
         // before its (possibly limiter-delayed) start arrives — including
         // episodes not visible this tick (scrolled off mid-grant), so a
@@ -6818,33 +7045,18 @@ impl WordDecorations {
         // `nova_start` set) must keep deferring classic grants for its whole
         // window, not only while its word is visible in `self.occ` below.
         //
-        // The scan covers the PARKED panes' shards too: the mutex is a
+        // The claim covers the PARKED panes' shards too: the mutex is a
         // window-wide claim over state that `bind_pane` mem::swaps, so a
         // supernova live in an unbound pane must hold the mutex exactly like
         // a scrolled-off one (the census supernova-burst-mutex aggregator
-        // obligation; its standing finding is closed by this scan). Every
+        // obligation; its standing finding is closed by this pass). Every
         // live end also folds into the returned wake, so a deferred grant
         // wakes AT the window end instead of waiting for unrelated damage.
         let mut busy = false;
-        for ep in self
-            .persist
-            .values()
-            .chain(self.parked.values().flat_map(|p| p.persist.values()))
-        {
-            if ep.nova_done {
-                continue;
-            }
-            let Some(s) = ep.nova_start else {
+        for ep in self.persist.values() {
+            let Some(end) = burst_mutex_end(ep) else {
                 continue;
             };
-            let win = match ep.burst_kind {
-                Some(BurstKind::SuperNova) if ep.burst_roll => win_of(ep.burst_tier),
-                Some(BurstKind::Nova) => {
-                    Duration::from_millis(u64::from(nova_features(ep.genome.gkey).duration_ms))
-                }
-                _ => continue,
-            };
-            let end = s + win;
             if now >= end {
                 continue;
             }
@@ -6852,6 +7064,39 @@ impl WordDecorations {
             until = Some(until.map_or(end, |u: Instant| u.max(end)));
             if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
                 self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
+            }
+        }
+        // The parked shards contribute through their O(1) cached summary rather
+        // than a second, CHAINED walk of every other pane's whole episode map —
+        // this loop used to be `O(panes × total episodes)` per presented frame
+        // (the host binds each visible pane in turn and ticks it), producing, in
+        // the steady state, nothing but `busy = false`. The cached read is EXACT,
+        // not conservative: `busy == (now < max(end))` over a set of windows, and
+        // `until`/`super_until` are that same max — the maximum end, when it is
+        // still in the future, is itself a member of the per-episode-filtered set
+        // AND its maximum. Folding the parked contribution after the live walk
+        // rather than interleaved is likewise irrelevant: `busy` is an OR and the
+        // other two are max folds.
+        for p in self.parked.values() {
+            // The summaries are derived state maintained at exactly one choke
+            // point ([`ParkedPane::swap`]); re-deriving the shard here is the
+            // walk they replace, kept as a debug-build cross-check so a future
+            // mutation path that bypasses `swap` fails loudly instead of
+            // silently over- or under-holding the mutex. It lives INSIDE this
+            // loop deliberately: the census's OB-15 aggregator check is
+            // LEXICAL, so a second `self.parked` occurrence in a debug-only
+            // assertion would keep the check green for a future edit that
+            // deleted the load-bearing read below. One occurrence, one meaning.
+            debug_assert!(
+                p.burst_summary() == (p.burst_end_max, p.super_end_max),
+                "a parked shard's burst-mutex summary drifted from its episode map"
+            );
+            if let Some(e) = p.burst_end_max.filter(|e| now < *e) {
+                busy = true;
+                until = Some(until.map_or(e, |u: Instant| u.max(e)));
+            }
+            if let Some(e) = p.super_end_max.filter(|e| now < *e) {
+                self.super_until = Some(self.super_until.map_or(e, |u: Instant| u.max(e)));
             }
         }
         // Hoisted out of the loop: the reservation label is a property of the
@@ -6914,7 +7159,7 @@ impl WordDecorations {
                 }
             }
             let Some(start) = ep.nova_start else { continue };
-            let win = win_of(ep.burst_tier);
+            let win = super_window_of(ep.burst_tier);
             if now >= start + win {
                 ep.nova_done = true;
                 continue;
@@ -22364,6 +22609,107 @@ mod scan_memo_bench {
                 wd.scan_memo.fresh_buffers,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pet_handoff_emission_tests {
+    use super::*;
+
+    fn pet_frame() -> crate::kitty_pet::PetFrame {
+        crate::kitty_pet::PetFrame {
+            alpha: 255,
+            action: crate::kitty_pet::PetAction::Sit,
+            pose: crate::pet_glyphs_gen::PetGlyphId::PetSit,
+            col: 10.0,
+            row: 5.0,
+            lift: 0.0,
+            facing_left: false,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            purr: 0.0,
+            under_ink: false,
+            motes: [None; crate::kitty_pet::PET_MOTES_MAX],
+            departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
+        }
+    }
+
+    /// THE SWAP FRAME NEVER WEARS THE OLD COAT TWICE: the live body's
+    /// deferred-bake fallback ([`WordDecorations::pet_last_tile`]) is
+    /// LOOK-KEYED. When the worn pair flips on a frame whose shared bake
+    /// budget is already spent, the held OLD-look tile must be REFUSED — the
+    /// old-look ghost is the one allowed to wear that coat — and the new
+    /// look lands on the next budgeted frame.
+    #[test]
+    fn a_look_flip_refuses_the_old_looks_held_tile_under_bake_pressure() {
+        let mut wd = WordDecorations::default();
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        };
+        let colors = CatColorKey::default();
+        let mut free = Vec::new();
+        let dress = |wd: &mut WordDecorations, coat: u8, iris: u8, free: &mut Vec<_>| {
+            free.clear();
+            wd.pet_cursor(
+                PetCursorFrame {
+                    geom,
+                    colors,
+                    coat,
+                    iris,
+                    pet: pet_frame(),
+                },
+                free,
+            );
+        };
+        // Look A lands (the two-door bake may take a couple of frames).
+        let mut landed = false;
+        for _ in 0..8 {
+            wd.cat_baker_ready = false;
+            dress(&mut wd, 3, 1, &mut free);
+            if !free.is_empty() {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "look A's tile never landed");
+        assert!(
+            wd.pet_last_tile.is_some_and(|(.., c, i)| (c, i) == (3, 1)),
+            "the held tile carries look A"
+        );
+        // A NEW frame whose shared two-bake budget word-cats already spent
+        // (the prologue run by hand so the budget can be drained first) —
+        // and the worn pair flips. Look B's fresh insert is refused by the
+        // budget, and the look-keyed fallback must refuse look A's held
+        // tile: NO body this frame, never the old coat on the new look.
+        wd.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
+        wd.animal_baker.begin_frame(geom.cell_w, geom.cell_h);
+        wd.cat_baker_ready = true;
+        let scratch = vec![0u8; 4 * 4 * 4];
+        assert!(wd.cat_baker.host_tile(0xDEAD_0001, 4, 4, &scratch).is_some());
+        assert!(wd.cat_baker.host_tile(0xDEAD_0002, 4, 4, &scratch).is_some());
+        dress(&mut wd, 9, 4, &mut free);
+        assert!(
+            free.is_empty(),
+            "the old coat's held tile must not dress the new look"
+        );
+        // The budget returns: the new look bakes, draws and takes the hold.
+        let mut landed = false;
+        for _ in 0..8 {
+            wd.cat_baker_ready = false;
+            dress(&mut wd, 9, 4, &mut free);
+            if !free.is_empty() {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "look B's tile never landed");
+        assert!(
+            wd.pet_last_tile.is_some_and(|(.., c, i)| (c, i) == (9, 4)),
+            "the held tile now carries look B"
+        );
     }
 }
 

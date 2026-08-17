@@ -154,6 +154,28 @@ pub(crate) const fn window_title_authority(
     }
 }
 
+/// Push a session's reported cwd onto `slot` in the `~`-abbreviated tab-label
+/// form, reporting whether anything was written (`false` leaves `slot` untouched,
+/// so the caller can fall through to the next rung). Byte-for-byte the result of
+/// [`crate::app_tabs::home_abbreviated`], but pushed IN PLACE — the window-title
+/// path recomposes on every redraw and must not allocate a `String` per frame.
+/// Mirrors the tab strip's own in-place cwd rung (`refill_strip_titles`).
+fn push_home_abbreviated_cwd(slot: &mut String, cwd: Option<&str>) -> bool {
+    let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
+        return false;
+    };
+    match crate::app_tabs::cached_home()
+        .and_then(|home| crate::app_tabs::home_relative_suffix(cwd, home))
+    {
+        Some(rest) => {
+            slot.push('~');
+            slot.push_str(rest);
+        }
+        None => slot.push_str(cwd),
+    }
+    true
+}
+
 /// Decide the `attach_os_window` outcome at its real installation seam. A
 /// stale/missing logical window must fail closed: it cannot offer startup
 /// milestones or tell the caller that a present target exists. Every successful
@@ -320,6 +342,9 @@ impl App {
         self.install_window_config_assets(wid);
         // The new window becomes frontmost (the standard "open and focus" behavior).
         self.frontmost_window = Some(wid);
+        // The status-item glance lists windows now, so a create moves it
+        // (fingerprint-gated; runs after every structural mutation above).
+        self.refresh_operator_status_item();
         debug_assert!(
             self.structural_invariants_ok(),
             "window/session structural invariants violated after create_window_logical",
@@ -703,6 +728,24 @@ impl App {
             // which runs the same confirmation + document barrier as Cmd-Q.
             // Registered once alongside the menu (a no-op off macOS).
             self.apprt.install_quit_confirm();
+        }
+        // The menu-bar OPERATOR status item (status_item.rs): created once with
+        // the FIRST window, alive for the process lifetime (the handle retains
+        // both the NSStatusItem — releasing one removes it from the bar — and
+        // its weakly-referenced action target). Same one-shot/headless/off-macOS
+        // contract as the menu install above.
+        if self._status_item.is_none()
+            && let Some(proxy) = self.proxy.as_ref()
+        {
+            let glance = self.operator_fleet_glance();
+            self._status_item = self.apprt.install_status_item(proxy, &glance);
+            self.operator_status_fingerprint = Some(glance.fingerprint());
+            self.operator_local_id = glance.operator_session;
+            // Seed the sibling-instances section so the FIRST menu open has
+            // fleet rows (menu opens kick refreshes thereafter).
+            if self._status_item.is_some() {
+                crate::fleet_watch::request_scan(proxy.clone());
+            }
         }
         // W11 MotionPolicy: seed the OS "Reduce Motion" flag at ATTACH and subscribe
         // to its change notification once (the observer target is retained for the
@@ -1256,6 +1299,10 @@ impl App {
         // Drop the closed window from the focus-order stack so it can never be picked
         // as a survivor below.
         self.focus_order.retain(|w| *w != wid);
+        // A pending menu-driven raise of this window dies with it.
+        if self.pending_deminiaturize_focus == Some(wid) {
+            self.pending_deminiaturize_focus = None;
+        }
         // Re-point frontmost if it named the just-closed window: the most-recently
         // focused SURVIVOR (matching the window the OS raises), with a deterministic
         // lowest-live-id fallback. See `next_frontmost_after_close`.
@@ -1275,6 +1322,10 @@ impl App {
                 "window/session structural invariants violated after re-mirror",
             );
         }
+        // Glance refresh AFTER the store deregistration and the map removal,
+        // so the menu shows post-close truth (fires on the last close too —
+        // harmless when the loop is about to exit).
+        self.refresh_operator_status_item();
         if self.windows.is_empty() {
             CloseOutcome::Exit
         } else {
@@ -1291,6 +1342,10 @@ impl App {
     pub(crate) fn note_window_focused(&mut self, wid: WindowId) {
         self.focus_order.retain(|w| *w != wid);
         self.focus_order.push(wid);
+        // The glance marks the frontmost window, and a same-window re-focus is
+        // the case the `frontmost_window` guard in the Focused(true) arm skips
+        // — this seam sees every focus gain (fingerprint-gated, cheap).
+        self.refresh_operator_status_item();
     }
 
     /// The window to make frontmost when the current front window closes: the
@@ -1707,11 +1762,18 @@ impl App {
     /// read is deliberately nonblocking because this runs on the event-loop thread;
     /// contention keeps the last tab-title cache value (or the presentation fallback)
     /// until the next output wake/redraw instead of parking behind a busy parser.
+    ///
+    /// Resolves IN PLACE into `slot` (which arrives holding anything and leaves
+    /// holding the resolved raw title) rather than returning an owned `String`:
+    /// [`Self::apply_title`] runs on every redraw of the window, so the steady
+    /// state must not allocate. Only the rare operator-title rung, which owns its
+    /// `String` in the session meta, still copies.
     fn window_title_identity(
         &self,
         id: WindowId,
         live_title: &str,
-    ) -> (Option<u64>, String, Option<String>) {
+        slot: &mut String,
+    ) -> (Option<u64>, Option<String>) {
         let focused_session = self.focused_session_id(id);
         let presentation_fallback = self
             .windows
@@ -1726,10 +1788,14 @@ impl App {
             } else {
                 live_title
             };
-            return (None, title.to_string(), None);
+            slot.clear();
+            slot.push_str(title);
+            return (None, None);
         };
         let Some(session) = self.pool.get(session_id) else {
-            return (Some(session_id), presentation_fallback.to_string(), None);
+            slot.clear();
+            slot.push_str(presentation_fallback);
+            return (Some(session_id), None);
         };
         let (user_title, authored_description) = {
             let meta = session
@@ -1742,31 +1808,39 @@ impl App {
                 meta.presentation_value("description"),
             )
         };
-        let resolved = if let Some(user_title) = user_title {
-            user_title
+        slot.clear();
+        if let Some(user_title) = user_title {
+            slot.push_str(&user_title);
         } else if !live_title.is_empty() {
-            live_title.to_string()
+            slot.push_str(live_title);
         } else {
-            let cwd = match session.term.try_lock() {
-                Ok(term) => term
-                    .current_working_directory()
-                    .filter(|cwd| !cwd.is_empty())
-                    .map(crate::app_tabs::home_abbreviated),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
-                    .into_inner()
-                    .current_working_directory()
-                    .filter(|cwd| !cwd.is_empty())
-                    .map(crate::app_tabs::home_abbreviated),
-                Err(std::sync::TryLockError::WouldBlock) => self
+            // Same rungs as before, written into the resident slot: reported cwd
+            // (`~`-abbreviated), else the last stable tab-title cache value when the
+            // parser holds the lock, else the presentation fallback.
+            let filled = match session.term.try_lock() {
+                Ok(term) => push_home_abbreviated_cwd(slot, term.current_working_directory()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let term = poisoned.into_inner();
+                    push_home_abbreviated_cwd(slot, term.current_working_directory())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => match self
                     .windows
                     .get(&id)
                     .and_then(|state| state.tab_title_cache.get(&session_id))
                     .filter(|title| !title.is_empty())
-                    .cloned(),
+                {
+                    Some(cached) => {
+                        slot.push_str(cached);
+                        true
+                    }
+                    None => false,
+                },
             };
-            cwd.unwrap_or_else(|| presentation_fallback.to_string())
-        };
-        (Some(session_id), resolved, authored_description)
+            if !filled {
+                slot.push_str(presentation_fallback);
+            }
+        }
+        (Some(session_id), authored_description)
     }
 
     /// Reflect the focused terminal's stable identity in the window chrome, falling
@@ -1804,15 +1878,25 @@ impl App {
         // steady screen no longer grabs the exclusive lock every redraw. Resolve the
         // active session via the TARGET window's active tab focus → pool.
         self.publish_active_terminal_title(id, title);
-        let (focused_session, resolved_title, authored_description) =
-            self.window_title_identity(id, title);
-        let base = self.title_summaries.compose(
+        // Resolve + compose through a RESIDENT slot: this runs on every redraw of
+        // this window (including the no-change early-out), so the identity ladder
+        // and the label composition must reuse one warmed buffer instead of
+        // allocating two `String`s per frame. Taken out of `self` for the call so
+        // `&self.config`/`&self.title_summaries` stay borrowable, and put back
+        // (with its capacity) before every exit.
+        let mut scratch = std::mem::take(&mut self.title_compose_scratch);
+        let (focused_session, authored_description) =
+            self.window_title_identity(id, title, &mut scratch);
+        // Composes IN PLACE: `scratch` arrives holding the resolved raw title and
+        // leaves holding the presented label — a cache hit `clone_from`s into the
+        // slot's existing capacity, so a steady frame allocates nothing.
+        self.title_summaries.compose_label_into(
             focused_session,
-            &resolved_title,
             authored_description.as_deref(),
             self.config.window_title_format_or_default(),
             &self.config,
             " — ",
+            &mut scratch,
         );
         let preedit = self.windows.get(&id).map_or("", |ws| ws.preedit.as_str());
         // No "[active/total]" tab counter in the title: the visible tab strip already
@@ -1831,27 +1915,31 @@ impl App {
         let title_authority = window_title_authority(warning_armed, search_active);
         let title_changed = if preedit.is_empty() {
             // Common path (no active IME composition): compare the cached title
-            // against `base` directly (String vs &str), avoiding the per-frame
+            // against the composed scratch directly, avoiding the per-frame
             // String allocation that an unconditional `format!`/`to_string` paid.
             let Some(ws) = self.windows.get_mut(&id) else {
+                // Disjoint field, so restoring the slot here is fine even though
+                // `self.windows` was just borrowed.
+                self.title_compose_scratch = scratch;
                 return;
             };
-            if ws.current_title != base
-                && !crate::toolbar::busy_spinner_phase_only_change(&ws.current_title, &base)
+            if ws.current_title != scratch
+                && !crate::toolbar::busy_spinner_phase_only_change(&ws.current_title, &scratch)
             {
                 if title_authority == WindowTitleAuthority::Canonical {
-                    window.set_title(&base);
+                    window.set_title(&scratch);
                 }
                 ws.current_title.clear();
-                ws.current_title.push_str(&base);
+                ws.current_title.push_str(&scratch);
                 true
             } else {
                 false
             }
         } else {
             // Rare IME-preedit path: only here do we allocate the formatted title.
-            let desired = format!("{base} [‹{preedit}›]");
+            let desired = format!("{scratch} [‹{preedit}›]");
             let Some(ws) = self.windows.get_mut(&id) else {
+                self.title_compose_scratch = scratch;
                 return;
             };
             if desired != ws.current_title
@@ -1867,6 +1955,9 @@ impl App {
                 false
             }
         };
+        // Hand the warmed buffer back before any further `&mut self` work, so the
+        // next frame's resolve/compose reuses this capacity.
+        self.title_compose_scratch = scratch;
         // LIVE TAB TITLES: the native tab strip labels each tab with its session's title
         // (the cwd / running command the shell integration sets via OSC 0/2). That title
         // changes constantly (every `cd`, every command) but `refresh_window_tabs` only
@@ -2488,13 +2579,17 @@ mod tests {
         let app = App::headless_for_test();
         let wid = WindowId(0);
         let session = app.pool.get(0).expect("session 0");
+        // The resolved title is written into a caller-owned slot (the per-frame
+        // path reuses one buffer); identity/description are still returned.
+        let mut slot = String::new();
 
         // With neither OSC title nor cwd, native chrome uses the same final
         // presentation fallback as the tab label.
         assert_eq!(
-            app.window_title_identity(wid, ""),
-            (Some(0), "aterm".to_string(), None)
+            app.window_title_identity(wid, "", &mut slot),
+            (Some(0), None)
         );
+        assert_eq!(slot, "aterm");
 
         crate::term_lock(&session.term)
             .process(b"\x1b]7;file://localhost/aterm-proof/window-title\x07");
@@ -2507,9 +2602,9 @@ mod tests {
                 "description",
                 Some("Runs the focused release checks".to_string()),
             );
-        let (session_id, cwd_title, description) = app.window_title_identity(wid, "");
+        let (session_id, description) = app.window_title_identity(wid, "", &mut slot);
         assert_eq!(session_id, Some(0));
-        assert_eq!(cwd_title, "/aterm-proof/window-title");
+        assert_eq!(slot, "/aterm-proof/window-title");
         assert_eq!(
             description.as_deref(),
             Some("Runs the focused release checks")
@@ -2517,7 +2612,7 @@ mod tests {
         assert_eq!(
             app.title_summaries.compose(
                 session_id,
-                &cwd_title,
+                &slot,
                 description.as_deref(),
                 app.config.window_title_format_or_default(),
                 &app.config,
@@ -2527,20 +2622,17 @@ mod tests {
             "OSC-7 cwd remains the stable title while Description stays distinct"
         );
 
-        assert_eq!(
-            app.window_title_identity(wid, "vim src/main.rs").1,
-            "vim src/main.rs",
-            "a live OSC 0/2 title outranks cwd"
-        );
+        app.window_title_identity(wid, "vim src/main.rs", &mut slot);
+        assert_eq!(slot, "vim src/main.rs", "a live OSC 0/2 title outranks cwd");
         let _ = session
             .ctx
             .meta
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .set("title", Some("release builder".to_string()));
+        app.window_title_identity(wid, "vim src/main.rs", &mut slot);
         assert_eq!(
-            app.window_title_identity(wid, "vim src/main.rs").1,
-            "release builder",
+            slot, "release builder",
             "the operator title is the top rung"
         );
     }
@@ -2556,9 +2648,10 @@ mod tests {
             .insert(0, "~/cached-worktree".to_string());
         let term = app.pool.get(0).expect("session 0").term.clone();
         let _parser_guard = term.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut slot = String::new();
+        app.window_title_identity(wid, "", &mut slot);
         assert_eq!(
-            app.window_title_identity(wid, "").1,
-            "~/cached-worktree",
+            slot, "~/cached-worktree",
             "a contended parser keeps the last stable label instead of blocking or flickering"
         );
     }

@@ -151,6 +151,7 @@ mod document_store;
 #[cfg(test)]
 mod document_store_conformance;
 mod find_bar;
+mod fleet_watch;
 mod front_content;
 /// D3: the un-bypassable self-feed floor (per-session injection token bucket).
 mod inject_floor;
@@ -169,6 +170,7 @@ mod logging;
 mod markdown;
 mod menu;
 mod metrics;
+mod status_item;
 /// W11: MotionPolicy — the single accessibility gate for decorative animation.
 mod motion;
 #[cfg(feature = "a11y-accesskit")]
@@ -1993,6 +1995,19 @@ enum Wake {
     /// constructed (no platform menu), keeping `Wake` platform-independent.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     MenuAction { action: menu::MenuAction },
+    /// A click in the menu-bar OPERATOR status item (status_item.rs): posted by
+    /// its AppKit action target, dispatched on `App` by the event loop (the
+    /// `MenuAction` relay pattern, in the status item's own tag namespace).
+    OperatorAction { action: status_item::OperatorAction },
+    /// The status-item menu is opening (its `NSMenuDelegate` relay): kick a
+    /// background sibling scan so the NEXT open renders fresh fleet rows —
+    /// the opening menu itself renders the cached glance. Constructed only by
+    /// the macOS delegate, like `MenuAction`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    OperatorMenuOpening,
+    /// A finished background sibling scan (fleet_watch.rs): summarized
+    /// instance rows, pre-sorted by pid, posted from the scan thread.
+    FleetInstances(Vec<status_item::InstanceRow>),
     /// AppKit asked to terminate through a path that bypasses the menu (Dock,
     /// AppleScript, logout/restart). The synchronous delegate vetoed termination
     /// and posted this stable generation so the event-loop-owned `App` can run the
@@ -3845,7 +3860,7 @@ pub struct SessionCtx {
     /// because the writer thread, the resize tap, and any future scrub reader
     /// touch it (never on the reader's hot path under `term_lock`).
     pub temporal: Arc<std::sync::Mutex<crate::temporal::TemporalRecorder>>,
-    /// USER-settable session metadata (`meta set title|description|icon`): the
+    /// USER-settable session metadata (`meta set title|description|icon|role|attention`): the
     /// operator's name/purpose/icon for the session, distinct from the engine's
     /// OSC title. Lives HERE (not on the registry handle) so there is exactly ONE
     /// copy per session, readable lock-disjointly by the per-frame tab-label
@@ -5364,6 +5379,17 @@ struct WindowState {
     /// carries no pixel position of its own) can tell whether the pointer is over
     /// the tab strip ([`Self::strip_col_at`]) before mapping to a terminal cell.
     last_cursor_px: (f64, f64),
+    /// Whether the pointer is currently INSIDE this window at all: set by every
+    /// `CursorMoved`, cleared by `CursorLeft`. The pet hover probe's staleness
+    /// gate ([`crate::App::pet_hover_anchor`]): `last_cursor_px` deliberately
+    /// FREEZES at its final in-window position for the press paths (the
+    /// documented first-click caveat), so geometry alone cannot distinguish "a
+    /// pointer holding still over the cat" from "a pointer that left the window
+    /// across the cat" — this flag is the missing fact. Without it, the label
+    /// drain that runs on the very redraw a `CursorLeft` dismissal schedules
+    /// would re-derive hover from the frozen pixel and resurrect the label,
+    /// with no further mouse event ever arriving to clear it.
+    pointer_in_window: bool,
     /// Sub-cell pixel offset of the last pointer move inside its grid cell, so a
     /// button press / wheel notch (winit delivers no pixel position on those) can
     /// still report a genuine sub-cell PIXEL coordinate under DEC 1016 (SGR-pixel
@@ -5647,17 +5673,22 @@ struct WindowState {
     /// refreshed every drawn frame so his tip bubble rides above his head
     /// wherever he is (floor, ladder, or hanging off the tab bar).
     robi_bubble_anchor: Option<(f32, f32)>,
-    /// Robi's body rect in FRAME px, stashed by the render pass for the mouse
-    /// path (the `pet_hit_rect` discipline: written every drawn frame, `None`
-    /// whenever he isn't on the glass — a cleared stash never eats a click).
+    /// Robi's LIVE drawn body this frame, `(x0, x1, y0, y1)` right/bottom-
+    /// exclusive in FRAME px: the emitter's own body law
+    /// (`aterm_effects::robi::body_px` — ONE copy, shared with the bake and
+    /// the draw) offset by the effects origin (whose y already carries the
+    /// tab-strip splice, so his negative-y monkey-bar poses land right too).
+    /// Stashed by the single-pane redraw and CLEARED on every frame he is
+    /// not drawn — which includes the route dispatch itself: ONLY the
+    /// unsplit terminal path draws him, so a split, a mixed terminal+native
+    /// window and a native tab all clear the stash before presenting, or a
+    /// stale invisible body would eat ordinary clicks (and write
+    /// `robi = false`) long after he left the glass. The dismiss seam —
+    /// `on_mouse_input` consumes a left press inside it (padded by
+    /// `ROBI_HIT_SLOP_PX`) and queues `robi = false` through the versioned
+    /// settings lane behind the `App::robi_dismissal` latch, so he retires
+    /// on the next frame and stays gone until Settings re-enables him.
     robi_hit_rect: Option<(i32, i32, i32, i32)>,
-    /// THE DISMISS LATCH (owner, 2026-08-15: "it needs to be easily
-    /// dismissable"): a left-click on Robi's body sends him off THIS window
-    /// until he is resummoned by name (`robi`/`robot`) — per window, per
-    /// session, never written to config (the persistent opt-out stays
-    /// `robi = false`). A latch rather than a bare `stop()` because the render
-    /// path immediately re-births any stopped resident whose gates are green.
-    robi_dismissed: bool,
     /// SING-ALONG detector (`aterm_effects::kitty_sing`): the
     /// held-key repeat run, fed on the SAME committed key-press path as
     /// `kitty_summon` (typed provenance only — PTY output and pastes can
@@ -5694,10 +5725,25 @@ struct WindowState {
     /// The pet's LIVE drawn body this frame, `(x0, x1, y0, y1)` right/bottom-
     /// exclusive in FRAME px: `PetFrame::body_px` offset by the effects
     /// origin (plus the focused pane's origin on the composed path), stashed
-    /// post-tick by the redraw and CLEARED whenever the pet is not drawn.
-    /// The petting hit-box — `on_mouse_input` consumes a left press inside
-    /// it (padded by `PET_HIT_SLOP_PX`) before the terminal seam.
+    /// post-tick by the redraw and CLEARED whenever the pet is not drawn —
+    /// including by the route dispatch on the native/heterogeneous routes,
+    /// which draw no pet (the robi_hit_rect lesson: a stale rect on an
+    /// undrawn route eats clicks). Only ever the LIVE pet: the handoff's
+    /// departing bodies never stash it, so a ghost can neither be petted nor
+    /// hovered. The petting hit-box — `on_mouse_input` consumes a left press
+    /// inside it (padded by `PET_HIT_SLOP_PX`) before the terminal seam.
     pet_hit_rect: Option<(i32, i32, i32, i32)>,
+    /// Whether the pointer is currently over the pet's padded body (the
+    /// hover-label latch): updated change-gated on `CursorMoved`, and
+    /// RECOMPUTED from `pet_hit_rect` × `last_cursor_px` by every drawn
+    /// frame's label drain — a recompute, not a mere re-check, so it can both
+    /// drop a label when the pet walks out from under a still pointer and
+    /// post one when it walks back under it. The recompute is gated on
+    /// `pointer_in_window`, which is what keeps it from resurrecting the
+    /// latch from the frozen pixel after `CursorLeft`. Cleared with the rect,
+    /// on `CursorLeft`, and by the non-pet routes. Drives
+    /// `NoticeKind::PetLabel`'s lifecycle.
+    pet_hovered: bool,
     /// The pet's `(session, content_seq)` latch for the PERK-AND-WATCH burst
     /// probe (wave 2): the content clock's previous reading, so a frame can
     /// tell "the pane wrote" from "the pane repainted". Same silent
@@ -7001,6 +7047,7 @@ impl WindowState {
             last_mouse_cell: (0, 0),
             last_mouse_window_cell: (0, 0),
             last_cursor_px: (0.0, 0.0),
+            pointer_in_window: false,
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
             hover_pointer: false,
@@ -7047,7 +7094,6 @@ impl WindowState {
             robi_tip_posted: None,
             robi_bubble_anchor: None,
             robi_hit_rect: None,
-            robi_dismissed: false,
             kitty_sing: aterm_effects::kitty_sing::KittySing::default(),
             music_notes: aterm_effects::kitty_sing::MusicNotes::default(),
             sing_riff_bar: None,
@@ -7057,6 +7103,7 @@ impl WindowState {
             rain_last_cmd: None,
             pet_last_cmd: None,
             pet_hit_rect: None,
+            pet_hovered: false,
             pet_content_seq: None,
             rain_shell_executing: None,
             cursor_trail: crate::cursor_trail::CursorTrail::default(),
@@ -7521,6 +7568,7 @@ fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         }
         Wake::Exit { .. }
         | Wake::MenuAction { .. }
+        | Wake::OperatorAction { .. }
         | Wake::CreateWindow
         | Wake::DetachActiveTab
         | Wake::ViewActiveSessionInNewWindow => UpdateHandoffEventClass::Revoking,
@@ -8010,6 +8058,23 @@ impl SessionChromeExpiryScan {
 /// millisecond keeps the loop responsive without a tight `WaitUntil(now)` spin.
 const SESSION_CHROME_EXPIRY_DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 
+/// The two waits of ROBI's click-dismissal (`App::robi_dismissal`, armed by
+/// `App::robi_press_at`, settled by `App::poll_robi_dismissal`). Either
+/// variant holds the render gate closed; what differs is what the poll is
+/// waiting FOR.
+enum RobiDismissal {
+    /// The `robi = false` write is queued in the versioned settings lane and
+    /// the reply RECEIVER is held here — completions (including an OCC
+    /// conflict with an external `aterm.toml` edit) always have a reader, so
+    /// a failed dismissal can never fizzle into a dropped channel unheard.
+    InFlight(std::sync::mpsc::Receiver<Result<String, String>>),
+    /// The lane confirmed the write durable; the latch still holds until the
+    /// new config generation replaces `App::config` — releasing at the
+    /// completion would let the gate read the OLD `robi = true` and re-birth
+    /// him for one awkward fade-in before the generation lands.
+    AwaitingConfig,
+}
+
 struct App {
     /// The native application-runtime (`apprt`) seam: the platform impl that backs
     /// every OS-integration operation (window chrome colour/appearance, menu bar,
@@ -8207,6 +8272,16 @@ struct App {
     /// coordinator. OSC title identity remains in each `Terminal`; this is separate
     /// display-only chrome state and never blocks the event loop on provider IO.
     title_summaries: title_summary::Coordinator,
+    /// Resident scratch buffer for the window-title recomposition
+    /// ([`App::apply_title`] → [`App::window_title_identity`] →
+    /// [`title_summary::Coordinator::compose_label_into`]). `apply_title` runs on
+    /// every redraw of a window INCLUDING the "nothing changed" early-out, so the
+    /// resolved title and the composed label must not allocate per frame — this
+    /// slot is `mem::take`n for the duration of the call and put back with its
+    /// warmed capacity, exactly like the tab strip's per-tab label slots. It lives
+    /// on `App` rather than `WindowState` because composing needs `&self.config`
+    /// and `&self.title_summaries` while a `&mut WindowState` borrow would be live.
+    title_compose_scratch: String,
     /// Live per-session Subject/Status classification (Tab Subject & Status).
     /// Budgeted: a session is classified at most once per `min_interval`, and
     /// evidence is only ever gathered under `try_lock`.
@@ -8593,6 +8668,27 @@ struct App {
     /// when not headless); `None` while no menu exists (headless, off macOS, or
     /// before `resumed`). The type is `()` off macOS (`menu::MenuHandle`).
     _menu: Option<menu::MenuHandle>,
+    /// The menu-bar OPERATOR status item (status_item.rs), installed once with
+    /// the first window and retained for the process lifetime: releasing an
+    /// `NSStatusItem` removes it from the bar, and AppKit holds its menu items'
+    /// action target only weakly. `()` off macOS, like `_menu`.
+    _status_item: Option<status_item::StatusItemHandle>,
+    /// Fingerprint of the last [`status_item::FleetGlance`] pushed to AppKit —
+    /// title drift is per-prompt frequent, so `refresh_operator_status_item`
+    /// rebuilds the native menu only when this changes.
+    operator_status_fingerprint: Option<String>,
+    /// The operator session's process-local id per the last glance — what the
+    /// status menu's Show/Stop actions resolve against.
+    operator_local_id: Option<u64>,
+    /// Sibling-instance rows from the last background fleet scan
+    /// (fleet_watch.rs), pre-sorted by pid; merged into every glance so the
+    /// status menu lists the other live aterms. Empty until a scan lands.
+    fleet_instances: Vec<status_item::InstanceRow>,
+    /// A status-menu click asked to focus a window that was MINIATURIZED:
+    /// `focus_window()` silently no-ops until deminiaturization lands, so the
+    /// raise completes when this window's `Occluded(false)`/`Focused(true)`
+    /// arrives (cleared then, or when the window closes — a stale id no-ops).
+    pending_deminiaturize_focus: Option<WindowId>,
     /// Retained native window-toolbar backing objects (macOS), keyed BY WINDOW and
     /// kept alive for each window's life — AppKit holds a toolbar's delegate and an
     /// item's target only WEAKLY, so dropping a handle silently kills that window's
@@ -8643,6 +8739,17 @@ struct App {
     /// overlay), or a cursor-themed "leveled-up" flourish right after the app relaunches
     /// into a newer build. GLOBAL like `config_notice`; auto-expires. See [`crate::notice`].
     notice: Option<notice::TransientNotice>,
+    /// ROBI's click-dismissal in flight ([`RobiDismissal`]) — the pending-dismissal
+    /// LATCH. Armed by `App::robi_press_at` when a press on his body queues the
+    /// `robi = false` write; the render gate consults it (`Some` retires him on the
+    /// very NEXT frame, in every window — GLOBAL like the config key the write
+    /// targets), and while it holds the gate keeps `robi_hit_rect` cleared, which is
+    /// the STRUCTURAL single-write guarantee a merely spent rect never was. Settled
+    /// by `App::poll_robi_dismissal`: released with a banner on a lane failure (he
+    /// walks back on — honest feedback), held through a success until the new config
+    /// generation lands and `robi = false` closes the gate by itself. `None` = no
+    /// dismissal in flight.
+    robi_dismissal: Option<RobiDismissal>,
     /// Whether the post-update "leveled-up" notice has already fired this run (it shows
     /// ONCE, when the first window attaches, if [`JUST_UPDATED`] is set) — guards against
     /// `resumed` running more than once.
@@ -9973,19 +10080,47 @@ impl App {
         // it now too so a switch with
         // no pending output still updates the chrome immediately. Capture the OS
         // handle + title (owned) so the `windows`/`pool` borrow is released before
-        // the `&mut self` `apply_title` call.
-        let title = focused_session
-            .and_then(|session| self.pool.get(session))
-            .map(|live| term_lock(&live.term).title().to_string())
-            .or_else(|| {
-                ws.tab_set
-                    .active()
-                    .map(|tab| tab.presentation.title.clone())
-            })
-            .unwrap_or_else(|| "aterm".to_string());
-        let nudge = ws.os_window.clone().map(|window| (window, title));
-        if let Some((w, title)) = nudge {
-            self.apply_title(front, &w, &title);
+        // the `&mut self` `apply_title` call. A window with no OS surface discards
+        // the nudge, so resolve nothing at all in that case.
+        let os_window = ws.os_window.clone();
+        if let Some(w) = os_window {
+            // TRY-lock, matching every other event-loop-owned read of this mutex
+            // (`refill_strip_titles`, `window_title_identity`, the blink predicate):
+            // this runs on the winit thread from tab switch / focus change, and the
+            // reader thread holds the same mutex for a whole ingest slice, so a
+            // blocking `lock()` parks the gesture behind a flooding pane's parser.
+            let title = match focused_session.and_then(|session| self.pool.get(session)) {
+                Some(live) => match live.term.try_lock() {
+                    Ok(term) => Some(term.title().to_string()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        Some(poisoned.into_inner().title().to_string())
+                    }
+                    // Contended: skip the NUDGE rather than inventing a title.
+                    // `sync_window` above already requested this window's redraw
+                    // unconditionally, and the redraw path reads the title under the
+                    // lock it must take to paint that grid anyway — so the titlebar
+                    // lands one frame later instead of parking the gesture. A
+                    // placeholder would be worse than waiting: `apply_title` hands
+                    // its argument straight to `publish_active_terminal_title`,
+                    // which writes it VERBATIM into the process-wide `SessionStore`
+                    // (and records a `title-change` timeline entry), so a blank or
+                    // borrowed title here would be visible to other processes
+                    // through the `sessions` verb.
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                },
+                // The native / session-less branch keeps the presentation title:
+                // `window_title_identity`'s `focused_session == None` arm depends on
+                // it (there is no live OSC rung to fall back to).
+                None => Some(
+                    ws.tab_set
+                        .active()
+                        .map(|tab| tab.presentation.title.clone())
+                        .unwrap_or_else(|| "aterm".to_string()),
+                ),
+            };
+            if let Some(title) = title {
+                self.apply_title(front, &w, &title);
+            }
         }
         // Live structural oracle (debug-only): after re-mirroring, the window/
         // session model is consistent — see `structural_invariants_ok`. Zero cost
@@ -10203,6 +10338,7 @@ impl App {
             theme,
             config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
+            title_compose_scratch: String::new(),
             session_status: session_status::StatusObserver::new(status_policy, status_interval),
             serious_mode: false,
             sparkle: None,
@@ -10277,6 +10413,11 @@ impl App {
             search_last_query: String::new(),
             search_last_anchor: None,
             _menu: None,
+            _status_item: None,
+            operator_status_fingerprint: None,
+            operator_local_id: None,
+            fleet_instances: Vec::new(),
+            pending_deminiaturize_focus: None,
             _toolbars: BTreeMap::new(),
             session_chrome: std::collections::HashMap::new(),
             session_chrome_retry: std::collections::HashSet::new(),
@@ -10285,6 +10426,7 @@ impl App {
             tab_strip_rows: 0,
             config_notice: None,
             notice: None,
+            robi_dismissal: None,
             level_up_done: false,
             first_present_done: false,
             boot_health_confirmation_dispatched: false,
@@ -13525,7 +13667,12 @@ impl ApplicationHandler<Wake> for App {
             // than posting this wake — posting from there would run the whole
             // refresh twice (two AppKit strip pushes + two redraw requests per
             // window) for one edit.
-            Wake::MetaChanged { session } => self.refresh_meta_dependent_chrome(session),
+            Wake::MetaChanged { session } => {
+                self.refresh_meta_dependent_chrome(session);
+                // A `meta set title` is exactly how the operator names itself
+                // and clears/raises `⚠` escalations — refresh the bar icon.
+                self.refresh_operator_status_item();
+            }
             // A session's reader thread confirmed it is live (first loop iteration).
             // Flip its registry handle `Spawning -> Alive` (the async-spawn path).
             // `mark_alive` is monotonic + fail-safe: an unknown id, an already-`Alive`
@@ -13541,6 +13688,8 @@ impl ApplicationHandler<Wake> for App {
                     .write()
                     .unwrap_or_else(|p| p.into_inner())
                     .mark_alive(session);
+                // A session coming alive can be the operator booting.
+                self.refresh_operator_status_item();
             }
             // A tab's shell/`-e` command exited. Close only THAT tab; exit the app
             // only when it was the last (and `--hold` keeps even that open). With
@@ -13585,6 +13734,9 @@ impl ApplicationHandler<Wake> for App {
                 for o in to_close {
                     self.close_window(el, o);
                 }
+                // The exited session may have been the operator (or an
+                // escalated fleet member) — re-render the bar icon's truth.
+                self.refresh_operator_status_item();
             }
             Wake::Snapshot => self.snapshot(),
             // MEM-ACCT-3(b): the OS raised memory pressure — shed reclaimable scrollback
@@ -14383,6 +14535,18 @@ impl ApplicationHandler<Wake> for App {
             // duplicated; the menu is just a second entry point. `el` is needed
             // because Quit / the last-tab Close must exit the loop.
             Wake::MenuAction { action } => self.dispatch_menu_action(el, action),
+            Wake::OperatorAction { action } => self.dispatch_operator_action(el, action),
+            Wake::OperatorMenuOpening => {
+                if let Some(proxy) = self.proxy.clone() {
+                    fleet_watch::request_scan(proxy);
+                }
+            }
+            Wake::FleetInstances(rows) => {
+                if self.fleet_instances != rows {
+                    self.fleet_instances = rows;
+                    self.refresh_operator_status_item();
+                }
+            }
             Wake::NativeTerminateRequested { generation } => {
                 self.on_native_terminate_requested(el, generation);
             }
@@ -14486,8 +14650,22 @@ impl ApplicationHandler<Wake> for App {
                         self.frontmost_window = Some(wid);
                         self.sync_active_session();
                     }
+                    // A menu-driven raise of this window is complete.
+                    if self.pending_deminiaturize_focus == Some(wid) {
+                        self.pending_deminiaturize_focus = None;
+                    }
                 }
                 self.on_focus(wid, f);
+            }
+            // Deminiaturization completing for a window a status-menu click
+            // raised: `focus_window()` no-oped while miniaturized, so finish
+            // the raise now that the window is visible again.
+            WindowEvent::Occluded(false) if self.pending_deminiaturize_focus == Some(wid) => {
+                self.pending_deminiaturize_focus = None;
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
+                    w.focus_window();
+                    w.request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.on_modifiers_changed(wid, m.state());
@@ -14557,6 +14735,10 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(wid, position.x, position.y);
             }
+            // The pointer left the window entirely: mouse-out for the pet's
+            // hover label (its latch must not outlive a stale
+            // `last_cursor_px` that still claims to sit over the cat).
+            WindowEvent::CursorLeft { .. } => self.on_cursor_left(wid),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_input(wid, state, button);
                 // A tab-strip click closing the last tab sets the clicked window's
@@ -16357,6 +16539,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         theme,
         config: config.clone(),
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
+        title_compose_scratch: String::new(),
         session_status: session_status::StatusObserver::new(
             config.tab_status_policy(),
             config.tab_status_observe_interval(),
@@ -16454,6 +16637,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         search_last_anchor: None,
         // Installed in `resumed` once the window exists (non-headless macOS only).
         _menu: None,
+        // The operator status item: installed alongside the menu (first window,
+        // non-headless macOS only); fingerprint/operator id fill on first glance.
+        _status_item: None,
+        operator_status_fingerprint: None,
+        operator_local_id: None,
+        fleet_instances: Vec::new(),
+        pending_deminiaturize_focus: None,
         // Native window toolbars, keyed per window; installed in `attach_os_window`.
         _toolbars: BTreeMap::new(),
         // Composed tab-chrome (tooltip + context menu) cache, filled on the
@@ -16467,6 +16657,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         tab_strip_rows,
         config_notice: None,
         notice: None,
+        robi_dismissal: None,
         level_up_done: false,
         first_present_done: false,
         boot_health_confirmation_dispatched: false,

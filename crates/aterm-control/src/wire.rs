@@ -27,14 +27,58 @@ pub fn visible_char(ch: char) -> char {
 #[must_use]
 pub fn pct_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    pct_encode_into(&mut out, s);
+    out
+}
+
+/// [`pct_encode`] APPENDING into a caller-owned buffer — byte-identical output,
+/// no allocation of its own (the twin of [`json_escape_into`], for the same
+/// reason: `blocks` and `history` encode up to a thousand records per reply,
+/// under the terminal lock, and every one of them was paying a `String` per
+/// field purely to be copied into the response buffer and dropped).
+pub fn pct_encode_into(out: &mut String, s: &str) {
+    // Nibble table rather than `format!("%{b:02X}")`: the `format!` arm
+    // allocated a throwaway `String` AND ran the whole `core::fmt` machinery for
+    // every escaped byte — and EVERY byte takes that arm for non-ASCII text.
+    // `{:02X}` on a `u8` is always exactly two zero-padded UPPERCASE hex digits,
+    // which is precisely what this table emits, so the bytes are unchanged.
+    // (Uppercase on purpose: `aterm_uds::rand::hex_encode`'s table is lowercase
+    // and must not be copied here.)
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for b in s.bytes() {
         if b.is_ascii_graphic() && b != b'%' {
             out.push(b as char);
         } else {
-            out.push_str(&format!("%{b:02X}"));
+            out.push('%');
+            out.push(HEX[usize::from(b >> 4)] as char);
+            out.push(HEX[usize::from(b & 0x0f)] as char);
         }
     }
-    out
+}
+
+/// Decode [`pct_encode`]'s output: every `%XX` hex pair becomes its byte;
+/// malformed escapes pass through verbatim and invalid UTF-8 decodes lossily,
+/// so this is TOTAL — safe on bytes a hostile peer authored. The decoder
+/// lives beside the encoder so the pair cannot drift.
+#[must_use]
+pub fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Escape a string as a JSON string BODY (no surrounding quotes): the two-char
@@ -90,4 +134,23 @@ pub fn json_str_field(key: &str, val: &str) -> String {
 #[must_use]
 pub fn json_ok(body: &str) -> String {
     format!("OK 1\n{body}\n")
+}
+
+#[cfg(test)]
+mod pct_tests {
+    use super::{pct_decode, pct_encode};
+
+    /// The decoder is total and the encoder's exact inverse on real strings;
+    /// malformed escapes pass through; invalid UTF-8 decodes lossily.
+    #[test]
+    fn pct_decode_is_total_and_round_trips() {
+        for s in ["", "plain", "with space", "构建 agent ✨", "100%", "a-b_c", "-"] {
+            assert_eq!(pct_decode(&pct_encode(s)), s, "round-trip: {s:?}");
+        }
+        assert_eq!(pct_decode("%G1"), "%G1", "malformed hex passes through");
+        assert_eq!(pct_decode("%2"), "%2", "truncated escape passes through");
+        assert_eq!(pct_decode("trail%"), "trail%");
+        // An escape decoding to invalid UTF-8 is replaced, never a panic.
+        assert_eq!(pct_decode("%FF"), "\u{FFFD}");
+    }
 }

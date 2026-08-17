@@ -61,12 +61,53 @@ pub fn encode_utf8(cb: u8, col: u16, row: u16) -> Vec<u8> {
     result
 }
 
+/// Append `val` to `buf` as decimal digits, allocation-free.
+///
+/// The zero-allocation counterpart of `val.to_string()`: the mouse encoders run
+/// once per pointer sample under DEC 1002/1003 tracking, so the three throwaway
+/// `String`s the `to_string()` form allocated per report are pure waste. Same
+/// idiom (and same Trust discipline) as `keyboard::encode::write_u32`.
+// Skip: pushes into a `Vec<u8>` — absent std body (alloc class). The emitted
+// bytes are pinned by this module's unit tests and by the protocol vector suite.
+#[cfg_attr(trust_verify, trust::skip)]
+#[allow(clippy::cast_possible_truncation)]
+fn push_dec_u16(buf: &mut Vec<u8>, val: u16) {
+    if val == 0 {
+        buf.push(b'0');
+        return;
+    }
+    // Extract decimal digits least-significant-first into a fixed 8-slot scratch
+    // (u16::MAX is 5 digits), then append most-significant-first. Like `write_u32`
+    // this uses only the literal divisor 10 (no runtime-divisor division for the
+    // Trust gate to guard against a zero divisor), masks every scratch index into
+    // the array's 0..=7 range, masks the remainder to a byte before the cast so the
+    // narrowing is provably lossless (`n % 10 <= 9`, so `& 0xFF` is identity), and
+    // forms each byte with `wrapping_add` (the digit is 0..=9, so it never actually
+    // wraps) — no div-by-zero, index-out-of-bounds, or `b'0' + digit` overflow
+    // obligation.
+    let mut digits = [0u8; 8];
+    let mut n = val;
+    let mut count = 0usize;
+    while n > 0 && count < 5 {
+        digits[count & 7] = b'0'.wrapping_add(((n % 10) & 0xFF) as u8);
+        n /= 10;
+        // saturating: `count < 5` guards the increment and `count > 0` the
+        // decrement — exact on every path; the verifier cannot chain either
+        // loop condition into the arithmetic.
+        count = count.saturating_add(1);
+    }
+    while count > 0 {
+        count = count.saturating_sub(1);
+        buf.push(digits[count & 7]);
+    }
+}
+
 /// Encode mouse coordinates in SGR format.
 ///
 /// Format: ESC [ < Cb ; Cx ; Cy M (press) or ESC [ < Cb ; Cx ; Cy m (release)
 /// Coordinates are 1-indexed decimal parameters, no offset needed.
 #[must_use]
-// Skip: format/extend absent std bodies.
+// Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
     // Trust gate: manual byte assembly instead of `write!` — runtime-argument
@@ -74,11 +115,11 @@ pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
     // (decimal `{}` of the integers, then the ASCII final byte).
     let mut buf = Vec::with_capacity(19);
     buf.extend_from_slice(b"\x1b[<");
-    buf.extend_from_slice(cb.to_string().as_bytes());
+    push_dec_u16(&mut buf, u16::from(cb));
     buf.push(b';');
-    buf.extend_from_slice(col.saturating_add(1).to_string().as_bytes());
+    push_dec_u16(&mut buf, col.saturating_add(1));
     buf.push(b';');
-    buf.extend_from_slice(row.saturating_add(1).to_string().as_bytes());
+    push_dec_u16(&mut buf, row.saturating_add(1));
     buf.push(if release { b'm' } else { b'M' });
     buf
 }
@@ -88,17 +129,20 @@ pub fn encode_sgr(cb: u8, col: u16, row: u16, release: bool) -> Vec<u8> {
 /// Format: ESC [ Cb ; Cx ; Cy M
 /// Like SGR but without the '<' prefix; Cb is already offset by 32.
 #[must_use]
-// Skip: format/extend absent std bodies.
+// Skip: Vec push/extend — absent std bodies (alloc class).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn encode_urxvt(cb: u16, col: u16, row: u16) -> Vec<u8> {
     // Trust gate: see `encode_sgr`.
-    let mut buf = Vec::with_capacity(18);
+    // 20 = ESC [ (2) + cb (<=5) + ';' + col (<=5) + ';' + row (<=5) + 'M'. The
+    // callers inside this crate cap `cb` at 287 (3 digits), but the function is
+    // `pub`, so size for the u16 worst case rather than reallocating on it.
+    let mut buf = Vec::with_capacity(20);
     buf.extend_from_slice(b"\x1b[");
-    buf.extend_from_slice(cb.to_string().as_bytes());
+    push_dec_u16(&mut buf, cb);
     buf.push(b';');
-    buf.extend_from_slice(col.saturating_add(1).to_string().as_bytes());
+    push_dec_u16(&mut buf, col.saturating_add(1));
     buf.push(b';');
-    buf.extend_from_slice(row.saturating_add(1).to_string().as_bytes());
+    push_dec_u16(&mut buf, row.saturating_add(1));
     buf.push(b'M');
     buf
 }

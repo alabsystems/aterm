@@ -114,6 +114,15 @@ pub(crate) fn image_read_line(
 /// anchor; `image read <r>` restricts to images intersecting row `r`; `image read
 /// <r> <c>` returns the single image tile covering that exact cell (`ERR none` if
 /// the cell has no image). Framed `OK <nlines>\n` + one line per image.
+///
+/// GATHER-THEN-SERIALIZE, like the styled-frame path: everything the reply needs
+/// (anchors, tile indices, and an `Arc` clone of each payload) is collected under
+/// ONE lock hold, then the guard is dropped and the (up to multi-MiB per image)
+/// base64 encode runs with the lock RELEASED. That mutex is the same one the PTY
+/// reader's `process()` and the renderer's frame snapshot take — holds there are
+/// budgeted in tens of microseconds, and an on-lock encode of a 4 MiB image is
+/// milliseconds. The bytes are `Arc`-shared and immutable once placed, so encoding
+/// after the drop yields byte-identical output.
 pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
     let t = term_lock(term);
     let rows = t.rows() as usize;
@@ -130,23 +139,25 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
         if r >= rows || c >= cols {
             return "ERR out of range\n".to_string();
         }
-        for (col, iref) in t.images_row(r) {
-            if col == c {
+        // Gather only: the FIRST tile at that column (what the old early `return`
+        // picked), carried out of the lock scope as an `Arc` clone.
+        let hit = t
+            .images_row(r)
+            .into_iter()
+            .find(|(col, _)| *col == c)
+            .map(|(col, iref)| {
                 let anchor_r = r.saturating_sub(iref.cell_row as usize);
                 let anchor_c = col.saturating_sub(iref.cell_col as usize);
-                return format!(
-                    "OK 1\n{}\n",
-                    image_read_line(
-                        anchor_r,
-                        anchor_c,
-                        iref.cell_row,
-                        iref.cell_col,
-                        &iref.image
-                    )
-                );
-            }
-        }
-        return "ERR none\n".to_string();
+                (anchor_r, anchor_c, iref.cell_row, iref.cell_col, iref.image)
+            });
+        drop(t);
+        let Some((anchor_r, anchor_c, cell_row, cell_col, img)) = hit else {
+            return "ERR none\n".to_string();
+        };
+        return format!(
+            "OK 1\n{}\n",
+            image_read_line(anchor_r, anchor_c, cell_row, cell_col, &img)
+        );
     }
 
     // Row mode (one row) or screen mode (all rows): distinct images, anchored.
@@ -159,7 +170,10 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
         None => (0..rows).collect(),
     };
     let mut seen: Vec<*const ImageData> = Vec::new();
-    let mut lines: Vec<String> = Vec::new();
+    // Anchor + payload handle per distinct image, in the same walk order the reply
+    // uses. Holding the `Arc` keeps each payload alive (and keeps the `seen`
+    // pointer-identity dedup valid) after the guard drops.
+    let mut hits: Vec<(usize, usize, Arc<ImageData>)> = Vec::new();
     for r in row_range {
         for (col, iref) in t.images_row(r) {
             let ptr = std::sync::Arc::as_ptr(&iref.image);
@@ -169,13 +183,14 @@ pub(crate) fn cmd_image_read(term: &Arc<Mutex<Terminal>>, rest: &str) -> String 
             seen.push(ptr);
             let anchor_r = r.saturating_sub(iref.cell_row as usize);
             let anchor_c = col.saturating_sub(iref.cell_col as usize);
-            // Whole-image report: anchor + tile 0/0 (the full payload is carried).
-            lines.push(image_read_line(anchor_r, anchor_c, 0, 0, &iref.image));
+            hits.push((anchor_r, anchor_c, iref.image));
         }
     }
-    let mut out = format!("OK {}\n", lines.len());
-    for l in lines {
-        out.push_str(&l);
+    drop(t);
+    let mut out = format!("OK {}\n", hits.len());
+    for (anchor_r, anchor_c, img) in hits {
+        // Whole-image report: anchor + tile 0/0 (the full payload is carried).
+        out.push_str(&image_read_line(anchor_r, anchor_c, 0, 0, &img));
         out.push('\n');
     }
     out

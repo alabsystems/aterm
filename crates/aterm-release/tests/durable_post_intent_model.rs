@@ -3,6 +3,9 @@
 
 //! Tier-1 conformance for journal-v5 one-shot GitHub POST authority.
 
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;

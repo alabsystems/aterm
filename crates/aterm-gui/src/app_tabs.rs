@@ -1448,13 +1448,18 @@ impl App {
         };
         let timeline: Vec<chrome::TimelineNote> = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-            let all: Vec<(&'static str, u64)> = tl.since(None).map(|e| (e.kind, e.t_ms)).collect();
-            all.iter()
+            // Walk the retained deque BACKWARDS and stop after the tail we keep:
+            // `since(None)`'s filter is a no-op, so this yields exactly what
+            // collecting all ~512 events and then doing `.rev().take(TAIL)` did —
+            // same notes, same newest-first order the tooltip/menu contract wants
+            // — while holding the leaf mutex for five steps instead of a full walk.
+            // `now` stays captured outside the lock, so the ages are unchanged too.
+            tl.since(None)
                 .rev()
                 .take(chrome::TIMELINE_TAIL)
-                .map(|&(kind, t_ms)| chrome::TimelineNote {
-                    kind,
-                    age_ms: now.saturating_sub(t_ms),
+                .map(|e| chrome::TimelineNote {
+                    kind: e.kind,
+                    age_ms: now.saturating_sub(e.t_ms),
                 })
                 .collect()
         };
@@ -2028,11 +2033,237 @@ impl App {
         }
     }
 
-    /// `@<sid> close`: retire the session addressably — the death half of the
-    /// `spawn` birth primitive. Stable `tab_set`/`view_store` identity is canonical:
-    /// a heterogeneous tab loses exactly the addressed terminal leaf and preserves
-    /// its native siblings, while an all-terminal tab retains the historical whole-
-    /// tab `close_tab_at` behavior (including quit-safety). Confirmed by REGISTRY
+    /// REGISTRY snapshot → [`crate::status_item::SessionRow`]s (effective
+    /// title + typed `role`/`attention`, one leaf-lock take per row) →
+    /// `classify`, then join the window rows (id order, composed chrome
+    /// title, tab count, frontmost mark) and the last background fleet scan's
+    /// sibling rows. Title rung: user meta title else the registry's live OSC
+    /// title — deliberately NO `Terminal` lock (this runs on chrome-refresh
+    /// paths). `Exited` sessions are excluded: a dead operator is not a
+    /// running operator.
+    pub(crate) fn operator_fleet_glance(&self) -> crate::status_item::FleetGlance {
+        let rows: Vec<crate::status_item::SessionRow> = {
+            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+            store
+                .snapshot()
+                .into_iter()
+                .filter(|h| !matches!(h.state, crate::session_store::SessionState::Exited))
+                .map(|h| {
+                    // One leaf-lock take per row: title + the typed keys.
+                    let (user_title, role, attention) = {
+                        let m = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                        (m.user_title.clone(), m.role.clone(), m.attention.clone())
+                    };
+                    crate::status_item::SessionRow {
+                        id: h.local_id,
+                        title: user_title.unwrap_or_else(|| h.title.clone()),
+                        role,
+                        attention,
+                    }
+                })
+                .collect()
+        };
+        let mut glance = crate::status_item::classify(&rows);
+        // Window rows: id order (the map's iteration order), composed chrome
+        // title, tab count, frontmost mark — the click-to-focus section.
+        glance.windows = self
+            .windows
+            .iter()
+            .map(|(wid, ws)| {
+                // Drop a leading busy-spinner frame (Codex dots / Claude moons
+                // animate at up to ~10Hz) and any IME preedit suffix (churns
+                // per keystroke mid-composition): the menu row reads the same
+                // either way, and the fingerprint must not rebuild the native
+                // menu at animation/typing rate.
+                let title = crate::toolbar::busy_spinner_title_parts(&ws.current_title)
+                    .map_or_else(|| ws.current_title.clone(), |(_, s)| s.trim_start().to_string());
+                let title = title
+                    .split(" [‹")
+                    .next()
+                    .map_or(title.clone(), str::to_string);
+                crate::status_item::WindowRow {
+                    id: wid.0,
+                    title,
+                    tabs: ws.tab_set.tabs().len(),
+                    frontmost: self.frontmost_window == Some(*wid),
+                }
+            })
+            .collect();
+        // Sibling rows from the last background scan (already pid-sorted).
+        glance.instances = self.fleet_instances.clone();
+        glance
+    }
+
+    /// Recompute the fleet glance and push it to the menu-bar status item —
+    /// fingerprint-gated, so per-prompt title drift does not rebuild the native
+    /// menu unless the rendered state actually changed. No-op with no status
+    /// item (headless, off macOS, or pre-first-window).
+    pub(crate) fn refresh_operator_status_item(&mut self) {
+        if self._status_item.is_none() {
+            return;
+        }
+        let glance = self.operator_fleet_glance();
+        // The operator's id is NOT part of the rendered fingerprint (same title
+        // after a restart ⇒ same strings), so track it before the change gate.
+        self.operator_local_id = glance.operator_session;
+        let fp = glance.fingerprint();
+        if self.operator_status_fingerprint.as_deref() == Some(fp.as_str()) {
+            return;
+        }
+        self.operator_status_fingerprint = Some(fp);
+        if let Some(handle) = &self._status_item {
+            crate::status_item::update(handle, &glance);
+        }
+    }
+
+    /// Dispatch one click from the menu-bar status item (the
+    /// `dispatch_menu_action` twin for `Wake::OperatorAction`).
+    pub(crate) fn dispatch_operator_action(
+        &mut self,
+        el: &ActiveEventLoop,
+        action: crate::status_item::OperatorAction,
+    ) {
+        match action {
+            crate::status_item::OperatorAction::Start => {
+                // A running operator makes Start a stale-menu no-op (the click
+                // raced a state change); just re-render the truth.
+                if self.operator_local_id.is_some() {
+                    self.refresh_operator_status_item();
+                    return;
+                }
+                match self.spawn_tab_session(None) {
+                    Ok(sid) => {
+                        // Stamp identity via user meta BEFORE the agent renames
+                        // itself, then type the launch line through the sink —
+                        // the `send` verb's write path (whole-frame atomic;
+                        // bytes buffer in the kernel while the shell boots).
+                        let stamped = {
+                            let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+                            store.by_sid(&aterm_session::SessionId::new(&sid)).map(|h| {
+                                // Typed identity FIRST (the classifier keys on
+                                // it); the title stays the human status line.
+                                // Through the validated ladder, so the
+                                // meta-change timeline records land exactly
+                                // like a wire `meta set` (the raw-set stamp
+                                // was invisible to `events` watchers).
+                                use crate::session_timeline::{
+                                    MetaEdit, MetaField, write_session_meta,
+                                };
+                                let _ = write_session_meta(
+                                    &h.ctx,
+                                    MetaField::Role,
+                                    MetaEdit::Set("operator"),
+                                );
+                                let _ = write_session_meta(
+                                    &h.ctx,
+                                    MetaField::Title,
+                                    MetaEdit::Set("operator: starting"),
+                                );
+                                (h.local_id, h.ctx.sink.clone())
+                            })
+                        };
+                        if let Some((local, sink)) = stamped {
+                            // The wire meta arm's fan-out, mirrored (the GUI
+                            // rename discipline): chrome recompose + a
+                            // subscriber notify so the fresh records push.
+                            self.refresh_meta_dependent_chrome(local);
+                            if self.subscribers.any() {
+                                self.subscribers
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .notify(local);
+                            }
+                            let mut bytes =
+                                crate::status_item::OPERATOR_LAUNCH_LINE.as_bytes().to_vec();
+                            bytes.push(0x0d);
+                            let _ = sink.write_frame(&bytes);
+                        }
+                        self.refresh_operator_status_item();
+                    }
+                    Err(e) => eprintln!("aterm-gui: start operator failed: {e}"),
+                }
+            }
+            crate::status_item::OperatorAction::Show => {
+                let Some(session) = self.operator_local_id else {
+                    return;
+                };
+                self.focus_session_window(session);
+            }
+            crate::status_item::OperatorAction::FocusSession(session) => {
+                // A stale menu row (session closed mid-track) misses and
+                // no-ops — ids are never reused, so it can never alias.
+                self.focus_session_window(session);
+            }
+            crate::status_item::OperatorAction::FocusWindow(id) => {
+                let wid = WindowId(id);
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
+                    // focus_window is a silent no-op on a miniaturized window
+                    // and deminiaturization is ASYNC — arm the pending-raise
+                    // so the Occluded(false)/Focused arms finish the job.
+                    if w.is_minimized().unwrap_or(false) {
+                        self.pending_deminiaturize_focus = Some(wid);
+                    }
+                    w.set_minimized(false);
+                    w.focus_window();
+                    w.request_redraw();
+                }
+                self.note_window_focused_if_present(wid);
+            }
+            crate::status_item::OperatorAction::RaiseInstance(pid) => {
+                // Composed rows disable pid 0; the seam re-guards anyway and a
+                // dead pid reads as a failed activation, silently — a stale
+                // menu row is a miss, never an error dialog.
+                let _ = self.apprt.activate_instance(pid);
+            }
+            crate::status_item::OperatorAction::Stop => {
+                let Some(session) = self.operator_local_id else {
+                    return;
+                };
+                // A menu click is a deliberate, explicit stop: suppress the
+                // foreground-job close confirm exactly like the scripted
+                // `Wake::TabCmd` close does, then escalate a last-tab close to
+                // its window teardown.
+                self.close_confirm_suppressed = true;
+                let result = self.close_session_by_id(session);
+                self.close_confirm_suppressed = false;
+                if result.is_ok() {
+                    self.escalate_pending_close(el);
+                }
+                self.refresh_operator_status_item();
+            }
+        }
+    }
+
+    /// Focus the tab displaying `session` and raise its window — the Show
+    /// Operator body, shared by every session-focusing menu row. Returns
+    /// whether the session was found in any window.
+    pub(crate) fn focus_session_window(&mut self, session: u64) -> bool {
+        let found = self.windows.keys().find_map(|wid| {
+            self.terminal_view_location(*wid, session)
+                .map(|location| (*wid, location.canonical_index))
+        });
+        let Some((wid, index)) = found else {
+            return false;
+        };
+        self.switch_tab_in(wid, index);
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
+            if w.is_minimized().unwrap_or(false) {
+                self.pending_deminiaturize_focus = Some(wid);
+            }
+            w.set_minimized(false);
+            w.focus_window();
+        }
+        true
+    }
+
+    /// MRU bookkeeping for a menu-driven raise, skipped when the id already
+    /// vanished (the stale-row miss path).
+    fn note_window_focused_if_present(&mut self, wid: WindowId) {
+        if self.windows.contains_key(&wid) {
+            self.note_window_focused(wid);
+        }
+    }
+
     /// DIFF (like spawn): if the session is gone afterward it succeeded; if it
     /// survives, the close was refused and we say so.
     pub(crate) fn close_session_by_id(&mut self, session: u64) -> Result<(), String> {
@@ -2464,6 +2695,11 @@ impl App {
                 },
             );
         }
+        // Title drift funnels through here (every structural change + each
+        // prompt relabel), so this is where the menu-bar operator icon observes
+        // a title gaining/losing `operator`/`⚠`. Fingerprint-gated: a steady
+        // prompt costs one glance compare, no AppKit work.
+        self.refresh_operator_status_item();
         (titles, metadata)
     }
 
@@ -5157,6 +5393,8 @@ mod mixed_tab_tests {
                     user_title: None,
                     description: None,
                     icon: None,
+                    role: None,
+                    attention: None,
                 },
             )),
             focused_path: Vec::new(),
@@ -5791,5 +6029,101 @@ mod rename_strip_click_tests {
             None,
             "no invisible field is left owning the keyboard"
         );
+    }
+}
+
+/// The operator glance end-to-end over the REAL registry + windows map —
+/// headless, no AppKit: typed meta drives classification, window rows ride
+/// the glance, and the structural seams (create/close/focus) move the
+/// fingerprint the status item gates its rebuilds on.
+#[cfg(test)]
+mod operator_glance_tests {
+    use super::*;
+
+    fn set_meta(app: &App, session: u64, field: &str, value: &str) {
+        let store = app.store.read().unwrap_or_else(|p| p.into_inner());
+        let h = store.by_local(session).expect("registered session");
+        h.ctx
+            .meta
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set(field, Some(value.to_string()));
+    }
+
+    /// Typed `role`/`attention` meta on a REGISTERED session drives the glance
+    /// exactly like the pure classifier promises: role names the operator,
+    /// attention escalates with the message, and the single headless window
+    /// appears as a frontmost row.
+    #[test]
+    fn typed_meta_drives_the_headless_glance() {
+        let app = App::headless_for_test();
+        let g = app.operator_fleet_glance();
+        assert_eq!(g.operator_session, None);
+        assert_eq!(g.sessions, 1);
+        assert_eq!(g.windows.len(), 1);
+        assert!(g.windows[0].frontmost);
+
+        set_meta(&app, 0, "role", "operator");
+        let g = app.operator_fleet_glance();
+        assert_eq!(g.operator_session, Some(0), "typed role names the operator");
+
+        set_meta(&app, 0, "attention", "wedged on CI");
+        let g = app.operator_fleet_glance();
+        assert_eq!(g.warnings, vec![(0, "⚠ wedged on CI".to_string())]);
+        assert_eq!(g.button_title(), "❯⚠");
+    }
+
+    /// The structural seams the status item now hooks (window create, focus
+    /// re-point, window close) each move the rendered fingerprint, and a
+    /// create→close round trip restores it — the change gate can never wedge
+    /// showing a stale window list.
+    #[test]
+    fn structural_seams_move_the_fingerprint() {
+        let mut app = App::headless_for_test();
+        let fp_base = app.operator_fleet_glance().fingerprint();
+
+        let wid = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        let fp_two = app.operator_fleet_glance().fingerprint();
+        assert_ne!(fp_base, fp_two, "a new window is a rendered fact");
+
+        app.frontmost_window = Some(WindowId(0));
+        let fp_refocus = app.operator_fleet_glance().fingerprint();
+        assert_ne!(fp_two, fp_refocus, "the frontmost mark is a rendered fact");
+
+        app.frontmost_window = Some(wid);
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Stay);
+        let fp_closed = app.operator_fleet_glance().fingerprint();
+        assert_eq!(
+            fp_base, fp_closed,
+            "create→close round-trips the glance to its baseline"
+        );
+    }
+
+    /// A busy-spinner frame on the window title (Codex dots / Claude moons)
+    /// never reaches the glance: the row text and therefore the fingerprint
+    /// stay stable across animation frames, so the native menu is not rebuilt
+    /// at spinner rate.
+    #[test]
+    fn spinner_frames_do_not_churn_the_window_row_or_fingerprint() {
+        let mut app = App::headless_for_test();
+        app.windows.get_mut(&WindowId(0)).unwrap().current_title = "\u{280b} cargo build".into();
+        let a = app.operator_fleet_glance();
+        assert_eq!(a.windows[0].title, "cargo build");
+        app.windows.get_mut(&WindowId(0)).unwrap().current_title = "\u{2819} cargo build".into();
+        let b = app.operator_fleet_glance();
+        assert_eq!(a.fingerprint(), b.fingerprint(), "phase-only change is not a rendered fact");
+        app.windows.get_mut(&WindowId(0)).unwrap().current_title = "cargo build done".into();
+        assert_ne!(a.fingerprint(), app.operator_fleet_glance().fingerprint());
+    }
+
+    /// The shared focus helper behind Show Operator and every clickable row:
+    /// a live session hits (tab switched; headless has no OS window to raise),
+    /// an unknown id misses without side effects — stale menu rows can only
+    /// miss, never alias.
+    #[test]
+    fn focus_session_window_hits_and_misses_honestly() {
+        let mut app = App::headless_for_test();
+        assert!(app.focus_session_window(0));
+        assert!(!app.focus_session_window(777));
     }
 }

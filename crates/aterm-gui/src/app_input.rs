@@ -1437,7 +1437,7 @@ impl App {
     /// jumping jacks, a fresh tip within seconds), exactly like clicking him
     /// in Nitro Keyboard. Gated like the render path (config, motion,
     /// serious) so a poke can never resurrect a policy-hidden robot.
-    pub(crate) fn feed_robi_typed(&mut self, wid: WindowId, now: std::time::Instant, typed: &[char]) {
+    fn feed_robi_typed(&mut self, wid: WindowId, now: std::time::Instant, typed: &[char]) {
         if typed.is_empty() || !self.config.robi_or_default() {
             return;
         }
@@ -1465,11 +1465,6 @@ impl App {
         if ws.robi_tail.ends_with("robi") || ws.robi_tail.ends_with("robot") {
             // Clear the tail so holding the last key can't re-poke per press.
             ws.robi_tail.clear();
-            // Calling him by name is the resurrection path from a click
-            // dismiss: the latch clears here and ONLY here, so a dismissed
-            // Robi stays gone until asked for (never resurrected by a mere
-            // config touch or focus change).
-            ws.robi_dismissed = false;
             ws.robi_shows += 1;
             ws.robi_show.start(now, ws.robi_shows);
             ws.robi_tip_posted = None;

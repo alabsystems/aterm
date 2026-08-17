@@ -738,7 +738,47 @@ impl SettingsPreviewSpec {
     /// Static, hidden, reduced-motion, and zero-intensity combinations return
     /// `None`, preserving aterm's pure-Wait idle contract.
     pub(crate) fn animation(&self) -> PreviewAnimation {
-        self.normalized().normalized_animation()
+        self.animation_in_place()
+    }
+
+    /// `self.normalized().normalized_animation()` evaluated without
+    /// materializing the normalized spec.
+    ///
+    /// The event loop probes the cadence for every window on every
+    /// `about_to_wait` turn, and the retained-raster key needs it once per
+    /// presented frame; neither wants the ~10 heap allocations `normalized()`
+    /// pays to produce a three-variant enum. Only the cursor lane actually
+    /// needs normalizing — `CursorPreviewSpec::normalized` allocates nothing
+    /// (its one clone is an `Option<Arc>` refcount, kept only for `Custom`) —
+    /// because `scene` and `reduced_motion` are copied verbatim and
+    /// `millis_until_next_blink_edge` re-applies `% PHASE_CYCLE_MS` itself.
+    ///
+    /// INVARIANT: this must answer identically to `normalized_animation()` on
+    /// the normalized spec, so the scheduler cannot drift from the painter.
+    /// Normalizing the cursor is what makes that exact rather than approximate:
+    /// a non-finite `intensity` collapses to 0.0 (no motion) here exactly as it
+    /// does in paint. The `debug_assert_eq!` is the standing guard.
+    fn animation_in_place(&self) -> PreviewAnimation {
+        let animation = if self.reduced_motion || self.scene != PreviewScene::CursorMotion {
+            PreviewAnimation::None
+        } else {
+            let cursor = self.cursor.normalized();
+            if cursor.trail_enabled && cursor.has_resolved_trail() && cursor.intensity > 0.0 {
+                PreviewAnimation::Continuous
+            } else if cursor.blink && cursor.style != PreviewCursorStyle::Hidden {
+                PreviewAnimation::BlinkEdge {
+                    after_ms: self.millis_until_next_blink_edge(),
+                }
+            } else {
+                PreviewAnimation::None
+            }
+        };
+        debug_assert_eq!(
+            animation,
+            self.normalized().normalized_animation(),
+            "preview cadence must not depend on spec normalization"
+        );
+        animation
     }
 
     fn normalized_animation(&self) -> PreviewAnimation {
@@ -1095,79 +1135,186 @@ impl SettingsPreviewSpec {
     /// Under reduced motion phase cannot affect paint and is normalized to 0,
     /// preventing a frozen preview from needlessly re-rasterizing.
     pub(crate) fn paint_fingerprint(&self) -> u64 {
+        let fingerprint = self.paint_identity_hash();
+        // Drift guard for the invariant documented on `paint_identity_hash`:
+        // hashing a spec and hashing its normalization must agree. Any raw
+        // field that leaks into the key (a missing clamp, trim, mask, or the
+        // `phase_ms` modulo) breaks this equality for un-normalized input, so
+        // every debug-built test that touches a fingerprint pins it.
+        debug_assert_eq!(
+            fingerprint,
+            self.normalized().paint_identity_hash(),
+            "paint identity must hash normalized values only"
+        );
+        fingerprint
+    }
+
+    /// The hashing half of [`Self::paint_fingerprint`].
+    ///
+    /// This runs on the present path (once per native frame, once per visible
+    /// native leaf on the split route), so it hashes each field's NORMALIZED
+    /// projection in place instead of materializing a whole `normalized()`
+    /// clone to hash — the same "touches NO heap" posture
+    /// [`crate::native_ui::CompiledUi::fingerprint`] documents for itself, with
+    /// FxHash over SipHash for the same stated reason: a cache key over
+    /// first-party data, never persisted and never sent on the wire.
+    ///
+    /// INVARIANT: the hashed value SET and its many-to-one collapses must stay
+    /// exactly those of `normalized()` — same clamps, same `0x00ff_ffff` masks,
+    /// same `trail_pack`-only-for-`Custom` rule, same title-format folding, and
+    /// the same `phase_ms % PHASE_CYCLE_MS`. Hashing coarser would stale-serve a
+    /// retained raster; hashing finer would re-raster identical pixels.
+    fn paint_identity_hash(&self) -> u64 {
         use std::hash::{Hash, Hasher};
 
-        let spec = self.normalized();
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        (spec.scene as u8).hash(&mut hash);
-        spec.font_px.to_bits().hash(&mut hash);
-        spec.line_height.to_bits().hash(&mut hash);
-        spec.baseline_adjust.hash(&mut hash);
-        spec.ligatures.hash(&mut hash);
-        spec.merged_ligatures.hash(&mut hash);
-        spec.synthetic_styles.hash(&mut hash);
-        spec.font_candidate.hash(&mut hash);
-        spec.font_ready_epoch.hash(&mut hash);
-        spec.focused_key.hash(&mut hash);
-        spec.focused_value.hash(&mut hash);
-        spec.appearance.window_theme.hash(&mut hash);
-        spec.appearance.minimum_contrast.to_bits().hash(&mut hash);
-        spec.appearance.selection_foreground.hash(&mut hash);
-        spec.appearance.selection_inactive.hash(&mut hash);
-        spec.appearance.bold_is_bright.hash(&mut hash);
-        spec.appearance.faint_opacity.to_bits().hash(&mut hash);
-        if spec.appearance.window_theme == "auto" {
-            spec.system_dark.hash(&mut hash);
-        }
-        spec.typography.cursor_break_ligatures.hash(&mut hash);
-        spec.typography.underline_position.hash(&mut hash);
-        spec.typography.underline_thickness.hash(&mut hash);
-        spec.typography.underline_skip_descenders.hash(&mut hash);
-        (spec.typography.text_blending as u8).hash(&mut hash);
-        spec.typography.font_thicken.hash(&mut hash);
-        spec.typography.stem_gamma.to_bits().hash(&mut hash);
-        spec.typography.variations.hash(&mut hash);
-        spec.post_fx.kitty_sprite.hash(&mut hash);
-        spec.post_fx.kitty_asset.fingerprint().hash(&mut hash);
-        spec.post_fx.bloom.hash(&mut hash);
-        spec.post_fx.bloom_strength.to_bits().hash(&mut hash);
-        spec.post_fx.bloom_radius.to_bits().hash(&mut hash);
-        spec.post_fx.fire_shimmer.hash(&mut hash);
-        spec.post_fx.hdr_glow.hash(&mut hash);
-        spec.post_fx.sdr_boost.to_bits().hash(&mut hash);
-        spec.post_fx.motion_raw.hash(&mut hash);
-        spec.post_fx.motion_effective.hash(&mut hash);
-        spec.post_fx.motion_reason.hash(&mut hash);
-        spec.post_fx.adaptive_motion.hash(&mut hash);
-        spec.post_fx.performance_reduced.hash(&mut hash);
-        spec.window_tabs.columns.hash(&mut hash);
-        spec.window_tabs.lines.hash(&mut hash);
-        spec.window_tabs.tab_strip_rows.hash(&mut hash);
-        spec.window_tabs.show_build_badge.hash(&mut hash);
-        spec.window_tabs.generate_activity.hash(&mut hash);
-        spec.window_tabs.tab_title_format.hash(&mut hash);
-        spec.window_tabs.window_title_format.hash(&mut hash);
-        spec.terminal_theme.hash(&mut hash);
-        (spec.cursor.style as u8).hash(&mut hash);
-        spec.cursor.blink.hash(&mut hash);
-        spec.cursor.trail_enabled.hash(&mut hash);
-        (spec.cursor.trail_style as u8).hash(&mut hash);
-        spec.cursor
-            .trail_pack
-            .as_ref()
-            .map(|pack| pack.pack_fp)
+        let mut hash = aterm_hash::FxHasher::default();
+        (self.scene as u8).hash(&mut hash);
+        finite_or(self.font_px, 14.0)
+            .clamp(MIN_FONT_PX, MAX_FONT_PX)
+            .to_bits()
             .hash(&mut hash);
-        spec.cursor.color.hash(&mut hash);
-        spec.cursor.accent.hash(&mut hash);
-        spec.cursor.duration_ms.hash(&mut hash);
-        spec.cursor.length.hash(&mut hash);
-        spec.cursor.intensity.to_bits().hash(&mut hash);
-        spec.cursor.radius.to_bits().hash(&mut hash);
-        spec.cursor.ring.hash(&mut hash);
-        spec.reduced_motion.hash(&mut hash);
-        match spec.normalized_animation() {
-            PreviewAnimation::Continuous => spec.phase_ms.hash(&mut hash),
-            PreviewAnimation::BlinkEdge { .. } => spec.cursor_visible().hash(&mut hash),
+        finite_or(self.line_height, 1.0)
+            .clamp(0.8, 2.0)
+            .to_bits()
+            .hash(&mut hash);
+        self.baseline_adjust.clamp(-32, 32).hash(&mut hash);
+        self.ligatures.hash(&mut hash);
+        self.merged_ligatures.hash(&mut hash);
+        self.synthetic_styles.hash(&mut hash);
+        self.font_candidate.hash(&mut hash);
+        self.font_ready_epoch.hash(&mut hash);
+        self.focused_key.trim().hash(&mut hash);
+        self.focused_value.trim().hash(&mut hash);
+        hash_trimmed_lowercase(&self.appearance.window_theme, &mut hash);
+        finite_or(self.appearance.minimum_contrast, 1.0)
+            .clamp(1.0, 21.0)
+            .to_bits()
+            .hash(&mut hash);
+        self.appearance
+            .selection_foreground
+            .map(|color| color & 0x00ff_ffff)
+            .hash(&mut hash);
+        self.appearance.selection_inactive.hash(&mut hash);
+        self.appearance.bold_is_bright.hash(&mut hash);
+        finite_or(self.appearance.faint_opacity, 0.5)
+            .clamp(0.0, 1.0)
+            .to_bits()
+            .hash(&mut hash);
+        // Compare the NORMALIZED theme word: an authored " Auto " must still
+        // fold `system_dark` in, or an OS light/dark flip would not invalidate
+        // the raster.
+        if self
+            .appearance
+            .window_theme
+            .trim()
+            .eq_ignore_ascii_case("auto")
+        {
+            self.system_dark.hash(&mut hash);
+        }
+        self.typography.cursor_break_ligatures.hash(&mut hash);
+        self.typography
+            .underline_position
+            .clamp(-32, 32)
+            .hash(&mut hash);
+        self.typography
+            .underline_thickness
+            .clamp(-32, 32)
+            .hash(&mut hash);
+        self.typography.underline_skip_descenders.hash(&mut hash);
+        (self.typography.text_blending as u8).hash(&mut hash);
+        self.typography.font_thicken.hash(&mut hash);
+        finite_or(self.typography.stem_gamma, 1.0)
+            .clamp(0.3, 3.0)
+            .to_bits()
+            .hash(&mut hash);
+        self.typography.variations.hash(&mut hash);
+        self.post_fx.kitty_sprite.trim().hash(&mut hash);
+        self.post_fx.kitty_asset.fingerprint().hash(&mut hash);
+        self.post_fx.bloom.hash(&mut hash);
+        finite_or(self.post_fx.bloom_strength, 0.35)
+            .clamp(0.0, 3.0)
+            .to_bits()
+            .hash(&mut hash);
+        finite_or(self.post_fx.bloom_radius, 2.0)
+            .clamp(0.5, 8.0)
+            .to_bits()
+            .hash(&mut hash);
+        self.post_fx.fire_shimmer.hash(&mut hash);
+        self.post_fx.hdr_glow.hash(&mut hash);
+        finite_or(self.post_fx.sdr_boost, 0.35)
+            .clamp(0.0, 1.0)
+            .to_bits()
+            .hash(&mut hash);
+        hash_trimmed_lowercase(&self.post_fx.motion_raw, &mut hash);
+        self.post_fx.motion_effective.hash(&mut hash);
+        self.post_fx.motion_reason.hash(&mut hash);
+        self.post_fx.adaptive_motion.hash(&mut hash);
+        self.post_fx.performance_reduced.hash(&mut hash);
+        self.window_tabs.columns.clamp(1, 1_000).hash(&mut hash);
+        self.window_tabs.lines.clamp(1, 1_000).hash(&mut hash);
+        self.window_tabs.tab_strip_rows.min(4).hash(&mut hash);
+        self.window_tabs.show_build_badge.hash(&mut hash);
+        self.window_tabs.generate_activity.hash(&mut hash);
+        normalized_title_format_str(&self.window_tabs.tab_title_format).hash(&mut hash);
+        normalized_title_format_str(&self.window_tabs.window_title_format).hash(&mut hash);
+        // `PreviewTerminalTheme` is `Copy`, so the normalized candidate is a
+        // stack value; only its ANSI ramp needs the mask `new()` already
+        // applies to the four named colours.
+        self.terminal_theme
+            .map(|theme| {
+                let mut normalized =
+                    PreviewTerminalTheme::new(theme.fg, theme.bg, theme.cursor, theme.selection);
+                normalized.ansi = theme.ansi.map(|color| color & 0x00ff_ffff);
+                normalized
+            })
+            .hash(&mut hash);
+        (self.cursor.style as u8).hash(&mut hash);
+        self.cursor.blink.hash(&mut hash);
+        self.cursor.trail_enabled.hash(&mut hash);
+        (self.cursor.trail_style as u8).hash(&mut hash);
+        // Pack identity counts only where the engine can dispatch to it, so two
+        // built-ins carrying a stale pack stay one key, exactly as today.
+        let trail_pack_fp = if matches!(self.cursor.trail_style, PreviewTrailStyle::Custom) {
+            self.cursor.trail_pack.as_ref().map(|pack| pack.pack_fp)
+        } else {
+            None
+        };
+        trail_pack_fp.hash(&mut hash);
+        self.cursor
+            .color
+            .map(|color| color & 0x00ff_ffff)
+            .hash(&mut hash);
+        self.cursor
+            .accent
+            .map(|color| color & 0x00ff_ffff)
+            .hash(&mut hash);
+        self.cursor
+            .duration_ms
+            .clamp(MIN_DURATION_MS, MAX_DURATION_MS)
+            .hash(&mut hash);
+        self.cursor.length.clamp(1, MAX_LENGTH).hash(&mut hash);
+        finite_or(self.cursor.intensity, 0.0)
+            .clamp(0.0, 1.0)
+            .to_bits()
+            .hash(&mut hash);
+        finite_or(self.cursor.radius, 0.0)
+            .clamp(0.0, 2.0)
+            .to_bits()
+            .hash(&mut hash);
+        self.cursor.ring.hash(&mut hash);
+        self.reduced_motion.hash(&mut hash);
+        // The phase MUST be reduced before the blink parity is read: 2,400 ms is
+        // deliberately not a whole multiple of the 530 ms half-period, so raw
+        // phase 4,800 (parity odd) and normalized phase 0 (parity even) disagree.
+        // Paint goes through `normalized()`, so the key must too, or two frames
+        // that paint differently collide on one retained raster.
+        let phase_ms = self.phase_ms % PHASE_CYCLE_MS;
+        let cursor_visible = self.reduced_motion
+            || !self.cursor.blink
+            || (phase_ms / CURSOR_BLINK_HALF_MS).is_multiple_of(2);
+        match self.animation_in_place() {
+            PreviewAnimation::Continuous => phase_ms.hash(&mut hash),
+            PreviewAnimation::BlinkEdge { .. } => cursor_visible.hash(&mut hash),
             PreviewAnimation::None => 0_u64.hash(&mut hash),
         }
         hash.finish() | 1
@@ -1827,6 +1974,62 @@ fn build_terminal_specimen_input(
         (5, FULL_SOURCE)
     };
 
+    // The memo key comes FIRST because it is a total function of this call's
+    // inputs — nothing below reads anything that is not hashed here.
+    //
+    // INVARIANT: every value the build below consults must appear in this hash.
+    // A `Continuous` preview re-lowers at 30 fps and only `phase_ms` moves
+    // between ticks, which the specimen itself does not read (it enters through
+    // `cursor_visible()` alone), so an unhashed input would silently freeze a
+    // stale snapshot on glass. Keep this list in step with the build.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    source.hash(&mut hash);
+    rows.hash(&mut hash);
+    theme.fg.hash(&mut hash);
+    theme.bg.hash(&mut hash);
+    theme.cursor.hash(&mut hash);
+    theme.selection.hash(&mut hash);
+    // Scene selects the source above AND gates the kitty layer below.
+    (spec.scene as u8).hash(&mut hash);
+    spec.terminal_theme
+        .map(|candidate| candidate.ansi)
+        .hash(&mut hash);
+    spec.appearance.selection_foreground.hash(&mut hash);
+    spec.appearance.bold_is_bright.hash(&mut hash);
+    spec.appearance.faint_opacity.to_bits().hash(&mut hash);
+    (spec.cursor.style as u8).hash(&mut hash);
+    spec.cursor.blink.hash(&mut hash);
+    spec.cursor_visible().hash(&mut hash);
+    // The remaining four gate the kitty sprite layer.
+    spec.cursor.trail_enabled.hash(&mut hash);
+    (spec.cursor.trail_style as u8).hash(&mut hash);
+    spec.reduced_motion.hash(&mut hash);
+    spec.focused_key.hash(&mut hash);
+    spec.post_fx.kitty_sprite.hash(&mut hash);
+    spec.post_fx.kitty_asset.fingerprint().hash(&mut hash);
+    let fingerprint = hash.finish() | 1;
+
+    // Building the snapshot means constructing a whole `aterm_core::Terminal`
+    // (grid page store included) and re-parsing the const specimen through the
+    // real VT parser, which is pure but far from free at 30 fps. The result is
+    // an immutable `Arc` snapshot (`TerminalSpecimenSpec::input`; raster only
+    // ever reads it), so returning the previous frame's `Arc` for an identical
+    // key is indistinguishable from rebuilding it.
+    //
+    // The slot is thread-local, so a raster worker can never observe another
+    // thread's entry, and it stores the full (key, value) pair: a bare value
+    // keyed elsewhere is exactly how such caches go stale.
+    thread_local! {
+        static LAST_SPECIMEN: std::cell::RefCell<Option<(u64, Arc<aterm_render::RenderInput>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(cached) = LAST_SPECIMEN.with_borrow(|slot| match slot {
+        Some((key, input)) if *key == fingerprint => Some(Arc::clone(input)),
+        _ => None,
+    }) {
+        return (cached, fingerprint);
+    }
+
     let mut terminal_config = aterm_core::config::TerminalConfig {
         default_foreground: packed_rgb(theme.fg),
         default_background: packed_rgb(theme.bg),
@@ -1879,24 +2082,9 @@ fn build_terminal_specimen_input(
         input.free_atlas = Some(atlas);
     }
 
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    source.hash(&mut hash);
-    rows.hash(&mut hash);
-    theme.fg.hash(&mut hash);
-    theme.bg.hash(&mut hash);
-    theme.cursor.hash(&mut hash);
-    theme.selection.hash(&mut hash);
-    spec.terminal_theme
-        .map(|candidate| candidate.ansi)
-        .hash(&mut hash);
-    spec.appearance.bold_is_bright.hash(&mut hash);
-    spec.appearance.faint_opacity.to_bits().hash(&mut hash);
-    (spec.cursor.style as u8).hash(&mut hash);
-    spec.cursor_visible().hash(&mut hash);
-    (spec.cursor.trail_style as u8).hash(&mut hash);
-    spec.post_fx.kitty_sprite.hash(&mut hash);
-    spec.post_fx.kitty_asset.fingerprint().hash(&mut hash);
-    (Arc::new(input), hash.finish() | 1)
+    let input = Arc::new(input);
+    LAST_SPECIMEN.with_borrow_mut(|slot| *slot = Some((fingerprint, Arc::clone(&input))));
+    (input, fingerprint)
 }
 
 fn kitty_layer(
@@ -2012,13 +2200,34 @@ fn paint_portable_post_fx(
     }
 }
 
-fn normalized_title_format(value: &str) -> String {
+/// The borrowing core of [`normalized_title_format`], so the per-frame paint
+/// identity can fold the same value in without allocating it and the two can
+/// never drift apart.
+fn normalized_title_format_str(value: &str) -> &str {
     match value.trim() {
-        "title" | "description" | "title-description" | "description-title" => {
-            value.trim().to_string()
-        }
-        _ => "title-description".to_string(),
+        known @ ("title" | "description" | "title-description" | "description-title") => known,
+        _ => "title-description",
     }
+}
+
+fn normalized_title_format(value: &str) -> String {
+    normalized_title_format_str(value).to_string()
+}
+
+/// Fold a string's trimmed, ASCII-lowercased form into `hash` without
+/// materializing it.
+///
+/// `normalized()` lowercases `window_theme` and `motion_raw`, so the paint
+/// identity must hash the lowered bytes; doing it in place keeps the per-frame
+/// key allocation-free. The trailing sentinel is load-bearing: `Hash for str`
+/// appends a terminator after the bytes, and a hand-rolled byte loop must
+/// supply its own or two adjacent string fields become concatenation-collidable
+/// ("auto" + "full" hashing the same as "autof" + "ull").
+fn hash_trimmed_lowercase<H: std::hash::Hasher>(value: &str, hash: &mut H) {
+    for byte in value.trim().bytes() {
+        H::write_u8(hash, byte.to_ascii_lowercase());
+    }
+    H::write_u8(hash, 0xff);
 }
 
 fn preview_title(title: &str, description: &str, format: &str, separator: &str) -> String {
@@ -2594,7 +2803,18 @@ mod tests {
     const NORD: PreviewTerminalTheme =
         PreviewTerminalTheme::new(0xD8_DEE9, 0x2E_3440, 0x88_C0D0, 0x43_4C5E);
 
-    fn compiled(mut spec: SettingsPreviewSpec) -> crate::native_ui::CompiledUi {
+    fn compiled(spec: SettingsPreviewSpec) -> crate::native_ui::CompiledUi {
+        compiled_with_font(spec, |_| {})
+    }
+
+    /// [`compiled`], with a last chance to perturb the host-prepared semantic
+    /// font snapshot the fixture injects. Only [`pixels_recomputed`] uses the
+    /// hook, and only to move `snapshot.ready_epoch` — the one field of that
+    /// snapshot that reaches no primitive at all (see the helper).
+    fn compiled_with_font(
+        mut spec: SettingsPreviewSpec,
+        perturb: impl FnOnce(&mut crate::tray_raster::PreparedSemanticFont),
+    ) -> crate::native_ui::CompiledUi {
         let _ = crate::native_appearance::install_preferences(
             crate::native_appearance::AppearancePreferences::default(),
         );
@@ -2625,8 +2845,9 @@ mod tests {
                 installed.set(Some(epoch));
             }
         });
-        let prepared =
+        let mut prepared =
             crate::tray_raster::prepared_semantic_font_for_direct_view_test(&spec.font_candidate);
+        perturb(&mut prepared);
         spec = spec.with_prepared_font(prepared);
         let preview = preview_node("preview", spec, 190.0);
         UiTree::new(
@@ -2642,16 +2863,81 @@ mod tests {
     }
 
     fn pixels(spec: SettingsPreviewSpec) -> Vec<u8> {
-        let compiled = compiled(spec);
-        let prims = compiled.tray(Theme::default(), 13.0).prims;
+        raster_of(&compiled(spec).tray(Theme::default(), 13.0).prims)
+    }
+
+    fn raster_of(prims: &[DrawPrim]) -> Vec<u8> {
         crate::tray_raster::rasterize_tray(
-            &prims,
+            prims,
             VIEWPORT.width as u32,
             VIEWPORT.height as u32,
             1.0,
             [0, 0, 0, 0],
         )
         .0
+    }
+
+    /// [`pixels`], with BOTH specimen memos on the paint path forced to miss,
+    /// so the terminal specimen — by far the most expensive prim in the tray —
+    /// is genuinely re-derived instead of replayed.
+    ///
+    /// Two caches sit between a spec and its pixels: the single-slot engine
+    /// snapshot memo inside [`build_terminal_specimen_input`], and
+    /// `tray_raster`'s retained specimen frame (an `Rc<Frame>` keyed by the
+    /// whole specimen spec beside the fork-source pointer). Both keys are total
+    /// functions of one paint's inputs, so a SECOND paint of one spec hits both
+    /// and hands back byte-identical bytes by construction — which would make
+    /// any `differences(..) == 0` assertion across two paints trivially true for
+    /// everything inside the specimen. Use this for the second half of such a
+    /// comparison; both memos then miss, and the assertion is once again a
+    /// statement about the renderer rather than about the cache:
+    ///
+    /// * the snapshot memo holds exactly one `(key, value)` pair, so parking
+    ///   another key in it evicts whatever the previous paint left there. The
+    ///   parking spec below is a different `PreviewScene`, which selects both a
+    ///   different row count and a different source string — three of the hashed
+    ///   inputs — and the returned fingerprint is asserted against the one this
+    ///   paint actually resolves to, so a memo hit cannot pass unnoticed.
+    /// * the retained frame is keyed on `prepared_font.snapshot.ready_epoch`
+    ///   among the rest. That epoch is an identity token: it reaches no
+    ///   primitive and no renderer setting — only `paint_fingerprint` and the
+    ///   two raster memo keys — so moving it cannot change a pixel, but it does
+    ///   force `cached_specimen_frame` to miss and the fork + `render_input` to
+    ///   run again against the same immutable renderer `Rc`. The nonce makes the
+    ///   key one this libtest worker has never retained, so a reused worker
+    ///   cannot serve one recomputed paint from another's entry.
+    fn pixels_recomputed(spec: SettingsPreviewSpec) -> Vec<u8> {
+        let parking_spec = if spec.scene == PreviewScene::Appearance {
+            SettingsPreviewSpec::cursor(CursorPreviewSpec::default())
+        } else {
+            SettingsPreviewSpec::appearance(14.0)
+        };
+        let (_, parked) = build_terminal_specimen_input(&parking_spec, Theme::default());
+
+        thread_local! {
+            static RECOMPUTE_NONCE: Cell<u64> = const { Cell::new(0) };
+        }
+        let prims = compiled_with_font(spec, |prepared| {
+            let nonce = RECOMPUTE_NONCE.with(|slot| {
+                let next = slot.get().wrapping_add(1);
+                slot.set(next);
+                next
+            });
+            prepared.snapshot.ready_epoch = prepared.snapshot.ready_epoch.wrapping_add(nonce);
+        })
+        .tray(Theme::default(), 13.0)
+        .prims;
+
+        let fingerprint = prims.iter().find_map(|primitive| match primitive {
+            DrawPrim::TerminalSpecimen { spec, .. } => Some(spec.input_fingerprint),
+            _ => None,
+        });
+        assert!(
+            fingerprint.is_some_and(|resolved| resolved != parked),
+            "the scene must paint a terminal specimen, and this paint must rebuild \
+             its own engine snapshot instead of inheriting the parked one"
+        );
+        raster_of(&prims)
     }
 
     fn differences(left: &[u8], right: &[u8]) -> usize {
@@ -3033,8 +3319,15 @@ mod tests {
             ..AppearancePreviewSpec::default()
         });
         let explicit_flip = explicit.clone().with_system_dark(true);
+        // The flipped paint recomputes: the two specs resolve to one theme, so
+        // a plain second paint would be served the first one's specimen frame
+        // (and its engine snapshot) and prove nothing about whether the OS side
+        // of Auto reached the specimen at all.
         assert_eq!(
-            differences(&pixels(explicit.clone()), &pixels(explicit_flip.clone())),
+            differences(
+                &pixels(explicit.clone()),
+                &pixels_recomputed(explicit_flip.clone())
+            ),
             0
         );
         assert_eq!(
@@ -3741,6 +4034,13 @@ mod tests {
     /// `set_chrome_fonts` seam this raced: a landing between two paints of
     /// one spec changed ~1,000 pixel bytes, failing four tests in parallel
     /// suite runs while every isolated run passed.)
+    ///
+    /// The second paint deliberately goes through [`pixels_recomputed`]: a
+    /// plain repeat paint now hits the specimen snapshot memo AND the retained
+    /// specimen frame, which would satisfy the assertion below for the whole
+    /// terminal specimen without re-deriving a single glyph. Only a paint that
+    /// misses both can witness a cascade swap — or any other nondeterminism in
+    /// a repeat render, such as lazily discovered fallback faces.
     #[test]
     fn fixture_semantic_font_is_settled_so_repeated_paints_are_identical() {
         let spec = SettingsPreviewSpec::appearance(14.0).with_phase(100);
@@ -3757,7 +4057,7 @@ mod tests {
             prepared.renderer_ready(),
             "the assertion must inspect the immutable renderer injected by compiled()"
         );
-        let after = pixels(spec);
+        let after = pixels_recomputed(spec);
         assert_eq!(
             differences(&before, &after),
             0,

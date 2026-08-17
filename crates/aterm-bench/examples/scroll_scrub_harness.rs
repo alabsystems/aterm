@@ -18,16 +18,16 @@
 // `xtask::perf::compare` throughput contract applies unchanged — jump-to-top is
 // a latency, so it is reported as jumps-per-second, not milliseconds):
 //   scrub     small-delta wheel scrub (3 lines/step, overlapping viewports) —
-//             the common interactive motion; the per-tier single-entry decode
-//             cache mostly HITS, so this measures the cache-warm scrub cost.
+//             the common interactive motion; the per-tier decode cache (two
+//             slots) mostly HITS, so this measures the cache-warm scrub cost.
 //   pageup    full-depth page sweep (one screen/step, NON-overlapping) — every
-//             step exposes a fresh screen, thrashing the single-entry tier
-//             caches into a real warm/cold decode per step. This is the
+//             step exposes a fresh screen, walking the tier caches off their
+//             cached blocks into a real warm/cold decode per step. This is the
 //             hold-PageUp worst case and the number THRU-5 must not regress.
 //   jump_top  bottom -> deep-history jumps, each landing on a DIFFERENT cold-tier
-//             page (the tiers cache only one decompressed page, so re-jumping to
-//             the same oldest page would measure cache hits, not decode) — the
-//             worst-case cold zstd/LZ4 decode fence.
+//             page (the tiers cache only the last two decompressed pages, so
+//             re-jumping to the same oldest page would measure cache hits, not
+//             decode) — the worst-case cold zstd/LZ4 decode fence.
 //
 // Rows MATERIALIZED (not raw lines) is the unit: the harness rebuilds each
 // visible history row through `materialize_scrollback_row_full`, the exact
@@ -167,12 +167,13 @@ const JUMP_STRIDE: usize = 137;
 /// Jump into deep history: `JUMP_REPS` bottom -> deep-page jumps, each landing on
 /// a DIFFERENT cold-tier page + a screen materialize. Returns the jump count.
 ///
-/// The warm/cold tiers cache exactly ONE decompressed block/page, so jumping to
-/// the SAME oldest page every rep would measure cache-HIT throughput, not the
-/// cold zstd/LZ4 decode this floor is meant to guard — a cold-decode regression
-/// could then pass the gate. Instead we sweep the jump target across the oldest
-/// region (stride > page size), so each rep evicts the prior page and pays a real
-/// cold decode. This keeps `jump_top_median_jps` a true worst-case-decode fence.
+/// The warm/cold tiers cache only the last TWO decompressed blocks/pages, so
+/// jumping to the SAME oldest page every rep would measure cache-HIT
+/// throughput, not the cold zstd/LZ4 decode this floor is meant to guard — a
+/// cold-decode regression could then pass the gate. Instead we sweep the jump
+/// target across the oldest region (stride > page size), so each rep enters a
+/// page no earlier rep cached and pays a real cold decode. This keeps
+/// `jump_top_median_jps` a true worst-case-decode fence.
 fn jump_top_pass(term: &mut Terminal) -> usize {
     let depth = term.grid().scrollback_lines();
     // Sweep the oldest `span` lines (all in the warm/cold tiers, past the 10k live

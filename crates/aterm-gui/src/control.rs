@@ -339,9 +339,17 @@ pub(crate) const fn native_control_decision(
 /// session capability that minted it. The authority verdict is the shipping
 /// [`native_control_decision`] classifier's existing App case, not a parallel
 /// control-only allowlist.
+///
+/// `text` is a THUNK, not a `String`: the guard below reads only verb/selector/
+/// front_has_terminal, so on the dominant terminal-front path the whole payload —
+/// up to `MAX_FEED_BIN` (256 KiB) for `paste-bin` — used to be UTF-8-scanned,
+/// heap-copied, and dropped unread before the caller re-derived it as a borrowed
+/// `Cow`. Deferring the materialization into the one arm that consumes it keeps
+/// the single guard as the only source of truth (no duplicated authority
+/// predicate at the two call sites) and is otherwise byte-for-byte identical.
 fn sessionless_front_paste_event(
     verb: &str,
-    text: String,
+    text: impl FnOnce() -> String,
     selector: Option<&Selector>,
     front_has_terminal: bool,
     principal: NativeControlPrincipal,
@@ -352,7 +360,7 @@ fn sessionless_front_paste_event(
     }
     Some(
         match native_control_decision(false, true, principal, NativeControlTarget::App) {
-            NativeControlDecision::WithoutSession => Ok(InputEvent::Paste(text)),
+            NativeControlDecision::WithoutSession => Ok(InputEvent::Paste(text())),
             NativeControlDecision::Denied => Err("ERR denied\n"),
             NativeControlDecision::ResolveSession
             | NativeControlDecision::NoActiveTerminal
@@ -2440,7 +2448,7 @@ fn dispatch_before_session(
     if verb == "paste"
         && let Some(route) = sessionless_front_paste_event(
             verb,
-            control_input::paste_text(rest),
+            || control_input::paste_text(rest),
             selector.as_ref(),
             resolve_active(active).is_some(),
             principal,
@@ -3457,10 +3465,12 @@ where
         } else {
             NativeControlPrincipal::Edge
         };
-        let text = String::from_utf8_lossy(&payload).into_owned();
+        // Lazy: only the native-front arm consumes it. With a terminal front (the
+        // ordinary case) the guard returns None and the payload is never scanned or
+        // copied here — the real path below re-derives it as a borrowed `Cow`.
         if let Some(route) = sessionless_front_paste_event(
             "paste",
-            text,
+            || String::from_utf8_lossy(&payload).into_owned(),
             selector.as_ref(),
             active_target.is_some(),
             principal,
@@ -6825,7 +6835,7 @@ mod tests {
     fn sessionless_front_paste_is_owner_bare_only_and_terminal_routing_is_unchanged() {
         let route = sessionless_front_paste_event(
             "paste",
-            "Paragraph".to_string(),
+            || "Paragraph".to_string(),
             None,
             false,
             NativeControlPrincipal::Owner,
@@ -6837,7 +6847,7 @@ mod tests {
         assert!(
             sessionless_front_paste_event(
                 "paste",
-                "terminal".to_string(),
+                || "terminal".to_string(),
                 None,
                 true,
                 NativeControlPrincipal::Owner,
@@ -6848,7 +6858,7 @@ mod tests {
         assert!(
             sessionless_front_paste_event(
                 "paste",
-                "explicit".to_string(),
+                || "explicit".to_string(),
                 Some(&Selector::Local(7)),
                 false,
                 NativeControlPrincipal::Owner,
@@ -6859,7 +6869,7 @@ mod tests {
         assert!(
             sessionless_front_paste_event(
                 "send",
-                "raw".to_string(),
+                || "raw".to_string(),
                 None,
                 false,
                 NativeControlPrincipal::Owner,
@@ -6870,7 +6880,7 @@ mod tests {
         assert_eq!(
             sessionless_front_paste_event(
                 "paste",
-                "denied".to_string(),
+                || "denied".to_string(),
                 None,
                 false,
                 NativeControlPrincipal::Edge,
@@ -6909,7 +6919,7 @@ mod tests {
         .unwrap();
         let search_paste = sessionless_front_paste_event(
             "paste",
-            "base".to_string(),
+            || "base".to_string(),
             None,
             false,
             NativeControlPrincipal::Owner,
@@ -6952,7 +6962,7 @@ mod tests {
         );
         let buffer_paste = sessionless_front_paste_event(
             "paste",
-            "Paragraph ".to_string(),
+            || "Paragraph ".to_string(),
             Some(&Selector::SelfTok),
             false,
             NativeControlPrincipal::Owner,
@@ -7990,6 +8000,15 @@ mod tests {
             escalated_op("meta", "unset icon"),
             Some(EOp(Op::WriteInput))
         );
+        // The typed role/attention keys ride the same write escalation.
+        assert_eq!(
+            escalated_op("meta", "set role operator"),
+            Some(EOp(Op::WriteInput))
+        );
+        assert_eq!(
+            escalated_op("meta", "unset attention"),
+            Some(EOp(Op::WriteInput))
+        );
         assert_eq!(escalated_op("meta", ""), None);
         assert_eq!(escalated_op("timeline", "10 since=3"), None);
 
@@ -8899,25 +8918,10 @@ mod tests {
         );
     }
 
-    /// Decode the percent-encoding `pct_encode` produces (test helper).
+    /// Decode the percent-encoding `pct_encode` produces (the shared wire
+    /// decoder — promoted beside the encoder so the pair cannot drift).
     fn pct_decode(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(hi), Some(lo)) = (hi, lo) {
-                    out.push((hi * 16 + lo) as u8);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        String::from_utf8(out).expect("valid utf8")
+        aterm_control::wire::pct_decode(s)
     }
 
     /// SEARCH-1: a term scrolled OFF the visible screen into scrollback is still
@@ -9378,6 +9382,8 @@ mod tests {
         assert!(read0.contains(" user_title=- "), "unset reads -: {read0}");
         assert!(read0.contains(" description=- "), "unset reads -: {read0}");
         assert!(read0.contains(" icon=- "), "unset reads -: {read0}");
+        assert!(read0.contains(" role=- "), "unset reads -: {read0}");
+        assert!(read0.contains(" attention=- "), "unset reads -: {read0}");
         assert!(read0.trim_end().ends_with(" state=alive"), "{read0}");
         assert!(
             cmd_sessions(&h.ctx, &store)
@@ -9434,6 +9440,33 @@ mod tests {
             "user metadata present -> meta=1"
         );
 
+        // The typed role/attention keys ride the same set/read/unset cycle.
+        let (_, c3) = cmd_meta(&h.term, &store, 0, &h.ctx, "set role operator");
+        let (_, c4) = cmd_meta(
+            &h.term,
+            &store,
+            0,
+            &h.ctx,
+            "set attention needs human: approval box",
+        );
+        assert!(c3 && c4);
+        let (read_typed, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+        assert!(read_typed.contains(&format!(" role={} ", pct_encode("operator"))));
+        assert!(read_typed.contains(&format!(
+            " attention={} ",
+            pct_encode("needs human: approval box")
+        )));
+        // A STORED "-" is not the unset sentinel: it reads back escaped.
+        let (_, dash) = cmd_meta(&h.term, &store, 0, &h.ctx, "set role -");
+        assert!(dash);
+        let (read_dash, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+        assert!(read_dash.contains(" role=%2D "), "{read_dash}");
+        let (_, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "set role operator");
+        let (_, cleared) = cmd_meta(&h.term, &store, 0, &h.ctx, "unset attention");
+        assert!(cleared);
+        let (read_cleared, _) = cmd_meta(&h.term, &store, 0, &h.ctx, "");
+        assert!(read_cleared.contains(" attention=- "), "{read_cleared}");
+
         // Unset clears back to '-' (labels fall back down the chain); a second
         // unset of the same field is a no-change.
         let (r, changed) = cmd_meta(&h.term, &store, 0, &h.ctx, "unset title");
@@ -9456,8 +9489,9 @@ mod tests {
     }
 
     /// SESSION-METADATA stage 1 — the byte caps are HARD refusals (never a silent
-    /// truncation): title > 120B, description > 1024B, icon > 64B each answer an
-    /// `ERR … too long` naming the cap, and the stored value is untouched.
+    /// truncation): title > 120B, description > 1024B, icon > 64B, role > 64B,
+    /// attention > 256B each answer an `ERR … too long` naming the cap, and the
+    /// stored value is untouched.
     #[test]
     fn meta_caps_reject_over_cap_values() {
         let store = session_store::new_store();
@@ -9490,6 +9524,22 @@ mod tests {
             &format!("set icon {}", over(64)),
         );
         assert_eq!(r, "ERR icon too long (max 64 bytes)\n");
+        let (r, _) = cmd_meta(
+            &h.term,
+            &store,
+            0,
+            &h.ctx,
+            &format!("set role {}", over(64)),
+        );
+        assert_eq!(r, "ERR role too long (max 64 bytes)\n");
+        let (r, _) = cmd_meta(
+            &h.term,
+            &store,
+            0,
+            &h.ctx,
+            &format!("set attention {}", over(256)),
+        );
+        assert_eq!(r, "ERR attention too long (max 256 bytes)\n");
         // Nothing was stored by any refused write.
         assert!(!h.ctx.meta.lock().unwrap().any_set());
         // AT-cap values are accepted (the cap is inclusive, after trim).

@@ -2986,6 +2986,105 @@ mod native_damage_tests {
         );
     }
 
+    /// The mixed route's fp/geom reuse gate must never serve a composite the
+    /// leaf loop abandoned half-built. A leaf that takes a REGIONAL patch moves
+    /// neither `fp` nor `geom` and spends its `native_damage` on the spot, so if
+    /// a LATER leaf bails the frame the resident card keeps pre-patch pixels
+    /// that no later frame would ever notice — it would be presented until some
+    /// unrelated input moved. The bail must therefore drop the card.
+    #[test]
+    fn heterogeneous_bail_after_a_leaf_rasters_drops_the_reusable_card() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let (_, native_view) = app.active_native_view(wid).expect("native Settings view");
+        let (session, terminal_view) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let order: Vec<_> = app
+            .active_visible_leaf_plan(wid)
+            .expect("mixed visible plan")
+            .leaves
+            .iter()
+            .map(|leaf| leaf.view)
+            .collect();
+        assert_eq!(
+            order,
+            vec![native_view, terminal_view],
+            "the native leaf must compose BEFORE the terminal one, or the bail \
+             precedes every raster and this regression cannot be reproduced"
+        );
+
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let resident = app.windows[&wid]
+            .settings_card
+            .as_ref()
+            .expect("mixed native tray");
+        let (fp, geom) = (resident.fp, resident.geom);
+        // Stand-in for "the leaf's PRE-patch pixels": bytes that the rebuilt
+        // composite provably cannot contain, so a reused card is visible here.
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .settings_card
+            .as_mut()
+            .unwrap()
+            .rgba
+            .fill(0xFF);
+
+        // A regional patch of an otherwise identical stamp — the one shape whose
+        // new pixels `fp` cannot see — followed by a sibling that transiently
+        // disappears from the pool. Its VIEW still resolves, so the route stays
+        // heterogeneous and the loop reaches (and bails on) the missing session.
+        app.invalidate_native_view_cache(
+            wid,
+            native_view,
+            crate::native_app::DamageRegion::Rect {
+                x: 7,
+                y: 11,
+                width: 19,
+                height: 23,
+            },
+        );
+        let pooled = app
+            .pool
+            .sessions
+            .remove(&session)
+            .expect("stub session is pooled");
+        assert!(
+            app.prepare_heterogeneous_input_scratch(wid).is_none(),
+            "a missing session abandons the mixed frame"
+        );
+        let patched = app.windows[&wid].leaf_render_cache[&native_view]
+            .native
+            .as_ref()
+            .expect("retained native leaf raster");
+        assert!(
+            matches!(patched.last_work, crate::NativeRasterWork::Region { .. }),
+            "the native leaf really did re-raster before the sibling bailed"
+        );
+        assert!(
+            app.windows[&wid].settings_card.is_none(),
+            "a bail after a leaf rastered must leave no card for the reuse gate to serve"
+        );
+
+        app.pool.sessions.insert(session, pooled);
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        let rebuilt = app.windows[&wid]
+            .settings_card
+            .as_ref()
+            .expect("the abandoned composite is rebuilt on the next frame");
+        assert_eq!(
+            (rebuilt.fp, rebuilt.geom),
+            (fp, geom),
+            "the patch moved neither gate input — this is exactly the frame the \
+             reuse gate would have served from the resident card"
+        );
+        assert!(
+            rebuilt.rgba.iter().any(|&byte| byte != 0xFF),
+            "the abandoned frame's composite must not survive into the next one"
+        );
+    }
+
     /// A mixed native/terminal split has one focused metadata authority. OSC 12
     /// and absolute-row anchors follow a focused terminal's exact extracted
     /// snapshot, while focusing the native sibling returns those terminal-only
@@ -7233,6 +7332,38 @@ pub(crate) struct TerminalCaptureGrid {
     pub(crate) leaves: Vec<TerminalCaptureLeaf>,
 }
 
+/// Straight-alpha source-over of ONE 4-byte RGBA pixel. Split out so the
+/// row-at-a-time fast path and the bounds-checked per-pixel tail below share a
+/// single blend — the two walks cannot drift apart pixel-wise.
+#[inline]
+fn blend_rgba_pixel_over(destination: &mut [u8], source: &[u8]) {
+    debug_assert_eq!(destination.len(), 4);
+    debug_assert_eq!(source.len(), 4);
+    let sa = u32::from(source[3]);
+    // An OPAQUE source is EXACTLY a copy, not an approximation: with `sa == 255`
+    // the alpha is `255 + (da * 0 + 127) / 255 == 255`, the destination term is
+    // `dst * da * 0 / 255 == 0`, and `(src * 255) / 255 == src`. So this branch
+    // is bit-identical to the general blend below while skipping 7 divisions —
+    // and a native leaf raster is opaque over almost its whole area.
+    if sa == 255 {
+        destination.copy_from_slice(source);
+        return;
+    }
+    let da = u32::from(destination[3]);
+    let out_a = sa + (da * (255 - sa) + 127) / 255;
+    if out_a == 0 {
+        destination.fill(0);
+        return;
+    }
+    for channel in 0..3 {
+        let source_premultiplied = u32::from(source[channel]) * sa;
+        let destination_premultiplied = u32::from(destination[channel]) * da * (255 - sa) / 255;
+        destination[channel] =
+            ((source_premultiplied + destination_premultiplied) / out_a).min(255) as u8;
+    }
+    destination[3] = out_a.min(255) as u8;
+}
+
 /// Straight-alpha source-over blit for a native leaf raster into the one
 /// window-owned tray texture. Bounds checks make a stale/rounded leaf harmless;
 /// the geometry plan remains the authority for where pixels and hits land.
@@ -7246,8 +7377,33 @@ fn blit_rgba_over(
     let (dst_width, dst_height) = dst_size;
     let (src_width, src_height) = src_size;
     let (x, y) = origin;
+    let span = src_width.min(dst_width.saturating_sub(x));
     for sy in 0..src_height.min(dst_height.saturating_sub(y)) {
-        for sx in 0..src_width.min(dst_width.saturating_sub(x)) {
+        // Row-at-a-time when BOTH row ranges are wholly in bounds: the union of
+        // the per-pixel ranges below IS this row range, so the row `get`
+        // succeeds exactly when every pixel `get` in the row would have, and
+        // the pixels/order are unchanged — only the bounds checks collapse from
+        // two per pixel to two per row. A short or ragged buffer falls through
+        // to the per-pixel walk, whose "blit the valid prefix, then abort the
+        // whole blit" shape is preserved verbatim.
+        let src_row = (sy as usize) * (src_width as usize) * 4;
+        let dst_row = ((y + sy) as usize * dst_width as usize + x as usize) * 4;
+        let len = span as usize * 4;
+        if let (Some(source_row), Some(destination_row)) = (
+            src.get(src_row..src_row.saturating_add(len)),
+            dst.get_mut(dst_row..dst_row.saturating_add(len)),
+        ) {
+            for (destination, source) in destination_row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source_row.as_chunks::<4>().0)
+            {
+                blend_rgba_pixel_over(destination, source);
+            }
+            continue;
+        }
+        for sx in 0..span {
             let si = ((sy * src_width + sx) * 4) as usize;
             let di = (((y + sy) * dst_width + x + sx) * 4) as usize;
             let Some(source) = src.get(si..si + 4) else {
@@ -7256,21 +7412,7 @@ fn blit_rgba_over(
             let Some(destination) = dst.get_mut(di..di + 4) else {
                 return;
             };
-            let sa = u32::from(source[3]);
-            let da = u32::from(destination[3]);
-            let out_a = sa + (da * (255 - sa) + 127) / 255;
-            if out_a == 0 {
-                destination.fill(0);
-                continue;
-            }
-            for channel in 0..3 {
-                let source_premultiplied = u32::from(source[channel]) * sa;
-                let destination_premultiplied =
-                    u32::from(destination[channel]) * da * (255 - sa) / 255;
-                destination[channel] =
-                    ((source_premultiplied + destination_premultiplied) / out_a).min(255) as u8;
-            }
-            destination[3] = out_a.min(255) as u8;
+            blend_rgba_pixel_over(destination, source);
         }
     }
 }
@@ -9082,6 +9224,178 @@ impl App {
         let block = term.current_block().or_else(|| term.all_blocks().last());
         let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
         slot.resolve(block).map(|identity| identity.look)
+    }
+
+    /// THE PET LABEL's identity half (owner ask, 2026-08-15: hover shows "the
+    /// program it corresponds to and the kitty's name"): the focused pane's
+    /// resolved `(program, kitty name)` — [`crate::app_kitty::AppIdentity`]'s
+    /// canonical id and its deterministic name, through the SAME cache the
+    /// breed resolve uses (one Terminal lock + the `app_kitty` leaf mutex,
+    /// lock order term → app_kitty).
+    ///
+    /// THE HONESTY DECISION (review, 2026-08-16): the label identifies the
+    /// kitty ON GLASS, and the glass is allowed to disagree with the pane —
+    /// the verdict ([`crate::app_kitty::companion_precedence`]) can dress a
+    /// favourite/discovery/session cat over the app's, and even the app's
+    /// own pair lands only through the brain's debounced handoff
+    /// (`kitty_pet::sync_look` parks a changed pair for seconds, longer on a
+    /// sleeper). So:
+    ///
+    ///   * the PROGRAM half describes the PANE and is always shown: the
+    ///     resolved app id, degrading to `"shell"` only when the pane has no
+    ///     shell block at all (no integration, native focus, an unknown
+    ///     session — a resting pane is a shell in every practical sense);
+    ///   * the NAME half is claimed ONLY while the cat on glass IS that
+    ///     identity's kitty — the verdict equals the identity's look AND the
+    ///     brain's worn pair has landed on it (`""` = suppressed; the card
+    ///     renders program-only) — so hover can never read
+    ///     "claude — Clementine" over a cat that is visibly not Clementine;
+    ///   * `None` — no label at all — when a block EXISTS but claims nothing
+    ///     (an Executing block with no commandline, an unknown future
+    ///     state): "shell" would be a lie while an unknown command runs,
+    ///     exactly the resolve rung's own no-claim doctrine.
+    ///
+    /// Resolved only at hover time (never per frame), so the one `String`
+    /// clone and the verdict recompute are free in practice.
+    pub(crate) fn pet_label_identity(
+        &mut self,
+        wid: WindowId,
+        session: Option<u64>,
+    ) -> Option<(String, &'static str)> {
+        let Some(session) = session else {
+            // Native focus: the pet is never drawn there, but stay total —
+            // the shell program with the name suppressed (no cat resolved
+            // means no cat to name).
+            return Some(("shell".to_owned(), ""));
+        };
+        // The pane's claim, gathered under the term → app_kitty locks and
+        // released before the verdict recompute borrows the log.
+        let resolved = self.pool.get(session).map(|s| {
+            let term = term_lock(&s.term);
+            let block = term.current_block().or_else(|| term.all_blocks().last());
+            let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
+            (block.is_some(), slot.resolve(block).cloned())
+        });
+        let (program, name, app_rung, identity_look) = match resolved {
+            // A block that claims nothing: silence, not a plausible lie.
+            Some((true, None)) => return None,
+            Some((_, Some(identity))) => {
+                let look = identity.look;
+                (identity.id, identity.name, Some(look), look)
+            }
+            // No block at all (or an unknown session): the shell fallback.
+            Some((false, None)) | None => (
+                "shell".to_owned(),
+                aterm_effects::kitty_registry::kitty_name("shell"),
+                None,
+                aterm_effects::kitty_registry::KittyLook::for_app("shell"),
+            ),
+        };
+        // THE NAME GATE: exactly the inputs the glass wears — the one
+        // precedence law plus the brain's worn pair, so the name half can
+        // never outrun (or outrank) the cat actually drawn.
+        let (favourite, discovery) = self.kitty_log.companion_looks();
+        let verdict =
+            crate::app_kitty::companion_precedence(favourite, app_rung, discovery, session);
+        let worn = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.cursor_pet.worn_look());
+        let dressed = verdict == identity_look
+            && worn == Some((identity_look.coat, identity_look.iris));
+        Some((program, if dressed { name } else { "" }))
+    }
+
+    /// THE PET HOVER PROBE: when the pointer's last position sits on the
+    /// pet's live drawn body (the stashed `pet_hit_rect`, padded by the
+    /// petting seam's own slop), the label's anchor in TRAY px —
+    /// `(x_center, y_top_of_the_pet)`, the RobiTip anchor convention. The
+    /// tray conversion is `notice_click`'s inverse of `splice_notice`'s
+    /// `dx = pad + x0` / `dy = pad_top + head + y0`, so the card lands where
+    /// the click test and the painter already agree it is. `None` when not
+    /// hovered, the pet is not on glass, or the pointer is not inside the
+    /// window at all (`pointer_in_window`, the `CursorLeft` staleness gate:
+    /// `last_cursor_px` freezes when the pointer leaves, and geometry alone
+    /// cannot tell "holding still over the cat" from "left across the cat").
+    /// Re-derived per drawn frame, so a pet that walks out from under a still
+    /// pointer drops the label.
+    pub(crate) fn pet_hover_anchor(&self, wid: WindowId) -> Option<(f32, f32)> {
+        let ws = self.windows.get(&wid)?;
+        if !ws.pointer_in_window {
+            return None;
+        }
+        let rect = ws.pet_hit_rect?;
+        let (px, py) = ws.last_cursor_px;
+        let (fx, fy) = self.window_to_frame(wid, px, py);
+        if !crate::app_mouse::pet_rect_hit(rect, fx, fy, crate::app_mouse::PET_HIT_SLOP_PX) {
+            return None;
+        }
+        let pad = self.win_pad(wid) as f32;
+        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
+        let (x0, x1, y0, _) = rect;
+        Some(((x0 + x1) as f32 * 0.5 - pad, y0 as f32 - top))
+    }
+
+    /// THE PET LABEL's lifecycle drain, run by `redraw_window` just before
+    /// `splice_notice` on BOTH terminal routes (the branch merges before the
+    /// drain, so splits are covered — the pet, unlike Robi, is not
+    /// single-pane-only). Re-verifies the hover against THIS frame's stashed
+    /// body (through [`Self::pet_hover_anchor`], whose `pointer_in_window`
+    /// gate keeps a `CursorLeft` dismissal from being resurrected by the very
+    /// redraw it schedules), keeps the per-window latch honest, and drives
+    /// the App-global notice slot:
+    ///
+    ///   * hovered ⇒ post `NoticeKind::PetLabel` into a FREE slot (expired,
+    ///     a Robi tip — the user's pointing gesture outranks an ambient tip
+    ///     — or an existing label; an UPDATE notice is never clobbered),
+    ///     re-anchor it over the pet, `hold_open` it past its TTL, and
+    ///     replace it if the identity under the pointer changed;
+    ///   * not hovered ⇒ retire the label this window owns (mouse-out).
+    ///
+    /// No dwell, deliberately: no hover surface in this app has one, and the
+    /// card's own 220 ms entrance ramp already keeps a drive-by pointer from
+    /// flashing a fully-opaque card.
+    pub(crate) fn drain_pet_hover_label(&mut self, wid: WindowId) {
+        let hover = self.pet_hover_anchor(wid);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.pet_hovered = hover.is_some();
+        }
+        let Some(anchor) = hover else {
+            self.clear_pet_label(wid);
+            return;
+        };
+        let now = std::time::Instant::now();
+        let session = self.focused_session_id(wid);
+        let Some((program, name)) = self.pet_label_identity(wid, session) else {
+            // The pane claims nothing nameable (an Executing block with no
+            // commandline): no card, and any label this window still owns
+            // retires. The hover latch above stays honest, so the moment a
+            // claim appears (a late OSC 633;E) the next drawn frame posts it.
+            self.clear_pet_label(wid);
+            return;
+        };
+        match self.notice.as_mut() {
+            Some(n) if n.is_pet_label() => {
+                if n.pet_label_matches(&program, name) {
+                    n.set_anchor(Some(anchor));
+                    n.hold_open(now);
+                } else {
+                    // The identity under the pointer changed (the app
+                    // flipped mid-hover): a fresh card, fresh entrance.
+                    *n = crate::notice::TransientNotice::pet_label(
+                        program, name, wid, anchor, now,
+                    );
+                }
+            }
+            Some(n) if !n.is_expired(now) && !n.is_robi_tip() => {
+                // An update notice owns the slot; the label waits its turn.
+            }
+            _ => {
+                self.notice = Some(crate::notice::TransientNotice::pet_label(
+                    program, name, wid, anchor, now,
+                ));
+            }
+        }
     }
 
     /// THE ONE COMPANION VERDICT (gauntlet F3 hardening): every surface that
@@ -11087,7 +11401,14 @@ impl App {
             .ok()?
             .checked_mul(usize::try_from(height).ok()?)?
             .checked_mul(4)?;
-        let mut native_layer = vec![0u8; byte_len];
+        // The full-window RGBA layer is NOT allocated here: the per-leaf blits
+        // are recorded and replayed only if the fp/geom gate below decides this
+        // frame's composite differs from the resident card (mirroring the
+        // single-native `should_raster` gate in `prepare_native_input_scratch`).
+        // Everything else in the leaf loop — snapshots, damage, rasters, tray
+        // primitives, fingerprint folding — still runs unconditionally.
+        let mut pending_blits: Vec<(crate::tab_model::ViewId, u32, u32)> = Vec::new();
+        let mut any_leaf_rasterized = false;
         let mut modal_native_prims = Vec::new();
         let mut native_fp = std::collections::hash_map::DefaultHasher::new();
         let mut title = "aterm".to_string();
@@ -11115,17 +11436,39 @@ impl App {
             window.input_scratch.selection = aterm_core::selection::TextSelection::new();
         }
 
+        // A `?` INSIDE this loop would abandon the frame after an earlier leaf
+        // already re-rastered — and `retain_native_leaf_raster` has by then
+        // consumed that leaf's `native_damage` and re-inserted its cache. The
+        // resident card would still hold the leaf's PRE-patch pixels, yet the
+        // next frame re-rasters nothing (the damage is spent), so
+        // `any_leaf_rasterized` is false and `fp`/`geom` still match — a
+        // regional patch moves neither — and the reuse gate below would serve
+        // that stale composite for as long as no unrelated input moves. So a
+        // mid-loop bail leaves through this flag instead, and the handler after
+        // the loop drops a card the abandoned frame has already made stale. One
+        // rebuilt frame costs nothing; a permanently stale composite is a bug.
+        let mut abandoned = false;
         for leaf in &plan.leaves {
-            match self.view_store.get(leaf.view).copied()? {
+            let Some(view) = self.view_store.get(leaf.view).copied() else {
+                abandoned = true;
+                break;
+            };
+            match view {
                 crate::tab_model::View::Terminal(terminal_view) => {
-                    let session = self.pool.get(terminal_view.session)?;
+                    let Some(session) = self.pool.get(terminal_view.session) else {
+                        abandoned = true;
+                        break;
+                    };
                     let term = session.term.clone();
-                    let mut cache = self
-                        .windows
-                        .get_mut(&id)?
-                        .leaf_render_cache
-                        .remove(&leaf.view)
-                        .unwrap_or_default();
+                    let Some(mut cache) = self.windows.get_mut(&id).map(|window| {
+                        window
+                            .leaf_render_cache
+                            .remove(&leaf.view)
+                            .unwrap_or_default()
+                    }) else {
+                        abandoned = true;
+                        break;
+                    };
                     let sub_rows = (leaf.rect.size.height.round() as usize).max(1);
                     let sub_cols = (leaf.rect.size.width.round() as usize).max(1);
                     if leaf.focused {
@@ -11134,7 +11477,13 @@ impl App {
                     let capture_cursor_fx_sample = leaf.focused
                         && matches!(cursor_fx, Some(ComposedCursorFxClock::Advance(_)));
                     let row_probe = if capture_cursor_fx_sample {
-                        std::mem::take(&mut self.windows.get_mut(&id)?.poof_row_buf)
+                        match self.windows.get_mut(&id) {
+                            Some(window) => std::mem::take(&mut window.poof_row_buf),
+                            None => {
+                                abandoned = true;
+                                break;
+                            }
+                        }
                     } else {
                         Vec::new()
                     };
@@ -11224,28 +11573,35 @@ impl App {
                         leaf_width as f32 / scale,
                         leaf_height as f32 / scale,
                     );
-                    let stamp = self
-                        .native_ui_compile_stamp_for(id, native.instance, leaf.view, viewport)
-                        .ok()?;
+                    let Ok(stamp) =
+                        self.native_ui_compile_stamp_for(id, native.instance, leaf.view, viewport)
+                    else {
+                        abandoned = true;
+                        break;
+                    };
                     stamp.hash(&mut native_fp);
-                    let mut cache = self
-                        .windows
-                        .get_mut(&id)?
-                        .leaf_render_cache
-                        .remove(&leaf.view)
-                        .unwrap_or_default();
+                    let Some(mut cache) = self.windows.get_mut(&id).map(|window| {
+                        window
+                            .leaf_render_cache
+                            .remove(&leaf.view)
+                            .unwrap_or_default()
+                    }) else {
+                        abandoned = true;
+                        break;
+                    };
                     if let Some(damage) =
                         pending_native_leaf_damage(&cache, stamp, leaf_width, leaf_height)
                     {
-                        let scene = self
-                            .build_native_leaf_scene(
-                                id,
-                                native.instance,
-                                leaf.view,
-                                viewport,
-                                damage,
-                            )
-                            .ok()?;
+                        let Ok(scene) = self.build_native_leaf_scene(
+                            id,
+                            native.instance,
+                            leaf.view,
+                            viewport,
+                            damage,
+                        ) else {
+                            abandoned = true;
+                            break;
+                        };
                         debug_assert_eq!(scene.stamp, stamp);
                         debug_assert_eq!(scene.instance, native.instance);
                         debug_assert_eq!(scene.view, leaf.view);
@@ -11259,6 +11615,12 @@ impl App {
                             scale,
                             self.theme,
                         );
+                        // A leaf that re-rastered (including a REGIONAL patch of
+                        // an otherwise identical stamp) has new pixels the
+                        // fingerprint cannot see, so the composite below must not
+                        // be reused. Same term as `leaf_rasterized` in
+                        // `prepare_native_input_scratch`'s `should_raster`.
+                        any_leaf_rasterized = true;
                     }
                     let x = (leaf.rect.origin.x * cw as f32).round().max(0.0) as u32;
                     let y = (leaf.rect.origin.y * ch as f32).round().max(0.0) as u32;
@@ -11269,15 +11631,14 @@ impl App {
                         raster.presented_x = x;
                         raster.presented_y = y;
                     }
-                    let raster = cache.native.as_ref()?;
+                    let Some(raster) = cache.native.as_ref() else {
+                        abandoned = true;
+                        break;
+                    };
                     raster.compiled.fingerprint().hash(&mut native_fp);
-                    blit_rgba_over(
-                        &mut native_layer,
-                        (width, height),
-                        &raster.rgba,
-                        (raster.width, raster.height),
-                        (x, y),
-                    );
+                    // Record where this leaf lands; the blit itself is replayed
+                    // below only when the gate says the layer must be rebuilt.
+                    pending_blits.push((leaf.view, x, y));
                     if overlay_open {
                         let logical_x = x as f32 / scale;
                         let logical_y = y as f32 / scale;
@@ -11306,23 +11667,31 @@ impl App {
                 }
             }
         }
+        if abandoned {
+            // This frame composes nothing (the caller drops it), so the only
+            // question is what the NEXT frame may reuse. Any leaf that already
+            // re-rastered has spent its damage into a cache the card below never
+            // read, so the resident card's pixels are now a lie no fingerprint
+            // can detect — drop it and force the next frame to rebuild. When no
+            // leaf rastered, every cache is byte-identical to the composite the
+            // card was built from, so the card stays valid and is kept.
+            if any_leaf_rasterized
+                && let Some(window) = self.windows.get_mut(&id)
+            {
+                window.settings_card = None;
+            }
+            return None;
+        }
 
         overlay_fp.hash(&mut native_fp);
-        if overlay_open {
-            // Re-lower the visible native leaves and append the modal as the
-            // final primitives in one full-window tray. This is the same
-            // linear-light ordering as a single native tab, while transparent
-            // terminal lanes remain visible below the modal card.
-            let appended = self.append_native_modal_prims(id, &mut modal_native_prims, 0.0);
-            debug_assert!(appended, "an open overlay must provide modal primitives");
-            native_layer = crate::tray_raster::rasterize_tray_pixels(
-                &modal_native_prims,
-                width,
-                height,
-                scale,
-                [0, 0, 0, 0],
-            );
-        }
+
+        // The card's PLACEMENT is a gate input, not just an output: `dx`/`dy`
+        // are stamped into the card below, and unlike the single-native `geom`
+        // this one hashes no padding terms. Fold them in so a head/tab-strip/pad
+        // change that leaves the grid dimensions untouched still rebuilds the
+        // card instead of presenting the resident pixels at a stale offset.
+        let card_dx = u32::try_from(self.win_pad(id)).unwrap_or(u32::MAX);
+        let card_dy = u32::try_from(self.native_content_origin_y(id)).unwrap_or(u32::MAX);
 
         let mut geometry = std::collections::hash_map::DefaultHasher::new();
         width.hash(&mut geometry);
@@ -11330,6 +11699,8 @@ impl App {
         cw.hash(&mut geometry);
         ch.hash(&mut geometry);
         scale.to_bits().hash(&mut geometry);
+        card_dx.hash(&mut geometry);
+        card_dy.hash(&mut geometry);
         for leaf in &plan.leaves {
             leaf.view.hash(&mut geometry);
             leaf.rect.origin.x.to_bits().hash(&mut geometry);
@@ -11340,21 +11711,99 @@ impl App {
         let geom = geometry.finish();
         let fp = native_fp.finish() | 1;
         let tab_strip = self.redraw_tab_strip_state(id);
-        let card_dx = u32::try_from(self.win_pad(id)).unwrap_or(u32::MAX);
-        let card_dy = u32::try_from(self.native_content_origin_y(id)).unwrap_or(u32::MAX);
+        // Nothing the tray layer reads has moved: every leaf's compile stamp
+        // (which carries the theme/chrome paint revision), every compiled
+        // fingerprint, the overlay fingerprint and the full geometry are folded
+        // into `fp`/`geom`, and no leaf re-rastered. The resident card's pixels
+        // ARE this frame's composite, so skip the allocation, the zero fill and
+        // every per-pixel blend. This is the mixed-route twin of the
+        // `should_raster` gate in `prepare_native_input_scratch` and of
+        // `compose_native_route_card`'s own fp/geom early-out.
+        let reuse = !any_leaf_rasterized
+            && self.windows.get(&id).is_some_and(|window| {
+                window.settings_card.as_ref().is_some_and(|card| {
+                    card.fp == fp && card.geom == geom && card.pw == width && card.ph == height
+                })
+            });
+        let native_layer = if reuse {
+            None
+        } else if overlay_open {
+            // Re-lower the visible native leaves and append the modal as the
+            // final primitives in one full-window tray. This is the same
+            // linear-light ordering as a single native tab, while transparent
+            // terminal lanes remain visible below the modal card. It replaces the
+            // whole layer, so the recorded per-leaf blits are skipped outright —
+            // they were overwritten unread before this change.
+            let appended = self.append_native_modal_prims(id, &mut modal_native_prims, 0.0);
+            debug_assert!(appended, "an open overlay must provide modal primitives");
+            Some(crate::tray_raster::rasterize_tray_pixels(
+                &modal_native_prims,
+                width,
+                height,
+                scale,
+                [0, 0, 0, 0],
+            ))
+        } else {
+            // Recycle the previous frame's allocation instead of mapping a fresh
+            // multi-megabyte surface every frame: `resize` grows OR shrinks it to
+            // the exact byte length, and the zero fill is mandatory because the
+            // composite below is an over-blend, not an overwrite.
+            let mut layer = self
+                .windows
+                .get_mut(&id)
+                .and_then(|window| window.settings_card.take())
+                .map_or_else(Vec::new, |card| card.rgba);
+            layer.resize(byte_len, 0);
+            layer.fill(0);
+            if let Some(window) = self.windows.get(&id) {
+                for &(view, x, y) in &pending_blits {
+                    // Same rasters, same left-to-right plan order as the inline
+                    // blits they replace: each leaf's cache was re-inserted
+                    // untouched by later leaves, which own disjoint entries.
+                    let Some(raster) = window
+                        .leaf_render_cache
+                        .get(&view)
+                        .and_then(|cache| cache.native.as_ref())
+                    else {
+                        continue;
+                    };
+                    blit_rgba_over(
+                        &mut layer,
+                        (width, height),
+                        &raster.rgba,
+                        (raster.width, raster.height),
+                        (x, y),
+                    );
+                }
+            }
+            Some(layer)
+        };
+
         if let Some(window) = self.windows.get_mut(&id) {
             window
                 .leaf_render_cache
                 .retain(|view, _| visible.contains(view));
-            window.settings_card = Some(crate::SettingsCard {
-                rgba: native_layer,
-                pw: width,
-                ph: height,
-                dx: card_dx,
-                dy: card_dy,
-                fp,
-                geom,
-            });
+            match native_layer {
+                Some(rgba) => {
+                    window.settings_card = Some(crate::SettingsCard {
+                        rgba,
+                        pw: width,
+                        ph: height,
+                        dx: card_dx,
+                        dy: card_dy,
+                        fp,
+                        geom,
+                    });
+                }
+                // Reused: the gate proved every pixel input identical, so only
+                // re-stamp the placement (which `geom` now covers anyway).
+                None => {
+                    if let Some(card) = window.settings_card.as_mut() {
+                        card.dx = card_dx;
+                        card.dy = card_dy;
+                    }
+                }
+            }
             window.native_ui_compiled =
                 focused_compiled.map(|(stamp, compiled)| crate::app_native::NativeCompiledFrame {
                     stamp,
@@ -12061,6 +12510,39 @@ impl App {
             return;
         };
         self.prepare_layout_coordinate_space(id, route);
+        // ROBI's in-flight click-dismissal, settled before any route reads the
+        // gate: a completed lane reply (success or failure) must be consumed on
+        // the next frame wherever it lands, not only on the single-pane path.
+        self.poll_robi_dismissal();
+        // ROBI lives ONLY on the unsplit terminal path — his emitter and every
+        // `robi_hit_rect` stash/clear sit in the single-pane else-branch below.
+        // Every OTHER route (a composed split, a mixed terminal+native window,
+        // a native tab) draws no robot this frame, so the dismiss hit-box
+        // clears HERE: the field's law ("CLEARED on every frame he is not
+        // drawn", `WindowState::robi_hit_rect`) has to hold across a split
+        // too, or the stale invisible body would keep eating clicks — and
+        // writing `robi = false` — long after he left the glass.
+        if !matches!(
+            route,
+            crate::VisibleContentRoute::Terminal { composed: false }
+        ) && let Some(ws) = self.windows.get_mut(&id)
+        {
+            ws.robi_hit_rect = None;
+        }
+        // THE PET is drawn only on the terminal routes (single-pane AND
+        // composed). Every other route (a mixed terminal+native window, a
+        // native tab) draws no pet this frame, so its hit-box, its hover
+        // latch and its hover LABEL clear here — the same field law as
+        // `robi_hit_rect` above: stale per-frame stashes on an undrawn route
+        // eat input, and those routes never reach the label drain that would
+        // otherwise retire the card.
+        if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
+            if let Some(ws) = self.windows.get_mut(&id) {
+                ws.pet_hit_rect = None;
+                ws.pet_hovered = false;
+            }
+            self.clear_pet_label(id);
+        }
         let multi_pane = match route {
             crate::VisibleContentRoute::Terminal { composed } => {
                 if let Some(window) = self.windows.get_mut(&id) {
@@ -13549,16 +14031,20 @@ impl App {
             // focus gate (an unfocused window freezes him mid-pose, it never
             // hides him), no session gate (he walks whatever tab fronts), no
             // expiry. Only config-off, serious mode, a real reduced-motion
-            // verdict, load shed — or a click on his body (the dismiss latch,
-            // owner 2026-08-15: "it needs to be easily dismissable") — take
-            // him off the glass. The latch is per window and clears when he
-            // is called by name, so a dismissed Robi stays gone rather than
-            // being re-born by this very block on the next frame.
+            // verdict, load shed — or a click on his body (owner 2026-08-15:
+            // "it needs to be easily dismissable", a click that writes
+            // `robi = false` through the settings lane) — take him off the
+            // glass.
             let robi_on = !deco_suspend
                 && self.config.robi_or_default()
+                // A click-dismissal in flight retires him THIS frame, not at
+                // the durable completion: the latch is what makes the press's
+                // promise structural — no re-stash, no second write, no
+                // re-birth flash while `robi = false` rides the settings lane
+                // (`App::robi_press_at` / `App::poll_robi_dismissal`).
+                && self.robi_dismissal.is_none()
                 && robi_serious_allowed
-                && robi_motion_allowed
-                && !ws.robi_dismissed;
+                && robi_motion_allowed;
             if !robi_on && ws.robi_show.born() {
                 // Bypass-to-final-state (the matrix-rain rule): no robot, no
                 // leftover bubble state; he is re-born when the gate reopens.
@@ -13629,6 +14115,11 @@ impl App {
                     handhold_count: count as u8,
                 };
                 let mut robi_fp = 0u64;
+                // The hit-box is THIS frame's truth (the `pet_hit_rect`
+                // discipline): cleared before the evaluation so a frame that
+                // draws nothing — geometry not ready, a bake miss with no
+                // fallback — can never leave a stale body eating clicks.
+                ws.robi_hit_rect = None;
                 if let Some(frame) = ws.robi_show.frame(frame_started, &sense) {
                     // Post each tip once per tip window. The notice slot is
                     // App-global, so the request is drained OUTSIDE this
@@ -13651,23 +14142,6 @@ impl App {
                     };
                     let head_top = frame.anchor_y as f32 - body_h * anchor_frac;
                     ws.robi_bubble_anchor = Some((frame.x as f32, head_top + strip_px as f32));
-                    // His clickable body for the mouse path (the pet-stash
-                    // discipline: fresh every drawn frame, `None` clears).
-                    // The emitter's exact rect — centered on `frame.x`, top
-                    // of head down one body — lifted from tray px into FRAME
-                    // px: the tray origin sits at (pad, pad_top + head), the
-                    // inverse of `notice_click`'s frame→tray step.
-                    let body_w = (body_h * aterm_effects::robi::ART_ASPECT).round();
-                    let pad_px = ws.metrics.pad as f32;
-                    let tray_top = (pad_top_px + head_px) as f32;
-                    let x0 = pad_px + frame.x as f32 - body_w * 0.5;
-                    let y0 = tray_top + head_top + strip_px as f32;
-                    ws.robi_hit_rect = Some((
-                        x0 as i32,
-                        (x0 + body_w) as i32,
-                        y0 as i32,
-                        (y0 + body_h) as i32,
-                    ));
                     if let Some(emitted) = ws.word_decos.robi(
                         aterm_effects::word_decorations::RobiShowFrame {
                             geom: effect_geom,
@@ -13676,6 +14150,22 @@ impl App {
                         &mut ws.free_scratch,
                     ) {
                         robi_fp = emitted.rotate_left(13);
+                        // DISMISS-BY-CLICK hit-box, FRAME px: the emitter's
+                        // body law in ONE copy (`aterm_effects::robi::
+                        // body_px` — the same functions the emitter bakes
+                        // and places by, tested at the law) offset by the
+                        // effects origin (whose y is `pad_top + head +
+                        // strip_px`, the same pre-splice → frame conversion
+                        // the sprites take) through the pet seam's pure,
+                        // tested `pet_hit_rect_win`. One accepted transient:
+                        // a bake-miss frame re-draws `robi_last_body` at the
+                        // PREVIOUS size, so right after a resize the box can
+                        // be a whisker off — the mouse seam's slop absorbs
+                        // it.
+                        ws.robi_hit_rect = pet_hit_rect_win(
+                            aterm_effects::robi::body_px(&frame, &effect_geom),
+                            (i32::from(origin_x), i32::from(origin_y)),
+                        );
                     }
                     // One-present-ahead wakes ONLY while a scene is actually
                     // in motion (the dog's clockless rule): his static idle
@@ -14486,6 +14976,12 @@ impl App {
                 n.set_anchor(Some(a));
             }
         }
+        // THE PET'S HOVER LABEL: post/refresh/retire against THIS frame's
+        // stashed pet body — after the tick (the rect is this frame's truth),
+        // before the splice (so the card rasters this frame). Runs on BOTH
+        // terminal routes: the branch above already merged, and the pet —
+        // unlike Robi — lives on splits too.
+        self.drain_pet_hover_label(id);
         // Transient update notice — paint-only, its own slot, priority over the badge.
         self.splice_notice(id);
         // LEVEL-UP rising up-arrow — paint-only, its own slot, priority over the notice
@@ -14661,6 +15157,14 @@ impl App {
             return;
         };
         titles.truncate(ws.tab_set.len());
+        // One buffer reused by every tab in this refill: `presentation_value`
+        // allocated two `String`s per SET FIELD per TAB (the char-filter
+        // `collect` plus the trim's `to_string`), and this runs before the
+        // redraw early-out, i.e. on skipped frames too. The description is only
+        // ever BORROWED by the label compose below and never escapes one loop
+        // iteration, so one shared scratch is enough; the operator title needs
+        // none at all because it is written straight into its resident slot.
+        let mut authored_description = String::new();
         for (i, tab) in ws.tab_set.tabs().iter().enumerate() {
             if i >= titles.len() {
                 titles.push(String::new());
@@ -14684,17 +15188,20 @@ impl App {
                     // dropped before the term try-lock below; contended only by
                     // an actual `meta set`, so the per-frame cost is one
                     // uncontended lock. When it hits, the term lock is skipped.
-                    let (user_title, authored_description) = {
+                    //
+                    // The title lands DIRECTLY in the resident slot and the
+                    // description in the shared scratch: same guard scope, same
+                    // bytes, but none of `presentation_value`'s per-tab
+                    // allocations. An unset/empty field leaves its buffer
+                    // untouched — which is precisely what the WouldBlock
+                    // keep-stale path below relies on for `slot`.
+                    let (has_user_title, has_description) = {
                         let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-                        (
-                            meta.presentation_value("title"),
-                            meta.presentation_value("description"),
-                        )
+                        let described =
+                            meta.presentation_value_into("description", &mut authored_description);
+                        (meta.presentation_value_into("title", slot), described)
                     };
-                    if let Some(t) = user_title {
-                        slot.clear();
-                        slot.push_str(&t);
-                    } else {
+                    if !has_user_title {
                         // Poisoned ⇒ recover the guard exactly like `term_lock`;
                         // WouldBlock ⇒ keep the stale slot rather than waiting out a
                         // background tab's parser.
@@ -14741,7 +15248,7 @@ impl App {
                     // change composes (and allocates) once.
                     self.title_summaries.compose_label_into(
                         Some(view.session),
-                        authored_description.as_deref(),
+                        has_description.then_some(authored_description.as_str()),
                         self.config.tab_title_format_or_default(),
                         &self.config,
                         " · ",
@@ -15567,30 +16074,36 @@ impl App {
         const PRESENT_LATENCY_CAP_NS: u64 = 5_000_000_000;
         let now = self.lat_epoch.elapsed().as_nanos() as u64;
         let mut dt_max = 0u64;
-        let visible_views: std::collections::BTreeSet<_> = self
-            .active_visible_leaf_plan(wid)
-            .map(|plan| plan.leaves.into_iter().map(|leaf| leaf.view).collect())
-            .unwrap_or_default();
+        // Visible leaves are 1-4, so the plan's own linear `leaf()` lookup beats
+        // collecting a `BTreeSet` outright — and saves the set's allocation.
+        let plan = self.active_visible_leaf_plan(wid);
         for tab in ws.tab_set.tabs() {
-            for view in tab.root.leaves() {
-                let visible = visible_views.contains(&view);
+            // PERF: `visit` instead of `leaves()` — the latter heap-allocates a
+            // `Vec` per TAB (tab_model.rs:299-305 documents the rule), and this
+            // walk runs on every successful present of every route. Same
+            // left-to-right leaf order, so the `swap(0)` stamp consumption is
+            // unchanged; the three `continue`s become `return`s from the
+            // closure, which is the same control flow.
+            tab.root.visit(&mut |view| {
+                let view = *view;
+                let visible = plan.as_ref().is_some_and(|plan| plan.leaf(view).is_some());
                 let Some(sid) = self
                     .view_store
                     .get(view)
                     .copied()
                     .and_then(crate::tab_model::View::terminal_session)
                 else {
-                    continue;
+                    return;
                 };
                 let Some(sess) = self.pool.get(sid) else {
-                    continue;
+                    return;
                 };
                 if !visible && self.is_visible_session(sid) {
                     // SHARED (Cmd-Shift-O) session hidden HERE but app-rendered in
                     // another window's active tab: leave the stamp armed for
                     // THAT window's present to book — a swap here would
                     // silently destroy the showing window's measurement.
-                    continue;
+                    return;
                 }
                 let stamp = sess.last_output_ns.swap(0, Ordering::Relaxed);
                 if visible && stamp != 0 {
@@ -15599,7 +16112,7 @@ impl App {
                         dt_max = dt_max.max(dt);
                     }
                 }
-            }
+            });
         }
         if dt_max != 0 && self.trace_latency {
             eprintln!(
@@ -17885,9 +18398,21 @@ impl App {
             .inline_rename_edit(wid)
             .map(|edit| (edit.tab, edit.text.clone(), edit.cursor))
             .and_then(|(tab, text, cursor)| Some((self.tab_index_for_id(wid, tab)?, text, cursor)));
-        let cache_key = (tab_strip, cols, show_update, hovered, subtitle.clone());
+        // Field-by-field BORROWED compare instead of building an owned
+        // `StripCacheKey` up front: `==` on the tuple compares exactly these five
+        // terms in exactly this way, so the hit/miss decision is unchanged — but
+        // the HIT path (the whole point of the cache) no longer pays a
+        // `subtitle.clone()` on every presented frame. The key is materialized
+        // below, only on a miss, by MOVING `subtitle` into it.
         let hit = self.windows.get(&wid).is_some_and(|ws| {
-            ws.last_strip_fp.as_ref() == Some(&cache_key) && ws.cached_strip_rows.len() == strip
+            ws.cached_strip_rows.len() == strip
+                && ws.last_strip_fp.as_ref().is_some_and(|key| {
+                    key.0 == tab_strip
+                        && key.1 == cols
+                        && key.2 == show_update
+                        && key.3 == hovered
+                        && key.4 == subtitle
+                })
         });
         if !hit {
             // Rebuild: lay out the segments + paint the labels onto the LAST strip row
@@ -17955,7 +18480,7 @@ impl App {
                 ws.tab_segments = segments;
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
-                ws.last_strip_fp = Some(cache_key);
+                ws.last_strip_fp = Some((tab_strip, cols, show_update, hovered, subtitle));
                 ws.strip_titles_scratch = titles;
                 ws.strip_metadata_scratch = metadata;
             }

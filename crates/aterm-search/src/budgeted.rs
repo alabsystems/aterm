@@ -71,8 +71,11 @@ enum RowMatcher {
 /// [`SearchResults`] (partial until complete). See the module docs for the
 /// results-equality and staleness contracts.
 pub struct BudgetedSearch {
-    /// Incrementally built index over the rows fed so far. Also the source of
-    /// per-row column maps and (for literal mode) match verification.
+    /// Incrementally built COLUMNS-ONLY index over the rows fed so far: the
+    /// per-row cached `ColumnMap` every verifier reads, the line cache, and the
+    /// eviction schedule that fixes the retained watermark. It maintains no
+    /// trigram postings and no bloom filter, because this engine never queries
+    /// it — every row is verified directly (see `verify_row`).
     index: SearchIndex,
     /// The query string (verbatim; folding/compilation lives in `matcher`).
     query: String,
@@ -151,7 +154,16 @@ impl BudgetedSearch {
             0
         };
         Ok(Self {
-            index: SearchIndex::with_max_cached_lines(max_cached_lines),
+            // Columns-only: this engine reads back nothing but `column_maps`
+            // (`verify_row` deliberately bypasses the query pipeline), so the
+            // trigram postings and the bloom filter a full index maintains are
+            // dead weight here — and `rebuild_bloom`, which the default bloom
+            // reaches after a few thousand rows, is an O(all cached lines) sweep
+            // landing inside a turn the caller sized for a handful of rows. The
+            // line cache, the column maps and the eviction schedule (hence
+            // `lowest_retained_line`) are unchanged, so the results-equality
+            // contract with the one-shot path is untouched.
+            index: SearchIndex::columns_only_with_max_cached_lines(max_cached_lines),
             query: query.to_string(),
             matcher,
             matches: Vec::new(),
