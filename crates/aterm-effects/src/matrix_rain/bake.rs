@@ -103,6 +103,48 @@ impl RainBaker {
         true
     }
 
+    /// Whether a SELECTIVE re-bake is sound right now: a live cell metric and a
+    /// complete atlas, i.e. every tile currently holds exactly the texels a full
+    /// bake of the current master would produce for it. Before the first
+    /// geometry `complete()` is vacuously true (`cell_w == 0`) but there is no
+    /// buffer to patch, so that case is excluded here.
+    #[must_use]
+    pub fn can_rebake(&self) -> bool {
+        self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
+    }
+
+    /// Re-bake ONLY the tiles named by `mask` (bit `i` ⇒ tile `i`) into the
+    /// finished atlas. The tiles left alone keep the texels they already hold,
+    /// which are the texels a full bake would produce for them as long as their
+    /// master glyphs did not change — the caller owns that half of the
+    /// invariant by re-authoring precisely the slots it lists here. The
+    /// published atlas bytes are therefore identical to a `restart()` + full
+    /// bake of the same master.
+    ///
+    /// VERSION ACCOUNTING IS DELIBERATE. The version is folded into the engine's
+    /// frame fingerprint, which is a pinned byte-identity contract, so this path
+    /// advances it by exactly what the wholesale path advanced it by — one
+    /// restart plus one bump per progressive batch — even though it physically
+    /// bakes fewer tiles. Monotonic, still changes whenever the bytes change,
+    /// and the fingerprint sequence is unmoved.
+    pub fn rebake_tiles(&mut self, rom: &RomMaster, mask: u64) -> bool {
+        if !self.can_rebake() || mask == 0 {
+            return false;
+        }
+        let mut rest = mask;
+        while rest != 0 {
+            let tile = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if tile < ROM_GLYPHS {
+                self.bake_tile(rom, tile);
+            }
+        }
+        let wholesale = 1 + ROM_GLYPHS.div_ceil(MAX_RAIN_BAKES_PER_TICK) as u64;
+        self.version = self.version.wrapping_add(wholesale);
+        self.dirty = true;
+        true
+    }
+
     /// Monotonic atlas version (folded into the frame fingerprint).
     #[must_use]
     pub fn version(&self) -> u64 {

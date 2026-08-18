@@ -114,7 +114,22 @@ pub struct CatBaker {
     /// The last published snapshot; rebuilt only when `dirty` (≤ 2 bakes/frame
     /// transient — zero steady-state allocation).
     published: Option<Arc<SceneAtlas>>,
+    /// The snapshot published BEFORE [`CatBaker::published`], kept so the next
+    /// dirty publish can recycle its buffer instead of cloning the whole atlas
+    /// (see [`CatBaker::atlas`]). A consumer that keeps only the newest snapshot
+    /// (the renderer's `ensure_free_atlas` holds exactly one) has released this
+    /// one by the time it is reused, so `Arc::get_mut` succeeds; if anything is
+    /// still holding it the publish falls back to today's full clone. Invariant:
+    /// `spare.is_some()` implies `published.is_some()` (it is only ever filled
+    /// from `published`), so [`CatBaker::clear`]'s already-empty early-out stays
+    /// exact.
+    spare: Option<Arc<SceneAtlas>>,
     dirty: bool,
+    /// Per-slot write stamp: the `version` this slot's band in `rgba` was last
+    /// baked at, parallel to `slots`. A recycled snapshot carries the `version`
+    /// its bytes were synced at, so every band stamped ABOVE that is exactly the
+    /// set of bands that have changed since — the rest are already byte-equal.
+    slot_version: Vec<u64>,
     /// LRU clock, advanced once per tick by [`CatBaker::begin_frame`].
     clock: u64,
     bakes_left: u32,
@@ -148,6 +163,8 @@ impl CatBaker {
             let slots = Self::slot_count(cell_h);
             self.slots.clear();
             self.slots.resize_with(slots, || None);
+            self.slot_version.clear();
+            self.slot_version.resize(slots, 0);
             self.rgba.clear();
             // v2.9 (2-band head): each slot is `2·ch` rows tall.
             self.rgba.resize(
@@ -184,9 +201,11 @@ impl CatBaker {
         for s in &mut self.slots {
             *s = None;
         }
+        self.slot_version.fill(0);
         self.rgba.fill(0);
         self.version = self.version.wrapping_add(1);
         self.published = None;
+        self.spare = None;
         self.dirty = false;
     }
 
@@ -210,13 +229,60 @@ impl CatBaker {
     /// carry no atlas (byte-identical off).
     pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         if self.dirty {
-            self.published = Some(Arc::new(SceneAtlas {
-                width: u32::from(self.slot_w),
-                // v2.9 (2-band head): each slot band is `2·ch` rows tall.
-                height: (self.slots.len() * 2 * usize::from(self.cell_h)) as u32,
-                rgba: self.rgba.clone(),
-                version: self.version,
-            }));
+            let width = u32::from(self.slot_w);
+            // v2.9 (2-band head): each slot band is `2·ch` rows tall.
+            let height = (self.slots.len() * 2 * usize::from(self.cell_h)) as u32;
+            let band = 2 * usize::from(self.cell_h) * usize::from(self.slot_w) * 4;
+            // Steady-state publish: recycle the buffer published two frames ago
+            // and patch ONLY the slot bands baked since it was last synced. The
+            // published bytes are IDENTICAL to the full clone below — `rgba` is
+            // written in exactly two places (the `get_v4` / `host_tile` bake
+            // blits, each of which rewrites one whole band and stamps it) plus
+            // `clear`, which drops both snapshots — so a band whose stamp is at
+            // or below the buffer's own synced `version` still holds byte-equal
+            // texels. Width, height and the byte count never move (only `clear`
+            // / a metric change resize `rgba`, and both drop the buffers), so
+            // nothing downstream of the atlas sees anything but the same pixels
+            // it would have seen from a fresh clone.
+            let spare = self.spare.take();
+            let recycled = spare.and_then(|mut arc| {
+                let synced = arc.version;
+                // Still referenced by a consumer (or the shape moved under a
+                // metric change): fall back to the full clone.
+                let buf = Arc::get_mut(&mut arc)?;
+                if buf.rgba.len() != self.rgba.len()
+                    || buf.width != width
+                    || buf.height != height
+                    || band == 0
+                {
+                    return None;
+                }
+                for (i, stamp) in self.slot_version.iter().enumerate() {
+                    if *stamp <= synced {
+                        continue;
+                    }
+                    let lo = i * band;
+                    let hi = lo + band;
+                    if let (Some(dst), Some(src)) =
+                        (buf.rgba.get_mut(lo..hi), self.rgba.get(lo..hi))
+                    {
+                        dst.copy_from_slice(src);
+                    }
+                }
+                buf.version = self.version;
+                Some(arc)
+            });
+            let published = match recycled {
+                Some(arc) => arc,
+                None => Arc::new(SceneAtlas {
+                    width,
+                    height,
+                    rgba: self.rgba.clone(),
+                    version: self.version,
+                }),
+            };
+            self.spare = self.published.take();
+            self.published = Some(published);
             self.dirty = false;
         }
         self.published.clone()
@@ -289,6 +355,9 @@ impl CatBaker {
             host: None,
         });
         self.version = self.version.wrapping_add(1);
+        if let Some(stamp) = self.slot_version.get_mut(i) {
+            *stamp = self.version;
+        }
         self.dirty = true;
         Some(CatTile {
             ax: 0,
@@ -369,6 +438,9 @@ impl CatBaker {
             host: Some(host_id),
         });
         self.version = self.version.wrapping_add(1);
+        if let Some(stamp) = self.slot_version.get_mut(i) {
+            *stamp = self.version;
+        }
         self.dirty = true;
         Some(CatTile {
             ax: 0,
@@ -1267,6 +1339,118 @@ mod tests {
         b.get_v4(&vk(1)).expect("bake 2");
         let a3 = b.atlas().expect("atlas");
         assert!(a3.version > a1.version, "bake bumps the published version");
+    }
+
+    /// CB-1: the RECYCLED publish is byte-equal to the full clone it replaces.
+    ///
+    /// Two bakers are driven with identical inputs. `fast` drops each published
+    /// snapshot immediately, so its spare is uniquely owned and `atlas()` takes
+    /// the recycle-and-patch path; `mirror` RETAINS every snapshot, so its spare
+    /// is never uniquely owned and it always falls back to the full
+    /// `rgba.clone()`. Every published field must match, on every frame, across
+    /// bakes, host tiles, hits, eviction and the metric-change clear — a stale
+    /// or torn band (the one way this optimization could regress invisibly)
+    /// shows up here as a byte diff, not as a wrong pixel three months later.
+    #[test]
+    fn recycled_publish_is_byte_equal_to_full_clone() {
+        let mut fast = CatBaker::default();
+        let mut mirror = CatBaker::default();
+        let mut retained: Vec<Arc<SceneAtlas>> = Vec::new();
+        let mut published = 0usize;
+        for f in 0..96u64 {
+            // A metric change part-way through proves the clear path drops both
+            // buffers (a recycled buffer of the OLD size must never be patched).
+            let (cw, ch) = if f == 61 { (12u16, 24u16) } else { (10, 20) };
+            fast.begin_frame(cw, ch);
+            mirror.begin_frame(cw, ch);
+            if f % 3 != 2 {
+                // More keys than slots: bakes, hits and LRU eviction interleave.
+                let key = vk((f % 37) as u8);
+                assert_eq!(fast.get_v4(&key).is_some(), mirror.get_v4(&key).is_some());
+            }
+            if f % 2 == 0 {
+                let px = vec![((f * 7) % 251) as u8; 40 * 24 * 4];
+                let a = fast.host_tile(f % 13, 40, 24, &px);
+                let b = mirror.host_tile(f % 13, 40, 24, &px);
+                assert_eq!(a.is_some(), b.is_some());
+            }
+            match (fast.atlas(), mirror.atlas()) {
+                (Some(a), Some(b)) => {
+                    published += 1;
+                    assert_eq!(
+                        (a.width, a.height, a.version),
+                        (b.width, b.height, b.version),
+                        "frame {f}: published header must be identical"
+                    );
+                    assert!(
+                        a.rgba == b.rgba,
+                        "frame {f}: the recycled publish must be BYTE-EQUAL to a full clone"
+                    );
+                    retained.push(b);
+                }
+                (a, b) => assert!(a.is_none() && b.is_none(), "frame {f}: publish parity"),
+            }
+        }
+        assert!(
+            published > 40,
+            "the loop must actually publish ({published})"
+        );
+    }
+
+    /// CB-1: the publish really does recycle — the third dirty publish lands in
+    /// the buffer the FIRST one allocated — and a snapshot a consumer is still
+    /// holding is NEVER mutated (the one hazard of an in-place publish). Pointer
+    /// identity is sound here: every snapshot stays alive inside the baker or in
+    /// a local for the whole test, so no address can be recycled underneath us.
+    #[test]
+    fn dirty_publish_recycles_and_never_mutates_a_held_snapshot() {
+        let mut b = CatBaker::default();
+        b.begin_frame(10, 20);
+        b.get_v4(&vk(0)).expect("bake 1");
+        let a1 = b.atlas().expect("publish 1");
+        let p1 = Arc::as_ptr(&a1);
+        drop(a1); // only the baker holds it now
+        b.begin_frame(10, 20);
+        b.get_v4(&vk(1)).expect("bake 2");
+        // KEEP this one: it is the spare the third publish would otherwise reuse
+        // after the fourth, so it pins the fallback path below.
+        let held = b.atlas().expect("publish 2");
+        let p2 = Arc::as_ptr(&held);
+        let held_bytes = held.rgba.clone();
+        assert_ne!(p1, p2, "consecutive publishes are distinct snapshots");
+
+        b.begin_frame(10, 20);
+        b.get_v4(&vk(2)).expect("bake 3");
+        let a3 = b.atlas().expect("publish 3");
+        assert_eq!(
+            Arc::as_ptr(&a3),
+            p1,
+            "the third publish must reuse the first buffer instead of cloning \
+             the whole atlas"
+        );
+        assert_eq!(
+            a3.version,
+            b.version(),
+            "a recycled publish carries the live version"
+        );
+        drop(a3);
+
+        // The spare is now the snapshot `held` still references, so `get_mut`
+        // must fail and the publish must allocate rather than mutate it.
+        b.begin_frame(10, 20);
+        b.get_v4(&vk(3)).expect("bake 4");
+        let a4 = b.atlas().expect("publish 4");
+        assert_ne!(Arc::as_ptr(&a4), p2, "a held snapshot must never be reused");
+        assert_ne!(
+            Arc::as_ptr(&a4),
+            p1,
+            "the live snapshot must never be reused"
+        );
+        assert_eq!(
+            held.rgba, held_bytes,
+            "a held snapshot must never be mutated"
+        );
+        assert_eq!(held.version, 2, "…nor re-stamped");
     }
 
     // ───────────────────────── cat-art v4 bake path ─────────────────────────

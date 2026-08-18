@@ -123,14 +123,27 @@ pub(crate) struct Config {
     /// the melody are untouched. The bed DSP itself is kept intact behind
     /// this gate: a redesign tournament evaluates it next phase.
     pub(crate) trail_sound_bed: Option<bool>,
-    /// Trail sound STYLE (`trail_sound_style`, default `"auto"`): WHICH
-    /// palette speaks for the keystroke sounds. `"auto"` follows the visual
-    /// trail style (each style's signature palette — today's sound, bit for
-    /// bit); `"mechanical"` (aliases: `mech`, `thock`, `mechanical keyboard`)
-    /// swaps every keystroke to the mechanical-keyboard palette — switch
-    /// click + case thock percussion — whatever the trail looks like. The
-    /// style-agnostic gestures (cursor-move melody tones, the curse bonk's
-    /// clash shape) are unchanged; volume/on-off/bed gates apply as usual.
+    /// TYPING SOUND (`trail_sound_style`, default `"auto"`): WHICH voice
+    /// speaks for the keystroke sounds — the Settings ▸ Sound ▸ "Typing
+    /// sound" picker. `"auto"` follows the visual trail style (each style's
+    /// signature palette — today's sound, bit for bit). Every other value
+    /// picks an instrument spoken whatever the trail looks like: the nine
+    /// palettes by what they SOUND like — `"glass bell"` (the rainbow
+    /// kitty's bell), `"warm pluck"` (lumen), `"glitter"` (sparkle), `"ice
+    /// chime"` (comet), `"droplet"` (water), `"pew"` (phaser), `"zap"`
+    /// (laser), `"tick"` (beam), `"crackle"` (fire) — the `"mechanical"`
+    /// keyboard (switch click + case thock), and three sound-only voices:
+    /// `"typewriter"` (slug clack + platen thud; a margin-bell ding and
+    /// carriage zip on Enter), `"marimba"` (a warm rosewood bar under a yarn
+    /// mallet) and `"felt"` (a felt-muted piano — the hush). Aliases accepted
+    /// on load, never offered: the trail-style names (`water`, `comet`,
+    /// `rainbow kitty`, …), `bell`, `raindrop`, `mech`, `thock`, `mechanical
+    /// keyboard`, `piano`, `clack`, … (`SoundVoice::ALIASES`). Each keystroke,
+    /// deletion, Enter and the cursor's melody speak in the chosen voice and
+    /// its own ambient bed; the kitty's hold-song stays the kitty's. Every
+    /// voice sits on the same −21 dBFS typing floor and under the same rate
+    /// governor; volume/on-off/bed gates apply as usual. Picking a voice in
+    /// Settings plays one keystroke of it.
     pub(crate) trail_sound_style: Option<String>,
     /// TONE MELODY (`tone_melody`, default ON): the trail-sound melody leans
     /// with the inferred MOOD of the line being typed — a tiny on-device
@@ -2642,20 +2655,37 @@ impl Config {
     }
 
     /// The parsed `trail_sound_style` voice (default `"auto"` → follow the
-    /// visual trail style, the exact pre-override identity). Borrow-free,
-    /// `eq_ignore_ascii_case` per call — the per-frame sound seam pays no
-    /// allocation (the `cursor_trail_style_raw` precedent). Unknown spellings
-    /// fall back to `auto` (the sound keeps playing; the Settings picker and
-    /// save-time validation keep the domain honest for panel edits).
+    /// visual trail style, the exact pre-override identity). Resolved by the
+    /// synth's own parser ([`aterm_effects::trail_sound::SoundVoice::parse`]:
+    /// the picker's canonical spellings plus the documented aliases,
+    /// case-insensitive) — borrow-free, no allocation, so the per-frame sound
+    /// seam pays nothing (the `cursor_trail_style_raw` precedent). Unknown
+    /// spellings fall back to `auto` (the sound keeps playing; the Settings
+    /// picker, save-time validation and `--validate-config`'s domain warning
+    /// keep the spelling honest).
     pub(crate) fn trail_sound_voice(&self) -> aterm_effects::trail_sound::SoundVoice {
         use aterm_effects::trail_sound::SoundVoice;
-        let raw = self.trail_sound_style.as_deref().unwrap_or("auto").trim();
-        for mech in ["mechanical", "mech", "thock", "mechanical keyboard"] {
-            if raw.eq_ignore_ascii_case(mech) {
-                return SoundVoice::Mech;
-            }
+        self.trail_sound_style
+            .as_deref()
+            .and_then(SoundVoice::parse)
+            .unwrap_or_default()
+    }
+
+    /// The `--validate-config` domain warning for `trail_sound_style`: an
+    /// unknown spelling is not an error at load (the voice falls back to
+    /// `auto` and the sound keeps playing), but it IS a silent no-op the
+    /// author should hear about — the `cursor_trail_style_warning` twin.
+    pub(crate) fn trail_sound_style_warning(&self) -> Option<String> {
+        use aterm_effects::trail_sound::SoundVoice;
+        let raw = self.trail_sound_style.as_deref().map(str::trim)?;
+        if SoundVoice::parse(raw).is_some() {
+            return None;
         }
-        SoundVoice::Style
+        Some(format!(
+            "trail_sound_style: {raw:?} is not a typing sound — playing auto (follow the \
+             trail); expected one of {} (or a documented alias like water/mech/thock)",
+            crate::prefs::TRAIL_SOUND_STYLES.join("|")
+        ))
     }
 
     /// Trail sound volume 0..1 (`trail_sound_volume`, default 0.4), clamped
@@ -7577,11 +7607,24 @@ impl App {
         // so a revert lands on the themed background, never spec-black. Apply to EVERY
         // live tab — window-level config, like a resize — and refresh the factory so
         // future Cmd-T tabs inherit the new config.
+        // THE TYPING-SOUND AUDITION from the reload path: a native-window pick
+        // or a hand edit that CHANGES the voice plays one keystroke of it
+        // (`typing_sound_to_audition_on_swap` — the in-app row already
+        // auditioned at commit time and latched the same voice, so its own
+        // reload is silent here; startup never reaches this branch — the
+        // initial config is set at construction and a byte-equal watcher pass
+        // returns above). Decided against the latch BEFORE the swap.
+        let audition_voice = self.typing_sound_to_audition_on_swap(&config);
         // Retain the parsed config so a later OS light↔dark switch can re-resolve a
         // `dark:…,light:…` split theme without re-reading disk (see
         // `App::sync_app_theme_to_appearance`). Resolve the engine/renderer theme for
         // the CURRENT OS appearance so a reload preserves the active light/dark side.
         self.config = config.clone();
+        if let Some(voice) = audition_voice {
+            // After the swap, so the preview plays at the NEW volume/master and
+            // under the new look — the settings the user just wrote.
+            self.audition_typing_sound(voice);
+        }
         // Selected-tab color override (`active_tab_color`): pinned UNCONDITIONALLY
         // on every reload — a pure tab-color edit changes neither theme nor font,
         // so no rebuild branch below would re-sync the native strip. The setter is

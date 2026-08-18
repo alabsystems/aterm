@@ -14,8 +14,16 @@
 //! spectral centroid, energy above 2 kHz, and level. Deterministic — fixed
 //! seed, fixed script, hand-rolled FFT, no dependency.
 //!
-//!   cargo run -p aterm-effects --example typing_voice_ab [-- <out_dir>]
+//!   cargo run -p aterm-effects --example typing_voice_ab [-- <out_dir>] [--voice <name>] [--all]
 //!   afplay target/typing-voice-ab/a-neutral.wav
+//!
+//! `--voice <name>` renders every scenario in that TYPING-SOUND VOICE
+//! (`SoundVoice::parse`: the picker's canonical spellings or a documented
+//! alias; default `auto` = the rainbow-kitty look's own palette). `--all`
+//! instead renders the `a-neutral` script ONCE PER VOICE of the picker roster
+//! into `<out_dir>/<voice>.wav` (spaces → `-`) and prints one comparable
+//! metrics row per voice — the owner's audition corpus, and the comfort
+//! figures each `palette_trim` comment quotes.
 //!
 //! It also benches the GESTURE FAMILY (`trail_sound`'s `gesture_shape` law):
 //! each of Typed / Backspace / Glide± / Sweep± is rendered in ISOLATION from
@@ -92,6 +100,8 @@ const BAR_S: f32 = aterm_effects::kitty_sing::SING_BAR_SECONDS;
 /// runs over so only the TYPING is scored.
 struct Scenario {
     name: String,
+    /// The typing-sound voice every cue rides (`--voice`).
+    voice: SoundVoice,
     cues: Vec<Cue>,
     window: (f32, f32),
     seconds: f32,
@@ -106,6 +116,7 @@ struct Scenario {
 /// `RiffBarSig` payload (2026-08-09, `e2efacaf`).
 fn scenario_neutral() -> Scenario {
     Scenario {
+        voice: SoundVoice::Style,
         name: "a-neutral".into(),
         cues: typing_script(0.0),
         window: (3.0, 12.5),
@@ -133,6 +144,7 @@ fn scenario_after_song(ch: char) -> Scenario {
     let t0 = 8.0 * BAR_S + 3.0;
     cues.extend(typing_script(t0));
     Scenario {
+        voice: SoundVoice::Style,
         name: format!("b-after-song-{ch}"),
         cues,
         window: (t0 + 3.0, t0 + 12.5),
@@ -165,6 +177,7 @@ fn scenario_leak(ch: char) -> Scenario {
     cues.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     // Score from +3 s (duck released, riff silent) for 9 s of pure typing.
     Scenario {
+        voice: SoundVoice::Style,
         name: format!("d-leak-{ch}"),
         cues,
         window: (t0 + 3.0, t0 + 12.5),
@@ -195,6 +208,7 @@ fn scenario_leak_fast(ch: char) -> Scenario {
     }
     cues.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     Scenario {
+        voice: SoundVoice::Style,
         name: format!("e-leak-fast-{ch}"),
         cues,
         window: (t0 + 3.5, t0 + 6.0),
@@ -220,6 +234,7 @@ fn scenario_during_song(ch: char) -> Scenario {
     cues.extend(typing_script(0.0));
     cues.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     Scenario {
+        voice: SoundVoice::Style,
         name: format!("c-during-song-{ch}"),
         cues,
         window: (3.0, 12.5),
@@ -276,6 +291,7 @@ fn scenario_family() -> Scenario {
     t += 0.4;
     cues.push((t, SoundGesture::Trail(SoundKind::Jump), -0.9, 0.5));
     Scenario {
+        voice: SoundVoice::Style,
         name: "f-family".into(),
         cues,
         window: (0.3, t + 0.6),
@@ -284,9 +300,10 @@ fn scenario_family() -> Scenario {
     }
 }
 
-fn render_cues(cues: &[Cue], seconds: f32) -> Vec<f32> {
+fn render_cues(cues: &[Cue], seconds: f32, voice: SoundVoice) -> Vec<f32> {
     let sc = Scenario {
         name: String::new(),
+        voice,
         cues: cues.to_vec(),
         window: (0.0, 0.0),
         seconds,
@@ -307,7 +324,7 @@ fn render(sc: &Scenario) -> Vec<f32> {
         .filter(|c| matches!(c.1, SoundGesture::Celebration(_)))
         .cloned()
         .collect();
-    let only = render_cues(&riff, sc.seconds);
+    let only = render_cues(&riff, sc.seconds, sc.voice);
     full.iter().zip(&only).map(|(a, b)| a - b).collect()
 }
 
@@ -325,7 +342,7 @@ fn render_one(sc: &Scenario) -> Vec<f32> {
             let (ct, kind, pan, heat) = sc.cues[cue_i];
             synth.push(SoundEvent {
                 style: GlowStyle::RainbowKitty,
-                voice: SoundVoice::Style,
+                voice: sc.voice,
                 kind,
                 pan,
                 heat,
@@ -404,6 +421,30 @@ fn mag_at(x: &[f32], start: usize, w: &[f32]) -> Vec<f32> {
     let mut im = vec![0.0f32; FFT_N];
     for i in 0..FFT_N {
         re[i] = x.get(start + i).copied().unwrap_or(0.0) * w[i];
+    }
+    fft(&mut re, &mut im);
+    (0..FFT_N / 2)
+        .map(|k| (re[k] * re[k] + im[k] * im[k]).sqrt())
+        .collect()
+}
+
+/// THE CHIRP WINDOW: 2 ms past the onset (under the attack, past nothing),
+/// where a pitch bend is still in flight. The settled anchor ([`SETTLE`])
+/// deliberately measures the note a gesture LANDS on — which made an audible
+/// upward scoop invisible to this bench. `sweep_st` closes that blind spot.
+const EARLY_OFF: usize = SR as usize * 2 / 1000;
+/// The early window's length: 1024 samples (~21 ms), zero-padded into the
+/// shared [`FFT_N`] transform so both windows read the same bin grid.
+const EARLY_N: usize = 1024;
+
+/// Magnitude spectrum of the EARLY window — [`EARLY_N`] samples under their
+/// own Hann, zero-padded to [`FFT_N`].
+fn mag_early(x: &[f32], start: usize) -> Vec<f32> {
+    let mut re = vec![0.0f32; FFT_N];
+    let mut im = vec![0.0f32; FFT_N];
+    for (i, r) in re.iter_mut().take(EARLY_N).enumerate() {
+        let w = 0.5 * (1.0 - (core::f32::consts::TAU * i as f32 / EARLY_N as f32).cos());
+        *r = x.get(start + i).copied().unwrap_or(0.0) * w;
     }
     fft(&mut re, &mut im);
     (0..FFT_N / 2)
@@ -546,6 +587,10 @@ struct Report {
     interval_hist: Vec<(i32, usize)>,
     unison_pct: f64,
     interval_autocorr: f64,
+    /// Median per-note pitch sweep, semitones: settled-window pitch over
+    /// early-window pitch (`12·log2(late/early)`). Positive = the note rises
+    /// into its anchor — the chirp/squeak artifact, measured.
+    sweep_st: f64,
     roughness: f64,
     centroid_hz: f64,
     /// Fraction of spectral energy above 2 kHz — chirp vs body.
@@ -584,6 +629,30 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
         *hist.entry(iv.round() as i32).or_default() += 1;
     }
     let unison = hist.get(&0).copied().unwrap_or(0) as f64 / intervals.len().max(1) as f64 * 100.0;
+    // THE PITCH SWEEP per note: the settled anchor (SETTLE past onset, the
+    // note the gesture lands on) against the early window (EARLY_OFF past
+    // onset, the note it arrives through). The early peak is searched within
+    // ±4.5 st of the settled pitch so a fixed-pitch tink or an octave error
+    // can never masquerade as a bend; the median across notes is robust to
+    // the occasional onset the fast-typing overlap smears.
+    let mut sweeps: Vec<f64> = ons
+        .iter()
+        .filter(|&&s| s + SETTLE + FFT_N < to)
+        .filter_map(|&s| {
+            let late = f64::from(peak_hz(&mag_at(x, s + SETTLE, &w), 150.0, 6000.0));
+            if late <= 0.0 {
+                return None;
+            }
+            let early = f64::from(peak_hz(
+                &mag_early(x, s + EARLY_OFF),
+                (late / 1.3) as f32,
+                (late * 1.3) as f32,
+            ));
+            (early > 0.0).then(|| 12.0 * (late / early).log2())
+        })
+        .collect();
+    sweeps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let sweep_st = sweeps.get(sweeps.len() / 2).copied().unwrap_or(0.0);
     // Global centroid over the window.
     let mut num = 0.0f64;
     let mut den = 0.0f64;
@@ -625,6 +694,7 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
         interval_hist: hist.into_iter().collect(),
         unison_pct: unison,
         interval_autocorr: seq_autocorr_peak(&intervals),
+        sweep_st,
         roughness: roughness(seg),
         centroid_hz: if den < 1e-12 { 0.0 } else { num / den },
         hi_frac: if den < 1e-12 { 0.0 } else { hi_e / den },
@@ -641,11 +711,11 @@ fn analyze(name: &str, x: &[f32], window: (f32, f32)) -> Report {
 /// Render ONE gesture in isolation after a single settling keystroke, so every
 /// probe starts from the same melody state (same phrase, same degree) and the
 /// pitches are directly comparable.
-fn probe(kind: SoundGesture) -> Vec<f32> {
+fn probe(kind: SoundGesture, voice: SoundVoice) -> Vec<f32> {
     let mut synth = TrailSynth::new(SR as f32, SEED);
     let ev = |kind| SoundEvent {
         style: GlowStyle::RainbowKitty,
-        voice: SoundVoice::Style,
+        voice,
         kind,
         pan: 0.0,
         heat: 0.5,
@@ -808,11 +878,114 @@ fn wav_bytes(mono: &[f32]) -> Vec<u8> {
     w
 }
 
+/// The command line: `[out_dir] [--voice <name>] [--all]`.
+struct Args {
+    out: PathBuf,
+    voice: SoundVoice,
+    all: bool,
+}
+
+fn parse_args() -> Args {
+    let mut out: Option<PathBuf> = None;
+    let mut voice = SoundVoice::Style;
+    let mut all = false;
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--all" {
+            all = true;
+        } else if let Some(name) = a
+            .strip_prefix("--voice=")
+            .map(str::to_string)
+            .or_else(|| (a == "--voice").then(|| it.next().unwrap_or_default()))
+        {
+            voice = match SoundVoice::parse(&name) {
+                Some(v) => v,
+                None => {
+                    eprintln!(
+                        "unknown voice: {name:?} (one of: {})",
+                        SoundVoice::ALL
+                            .iter()
+                            .map(|v| v.name())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    );
+                    std::process::exit(2);
+                }
+            };
+        } else if out.is_none() {
+            out = Some(PathBuf::from(a));
+        } else {
+            eprintln!("unexpected argument {a:?}");
+            std::process::exit(2);
+        }
+    }
+    Args {
+        out: out.unwrap_or_else(|| PathBuf::from("target/typing-voice-ab")),
+        voice,
+        all,
+    }
+}
+
+/// `--all`: the `a-neutral` script once per voice of the picker roster, one
+/// WAV each, one metrics row each — the audition corpus. Levels are the
+/// window's (3.0–12.5 s of typing) RMS/peak; `typed dBFS` is the isolated
+/// keystroke peak on `mix_meter`'s exact stance (gain 0.4, heat 0.5, pan 0,
+/// bed off), the quantity every `palette_trim` is fitted on.
+fn render_all_voices(out: &std::path::Path) {
+    println!(
+        "{:<12} {:>10} {:>8} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}  file",
+        "voice", "typed dBFS", "rms dB", "peak dB", "crest", "cent Hz", "hi>2k", "rough", "notes"
+    );
+    for &voice in SoundVoice::ALL {
+        let mut sc = scenario_neutral();
+        sc.voice = voice;
+        let mono = render(&sc);
+        let file = format!("{}.wav", voice.name().replace(' ', "-"));
+        std::fs::write(out.join(&file), wav_bytes(&mono)).expect("wav");
+        let r = analyze(voice.name(), &mono, sc.window);
+        // The isolated keystroke on the ladder's own stance.
+        let typed_db = {
+            let mut synth = TrailSynth::new(SR as f32, 0x5EED_1234);
+            synth.push(SoundEvent {
+                style: GlowStyle::RainbowKitty,
+                voice,
+                kind: SoundGesture::Trail(SoundKind::Typed),
+                pan: 0.0,
+                heat: 0.5,
+                hue: 0.0,
+                gain: 0.4,
+                tone: Tone::Technical,
+                bed: false,
+            });
+            let mut stereo = vec![0.0f32; (SR as f32 * 2.4) as usize * CHANNELS];
+            synth.render(&mut stereo);
+            20.0 * f64::from(stereo.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6)).log10()
+        };
+        println!(
+            "{:<12} {:>10.2} {:>8.1} {:>8.1} {:>8.1} {:>8.0} {:>7.3} {:>8.4} {:>8}  {}",
+            voice.name(),
+            typed_db,
+            r.rms_db,
+            r.peak_db,
+            r.peak_db - r.rms_db,
+            r.centroid_hz,
+            r.hi_frac,
+            r.roughness,
+            r.notes,
+            file
+        );
+    }
+    println!("\nwrote {} voice wavs to {}", SoundVoice::ALL.len(), out.display());
+}
+
 fn main() {
-    let out: PathBuf = std::env::args()
-        .nth(1)
-        .map_or_else(|| PathBuf::from("target/typing-voice-ab"), PathBuf::from);
+    let Args { out, voice, all } = parse_args();
     std::fs::create_dir_all(&out).expect("out dir");
+    if all {
+        render_all_voices(&out);
+        return;
+    }
+    println!("voice: {} ({voice:?})", voice.name());
 
     let mut scenarios = vec![scenario_neutral(), scenario_family()];
     // Real held keys, spanning the root/mode classes the mixer produces.
@@ -828,6 +1001,9 @@ fn main() {
     for ch in ['a', 'e', 'z'] {
         scenarios.push(scenario_during_song(ch));
     }
+    for sc in &mut scenarios {
+        sc.voice = voice;
+    }
     println!("per-key song axes: root = sig%5-2, mode = [0,2,-1][sig%3]");
     for ch in ['a', 'e', 'k', 'o', 'z', ' '] {
         let sig = song_signature(ch);
@@ -842,7 +1018,7 @@ fn main() {
     }
 
     println!(
-        "{:<22} {:>5} {:>7} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>7} {:>8} {:>8} {:>7} {:>8} {:>8}",
+        "{:<22} {:>5} {:>7} {:>8} {:>8} {:>7} {:>7} {:>7} {:>6} {:>7} {:>8} {:>8} {:>8} {:>7} {:>8} {:>8}",
         "scenario",
         "notes",
         "n/s",
@@ -853,6 +1029,7 @@ fn main() {
         "|ivl|st",
         "uni%",
         "ivl-ac",
+        "sweep st",
         "rough",
         "cent Hz",
         "hi>2k",
@@ -865,7 +1042,7 @@ fn main() {
         std::fs::write(out.join(format!("{}.wav", sc.name)), wav_bytes(&mono)).expect("wav");
         let r = analyze(&sc.name, &mono, sc.window);
         println!(
-            "{:<22} {:>5} {:>7.2} {:>8.1} {:>8.1} {:>7.1} {:>7.2} {:>7.2} {:>6.1} {:>7.3} {:>8.4} {:>8.0} {:>7.3} {:>8.0} {:>8.1}",
+            "{:<22} {:>5} {:>7.2} {:>8.1} {:>8.1} {:>7.1} {:>7.2} {:>7.2} {:>6.1} {:>7.3} {:>+8.2} {:>8.4} {:>8.0} {:>7.3} {:>8.0} {:>8.1}",
             r.name,
             r.notes,
             r.density_hz,
@@ -876,6 +1053,7 @@ fn main() {
             r.mean_abs_interval_st,
             r.unison_pct,
             r.interval_autocorr,
+            r.sweep_st,
             r.roughness,
             r.centroid_hz,
             r.hi_frac,
@@ -919,7 +1097,7 @@ fn main() {
         "peak dB",
         "crest dB"
     );
-    let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed));
+    let typed_probe = probe(SoundGesture::Trail(SoundKind::Typed), voice);
     let reference = family_row("Typed", &typed_probe, 0.0).first_hz;
     let family: [(&str, SoundGesture); 6] = [
         ("Typed", SoundGesture::Trail(SoundKind::Typed)),
@@ -930,7 +1108,7 @@ fn main() {
         ("Sweep -", SoundGesture::Trail(SoundKind::Sweep { dir: -1 })),
     ];
     for (name, g) in family {
-        let x = probe(g);
+        let x = probe(g, voice);
         std::fs::write(
             out.join(format!(
                 "g-{}.wav",
@@ -963,7 +1141,7 @@ fn main() {
     for (i, r) in reports.iter().enumerate() {
         writeln!(
             f,
-            "  {{\"name\":\"{}\",\"notes\":{},\"density_hz\":{:.4},\"median_hz\":{:.2},\"lo_hz\":{:.2},\"hi_hz\":{:.2},\"span_semitones\":{:.3},\"mean_abs_interval_st\":{:.3},\"unison_pct\":{:.2},\"interval_autocorr\":{:.4},\"roughness\":{:.5},\"centroid_hz\":{:.1},\"hi_frac\":{:.4},\"low_edge_hz\":{:.1},\"rms_db\":{:.2},\"peak_db\":{:.2}}}{}",
+            "  {{\"name\":\"{}\",\"notes\":{},\"density_hz\":{:.4},\"median_hz\":{:.2},\"lo_hz\":{:.2},\"hi_hz\":{:.2},\"span_semitones\":{:.3},\"mean_abs_interval_st\":{:.3},\"unison_pct\":{:.2},\"interval_autocorr\":{:.4},\"sweep_st\":{:.3},\"roughness\":{:.5},\"centroid_hz\":{:.1},\"hi_frac\":{:.4},\"low_edge_hz\":{:.1},\"rms_db\":{:.2},\"peak_db\":{:.2}}}{}",
             r.name,
             r.notes,
             r.density_hz,
@@ -974,6 +1152,7 @@ fn main() {
             r.mean_abs_interval_st,
             r.unison_pct,
             r.interval_autocorr,
+            r.sweep_st,
             r.roughness,
             r.centroid_hz,
             r.hi_frac,

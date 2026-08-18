@@ -197,7 +197,7 @@ pub(crate) struct KittyCollectible {
     /// they liked, not the one first stumbled upon. Election by MAX is
     /// commutative, so it merges across processes exactly like `last_seen`.
     /// A pre-favourite rollback rewriting the sidecar drops the pin (never the
-    /// unlock) and the companion falls back to the latest-discovery rule.
+    /// unlock) and the companion falls back to the launch kitty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) favourite: String,
     #[serde(default)]
@@ -1156,15 +1156,18 @@ struct RingSlot {
 
 /// Where a batch of sightings came from — the provenance that decides what a
 /// first-ever discovery is ALLOWED to do (owner ruling, 2026-08-07: words in
-/// OUTPUT text must never activate or re-dress the cursor companion).
+/// OUTPUT text must never activate the cursor companion; owner ruling,
+/// 2026-08-17: NO discovery re-dresses it — the cat is the launch kitty, and
+/// only a pinned favourite outranks that).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SightingSource {
-    /// The committed keystream (`record_typed_kitty`): the user did this on
-    /// purpose, so a discovery repoints the companion (favourite permitting)
-    /// and is returned for its hello.
+    /// The committed keystream (`record_typed_kitty`): a first-ever
+    /// discovery is RETURNED — the Kitty Log's own accounting of an unlock
+    /// (and what the tests pin); no caller presents it, and it never repoints
+    /// the companion.
     Typed,
     /// The grid scanner's peeking word-cats: whatever a program happened to
-    /// print. Counts and collects only — the companion is out of reach.
+    /// print. Counts and collects only — nothing is returned.
     Ambient,
 }
 
@@ -1183,9 +1186,21 @@ pub(crate) struct KittyLogHost {
     delta: KittyLog,
     /// Bumps once per recorded sighting; snapshot staleness + repaint stamp.
     revision: u64,
-    /// Most recently discovered visual identity, resolved once on load/update.
+    /// The PINNED FAVOURITE's visual identity, resolved once on load/update
+    /// (the ledger's pin stamp, or a memory-only pin under `log = false`).
     /// Cursor frames read this `Copy` value in O(1), never scan the ledger.
-    companion: Option<KittyLook>,
+    /// This is the only ledger-side claim on the companion look: since the
+    /// launch-kitty ruling (2026-08-17) a discovery — typed or ambient —
+    /// collects but never repoints the cat.
+    favourite: Option<KittyLook>,
+    /// The user pinned a favourite IN THIS PROCESS (`favourite`). The one-shot
+    /// startup import ([`Self::absorb_initial`]) may land after such a press
+    /// (it is a spawned thread doing an flock plus two TOML parses); its
+    /// restart election must then leave the session's explicit pick alone —
+    /// a choice made now outranks one imported from disk, and under
+    /// `log = false` the memory-only pin has no roster row to win the
+    /// election on its own.
+    pinned_this_session: bool,
     /// Recently-logged `(session, ident)` episodes (≤ [`RING_SLOTS`], TTL
     /// [`RING_TTL`], stamp refreshed on hit): shared-session multi-window
     /// drains and vim-round-trip recounts collapse to one count.
@@ -1373,7 +1388,8 @@ impl KittyLogHost {
             mem: KittyLog::default(),
             delta: KittyLog::default(),
             revision: 0,
-            companion: None,
+            favourite: None,
+            pinned_this_session: false,
             ring: Vec::new(),
             ring_next: 0,
             last_flush: None,
@@ -1455,16 +1471,15 @@ impl KittyLogHost {
             return;
         }
         self.mem = loaded;
-        // THE RESTART ELECTION. An explicit pin is the strongest statement the
-        // user can make about which cat they want, so it outranks the
-        // chronologically-latest discovery it used to lose to.
-        self.companion = self.mem.favourite_look().or_else(|| {
-            self.mem
-                .collectibles
-                .iter()
-                .rev()
-                .find_map(KittyCollectible::look)
-        });
+        // THE RESTART ELECTION: an explicit pin, or nothing. The startup
+        // import used to elect the chronologically-latest discovery when no
+        // pin existed; under the launch-kitty ruling (2026-08-17) an unpinned
+        // ledger claims nothing and the launch kitty rides. A pin the user
+        // took in THIS process before the import landed is never clobbered
+        // by an older one from disk (`pinned_this_session`).
+        if !self.pinned_this_session {
+            self.favourite = self.mem.favourite_look();
+        }
         self.revision = self.revision.wrapping_add(1);
     }
 
@@ -1474,29 +1489,14 @@ impl KittyLogHost {
         self.revision
     }
 
-    /// The collected identity used by the cursor companion (O(1), no I/O).
-    pub(crate) fn companion_look(&mut self) -> Option<KittyLook> {
+    /// The PINNED FAVOURITE, if any — the ledger's one claim on the cursor
+    /// companion (O(1), no I/O), read by the precedence seam
+    /// (`launch_kitty::companion_precedence`: favourite > program with
+    /// tenure > launch kitty). `None` means the ledger claims nothing — the
+    /// tenured program cat or the launch kitty rides.
+    pub(crate) fn favourite_look(&mut self) -> Option<KittyLook> {
         self.poll_initial_load();
-        self.companion
-    }
-
-    /// The companion split by REASON — `(pinned favourite, discovery)` — for
-    /// the app-kitty precedence seam (`app_kitty::companion_precedence`,
-    /// owner spec 2026-08-07: favourite > app > discovery > session). A
-    /// pinned FAVOURITE is the user's explicit pick and outranks the app
-    /// kitty; a mere ambient/typed DISCOVERY does not. Exactly one side is
-    /// ever `Some`: the host's invariant is that a pinned favourite OWNS
-    /// `self.companion` (restart election, `observe`'s favourite guard, and
-    /// `favourite` itself all enforce it), so when the pin exists the
-    /// discovery slot reports empty. Cost per call: one bounded scan of the
-    /// collectible roster for the pin stamp (`favourite_look`), same as the
-    /// palette's `is_favourite`.
-    pub(crate) fn companion_looks(&mut self) -> (Option<KittyLook>, Option<KittyLook>) {
-        self.poll_initial_load();
-        match self.mem.favourite_look() {
-            Some(pinned) => (Some(pinned), None),
-            None => (None, self.companion),
-        }
+        self.favourite
     }
 
     /// Snapshot for the settings overlay (memory only — no IO).
@@ -1509,11 +1509,13 @@ impl KittyLogHost {
     }
 
     /// TYPED drain-site entry point (`record_typed_kitty`): dedupe, record,
-    /// and debounce-flush this tick's sightings. A first-ever discovery
-    /// repoints the companion (unless a favourite is pinned) and is RETURNED
-    /// so the caller can present its hello — the user typed the word, so the
-    /// unlock is theirs to see. `enabled=false` (`[sparkle_words.feline]
-    /// log = false`) drains-and-drops — the effects-side recorder always runs
+    /// and debounce-flush this tick's sightings. A first-ever discovery is
+    /// RETURNED as the Kitty Log's own accounting of the unlock (the caller
+    /// presents nothing with it — the collection book repaints on the
+    /// revision like every sighting) and it never repoints the companion
+    /// (owner ruling, 2026-08-17: the cat is the launch kitty).
+    /// `enabled=false` (`[sparkle_words.feline] log = false`)
+    /// drains-and-drops — the effects-side recorder always runs
     /// (§F4.7), the host gate is here. `now` is the tick's existing frame
     /// Instant (no new clock reads on the render path); the RFC3339 stamp is
     /// taken once per RECORDED sighting (rare), not per tick.
@@ -1567,8 +1569,8 @@ impl KittyLogHost {
     }
 
     /// The shared drain core. `source` is the ONE divergence between the two
-    /// public entry points: only [`SightingSource::Typed`] may repoint the
-    /// companion or surface a discovery for presentation.
+    /// public entry points: only [`SightingSource::Typed`] surfaces a
+    /// discovery for presentation (neither repoints the companion).
     fn observe_from<I>(
         &mut self,
         session: u64,
@@ -1592,17 +1594,12 @@ impl KittyLogHost {
             }
             let stamp = now_rfc3339();
             if self.mem.record(&s, lexicon, &stamp) && source == SightingSource::Typed {
-                let look = s.look.normalized();
-                // The hello still plays for a genuine TYPED discovery, but an
-                // explicit favourite is a stronger reason than stumbling on a
-                // new glyph: the pinned cat comes back once the newcomer's
-                // hello ends, rather than being silently displaced. An AMBIENT
-                // discovery gets neither arm — the row above is all output
+                // A genuine TYPED discovery reports itself (the ledger's own
+                // accounting of the unlock) but never re-dresses the
+                // companion: only a favourite pin changes the cat. An AMBIENT
+                // discovery gets nothing back — the row above is all output
                 // text may earn.
-                if self.mem.favourite_look().is_none() {
-                    self.companion = Some(look);
-                }
-                discovery = Some(look);
+                discovery = Some(s.look.normalized());
             }
             let _ = self.delta.record(&s, lexicon, &stamp);
             self.revision = self.revision.wrapping_add(1);
@@ -1637,7 +1634,8 @@ impl KittyLogHost {
         let look = s.look.normalized();
         // Unconditional: the press IS the reason to change the identity, and
         // `record`'s "new key" answer cannot express that.
-        self.companion = Some(look);
+        self.favourite = Some(look);
+        self.pinned_this_session = true;
         if !enabled {
             return;
         }
@@ -1664,11 +1662,15 @@ impl KittyLogHost {
     }
 
     /// Whether `look` is the currently pinned favourite (the palette
-    /// checkmark). `&self` on purpose: `App::palette_live` is `&self` and
-    /// cannot poll the startup import — staleness is a non-issue because the
-    /// render loop polls every tick.
+    /// checkmark). Reads the SAME value the companion verdict reads
+    /// ([`Self::favourite_look`]'s cache, not a fresh roster scan), so the
+    /// checkmark can never disagree with the cat on glass — including the
+    /// memory-only pin under `[sparkle_words.feline] log = false`, which the
+    /// roster never sees. `&self` on purpose: `App::palette_live` is `&self`
+    /// and cannot poll the startup import — staleness is a non-issue because
+    /// the render loop polls every tick.
     pub(crate) fn is_favourite(&self, look: KittyLook) -> bool {
-        self.mem.favourite_look() == Some(look.normalized())
+        self.favourite == Some(look.normalized())
     }
 
     /// Note `(session, ident)` in the dedupe ring. Returns `true` when the
@@ -2013,43 +2015,6 @@ mod tests {
     fn write_transitional_embedded(path: &Path, log: &KittyLog) {
         std::fs::write(path, toml::to_string(log).expect("serialize legacy ledger"))
             .expect("write transitional ledger");
-    }
-
-    /// THE NAMESPACE FENCE, pinned where it CAN be: the collection book's
-    /// `glyph_label` names (they name COLLECTED specials/accessories) and the
-    /// registry's kitty NAMES (they name APP kitties) are different
-    /// namespaces and must never share a word. The registry's own hygiene
-    /// test pins its signature-table half but cannot see this crate's label
-    /// table (`glyph_label` lives downstream of aterm-effects), so this half
-    /// of the law lives here, beside the labels, through the registry's
-    /// read-only [`aterm_effects::kitty_registry::kitty_name_bank`] door.
-    #[test]
-    fn glyph_labels_stay_out_of_the_kitty_name_namespace() {
-        let bank = aterm_effects::kitty_registry::kitty_name_bank();
-        // The signature names, reached through the same public door the
-        // labels must stay clear of — the id list is the registry's own
-        // pinned canonical coverage.
-        let signatures: Vec<&str> = ["shell", "claude", "codex", "agy", "aider", "gemini", "cursor"]
-            .into_iter()
-            .map(aterm_effects::kitty_registry::kitty_name)
-            .collect();
-        let mut labeled = 0;
-        for def in GLYPHS {
-            if def.kind == GlyphKind::Head {
-                continue; // heads share the one summary row; no label of their own
-            }
-            let label = glyph_label(def.id);
-            labeled += 1;
-            assert!(
-                !bank.contains(&label),
-                "{label:?} names a collected glyph AND rides the app-name bank"
-            );
-            assert!(
-                !signatures.contains(&label),
-                "{label:?} names a collected glyph AND a flagship app kitty"
-            );
-        }
-        assert!(labeled >= 11, "the fence must cover every authored label");
     }
 
     fn write_precollectibles_rewrite(path: &Path, log: &KittyLog) {
@@ -3176,9 +3141,11 @@ mod tests {
         let mut host = KittyLogHost::load(Some(p.clone()));
         host.await_initial_load();
         assert_eq!(
-            host.companion_look().map(|look| look.variant),
-            Some(CatGlyphId::SpecSleeping),
-            "startup companion is the chronologically latest discovery"
+            host.favourite_look(),
+            None,
+            "an unpinned ledger claims no companion on startup — the launch \
+             kitty rides (the startup import no longer elects the latest \
+             discovery; owner ruling, 2026-08-17)"
         );
         assert_eq!(
             kitty_book(host.log()).rarest,
@@ -3223,12 +3190,16 @@ mod tests {
         let now = Instant::now();
 
         host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
-        assert_eq!(host.companion_look(), Some(stumbled));
+        assert_eq!(
+            host.favourite_look(),
+            None,
+            "a stumbled discovery collects but claims nothing"
+        );
 
         host.favourite(&look_sighting(12, pinned), lex, now, true);
 
         assert_eq!(
-            host.companion_look(),
+            host.favourite_look(),
             Some(pinned),
             "the pin wins even though this glyph was already collected"
         );
@@ -3243,32 +3214,33 @@ mod tests {
         assert!(!rows[0].favourite.is_empty(), "and is stamped durably");
     }
 
-    /// The app-kitty precedence seam's surface: `companion_looks` reports a
-    /// stumbled-on companion in the DISCOVERY slot (the app kitty may outrank
-    /// it) and moves it to the FAVOURITE slot the moment the user pins one
-    /// (nothing outranks a choice). Exactly one slot is ever occupied.
+    /// The precedence seam's surface (`launch_kitty::companion_precedence`:
+    /// favourite > program with tenure > launch kitty): `favourite_look` is
+    /// `None` on a fresh install AND after a stumbled discovery (neither is a
+    /// choice — the unpinned rungs ride), and becomes the pin the moment the
+    /// user pins one (nothing outranks a choice).
     #[test]
-    fn companion_looks_splits_favourite_from_discovery() {
+    fn favourite_look_reports_only_the_pin() {
         let lex = Lexicon::builtin();
         let mut host = KittyLogHost::in_memory();
         let now = Instant::now();
 
-        assert_eq!(host.companion_looks(), (None, None), "fresh install: floor");
+        assert_eq!(host.favourite_look(), None, "fresh install: the launch kitty");
 
         let stumbled = coated(CatGlyphId::S100, 3);
         host.observe(4, [look_sighting(11, stumbled)], lex, now, true);
         assert_eq!(
-            host.companion_looks(),
-            (None, Some(stumbled)),
-            "a stumbled discovery is NOT a favourite — the app kitty may pass it"
+            host.favourite_look(),
+            None,
+            "a stumbled discovery is NOT a favourite — the launch kitty still rides"
         );
 
         let pinned = coated(CatGlyphId::S100, 9);
         host.favourite(&look_sighting(12, pinned), lex, now, true);
         assert_eq!(
-            host.companion_looks(),
-            (Some(pinned), None),
-            "the pin occupies the favourite slot and empties the discovery slot"
+            host.favourite_look(),
+            Some(pinned),
+            "the pin is the one ledger claim on the companion"
         );
     }
 
@@ -3291,9 +3263,9 @@ mod tests {
             "a genuine unlock still reports itself, so its hello still plays"
         );
         assert_eq!(
-            host.companion_look(),
+            host.favourite_look(),
             Some(pinned),
-            "…but the companion returns to the pin once that hello ends"
+            "…but the pin is untouched"
         );
     }
 
@@ -3312,7 +3284,7 @@ mod tests {
         host.observe_ambient(4, [look_sighting(41, newcomer)], lex, now, true);
 
         assert_eq!(
-            host.companion_look(),
+            host.favourite_look(),
             None,
             "watching output earns no companion"
         );
@@ -3326,27 +3298,26 @@ mod tests {
         assert_eq!(host.log().sightings, 1, "and the ledger still counts");
     }
 
-    /// The re-dress half of the same ruling: with a companion already
-    /// collected, an ambient discovery of a NEW glyph must not repoint it —
+    /// The re-dress half of the same ruling: with a favourite already
+    /// pinned, an ambient discovery of a NEW glyph must not repoint it —
     /// `cat` scrolling by in a man page is not a reason to change the cat at
     /// the cursor.
     #[test]
-    fn an_ambient_discovery_never_redresses_an_existing_companion() {
+    fn an_ambient_discovery_never_redresses_a_pinned_favourite() {
         let lex = Lexicon::builtin();
         let mut host = KittyLogHost::in_memory();
-        let typed = coated(CatGlyphId::S100, 3);
+        let pinned = coated(CatGlyphId::S100, 3);
         let printed = coated(CatGlyphId::SpecWitch, 12);
         let now = Instant::now();
 
-        let discovery = host.observe(4, [look_sighting(51, typed)], lex, now, true);
-        assert_eq!(discovery, Some(typed));
-        assert_eq!(host.companion_look(), Some(typed));
+        host.favourite(&look_sighting(51, pinned), lex, now, true);
+        assert_eq!(host.favourite_look(), Some(pinned));
 
         host.observe_ambient(4, [look_sighting(52, printed)], lex, now, true);
 
         assert_eq!(
-            host.companion_look(),
-            Some(typed),
+            host.favourite_look(),
+            Some(pinned),
             "output text never re-dresses the companion"
         );
         assert!(
@@ -3358,12 +3329,12 @@ mod tests {
         );
     }
 
-    /// The typed contrast pin: everything TYPED stays exactly as it was — a
-    /// first-ever typed discovery repoints the companion AND returns the
-    /// unlocked look, which is `record_typed_kitty`'s cue that the host owes
-    /// one wake for the identity change.
+    /// The typed contrast pin: a first-ever TYPED discovery still RETURNS
+    /// the unlocked look (the hello is the user's to see) — but it no longer
+    /// repoints the companion (owner ruling, 2026-08-17: the launch kitty
+    /// does not change for a discovery; only a pin changes the cat).
     #[test]
-    fn a_typed_discovery_still_repoints_and_reports() {
+    fn a_typed_discovery_reports_without_repointing() {
         let lex = Lexicon::builtin();
         let mut host = KittyLogHost::in_memory();
         let unlocked = coated(CatGlyphId::S101, 6);
@@ -3377,9 +3348,9 @@ mod tests {
             "the typed path still reports the unlock for its hello"
         );
         assert_eq!(
-            host.companion_look(),
-            Some(unlocked),
-            "and the companion follows the user's own discovery"
+            host.favourite_look(),
+            None,
+            "…and the companion does NOT follow the discovery"
         );
     }
 
@@ -3432,8 +3403,9 @@ mod tests {
         }
     }
 
-    /// THE RESTART ELECTION. A pin must outrank the chronologically-latest
-    /// discovery the startup import used to elect unconditionally.
+    /// THE RESTART ELECTION. A pin survives restart (it is the ledger's one
+    /// claim on the companion); the chronologically-latest discovery the
+    /// startup import used to elect claims nothing any more.
     #[test]
     fn a_favourite_survives_the_startup_import() {
         let lex = Lexicon::builtin();
@@ -3459,7 +3431,7 @@ mod tests {
         let mut restarted = KittyLogHost::load(Some(p.clone()));
         restarted.await_initial_load();
         assert_eq!(
-            restarted.companion_look(),
+            restarted.favourite_look(),
             Some(pinned),
             "the pin outranks the chronologically latest discovery on restart"
         );
@@ -3506,7 +3478,7 @@ mod tests {
         host.favourite(&look_sighting(88, look), lex, Instant::now(), false);
 
         assert_eq!(
-            host.companion_look(),
+            host.favourite_look(),
             Some(look),
             "the pick still holds for this session"
         );
@@ -3515,6 +3487,46 @@ mod tests {
             host.log().collectibles.is_empty(),
             "and no roster row was minted"
         );
+        assert!(
+            host.is_favourite(look),
+            "the palette checkmark reads the same pin the verdict wears — even \
+             a memory-only pin the roster never sees"
+        );
+    }
+
+    /// A pin the user takes in THIS process before the one-shot startup import
+    /// lands must survive the import's restart election: a choice made now
+    /// outranks one imported from disk. Proven in the exposed case — a
+    /// memory-only pin (`log = false`) has no roster row to win the election
+    /// on its own — with a control showing the import still elects a disk pin
+    /// when the session has not chosen.
+    #[test]
+    fn a_session_pin_is_not_clobbered_by_a_late_startup_import() {
+        let lex = Lexicon::builtin();
+        let now = Instant::now();
+        let session_pick = coated(CatGlyphId::S100, 6);
+        let disk_pin = coated(CatGlyphId::S101, 2);
+        // A ledger as the startup import would deliver it: one pinned row.
+        let mut on_disk = KittyLog::default();
+        let _ = on_disk.record(&look_sighting(1, disk_pin), lex, "2026-08-01T00:00:00Z");
+        on_disk.favourite_collectible(disk_pin, "2026-08-01T00:00:00Z");
+        assert_eq!(on_disk.favourite_look(), Some(disk_pin), "fixture: the disk carries a pin");
+
+        // CONTROL: no session choice ⇒ the import elects the disk pin.
+        let mut untouched = KittyLogHost::in_memory();
+        untouched.absorb_initial(on_disk.clone());
+        assert_eq!(untouched.favourite_look(), Some(disk_pin));
+
+        // THE CASE: the user pinned first (memory-only), then the import lands.
+        let mut host = KittyLogHost::in_memory();
+        host.favourite(&look_sighting(88, session_pick), lex, now, false);
+        host.absorb_initial(on_disk);
+        assert_eq!(
+            host.favourite_look(),
+            Some(session_pick),
+            "the session's explicit pick outranks the imported pin"
+        );
+        assert!(host.is_favourite(session_pick), "and the checkmark agrees");
     }
 
     /// TYPING-5 negative control: even when the one construction-time writer

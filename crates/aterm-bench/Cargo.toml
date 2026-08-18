@@ -38,6 +38,10 @@ name = "hyperlink_screen"
 harness = false
 
 [[bench]]
+name = "extras_erase"
+harness = false
+
+[[bench]]
 name = "comparative"
 harness = false
 

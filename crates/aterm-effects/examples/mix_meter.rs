@@ -19,7 +19,15 @@
 //! ```text
 //! cargo run -q -p aterm-effects --example mix_meter
 //! cargo run -q -p aterm-effects --example mix_meter -- rainbow kitty
+//! cargo run -q -p aterm-effects --example mix_meter -- --voice typewriter
+//! cargo run -q -p aterm-effects --example mix_meter -- --voice droplet lumen
 //! ```
+//!
+//! `--voice <name>` selects the TYPING-SOUND VOICE (`SoundVoice::parse`: the
+//! picker's canonical spellings or a documented alias; default `auto`); the
+//! bare style argument still selects the LOOK the events ride, which only
+//! matters under `auto`. This is the bench every `palette_trim` fit is read
+//! on, so a sound-only voice must be meterable without an edit.
 //!
 //! Levels are reported at the host's DEFAULT `trail_sound_volume` (0.4) and,
 //! separately, normalized to `gain = 1.0` so the palette's own trim can be
@@ -39,11 +47,11 @@ const DEFAULT_VOLUME: f32 = 0.4;
 const TAIL_S: f32 = 2.4;
 
 /// Render one gesture in isolation and return its peak absolute sample.
-fn peak_of(style: GlowStyle, kind: SoundGesture, gain: f32, heat: f32) -> f32 {
+fn peak_of(voice: SoundVoice, style: GlowStyle, kind: SoundGesture, gain: f32, heat: f32) -> f32 {
     let mut s = TrailSynth::new(SR, 0x5EED_1234);
     s.push(SoundEvent {
         style,
-        voice: SoundVoice::Style,
+        voice,
         kind,
         pan: 0.0,
         heat,
@@ -67,7 +75,36 @@ fn db(x: f32) -> f32 {
 }
 
 fn main() {
-    let arg = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--voice <name>` / `--voice=<name>` — quote a two-word name
+    // (`--voice "glass bell"`).
+    let mut voice = SoundVoice::Style;
+    if let Some(i) = args
+        .iter()
+        .position(|a| a == "--voice" || a.starts_with("--voice="))
+    {
+        let flag = args.remove(i);
+        let name = match flag.strip_prefix("--voice=") {
+            Some(inline) => inline.to_string(),
+            None if i < args.len() => args.remove(i),
+            None => String::new(),
+        };
+        voice = match SoundVoice::parse(&name) {
+            Some(v) => v,
+            None => {
+                eprintln!(
+                    "unknown voice: {name:?} (one of: {})",
+                    SoundVoice::ALL
+                        .iter()
+                        .map(|v| v.name())
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                );
+                std::process::exit(2);
+            }
+        };
+    }
+    let arg = args.join(" ");
     let style = match arg.trim() {
         "" | "rainbow kitty" | "rainbow" | "kitty" => GlowStyle::RainbowKitty,
         "lumen" => GlowStyle::Lumen,
@@ -98,7 +135,11 @@ fn main() {
         ("Bonk", SoundGesture::Words(WordGesture::Bonk)),
     ];
 
-    println!("MIX METER — {style:?} @ {SR} Hz, Tone::Technical, heat 0.5, pan 0\n");
+    println!(
+        "MIX METER — voice {:?} ({}) on look {style:?} @ {SR} Hz, Tone::Technical, heat 0.5, pan 0\n",
+        voice,
+        voice.name()
+    );
     println!(
         "{:<12} {:>12} {:>12}   vs Typed",
         "gesture", "@vol 0.40", "@gain 1.0"
@@ -106,6 +147,7 @@ fn main() {
     println!("{}", "-".repeat(56));
 
     let typed_ref = peak_of(
+        voice,
         style,
         SoundGesture::Trail(SoundKind::Typed),
         DEFAULT_VOLUME,
@@ -113,8 +155,8 @@ fn main() {
     );
 
     for (name, g) in gestures {
-        let at_vol = peak_of(style, g, DEFAULT_VOLUME, 0.5);
-        let at_one = peak_of(style, g, 1.0, 0.5);
+        let at_vol = peak_of(voice, style, g, DEFAULT_VOLUME, 0.5);
+        let at_one = peak_of(voice, style, g, 1.0, 0.5);
         let rel = db(at_vol) - db(typed_ref);
         println!(
             "{name:<12} {:>11.2} {:>11.2}   {rel:>+6.2} dB",
@@ -127,6 +169,7 @@ fn main() {
     // push at bar 4 of the 8-bar form) rather than bar 0, so the ladder is
     // read at the peak the listener actually meets.
     let riff = peak_of(
+        voice,
         style,
         SoundGesture::Celebration(CelebrationGesture::riff_bar(4, 0)),
         DEFAULT_VOLUME,
@@ -137,6 +180,7 @@ fn main() {
         "RiffBar(4)",
         db(riff),
         db(peak_of(
+            voice,
             style,
             SoundGesture::Celebration(CelebrationGesture::riff_bar(4, 0)),
             1.0,
@@ -149,7 +193,13 @@ fn main() {
         "\nTIER 1 target for Typed is -21.0 dBFS at gain 1.0 (see the ladder \
          doc above `TYPED_KIND_GAIN`)."
     );
-    let typed_one = peak_of(style, SoundGesture::Trail(SoundKind::Typed), 1.0, 0.5);
+    let typed_one = peak_of(
+        voice,
+        style,
+        SoundGesture::Trail(SoundKind::Typed),
+        1.0,
+        0.5,
+    );
     println!(
         "Typed @ gain 1.0 measures {:.2} dBFS  ->  trim correction x{:.4} ({:+.2} dB)",
         db(typed_one),

@@ -1039,37 +1039,36 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     Some((age_s.max(0.0) * 1e9) as u64)
 }
 
-/// Whether a hardware-input event occurred inside `within`, including an event
-/// that CoreGraphics has accepted but AppKit/winit has not dispatched yet.
+/// Whether a hardware-input event occurred inside `within`.
 ///
-/// This deliberately queries the CoreGraphics event-source clocks instead of
-/// calling `NSApplication::nextEventMatchingMask`. The latter is not a passive
-/// peek: AppKit may service a queued run-loop closure while answering it, which
-/// recursively enters winit when this function is called from `about_to_wait`.
-/// `CGEventSourceSecondsSinceLastEventType` is a flat, non-dispatching C getter,
-/// so it is safe from every winit callback. The combined-session source is
-/// conservative (activity in another application can postpone an automatic
-/// update), which is appropriate for the "install when quiet" policy.
+/// Reads the KERNEL's HID idle clock — the `HIDIdleTime` property of the
+/// `IOHIDSystem` registry entry, nanoseconds since the last event from any HID
+/// device, physical or virtual — through IOKit (see [`hid_idle`]). Machine-wide
+/// and therefore conservative (activity in another application postpones an
+/// automatic update), which is what the "install when quiet" policy wants.
+///
+/// LAW (the 2026-08-17 WindowServer watchdog incident): this probe MUST NOT go
+/// through WindowServer. It used to read CoreGraphics' event-source clocks —
+/// a "flat, non-dispatching C getter", and it was, but its FIRST call in a
+/// process lazily opens a SkyLight connection and asks WindowServer for the
+/// event shmem; WindowServer's MAIN THREAD then runs a synchronous TCC
+/// Input-Monitoring preflight for the caller's code identity, and tccd's
+/// identify step `readdir`s the executable's parent directory. From a unit-test
+/// binary in a 1.1-million-entry `target/debug/deps` that scan outran the 40 s
+/// watchdog. The kernel registry read has no such path, and no test or headless
+/// instance's `App` reaches even that — they get [`no_recent_user_input_event`]
+/// through the injected `App::user_input_recent` field. (It also never touches
+/// AppKit's event queue: the crash-45791 concern this probe originally replaced
+/// `nextEventMatchingMask` for still holds — see the guard test below.)
+///
+/// Fails CLOSED: if the HID system cannot be read, input is reported as recent
+/// (the machine is treated as busy), the same posture as an invalid sample.
 #[cfg(target_os = "macos")]
 pub(crate) fn recent_user_input_event(within: std::time::Duration) -> bool {
-    // Stable CGEventType ABI values matching the former AppKit NSEventMask:
-    // mouse buttons/motion/drags, keyboard/flags, and scroll-wheel input.
-    const USER_INPUT_EVENT_TYPES: [u32; 14] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 25, 26, 27];
-    const COMBINED_SESSION_STATE: i32 = 0;
-
-    #[link(name = "CoreGraphics", kind = "framework")]
-    unsafe extern "C" {
-        fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+    match hid_idle::seconds_since_last_input() {
+        Some(age_seconds) => user_input_age_is_recent(age_seconds, within.as_secs_f64()),
+        None => true,
     }
-
-    let within_seconds = within.as_secs_f64();
-    USER_INPUT_EVENT_TYPES.into_iter().any(|event_type| {
-        // SAFETY: this CoreGraphics getter accepts the published enum values
-        // above, returns a scalar, and neither pumps nor mutates the event queue.
-        let age_seconds =
-            unsafe { CGEventSourceSecondsSinceLastEventType(COMBINED_SESSION_STATE, event_type) };
-        user_input_age_is_recent(age_seconds, within_seconds)
-    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1077,7 +1076,153 @@ pub(crate) fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
 }
 
-/// Reduce one CoreGraphics age sample without platform state. Invalid negative
+/// The input-activity source for HEADLESS instances and unit tests: never
+/// recent. A headless `App` has no operator at a keyboard whose activity should
+/// postpone anything, and a unit test must not depend on whether the machine
+/// running it happens to be busy — so neither may consult the platform. This is
+/// also the guarantee that keeps a test binary from ever reaching WindowServer
+/// through the input-activity path (see [`recent_user_input_event`]).
+#[must_use]
+pub(crate) fn no_recent_user_input_event(_within: std::time::Duration) -> bool {
+    false
+}
+
+/// The kernel's HID idle clock, read from the IORegistry — the one
+/// input-activity source on macOS that never involves WindowServer.
+///
+/// Tiny-FFI posture (like `keymap::hid_lock_state`): IOKit + CoreFoundation
+/// are system frameworks (no crate on the dependency surface); the SDK
+/// signatures are declared inline. The `IOHIDSystem` service and the property
+/// key are looked up ONCE and cached; each read is one `IORegistryEntry
+/// CreateCFProperty` (a synchronous kernel RPC, thread-agnostic) plus a
+/// `CFNumber` unwrap. Measured on macOS 26.5.1: unentitled read succeeds and the
+/// value advances one second per second while the machine is idle.
+#[cfg(target_os = "macos")]
+mod hid_idle {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    type MachPort = u32;
+    type IoObject = MachPort;
+    type IoService = IoObject;
+    type IoRegistryEntry = IoObject;
+    type CfTypeRef = *const c_void;
+    type CfStringRef = *const c_void;
+    type CfAllocatorRef = *const c_void;
+    type CfTypeId = usize;
+    type CfIndex = isize;
+    type CfStringEncoding = u32;
+
+    /// `IOKitLib.h`: MACH_PORT_NULL selects the default main port.
+    const IO_MAIN_PORT_DEFAULT: MachPort = 0;
+    /// `hidsystem/IOHIDShared.h`: `kIOHIDSystemClass "IOHIDSystem"`.
+    const IOHID_SYSTEM_CLASS: &[u8] = b"IOHIDSystem\0";
+    /// The registry property (`hidsystem/IOHIDParameter.h`: `kIOHIDIdleTimeKey`).
+    const HID_IDLE_TIME_KEY: &[u8] = b"HIDIdleTime\0";
+    /// `CFString.h`: `kCFStringEncodingUTF8`.
+    const CF_STRING_ENCODING_UTF8: CfStringEncoding = 0x0800_0100;
+    /// `CFNumber.h`: `kCFNumberSInt64Type`.
+    const CF_NUMBER_SINT64_TYPE: CfIndex = 4;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        /// Returns a CFMutableDictionaryRef, CONSUMED by `IOServiceGetMatchingService`.
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: MachPort, matching: *mut c_void) -> IoService;
+        fn IOObjectRelease(object: IoObject) -> i32;
+        /// Returns a +1 retained CF object (Create rule) or NULL.
+        fn IORegistryEntryCreateCFProperty(
+            entry: IoRegistryEntry,
+            key: CfStringRef,
+            allocator: CfAllocatorRef,
+            options: u32,
+        ) -> CfTypeRef;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: CfAllocatorRef,
+            c_str: *const c_char,
+            encoding: CfStringEncoding,
+        ) -> CfStringRef;
+        fn CFGetTypeID(cf: CfTypeRef) -> CfTypeId;
+        fn CFNumberGetTypeID() -> CfTypeId;
+        fn CFNumberGetValue(number: CfTypeRef, the_type: CfIndex, value_ptr: *mut c_void) -> u8;
+        fn CFRelease(cf: CfTypeRef);
+    }
+
+    /// A raw pointer that is safe to share: the cached key is an immutable,
+    /// never-released CFString; the service is a mach port name.
+    struct Handles {
+        service: IoService,
+        key: CfStringRef,
+    }
+    // SAFETY: both fields are process-wide handles that IOKit/CF document as
+    // usable from any thread; nothing here is dereferenced by Rust.
+    unsafe impl Send for Handles {}
+    unsafe impl Sync for Handles {}
+
+    fn handles() -> Option<&'static Handles> {
+        static HANDLES: OnceLock<Option<Handles>> = OnceLock::new();
+        HANDLES
+            .get_or_init(|| {
+                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name
+                // and returns an owned dictionary consumed by
+                // `IOServiceGetMatchingService`; the returned service is retained
+                // for the life of the process (deliberately never released — it
+                // is the cache) unless the key cannot be made, in which case it is
+                // released. `CFStringCreateWithCString` takes a NUL-terminated
+                // UTF-8 literal; the string is likewise kept for the process.
+                unsafe {
+                    let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
+                    if matching.is_null() {
+                        return None;
+                    }
+                    let service = IOServiceGetMatchingService(IO_MAIN_PORT_DEFAULT, matching);
+                    if service == 0 {
+                        return None;
+                    }
+                    let key = CFStringCreateWithCString(
+                        std::ptr::null(),
+                        HID_IDLE_TIME_KEY.as_ptr().cast::<c_char>(),
+                        CF_STRING_ENCODING_UTF8,
+                    );
+                    if key.is_null() {
+                        IOObjectRelease(service);
+                        return None;
+                    }
+                    Some(Handles { service, key })
+                }
+            })
+            .as_ref()
+    }
+
+    /// Seconds since the last HID event, `None` when the registry cannot be
+    /// read (no `IOHIDSystem`, no property, or not a number).
+    #[must_use]
+    pub(super) fn seconds_since_last_input() -> Option<f64> {
+        let h = handles()?;
+        // SAFETY: `h.service` is a live registry entry and `h.key` a live
+        // CFString (both process-cached); the Create rule gives us +1 on the
+        // returned object, which we release on every path after use. The type
+        // is checked before `CFNumberGetValue` writes into the `i64`.
+        unsafe {
+            let value = IORegistryEntryCreateCFProperty(h.service, h.key, std::ptr::null(), 0);
+            if value.is_null() {
+                return None;
+            }
+            let mut idle_ns: i64 = 0;
+            let ok = CFGetTypeID(value) == CFNumberGetTypeID()
+                && CFNumberGetValue(value, CF_NUMBER_SINT64_TYPE, (&raw mut idle_ns).cast::<c_void>())
+                    != 0;
+            CFRelease(value);
+            #[allow(clippy::cast_precision_loss)] // nanoseconds → seconds; sub-ns precision is irrelevant
+            ok.then(|| idle_ns as f64 / 1e9)
+        }
+    }
+}
+
+/// Reduce one idle-clock age sample without platform state. Invalid negative
 /// or NaN samples fail closed; positive infinity is the useful "never observed"
 /// shape and therefore is not recent.
 #[cfg(any(target_os = "macos", test))]
@@ -1111,13 +1256,28 @@ mod user_input_probe_tests {
         );
     }
 
+    /// The macOS probe is a kernel registry read (never WindowServer — see
+    /// `hid_idle`), callable from a libtest worker thread without a window or
+    /// event loop. It is allowed to find the HID system unreachable (a sandbox);
+    /// when it can read, two consecutive samples come from the same clock.
     #[cfg(target_os = "macos")]
     #[test]
-    fn core_graphics_input_probe_is_callable_off_the_appkit_main_thread() {
-        // Rust's test harness runs this on a worker. The old MainThreadMarker +
-        // AppKit queue path failed closed here and could not exercise its query;
-        // CoreGraphics' scalar source-clock getter is thread-safe.
+    fn hid_idle_input_probe_is_callable_off_the_appkit_main_thread() {
+        let first = super::hid_idle::seconds_since_last_input();
         let _ = super::recent_user_input_event(std::time::Duration::from_millis(500));
+        let second = super::hid_idle::seconds_since_last_input();
+        assert_eq!(first.is_some(), second.is_some(), "the cached handles answer consistently");
+        if let (Some(a), Some(b)) = (first, second) {
+            assert!(a >= 0.0 && b >= 0.0, "idle ages are non-negative: {a} {b}");
+        }
+    }
+
+    /// The headless/test source is inert: what keeps a unit test's admission
+    /// decisions independent of the machine running it, and what keeps a test
+    /// binary off the platform input-activity path (2026-08-17).
+    #[test]
+    fn no_recent_user_input_event_is_never_recent() {
+        assert!(!super::no_recent_user_input_event(std::time::Duration::from_secs(3600)));
     }
 }
 

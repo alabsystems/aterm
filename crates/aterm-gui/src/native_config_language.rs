@@ -114,9 +114,6 @@ const AMBIGUOUS_WIDTH_ALIASES: &[&str] = &["single", "double"];
 const PREDICTIVE_ECHO_ALIASES: &[&str] = &["auto", "on", "true", "force"];
 const TEXT_BLENDING_ALIASES: &[&str] = &["linear_corrected"];
 const MOTION_ALIASES: &[&str] = &["reduce"];
-/// The `trail_sound_style` spellings `Config::trail_sound_voice` accepts
-/// beyond the canonical [`crate::prefs::TRAIL_SOUND_STYLES`] tokens.
-const TRAIL_SOUND_STYLE_ALIASES: &[&str] = &["mech", "thock", "mechanical keyboard"];
 const WINDOW_COLORSPACE_ALIASES: &[&str] = &["displayp3", "p3"];
 const BACKGROUND_MATERIAL_ALIASES: &[&str] = &["underwindow", "under_window", ""];
 const CUSTOM_INK_COLORWAYS: &[&str] = &["rainbow", "twotone:#RRGGBB,#RRGGBB"];
@@ -1722,6 +1719,12 @@ pub(crate) fn registered_enum_value_is_valid(key: &str, value: &str, options: &[
                 .strip_prefix("pack:")
                 .is_some_and(|id| !id.trim().is_empty());
     }
+    // The typing-sound picker's domain is the synth's own roster + aliases
+    // (`SoundVoice::parse`), through the same canonicaliser the Settings row
+    // and `--validate-config` use.
+    if key == crate::prefs::EDIT_TRAIL_SOUND_STYLE {
+        return crate::prefs::trail_sound_style_canonical(value).is_some();
+    }
     // `display_font` also accepts a MIX — 2..=3 distinct bundled ids joined by
     // `+` ("pixel+engraved"), authored by the Text & Fonts toggles. The same
     // domain the typed TOML writer enforces (`prefs::typed_item`).
@@ -1758,7 +1761,9 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         crate::prefs::EDIT_PREDICTIVE_ECHO => PREDICTIVE_ECHO_ALIASES,
         crate::prefs::EDIT_TEXT_BLENDING => TEXT_BLENDING_ALIASES,
         crate::prefs::EDIT_MOTION => MOTION_ALIASES,
-        crate::prefs::EDIT_TRAIL_SOUND_STYLE => TRAIL_SOUND_STYLE_ALIASES,
+        // `trail_sound_style` aliases live on the synth (`SoundVoice::ALIASES`)
+        // and are honoured by the early return in
+        // `registered_enum_value_is_valid`, like the cursor-trail table.
         crate::prefs::EDIT_WINDOW_COLORSPACE => WINDOW_COLORSPACE_ALIASES,
         crate::prefs::EDIT_BACKGROUND_MATERIAL => BACKGROUND_MATERIAL_ALIASES,
         // The pre-rename face ids. Accepted, never OFFERED — see
@@ -4748,10 +4753,6 @@ home = "~/aterm"
             (crate::prefs::EDIT_TEXT_BLENDING, TEXT_BLENDING_ALIASES),
             (crate::prefs::EDIT_MOTION, MOTION_ALIASES),
             (
-                crate::prefs::EDIT_TRAIL_SOUND_STYLE,
-                TRAIL_SOUND_STYLE_ALIASES,
-            ),
-            (
                 crate::prefs::EDIT_WINDOW_COLORSPACE,
                 WINDOW_COLORSPACE_ALIASES,
             ),
@@ -4783,6 +4784,16 @@ home = "~/aterm"
             assert!(
                 !analysis.has_errors(),
                 "trail alias {alias:?}: {:?}",
+                analysis.diagnostics
+            );
+        }
+        // The typing-sound picker's aliases live on the synth's own roster.
+        for &(alias, _) in aterm_effects::trail_sound::SoundVoice::ALIASES {
+            let source = source_for(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);
+            let analysis = analyze(&source);
+            assert!(
+                !analysis.has_errors(),
+                "typing-sound alias {alias:?}: {:?}",
                 analysis.diagnostics
             );
         }

@@ -45,23 +45,147 @@ pub fn modifiers_from_winit(mods: ModifiersState) -> Modifiers {
 ///
 /// winit's portable [`ModifiersState`] carries only Shift/Ctrl/Alt/Super, so the
 /// Kitty `CAPS_LOCK`/`NUM_LOCK` bits (which `Modifiers::kitty_encoded` folds into
-/// the reported value) must come from a platform query. On macOS we read the live
-/// global flags via `+[NSEvent modifierFlags]`; macOS hardware has no Num Lock, so
-/// only Caps Lock is reported. Off macOS this is empty until a platform lock-state
+/// the reported value) must come from a platform query. On macOS we ask the
+/// kernel's HID system directly (`IOHIDGetModifierLockState` on the IOHIDSystem
+/// user client — see [`hid_lock_state`]); macOS hardware has no Num Lock, so only
+/// Caps Lock is reported. Off macOS this is empty until a platform lock-state
 /// source is wired (winit exposes none).
+///
+/// LAW (the 2026-08-17 WindowServer watchdog incident): this query MUST NOT go
+/// through WindowServer. It used to read AppKit's global modifier flags, whose
+/// first call lazily opens a SkyLight connection and asks WindowServer for the
+/// event shmem; WindowServer's MAIN THREAD then runs a synchronous TCC
+/// Input-Monitoring preflight for the caller's code identity, and tccd's
+/// identify step `readdir`s the executable's parent directory. From a unit test
+/// binary in a 1.1-million-entry `target/debug/deps` that scan outran the 40 s
+/// watchdog: WindowServer was killed and every GUI session on the machine died.
+/// A kernel round-trip has no such path; and no test's or headless instance's
+/// `App` reaches even that — they get [`no_lock_modifiers`] through the injected
+/// `App::lock_modifiers` field. (This module's own test does call it once,
+/// deliberately: a real, kernel-only round-trip.)
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn lock_modifiers() -> Modifiers {
-    use objc2_app_kit::{NSEvent, NSEventModifierFlags};
-    let mut out = Modifiers::empty();
-    // SAFETY: `+[NSEvent modifierFlags]` is a parameterless class method that
-    // returns the current global modifier-flag bitmask. It is safe to call from
-    // any thread and has no main-thread requirement.
-    let flags = unsafe { NSEvent::modifierFlags_class() };
-    if flags.contains(NSEventModifierFlags::NSEventModifierFlagCapsLock) {
-        out |= Modifiers::CAPS_LOCK;
+    match hid_lock_state::caps_lock() {
+        Some(true) => Modifiers::CAPS_LOCK,
+        Some(false) | None => Modifiers::empty(),
     }
-    out
+}
+
+/// The lock-state source for HEADLESS instances and unit tests: always empty.
+///
+/// A headless `App` has no window and therefore no live keyboard whose LEDs
+/// could matter, and a unit test must encode the same bytes on every machine
+/// regardless of the operator's Caps Lock — so neither may consult the platform.
+/// This is also the guarantee that keeps a test binary from ever reaching
+/// WindowServer through the lock-key path (see [`lock_modifiers`]).
+#[must_use]
+pub fn no_lock_modifiers() -> Modifiers {
+    Modifiers::empty()
+}
+
+/// Caps Lock straight from the kernel's HID system — the one lock-key source
+/// on macOS that never involves WindowServer.
+///
+/// Tiny-FFI posture, same as the Windows `GetKeyState` path below: IOKit is a
+/// system framework (no crate on the dependency surface), five functions, all
+/// declared against the SDK's `IOKitLib.h`/`hidsystem/IOHIDLib.h`. The user
+/// client is opened ONCE per process and cached (`io_connect_t` is a mach port,
+/// valid process-wide, and `IOHIDGetModifierLockState` is a plain synchronous
+/// call on it); if the open fails the failure is cached too and every read is
+/// `None` — Caps Lock then simply isn't reported in the Kitty modifier byte,
+/// which is the same degraded truth the non-macOS/non-Windows fallback ships.
+/// Measured on macOS 26.5.1: `IOServiceOpen(kIOHIDParamConnectType)` and the
+/// read both return `KERN_SUCCESS` unentitled, and the value tracks the LED
+/// (set via `IOHIDSetModifierLockState`, read back 1, restored, read back 0).
+#[cfg(target_os = "macos")]
+mod hid_lock_state {
+    use std::ffi::{c_char, c_int, c_void};
+    use std::sync::OnceLock;
+
+    // SDK types (mach ports are 32-bit names; kern_return_t is an int).
+    type MachPort = u32;
+    type IoObject = MachPort;
+    type IoService = IoObject;
+    type IoConnect = IoObject;
+    type KernReturn = c_int;
+
+    /// `IOKitLib.h`: MACH_PORT_NULL selects the default main port.
+    const IO_MAIN_PORT_DEFAULT: MachPort = 0;
+    /// `hidsystem/IOHIDShared.h`: `kIOHIDParamConnectType = 1`.
+    const IOHID_PARAM_CONNECT_TYPE: u32 = 1;
+    /// `hidsystem/IOHIDParameter.h`: `kIOHIDCapsLockState = 0x1`.
+    const IOHID_CAPS_LOCK_STATE: c_int = 0x0000_0001;
+    /// `hidsystem/IOHIDShared.h`: `kIOHIDSystemClass "IOHIDSystem"`.
+    const IOHID_SYSTEM_CLASS: &[u8] = b"IOHIDSystem\0";
+    const KERN_SUCCESS: KernReturn = 0;
+
+    unsafe extern "C" {
+        /// libSystem's own task port (`mach/mach_init.h`); declared here rather
+        /// than through `libc::mach_task_self`, which libc deprecates.
+        static mach_task_self_: MachPort;
+    }
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        /// Returns a CFMutableDictionaryRef, CONSUMED by `IOServiceGetMatchingService`.
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: MachPort, matching: *mut c_void) -> IoService;
+        fn IOServiceOpen(
+            service: IoService,
+            owning_task: MachPort,
+            connect_type: u32,
+            connect: *mut IoConnect,
+        ) -> KernReturn;
+        fn IOObjectRelease(object: IoObject) -> KernReturn;
+        fn IOHIDGetModifierLockState(handle: IoConnect, selector: c_int, state: *mut bool) -> KernReturn;
+    }
+
+    /// The process-wide user client, `None` once the open has failed.
+    fn connection() -> Option<IoConnect> {
+        static CONN: OnceLock<Option<IoConnect>> = OnceLock::new();
+        *CONN.get_or_init(|| {
+            // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and
+            // returns an owned dictionary that `IOServiceGetMatchingService`
+            // consumes (its documented contract), so nothing leaks on either
+            // path; a NULL dictionary makes the lookup return 0. `IOServiceOpen`
+            // writes the connect port only on success; `mach_task_self()` is
+            // our own task. The service ref is released after the open, which
+            // holds its own reference. `mach_task_self_` is libSystem's cached
+            // task port. All calls are thread-safe kernel RPCs.
+            unsafe {
+                let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
+                if matching.is_null() {
+                    return None;
+                }
+                let service = IOServiceGetMatchingService(IO_MAIN_PORT_DEFAULT, matching);
+                if service == 0 {
+                    return None;
+                }
+                let mut connect: IoConnect = 0;
+                let kr = IOServiceOpen(
+                    service,
+                    mach_task_self_,
+                    IOHID_PARAM_CONNECT_TYPE,
+                    &raw mut connect,
+                );
+                IOObjectRelease(service);
+                (kr == KERN_SUCCESS && connect != 0).then_some(connect)
+            }
+        })
+    }
+
+    /// `Some(state)` of the Caps Lock LED, `None` when the HID system is
+    /// unreachable (no user client, or the read failed).
+    #[must_use]
+    pub(super) fn caps_lock() -> Option<bool> {
+        let conn = connection()?;
+        let mut state = false;
+        // SAFETY: `conn` is a live user-client port from `connection()`; the
+        // out-pointer is a valid `bool` for the call's duration; the selector is
+        // the SDK constant. Synchronous kernel RPC, safe from any thread.
+        let kr = unsafe { IOHIDGetModifierLockState(conn, IOHID_CAPS_LOCK_STATE, &raw mut state) };
+        (kr == KERN_SUCCESS).then_some(state)
+    }
 }
 
 /// Windows: the live toggle state via user32 `GetKeyState` — the low-order bit
@@ -406,6 +530,34 @@ mod tests {
             (Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK).contains(locks),
             "lock_modifiers must set nothing beyond CAPS_LOCK/NUM_LOCK, got {locks:?}"
         );
+    }
+
+    /// The macOS lock-state query is a real IOKit HID round-trip (kernel, never
+    /// WindowServer — see `hid_lock_state`), callable without a window or event
+    /// loop, and reports ONLY Caps Lock (macOS has no Num Lock). It is allowed
+    /// to find the HID system unreachable (a sandbox) — then it reports nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lock_modifiers_reports_only_caps_lock_from_the_hid_system() {
+        let locks = lock_modifiers();
+        assert!(
+            Modifiers::CAPS_LOCK.contains(locks),
+            "lock_modifiers must set nothing beyond CAPS_LOCK, got {locks:?}"
+        );
+        // Both reads agree with each other (the connection is cached, the value
+        // is the same LED) — a second call is not a second open.
+        assert_eq!(locks, lock_modifiers());
+        if let Some(on) = hid_lock_state::caps_lock() {
+            assert_eq!(on, locks.contains(Modifiers::CAPS_LOCK));
+        }
+    }
+
+    /// The headless/test source is inert on every platform: this is what keeps a
+    /// unit test's encoded bytes machine-independent, and what keeps a test
+    /// binary off every platform lock-key path (2026-08-17).
+    #[test]
+    fn no_lock_modifiers_is_empty() {
+        assert!(no_lock_modifiers().is_empty());
     }
 
     /// winit ModifiersState → engine Modifiers carries Super/Cmd through

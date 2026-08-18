@@ -172,10 +172,11 @@ pub(crate) struct PaletteLive {
     /// else the config `enabled` bit) — the checkmark on Matrix Rain. False
     /// when no terminal is frontmost (the row is disabled there anyway).
     pub rain_on: bool,
-    /// The FRONT session's OWN kitty is the currently pinned favourite — the
-    /// checkmark on Favourite Session Kitty. False when no terminal is
-    /// frontmost (the row is disabled there anyway).
-    pub session_kitty_favourited: bool,
+    /// The front window's PROMOTABLE kitty (its tenured program cat on glass,
+    /// else the launch kitty) is the currently pinned favourite — the
+    /// checkmark on Favourite This Kitty. Never needs a front terminal (with
+    /// no window at all it asks about the launch kitty).
+    pub kitty_favourited: bool,
     /// Process-wide serious mode is active (checkmark on Serious Mode).
     pub serious_mode: bool,
     /// The window is full-screen (checkmark on Enter Full Screen).
@@ -428,12 +429,12 @@ impl PaletteState {
                     row.checked = Some(live.rain_on);
                     row.enabled = live.terminal_front;
                 }
-                // Per-session too: the checkmark answers "is THIS session's own
-                // kitty the pin?", and without a front terminal there is no
-                // session kitty to promote.
-                MenuAction::FavouriteSessionKitty => {
-                    row.checked = Some(live.session_kitty_favourited);
-                    row.enabled = live.terminal_front;
+                // Process-wide: the checkmark answers "is the promotable kitty
+                // (program cat on glass, else the launch kitty) the pin?", and
+                // the launch kitty exists whether or not a terminal is
+                // frontmost, so the row stays enabled everywhere.
+                MenuAction::FavouriteKitty => {
+                    row.checked = Some(live.kitty_favourited);
                 }
                 // The pin is SESSION metadata, so a native whole tab has nothing
                 // to rename: the row disables (and the invoke fence refuses)
@@ -891,6 +892,10 @@ impl PaletteState {
     /// enforces), an unmatched name errs as unknown. An enabled row wins over a
     /// disabled duplicate (the Version section may render an action in two states).
     pub(crate) fn action_by_name(&self, name: &str) -> Result<MenuAction, String> {
+        // LEGACY SPELLING: `FavouriteSessionKitty` was the wire name until the
+        // launch-kitty ruling (2026-08-17) retired the session kitty; scripts
+        // that still say it reach the renamed action.
+        let name = crate::menu::canonical_invoke_name(name);
         let mut seen_disabled = false;
         for r in &self.rows {
             let Some(action) = r.action.menu() else {
@@ -1542,14 +1547,16 @@ mod tests {
         );
     }
 
-    /// The View ▸ Favourite Session Kitty row reports whether the FRONT
-    /// session's own kitty is the current pin, and — like the rain toggle —
-    /// honestly disables wherever there is no front session to have one.
+    /// The View ▸ Favourite This Kitty row reports whether the LAUNCH kitty
+    /// is the current pin, and — unlike the rain toggle — stays ENABLED with
+    /// no front terminal: the launch kitty is process-wide (owner ruling,
+    /// 2026-08-17), so a native whole tab and the windowless-app state can
+    /// still pin it.
     #[test]
-    fn favourite_row_checks_when_pinned_and_disables_without_a_terminal() {
+    fn favourite_row_checks_when_pinned_and_stays_enabled_without_a_terminal() {
         let mut s = PaletteState::new();
         s.resolve(&PaletteLive {
-            session_kitty_favourited: true,
+            kitty_favourited: true,
             terminal_front: true,
             can_rename: true,
             ..Default::default()
@@ -1559,9 +1566,9 @@ mod tests {
         let row = |s: &PaletteState| {
             s.rows
                 .iter()
-                .find(|r| r.action == MenuAction::FavouriteSessionKitty)
+                .find(|r| r.action == MenuAction::FavouriteKitty)
                 .map(|r| (r.checked, r.enabled))
-                .expect("View menu contributes Favourite Session Kitty")
+                .expect("View menu contributes Favourite This Kitty")
         };
         assert_eq!(
             row(&s),
@@ -1575,8 +1582,8 @@ mod tests {
         });
         assert_eq!(
             row(&s),
-            (Some(false), false),
-            "native whole tab: no session, no session kitty"
+            (Some(false), true),
+            "native whole tab: the launch kitty is still there to pin"
         );
 
         // The windowless-app state (macOS keeps running with every window
@@ -1584,8 +1591,8 @@ mod tests {
         s.resolve(&PaletteLive::default());
         assert_eq!(
             row(&s),
-            (Some(false), false),
-            "no window: nothing to promote, refuse honestly"
+            (Some(false), true),
+            "no window: the launch kitty is process-wide, still promotable"
         );
     }
 

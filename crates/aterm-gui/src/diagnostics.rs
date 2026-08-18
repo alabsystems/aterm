@@ -733,6 +733,14 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
             message,
         });
     }
+    // The typing-sound picker's domain: an unknown spelling plays `auto`
+    // silently at runtime, so the validator is where the author hears of it.
+    if let Some(message) = config.trail_sound_style_warning() {
+        warnings.push(ConfigSemanticWarning {
+            key: crate::prefs::EDIT_TRAIL_SOUND_STYLE,
+            message,
+        });
+    }
     if let Some(reason) = assets.kitty_sprite.diagnostic() {
         let source = assets
             .kitty_sprite
@@ -2387,6 +2395,35 @@ ink = "rainbow"
             let clean =
                 validate_config_text(&format!("cursor_trail_style = \"{ok}\"\n")).expect("valid");
             assert!(clean.is_empty(), "{ok:?} must validate green: {clean:?}");
+        }
+    }
+
+    /// An unknown `trail_sound_style` silently plays `auto` at runtime, so
+    /// `--validate-config` must flag it — while every picker option AND every
+    /// documented alias (water/mech/bell/…) validates green (the macOS-only
+    /// platform note aside), since those genuinely select a voice.
+    #[test]
+    fn validate_flags_unknown_trail_sound_style() {
+        let joined = validate_config_text("trail_sound_style = \"glas bel\"\n")
+            .expect("structurally valid TOML")
+            .join("\n");
+        assert!(
+            joined.contains("trail_sound_style") && joined.contains("glas bel"),
+            "typo'd typing sound must be flagged: {joined}"
+        );
+        for ok in crate::prefs::TRAIL_SOUND_STYLES
+            .iter()
+            .copied()
+            .chain(["Glass Bell", "water", "mech", "thock", "raindrop", " felt "])
+        {
+            let clean = validate_config_text(&format!("trail_sound_style = \"{ok}\"\n"))
+                .expect("valid");
+            assert!(
+                clean
+                    .iter()
+                    .all(|w| !w.contains("is not a typing sound")),
+                "{ok:?} must validate green: {clean:?}"
+            );
         }
     }
 

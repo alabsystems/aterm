@@ -257,7 +257,9 @@ const HELP_TAIL: &str = concat!(
     // owner's Sound menu); listing it under Cursor is what made the volume dial
     // hard to find in the first place.
     "  Sound       trail_sounds (master), trail_sound_volume (scales every synth\n",
-    "              voice), trail_sound_style (auto | mechanical), tone_melody,\n",
+    "              voice), trail_sound_style (the typing sound: auto | glass bell |\n",
+    "              warm pluck | glitter | ice chime | droplet | pew | zap | tick |\n",
+    "              crackle | mechanical | typewriter | marimba | felt), tone_melody,\n",
     "              trail_sound_bed (the ambient texture; default off),\n",
     "              trail_sound_riff (the sing-along song — the loudest voice),\n",
     "              bell_sound (the audible BEL beep; macOS/Windows),\n",
@@ -374,7 +376,10 @@ const STARTER_CONFIG: &str = "\
 # --- sound (Settings > Cursor & Motion > Sound) -------------------------------
 # trail_sounds = true              # macOS-only trail-style audio (parsed but inert elsewhere); silent whenever the trail is (default ON)
 # trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
-# trail_sound_style = \"auto\"     # typing-sound palette: auto = follow the trail style; mechanical = keyboard click + thock (aliases: mech, thock)
+# trail_sound_style = \"auto\"     # typing sound: auto = follow the trail style; or an instrument for every keystroke whatever the trail looks like:
+#                                  #   glass bell | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
+#                                  #   mechanical (keyboard click + thock) | typewriter (clack + platen, bell + carriage on Enter) | marimba | felt (muted piano)
+#                                  #   aliases: the trail-style names (water, comet, rainbow kitty, ...), bell, raindrop, mech, thock, piano, clack
 # tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
 # trail_sound_bed = false          # the continuous ambient BED texture behind the notes (default OFF; true re-enables the per-style drone)
 # trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)

@@ -160,6 +160,7 @@ mod keybinding;
 mod keymap;
 /// The Kitty Log (§F4): durable kitty-sighting ledger + settings collection book.
 mod kitty_log;
+mod launch_kitty;
 /// The typed-word detector: feline completions record a Kitty Log sighting,
 /// profanity winces the companion, and `dog` past the typed-a-lot gate pops a
 /// visiting dog.
@@ -3873,16 +3874,19 @@ pub struct SessionCtx {
     /// nowhere reversed) so racing `meta set`s can never invert the event
     /// stream against the stored value.
     pub meta: std::sync::Mutex<crate::session_timeline::SessionMeta>,
-    /// THE APP KITTY slot (per-app cursor breeds, owner spec 2026-08-07): the
-    /// pane's resolved app identity — canonical id + breed — derived from its
-    /// current shell block and cached by `(block id, state, commandline
-    /// present)` inside [`crate::app_kitty::AppKittySlot`], so the render rung
-    /// re-parses a commandline only on shell-block TRANSITIONS, never per
-    /// frame. Lives HERE and not in [`Self::meta`] because `meta` is the
-    /// USER-settable surface (`meta set …`) and the app identity is engine
-    /// state. A LEAF lock like `meta`: taken briefly by the render path's
-    /// `App::app_kitty_look` WHILE it holds this session's `Terminal` lock
-    /// (order term → app_kitty, never reversed) and by nothing else.
+    /// THE PROGRAM-CAT slot (per-app cursor breeds with tenure, owner spec
+    /// 2026-08-07 / ruling 2026-08-17): the pane's RAW program claim —
+    /// canonical id + breed — derived from its current shell block and
+    /// cached by `(block id, state, commandline present)` inside
+    /// [`crate::app_kitty::AppKittySlot`], so the render rung re-parses a
+    /// commandline only on shell-block TRANSITIONS, never per frame. Lives
+    /// HERE and not in [`Self::meta`] because `meta` is the USER-settable
+    /// surface (`meta set …`) and the program claim is engine state. A LEAF
+    /// lock like `meta`: taken briefly by the render path's
+    /// `App::app_kitty_claim` WHILE it holds this session's `Terminal` lock
+    /// (order term → app_kitty, never reversed) and by nothing else. The
+    /// claim is gated by the window's [`crate::app_kitty::KittyTenure`]
+    /// before it reaches glass.
     pub app_kitty: std::sync::Mutex<crate::app_kitty::AppKittySlot>,
     /// The per-session EVENT TIMELINE (spawned / state-change / title-change /
     /// cwd-change / meta-change), the lifecycle twin of [`Self::turns`]: bounded
@@ -5379,17 +5383,6 @@ struct WindowState {
     /// carries no pixel position of its own) can tell whether the pointer is over
     /// the tab strip ([`Self::strip_col_at`]) before mapping to a terminal cell.
     last_cursor_px: (f64, f64),
-    /// Whether the pointer is currently INSIDE this window at all: set by every
-    /// `CursorMoved`, cleared by `CursorLeft`. The pet hover probe's staleness
-    /// gate ([`crate::App::pet_hover_anchor`]): `last_cursor_px` deliberately
-    /// FREEZES at its final in-window position for the press paths (the
-    /// documented first-click caveat), so geometry alone cannot distinguish "a
-    /// pointer holding still over the cat" from "a pointer that left the window
-    /// across the cat" — this flag is the missing fact. Without it, the label
-    /// drain that runs on the very redraw a `CursorLeft` dismissal schedules
-    /// would re-derive hover from the frozen pixel and resurrect the label,
-    /// with no further mouse event ever arriving to clear it.
-    pointer_in_window: bool,
     /// Sub-cell pixel offset of the last pointer move inside its grid cell, so a
     /// button press / wheel notch (winit delivers no pixel position on those) can
     /// still report a genuine sub-cell PIXEL coordinate under DEC 1016 (SGR-pixel
@@ -5733,17 +5726,15 @@ struct WindowState {
     /// hovered. The petting hit-box — `on_mouse_input` consumes a left press
     /// inside it (padded by `PET_HIT_SLOP_PX`) before the terminal seam.
     pet_hit_rect: Option<(i32, i32, i32, i32)>,
-    /// Whether the pointer is currently over the pet's padded body (the
-    /// hover-label latch): updated change-gated on `CursorMoved`, and
-    /// RECOMPUTED from `pet_hit_rect` × `last_cursor_px` by every drawn
-    /// frame's label drain — a recompute, not a mere re-check, so it can both
-    /// drop a label when the pet walks out from under a still pointer and
-    /// post one when it walks back under it. The recompute is gated on
-    /// `pointer_in_window`, which is what keeps it from resurrecting the
-    /// latch from the frozen pixel after `CursorLeft`. Cleared with the rect,
-    /// on `CursorLeft`, and by the non-pet routes. Drives
-    /// `NoticeKind::PetLabel`'s lifecycle.
-    pet_hovered: bool,
+    /// THE TENURE GATE for this window's program cat
+    /// ([`crate::app_kitty::KittyTenure`]): turns the focused pane's raw,
+    /// instantly-flapping program claim into the slow, deliberate one the
+    /// companion wears (a program earns the cursor after `TENURE`; the cat
+    /// lingers `RELEASE` after it exits). Per window, because a window's cat
+    /// follows its own focused pane. Advanced by `App::companion_verdict`;
+    /// its pending deadline is folded into the wake so a silent program
+    /// still gets dressed on time.
+    kitty_tenure: crate::app_kitty::KittyTenure,
     /// The pet's `(session, content_seq)` latch for the PERK-AND-WATCH burst
     /// probe (wave 2): the content clock's previous reading, so a frame can
     /// tell "the pane wrote" from "the pane repainted". Same silent
@@ -7047,7 +7038,6 @@ impl WindowState {
             last_mouse_cell: (0, 0),
             last_mouse_window_cell: (0, 0),
             last_cursor_px: (0.0, 0.0),
-            pointer_in_window: false,
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
             hover_pointer: false,
@@ -7103,7 +7093,7 @@ impl WindowState {
             rain_last_cmd: None,
             pet_last_cmd: None,
             pet_hit_rect: None,
-            pet_hovered: false,
+            kitty_tenure: crate::app_kitty::KittyTenure::default(),
             pet_content_seq: None,
             rain_shell_executing: None,
             cursor_trail: crate::cursor_trail::CursorTrail::default(),
@@ -7310,9 +7300,9 @@ const AUTOMATIC_UPDATE_QUIET_EPOCH: Duration =
 /// How long an armed automatic apply will keep holding out for a quiet moment
 /// before it stops asking and just lands.
 ///
-/// The quiet epoch above is sampled against a MACHINE-WIDE input clock
-/// (`CGEventSourceSecondsSinceLastEventType`) and every live PTY's latest
-/// output. On the daily driver this feature exists for — an agent streaming
+/// The quiet epoch above is sampled against a MACHINE-WIDE input clock (the
+/// kernel's HID idle time, via `platform::recent_user_input_event`) and every
+/// live PTY's latest output. On the daily driver this feature exists for — an agent streaming
 /// output into one pane while a human works in another app — that conjunction
 /// is essentially never true, so the previous unbounded wait meant a verified,
 /// staged, notarized build simply never applied itself: the user watched an
@@ -8348,6 +8338,14 @@ struct App {
     /// drained at both `word_decos.tick` sites; IO is debounced onto a detached
     /// writer thread — never the render path. See [`crate::kitty_log`].
     kitty_log: crate::kitty_log::KittyLogHost,
+    /// THE LAUNCH KITTY (owner ruling, 2026-08-17): the BASE companion
+    /// breed for the whole process, decoded once at construction from a seed
+    /// minted by [`crate::launch_kitty::mint_launch_seed`]. Worn wherever no
+    /// program has earned the cursor (`app_kitty::KittyTenure`) and no
+    /// favourite is pinned — the prompt's cat in every window and session
+    /// until aterm is launched again (`App::companion_verdict`). Plain `Copy`
+    /// state — no lock, no per-frame derivation.
+    launch_kitty: aterm_effects::kitty_registry::KittyLook,
     /// Monotonic sequence for typed-"kitty" summon idents (see
     /// [`App::record_typed_kitty`]). App-wide — not per window — so two
     /// windows sharing one session can never mint the same `(session, ident)`
@@ -8506,6 +8504,30 @@ struct App {
     /// (`trail_audio.rs`). Lazy — the device opens on the first pushed cue,
     /// so `trail_sounds = false` sessions never touch CoreAudio.
     trail_audio: trail_audio::TrailAudio,
+    /// THE TYPING-SOUND AUDITION's dedupe latch: the voice most recently
+    /// played (or applied) as a preview. Picking a voice in Settings plays
+    /// ONE keystroke of it (`App::audition_typing_sound`); the config reload
+    /// that follows the in-app commit sees the same voice here and stays
+    /// silent, while a native-window or hand edit that changes the voice
+    /// auditions once from the reload path. Initialised to the startup
+    /// config's voice, so startup never auditions.
+    typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice,
+    /// THE LOCK-KEY SOURCE for `on_key`'s Kitty modifier byte (Caps/Num Lock):
+    /// `keymap::lock_modifiers` (a kernel HID query on macOS) for a windowed
+    /// instance, `keymap::no_lock_modifiers` for headless instances and every
+    /// unit test. Injected at construction so the platform is consulted ONLY
+    /// where a live keyboard's LEDs can matter — the 2026-08-17 WindowServer
+    /// watchdog incident began with a unit test reaching a platform lock-key
+    /// query that opened a WindowServer connection (see `keymap::lock_modifiers`).
+    lock_modifiers: fn() -> aterm_types::keyboard::Modifiers,
+    /// THE INPUT-ACTIVITY SOURCE for the "install when quiet" admission
+    /// (`automatic_update_activity_quiet`, the handoff drain gate):
+    /// `platform::recent_user_input_event` (a kernel HID idle-clock read on
+    /// macOS) for a windowed instance, `platform::no_recent_user_input_event`
+    /// for headless instances and every unit test — same injection, same
+    /// reason as `lock_modifiers` above (2026-08-17: the previous CoreGraphics
+    /// probe opened a WindowServer connection from a headless test).
+    user_input_recent: fn(std::time::Duration) -> bool,
     /// Shared queue of control-socket `image` requests, drained on
     /// [`Wake::Control`] (the control thread cannot touch the renderer).
     image_queue: control::ImageQueue,
@@ -8680,6 +8702,10 @@ struct App {
     /// The operator session's process-local id per the last glance — what the
     /// status menu's Show/Stop actions resolve against.
     operator_local_id: Option<u64>,
+    /// Whether that operator was elected by the TYPED `role=operator` meta.
+    /// Stop's confirm-suppression authority follows this bit (status_item.rs
+    /// SI-3): a title-elected operator is closed with the confirm ARMED.
+    operator_typed: bool,
     /// Sibling-instance rows from the last background fleet scan
     /// (fleet_watch.rs), pre-sorted by pid; merged into every glance so the
     /// status menu lists the other live aterms. Empty until a scan lands.
@@ -9054,7 +9080,7 @@ impl App {
     fn automatic_update_activity_quiet(&self, now: Instant) -> bool {
         self.automatic_update_activity_quiet_with_pending_input(
             now,
-            crate::platform::recent_user_input_event(AUTOMATIC_UPDATE_QUIET_EPOCH),
+            (self.user_input_recent)(AUTOMATIC_UPDATE_QUIET_EPOCH),
         )
     }
 
@@ -10163,6 +10189,12 @@ impl App {
         Self::headless_for_test_with_sink(Arc::new(SinkWriter::new(-1)))
     }
 
+    /// The headless App's launch-kitty seed: FIXED so a test can name the
+    /// exact cat the harness wears (`KittyLook::for_launch(TEST_LAUNCH_SEED)`)
+    /// and so no test ever rolls a random breed.
+    #[cfg(test)]
+    pub(crate) const TEST_LAUNCH_SEED: u64 = 0x5EED;
+
     /// [`Self::headless_for_test`] with an observing sink installed in every
     /// session capability from construction time. This keeps PTY-byte tests on
     /// the real per-session routing path instead of swapping only one mirror.
@@ -10353,6 +10385,9 @@ impl App {
             rain_dirty: true,
             // In-memory only: tests must never read/write the user's real ledger.
             kitty_log: crate::kitty_log::KittyLogHost::in_memory(),
+            // A FIXED seed: tests must never roll a random cat (assertions
+            // compare against `KittyLook::for_launch(TEST_LAUNCH_SEED)`).
+            launch_kitty: aterm_effects::kitty_registry::KittyLook::for_launch(Self::TEST_LAUNCH_SEED),
             kitty_summon_seq: 0,
             os_appearance: aterm_types::Appearance::default(),
             font_family: None,
@@ -10402,6 +10437,9 @@ impl App {
             frame_interval: MIN_FRAME_INTERVAL,
             bell_beep: BellRateLimiter::new(BELL_BEEP_INTERVAL),
             trail_audio: trail_audio::TrailAudio::new(false),
+            typing_sound_auditioned: aterm_effects::trail_sound::SoundVoice::default(),
+            lock_modifiers: keymap::no_lock_modifiers,
+            user_input_recent: platform::no_recent_user_input_event,
             image_queue,
             encode_tx: None,
             trace_latency: false,
@@ -10416,6 +10454,7 @@ impl App {
             _status_item: None,
             operator_status_fingerprint: None,
             operator_local_id: None,
+            operator_typed: false,
             fleet_instances: Vec::new(),
             pending_deminiaturize_focus: None,
             _toolbars: BTreeMap::new(),
@@ -12233,6 +12272,17 @@ impl ApplicationHandler<Wake> for App {
                 if ws.predictor.next_deadline().is_some_and(|d| now >= d) {
                     dirty = true;
                 }
+                // The program cat's tenure gate: a candidate claim just served
+                // its dwell → LAND it here, at wake time (`poll`), and repaint
+                // so the verdict dresses it (a silent program still gets
+                // dressed on time; a lingering cat still releases). Landing
+                // here rather than waiting for a present is what disarms the
+                // deadline even when this window is on a route that never
+                // reaches the verdict (a Settings/native tab) — an armed
+                // deadline nobody consumes would spin the loop.
+                if ws.kitty_tenure.poll(now) {
+                    dirty = true;
+                }
                 // M1 smooth-scroll glide in flight: queue this window — the tick
                 // locks the glide's own engine (scroll + repaint), so it is
                 // serviced AFTER the borrow loop, like the autoscroll ticks.
@@ -12940,6 +12990,19 @@ impl ApplicationHandler<Wake> for App {
                     &mut deadline_owner,
                     d,
                     metrics::DeadlineOwner::Predictor,
+                );
+            }
+            // The program cat's tenure gate: ONE wake at the instant the pending
+            // claim earns (or releases) the cursor — nothing while nothing is
+            // pending, so the gate can never pin the loop (idle-to-zero).
+            if ws.os_window.is_some()
+                && let Some(d) = ws.kitty_tenure.deadline()
+            {
+                fold_owned_deadline(
+                    &mut deadline,
+                    &mut deadline_owner,
+                    d,
+                    metrics::DeadlineOwner::KittyTenure,
                 );
             }
             // M1 smooth-scroll glide: frame-paced wakes while a Full-policy ease
@@ -14735,10 +14798,6 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(wid, position.x, position.y);
             }
-            // The pointer left the window entirely: mouse-out for the pet's
-            // hover label (its latch must not outlive a stale
-            // `last_cursor_px` that still claims to sit over the cat).
-            WindowEvent::CursorLeft { .. } => self.on_cursor_left(wid),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_input(wid, state, button);
                 // A tab-strip click closing the last tab sets the clicked window's
@@ -15833,9 +15892,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // (`ATERM_SHELL_INTEGRATION_INSTALLED=1`), and that export rides the
     // environment into the shell THIS instance spawns. The child's loader then
     // sees the inherited guard and bails before emitting a single OSC 133/633
-    // mark — no blocks, no cwd tracking, and no app-kitty identity source, so
-    // the per-app cursor breeds sit dead on the session kitty (the 0.19.0
-    // gauntlet's F3). The guard is a PER-SHELL-PROCESS fact, not a per-process-
+    // mark — no blocks, no cwd tracking, no `blocks`/`wait` verbs in that
+    // instance (the 0.19.0 gauntlet's F3, first noticed through the then-
+    // per-app cursor breeds). The guard is a PER-SHELL-PROCESS fact, not a per-process-
     // TREE fact, so override the inherited value with an EMPTY one (the pty
     // seam's `build_child_env` is override-only): the zsh/bash `[[ -n … ]]`
     // guards pass, the child shell loads its own marks, and its own re-export
@@ -15845,7 +15904,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // in the changelog.)
     if integrate {
         env_add.push((
-            crate::app_kitty::SHELL_INTEGRATION_LOADED_GUARD.to_string(),
+            crate::spawn::SHELL_INTEGRATION_LOADED_GUARD.to_string(),
             String::new(),
         ));
     }
@@ -16558,6 +16617,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // One fail-open startup read of `kitty-log.toml` (a config_path sibling);
         // Containment / no-config-dir degrade to in-memory-only silently.
         kitty_log: crate::kitty_log::KittyLogHost::load(app_config::config_path()),
+        // THE LAUNCH KITTY: one CSPRNG draw, here and nowhere else.
+        launch_kitty: aterm_effects::kitty_registry::KittyLook::for_launch(
+            crate::launch_kitty::mint_launch_seed(),
+        ),
         kitty_summon_seq: 0,
         os_appearance: aterm_types::Appearance::default(),
         // GLOBAL config (window-uniform): font family, Option-as-Meta, keybindings.
@@ -16622,6 +16685,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         trail_audio: trail_audio::TrailAudio::new(
             !headless && !bench_knobs::flood_quiet() && !config.serious_mode_or_default(),
         ),
+        typing_sound_auditioned: config.trail_sound_voice(),
+        lock_modifiers: if headless { keymap::no_lock_modifiers } else { keymap::lock_modifiers },
+        user_input_recent: if headless {
+            platform::no_recent_user_input_event
+        } else {
+            platform::recent_user_input_event
+        },
         image_queue,
         // The PNG encode worker is spawned on the first `image`/`window` capture.
         encode_tx: None,
@@ -16642,6 +16712,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         _status_item: None,
         operator_status_fingerprint: None,
         operator_local_id: None,
+        operator_typed: false,
         fleet_instances: Vec::new(),
         pending_deminiaturize_focus: None,
         // Native window toolbars, keyed per window; installed in `attach_os_window`.
@@ -19764,9 +19835,13 @@ mod multi_window_tests {
             let mode = KeyboardMode::DISAMBIGUATE_ESC_CODES
                 | KeyboardMode::REPORT_EVENT_TYPES
                 | KeyboardMode::REPORT_ALTERNATE_KEYS;
+            // The same source the headless `App` under test uses
+            // (`lock_modifiers: keymap::no_lock_modifiers`): a unit test never
+            // consults the platform's Caps Lock, so the bytes are pinned
+            // exactly, on every machine.
             encode_key_with_event(
                 &Key::Character('l'),
-                crate::keymap::modifiers_from_winit(mods) | crate::keymap::lock_modifiers(),
+                crate::keymap::modifiers_from_winit(mods) | crate::keymap::no_lock_modifiers(),
                 mode,
                 event_type,
             )
@@ -19942,9 +20017,7 @@ mod multi_window_tests {
         let bytes = codex_l_bytes(app.windows[&wid].mods, KeyEventType::Press);
         let ctrl_press = codex_l_bytes(ModifiersState::CONTROL, KeyEventType::Press);
         assert_eq!(bytes, ctrl_press);
-        if crate::keymap::lock_modifiers().is_empty() {
-            assert_eq!(bytes, b"\x1b[108;5u");
-        }
+        assert_eq!(bytes, b"\x1b[108;5u", "headless: no lock bits, so the byte pin is exact");
         let next = project_focus_modifier_cache(&app, wid, 1, i64::from(bytes == ctrl_press));
         assert_conforms(&model, "PressL", &state, &next);
         state = next;
@@ -19959,9 +20032,7 @@ mod multi_window_tests {
             bytes, ctrl_release,
             "real release keeps the same authoritative Ctrl modifier"
         );
-        if crate::keymap::lock_modifiers().is_empty() {
-            assert_eq!(bytes, b"\x1b[108;5:3u");
-        }
+        assert_eq!(bytes, b"\x1b[108;5:3u", "headless: no lock bits, so the byte pin is exact");
         assert!(!app.physical_press_owners.contains_key(&physical_l));
 
         // A genuine focused Ctrl-up remains authoritative too.

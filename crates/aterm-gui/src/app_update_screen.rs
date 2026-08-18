@@ -386,26 +386,6 @@ impl App {
             crate::notice::notice_rect(n, &geom, now, motion, self.notice_clear_rows());
         let (x, y) = self.window_to_frame(wid, x, y);
         let (px, py) = (x as f32 - pad, y as f32 - top);
-        // THE PET'S HOVER LABEL is an information surface, not a control, and
-        // THE PET OUTRANKS ITS OWN NAMEPLATE: a press that lands on the pet's
-        // padded body falls through this seam entirely (`false`) so the
-        // ordinary petting path — `pet_press_at`, later in `on_mouse_input`'s
-        // chain — still strokes the cat; the label must never make the pet
-        // unpettable (the deliberate INVERSE of Robi, whose bubble this seam
-        // consumes). A press on the card but OFF the cat is swallowed quietly
-        // (`true`, no dismiss — the label's lifecycle is hover, not clicks,
-        // and a click a card visually caught must not leak into the grid or
-        // a mouse-tracking app's stdin).
-        if n.is_pet_label() {
-            if self.windows.get(&wid).is_some_and(|ws| {
-                ws.pet_hit_rect.is_some_and(|r| {
-                    crate::app_mouse::pet_rect_hit(r, x, y, crate::app_mouse::PET_HIT_SLOP_PX)
-                })
-            }) {
-                return false;
-            }
-            return px >= rx && px < rx + rw && py >= ry && py < ry + rh;
-        }
         if px >= rx && px < rx + rw && py >= ry && py < ry + rh {
             self.notice = None;
             if actionable {

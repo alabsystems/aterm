@@ -2228,6 +2228,33 @@ pub struct WordDecorations {
     /// (pending or live) supernovae — classic nova ignitions are
     /// limiter-deferred while `now` is inside it.
     super_until: Option<Instant>,
+    /// §3.2 burst-mutex FAST PATH: the latest instant any burst window this
+    /// ENGINE has ever granted can still be running — an upper bound over
+    /// [`burst_mutex_end`] for every episode of every map it owns. `None`
+    /// until the first grant.
+    ///
+    /// WHY: [`Self::super_prepass`]'s busy scan walked the whole live episode
+    /// map on EVERY presented frame to compute `busy`/`until`/`super_until`,
+    /// and `burst_mutex_end` is `None` for every episode that is finished,
+    /// never granted, or not a burst kind — which is essentially all of them,
+    /// essentially always (a granted-and-unfinished window lasts ~1–3.6 s and
+    /// `MAX_ACTIVE_SUPERNOVAE = 1`). Since every end in the map is `<= hint`,
+    /// `now >= hint` proves the walk can only `continue` on every entry, so it
+    /// is skipped outright instead of touching up to `PERSIST_CAP` = 512
+    /// episodes to conclude nothing. This is EXACT, not conservative: the
+    /// skipped walk provably writes nothing and returns the same three values.
+    ///
+    /// MONOTONE ON PURPOSE. A max cannot be decremented incrementally without
+    /// re-deriving it, and the two error directions are not symmetric: an
+    /// over-held hint costs one wasted walk, while an under-held one would let
+    /// two burst windows overlap and falsify the `nova_add` quad bound (§3.2).
+    /// So it is folded at the ONLY two sites that grant a window (the two
+    /// ignition grants below) and shifted by [`Self::thaw`] with every other
+    /// stored instant; `nova_done`, eviction, grace expiry and pane parking can
+    /// only SHRINK the true max, so they leave it alone. Engine-wide rather
+    /// than per-map for the same reason: every grant is made against whichever
+    /// map is live at the time, so one bound covers the parked shards too.
+    burst_hint: Option<Instant>,
     /// v3 §3.2: session-scoped birth sequence, incremented on EVERY persist
     /// miss — the supernova roll's decorrelation term. Deliberately survives
     /// both `reset()` and `hard_reset()` (session-scoped, not episode state).
@@ -2979,6 +3006,12 @@ impl WordDecorations {
         }
         if let Some(s) = self.super_until {
             self.super_until = Some(s + d);
+        }
+        // The burst-mutex hint bounds `nova_start + window`, and `nova_start`
+        // was just shifted for every resident episode, so the bound shifts with
+        // them or it would stop bounding them.
+        if let Some(h) = self.burst_hint {
+            self.burst_hint = Some(h + d);
         }
         // §3.2b: combo heat is deliberately NOT thaw-shifted. `frozen_at` is
         // pane-scoped while the ring is window-wide, so shifting here would
@@ -6764,7 +6797,27 @@ impl WordDecorations {
                     // reduced, so a pure OS-reduce-motion user keeps the
                     // pose forever.
                     match ep.shown_as {
-                        Some(KittyShownAs::Cat) => {
+                        // A SPENT peek is skipped WHOLE. Nothing inside this
+                        // arm can transition once `peek_done` is latched — the
+                        // clearance pause, the resume, the start and the
+                        // completion each require an unfinished peek — and the
+                        // emission loop already `break`s on
+                        // `peek.peek_done` before it draws a quad. So a
+                        // finished cat still on screen was re-deriving
+                        // `cat_magic`, the v4 accessory and the whole
+                        // `peek_total_ms` chain (three `mix`es) on EVERY
+                        // presented frame, for as long as its word stayed
+                        // visible inside the 10 s grace TTL, to write a value
+                        // nothing would ever read again.
+                        //
+                        // CANNOT MOVE A PIXEL: the only state it stops writing
+                        // is `peek_pause`, `phase_start` and `peek_total`, and
+                        // every reader of those three is itself gated on
+                        // `!peek_done` — this arm, the scrolled-off sweep in
+                        // `stamp_spent_marks`, and `emit_cat` (whose `PeekView`
+                        // is built before the `peek_done` break but consulted
+                        // only after it).
+                        Some(KittyShownAs::Cat) if !ep.peek_done => {
                             // Clearance pause/resume: terminal text flooding
                             // the body footprint mid-peek vanishes the cat
                             // (emission gates on `cat_eligible` per frame) —
@@ -7053,18 +7106,35 @@ impl WordDecorations {
         // live end also folds into the returned wake, so a deferred grant
         // wakes AT the window end instead of waiting for unrelated damage.
         let mut busy = false;
-        for ep in self.persist.values() {
-            let Some(end) = burst_mutex_end(ep) else {
-                continue;
-            };
-            if now >= end {
-                continue;
+        // O(1) SKIP (see [`Self::burst_hint`]): every end this map can hold is
+        // `<= hint`, so once `now` reaches it the walk below can only take its
+        // `now >= end` continue on every entry — `busy` stays false and both
+        // maxes stay `None`. The debug build re-derives the answer and shouts
+        // if the two ever disagree, exactly like the parked shards' summary
+        // below: a hint that is even slightly LOW would under-hold the mutex
+        // and let a classic nova and a supernova overlap.
+        if self.burst_hint.is_some_and(|h| now < h) {
+            for ep in self.persist.values() {
+                let Some(end) = burst_mutex_end(ep) else {
+                    continue;
+                };
+                if now >= end {
+                    continue;
+                }
+                busy = true;
+                until = Some(until.map_or(end, |u: Instant| u.max(end)));
+                if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
+                    self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
+                }
             }
-            busy = true;
-            until = Some(until.map_or(end, |u: Instant| u.max(end)));
-            if matches!(ep.burst_kind, Some(BurstKind::SuperNova)) {
-                self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
-            }
+        } else {
+            debug_assert!(
+                !self
+                    .persist
+                    .values()
+                    .any(|ep| burst_mutex_end(ep).is_some_and(|end| now < end)),
+                "a live burst window outlived the burst-mutex hint"
+            );
         }
         // The parked shards contribute through their O(1) cached summary rather
         // than a second, CHAINED walk of every other pane's whole episode map —
@@ -7139,6 +7209,12 @@ impl WordDecorations {
                     continue;
                 };
                 ep.nova_start = Some(start);
+                // Fold the granted window into the monotone burst-mutex hint
+                // (see [`Self::burst_hint`]) through the SAME predicate the
+                // busy scan reads, so the bound and the scan cannot drift.
+                if let Some(end) = burst_mutex_end(ep) {
+                    self.burst_hint = Some(self.burst_hint.map_or(end, |h: Instant| h.max(end)));
+                }
                 // §1.1: burst_done at IGNITION GRANT — a supernova scrolled
                 // off mid-blast never replays when the word comes back.
                 ep.burst_started = true;
@@ -7276,6 +7352,12 @@ impl WordDecorations {
                     continue;
                 };
                 ep.nova_start = Some(start);
+                // The classic half of the burst-mutex hint fold (see
+                // [`Self::burst_hint`]): the mutex is TWO-WAY, so a live
+                // CLASSIC window must raise the bound exactly like a supernova.
+                if let Some(end) = burst_mutex_end(ep) {
+                    self.burst_hint = Some(self.burst_hint.map_or(end, |h: Instant| h.max(end)));
+                }
                 // v3 §1.1: `burst_done` is set at IGNITION GRANT — detonation
                 // start is the point of no return; a nova scrolled off
                 // mid-blast never replays when the word comes back (done-mark
@@ -8262,6 +8344,50 @@ fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -
 /// `amp = 4c³ / (27(c+1)²)` by bisection so `max f = 1 + amp` (the genome
 /// amplitude, kitten-scaled ×1.3). `f(0) = 0`, `f(1) = 1`.
 fn ease_out_back(p: f32, amp: f32) -> f32 {
+    let c = overshoot_c(amp);
+    let u = p - 1.0;
+    1.0 + (c + 1.0) * u * u * u + c * u * u
+}
+
+/// Solve `amp = 4c³ / (27(c+1)²)` for `c` — MEMOIZED on the exact `f32` bits
+/// of `amp`.
+///
+/// THE BISECTION BELOW IS THE ORIGINAL, VERBATIM: 24 rounds on `[0, 6]`, the
+/// same `over`, the same midpoint, the same tie rule. So the `c` this returns
+/// is the same `f32` the inline loop produced, bit for bit, every rounded
+/// reveal is unchanged, and no pixel of a cat's entrance moves. Do NOT
+/// "improve" it into the closed-form real root of the cubic: that shifts `c` by
+/// a few ULPs, `ease_out_back(p, amp) * rest` then rounds to a different
+/// integer on some frames of some genomes, and the entrance overshoot moves by
+/// a pixel — invisible to every test in this file and exactly the regression
+/// this repo verifies against real frames.
+///
+/// WHY A MEMO IS ENOUGH: `amp` is frame-invariant and drawn from a tiny fixed
+/// set — `(0.06 + a 2-bit genome field × 0.04) × {1.0, 1.3}` in [`emit_cat`],
+/// the same without the kitten factor in [`emit_animal`] — so EIGHT values
+/// cover every cat and every animal that will ever exist. The solve was being
+/// re-run from scratch on every frame of every rising sprite (24 serial
+/// divides each, up to `MAX_CATS + MAX_ANIMALS` = 16 sprites at once) to
+/// recover one of eight constants.
+fn overshoot_c(amp: f32) -> f32 {
+    // Past the reachable set with headroom. A ninth amplitude (only a custom
+    // spec could produce one) simply misses and pays the solve — i.e. what
+    // every call paid before.
+    const SLOTS: usize = 16;
+    thread_local! {
+        static MEMO: std::cell::RefCell<[(u32, f32); SLOTS]> =
+            const { std::cell::RefCell::new([(0, 0.0); SLOTS]) };
+    }
+    // Key 0 marks an empty slot. `amp = +0.0` is not a reachable amplitude (the
+    // smallest is 0.06), so nothing real is denied a slot by that choice; a
+    // zero amplitude just never caches.
+    let key = amp.to_bits();
+    if key != 0
+        && let Some(c) =
+            MEMO.with_borrow(|memo| memo.iter().find_map(|&(k, c)| (k == key).then_some(c)))
+    {
+        return c;
+    }
     let over = |c: f32| 4.0 * c * c * c / (27.0 * (c + 1.0) * (c + 1.0));
     let (mut lo, mut hi) = (0.0f32, 6.0f32);
     for _ in 0..24 {
@@ -8269,8 +8395,14 @@ fn ease_out_back(p: f32, amp: f32) -> f32 {
         if over(mid) < amp { lo = mid } else { hi = mid }
     }
     let c = 0.5 * (lo + hi);
-    let u = p - 1.0;
-    1.0 + (c + 1.0) * u * u * u + c * u * u
+    if key != 0 {
+        MEMO.with_borrow_mut(|memo| {
+            if let Some(slot) = memo.iter_mut().find(|(k, _)| *k == 0) {
+                *slot = (key, c);
+            }
+        });
+    }
+    c
 }
 
 /// v3 §1.2 descend easing (easeInOutCubic), `f(0) = 0`, `f(1) = 1`.
@@ -9398,9 +9530,32 @@ fn emit_rainbow_ink(
     };
     let step = cfg.ink_strength.clamp(0.0, 1.0) / 8.0;
     let mut strength = cfg.ink_strength.clamp(0.0, 1.0);
+    // The four guard samples are LOOP-INVARIANT: `hue_at` reads `base_hue`,
+    // `span_used`, `phase`, `sat` and `val` — every one of them fixed before
+    // the loop starts — and NOT `strength`. A failing sample restarted the
+    // whole sweep, so the same four colours were re-derived on every one of up
+    // to 9 passes: up to 36 `hsv2rgb` per word per frame, settled or not (past
+    // `drift_ms` the phase is pinned to exactly 0.0 and this function's output
+    // cannot change at all). Hoisted, they cost 4.
+    //
+    // BIT-IDENTICAL by construction: `hsv2rgb` is a pure function with no
+    // accumulator, the four `u` values and the order they are consumed in are
+    // unchanged, so every `f32` — and therefore every emitted `InkCell`, and
+    // the fingerprint that folds it — is the same as before, sample for
+    // sample. What changes is only that a pass which used to short-circuit at
+    // the FIRST failing sample now finds all four already computed: the sweep
+    // is paid once instead of once per pass. (The single case that does more
+    // work than before is `ink_strength == 0`, where the loop never ran at all
+    // — a setting that erases the ink entirely.)
+    let guard_hues = [
+        hue_at(0.0),
+        hue_at(1.0 / 3.0),
+        hue_at(2.0 / 3.0),
+        hue_at(1.0),
+    ];
     'guard: while strength > 0.0 {
-        for u in [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0] {
-            if contrast(mix_rgb(fg_first, hue_at(u), strength)) < MIN_INK_CONTRAST {
+        for hue in guard_hues {
+            if contrast(mix_rgb(fg_first, hue, strength)) < MIN_INK_CONTRAST {
                 strength = (strength - step).max(0.0);
                 continue 'guard;
             }
@@ -21343,15 +21498,15 @@ mod tests {
     ///
     /// The claim is HALF true, and this test states which half:
     ///
-    /// * TRUE for the floor. [`KittyLook::for_session`] and `for_app` decode
-    ///   `variant` through [`crate::genome::cat_variant_v4`], which indexes
-    ///   `HEADS` — and `SpecManeki` is not in it. A user whose ledger is empty
+    /// * TRUE for the floor. [`KittyLook::for_launch`] decodes `variant`
+    ///   through [`crate::genome::cat_variant_v4`], which indexes `HEADS` —
+    ///   and `SpecManeki` is not in it. A user who never pins a favourite
     ///   therefore never wears the Lucky Bean, no matter how long they wait.
     /// * FALSE for the discovery lane. An AMBIENT word-cat resolves its variant
     ///   as `special_variant_v4(magic).unwrap_or(head)`, so the maneki does
     ///   appear on screen (1/512 of feline sightings), it is logged with that
-    ///   variant, and a collected one becomes `discovery_look` — which is what
-    ///   the cursor companion wears.
+    ///   variant, and a collected one can be PINNED as the favourite — which
+    ///   is what the cursor companion then wears.
     ///
     /// So the enlarged art IS reachable, and this pins the path end to end: a
     /// look carrying `SpecManeki` survives `normalized()` and the ONE sizing
@@ -21359,23 +21514,23 @@ mod tests {
     /// the maneki's OWN authored aspect — the widened one, which is how the
     /// bigger paw reaches glass at all.
     #[test]
-    fn the_enlarged_maneki_is_off_the_session_roster_but_on_the_discovery_path() {
+    fn the_enlarged_maneki_is_off_the_launch_roster_but_on_the_discovery_path() {
         use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS, GlyphRole, HEADS};
         use crate::genome::CatAge;
 
-        // ── the skeptic's half: never rolled by the session/app floor ───────
+        // ── the skeptic's half: never rolled by the launch floor ────────────
         assert!(
             !HEADS.contains(&CatGlyphId::SpecManeki),
             "PRECONDITION: the maneki is a SPECIAL, not a head"
         );
         assert!(
-            (0..4096u64).any(|s| KittyLook::for_session(s).variant == CatGlyphId::S103),
+            (0..4096u64).any(|s| KittyLook::for_launch(s).variant == CatGlyphId::S103),
             "PRECONDITION: the sample really does roll heads, so the negative \
              below is not vacuous"
         );
         assert!(
-            (0..4096u64).all(|s| KittyLook::for_session(s).variant != CatGlyphId::SpecManeki),
-            "the session kitty can never BE the maneki — the enlarged paw is \
+            (0..4096u64).all(|s| KittyLook::for_launch(s).variant != CatGlyphId::SpecManeki),
+            "the launch kitty can never BE the maneki — the enlarged paw is \
              unreachable through that lane"
         );
 

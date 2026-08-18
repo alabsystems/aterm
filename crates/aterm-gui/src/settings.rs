@@ -1280,6 +1280,12 @@ fn enum_alias(key: &str, token: &str) -> Option<&'static str> {
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
         return prefs::cursor_trail_style_canonical(token);
     }
+    // Typing-sound aliases (water → droplet, mech → mechanical, bell → glass
+    // bell, …) resolve through the synth's own parser, so an authored alias
+    // projects onto its picker row instead of showing as a custom entry.
+    if key == prefs::EDIT_TRAIL_SOUND_STYLE {
+        return prefs::trail_sound_style_canonical(token);
+    }
     Some(match (key, token.to_ascii_lowercase().as_str()) {
         (prefs::EDIT_CURSOR_STYLE, "beam" | "underline") => "bar",
         (prefs::EDIT_BIDI, "off") => "disabled",
@@ -6436,6 +6442,25 @@ mod tests {
                 "trail alias {alias:?} must not become a custom option"
             );
         }
+
+        // The typing-sound picker: every synth alias (water → droplet, mech →
+        // mechanical, bell → glass bell, …) projects onto its picker row, the
+        // row is a POPUP chip (14 options), and ←/→ steps the roster.
+        for &(alias, voice) in aterm_effects::trail_sound::SoundVoice::ALIASES {
+            let canonical = voice.name();
+            let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, alias);
+            assert!(uses_popup(&f), "typing sound is a popup chip");
+            assert_eq!(SettingsState::display_value(&f), canonical, "{alias}");
+            assert_eq!(enum_current(&f), canonical, "{alias}");
+            assert_eq!(
+                popup_options(&f).len(),
+                crate::prefs::TRAIL_SOUND_STYLES.len(),
+                "typing-sound alias {alias:?} must not become a custom option"
+            );
+        }
+        let f = field(crate::prefs::EDIT_TRAIL_SOUND_STYLE, "water");
+        assert_eq!(enum_current(&f), "droplet");
+        assert_eq!(cycle_edit(&f).unwrap().1.as_deref(), Some("pew"));
     }
 
     #[test]

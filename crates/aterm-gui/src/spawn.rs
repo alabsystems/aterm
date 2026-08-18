@@ -20,6 +20,20 @@ use crate::{
     term_lock,
 };
 
+/// The shell-integration loader's load-once guard variable — the env var the
+/// shipped zsh/bash scripts check (`[[ -n … ]] && return`) and then `export`.
+///
+/// Named HERE because it is a lifeline for shell integration in a NESTED
+/// aterm: an aterm spawned from a shell that itself runs inside aterm
+/// inherits the parent shell's exported guard, the child loader bails, no
+/// OSC 133/633 marks are ever emitted, and blocks / cwd tracking / the
+/// `blocks`/`wait` verbs sit dead in that instance (the 0.19.0 gauntlet's
+/// F3, first noticed through the then-per-app cursor breeds). The spawn env
+/// assembly in `lib.rs` overrides the inherited value with an EMPTY string
+/// for every integrated session; the test below pins this name against the
+/// shipped scripts so the two can never drift apart.
+pub(crate) const SHELL_INTEGRATION_LOADED_GUARD: &str = "ATERM_SHELL_INTEGRATION_INSTALLED";
+
 /// Prepare OSC 133/633 shell integration for `$SHELL`: returns the `(key, value)`
 /// environment additions + an optional argv override (bash's `--rcfile`) to
 /// inject into the spawned shell so it emits the command marks the
@@ -872,6 +886,36 @@ impl DeferredReaderGate {
             };
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod shell_integration_guard_tests {
+    use super::SHELL_INTEGRATION_LOADED_GUARD;
+
+    /// The NESTED-LAUNCH lifeline (gauntlet F3 root cause): the spawn env
+    /// overrides the inherited [`SHELL_INTEGRATION_LOADED_GUARD`] with an
+    /// EMPTY value, which only defuses the loader guard if the shipped
+    /// scripts (a) use exactly this variable name and (b) test it with a
+    /// non-empty check (`[[ -n … ]]`). Pin both so the script and the spawn
+    /// scrub can never drift apart silently.
+    #[test]
+    fn nested_launch_guard_name_matches_the_shipped_scripts() {
+        use aterm_core::shell_integration::scripts;
+        let guard_test = format!("[[ -n \"${SHELL_INTEGRATION_LOADED_GUARD}\" ]]");
+        for (shell, script) in [("zsh", scripts::ZSH), ("bash", scripts::BASH)] {
+            assert!(
+                script.contains(SHELL_INTEGRATION_LOADED_GUARD),
+                "{shell}: the loader guard variable was renamed — update \
+                 SHELL_INTEGRATION_LOADED_GUARD and the lib.rs spawn scrub"
+            );
+            assert!(
+                script.contains(&guard_test),
+                "{shell}: the loader guard is no longer a `[[ -n … ]]` check, \
+                 so an empty-string override would not defuse it — rework the \
+                 nested-launch scrub"
+            );
+        }
     }
 }
 

@@ -343,25 +343,51 @@ pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     // charset change — byte-identical master, one 12 KB memcpy.
     let mut master = decorative_master().clone();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
-        let Some(bitmap) = material_bitmap(ch) else {
-            continue;
-        };
-        let glyph = &mut master.rows[glyph_index * MASTER_H..(glyph_index + 1) * MASTER_H];
-        glyph.fill(0);
-        for (sy, bits) in bitmap.into_iter().enumerate() {
-            for sx in 0..8usize {
-                if bits & (1 << sx) == 0 {
-                    continue;
-                }
-                for dy in 0..5usize {
-                    for dx in 0..2usize {
-                        plot(glyph, (4 + sx * 2 + dx) as i32, (4 + sy * 5 + dy) as i32);
-                    }
+        author_material_glyph(&mut master, glyph_index, ch);
+    }
+    master
+}
+
+/// Author ONE material slot over the decorative glyph already resident in it.
+/// An unsupported code point leaves that decorative glyph untouched — the
+/// whole-master loop's `continue`, and the reason literal mode never
+/// substitutes a different-looking character.
+fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
+    let Some(bitmap) = material_bitmap(ch) else {
+        return;
+    };
+    let glyph = &mut master.rows[slot * MASTER_H..(slot + 1) * MASTER_H];
+    glyph.fill(0);
+    for (sy, bits) in bitmap.into_iter().enumerate() {
+        for sx in 0..8usize {
+            if bits & (1 << sx) == 0 {
+                continue;
+            }
+            for dy in 0..5usize {
+                for dx in 0..2usize {
+                    plot(glyph, (4 + sx * 2 + dx) as i32, (4 + sy * 5 + dy) as i32);
                 }
             }
         }
     }
-    master
+}
+
+/// Re-author ONE slot of an ALREADY AUTHORED master IN PLACE: restore the
+/// decorative glyph every slot of [`rasterize_material_master`] starts from,
+/// then author `ch` over it (or leave the decorative glyph when the slot is now
+/// unused). The resulting slot is byte-identical to the same slot of
+/// `rasterize_material_master(new_chars)`; the difference is that the slots
+/// whose character did NOT change are not rewritten, and the 12 KB fork of the
+/// decorative master is not paid at all.
+pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<char>) {
+    if slot >= ROM_GLYPHS {
+        return;
+    }
+    let range = slot * MASTER_H..(slot + 1) * MASTER_H;
+    master.rows[range.clone()].copy_from_slice(&decorative_master().rows[range]);
+    if let Some(ch) = ch {
+        author_material_glyph(master, slot, ch);
+    }
 }
 
 /// Set pixel `(x, y)` if in bounds.

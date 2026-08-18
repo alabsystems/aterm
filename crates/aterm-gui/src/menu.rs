@@ -234,15 +234,19 @@ pub enum MenuAction {
     /// no session to toggle. The palette row's checkmark mirrors the front
     /// session's effective state.
     ToggleMatrixRain,
-    /// Promote the FRONT SESSION's own kitty into the durable kitty registry and
-    /// pin it as the cursor companion (`App::favourite_session_kitty`). Owner:
-    /// "there is a unique kitty chosen per session … if somebody really likes
-    /// that kitty it goes into the kitty registry". Terminal-only
-    /// ([`requires_terminal_tab`]): a native whole tab has no session, hence no
-    /// session kitty. The palette row's checkmark reports whether THIS session's
-    /// kitty is the current pin. One-way: the pin is transferable, not
-    /// toggleable.
-    FavouriteSessionKitty,
+    /// Promote the front window's PROMOTABLE kitty — the tenured program cat
+    /// on its glass, else the launch kitty (the base cat generated at launch,
+    /// per computer; owner rulings 2026-08-17) — into the durable kitty
+    /// registry and pin it as the cursor companion (`App::favourite_kitty`).
+    /// Owner: "if somebody really likes that kitty it goes into the kitty
+    /// registry" — and since a pinned favourite outranks both program cats
+    /// and the launch kitty, this is also how a cat you like is KEPT across
+    /// launches and programs. Process-wide (never terminal-only: the launch
+    /// kitty exists without a front session). The palette row's checkmark
+    /// reports whether that promotable kitty is the current pin. One-way: the
+    /// pin is transferable, not toggleable. Wire id 46 and the legacy invoke
+    /// spelling `FavouriteSessionKitty` are kept ([`canonical_invoke_name`]).
+    FavouriteKitty,
     /// Toggle the process-wide serious-mode policy. While enabled it suppresses
     /// every audible and decorative effect without overwriting the underlying
     /// preferences; disabling it restores those requested settings exactly.
@@ -343,7 +347,7 @@ impl MenuAction {
             MenuAction::CopyCwd => 43,
             MenuAction::ToggleMatrixRain => 44,
             MenuAction::ToggleSeriousMode => 45,
-            MenuAction::FavouriteSessionKitty => 46,
+            MenuAction::FavouriteKitty => 46,
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
         }
@@ -396,11 +400,24 @@ impl MenuAction {
             43 => MenuAction::CopyCwd,
             44 => MenuAction::ToggleMatrixRain,
             45 => MenuAction::ToggleSeriousMode,
-            46 => MenuAction::FavouriteSessionKitty,
+            46 => MenuAction::FavouriteKitty,
             47 => MenuAction::Packages,
             48 => MenuAction::RenameSession,
             _ => return None,
         })
+    }
+}
+
+/// Fold a legacy `invoke` spelling onto the current Debug token. ONE alias:
+/// `FavouriteSessionKitty` — the wire name of the favourite action until the
+/// launch-kitty ruling (2026-08-17) retired the session kitty and renamed the
+/// action [`MenuAction::FavouriteKitty`]. Scripts and keybindings that still
+/// say the old name keep working; the numeric wire id (46) never moved.
+#[must_use]
+pub(crate) fn canonical_invoke_name(name: &str) -> &str {
+    match name {
+        "FavouriteSessionKitty" => "FavouriteKitty",
+        other => other,
     }
 }
 
@@ -417,9 +434,6 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The rain toggle acts on the front SESSION; a native whole tab
             // has none, so the item greys out rather than dead-clicking.
             | MenuAction::ToggleMatrixRain
-            // The favourite promotes the front SESSION's own kitty — a native
-            // whole tab has no session, so it has no session kitty to pin.
-            | MenuAction::FavouriteSessionKitty
             // The pin is SESSION metadata; a native whole tab owns no session,
             // so the item greys rather than opening an editor over nothing.
             | MenuAction::RenameSession
@@ -552,7 +566,7 @@ impl MenuAction {
             // Writes ONLY the machine-owned toy ledger (`kitty-collectibles.toml`
             // and its `kitty-log.toml` mirror) — never `aterm.toml`, no security
             // knob, no capability escalation. That is why it is not `ConfigWrite`.
-            | MenuAction::FavouriteSessionKitty
+            | MenuAction::FavouriteKitty
             // Opens the inline pin editor. Its eventual write is `meta set title`,
             // which the control layer's own `escalated_op` already classifies as
             // `WriteInput` (not `ConfigWrite` — nothing durable on disk is
@@ -574,7 +588,7 @@ impl MenuAction {
     /// in lockstep with the enum by `invoke_name_round_trips`.
     #[must_use]
     pub(crate) fn from_invoke_name(name: &str) -> Option<MenuAction> {
-        match name {
+        match canonical_invoke_name(name) {
             "About" => Some(MenuAction::About),
             "SoftwareUpdate" => Some(MenuAction::SoftwareUpdate),
             "Version" => Some(MenuAction::Version),
@@ -604,7 +618,7 @@ impl MenuAction {
             "SplitVertical" => Some(MenuAction::SplitVertical),
             "SplitHorizontal" => Some(MenuAction::SplitHorizontal),
             "ToggleMatrixRain" => Some(MenuAction::ToggleMatrixRain),
-            "FavouriteSessionKitty" => Some(MenuAction::FavouriteSessionKitty),
+            "FavouriteKitty" => Some(MenuAction::FavouriteKitty),
             "ToggleSeriousMode" => Some(MenuAction::ToggleSeriousMode),
             "ToggleSettings" => Some(MenuAction::ToggleSettings),
             "Packages" => Some(MenuAction::Packages),
@@ -867,8 +881,8 @@ const VIEW_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: "Favourite Session Kitty",
-        action: MenuAction::FavouriteSessionKitty,
+        label: "Favourite This Kitty",
+        action: MenuAction::FavouriteKitty,
         key: "",
         mods: MenuMods::None,
     },
@@ -1694,16 +1708,17 @@ mod macos {
             "",
             false,
         );
-        // Promote the front session's own kitty into the durable registry.
-        // Terminal-only, so `requires_terminal_tab` greys it over a native
-        // whole tab. No key-equivalent: a rare, one-way act, reachable from the
-        // menu bar and the ⇧⌘P palette (the cross-platform surface).
+        // Promote the promotable kitty (program cat on glass, else the launch
+        // kitty) into the durable registry and pin it. Process-wide, so it is
+        // never greyed. No key-equivalent: a rare,
+        // one-way act, reachable from the menu bar and the ⇧⌘P palette (the
+        // cross-platform surface).
         add_item(
             mtm,
             &view,
             target,
-            "Favourite Session Kitty",
-            MenuAction::FavouriteSessionKitty,
+            "Favourite This Kitty",
+            MenuAction::FavouriteKitty,
             "",
             false,
         );
@@ -2158,7 +2173,7 @@ mod tests {
         MenuAction::RenameSession,
         MenuAction::ToggleSeriousMode,
         MenuAction::ToggleMatrixRain,
-        MenuAction::FavouriteSessionKitty,
+        MenuAction::FavouriteKitty,
         MenuAction::ToggleSettings,
         MenuAction::Packages,
         MenuAction::OpenPalette,
@@ -2455,8 +2470,6 @@ mod tests {
                     // Per-session rain acts on the front SESSION — no session
                     // under a native whole tab, so the item greys out there.
                     | MenuAction::ToggleMatrixRain
-                    // Same reason: no session ⇒ no session kitty to promote.
-                    | MenuAction::FavouriteSessionKitty
                     // Same reason: the pin is SESSION metadata.
                     | MenuAction::RenameSession
             );

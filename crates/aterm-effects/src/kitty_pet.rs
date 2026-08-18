@@ -60,15 +60,21 @@
 //! The pet's LOOK — the `(coat, iris)` pair the host syncs from the companion
 //! verdict — is latched per appearance ([`PetBrain::sync_look`]): a differing
 //! verdict PARKS while the pet is visible. A park that stays stable through
-//! [`HANDOFF_DEBOUNCE`] (an app identity flips shell→app→shell around every
-//! command, and short flips must dissolve unseen) earns the HANDOFF: the pet
-//! swaps to the new look IN PLACE — position, gait, mood and sleep carried
-//! through exactly like a species reskin — while a **departing body** wearing
-//! the OLD look spawns where it stood and runs off toward the nearest edge on
-//! its side of the caret, fading out as it goes. For a moment the outgoing
-//! kitty and the incoming one are genuinely both on screen; that is the show
-//! (owner ask, 2026-08-15: "multiple kitties per screen while they are
-//! running a swap").
+//! [`HANDOFF_DEBOUNCE`] earns the HANDOFF: the pet swaps to the new look IN
+//! PLACE — position, gait, mood and sleep carried through exactly like a
+//! species reskin — while a **departing body** wearing the OLD look spawns
+//! where it stood and runs off toward the nearest edge on its side of the
+//! caret, fading out as it goes. For a moment the outgoing kitty and the
+//! incoming one are genuinely both on screen; that is the show (owner ask,
+//! 2026-08-15: "multiple kitties per screen while they are running a swap").
+//! Since the 2026-08-17 rulings the verdict changes rarely and deliberately —
+//! a program that has EARNED the cursor through the host's tenure gate, the
+//! base cat returning after the program is gone, a favourite pin — so the
+//! handoff is a ceremony, not a metronome; the debounce stays as the guard
+//! against any host that syncs a flapping verdict. And the swap is soft: the
+//! incoming kitty fades UP over [`ARRIVE_IN`] while the departing body runs
+//! off — the old cat leaving, the new one arriving — never a one-frame
+//! recolour (owner: "switching the cats all the time is too abrupt").
 //!
 //! Departing bodies are scripted transients, not second brains: each is a
 //! pure function of its spawn record and the brain's own clock (clockless,
@@ -822,10 +828,12 @@ const BAT_TTL: f32 = 1.5;
 const BAT_HOLD: f32 = 0.6;
 
 /// BREED HANDOFF: a look sync parked mid-appearance ([`PetBrain::sync_look`])
-/// must have stayed STABLE this long before the handoff fires — an app
-/// identity flips shell→app→shell around every command round-trip, and a
-/// ghost body sprinting off at every prompt would be a metronome, not an
-/// animal. Short flips clear the park (and its clock) long before this.
+/// must have stayed STABLE this long before the handoff fires. The host's
+/// tenure gate already keeps the verdict from flapping (a program earns the
+/// cursor by holding the pane for seconds; the cat lingers after it exits),
+/// so this is the second guard: a host syncing a flapping verdict must never
+/// turn the pet into a metronome of ghost bodies — short flips clear the park
+/// (and its clock) long before this.
 const HANDOFF_DEBOUNCE: f32 = 2.5;
 /// The departing body's tail fade (seconds) — deliberately faster than
 /// [`FADE_OUT`]: the old kitty is EXITING on purpose, not dissolving. The
@@ -842,6 +850,18 @@ const DEPART_SPEED: f32 = 18.0;
 /// the departure is strictly finite BY CONSTRUCTION, so it can never pin
 /// `needs_frames` past its own window (the idle-to-zero law).
 const DEPART_MAX: f32 = 2.0;
+/// THE ARRIVAL: the incoming kitty of a breed handoff fades UP over this long
+/// (owner, 2026-08-17: "switching the cats all the time is too abrupt" — the
+/// old handoff recoloured the standing pet in one frame). Longer than
+/// [`FADE_IN`] on purpose: this is a change of character, not a first
+/// sighting, and it overlaps the departing body's run so for a moment the
+/// old cat is leaving while the new one is still faint — a handover, not a
+/// cut. Finite by construction, so `needs_frames` releases after it.
+const ARRIVE_IN: f32 = 0.9;
+/// The arrival ramp's floor: the incoming kitty's alpha on the landing frame
+/// (× 255 ≈ 15) — faint, but on glass, so hosts that gate the pet (and its
+/// departing body) on `alpha > 0` never see a blank frame at the swap.
+const ARRIVE_FLOOR: f32 = 0.06;
 
 /// THE CAP on concurrent departing bodies — the documented "multiple kitties
 /// per screen" bound. Rapid tab cycling may layer departures; past this many
@@ -1609,6 +1629,11 @@ pub struct PetBrain {
     /// parked pair was parked — the [`HANDOFF_DEBOUNCE`] anchor. Restamped
     /// whenever the park changes, cleared when it dissolves or lands.
     handoff_parked_clock: Option<f64>,
+    /// Seconds left of the breed handoff's ARRIVAL ramp ([`ARRIVE_IN`]): the
+    /// emitted alpha is scaled by `1 − arrive_t/ARRIVE_IN`, so the incoming
+    /// kitty fades up in place while the departing body runs off. Zero
+    /// outside a handoff.
+    arrive_t: f32,
     /// The live departing bodies (the handoff's outgoing kitties), each a
     /// self-expiring birth record resolved per frame — the mote lane's shape,
     /// capped at [`PET_DEPARTURES_MAX`] with oldest-drops-first overflow.
@@ -1726,6 +1751,7 @@ impl Default for PetBrain {
             worn: None,
             pending_worn: None,
             handoff_parked_clock: None,
+            arrive_t: 0.0,
             departures: [None; PET_DEPARTURES_MAX],
         }
     }
@@ -2293,6 +2319,7 @@ impl PetBrain {
             // rule), and nothing left to pin `needs_frames` on a hidden cat.
             self.departures = [None; PET_DEPARTURES_MAX];
             self.handoff_parked_clock = None;
+            self.arrive_t = 0.0;
             // Micro-life sleeps with the audience gone.
             self.twitch_t = 0.0;
             self.last_burst = false;
@@ -2415,6 +2442,7 @@ impl PetBrain {
             }
             self.handoff_parked_clock = None;
             self.departures = [None; PET_DEPARTURES_MAX];
+            self.arrive_t = 0.0;
             self.action = if self.quiet >= SLEEP_AFTER {
                 PetAction::Sleep
             } else {
@@ -2504,6 +2532,7 @@ impl PetBrain {
         self.twitch_t = (self.twitch_t - dt).max(0.0);
         self.stumble_t = (self.stumble_t - dt).max(0.0);
         self.bored_cool = (self.bored_cool - dt).max(0.0);
+        self.arrive_t = (self.arrive_t - dt).max(0.0);
         if burst_edge
             && self.twitch_t <= 0.0
             && self.watch_heat < WATCH_GATE
@@ -3427,6 +3456,9 @@ impl PetBrain {
                 // `unwrap_or` above on a never-dressed pet) spawns no ghost:
                 // two identical kitties on glass would read as a render bug.
                 if old != pair {
+                    // The new cat ARRIVES (fades up over ARRIVE_IN) while the
+                    // old one runs off — never a one-frame recolour.
+                    self.arrive_t = ARRIVE_IN;
                     self.spawn_departure(Departure {
                         born: self.clock,
                         coat: old.0,
@@ -4869,8 +4901,19 @@ impl PetBrain {
             scale_y *= if self.twitch_up { 1.0 + q } else { 1.0 - q };
         }
 
+        // The breed handoff's ARRIVAL: the incoming kitty fades up over
+        // ARRIVE_IN — multiplied into the fade envelope, never replacing it.
+        // Floored so the landing frame is FAINT, never absent: hosts gate
+        // "is the pet on glass" on alpha > 0, and a zero here would blank
+        // the pet, its hit-box and the just-spawned departing body for one
+        // frame — the very cut the arrival exists to remove.
+        let arrival = if self.arrive_t > 0.0 {
+            (1.0 - (self.arrive_t / ARRIVE_IN).clamp(0.0, 1.0)).max(ARRIVE_FLOOR)
+        } else {
+            1.0
+        };
         PetFrame {
-            alpha: (self.alpha.clamp(0.0, 1.0) * 255.0) as u8,
+            alpha: (self.alpha.clamp(0.0, 1.0) * arrival * 255.0) as u8,
             action: self.action,
             // THE SPECIES SKIN, APPLIED LAST. Everything above chose a CAT
             // pose; `skin` swaps in the same frame from another species'
@@ -4923,11 +4966,11 @@ impl PetBrain {
         self.alpha > 0.0
     }
 
-    /// Host sync for the pet's collected identity — the flying kitty's
-    /// per-appearance look latch (`kitty_cursor::CursorCat::set_look`),
-    /// extended to the pet: ONE APPEARANCE WEARS ONE CAT. The host passes
-    /// this frame's GLOBAL `(coat, iris)` verdict and draws whatever comes
-    /// back.
+    /// Host sync for the pet's identity — the flying kitty's per-appearance
+    /// look latch (`kitty_cursor::CursorCat::set_look`), extended to the pet:
+    /// ONE APPEARANCE WEARS ONE CAT. The host passes this frame's verdict for
+    /// its window — `(coat, iris)` of a pinned favourite, else the tenured
+    /// program cat, else the launch kitty — and draws whatever comes back.
     ///
     /// While the fade envelope is at zero (or the pet has never been dressed)
     /// there is nothing on screen to protect, so the sync applies
@@ -4937,9 +4980,9 @@ impl PetBrain {
     /// the module's handoff section) or once the envelope returns to zero
     /// (`tick`'s no-caret arm). The host re-syncs every emission, so the
     /// parking slot always holds the latest verdict, never a stale
-    /// intermediate. A typed discovery in pet mode therefore latches
-    /// SILENTLY for the next appearance — the pet has no collection-hello
-    /// presentation, by design.
+    /// intermediate. A favourite pinned in pet mode therefore latches
+    /// SILENTLY for the handoff or the next appearance — the pet has no
+    /// collection-hello presentation, by design.
     pub fn sync_look(&mut self, coat: u8, iris: u8) -> (u8, u8) {
         let pair = (coat, iris);
         match self.worn {
@@ -4962,18 +5005,6 @@ impl PetBrain {
                 pair
             }
         }
-    }
-
-    /// The `(coat, iris)` the CURRENT appearance is wearing — what
-    /// [`Self::sync_look`] latched, exposed read-only so a host surface that
-    /// NAMES the cat (the pet's hover label) can tell whether the identity it
-    /// resolved is the one actually on glass: a parked handoff lags the
-    /// verdict by design, and a label that trusted the raw verdict would name
-    /// the incoming kitty while the outgoing one is still drawn. `None` until
-    /// the host first dresses the pet.
-    #[must_use]
-    pub fn worn_look(&self) -> Option<(u8, u8)> {
-        self.worn
     }
 
     /// Whether the pet needs the host's 60 fps lane this frame — the
@@ -5063,6 +5094,9 @@ impl PetBrain {
         }
         if self.pending_worn.is_some() && self.action != PetAction::Sleep {
             return true;
+        }
+        if self.arrive_t > 0.0 {
+            return true; // the incoming kitty is still fading up (finite)
         }
         // Micro-life: a live twitch bob is 0.12 s of finite envelope (the
         // loaf thump needs no term — it lives inside the settle window's
@@ -7568,18 +7602,41 @@ mod tests {
         let mut swapped = false;
         let mut prev_col = None::<f32>;
         let mut last_departures_live = false;
+        // THE ARRIVAL: the incoming kitty fades UP over ARRIVE_IN from the
+        // swap frame (never a one-frame recolour); before the swap and after
+        // the ramp the live pet is fully opaque.
+        let mut swap_at: Option<Instant> = None;
+        let mut prev_alpha = 255u8;
+        let mut ramp_frames = 0u32;
         for _ in 0..600 {
             t += Duration::from_millis(16);
             let f = pet.tick(sense(t, Some((4, 50))));
-            // THE LIVE PET IS UNBOTHERED: never fades, never leaves its post —
-            // the swap is a reskin in place, not a trip.
-            assert_eq!(f.alpha, 255, "the live pet never fades during a handoff");
+            let worn = pet.sync_look(9, 4); // the host's per-frame re-sync
+            if swap_at.is_none() && worn == (9, 4) {
+                swap_at = Some(t);
+                assert!(
+                    f.alpha > 0 && f.alpha < 64,
+                    "the incoming kitty starts faint — but ON glass — at the swap ({})",
+                    f.alpha
+                );
+            }
+            match swap_at {
+                None => assert_eq!(f.alpha, 255, "before the swap: fully there"),
+                Some(at) if at == t => {} // the swap frame itself: the dip
+                Some(at) if t.duration_since(at).as_secs_f32() <= ARRIVE_IN => {
+                    assert!(f.alpha >= prev_alpha, "the arrival only ever fades UP");
+                    ramp_frames += 1;
+                }
+                Some(_) => assert_eq!(f.alpha, 255, "after the ramp: fully there"),
+            }
+            prev_alpha = f.alpha;
+            // THE LIVE PET IS UNBOTHERED: it never leaves its post — the swap
+            // is an arrival in place, not a trip.
             assert!(
                 (f.col - station).abs() < 4.0,
                 "…and never leaves its station ({} vs {station})",
                 f.col
             );
-            let worn = pet.sync_look(9, 4); // the host's per-frame re-sync
             let live: Vec<_> = f.departures.iter().flatten().collect();
             assert!(live.len() <= 1, "one swap spawns exactly one ghost");
             if let Some(d) = live.first() {
@@ -7609,6 +7666,10 @@ mod tests {
         }
         assert!(swapped, "the debounced park lands the new look");
         assert!(!swap_frame_moved, "the swap never moves the live pet");
+        assert!(
+            ramp_frames >= (ARRIVE_IN / 0.016) as u32 - 2,
+            "the arrival ramp ran its whole length ({ramp_frames} frames)"
+        );
         let first = ghost_first.expect("the swap spawned a departing body");
         assert!(
             ghost_last > first + 10.0,

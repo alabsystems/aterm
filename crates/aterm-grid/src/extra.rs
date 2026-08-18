@@ -42,7 +42,7 @@
 //! Kani proofs (5 symbolic, genuine verification):
 //! - `cell_coord_hash_consistent` - CellCoord PartialEq reflexivity (symbolic row/col)
 //! - `combining_mark_range_valid` - Combining mark detection over U+0300..U+036F (symbolic codepoint)
-//! - `hyperlink_data_box_niche` - `Option<Box<HyperlinkData>>` uses niche optimization (8 bytes)
+//! - `hyperlink_data_box_niche` - `Option<Arc<HyperlinkData>>` uses niche optimization (8 bytes)
 //! - `fnv1a_nonzero_single_byte` - FNV-1a hash non-zero for all 256 byte values
 //! - `fnv1a_nonzero_two_bytes` - FNV-1a hash non-zero for all 2-byte sequences
 
@@ -89,9 +89,17 @@ mod extra_flags {
 
 /// Hyperlink data: URL and optional ID from OSC 8 sequences.
 ///
-/// Packed into a single heap allocation via `Box` to save 24 bytes in `CellExtra`
+/// Packed into a single heap allocation to save 24 bytes in `CellExtra`
 /// (one 8-byte pointer vs two 16-byte `Option<Arc<str>>` fields).
 /// Hyperlinks are rare (most cells have none), so the extra indirection is negligible.
+///
+/// Held by `Arc`, not `Box`: an OSC 8 run writes the SAME (url, id) pair to every
+/// covered cell, so the bulk writer builds one payload per run and hands each cell
+/// a refcount bump instead of its own malloc (`ls --hyperlink=always`, hyperlinked
+/// man pages and OSC 8 diagnostics otherwise issue thousands of small mallocs per
+/// screenful). The sharing is unobservable: every single-cell mutator goes through
+/// `Arc::make_mut`, so a per-cell url/id write copies-on-write exactly as it did
+/// when each cell owned its own `Box`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HyperlinkData {
     /// Hyperlink URL (OSC 8).
@@ -198,7 +206,8 @@ pub struct KittyPlaceholderData {
 /// Uses packed storage to minimize size:
 /// - `flags: u16` - presence bitflags + extended flags (bits 3-15)
 /// - `colors: [u8; 9]` - packed RGB: underline[0-2], fg[3-5], bg[6-8]
-/// - `hyperlink: Option<Box<HyperlinkData>>` - packed URL+ID (8 bytes via niche)
+/// - `hyperlink: Option<Arc<HyperlinkData>>` - packed URL+ID (8 bytes via niche),
+///   shared across the cells of one OSC 8 run (copy-on-write on per-cell edits)
 /// - `complex_char: Option<Box<Arc<str>>>` - boxed; rare, so the 8-byte niche
 ///   pointer replaces the 16-byte inline `Arc<str>` fat pointer on the common path
 /// - `combining: SmallVec<char, 2>` - inline for the common case
@@ -228,9 +237,11 @@ pub struct CellExtra {
     /// hold the index in `[0]` (the RGB bytes are unused in this mode).
     underline_color_idx: Option<u8>,
 
-    /// Hyperlink URL and optional ID (OSC 8), packed into a single Box.
+    /// Hyperlink URL and optional ID (OSC 8), packed into a single allocation.
     /// Uses niche optimization: None = null pointer = 0 overhead.
-    hyperlink: Option<Box<HyperlinkData>>,
+    /// `Arc` (not `Box`) so one OSC 8 run allocates once and every covered cell
+    /// takes a refcount bump — see [`HyperlinkData`].
+    hyperlink: Option<Arc<HyperlinkData>>,
 
     /// Complex character string (non-BMP, grapheme clusters, combining marks).
     /// Only used when Cell.flags.is_complex() is true.
@@ -300,16 +311,37 @@ impl CellExtra {
         match url {
             Some(url) => {
                 if let Some(data) = &mut self.hyperlink {
+                    // COPY-ON-WRITE IS MANDATORY, not an optimization: the bulk
+                    // run writer shares ONE payload across every cell of an OSC 8
+                    // run, so mutating in place here would silently rewrite the
+                    // whole run's link. `make_mut` reproduces the old per-cell
+                    // `Box` semantics exactly, and never clones on the
+                    // per-character path, which builds its own payload (refcount
+                    // 1) before touching it.
+                    let data = Arc::make_mut(data);
                     data.url = url;
                     data.id = None; // Clear stale ID from previous hyperlink
                 } else {
-                    self.hyperlink = Some(Box::new(HyperlinkData { url, id: None }));
+                    self.hyperlink = Some(Arc::new(HyperlinkData { url, id: None }));
                 }
             }
             None => {
                 self.hyperlink = None;
             }
         }
+    }
+
+    /// Attach an already-built — and possibly SHARED — hyperlink payload.
+    ///
+    /// Replaces URL and ID together, matching [`Self::set_hyperlink`]'s contract
+    /// (which clears any stale ID), but without the per-cell allocation: the bulk
+    /// run writer builds one `Arc<HyperlinkData>` per OSC 8 run and gives each
+    /// covered cell a refcount bump instead of its own `HyperlinkData` malloc.
+    /// Sharing stays unobservable because every single-cell mutator
+    /// (`set_hyperlink`, `set_hyperlink_id`) copies-on-write via `Arc::make_mut`.
+    #[inline]
+    pub(crate) fn set_hyperlink_data(&mut self, data: Option<Arc<HyperlinkData>>) {
+        self.hyperlink = data;
     }
 
     /// Get the hyperlink ID (OSC 8 `id=` parameter).
@@ -325,7 +357,9 @@ impl CellExtra {
     #[inline]
     pub fn set_hyperlink_id(&mut self, id: Option<Arc<str>>) {
         if let Some(data) = &mut self.hyperlink {
-            data.id = id;
+            // Copy-on-write for the same reason as `set_hyperlink`: the payload
+            // may be shared with every other cell of the run.
+            Arc::make_mut(data).id = id;
         }
     }
 
@@ -538,6 +572,10 @@ impl CellExtra {
     #[must_use]
     pub fn memory_used(&self) -> usize {
         let base = std::mem::size_of::<Self>();
+        // Upper bound, as before: the URL bytes were already counted once per
+        // cell even though the `Arc<str>` is shared, and the `HyperlinkData`
+        // payload is now shared across the cells of a run too. Over-reporting is
+        // the safe direction for a memory budget — it never under-counts.
         let hyperlink_mem = self.hyperlink.as_ref().map_or(0, |data| {
             std::mem::size_of::<HyperlinkData>()
                 + data.url.len()

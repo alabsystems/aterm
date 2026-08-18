@@ -1127,7 +1127,7 @@ fn notary_check() -> Check {
             ),
             fix: format!(
                 "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-                 --team-id {} (password: an app-specific password from appleid.apple.com)",
+                 --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
                 pins::APPLE_TEAM_ID
             ),
         },

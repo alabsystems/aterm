@@ -2091,6 +2091,9 @@ impl App {
             .collect();
         // Sibling rows from the last background scan (already pid-sorted).
         glance.instances = self.fleet_instances.clone();
+        // Start is only offered when the agent CLI is actually launchable —
+        // otherwise the menu would type a command the shell cannot find.
+        glance.start_available = operator_cli_on_path();
         glance
     }
 
@@ -2104,8 +2107,12 @@ impl App {
         }
         let glance = self.operator_fleet_glance();
         // The operator's id is NOT part of the rendered fingerprint (same title
-        // after a restart ⇒ same strings), so track it before the change gate.
+        // after a restart ⇒ same strings), so track it before the change gate —
+        // and the typed bit with it, because Stop's confirm-suppression
+        // authority follows the id (a stale menu click must judge the CURRENT
+        // election, not the one the menu was drawn from).
         self.operator_local_id = glance.operator_session;
+        self.operator_typed = glance.operator_typed;
         let fp = glance.fingerprint();
         if self.operator_status_fingerprint.as_deref() == Some(fp.as_str()) {
             return;
@@ -2118,6 +2125,8 @@ impl App {
 
     /// Dispatch one click from the menu-bar status item (the
     /// `dispatch_menu_action` twin for `Wake::OperatorAction`).
+    ///
+    /// See [`operator_cli_on_path`] for the Start-side launchability gate.
     pub(crate) fn dispatch_operator_action(
         &mut self,
         el: &ActiveEventLoop,
@@ -2126,8 +2135,11 @@ impl App {
         match action {
             crate::status_item::OperatorAction::Start => {
                 // A running operator makes Start a stale-menu no-op (the click
-                // raced a state change); just re-render the truth.
-                if self.operator_local_id.is_some() {
+                // raced a state change); just re-render the truth. Same for a
+                // missing agent CLI (the row renders disabled, but a stale
+                // menu can still deliver the click): never spawn a session
+                // just to type a command the shell will not find.
+                if self.operator_local_id.is_some() || !operator_cli_on_path() {
                     self.refresh_operator_status_item();
                     return;
                 }
@@ -2219,13 +2231,21 @@ impl App {
                 let Some(session) = self.operator_local_id else {
                     return;
                 };
-                // A menu click is a deliberate, explicit stop: suppress the
-                // foreground-job close confirm exactly like the scripted
-                // `Wake::TabCmd` close does, then escalate a last-tab close to
-                // its window teardown.
-                self.close_confirm_suppressed = true;
+                // Confirm-suppression REQUIRES the typed role: only a session
+                // that declared `role=operator` may be closed without the
+                // dialog. A title-elected operator gets no Stop row, but a
+                // stale menu can still deliver the click — judged here against
+                // the CURRENT election, that close runs with the confirm
+                // armed, so an innocent session ("operator.md" in an editor)
+                // is protected by the ordinary dialog.
+                let suppress = self.operator_typed;
+                if suppress {
+                    self.close_confirm_suppressed = true;
+                }
                 let result = self.close_session_by_id(session);
-                self.close_confirm_suppressed = false;
+                if suppress {
+                    self.close_confirm_suppressed = false;
+                }
                 if result.is_ok() {
                     self.escalate_pending_close(el);
                 }
@@ -6126,4 +6146,14 @@ mod operator_glance_tests {
         assert!(app.focus_session_window(0));
         assert!(!app.focus_session_window(777));
     }
+}
+
+/// Whether the operator agent CLI (`claude`) is launchable from a fresh shell:
+/// a file by that name in some `PATH` entry. A handful of stat calls — cheap
+/// enough to run per glance refresh, and deliberately uncached so an install
+/// or uninstall mid-run is noticed on the next refresh.
+fn operator_cli_on_path() -> bool {
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
+    })
 }

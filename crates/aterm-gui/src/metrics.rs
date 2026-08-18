@@ -292,6 +292,9 @@ pub(crate) enum DeadlineOwner {
     TitleSummary = 30,
     SessionChrome = 31,
     TitleDrift = 32,
+    /// The program cat's tenure gate (`app_kitty::KittyTenure`): one wake at
+    /// the instant a pending claim earns or releases the cursor.
+    KittyTenure = 33,
 }
 
 impl DeadlineOwner {
@@ -329,6 +332,7 @@ impl DeadlineOwner {
             30 => Self::TitleSummary,
             31 => Self::SessionChrome,
             32 => Self::TitleDrift,
+            33 => Self::KittyTenure,
             _ => Self::None,
         }
     }
@@ -369,6 +373,7 @@ impl DeadlineOwner {
             Self::TitleSummary => "title_summary",
             Self::SessionChrome => "session_chrome",
             Self::TitleDrift => "title_drift",
+            Self::KittyTenure => "kitty_tenure",
         }
     }
 }
@@ -2198,5 +2203,10 @@ mod histogram_tests {
             DeadlineOwner::TitleDrift
         );
         assert_eq!(DeadlineOwner::TitleDrift.as_str(), "title_drift");
+        assert_eq!(
+            DeadlineOwner::from_raw(DeadlineOwner::KittyTenure as u64),
+            DeadlineOwner::KittyTenure
+        );
+        assert_eq!(DeadlineOwner::KittyTenure.as_str(), "kitty_tenure");
     }
 }

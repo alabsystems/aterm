@@ -26,10 +26,14 @@
 //! stubs off macOS so `App`'s field shape is platform-independent.
 
 /// The launch line [`OperatorAction::Start`] types into the freshly spawned shell —
-/// exactly what a human would type to stand the operator up. The brief teaches
-/// the whole loop; the agent CLI authenticates from its own config, so this
-/// carries no secrets (aterm strips agent env vars from children by design).
-pub const OPERATOR_LAUNCH_LINE: &str = "claude \"You are the operator. Read docs/OPERATOR.md and follow it exactly, then await fleet instructions from the human.\"";
+/// exactly what a human would type to stand the operator up. SELF-CONTAINED by
+/// design: it references no filesystem path, because the spawned session's cwd
+/// is wherever the user's focused pane was and an installed aterm has no repo
+/// checkout — the bootstrap brief is `aterm help introspection`, which ships in
+/// every binary; `docs/OPERATOR.md` is named as optional enhancement only. The
+/// agent CLI authenticates from its own config, so this carries no secrets
+/// (aterm strips agent env vars from children by design).
+pub const OPERATOR_LAUNCH_LINE: &str = "claude \"You are this machine's aterm fleet operator. Run 'aterm help introspection' to learn how to see and drive sessions, set your role with: aterm ctl @self meta set role operator - then await fleet instructions from the human. If a docs/OPERATOR.md exists in your cwd, read and follow it too.\"";
 
 /// One user action from the status-item menu. Carried by `Wake::OperatorAction`
 /// from the AppKit callback to the event loop, which dispatches on `App`.
@@ -169,6 +173,16 @@ pub struct FleetGlance {
     /// The operator session's process-local id, when one is running — what
     /// the menu's Show/Stop actions act on.
     pub operator_session: Option<u64>,
+    /// Whether the operator was elected by the TYPED `role=operator` meta
+    /// (`true`) or by the legacy title heuristic (`false`). Destructive
+    /// authority follows this bit: only a typed operator gets a Stop row and a
+    /// confirm-suppressed close — a title match ("operator.md" in an editor is
+    /// enough to produce one) must never be silently closable.
+    pub operator_typed: bool,
+    /// Whether the operator agent CLI is actually launchable on this machine
+    /// (caller-owned fact, like `windows`): gates the Start row so clicking
+    /// it can never type a command the shell will not find.
+    pub start_available: bool,
     /// Total live sessions in this instance (the operator included).
     pub sessions: usize,
     /// Escalating sessions in roster order: `(local_id, display text)`. Typed
@@ -217,6 +231,10 @@ impl FleetGlance {
         fp.push_str(self.button_title());
         fp.push('\u{1f}');
         fp.push_str(&self.sessions.to_string());
+        // Both bits change what the menu renders (Stop row / Start enablement).
+        fp.push('\u{1f}');
+        fp.push(if self.operator_typed { 'T' } else { 't' });
+        fp.push(if self.start_available { 'S' } else { 's' });
         for (id, title) in &self.warnings {
             fp.push('\u{1f}');
             fp.push_str(&id.to_string());
@@ -308,7 +326,7 @@ pub fn classify(rows: &[SessionRow]) -> FleetGlance {
         rows.iter()
             .find_map(|row| title_operator_detail(&row.title).map(|detail| (row, detail)))
     };
-    let (operator, operator_session) = match typed {
+    let (operator, operator_session, operator_typed) = match typed {
         Some(row) => {
             // Detail rung: legacy `operator…` title tail when present (the
             // brief's status-line convention), else the whole title.
@@ -320,17 +338,19 @@ pub fn classify(rows: &[SessionRow]) -> FleetGlance {
                     format!(": {title}")
                 }
             });
-            (OperatorState::Running(detail), Some(row.id))
+            (OperatorState::Running(detail), Some(row.id), true)
         }
         None => match by_title() {
-            Some((row, detail)) => (OperatorState::Running(detail), Some(row.id)),
-            None => (OperatorState::NotRunning, None),
+            Some((row, detail)) => (OperatorState::Running(detail), Some(row.id), false),
+            None => (OperatorState::NotRunning, None, false),
         },
     };
 
     FleetGlance {
         operator,
         operator_session,
+        operator_typed,
+        start_available: false,
         sessions: rows.len(),
         warnings,
         windows: Vec::new(),
@@ -364,22 +384,38 @@ pub enum StatusRow {
 pub fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
     let mut rows = vec![StatusRow::Info(glance.header_line())];
     match glance.operator {
-        OperatorState::NotRunning => rows.push(StatusRow::Action {
-            label: "Start Operator".to_string(),
-            action: OperatorAction::Start,
-            enabled: true,
-        }),
+        OperatorState::NotRunning => {
+            // Rendered-but-inert when the agent CLI is missing: the affordance
+            // stays discoverable, and the Info line says why it is grey.
+            rows.push(StatusRow::Action {
+                label: "Start Operator".to_string(),
+                action: OperatorAction::Start,
+                enabled: glance.start_available,
+            });
+            if !glance.start_available {
+                rows.push(StatusRow::Info("(claude CLI not found on PATH)".to_string()));
+            }
+        }
         OperatorState::Running(_) => {
             rows.push(StatusRow::Action {
                 label: "Show Operator".to_string(),
                 action: OperatorAction::Show,
                 enabled: true,
             });
-            rows.push(StatusRow::Action {
-                label: "Stop Operator".to_string(),
-                action: OperatorAction::Stop,
-                enabled: true,
-            });
+            // DESTRUCTIVE authority requires the TYPED role: a title-elected
+            // "operator" can be an innocent session (vim editing operator.md),
+            // so it gets no Stop row at all — Show is the only offer.
+            if glance.operator_typed {
+                rows.push(StatusRow::Action {
+                    label: "Stop Operator".to_string(),
+                    action: OperatorAction::Stop,
+                    enabled: true,
+                });
+            } else {
+                rows.push(StatusRow::Info(
+                    "(detected by title only — stop it from its own tab)".to_string(),
+                ));
+            }
         }
     }
 
@@ -845,7 +881,8 @@ mod tests {
 
     #[test]
     fn compose_layout_not_running_is_minimal() {
-        let g = classify(&[]);
+        let mut g = classify(&[]);
+        g.start_available = true;
         let rows = compose_status_menu(&g);
         assert_eq!(
             rows,
@@ -860,6 +897,76 @@ mod tests {
                 StatusRow::Info("Sessions: 0".into()),
             ]
         );
+    }
+
+    #[test]
+    fn start_is_inert_and_explained_without_the_cli() {
+        // classify() leaves start_available=false (caller-owned fact): the
+        // Start row renders disabled with the reason line under it.
+        let rows = compose_status_menu(&classify(&[]));
+        assert_eq!(
+            &rows[1..3],
+            &[
+                StatusRow::Action {
+                    label: "Start Operator".into(),
+                    action: OperatorAction::Start,
+                    enabled: false,
+                },
+                StatusRow::Info("(claude CLI not found on PATH)".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn title_elected_operator_gets_no_stop_row() {
+        // SI-3: vim editing "operator.md" must never receive a silent Stop.
+        let rows_for = |role: Option<&str>, title: &str| {
+            let mut g = classify(&[SessionRow {
+                id: 7,
+                title: title.into(),
+                role: role.map(str::to_string),
+                attention: None,
+            }]);
+            g.start_available = true;
+            compose_status_menu(&g)
+        };
+        let heuristic = rows_for(None, "operator: fleet idle");
+        assert!(
+            !heuristic.iter().any(|r| matches!(
+                r,
+                StatusRow::Action { action: OperatorAction::Stop, .. }
+            )),
+            "title-elected operator must not be offered Stop: {heuristic:?}"
+        );
+        let typed = rows_for(Some("operator"), "operator: fleet idle");
+        assert!(
+            typed.iter().any(|r| matches!(
+                r,
+                StatusRow::Action { action: OperatorAction::Stop, .. }
+            )),
+            "typed operator must keep Stop: {typed:?}"
+        );
+    }
+
+    #[test]
+    fn typed_bit_reaches_the_glance_and_fingerprint() {
+        let typed = classify(&[SessionRow {
+            id: 1,
+            title: "operator: x".into(),
+            role: Some("operator".into()),
+            attention: None,
+        }]);
+        let heuristic = classify(&[SessionRow {
+            id: 1,
+            title: "operator: x".into(),
+            role: None,
+            attention: None,
+        }]);
+        assert!(typed.operator_typed);
+        assert!(!heuristic.operator_typed);
+        // Same rendered strings, different authority — the fingerprint must
+        // still differ so the menu rebuilds when the election basis changes.
+        assert_ne!(typed.fingerprint(), heuristic.fingerprint());
     }
 
     #[test]

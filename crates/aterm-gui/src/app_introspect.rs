@@ -1739,12 +1739,12 @@ impl App {
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let glow_cfg = self.glow_config();
-        // The ONE companion verdict (favourite > app > discovery > session) —
-        // the same seam the composed PRESENT resolves through, so a capture
-        // shows the breed the glass wears instead of the pre-precedence
-        // collected look (gauntlet F3: the old `companion_look()` here had no
-        // app rung and no session floor, so captures stomped the app breeds).
-        let companion_look = self.companion_verdict(focus);
+        // The ONE companion verdict (favourite > program with tenure > launch
+        // kitty) — the same seam the composed PRESENT resolves through, so a
+        // capture shows the breed the glass wears (gauntlet F3: a capture
+        // must never resolve the companion through a different rule than the
+        // present). Same window, same focused pane, same frame instant.
+        let companion_look = self.companion_verdict(wid, focus, now);
         let windowless = self.headless;
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
         let focus_cursor = self.pool.get(focus).and_then(|s| {
@@ -1938,14 +1938,13 @@ impl App {
         let (cell_w, cell_h) = self.backend.cell_size();
         let kitty_log_on = self.kitty_log_enabled();
         // The ONE companion verdict — the single-pane present's seam
-        // ([`crate::App::companion_verdict`]): favourite > app > discovery >
-        // session, resolved for the window's front session. The old
-        // `companion_look()` read had no app rung and no session floor, so
-        // every `aterm-ctl image` on a windowed target stomped the present's
-        // app-breed verdict, and a headless target never saw it at all
-        // (gauntlet F3).
+        // ([`crate::App::companion_verdict`]): favourite > program with
+        // tenure > launch kitty, resolved for this window's front session at
+        // this frame's instant. A capture resolves through exactly the
+        // present's rule so `aterm-ctl image` can never show a different cat
+        // than the glass (gauntlet F3).
         let capture_front_session = self.focused_session_id(wid).unwrap_or(0);
-        let companion_look = self.companion_verdict(capture_front_session);
+        let companion_look = self.companion_verdict(wid, capture_front_session, now);
         let glow_cfg = self.glow_config();
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
@@ -8908,9 +8907,10 @@ mod encode_worker_tests {
             "the same visible sprite must be observed as a collectible"
         );
         // The AMBIENT half of the law: the collection grew, the companion did
-        // not — a scanned word is output text, not a keystroke.
+        // not — a scanned word is output text, not a keystroke (and since the
+        // launch-kitty ruling no discovery of any kind pins the cat).
         assert_eq!(
-            app.kitty_log.companion_look(),
+            app.kitty_log.favourite_look(),
             None,
             "an ambient discovery never becomes the companion"
         );

@@ -245,55 +245,19 @@ const LAND_DECAY: f32 = 3.0;
 /// SING-ALONG dance depths at full drive (`crate::kitty_sing`): the ON-BEAT
 /// squash pulse (each beat lands as a bounce that relaxes across the beat)
 /// and the two-beat side-to-side lean sway. Both scale with the drive, so
-/// the wind-down crossfade eases the whole dance out — never a hard cut —
-/// and with the ARC's energy ([`SING_AMP_FLOOR`]): the intro sways small,
-/// the peak sways full.
+/// the wind-down crossfade eases the whole dance out — never a hard cut.
 const SING_SQUASH: f32 = 0.14;
 const SING_SWAY: f32 = 0.12;
 
-/// Dance amplitude = `SING_AMP_FLOOR + (1 − SING_AMP_FLOOR) × energy`: the
-/// spec's `(0.5 + 0.5·energy)` — a cold intro dances at half depth, a
-/// peaked song at full.
-const SING_AMP_FLOOR: f32 = 0.5;
-
-/// The COMMIT LANDING: the reopened bar's first beat squashes ×1.6 — one
-/// double-squash announcing the switch the ear is about to confirm.
-const SING_LANDING_BOOST: f32 = 1.6;
-
-/// PRE-ECHO POSE BIAS, per section class (verse, chorus, bridge,
-/// percussive, breath): a small standing lean, in cell widths, that flips
-/// to the DESTINATION key's class on the very press that starts a
-/// hand-over — the eye reads the switch a bar before the ear. Chorus leans
-/// in, bridge leans back, the breath stands centered.
-const SING_CLASS_LEAN: [f32; 5] = [-0.03, 0.05, -0.05, 0.03, 0.0];
-
-/// THE BOW (the finale): at full depth the singer squashes to this
-/// fraction of standing height. The down/hold/rise envelope is timed by
-/// `kitty_sing`'s cadence clock and arrives here as the 0..1 depth in
-/// [`SingSync::bow`] — this module only translates depth to pose.
-const BOW_SQUASH: f32 = 0.75;
-
 /// One frame's sing-along sync from the host: the drive/beat pair the dance
-/// always rode, plus the SONG-BUILDER arc (energy, class) and the moment
-/// flags (the commit landing, the announced fill's final beat, the bow).
-/// One struct so both render paths speak the same seam and a new axis never
-/// forks the call sites again.
+/// rides. One struct so both render paths speak the same seam and a new
+/// axis never forks the call sites again.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SingSync {
     /// Celebration drive 0..=1 (1 armed, easing through the wind-down).
     pub drive: f32,
     /// Beat phase in beats since the arm (fractional).
     pub beat: f32,
-    /// Arc RENDER energy 0..=1.25 (`KittySing::arc_energy_q` / 200).
-    pub energy: f32,
-    /// Section class 0..=4 (`KittySing::section_class_now`).
-    pub class: u8,
-    /// True during the reopened bar's first beat (`switch_landing`).
-    pub landing: bool,
-    /// True while the announced fill rolls under beat 4 (`fill_beat`).
-    pub fill: bool,
-    /// Bow depth 0..=1 (`bow_depth`, phase 3) — 0 when no finale.
-    pub bow: f32,
 }
 
 /// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
@@ -602,10 +566,6 @@ pub struct CursorCat {
     /// The shared dance-beat phase in beats (fractional), from the same
     /// host sync. Meaningful only while `sing > 0`.
     sing_beat: f32,
-    /// The rest of the per-frame sing sync — the SONG-BUILDER arc's energy
-    /// and class plus the moment flags (landing, fill, bow). See
-    /// [`SingSync`]. Meaningful only while `sing > 0`.
-    sing_sync: SingSync,
     rng: u32,
 }
 
@@ -647,7 +607,6 @@ impl Default for CursorCat {
             delight_chain: 0,
             sing: 0.0,
             sing_beat: 0.0,
-            sing_sync: SingSync::default(),
             rng: 0x2545_F491,
         }
     }
@@ -872,11 +831,8 @@ impl CursorCat {
 
     /// Host sync for the SING-ALONG (`crate::kitty_sing`): once per
     /// frame, BEFORE [`Self::frame`]/[`Self::static_frame`], with the
-    /// detector's current drive, the shared dance-beat phase, and the
-    /// SONG-BUILDER arc ([`SingSync`] — energy scales the dance, class
-    /// biases the pose within a frame of a hand-over press, the landing/
-    /// fill flags drive the one-beat flourishes, and the bow depth plays
-    /// the finale).
+    /// detector's current drive and the shared dance-beat phase
+    /// ([`SingSync`]).
     ///
     /// THE MOMENTUM BYPASS (documented, deliberate): while ARMED
     /// (`drive == 1`) the canonical typing-momentum metric is pinned to 1.0.
@@ -903,22 +859,6 @@ impl CursorCat {
         } else {
             0.0
         };
-        self.sing_sync = SingSync {
-            drive: self.sing,
-            beat: self.sing_beat,
-            energy: if sync.energy.is_finite() {
-                sync.energy.clamp(0.0, 1.25)
-            } else {
-                0.0
-            },
-            class: sync.class.min(4),
-            bow: if sync.bow.is_finite() {
-                sync.bow.clamp(0.0, 1.0)
-            } else {
-                0.0
-            },
-            ..sync
-        };
         if self.sing < 1.0 {
             return;
         }
@@ -929,31 +869,37 @@ impl CursorCat {
         }
     }
 
-    /// Install the startup/current collected identity without changing the
-    /// lifecycle. This is an O(1) scalar compare/copy and is safe to call from
-    /// the host's frame setup.
+    /// Install the companion's current identity — the host's per-frame
+    /// verdict (a pinned favourite, else the tenured program cat, else the
+    /// launch kitty) — without changing the lifecycle. This is an O(1) scalar compare/copy and is
+    /// safe to call from the host's frame setup.
     ///
     /// THE TWO-PATH RULE for look changes: a companion must not switch to a
-    /// different collected look mid-flight.
+    /// different look mid-flight. Since the 2026-08-17 rulings the verdict
+    /// changes rarely and deliberately — a program cat that has earned the
+    /// cursor through the host's tenure gate, the base cat returning after it
+    /// exits, a favourite pin — and this latch is what keeps any of those
+    /// from morphing the sprite mid-air: the flying kitty swaps only BETWEEN
+    /// appearances, which is the soft switch the owner asked for.
     ///
-    /// 1. **Sync (this method) — LATCHED per appearance.** A kitty-log
-    ///    discovery in another window (or any companion reassignment) that
-    ///    lands while THIS companion is on screen must never morph the sprite
-    ///    mid-appearance — one appearance wears one cat. The new look parks in
-    ///    `pending_look` and is applied at the start of the NEXT appearance
-    ///    (`on_key`'s Hidden→FadeIn earn). The mid-fade
-    ///    revive (FadeOut→FadeIn in `on_key`) is the SAME appearance
+    /// 1. **Sync (this method) — LATCHED per appearance.** A verdict change
+    ///    (a program earning or releasing the cursor, a favourite pinned from
+    ///    another window) that lands while THIS companion is on screen must
+    ///    never morph the sprite mid-appearance — one appearance wears one
+    ///    cat. The new look parks in `pending_look` and is applied at the
+    ///    start of the NEXT appearance (`on_key`'s Hidden→FadeIn earn). The
+    ///    mid-fade revive (FadeOut→FadeIn in `on_key`) is the SAME appearance
     ///    continuing, so it deliberately does not consume the latch. While
     ///    hidden the sync applies immediately — there is nothing on screen to
     ///    protect.
-    /// 2. **`on_collect` — IMMEDIATE, and TYPED-ONLY.** The discovery hello
-    ///    legitimately presents the newly unlocked collectible; swapping to
-    ///    it is the point of the presentation, so it replaces the look (and
-    ///    clears any parked sync) even mid-flight. Its only routes are the
-    ///    user's own acts — the typed summon and the favourite pin. A
-    ///    discovery in scanned OUTPUT text records to the ledger but never
-    ///    reaches this companion: the host's ambient drains return no look to
-    ///    present (owner ruling, 2026-08-07).
+    /// 2. **`on_collect` — IMMEDIATE, and USER-ACT-ONLY.** The favourite
+    ///    pin's hello legitimately presents the cat the user just chose;
+    ///    swapping to it is the point of the presentation, so it replaces
+    ///    the look (and clears any parked sync) even mid-flight. Its only
+    ///    route is the user's own act (the favourite pin). A discovery —
+    ///    typed or in scanned OUTPUT text — records to the ledger but never
+    ///    re-dresses this companion (owner rulings, 2026-08-07 and
+    ///    2026-08-17): the host's drains return no look to present.
     pub fn set_look(&mut self, look: KittyLook) {
         let look = look.normalized();
         if self.is_active() || self.collection_hello {
@@ -974,15 +920,16 @@ impl CursorCat {
     /// its goodbye at the hold deadline unless live typing has re-earned past
     /// [`REVIVE_GATE`] — and settles back to zero-idle.
     ///
-    /// TYPED-ONLY BY CONTRACT (owner ruling, 2026-08-07): the host's ambient
-    /// grid-scan drains record to the ledger and return no discovery, so the
-    /// only routes here are the user's own acts (the typed summon, the
-    /// favourite pin). Output text that happens to say `cat` must neither
-    /// activate nor re-dress the companion.
+    /// USER-ACT-ONLY BY CONTRACT (owner rulings, 2026-08-07 and 2026-08-17):
+    /// the host's discovery drains — ambient grid scans and the typed summon
+    /// alike — record to the ledger and never hand a look here, so the only
+    /// route is the user's own act: the favourite pin. Output text that
+    /// happens to say `cat` must neither activate nor re-dress the companion,
+    /// and a typed `kitty` presents the cat it already has ([`Self::on_summon`]).
     pub fn on_collect(&mut self, now: Instant, look: KittyLook) {
         self.look = look.normalized();
         // Two-path rule, path 2 ([`Self::set_look`]): the hello IS the
-        // presentation of the new collectible, so the explicit replace above
+        // presentation of the newly pinned cat, so the explicit replace above
         // supersedes any look the mid-appearance latch had parked.
         self.pending_look = None;
         self.momentum.set_value(now, 1.0);
@@ -1007,11 +954,13 @@ impl CursorCat {
     /// identity it already has.
     ///
     /// This is [`Self::on_collect`]'s lifecycle WITHOUT its look replacement.
-    /// Typing the companion's name is not a discovery; there is no new
-    /// collectible to present, so nothing about it justifies swapping the
-    /// sprite — the session's kitty stays that session's kitty. A genuine
-    /// first-ever sighting still goes through `on_collect`, which legitimately
-    /// shows off what it just unlocked.
+    /// Typing the companion's name is not a reason to change it; there is no
+    /// newly chosen cat to present, so nothing about it justifies swapping
+    /// the sprite — the launch kitty stays the launch kitty (owner ruling,
+    /// 2026-08-17: the cat is generated at launch and does not keep
+    /// changing). Even a first-ever typed discovery rides THIS path now: it
+    /// is collected into the ledger, but only a favourite pin (`on_collect`)
+    /// re-dresses the companion.
     ///
     /// A hidden companion FADES IN (typing `kitty` must make a kitty appear —
     /// that is the whole point of the gesture), and a visible one simply
@@ -1343,38 +1292,11 @@ impl CursorCat {
         // resumes mid-dance, not mid-glitch. The delete "oops" recoil above
         // still reads through it (the wrong-note gag outranks the song).
         if self.sing > 0.0 {
-            // THE ARC IN THE BODY: amplitude follows the earned energy —
-            // the intro sways at half depth, the peak at full.
-            let amp = SING_AMP_FLOOR + (1.0 - SING_AMP_FLOOR) * self.sing_sync.energy.min(1.0);
-            // THE ANNOUNCED FILL (beat 4 of an early switch's bar): the
-            // squash pulse clock-divides to SIXTEENTH rate — a drum-roll
-            // head-bob riding the exact envelope the beat already owns.
-            let u = if self.sing_sync.fill {
-                (self.sing_beat * 4.0).fract()
-            } else {
-                self.sing_beat.fract()
-            };
+            let u = self.sing_beat.fract();
             let pulse = (1.0 - u) * (1.0 - u);
-            // THE COMMIT LANDING: one double-squash on the reopened bar's
-            // first beat.
-            let squash = SING_SQUASH
-                * if self.sing_sync.landing {
-                    SING_LANDING_BOOST
-                } else {
-                    1.0
-                };
-            let dance = 1.0 - self.sing_sync.bow; // the bow stills the dance
-            scale_y *= 1.0 - squash * amp * pulse * self.sing * dance;
-            scale_x *= 1.0 + squash * 0.7 * amp * pulse * self.sing * dance;
-            lead +=
-                SING_SWAY * amp * (std::f32::consts::PI * self.sing_beat).sin() * self.sing * dance;
-            // PRE-ECHO POSE BIAS: the destination class's standing lean,
-            // live from the hand-over press itself.
-            lead += SING_CLASS_LEAN[usize::from(self.sing_sync.class.min(4))] * self.sing;
-            // THE BOW: squash toward BOW_SQUASH height at full depth, the
-            // envelope timed by the cadence clock host-side.
-            scale_y *= 1.0 - (1.0 - BOW_SQUASH) * self.sing_sync.bow;
-            scale_x *= 1.0 + 0.5 * (1.0 - BOW_SQUASH) * self.sing_sync.bow;
+            scale_y *= 1.0 - SING_SQUASH * pulse * self.sing;
+            scale_x *= 1.0 + SING_SQUASH * 0.7 * pulse * self.sing;
+            lead += SING_SWAY * (std::f32::consts::PI * self.sing_beat).sin() * self.sing;
         }
         // Expression: blink/squint only over the plain cruising/discovery face —
         // the wink/celebrate reactions own their own eyes via a variant swap.
@@ -1387,7 +1309,7 @@ impl CursorCat {
             EyesFrame::Happy
         } else if !plain_face {
             EyesFrame::Open
-        } else if self.blink_active(now) && (self.sing <= 0.33 || self.sing_sync.bow > 0.5) {
+        } else if self.blink_active(now) && self.sing <= 0.33 {
             // A BLINK OUTRANKS THE CRUISING FACE. This arm used to sit BELOW the
             // happy face and was additionally gated on `disp < BLINK_CEIL` — but
             // `disp` is pinned at 1.0 at every human cadence whenever the cat is
@@ -1397,8 +1319,6 @@ impl CursorCat {
             // the cheapest life in the sprite. SINGING still outranks it: the
             // open-mouth meow head is a different baked head, and blinking
             // through a song reads as a glitch rather than as breathing.
-            // THE BOW is the exception — the song is over, the singer dips,
-            // and the blink re-enabling is what sells "at rest, grateful".
             EyesFrame::Blink
         } else if self.sing > 0.33 || self.disp >= HAPPY_GATE {
             // Singing is sung with happy eyes (over the open-mouth meow head
@@ -2497,14 +2417,14 @@ mod tests {
     }
 
     /// Typing a feline word must PRESENT the companion without changing WHICH
-    /// companion it is — the session's kitty survives every summon, including
+    /// companion it is — the launch kitty survives every summon, including
     /// repeats inside the chain window.
     #[test]
     fn on_summon_presents_without_ever_changing_the_look() {
         let t = Instant::now();
-        let session_look = KittyLook::for_session(4242);
+        let launch_look = KittyLook::for_launch(4242);
         let mut cat = CursorCat::default();
-        cat.set_look(session_look);
+        cat.set_look(launch_look);
         assert!(!cat.is_active(), "starts hidden");
 
         cat.on_summon(t, 1);
@@ -2514,8 +2434,8 @@ mod tests {
         );
         assert_eq!(
             cat.frame(t).look,
-            session_look,
-            "the session's own kitty is the one that shows up"
+            launch_look,
+            "the launch kitty is the one that shows up"
         );
         assert_eq!(
             cat.frame(t).reaction,
@@ -2527,39 +2447,42 @@ mod tests {
         cat.on_summon(t + Duration::from_millis(200), 1);
         assert_eq!(
             cat.frame(t + Duration::from_millis(200)).look,
-            session_look,
+            launch_look,
             "repeat summons never swap the identity"
         );
     }
 
-    /// `on_collect` — a GENUINE discovery — still swaps: unlocking a new
-    /// collectible is the one reason a mid-session identity change is allowed.
+    /// `on_collect` — the FAVOURITE PIN's hello — still swaps: the user
+    /// choosing a cat is the one reason a mid-process identity change is
+    /// allowed (owner ruling, 2026-08-17: the launch kitty otherwise never
+    /// changes).
     #[test]
-    fn a_real_discovery_still_swaps_the_look() {
+    fn a_favourite_pin_still_swaps_the_look() {
         let t = Instant::now();
         let mut cat = CursorCat::default();
-        cat.set_look(KittyLook::for_session(1));
-        let unlocked = KittyLook::for_session(999);
-        cat.on_collect(t, unlocked);
+        cat.set_look(KittyLook::for_launch(1));
+        let pinned = KittyLook::for_launch(999);
+        cat.on_collect(t, pinned);
         assert_eq!(
             cat.frame(t).look,
-            unlocked.normalized(),
-            "a discovery presents the newly unlocked collectible"
+            pinned.normalized(),
+            "the pin's hello presents the cat the user just chose"
         );
     }
 
-    /// Session kitties are UNIQUE per session and STABLE for that session's
-    /// life — the property that makes the session kitty special.
+    /// Launch kitties are a PURE function of the seed (STABLE for the life of
+    /// the process, byte-identical on every machine) and genuinely different
+    /// across seeds — the property that makes each computer's cat its own.
     #[test]
-    fn session_kitties_are_unique_and_stable() {
-        let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_session).collect();
+    fn launch_kitties_are_unique_per_seed_and_stable() {
+        let looks: Vec<KittyLook> = (0..64u64).map(KittyLook::for_launch).collect();
         for (i, look) in looks.iter().enumerate() {
             assert_eq!(
                 *look,
-                KittyLook::for_session(i as u64),
-                "the same session always resolves to the same kitty"
+                KittyLook::for_launch(i as u64),
+                "the same seed always resolves to the same kitty"
             );
-            assert_eq!(*look, look.normalized(), "session kitties are normalized");
+            assert_eq!(*look, look.normalized(), "launch kitties are normalized");
             assert!(
                 look.accessory.is_none(),
                 "accessories mark COLLECTED cats and are never minted for free"
@@ -2571,13 +2494,13 @@ mod tests {
             .collect();
         assert!(
             distinct.len() >= 32,
-            "sessions get visibly different kitties, got {} distinct of 64",
+            "seeds get visibly different kitties, got {} distinct of 64",
             distinct.len()
         );
         assert_ne!(
-            KittyLook::for_session(0),
+            KittyLook::for_launch(0),
             KittyLook::default(),
-            "a session kitty is not the one shared default cat"
+            "a launch kitty is not the one shared default cat"
         );
     }
 
@@ -2597,7 +2520,7 @@ mod tests {
         );
         assert!(!hidden.is_active());
 
-        let look = KittyLook::for_session(7);
+        let look = KittyLook::for_launch(7);
         let mut live = CursorCat::default();
         live.set_look(look);
         live.on_summon(t, 1);
@@ -2625,7 +2548,7 @@ mod tests {
     fn delight_is_expression_not_displacement() {
         let t = Instant::now();
         let mut cat = CursorCat::default();
-        cat.set_look(KittyLook::for_session(11));
+        cat.set_look(KittyLook::for_launch(11));
         cat.on_summon(t, 1);
         let rest = cat.frame(t).bob;
         // What was the apex of the hop: the anchor must not move there.
@@ -3664,16 +3587,9 @@ mod tests {
         assert_eq!(after.pose, CatPose::STILL);
     }
 
-    /// A full-energy [`SingSync`] from just (drive, beat) — the shape every
-    /// pre-arc test spoke; energy 1.0 keeps their amplitude assertions at
-    /// the classic full-depth dance.
+    /// The [`SingSync`] for (drive, beat) — the pair the dance rides.
     fn sync(drive: f32, beat: f32) -> SingSync {
-        SingSync {
-            drive,
-            beat,
-            energy: 1.0,
-            ..SingSync::default()
-        }
+        SingSync { drive, beat }
     }
 
     fn arm_singing_after_travel(c: &mut CursorCat, t: Instant) -> Instant {
@@ -3806,173 +3722,5 @@ mod tests {
         c.set_singing(t1, sync(0.3, 7.3));
         let off = c.static_frame(t1);
         assert_eq!(off.alpha, 0, "one-step disappearance, no fade animation");
-    }
-
-    /// THE ARC IN THE BODY: at the same beat phase, a peaked song (energy
-    /// 1.0) squashes deeper than a cold intro (energy 0.0) — the dance
-    /// amplitude follows the earned energy, half depth to full.
-    #[test]
-    fn the_dance_amplitude_follows_the_arc_energy() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        let armed_at = arm_singing_after_travel(&mut c, t);
-        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        let pose_at_energy = |c: &mut CursorCat, energy: f32| {
-            c.set_singing(
-                t1,
-                SingSync {
-                    drive: 1.0,
-                    beat: 2.05, // just after a beat: the pulse is near full
-                    energy,
-                    ..SingSync::default()
-                },
-            );
-            c.frame(t1).pose
-        };
-        let cold = pose_at_energy(&mut c, 0.0);
-        let peak = pose_at_energy(&mut c, 1.0);
-        assert!(
-            peak.scale_y < cold.scale_y,
-            "full energy dances deeper ({} vs {})",
-            peak.scale_y,
-            cold.scale_y
-        );
-    }
-
-    /// THE COMMIT LANDING: the reopened bar's first beat squashes deeper
-    /// (×1.6) than the same beat phase without the landing flag.
-    #[test]
-    fn the_commit_landing_doubles_the_squash() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        let armed_at = arm_singing_after_travel(&mut c, t);
-        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        let pose_landing = |c: &mut CursorCat, landing: bool| {
-            c.set_singing(
-                t1,
-                SingSync {
-                    drive: 1.0,
-                    beat: 4.1,
-                    energy: 1.0,
-                    landing,
-                    ..SingSync::default()
-                },
-            );
-            c.frame(t1).pose
-        };
-        let plain = pose_landing(&mut c, false);
-        let landed = pose_landing(&mut c, true);
-        assert!(
-            landed.scale_y < plain.scale_y,
-            "the landing beat is the double squash ({} vs {})",
-            landed.scale_y,
-            plain.scale_y
-        );
-    }
-
-    /// THE FILL BEAT: with the announced fill rolling, the squash pulse
-    /// clock-divides to sixteenth rate — at mid-beat (where the beat pulse
-    /// has relaxed) a fresh sixteenth lands a NEW pulse.
-    #[test]
-    fn the_fill_beat_bobs_at_sixteenth_rate() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        let armed_at = arm_singing_after_travel(&mut c, t);
-        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        let pose_fill = |c: &mut CursorCat, fill: bool| {
-            c.set_singing(
-                t1,
-                SingSync {
-                    drive: 1.0,
-                    beat: 7.5, // mid-beat: beat pulse relaxed, sixteenth fresh
-                    energy: 1.0,
-                    fill,
-                    ..SingSync::default()
-                },
-            );
-            c.frame(t1).pose
-        };
-        let normal = pose_fill(&mut c, false);
-        let rolling = pose_fill(&mut c, true);
-        assert!(
-            rolling.scale_y < normal.scale_y,
-            "the drum-roll head-bob pulses on the sixteenth ({} vs {})",
-            rolling.scale_y,
-            normal.scale_y
-        );
-    }
-
-    /// THE PRE-ECHO POSE BIAS: the destination class leans the singer —
-    /// chorus in, bridge back — at the same beat phase, so a hand-over
-    /// press changes the pose on the very next frame.
-    #[test]
-    fn the_class_lean_pre_echoes_the_destination() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        let armed_at = arm_singing_after_travel(&mut c, t);
-        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        let pose_class = |c: &mut CursorCat, class: u8| {
-            c.set_singing(
-                t1,
-                SingSync {
-                    drive: 1.0,
-                    beat: 3.0,
-                    energy: 1.0,
-                    class,
-                    ..SingSync::default()
-                },
-            );
-            c.frame(t1).pose
-        };
-        let chorus = pose_class(&mut c, 1);
-        let bridge = pose_class(&mut c, 2);
-        assert!(
-            chorus.lead > bridge.lead,
-            "chorus leans in, bridge leans back ({} vs {})",
-            chorus.lead,
-            bridge.lead
-        );
-    }
-
-    /// THE BOW stills the dance and dips the body: at full bow depth the
-    /// pose no longer varies with the beat, the height dips toward the
-    /// bow squash, and the blink re-enables through the singing face.
-    #[test]
-    fn the_bow_stills_the_dance_and_dips() {
-        let mut c = CursorCat::default();
-        let t = Instant::now();
-        let armed_at = arm_singing_after_travel(&mut c, t);
-        let t1 = armed_at + Duration::from_secs_f32(FADE_IN + 0.02);
-        let pose_bow = |c: &mut CursorCat, beat: f32, bow: f32| {
-            c.set_singing(
-                t1,
-                SingSync {
-                    drive: 1.0,
-                    beat,
-                    energy: 1.0,
-                    bow,
-                    ..SingSync::default()
-                },
-            );
-            c.frame(t1).pose
-        };
-        let dancing_a = pose_bow(&mut c, 2.05, 0.0);
-        let dancing_b = pose_bow(&mut c, 2.5, 0.0);
-        assert_ne!(
-            dancing_a.scale_y, dancing_b.scale_y,
-            "without the bow the dance moves with the beat"
-        );
-        let bowed_a = pose_bow(&mut c, 2.05, 1.0);
-        let bowed_b = pose_bow(&mut c, 2.5, 1.0);
-        assert_eq!(
-            bowed_a.scale_y, bowed_b.scale_y,
-            "at full bow the dance is stilled"
-        );
-        assert!(
-            bowed_a.scale_y < dancing_b.scale_y,
-            "the bow dips below the standing dance ({} vs {})",
-            bowed_a.scale_y,
-            dancing_b.scale_y
-        );
     }
 }

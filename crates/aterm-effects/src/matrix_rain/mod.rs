@@ -361,6 +361,13 @@ struct FrameRegion {
     right: usize,
 }
 
+/// The Unicode Box Drawing block — a sound short-circuit for every `frame_*`
+/// classifier below, all of whose literals lie in U+2500..=U+257A.
+#[inline]
+fn in_box_drawing_block(ch: char) -> bool {
+    matches!(ch as u32, 0x2500..=0x257F)
+}
+
 #[inline]
 fn frame_top_left(ch: char) -> bool {
     matches!(ch, '┌' | '┏' | '╔' | '╒' | '╓' | '╭')
@@ -1038,6 +1045,20 @@ impl MatrixRain {
         // a second pass so later eligibility writes cannot re-enable a neighbor.
         for r in 0..rows {
             let row_cells: &[RenderCell] = cells.get(r).map(Vec::as_slice).unwrap_or(&[]);
+            // The 3x3 boxes of ADJACENT meaningful cells overlap almost
+            // completely: a run of n text cells clears 3(n+2) distinct bits with
+            // 9n bounded, divided, scalar read-modify-writes. The dilated
+            // columns arrive in ascending order, so one running interval
+            // coalesces them, and each interval is cleared with the masked-word
+            // span writer this file already uses for framed regions.
+            //
+            // The cleared SET is unchanged by construction: two [c-1, c+1]
+            // boxes are merged only when they touch or overlap (`lo <= end +
+            // 1`), so a one-cell gap between two runs is still never cleared,
+            // and the interval is flushed across exactly rows r-1..=r+1 with
+            // the same clamping. Occupancy stays byte-identical, so every
+            // emitted quad, tint and fingerprint is unchanged.
+            let mut run: Option<(usize, usize)> = None;
             for (c, cell) in row_cells.iter().enumerate().take(cols) {
                 let meaningful = cell.ch != ' '
                     || cell.wide
@@ -1045,9 +1066,21 @@ impl MatrixRain {
                     || cell.strikethrough
                     || cell.overline
                     || cell.bg != bg;
-                if meaningful {
-                    self.clear_occ_neighborhood(r, c);
+                if !meaningful {
+                    continue;
                 }
+                let (lo, hi) = (c.saturating_sub(1), c + 1);
+                match run {
+                    Some((start, end)) if lo <= end + 1 => run = Some((start, hi)),
+                    Some((start, end)) => {
+                        self.clear_occ_neighborhood_span(r, start, end);
+                        run = Some((lo, hi));
+                    }
+                    None => run = Some((lo, hi)),
+                }
+            }
+            if let Some((start, end)) = run {
+                self.clear_occ_neighborhood_span(r, start, end);
             }
             if let Some(spans) = images.get(r) {
                 for (c, _) in spans {
@@ -1183,11 +1216,44 @@ impl MatrixRain {
         self.material_slots_scratch.sort_unstable();
 
         if self.material_chars != self.material_slots_scratch {
+            // WHICH SLOTS ACTUALLY MOVED. Slot assignment is unchanged — the
+            // distinct set, sorted, exactly as before — so a slot either keeps
+            // its character across the change or it does not, and only the ones
+            // that differ need their ROM glyph re-authored and their atlas tile
+            // re-baked. Ordinary streaming turns over a handful of characters at
+            // a time, yet every such frame today re-authors the whole 12 KB
+            // master, memsets the entire 8x8-tile atlas (51 KB at 10x20 cells,
+            // 205 KB at retina) and box-filters all 64 tiles in one synchronous
+            // block.
+            let changed = slot_change_mask(&self.material_chars, &self.material_slots_scratch);
             self.material_chars.clone_from(&self.material_slots_scratch);
-            self.rom = Some(rom::rasterize_material_master(&self.material_chars));
-            self.baker.restart();
-            self.last_bake_tick = None;
-            self.finish_material_bake();
+            // THE INVARIANT THE FAST PATH RESTS ON: every writer of `self.rom`
+            // (`clear_material_bank`, the wholesale arm below) follows it with
+            // `baker.restart()`, and `begin_frame` restarts on a cell-metric
+            // change — so a baker that is COMPLETE at a live metric is, by
+            // construction, a full bake of the current `self.rom` at the current
+            // metric. Patching exactly the changed tiles therefore leaves the
+            // published atlas BYTE-IDENTICAL to the wholesale rebuild, at the
+            // same slot origins, and `rebake_tiles` advances the version by the
+            // same amount the wholesale path did, so the frame fingerprint is
+            // unmoved too.
+            if let Some(rom) = self.rom.as_mut()
+                && self.baker.can_rebake()
+            {
+                let mut rest = changed;
+                while rest != 0 {
+                    let slot = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    rom::reauthor_material_glyph(rom, slot, self.material_chars.get(slot).copied());
+                }
+                self.baker.rebake_tiles(rom, changed);
+                self.last_bake_tick = Some(self.tick);
+            } else {
+                self.rom = Some(rom::rasterize_material_master(&self.material_chars));
+                self.baker.restart();
+                self.last_bake_tick = None;
+                self.finish_material_bake();
+            }
         }
 
         self.material.clear();
@@ -2001,11 +2067,20 @@ impl MatrixRain {
             let row = cells.get(r).map(Vec::as_slice).unwrap_or(&[]);
             let ch_at = |col: usize| row.get(col).map_or(' ', |cell| cell.ch);
 
-            self.frame_horizontal_prefix.resize(cols + 1, 0);
-            self.frame_horizontal_prefix[0] = 0;
-            for col in 0..cols {
-                self.frame_horizontal_prefix[col + 1] =
-                    self.frame_horizontal_prefix[col] + usize::from(frame_horizontal(ch_at(col)));
+            // The bottom-edge prefix sums are READ only from the candidate
+            // loop below, so a row with no live candidate never observes them —
+            // and an ordinary text screen has no candidate on any row. Building
+            // it lazily drops a `cols`-wide usize scan (8 B written per cell,
+            // 1.6 KB per 200-column row) from every rescan that finds no box at
+            // all; when it IS built it is built before its first read, from the
+            // same row, with the same contents.
+            if !self.frame_candidates.is_empty() {
+                self.frame_horizontal_prefix.resize(cols + 1, 0);
+                self.frame_horizontal_prefix[0] = 0;
+                for col in 0..cols {
+                    self.frame_horizontal_prefix[col + 1] = self.frame_horizontal_prefix[col]
+                        + usize::from(frame_horizontal(ch_at(col)));
+                }
             }
 
             let mut write = 0usize;
@@ -2056,6 +2131,16 @@ impl MatrixRain {
             let mut has_horizontal = false;
             for col in 0..cols {
                 let ch = ch_at(col);
+                // Every character any `frame_*` classifier matches lives in the
+                // Unicode Box Drawing block: the 74 distinct literals across the
+                // six classifiers span U+2500..=U+257A. ONE range compare
+                // therefore rejects all three of this loop's classifiers for an
+                // ordinary ASCII cell instead of walking up to 32 `matches!`
+                // arms, and it cannot change the outcome — a non-box character
+                // leaves `open_left` and `has_horizontal` untouched today too.
+                if !in_box_drawing_block(ch) {
+                    continue;
+                }
                 if frame_top_left(ch) {
                     open_left = Some(col);
                     has_horizontal = false;
@@ -2118,6 +2203,24 @@ impl MatrixRain {
         self.occ[first_word] &= !first_mask;
         self.occ[first_word + 1..last_word].fill(0);
         self.occ[last_word] &= !last_mask;
+    }
+
+    /// Clear rows `row-1 ..= row+1` over one ALREADY DILATED inclusive column
+    /// interval — the run-at-a-time form of [`Self::clear_occ_neighborhood`]
+    /// for a whole run of adjacent semantic cells. Same bits, same clamping;
+    /// three masked word writes per interval instead of nine scalar
+    /// read-modify-writes per cell.
+    fn clear_occ_neighborhood_span(&mut self, row: usize, start_col: usize, end_col: usize) {
+        if self.occ_rows == 0 || self.occ_cols == 0 {
+            return;
+        }
+        let r0 = row.saturating_sub(1);
+        let r1 = row.saturating_add(1).min(self.occ_rows - 1);
+        for r in r0..=r1 {
+            // `clear_occ_span` clamps `end_col` to the last column and returns
+            // early past the last row, exactly as the 3x3 form clamped `c1`/`r1`.
+            self.clear_occ_span(r, start_col, end_col);
+        }
     }
 
     /// Clear the 3×3 occupancy neighborhood around one semantic cell. Called
@@ -2389,6 +2492,20 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
 fn fold_u64(mut h: u64, x: u64) -> u64 {
     h ^= x;
     h.wrapping_mul(0x0000_0100_0000_01B3)
+}
+
+/// Which of the 64 dynamic-ROM slots change CHARACTER between two sorted slot
+/// tables (bit `i` ⇒ slot `i` must be re-authored and re-baked). A slot past the
+/// end of a table holds the decorative glyph, so "absent from both" is unchanged
+/// and "present in exactly one" is a change.
+fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
+    let mut mask = 0u64;
+    for slot in 0..rom::ROM_GLYPHS {
+        if old.get(slot) != new.get(slot) {
+            mask |= 1u64 << slot;
+        }
+    }
+    mask
 }
 
 /// Frame fingerprint: FNV-1a chain over EVERY field of every quad — each quad's

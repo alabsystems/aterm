@@ -411,7 +411,11 @@ fn await_then_install(
         step(label, &note);
         label = "";
     }
-    step(label, &errand(csr));
+    // Surface the request in ~/Downloads and reveal it in Finder before the errand
+    // names it: the operator's next act is an upload dialog, and a path under hidden
+    // ~/.aterm is invisible to one. The errand then names the copy the dialog can see.
+    let visible = surface_csr(csr, id);
+    step(label, &errand(visible.as_deref().unwrap_or(csr)));
     step(
         "",
         "waiting for the certificate to appear… (Ctrl-C is safe — re-running resumes here)",
@@ -767,7 +771,7 @@ fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
 /// `provision::notary_check` live-tests it, and the cut reads it back.
 ///
 /// Per-machine revocability lives where it actually bites: the app-specific password
-/// behind it, which should be minted per machine at appleid.apple.com.
+/// behind it, which should be minted per machine at https://account.apple.com (Sign-In and Security → App-Specific Passwords).
 pub(crate) const NOTARY_PROFILE: &str = "notary";
 
 /// Store a notarytool credential in this machine's keychain.
@@ -791,6 +795,17 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     // (`notary_acquire`) LIVE-checks with `notarytool history` before ever calling this,
     // and that is the only test that means anything — see below.
     let profile = NOTARY_PROFILE;
+    // Said BEFORE the prompts, because the password notarytool asks for is the one
+    // credential in this ceremony that exists nowhere until the operator MINTS it —
+    // and an ordinary Apple ID password pasted there fails only after a round-trip
+    // to Apple, twenty words into the errand this line replaces.
+    step(
+        "notary",
+        "the password asked for below is an APP-SPECIFIC password, not your Apple ID \
+         password — mint one at https://account.apple.com → Sign-In and Security → \
+         App-Specific Passwords → + (2FA required; the xxxx-xxxx-xxxx-xxxx string is \
+         shown exactly once), then paste it at the prompt",
+    );
     let apple_id = match tty_line(
         "\n  notary   Apple ID for notarization (blank to skip): ",
         128,
@@ -812,7 +827,7 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
             what: "no notarytool credential in the keychain".into(),
             next: format!(
                 "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-                 --team-id {} (password: an app-specific password from appleid.apple.com)",
+                 --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
                 pins::APPLE_TEAM_ID
             ),
         };
@@ -948,15 +963,32 @@ fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
 /// derive: where the download has to land.
 fn errand(csr: &Path) -> String {
     format!(
-        "upload {} at developer.apple.com/account/resources/certificates (sign in as the \
-         Account Holder — Apple permits nobody else to create a Developer ID certificate) \
-         → + → Software → 'Developer ID Application' → Profile Type 'G2 Sub-CA' (NOT \
-         'Previous Sub-CA': its intermediate expires 2027-02-01) → upload the request → \
-         Download into ~/Downloads, where it is matched by public key. If the list ALREADY \
-         has a certificate for this request, download that one — creating a second spends \
-         a second slot.",
+        "upload {} at https://developer.apple.com/account/resources/certificates (sign in \
+         as the Account Holder — Apple permits nobody else to create a Developer ID \
+         certificate) → + → Software → 'Developer ID Application' → Profile Type 'G2 \
+         Sub-CA' (NOT 'Previous Sub-CA': its intermediate expires 2027-02-01) → upload \
+         the request → Download into ~/Downloads, where it is matched by public key. If \
+         the list ALREADY has a certificate for this request, download that one — \
+         creating a second spends a second slot.",
         csr.display()
     )
+}
+
+/// Copy the request somewhere a file picker can actually see. The canonical copy lives
+/// under hidden `~/.aterm/apple/`, which an upload dialog cannot show — and the dialog
+/// opens in ~/Downloads, which is also where the certificate comes back, so the errand
+/// starts and ends in one visible folder. The CSR is PUBLIC material (the subject and
+/// public key; the private half never leaves `~/.aterm/apple`), so the copy leaks
+/// nothing. Best-effort by design: on any failure the hidden canonical path still
+/// works, and the Finder reveal merely pre-selects the file for the operator.
+#[cfg(unix)]
+fn surface_csr(csr: &Path, id: &str) -> Option<PathBuf> {
+    let visible = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join("Downloads"))?
+        .join(format!("devid-{id}.certSigningRequest"));
+    std::fs::copy(csr, &visible).ok()?;
+    let _ = Command::new("/usr/bin/open").arg("-R").arg(&visible).status();
+    Some(visible)
 }
 
 /// Find a downloaded certificate that belongs to THIS key, by comparing public keys. This

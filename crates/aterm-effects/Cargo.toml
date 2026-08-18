@@ -52,6 +52,30 @@ libc = { workspace = true }
 aterm-spec = { workspace = true }
 # Atlas PNG dumps for visual iteration (gated behind ATERM_CAT_DUMP); dev-only.
 png = "0.17"
+# The per-frame effect benchmarks. Until these landed the crate had NO bench
+# target at all — 130k lines on the frame path with no instrument, which is how
+# four unmeasured "optimizations" once shipped a 1.83% engine regression.
+criterion = "0.5"
+
+[[bench]]
+name = "cursor_glow_tick"
+harness = false
+
+[[bench]]
+name = "word_decorations_tick"
+harness = false
+
+[[bench]]
+name = "trail_synth_render"
+harness = false
+
+[[bench]]
+name = "matrix_rain_tick"
+harness = false
+
+[[bench]]
+name = "effect_bakers"
+harness = false
 
 [lints]
 workspace = true

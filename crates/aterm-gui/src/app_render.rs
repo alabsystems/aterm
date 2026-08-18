@@ -5414,18 +5414,8 @@ pub(crate) fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, p
 /// (`KittySing::signature`): the synth derives every per-key axis from it —
 /// the verse melody walk, the root transpose, the mode rotation — so holding
 /// a different key sings a DIFFERENT VERSE of the same celebration, over one
-/// continuous bar grid instead of restarting it. `class` and `energy_q` are
-/// the SONG ARC's half of the payload (`KittySing::section_class_now` /
-/// `arc_energy_q`): the section timbre/dynamics and the earned escalation —
-/// energy INHERITS across a key switch, so the build is continuous where
-/// the bar index jumps forward at a section reopen.
-fn sing_riff_event(
-    bar: u64,
-    gain: f32,
-    sig: u32,
-    class: u8,
-    energy_q: u8,
-) -> aterm_effects::trail_sound::SoundEvent {
+/// continuous bar grid instead of restarting it.
+fn sing_riff_event(bar: u64, gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEvent {
     aterm_effects::trail_sound::SoundEvent {
         style: crate::cursor_glow::GlowStyle::RainbowKitty,
         // The sing-along riff is its own authored song — the
@@ -5433,12 +5423,7 @@ fn sing_riff_event(
         voice: aterm_effects::trail_sound::SoundVoice::Style,
         kind: aterm_effects::trail_sound::SoundGesture::Celebration(
             // Through the stable constructor (not the variant literal).
-            aterm_effects::trail_sound::CelebrationGesture::riff_bar_arc(
-                (bar & 0xffff) as u16,
-                sig,
-                class,
-                energy_q,
-            ),
+            aterm_effects::trail_sound::CelebrationGesture::riff_bar((bar & 0xffff) as u16, sig),
         ),
         pan: 0.0,
         // Momentum is pinned to 1.0 while armed — that IS maximal flow; the
@@ -5447,58 +5432,6 @@ fn sing_riff_event(
         hue: 0.0,
         gain,
         // Tone-blind like the bonk, and it never feeds the bed.
-        tone: aterm_effects::tone::Tone::Technical,
-        bed: false,
-    }
-}
-
-/// THE DRUMMER'S CUE (`KittySing::take_fill_cue` →
-/// `CelebrationGesture::RiffFillCue`): a committed key switch with runway
-/// announces itself with the authored four-sixteenth fill on the sounding
-/// bar's last beat, WALKING from the departed key (`sig`) into the
-/// arriving one (`sig_next`). The synth quantizes the hits to its OWN
-/// sixteenth grid — this event carries identity, never timing. Same
-/// sound-policy envelope as the riff bar.
-fn sing_fill_event(gain: f32, sig: u32, sig_next: u32) -> aterm_effects::trail_sound::SoundEvent {
-    aterm_effects::trail_sound::SoundEvent {
-        style: crate::cursor_glow::GlowStyle::RainbowKitty,
-        voice: aterm_effects::trail_sound::SoundVoice::Style,
-        kind: aterm_effects::trail_sound::SoundGesture::Celebration(
-            aterm_effects::trail_sound::CelebrationGesture::RiffFillCue { sig, sig_next },
-        ),
-        pan: 0.0,
-        heat: 1.0,
-        hue: 0.0,
-        gain,
-        tone: aterm_effects::tone::Tone::Technical,
-        bed: false,
-    }
-}
-
-/// THE FINALE (`KittySing::take_cadence` ->
-/// `CelebrationGesture::RiffCadence`): one ending bar in the RELEASED
-/// key, gain scaled by the earned energy, the fused clap when the
-/// performance crossed the gate. Same sound-policy envelope as the riff.
-fn sing_cadence_event(
-    gain: f32,
-    sig: u32,
-    energy_q: u8,
-    span_bars: u16,
-) -> aterm_effects::trail_sound::SoundEvent {
-    aterm_effects::trail_sound::SoundEvent {
-        style: crate::cursor_glow::GlowStyle::RainbowKitty,
-        voice: aterm_effects::trail_sound::SoundVoice::Style,
-        kind: aterm_effects::trail_sound::SoundGesture::Celebration(
-            aterm_effects::trail_sound::CelebrationGesture::RiffCadence {
-                sig,
-                energy_q,
-                span_bars,
-            },
-        ),
-        pan: 0.0,
-        heat: 1.0,
-        hue: 0.0,
-        gain,
         tone: aterm_effects::tone::Tone::Technical,
         bed: false,
     }
@@ -9205,216 +9138,54 @@ impl App {
         }
     }
 
-    /// THE APP KITTY resolve rung (owner spec, 2026-08-07): the focused
-    /// pane's app-derived breed, or `None` when no app claims the pane (no
-    /// shell integration, unknown session, or an Executing block with no
-    /// commandline). Identity comes from the pane's CURRENT shell block —
-    /// `current_block().or_else(last)`, the `title_summary::Snapshot`
-    /// precedent — and is cached in `SessionCtx::app_kitty` keyed by
-    /// `(block id, state, commandline present)`, so per frame this is one
-    /// short `Terminal` lock plus a leaf-mutex check; a commandline is parsed
-    /// only on block-state transitions. Lock order term → app_kitty, never
-    /// reversed (documented on the field).
-    pub(crate) fn app_kitty_look(
-        &self,
-        session: u64,
-    ) -> Option<aterm_effects::kitty_registry::KittyLook> {
+    /// THE PROGRAM CAT's raw claim (owner spec, 2026-08-07): the focused
+    /// pane's program-derived breed, or `None` when no program claims the
+    /// pane (the prompt, no shell integration, an unknown session, an
+    /// Executing block with no commandline, a nested shell). Identity comes
+    /// from the pane's CURRENT shell block — `current_block().or_else(last)`,
+    /// the `title_summary::Snapshot` precedent — and is cached in
+    /// `SessionCtx::app_kitty` keyed by `(block id, state, commandline
+    /// present)`, so per frame this is one short `Terminal` lock plus a
+    /// leaf-mutex check; a commandline is parsed only on block-state
+    /// transitions. Lock order term → app_kitty, never reversed (documented
+    /// on the field). RAW: this claim flaps around every command; only
+    /// [`Self::companion_verdict`]'s tenure gate decides what is worn.
+    pub(crate) fn app_kitty_claim(&self, session: u64) -> Option<crate::app_kitty::AppIdentity> {
         let s = self.pool.get(session)?;
         let term = term_lock(&s.term);
         let block = term.current_block().or_else(|| term.all_blocks().last());
         let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
-        slot.resolve(block).map(|identity| identity.look)
-    }
-
-    /// THE PET LABEL's identity half (owner ask, 2026-08-15: hover shows "the
-    /// program it corresponds to and the kitty's name"): the focused pane's
-    /// resolved `(program, kitty name)` — [`crate::app_kitty::AppIdentity`]'s
-    /// canonical id and its deterministic name, through the SAME cache the
-    /// breed resolve uses (one Terminal lock + the `app_kitty` leaf mutex,
-    /// lock order term → app_kitty).
-    ///
-    /// THE HONESTY DECISION (review, 2026-08-16): the label identifies the
-    /// kitty ON GLASS, and the glass is allowed to disagree with the pane —
-    /// the verdict ([`crate::app_kitty::companion_precedence`]) can dress a
-    /// favourite/discovery/session cat over the app's, and even the app's
-    /// own pair lands only through the brain's debounced handoff
-    /// (`kitty_pet::sync_look` parks a changed pair for seconds, longer on a
-    /// sleeper). So:
-    ///
-    ///   * the PROGRAM half describes the PANE and is always shown: the
-    ///     resolved app id, degrading to `"shell"` only when the pane has no
-    ///     shell block at all (no integration, native focus, an unknown
-    ///     session — a resting pane is a shell in every practical sense);
-    ///   * the NAME half is claimed ONLY while the cat on glass IS that
-    ///     identity's kitty — the verdict equals the identity's look AND the
-    ///     brain's worn pair has landed on it (`""` = suppressed; the card
-    ///     renders program-only) — so hover can never read
-    ///     "claude — Clementine" over a cat that is visibly not Clementine;
-    ///   * `None` — no label at all — when a block EXISTS but claims nothing
-    ///     (an Executing block with no commandline, an unknown future
-    ///     state): "shell" would be a lie while an unknown command runs,
-    ///     exactly the resolve rung's own no-claim doctrine.
-    ///
-    /// Resolved only at hover time (never per frame), so the one `String`
-    /// clone and the verdict recompute are free in practice.
-    pub(crate) fn pet_label_identity(
-        &mut self,
-        wid: WindowId,
-        session: Option<u64>,
-    ) -> Option<(String, &'static str)> {
-        let Some(session) = session else {
-            // Native focus: the pet is never drawn there, but stay total —
-            // the shell program with the name suppressed (no cat resolved
-            // means no cat to name).
-            return Some(("shell".to_owned(), ""));
-        };
-        // The pane's claim, gathered under the term → app_kitty locks and
-        // released before the verdict recompute borrows the log.
-        let resolved = self.pool.get(session).map(|s| {
-            let term = term_lock(&s.term);
-            let block = term.current_block().or_else(|| term.all_blocks().last());
-            let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
-            (block.is_some(), slot.resolve(block).cloned())
-        });
-        let (program, name, app_rung, identity_look) = match resolved {
-            // A block that claims nothing: silence, not a plausible lie.
-            Some((true, None)) => return None,
-            Some((_, Some(identity))) => {
-                let look = identity.look;
-                (identity.id, identity.name, Some(look), look)
-            }
-            // No block at all (or an unknown session): the shell fallback.
-            Some((false, None)) | None => (
-                "shell".to_owned(),
-                aterm_effects::kitty_registry::kitty_name("shell"),
-                None,
-                aterm_effects::kitty_registry::KittyLook::for_app("shell"),
-            ),
-        };
-        // THE NAME GATE: exactly the inputs the glass wears — the one
-        // precedence law plus the brain's worn pair, so the name half can
-        // never outrun (or outrank) the cat actually drawn.
-        let (favourite, discovery) = self.kitty_log.companion_looks();
-        let verdict =
-            crate::app_kitty::companion_precedence(favourite, app_rung, discovery, session);
-        let worn = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.cursor_pet.worn_look());
-        let dressed = verdict == identity_look
-            && worn == Some((identity_look.coat, identity_look.iris));
-        Some((program, if dressed { name } else { "" }))
-    }
-
-    /// THE PET HOVER PROBE: when the pointer's last position sits on the
-    /// pet's live drawn body (the stashed `pet_hit_rect`, padded by the
-    /// petting seam's own slop), the label's anchor in TRAY px —
-    /// `(x_center, y_top_of_the_pet)`, the RobiTip anchor convention. The
-    /// tray conversion is `notice_click`'s inverse of `splice_notice`'s
-    /// `dx = pad + x0` / `dy = pad_top + head + y0`, so the card lands where
-    /// the click test and the painter already agree it is. `None` when not
-    /// hovered, the pet is not on glass, or the pointer is not inside the
-    /// window at all (`pointer_in_window`, the `CursorLeft` staleness gate:
-    /// `last_cursor_px` freezes when the pointer leaves, and geometry alone
-    /// cannot tell "holding still over the cat" from "left across the cat").
-    /// Re-derived per drawn frame, so a pet that walks out from under a still
-    /// pointer drops the label.
-    pub(crate) fn pet_hover_anchor(&self, wid: WindowId) -> Option<(f32, f32)> {
-        let ws = self.windows.get(&wid)?;
-        if !ws.pointer_in_window {
-            return None;
-        }
-        let rect = ws.pet_hit_rect?;
-        let (px, py) = ws.last_cursor_px;
-        let (fx, fy) = self.window_to_frame(wid, px, py);
-        if !crate::app_mouse::pet_rect_hit(rect, fx, fy, crate::app_mouse::PET_HIT_SLOP_PX) {
-            return None;
-        }
-        let pad = self.win_pad(wid) as f32;
-        let top = (self.win_pad_top(wid) + self.win_head(wid)) as f32;
-        let (x0, x1, y0, _) = rect;
-        Some(((x0 + x1) as f32 * 0.5 - pad, y0 as f32 - top))
-    }
-
-    /// THE PET LABEL's lifecycle drain, run by `redraw_window` just before
-    /// `splice_notice` on BOTH terminal routes (the branch merges before the
-    /// drain, so splits are covered — the pet, unlike Robi, is not
-    /// single-pane-only). Re-verifies the hover against THIS frame's stashed
-    /// body (through [`Self::pet_hover_anchor`], whose `pointer_in_window`
-    /// gate keeps a `CursorLeft` dismissal from being resurrected by the very
-    /// redraw it schedules), keeps the per-window latch honest, and drives
-    /// the App-global notice slot:
-    ///
-    ///   * hovered ⇒ post `NoticeKind::PetLabel` into a FREE slot (expired,
-    ///     a Robi tip — the user's pointing gesture outranks an ambient tip
-    ///     — or an existing label; an UPDATE notice is never clobbered),
-    ///     re-anchor it over the pet, `hold_open` it past its TTL, and
-    ///     replace it if the identity under the pointer changed;
-    ///   * not hovered ⇒ retire the label this window owns (mouse-out).
-    ///
-    /// No dwell, deliberately: no hover surface in this app has one, and the
-    /// card's own 220 ms entrance ramp already keeps a drive-by pointer from
-    /// flashing a fully-opaque card.
-    pub(crate) fn drain_pet_hover_label(&mut self, wid: WindowId) {
-        let hover = self.pet_hover_anchor(wid);
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.pet_hovered = hover.is_some();
-        }
-        let Some(anchor) = hover else {
-            self.clear_pet_label(wid);
-            return;
-        };
-        let now = std::time::Instant::now();
-        let session = self.focused_session_id(wid);
-        let Some((program, name)) = self.pet_label_identity(wid, session) else {
-            // The pane claims nothing nameable (an Executing block with no
-            // commandline): no card, and any label this window still owns
-            // retires. The hover latch above stays honest, so the moment a
-            // claim appears (a late OSC 633;E) the next drawn frame posts it.
-            self.clear_pet_label(wid);
-            return;
-        };
-        match self.notice.as_mut() {
-            Some(n) if n.is_pet_label() => {
-                if n.pet_label_matches(&program, name) {
-                    n.set_anchor(Some(anchor));
-                    n.hold_open(now);
-                } else {
-                    // The identity under the pointer changed (the app
-                    // flipped mid-hover): a fresh card, fresh entrance.
-                    *n = crate::notice::TransientNotice::pet_label(
-                        program, name, wid, anchor, now,
-                    );
-                }
-            }
-            Some(n) if !n.is_expired(now) && !n.is_robi_tip() => {
-                // An update notice owns the slot; the label waits its turn.
-            }
-            _ => {
-                self.notice = Some(crate::notice::TransientNotice::pet_label(
-                    program, name, wid, anchor, now,
-                ));
-            }
-        }
+        slot.resolve(block).cloned()
     }
 
     /// THE ONE COMPANION VERDICT (gauntlet F3 hardening): every surface that
     /// dresses the cursor companion — the single-pane present, the composed
     /// present, and BOTH capture splices in `app_introspect` — resolves the
     /// look through this method, so the precedence law
-    /// ([`crate::app_kitty::companion_precedence`]: favourite > app >
-    /// discovery > session) cannot be true on the glass and false in the
-    /// capture lens (or vice versa). Before this seam existed the capture
-    /// splices still called the pre-precedence `companion_look()` — no app
-    /// rung, no session floor — so a capture could stomp the present's
-    /// verdict and a headless probe never saw the app breeds at all.
+    /// ([`crate::launch_kitty::companion_precedence`]: favourite > program
+    /// with tenure > launch kitty) cannot be true on the glass and false in
+    /// the capture lens (or vice versa).
+    ///
+    /// `focus_session` is the window's focused pane (its raw program claim
+    /// feeds the window's [`crate::app_kitty::KittyTenure`] gate); `now` is
+    /// the frame's instant (the gate is clockless — the caller injects
+    /// time). Advancing the gate here is idempotent for a stable claim, so a
+    /// capture splice or a typed summon re-resolving in the same frame lands
+    /// nothing the present would not. `&mut self`: the gate advances, and the
+    /// ledger read polls its lazy startup load.
     pub(crate) fn companion_verdict(
         &mut self,
+        wid: WindowId,
         focus_session: u64,
+        now: std::time::Instant,
     ) -> aterm_effects::kitty_registry::KittyLook {
-        let (favourite, discovery) = self.kitty_log.companion_looks();
-        let app = self.app_kitty_look(focus_session);
-        crate::app_kitty::companion_precedence(favourite, app, discovery, focus_session)
+        let favourite = self.kitty_log.favourite_look();
+        let raw = self.app_kitty_claim(focus_session);
+        let app = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.kitty_tenure.observe(raw.as_ref(), now).map(|i| i.look));
+        crate::launch_kitty::companion_precedence(favourite, app, self.launch_kitty)
     }
 
     /// WINDOW-SPACE effects geometry for window `wid`'s effect streams
@@ -12531,17 +12302,13 @@ impl App {
         }
         // THE PET is drawn only on the terminal routes (single-pane AND
         // composed). Every other route (a mixed terminal+native window, a
-        // native tab) draws no pet this frame, so its hit-box, its hover
-        // latch and its hover LABEL clear here — the same field law as
-        // `robi_hit_rect` above: stale per-frame stashes on an undrawn route
-        // eat input, and those routes never reach the label drain that would
-        // otherwise retire the card.
-        if !matches!(route, crate::VisibleContentRoute::Terminal { .. }) {
-            if let Some(ws) = self.windows.get_mut(&id) {
-                ws.pet_hit_rect = None;
-                ws.pet_hovered = false;
-            }
-            self.clear_pet_label(id);
+        // native tab) draws no pet this frame, so its hit-box clears here —
+        // the same field law as `robi_hit_rect` above: a stale per-frame
+        // stash on an undrawn route eats input.
+        if !matches!(route, crate::VisibleContentRoute::Terminal { .. })
+            && let Some(ws) = self.windows.get_mut(&id)
+        {
+            ws.pet_hit_rect = None;
         }
         let multi_pane = match route {
             crate::VisibleContentRoute::Terminal { composed } => {
@@ -13144,14 +12911,13 @@ impl App {
                     .set_cursor_style_override(Some(CursorStyle::SteadyBlock));
             }
             self.install_window_config_assets(id);
-            // Resolved BEFORE the mutable window borrow: the session kitty is a
-            // pure function of the focused pane's session id, the collected
-            // companion is split by reason (favourite vs discovery), and the
-            // app kitty is the cached identity of the pane's shell block —
-            // folded by the ONE verdict seam every dressing surface shares
-            // ([`Self::companion_verdict`]).
+            // Resolved BEFORE the mutable window borrow: the launch kitty is
+            // process-wide state, a pinned favourite is a ledger fact, and
+            // the program cat is the focused pane's claim after this window's
+            // tenure gate — folded by the ONE verdict seam every dressing
+            // surface shares ([`Self::companion_verdict`]).
             let front_session = self.focused_session_id(id).unwrap_or(0);
-            let companion_verdict = self.companion_verdict(front_session);
+            let companion_verdict = self.companion_verdict(id, front_session, frame_started);
             // Likewise a pure config read, hoisted above the window borrow: it
             // selects WHICH companion the draw block below emits.
             let pet_mode = self.trail_is_kitty_pet();
@@ -13187,31 +12953,27 @@ impl App {
             // homage only when the admitted catalog contains a Ready asset. An
             // Invalid asset disables the companion and remains diagnosable; no
             // presentation path expands a path, reads a file, or decodes PNG.
-            // O(1) scalar sync from the durable collection (no ledger scan/I/O).
-            // It keeps new windows and restored sessions on the latest
-            // collected identity. `on_collect` fires from the TYPED path only
-            // (`record_typed_kitty`); this tick's ambient drain below records
-            // to the ledger and can never repoint the companion (owner
-            // ruling, 2026-08-07).
+            // O(1) scalar sync (no ledger scan/I/O). `on_collect` fires from
+            // the favourite-pin path only (`favourite_kitty`); this tick's
+            // ambient drain below records to the ledger and can never repoint
+            // the companion (owner rulings, 2026-08-07 and 2026-08-17).
             // TWO-PATH RULE (owner: switching character mid-flight is
             // distracting): this per-frame sync is LATCHED per appearance —
             // while the companion is on screen `set_look` parks the change and
             // the one body keeps the same latched look until the next wake.
-            // Only `on_collect` swaps mid-appearance, because the discovery
-            // hello legitimately presents the newly unlocked collectible.
-            // THE COMPANION PRECEDENCE LAW (owner, 2026-08-07; stated once in
-            // `app_kitty::companion_precedence`): favourite > app > discovery
-            // > session. A PINNED FAVOURITE still owns the companion look —
-            // the user picked it, and only a reason may change the kitty.
-            // Below the pin sits THE APP KITTY: while the focused pane runs
-            // `claude`, the claude cat rides the cursor; at the prompt, the
-            // shell's own tuxedo. A mere ambient/typed DISCOVERY (collected,
-            // never pinned) ranks under the app — earned, but not chosen —
-            // and the floor stays THE SESSION KITTY (owner, 2026-07-26):
-            // unique per session, stable for the session's life, free to
-            // restore because it is a pure function of the id. Mid-appearance
-            // switches ride the existing `set_look` latch — the body swaps
-            // breeds only between appearances.
+            // Only `on_collect` swaps mid-appearance, because the pin's hello
+            // legitimately presents the cat the user just chose.
+            // THE COMPANION PRECEDENCE LAW (owner, 2026-08-07/17; stated once
+            // in `launch_kitty::companion_precedence`): favourite > program
+            // with tenure > launch kitty. A PINNED FAVOURITE owns the
+            // companion look — the user picked it, and only a reason may
+            // change the kitty. Below it, a PROGRAM that has EARNED the
+            // cursor (held the focused pane through `app_kitty::TENURE`,
+            // lingering `RELEASE` after it exits — never a flap per command)
+            // wears its own cat; otherwise THE LAUNCH KITTY rides: the base
+            // cat, minted once at launch. Mid-appearance switches ride the
+            // existing `set_look` latch — the body swaps breeds only between
+            // appearances.
             ws.cursor_cat.set_look(companion_verdict);
             // Full motion advances the fade/bob machine. Reduced motion samples
             // a collection hello as one opaque still; ordinary earned flights
@@ -13278,49 +13040,12 @@ impl App {
                         // signature drives the verse, root and mode, so
                         // switching which key you hold changes the tune — over
                         // the same bar grid, so the change is seamless rather
-                        // than a restart. The ARC rides beside it: section
-                        // class + earned energy, inherited across switches.
+                        // than a restart.
                         self.trail_audio.push(sing_riff_event(
                             bar,
                             gain,
                             ws.kitty_sing.signature(),
-                            ws.kitty_sing.section_class_now(),
-                            ws.kitty_sing.arc_energy_q(frame_started),
                         ));
-                    }
-                }
-                // THE ANNOUNCED SWITCH: drain the drummer's cue
-                // UNCONDITIONALLY (the latch law — a muted riff must not
-                // bank a stale cue for an unmuted later moment), push only
-                // when the riff gate says audible.
-                if let Some((old_sig, new_sig)) = ws.kitty_sing.take_fill_cue()
-                    && let Some(gain) = sing_riff_gain(
-                        ws.focused,
-                        self.config.trail_sounds_or_default(),
-                        self.config.trail_sound_riff_or_default(),
-                        self.config.trail_sound_volume(),
-                    )
-                {
-                    self.trail_audio
-                        .push(sing_fill_event(gain, old_sig, new_sig));
-                }
-                // THE FINALE: consume the cadence exactly once. The audio
-                // push rides the riff gate (muted => no sound, still
-                // consumed); the FIREWORKS are a MOTION contract — they
-                // run for a muted riff, and never under reduced motion
-                // (the fade-only law).
-                if let Some((sig, energy_q, span)) = ws.kitty_sing.take_cadence(frame_started) {
-                    if let Some(gain) = sing_riff_gain(
-                        ws.focused,
-                        self.config.trail_sounds_or_default(),
-                        self.config.trail_sound_riff_or_default(),
-                        self.config.trail_sound_volume(),
-                    ) {
-                        self.trail_audio
-                            .push(sing_cadence_event(gain, sig, energy_q, span));
-                    }
-                    if motion.animate(crate::motion::MotionEffect::CursorGlow) {
-                        ws.music_notes.fireworks(frame_started, u32::from(span));
                     }
                 }
             } else {
@@ -13334,11 +13059,6 @@ impl App {
                 crate::kitty_cursor::SingSync {
                     drive: sing_drive,
                     beat: ws.kitty_sing.beat(frame_started).unwrap_or(0.0),
-                    energy: f32::from(ws.kitty_sing.arc_energy_q(frame_started)) / 200.0,
-                    class: ws.kitty_sing.section_class_now(),
-                    landing: ws.kitty_sing.switch_landing(frame_started),
-                    fill: ws.kitty_sing.fill_beat(frame_started),
-                    bow: ws.kitty_sing.bow_depth(frame_started),
                 },
             );
             let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
@@ -13840,10 +13560,12 @@ impl App {
                         });
                         // ONE APPEARANCE WEARS ONE CAT (`kitty_pet::sync_look`
                         // — the flying kitty's `set_look` latch, extended to
-                        // the pet): `cat_frame.look` is this frame's GLOBAL
-                        // verdict, which a typed discovery can repoint
-                        // mid-walk, so it is the SYNC input — the pet draws
-                        // the pair its current appearance latched.
+                        // the pet): `cat_frame.look` is this frame's verdict
+                        // for THIS window (only the launch-kitty floor is
+                        // process-wide), which a tenured program or a
+                        // favourite pin can repoint mid-walk, so it is the
+                        // SYNC input — the pet draws the pair its current
+                        // appearance latched.
                         let look = cat_frame.look.normalized();
                         let (coat, iris) = ws.cursor_pet.sync_look(look.coat, look.iris);
                         if let Some(pet_fp) = ws.word_decos.pet_cursor(
@@ -13913,16 +13635,11 @@ impl App {
                                     notes: {
                                         ws.music_notes.update(
                                             frame_started,
-                                            // ARMED, not the drive: the
-                                            // finale tail streams nothing —
-                                            // the fireworks own the ending.
+                                            // ARMED, not the drive: wind-down
+                                            // spawns nothing — the fade is
+                                            // the visual crossfade.
                                             ws.kitty_sing.is_armed(frame_started),
                                             ws.kitty_sing.beat(frame_started),
-                                            // The stripe range follows the
-                                            // section class — and flips on
-                                            // the hand-over press itself
-                                            // (the tint pre-echo).
-                                            ws.kitty_sing.section_class_now(),
                                         );
                                         ws.music_notes
                                             .frame_array(frame_started, tick_cfg.reduced_motion)
@@ -14976,12 +14693,6 @@ impl App {
                 n.set_anchor(Some(a));
             }
         }
-        // THE PET'S HOVER LABEL: post/refresh/retire against THIS frame's
-        // stashed pet body — after the tick (the rect is this frame's truth),
-        // before the splice (so the card rasters this frame). Runs on BOTH
-        // terminal routes: the branch above already merged, and the pet —
-        // unlike Robi — lives on splits too.
-        self.drain_pet_hover_label(id);
         // Transient update notice — paint-only, its own slot, priority over the badge.
         self.splice_notice(id);
         // LEVEL-UP rising up-arrow — paint-only, its own slot, priority over the notice
@@ -16815,7 +16526,7 @@ impl App {
             }
         };
         // ONE APPEARANCE WEARS ONE CAT: same latch as the single-pane twin —
-        // the global verdict is the SYNC input, the worn pair is what draws.
+        // this window's verdict is the SYNC input, the worn pair is what draws.
         let look = ctx.cat_frame.look.normalized();
         let (coat, iris) = ws.cursor_pet.sync_look(look.coat, look.iris);
         ws.pane_free.clear();
@@ -16931,12 +16642,10 @@ impl App {
                 notes: {
                     ws.music_notes.update(
                         ctx.now,
-                        // ARMED, not the drive — the finale tail belongs
-                        // to the fireworks (the single-pane twin's law).
+                        // ARMED, not the drive — wind-down spawns nothing
+                        // (the single-pane twin's law).
                         ws.kitty_sing.is_armed(ctx.now),
                         ws.kitty_sing.beat(ctx.now),
-                        // The class-tinted stripes — the pre-echo's tint half.
-                        ws.kitty_sing.section_class_now(),
                     );
                     ws.music_notes.frame_array(ctx.now, reduced)
                 },
@@ -17660,7 +17369,7 @@ impl App {
         // The companion's identity verdict, hoisted above the `ws` borrow like
         // the single-pane seam — the same one function every dressing surface
         // resolves through ([`Self::companion_verdict`]).
-        let companion_verdict = self.companion_verdict(focus);
+        let companion_verdict = self.companion_verdict(wid, focus, now);
         let sing_style = matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();
         let sound_volume = self.config.trail_sound_volume();
@@ -17698,12 +17407,12 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, fill, cadence, pet_frame) = {
+        let (cat_frame, kitty_alpha, riff, pet_frame) = {
             let ws = self.windows.get_mut(&wid)?;
             // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
-            // through the same one verdict (favourite > app > discovery
-            // > session; see `app_kitty::companion_precedence`, resolved
-            // by [`Self::companion_verdict`] above).
+            // through the same one verdict (favourite > program with tenure
+            // > launch kitty; see `launch_kitty::companion_precedence`,
+            // resolved by [`Self::companion_verdict`] above).
             ws.cursor_cat.set_look(companion_verdict);
             ws.cursor_cat
                 .set_collection_presentable(now, cat_presentable);
@@ -17714,9 +17423,7 @@ impl App {
             } else {
                 0.0
             };
-            let mut riff: Option<(u64, f32, u32, u8, u8)> = None;
-            let mut fill: Option<(f32, u32, u32)> = None;
-            let mut cadence: Option<(f32, u32, u8, u16)> = None;
+            let mut riff: Option<(u64, f32, u32)> = None;
             if sing_drive > 0.0 {
                 ws.cursor_glow.celebrate(now, sing_drive);
                 if let Some(bar) = ws.kitty_sing.bar(now)
@@ -17727,32 +17434,8 @@ impl App {
                     // above, exactly like the single-pane seam: quieting
                     // the song must not stall the bar grid, or re-enabling
                     // it mid-celebration would replay a stale bar.
-                    riff =
-                        sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume).map(|gain| {
-                            (
-                                bar,
-                                gain,
-                                ws.kitty_sing.signature(),
-                                ws.kitty_sing.section_class_now(),
-                                ws.kitty_sing.arc_energy_q(now),
-                            )
-                        });
-                }
-                // THE ANNOUNCED SWITCH — the single-pane twin: drain
-                // unconditionally, push (deferred, outside this borrow)
-                // only when audible.
-                if let Some((old_sig, new_sig)) = ws.kitty_sing.take_fill_cue() {
-                    fill = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
-                        .map(|gain| (gain, old_sig, new_sig));
-                }
-                // THE FINALE — the single-pane twin: consume once,
-                // audio behind the gate, fireworks behind motion.
-                if let Some((sig, energy_q, span)) = ws.kitty_sing.take_cadence(now) {
-                    cadence = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
-                        .map(|gain| (gain, sig, energy_q, span));
-                    if animate_cat {
-                        ws.music_notes.fireworks(now, u32::from(span));
-                    }
+                    riff = sing_riff_gain(ws.focused, sound_on, riff_key, sound_volume)
+                        .map(|gain| (bar, gain, ws.kitty_sing.signature()));
                 }
             } else {
                 ws.kitty_sing.settle(now);
@@ -17763,11 +17446,6 @@ impl App {
                 crate::kitty_cursor::SingSync {
                     drive: sing_drive,
                     beat: ws.kitty_sing.beat(now).unwrap_or(0.0),
-                    energy: f32::from(ws.kitty_sing.arc_energy_q(now)) / 200.0,
-                    class: ws.kitty_sing.section_class_now(),
-                    landing: ws.kitty_sing.switch_landing(now),
-                    fill: ws.kitty_sing.fill_beat(now),
-                    bow: ws.kitty_sing.bow_depth(now),
                 },
             );
             let mut cat_frame = if animate_cat {
@@ -17908,19 +17586,10 @@ impl App {
                 } else {
                     None
                 };
-            (cat_frame, alpha, riff, fill, cadence, pet_frame)
+            (cat_frame, alpha, riff, pet_frame)
         };
-        if let Some((bar, gain, sig, class, energy_q)) = riff {
-            self.trail_audio
-                .push(sing_riff_event(bar, gain, sig, class, energy_q));
-        }
-        if let Some((gain, old_sig, new_sig)) = fill {
-            self.trail_audio
-                .push(sing_fill_event(gain, old_sig, new_sig));
-        }
-        if let Some((gain, sig, energy_q, span)) = cadence {
-            self.trail_audio
-                .push(sing_cadence_event(gain, sig, energy_q, span));
+        if let Some((bar, gain, sig)) = riff {
+            self.trail_audio.push(sing_riff_event(bar, gain, sig));
         }
         // The brain tick used the base gate; presentation uses the custody gate.
         let pet_visible = pet_companion_admitted(pet_visible, cat_frame.sing);

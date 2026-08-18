@@ -91,20 +91,16 @@ impl App {
             .frontmost_window
             .and_then(|wid| self.front_terminal(wid))
             .is_some_and(|terminal| self.session_rain_enabled(terminal.session));
-        // The checkmark answers "is THIS session's own kitty the pinned
-        // favourite?" — the same look `App::favourite_session_kitty` promotes,
-        // deliberately NOT `companion_look()` (once anything is collected the
-        // companion wins for every window, so it could never report the
-        // session kitty). `is_favourite` is `&self`: this resolver cannot poll
-        // the startup import, and the render loop polls every tick anyway.
-        let session_kitty_favourited =
-            self.frontmost_window
-                .and_then(|wid| self.front_terminal(wid))
-                .is_some_and(|terminal| {
-                    self.kitty_log.is_favourite(
-                        aterm_effects::kitty_registry::KittyLook::for_session(terminal.session),
-                    )
-                });
+        // The checkmark answers "is this window's promotable kitty (the
+        // tenured program cat on glass, else the launch kitty) the pinned
+        // favourite?" — the same look `App::favourite_kitty` promotes. With
+        // no window at all the launch kitty is the answer. `is_favourite` is
+        // `&self`: this resolver cannot poll the startup import, and the
+        // render loop polls every tick anyway.
+        let promotable = self
+            .frontmost_window
+            .map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
+        let kitty_favourited = self.kitty_log.is_favourite(promotable);
         // Per-session rows need a real front terminal — false over a native
         // whole tab AND with no window at all (the windowless-app state).
         let terminal_front = self
@@ -118,7 +114,7 @@ impl App {
             can_rename,
             settings_open: self.settings_tab_open(),
             rain_on,
-            session_kitty_favourited,
+            kitty_favourited,
             serious_mode: self.serious_mode_enabled(),
             fullscreen,
             multi_tab,

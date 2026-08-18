@@ -109,7 +109,7 @@ struct KeyClickSynth {
 }
 
 #[inline]
-fn keystroke_click_audible(
+pub(crate) fn keystroke_click_audible(
     worker_live: bool,
     sounds_on: bool,
     volume: f32,
@@ -1207,6 +1207,13 @@ impl App {
         use aterm_effects::kitty_registry::{
             KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
         };
+        // The SAME verdict the glass wears (`App::companion_verdict`: a pinned
+        // favourite, else the tenured program cat, else the launch kitty), so
+        // a typed summon logs the cat actually drawn. Never
+        // `KittyLook::default()`. Read first: it borrows `self` mutably (the
+        // tenure gate, the ledger's lazy load poll), before `sparkle` is held
+        // below.
+        let look = self.companion_verdict(wid, session, now).normalized();
         // EFFECTS MASTER GATE: with sparkle words off (config or the panic
         // toggle) no cat machinery can draw — `kitty_enabled` requires
         // `sparkle_on` — so the summon is wholly inert, exactly like the
@@ -1227,15 +1234,6 @@ impl App {
         if !rs.cfg.feline {
             return;
         }
-        // Same resolution order as the per-frame sync in `app_render`: an
-        // explicitly collected companion wins, otherwise this session's own
-        // kitty. Never `KittyLook::default()` — that is one cat shared by
-        // every session.
-        let look = self
-            .kitty_log
-            .companion_look()
-            .unwrap_or_else(|| aterm_effects::kitty_registry::KittyLook::for_session(session))
-            .normalized();
         // Displayed-trait bits mirror the word renderer's recorder exactly:
         // only the overlay accessories a drawn cat actually carries are counted.
         let traits = match look.accessory {
@@ -1277,26 +1275,25 @@ impl App {
         let discovered = self
             .kitty_log
             .observe(session, [sighting], &rs.lexicon, now, enabled);
-        // A FIRST-EVER sighting repoints the COMPANION — the host's per-frame
-        // `companion_precedence` sync owns that, and it promotes the fresh
-        // discovery on the very next frame. An idle prompt draws no next frame
-        // on its own, so one explicit wake is owed; nothing else here changes a
-        // pixel, so nothing else asks for one.
-        if discovered.is_some()
-            && let Some(ws) = self.windows.get_mut(&wid)
-            && let Some(w) = ws.os_window.as_ref()
-        {
-            w.request_redraw();
-        }
+        // A FIRST-EVER sighting is collected and reported, but it repoints
+        // nothing (owner ruling, 2026-08-17: the launch kitty does not change
+        // for a discovery — only a favourite pin changes the cat), so no
+        // pixel changes here and no wake is owed. The return value is the
+        // Kitty Log's own accounting; the settings book repaints on its
+        // revision like every other sighting.
+        let _ = discovered;
     }
 
-    /// Promote the FRONT SESSION's own kitty into the durable kitty registry
-    /// and pin it as the companion. The menu-bar item, the ⇧⌘P palette row, and
-    /// `aterm-ctl invoke FavouriteSessionKitty` all land here.
-    pub(crate) fn favourite_session_kitty(&mut self, wid: WindowId, now: std::time::Instant) {
-        use aterm_effects::kitty_registry::{
-            KittyLook, KittyMagic, KittyShownAs, KittySighting, KittyType,
-        };
+    /// Promote THIS window's unpinned companion — the tenured program cat if
+    /// one has the cursor, else the launch kitty ([`Self::promotable_kitty`])
+    /// — into the durable kitty registry and pin it as the companion (which
+    /// is also how a cat you like is KEPT across launches and programs, since
+    /// a pin outranks both). The menu-bar item, the ⇧⌘P palette row, and
+    /// `aterm-ctl invoke FavouriteKitty` (legacy spelling
+    /// `FavouriteSessionKitty` still accepted) all land here. `wid` is the
+    /// window whose cat is promoted and whose companion presents the hello.
+    pub(crate) fn favourite_kitty(&mut self, wid: WindowId, now: std::time::Instant) {
+        use aterm_effects::kitty_registry::{KittyMagic, KittyShownAs, KittySighting, KittyType};
         // EFFECTS MASTER GATE, then the FELINE SUB-GATE — the exact pair
         // `record_typed_kitty` documents: nothing can draw ⇒ nothing may log,
         // and `feline.enabled = false` means cats do not exist, so a synthetic
@@ -1308,14 +1305,13 @@ impl App {
         if !rs.cfg.feline {
             return;
         }
-        let Some(session) = self.focused_session_id(wid) else {
-            return;
-        };
-        // THE SESSION KITTY, deliberately not `companion_look()`. Once ANYTHING
-        // is collected the companion wins for every window (`app_render`), so
-        // favouriting "the cat I can see" could never promote a session kitty —
-        // on a used ledger it would only ever re-pin the cat that already won.
-        let look = KittyLook::for_session(session);
+        // THE PROMOTABLE KITTY — the verdict BELOW the pin rung — deliberately
+        // not the current verdict: on a ledger that already carries a pin the
+        // verdict IS that pin, so favouriting "the cat I can see" could only
+        // ever re-pin the cat that already won. Promoting the cat that would
+        // ride without the pin (this window's tenured program cat, else the
+        // launch kitty) is what lets the user swap the pin onto it.
+        let look = self.promotable_kitty(wid);
         let enabled = self.kitty_log_enabled();
         let ident = next_kitty_summon_ident(
             &mut self.kitty_summon_seq,
@@ -1329,8 +1325,8 @@ impl App {
             // so "unknown" is the honest primary language rather than a
             // borrowed chip from a scan that never happened.
             langs: aterm_lexicon::LangSet::EMPTY,
-            // `for_session` never mints an accessory, so no overlay was drawn
-            // and no displayed-trait bit may be claimed.
+            // Neither `for_launch` nor `for_app` mints an accessory, so no
+            // overlay was drawn and no displayed-trait bit may be claimed.
             traits: 0,
             look,
             ident,
@@ -1338,9 +1334,10 @@ impl App {
         self.kitty_log
             .favourite(&sighting, &rs.lexicon, now, enabled);
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // TWO REASONS, TWO PRESENTATIONS: a favourite IS a reason to change
-            // the identity, so it takes path 2 (`on_collect`) like a discovery
-            // hello, rather than the identity-preserving `on_summon`.
+            // THE ONE REASON: a favourite IS a reason to change the identity,
+            // so it takes path 2 (`on_collect`, the immediate hello) rather
+            // than the identity-preserving `on_summon` — the only caller
+            // that may, since discovery no longer re-dresses the companion.
             ws.cursor_cat.on_collect(now, look);
             // A no-echo prompt repaints nothing on its own — one explicit wake
             // lets the hello's first frame present.
@@ -1350,10 +1347,22 @@ impl App {
         }
     }
 
+    /// The cat "Favourite This Kitty" promotes and its checkmark reports on:
+    /// the companion verdict BELOW the pin rung for window `wid` — the
+    /// tenured program cat currently on glass there, else the launch kitty.
+    /// Reads the tenure gate without advancing it (`&self`), so the palette
+    /// resolver and the press agree.
+    pub(crate) fn promotable_kitty(&self, wid: WindowId) -> aterm_effects::kitty_registry::KittyLook {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.kitty_tenure.worn().map(|i| i.look))
+            .unwrap_or(self.launch_kitty)
+    }
+
     /// Deliver a typed-word reaction to the window's cursor companion.
     ///
     /// EXPRESSION ONLY. Neither family touches `look`, the flight lifetime, or
-    /// typing momentum — the session's kitty keeps its identity through every
+    /// typing momentum — the launch kitty keeps its identity through every
     /// reaction. The FELINE arm is deliberately silent here: a typed feline
     /// word is answered by the ambient word-cat the echoed word grows, and the
     /// companion is not something typing a word may wake (owner, 2026-08-09:
@@ -2577,7 +2586,7 @@ impl App {
                         self.record_typed_kitty(wid, session, input_now);
                     }
                     // COMPANION REACTIONS (multilingual, via the lexicon scan
-                    // above). Expression only — the session's kitty never changes
+                    // above). Expression only — the launch kitty never changes
                     // identity for a typed word.
                     if summoned.feline || summoned.profanity {
                         self.react_typed_word(wid, input_now, summoned);
@@ -4208,7 +4217,7 @@ impl App {
             return true;
         }
 
-        let km_mods = keymap::modifiers_from_winit(mods) | keymap::lock_modifiers();
+        let km_mods = keymap::modifiers_from_winit(mods) | (self.lock_modifiers)();
         if let Some((key, km_mods, base_layout)) = keymap::build_key_input(ev, km_mods) {
             let input = InputEvent::Key {
                 key,
@@ -4712,7 +4721,7 @@ impl App {
         // physical key for Kitty REPORT_ALTERNATE_KEYS.
         // Caps/Num Lock are not in winit's `ModifiersState`; fold the live
         // platform lock state into the Kitty modifier byte (WIRE-MODIFIERS).
-        let km_mods = keymap::modifiers_from_winit(mods) | keymap::lock_modifiers();
+        let km_mods = keymap::modifiers_from_winit(mods) | (self.lock_modifiers)();
         if let Some((key, km_mods, base_layout)) = keymap::build_key_input(&ev, km_mods) {
             // Always a genuine PRESS: `on_key` routes every auto-repeat through
             // `route_physical_repeat` and every RELEASE through
@@ -6545,11 +6554,12 @@ impl App {
                     self.toggle_matrix_rain(wid);
                 }
             }
-            // Promote the front session's own kitty into the durable registry.
-            // No-op with no frontmost terminal (the item is greyed there).
-            MenuAction::FavouriteSessionKitty => {
+            // Promote the frontmost window's promotable kitty (its tenured
+            // program cat, else the launch kitty) into the durable registry
+            // and pin it; that window presents the hello.
+            MenuAction::FavouriteKitty => {
                 if let Some(wid) = self.frontmost_window {
-                    self.favourite_session_kitty(wid, std::time::Instant::now());
+                    self.favourite_kitty(wid, std::time::Instant::now());
                 }
             }
             MenuAction::ToggleSeriousMode => {
@@ -10577,10 +10587,9 @@ mod typed_kitty_summon_tests {
         // cursor trail at all; the ORDINARY earned flight above is the thing the
         // master owns. (A typed feline word touches neither: it is answered by
         // the ambient word-cat the echoed word grows.)
-        let session = off_app.front_terminal(wid).unwrap().session;
         let hello_at = Instant::now();
         {
-            let look = aterm_effects::kitty_registry::KittyLook::for_session(session);
+            let look = aterm_effects::kitty_registry::KittyLook::for_launch(App::TEST_LAUNCH_SEED);
             let ws = off_app.windows.get_mut(&wid).expect("window 0");
             ws.cursor_cat.on_collect(hello_at, look);
             ws.cursor_cat.set_collection_presentable(hello_at, true);
@@ -11080,26 +11089,91 @@ mod typed_kitty_summon_tests {
             "a reused ident would have been absorbed by the ring for RING_TTL"
         );
     }
+
+    /// The typed summon LOGS THE CAT ON GLASS: the roster row it mints wears
+    /// the companion verdict's look — the launch kitty by default, and the
+    /// pinned favourite once one exists — never `KittyLook::default()`.
+    #[test]
+    fn a_typed_summon_records_the_verdicts_look() {
+        use aterm_effects::kitty_registry::{KittyLook, glyph_key};
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let session = app.front_terminal(wid).unwrap().session;
+        let now = std::time::Instant::now();
+        let launch = KittyLook::for_launch(App::TEST_LAUNCH_SEED);
+        assert_eq!(
+            app.companion_verdict(wid, session, now),
+            launch,
+            "precondition: nothing pinned"
+        );
+
+        app.record_typed_kitty(wid, session, now);
+        let row = app
+            .kitty_log
+            .log()
+            .collectibles
+            .iter()
+            .find(|item| item.key == glyph_key(launch.variant))
+            .expect("the summon minted the launch kitty's head as a roster row")
+            .clone();
+        assert_eq!((row.coat, row.iris), (launch.coat, launch.iris), "…in the launch coat");
+
+        // Pin a DIFFERENT cat: the verdict moves to the pin, and so does what
+        // the next summon logs.
+        let pinned = KittyLook {
+            variant: aterm_effects::cat_glyphs_gen::CatGlyphId::S101,
+            coat: (launch.coat + 3) % 16,
+            ..KittyLook::default()
+        }
+        .normalized();
+        assert_ne!(pinned.variant, launch.variant, "fixture: a different head");
+        app.kitty_log.favourite(
+            &aterm_effects::kitty_registry::KittySighting {
+                kitty_type: aterm_effects::kitty_registry::KittyType::HeadPeek,
+                magic: aterm_effects::kitty_registry::KittyMagic::None,
+                shown_as: aterm_effects::kitty_registry::KittyShownAs::Cat,
+                langs: aterm_lexicon::LangSet::EMPTY,
+                traits: 0,
+                look: pinned,
+                ident: 0xF00D,
+            },
+            aterm_lexicon::Lexicon::builtin(),
+            now,
+            true,
+        );
+        assert_eq!(app.companion_verdict(wid, session, now), pinned);
+        app.record_typed_kitty(wid, session, now);
+        let row = app
+            .kitty_log
+            .log()
+            .collectibles
+            .iter()
+            .find(|item| item.key == glyph_key(pinned.variant))
+            .expect("the summon logged the pinned head")
+            .clone();
+        assert_eq!((row.coat, row.iris), (pinned.coat, pinned.iris), "…in the pinned coat");
+    }
 }
 
-/// FAVOURITE-THE-SESSION-KITTY App seams. The ledger laws (composition
-/// transfer, the restart election, ring bypass) are proven in `kitty_log`; this
-/// module binds the App seam: WHICH cat is promoted, the two gates, and the
-/// surface wiring.
+/// FAVOURITE-THIS-KITTY App seams. The ledger laws (composition transfer,
+/// the restart election, ring bypass) are proven in `kitty_log`; this module
+/// binds the App seam: WHICH cat is promoted (the launch kitty), the two
+/// gates, and the surface wiring.
 ///
 /// `dispatch_menu_action` takes an `&ActiveEventLoop` and is not
 /// headless-callable, so — exactly as the summon tests do — the action is
 /// called directly and `action_by_name` proves the surface reachability.
 #[cfg(test)]
-mod favourite_session_kitty_tests {
+mod favourite_kitty_tests {
     use crate::{App, WindowId};
     use aterm_effects::kitty_registry::{KittyLook, glyph_key};
 
-    /// The promoted cat is THIS SESSION's own kitty — never `companion_look()`,
-    /// which on any non-empty ledger is whatever was last collected — and the
-    /// press presents it through the collection hello.
+    /// The promoted cat is THE LAUNCH KITTY — the process's own cat, the
+    /// floor of the verdict — and the press presents it through the
+    /// collection hello. Pinning it is how a launch cat is kept.
     #[test]
-    fn favourite_promotes_the_session_kitty() {
+    fn favourite_promotes_the_launch_kitty() {
         let mut app = App::headless_for_test();
         app.recompute_sparkle();
         let wid = WindowId(0);
@@ -11107,22 +11181,18 @@ mod favourite_session_kitty_tests {
             .front_terminal(wid)
             .expect("headless front terminal")
             .session;
-        let look = KittyLook::for_session(session);
+        let look = KittyLook::for_launch(App::TEST_LAUNCH_SEED);
+        assert_eq!(app.launch_kitty, look, "the harness wears the fixed-seed cat");
         let now = std::time::Instant::now();
 
-        // Collect something ELSE first, so the App-global companion — which
-        // wins for EVERY window in `app_render` — is a different cat.
-        // Favouriting "what I can see" could then never promote a session
-        // kitty.
+        // Collect something ELSE first: a discovery must not become the pin
+        // and must not be what the favourite promotes.
         let other = KittyLook {
             variant: aterm_effects::cat_glyphs_gen::CatGlyphId::SpecWitch,
             ..KittyLook::default()
         }
         .normalized();
-        assert_ne!(
-            other, look,
-            "the fixture must differ from the session kitty"
-        );
+        assert_ne!(other, look, "the fixture must differ from the launch kitty");
         app.kitty_log.observe(
             session,
             [aterm_effects::kitty_registry::KittySighting {
@@ -11139,17 +11209,27 @@ mod favourite_session_kitty_tests {
             true,
         );
         assert_eq!(
-            app.kitty_log.companion_look(),
-            Some(other),
-            "the collected companion is displayed everywhere until we favourite"
+            app.kitty_log.favourite_look(),
+            None,
+            "a discovery collects but pins nothing — the launch kitty rides"
+        );
+        assert_eq!(
+            app.companion_verdict(wid, session, now),
+            look,
+            "…and the verdict says so"
         );
 
-        app.favourite_session_kitty(wid, now);
+        app.favourite_kitty(wid, now);
 
         assert_eq!(
-            app.kitty_log.companion_look(),
+            app.kitty_log.favourite_look(),
             Some(look),
-            "the session kitty is the one that got promoted, not the displayed cat"
+            "the launch kitty is the one that got promoted"
+        );
+        assert_eq!(
+            app.companion_verdict(wid, session, now),
+            look,
+            "the verdict now rests on the pin"
         );
         let row = app
             .kitty_log
@@ -11157,7 +11237,7 @@ mod favourite_session_kitty_tests {
             .collectibles
             .iter()
             .find(|item| item.key == glyph_key(look.variant))
-            .expect("the session kitty's head is now a durable roster row")
+            .expect("the launch kitty's head is now a durable roster row")
             .clone();
         assert!(!row.favourite.is_empty(), "stamped as the user's pick");
         assert_eq!(row.coat, look.coat, "wearing the pinned composition");
@@ -11177,6 +11257,41 @@ mod favourite_session_kitty_tests {
         assert_eq!(frame.look, look, "and the hello wears the promoted cat");
     }
 
+    /// With a PROGRAM CAT on glass (tenure served), "Favourite This Kitty"
+    /// promotes THAT cat — the one the user can see — and the checkmark asks
+    /// about the same look; the launch kitty is only what it promotes when no
+    /// program has the cursor.
+    #[test]
+    fn favourite_promotes_the_tenured_program_cat_when_one_is_worn() {
+        use crate::app_kitty::{AppIdentity, TENURE};
+        let mut app = App::headless_for_test();
+        app.recompute_sparkle();
+        let wid = WindowId(0);
+        let t0 = std::time::Instant::now();
+        let claude = AppIdentity {
+            id: "claude".into(),
+            basename: "claude".into(),
+            look: KittyLook::for_app("claude"),
+        };
+        {
+            let gate = &mut app.windows.get_mut(&wid).expect("window").kitty_tenure;
+            gate.observe(Some(&claude), t0);
+            assert!(gate.observe(Some(&claude), t0 + TENURE).is_some(), "fixture: tenure served");
+        }
+        assert_eq!(app.promotable_kitty(wid), claude.look, "the promotable cat is the program's");
+        assert!(!app.palette_live().kitty_favourited, "not pinned yet");
+
+        app.favourite_kitty(wid, t0 + TENURE);
+
+        assert_eq!(app.kitty_log.favourite_look(), Some(claude.look));
+        assert!(app.palette_live().kitty_favourited, "the checkmark asks about the same cat");
+        assert_eq!(
+            app.companion_verdict(wid, 0, t0 + TENURE),
+            claude.look,
+            "the verdict rests on the pin (which happens to be the program cat)"
+        );
+    }
+
     /// The two hard gates, in order. Neither may leave a trace: nothing can
     /// draw ⇒ nothing may log, and `feline.enabled = false` means cats do not
     /// exist, so a synthetic row for a category the config can never produce
@@ -11189,8 +11304,8 @@ mod favourite_session_kitty_tests {
         // (a) SPARKLE MASTER unresolved.
         let mut app = App::headless_for_test();
         assert!(app.sparkle.is_none(), "headless default: not yet resolved");
-        app.favourite_session_kitty(wid, now);
-        assert_eq!(app.kitty_log.companion_look(), None, "master off: no pin");
+        app.favourite_kitty(wid, now);
+        assert_eq!(app.kitty_log.favourite_look(), None, "master off: no pin");
         assert_eq!(app.kitty_log.log().sightings, 0);
         assert!(!app.windows[&wid].cursor_cat.is_active());
 
@@ -11213,14 +11328,145 @@ mod favourite_session_kitty_tests {
                 .cfg
                 .feline
         );
-        app.favourite_session_kitty(wid, now);
-        assert_eq!(app.kitty_log.companion_look(), None, "feline off: no pin");
+        app.favourite_kitty(wid, now);
+        assert_eq!(app.kitty_log.favourite_look(), None, "feline off: no pin");
         assert_eq!(app.kitty_log.log().sightings, 0);
         assert!(!app.windows[&wid].cursor_cat.is_active());
     }
 
+    /// THE COMPROMISE, on the live seams (owner, 2026-08-17: "I like the
+    /// different cats. I think switching the cats all the time is too
+    /// abrupt"): real OSC 133/633 bytes walk the pane through prompt →
+    /// `claude` running → prompt again. The base cat is the launch kitty; the
+    /// claude cat arrives only after `TENURE`; it LINGERS after claude exits
+    /// and the base cat returns only after `RELEASE`; and at every step the
+    /// capture splice dresses exactly what `App::companion_verdict` says
+    /// (glass and capture resolve through the one seam, gauntlet F3). A
+    /// favourite pin outranks all of it.
+    #[test]
+    fn program_cats_arrive_by_tenure_linger_and_the_capture_seam_agrees() {
+        use crate::app_kitty::{RELEASE, TENURE};
+        let t0 = std::time::Instant::now();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.recompute_sparkle();
+        let launch = KittyLook::for_launch(App::TEST_LAUNCH_SEED);
+        let claude = KittyLook::for_app("claude");
+        assert_ne!(claude, launch, "fixture: distinguishable");
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        let session = app.front_terminal(wid).expect("front terminal").session;
+        let dressed = |app: &mut App, t: std::time::Instant| {
+            app.splice_word_decorations_for_test(wid, t);
+            app.windows
+                .get_mut(&wid)
+                .expect("window")
+                .cursor_cat
+                .static_frame(t)
+                .look
+        };
+
+        // At the prompt: the base cat.
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
+        }
+        assert_eq!(app.companion_verdict(wid, session, t0), launch);
+        assert_eq!(dressed(&mut app, t0), launch, "at the prompt: the launch kitty");
+
+        // claude starts (the exact byte stream the zsh integration emits).
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"claude --resume\x1b]633;E;claude --resume\x07\r\n\x1b]133;C\x07");
+        }
+        assert_eq!(
+            app.companion_verdict(wid, session, t1),
+            launch,
+            "just started: no tenure yet, still the base cat"
+        );
+        assert_eq!(dressed(&mut app, t1), launch);
+        assert_eq!(
+            app.windows[&wid].kitty_tenure.deadline(),
+            Some(t1 + TENURE),
+            "the wake is armed for the moment claude earns the cursor"
+        );
+        let t2 = t1 + TENURE;
+        assert_eq!(
+            app.companion_verdict(wid, session, t2),
+            claude,
+            "tenure served: the claude cat"
+        );
+        assert_eq!(dressed(&mut app, t2), claude, "…and the capture seam agrees");
+
+        // claude exits, back at the prompt: the claude cat LINGERS.
+        let t3 = t2 + std::time::Duration::from_secs(60);
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
+        }
+        assert_eq!(app.companion_verdict(wid, session, t3), claude, "lingering");
+        assert_eq!(dressed(&mut app, t3), claude);
+        // A quick `ls` inside the linger window flips nothing (its raw claim
+        // restarts the candidate clock, then home again dissolves it).
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"ls\x1b]633;E;ls\x07\r\n\x1b]133;C\x07");
+        }
+        let t4 = t3 + std::time::Duration::from_millis(300);
+        assert_eq!(app.companion_verdict(wid, session, t4), claude, "`ls` earns nothing");
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
+        }
+        let t5 = t4 + std::time::Duration::from_millis(200);
+        assert_eq!(app.companion_verdict(wid, session, t5), claude, "home: still lingering");
+        // Settled at the prompt for RELEASE: the base cat returns.
+        let t6 = t5 + RELEASE;
+        assert_eq!(
+            app.companion_verdict(wid, session, t6),
+            launch,
+            "settled at the prompt: the launch kitty is back"
+        );
+        assert_eq!(dressed(&mut app, t6), launch);
+
+        // A favourite pin outranks everything, program cats included.
+        let pinned = KittyLook {
+            variant: aterm_effects::cat_glyphs_gen::CatGlyphId::S101,
+            coat: (launch.coat + 5) % 16,
+            ..KittyLook::default()
+        }
+        .normalized();
+        assert!(pinned != launch && pinned != claude, "fixture: distinguishable");
+        app.kitty_log.favourite(
+            &aterm_effects::kitty_registry::KittySighting {
+                kitty_type: aterm_effects::kitty_registry::KittyType::HeadPeek,
+                magic: aterm_effects::kitty_registry::KittyMagic::None,
+                shown_as: aterm_effects::kitty_registry::KittyShownAs::Cat,
+                langs: aterm_lexicon::LangSet::EMPTY,
+                traits: 0,
+                look: pinned,
+                ident: 0xF00D,
+            },
+            aterm_lexicon::Lexicon::builtin(),
+            t6,
+            true,
+        );
+        {
+            let mut t = crate::term_lock(&term);
+            t.process(b"claude\x1b]633;E;claude\x07\r\n\x1b]133;C\x07");
+        }
+        let t7 = t6 + TENURE + std::time::Duration::from_secs(1);
+        assert_eq!(
+            app.companion_verdict(wid, session, t7),
+            pinned,
+            "the pin outranks a tenured program cat"
+        );
+        assert_eq!(dressed(&mut app, t7), pinned, "the capture seam wears the pin");
+    }
+
     /// The whole menu/palette/`invoke` wiring in one assertion, plus the
-    /// checkmark that reports the pin back to the user.
+    /// checkmark that reports the pin back to the user — reachable by BOTH the
+    /// current invoke spelling and the legacy `FavouriteSessionKitty` one.
     #[test]
     fn the_favourite_row_is_invoke_reachable_and_checks_once_pinned() {
         let mut app = App::headless_for_test();
@@ -11229,9 +11475,19 @@ mod favourite_session_kitty_tests {
 
         let before = app.palette_snapshot(wid);
         assert_eq!(
+            before.action_by_name("FavouriteKitty"),
+            Ok(crate::menu::MenuAction::FavouriteKitty),
+            "the row must be reachable by `aterm-ctl invoke`"
+        );
+        assert_eq!(
             before.action_by_name("FavouriteSessionKitty"),
-            Ok(crate::menu::MenuAction::FavouriteSessionKitty),
-            "the row must be reachable by `aterm-ctl invoke` over a front terminal"
+            Ok(crate::menu::MenuAction::FavouriteKitty),
+            "the legacy spelling still reaches the renamed action"
+        );
+        assert_eq!(
+            crate::menu::MenuAction::from_invoke_name("FavouriteSessionKitty"),
+            Some(crate::menu::MenuAction::FavouriteKitty),
+            "…and classifies at the authority layer too"
         );
         // `controls_lines` is the same text `controls menu` prints, so this
         // covers the introspection surface as well as the checkmark.
@@ -11239,7 +11495,7 @@ mod favourite_session_kitty_tests {
             state
                 .controls_lines()
                 .into_iter()
-                .find(|line| line.contains("action=FavouriteSessionKitty"))
+                .find(|line| line.contains("action=FavouriteKitty"))
                 .expect("the View menu contributes the row")
         };
         let listed = row(&before);
@@ -11249,17 +11505,18 @@ mod favourite_session_kitty_tests {
             "nothing pinned yet: {listed}"
         );
         assert!(
-            !app.palette_live().session_kitty_favourited,
+            !app.palette_live().kitty_favourited,
             "and the live predicate agrees"
         );
 
-        app.favourite_session_kitty(wid, std::time::Instant::now());
+        app.favourite_kitty(wid, std::time::Instant::now());
 
         let listed = row(&app.palette_snapshot(wid));
         assert!(
             listed.contains("checked=true"),
-            "the row reports THIS session's kitty as the pin: {listed}"
+            "the row reports the launch kitty as the pin: {listed}"
         );
+        assert!(app.palette_live().kitty_favourited);
     }
 }
 

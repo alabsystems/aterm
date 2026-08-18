@@ -250,7 +250,14 @@ impl ChoicePicker {
             });
         }
         authored.extend(options.into_iter().map(|value| ChoiceOption {
-            label: choice_label(&value),
+            // The typing-sound picker's rows read as the button does
+            // ("Follow the trail", not "Automatic"); the motion row keeps its
+            // button-only paint label out of the list, as before.
+            label: if key == prefs::EDIT_TRAIL_SOUND_STYLE {
+                setting_choice_label(key, &value)
+            } else {
+                choice_label(&value)
+            },
             terminal_theme: preview_theme_choice(key, &value, themes),
             value: Some(value),
         }));
@@ -3868,6 +3875,23 @@ fn choice_label(value: &str) -> String {
 fn setting_choice_label(key: &str, value: &str) -> String {
     if key == prefs::EDIT_MOTION && motion_value_is_auto(value) {
         return motion_auto_visual_label(std::env::consts::OS).to_string();
+    }
+    // The typing-sound picker's `auto` is "follow the trail" — its meaning,
+    // not the generic "Automatic"; every instrument falls to sentence case
+    // ("Glass bell", "Ice chime", "Typewriter", …).
+    if key == prefs::EDIT_TRAIL_SOUND_STYLE {
+        let value = value.trim();
+        let (raw, annotated) = match value.strip_suffix(" (default)") {
+            Some(raw) => (raw.trim(), true),
+            None => (value, false),
+        };
+        if raw.eq_ignore_ascii_case(prefs::DEFAULT_TRAIL_SOUND_STYLE) {
+            return if annotated {
+                "Follow the trail (default)".to_string()
+            } else {
+                "Follow the trail".to_string()
+            };
+        }
     }
     choice_label(value)
 }
@@ -29399,6 +29423,54 @@ enabled = true
         );
     }
 
+    /// The typing-sound picker's labels: `auto` reads as what it MEANS
+    /// ("Follow the trail", not the generic "Automatic"), every instrument
+    /// reads in sentence case, and the popup rows carry the same labels as
+    /// the button. The static option list is the synth's roster (14 rows).
+    #[test]
+    fn typing_sound_choice_labels_read_as_instruments() {
+        assert_eq!(
+            setting_choice_label(prefs::EDIT_TRAIL_SOUND_STYLE, "auto"),
+            "Follow the trail"
+        );
+        assert_eq!(
+            setting_choice_label(prefs::EDIT_TRAIL_SOUND_STYLE, "auto (default)"),
+            "Follow the trail (default)",
+            "the unset row keeps its default annotation"
+        );
+        for (value, label) in [
+            ("glass bell", "Glass bell"),
+            ("ice chime", "Ice chime"),
+            ("typewriter", "Typewriter"),
+            ("mechanical", "Mechanical"),
+            ("felt", "Felt"),
+        ] {
+            assert_eq!(setting_choice_label(prefs::EDIT_TRAIL_SOUND_STYLE, value), label);
+        }
+        // Other keys' `auto` keeps its generic label.
+        assert_eq!(setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto"), "Automatic");
+        let field = prefs::editable_fields(&crate::app_config::Config::default())
+            .into_iter()
+            .find(|f| f.key == prefs::EDIT_TRAIL_SOUND_STYLE)
+            .expect("the typing-sound row");
+        let choices = choices_for_field(&field, &[], &crate::app_config::ThemeCatalog::default())
+            .expect("static options");
+        assert_eq!(choices.len(), 14);
+        assert_eq!(choices[0], "auto");
+        assert!(choices.iter().any(|c| c == "typewriter"));
+        let picker = ChoicePicker::new(
+            prefs::EDIT_TRAIL_SOUND_STYLE,
+            choices.clone(),
+            "auto (default)",
+            false,
+            false,
+            "auto",
+            &crate::app_config::ThemeCatalog::default(),
+        );
+        assert_eq!(picker.options[0].label, "Follow the trail");
+        assert!(picker.options.iter().any(|o| o.label == "Glass bell"));
+    }
+
     /// EVERY SOUND-MENU KEY IS READ AT ITS CONSUMER — the pin that stops this
     /// panel from shipping a switch that does nothing.
     ///
@@ -29539,14 +29611,12 @@ enabled = true
                     .starts_with("ws.focused")
             })
             .count();
-        // The song-arc instrument multiplied the seams: each path now pushes
-        // the BAR riff, the announced-switch FILL, and the finale CADENCE —
-        // three audible pushes per path, single-pane + compose = six. The law
-        // is unchanged (every push resolves gain through the one policy
-        // function, identified by the raw focus bit); only the census grew.
+        // One audible push per path — the BAR riff — single-pane + compose
+        // = two. Every push resolves gain through the one policy function,
+        // identified by the raw focus bit.
         assert_eq!(
-            production_calls, 6,
-            "all riff/fill/cadence pushes must resolve gain through the one policy function"
+            production_calls, 2,
+            "both riff pushes must resolve gain through the one policy function"
         );
 
         // BOTH BONK SEAMS MUST FEED THE MASTER IN. This is a LAYOUT pin and it

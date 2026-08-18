@@ -230,7 +230,7 @@ struct HandoffCommitFacts {
     sessions_alive: bool,
     /// The OS input queue has been DISPATCHED into the masters: the main thread
     /// ran the event loop for a bounded interval after ProofReady, so every
-    /// hardware event CoreGraphics had already accepted has flowed through the
+    /// hardware event the OS had already accepted has flowed through the
     /// tolerated input path to the still-open PTY masters. This replaced "no
     /// hardware event happened in the last 50 ms", which was unsatisfiable on a
     /// machine in use AND never the property that mattered (see the drain gate
@@ -3085,8 +3085,9 @@ impl App {
     /// DRAIN, DON'T DIE (seamless: OS-accepted input): hardware events
     /// accepted immediately before this callback may not yet have been
     /// dispatched through winit and would die with `_exit`. Defer Commit
-    /// through a short CoreGraphics quiet epoch, using a scalar event
-    /// source clock that cannot recursively pump AppKit. Re-posting this
+    /// through a short input-quiet epoch, read from the kernel's HID idle
+    /// clock through the injected `App::user_input_recent` (never through
+    /// WindowServer, never pumping AppKit). Re-posting this
     /// exact completion gives the run loop time to dispatch those events —
     /// their bytes flow through the tolerated input path into the
     /// still-open PTY masters — and the re-post re-runs this admission
@@ -3150,7 +3151,7 @@ impl App {
         // iterated) and the elapsed floor.
         let input_dispatch_fenced =
             completion.input_drain_spins >= 1 && drained_for >= HANDOFF_INPUT_DISPATCH_FENCE;
-        let input_quiet = !crate::platform::recent_user_input_event(HANDOFF_INPUT_QUIET_EPOCH);
+        let input_quiet = !(self.user_input_recent)(HANDOFF_INPUT_QUIET_EPOCH);
         let quiet_window_settled = input_quiet || drained_for >= HANDOFF_INPUT_QUIET_BUDGET;
         let egress_settled = self
             .pending_update_handoff

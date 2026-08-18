@@ -257,11 +257,6 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
         aterm_effects::kitty_cursor::SingSync {
             drive: 1.0,
             beat: 0.0,
-            energy: 0.30,
-            class: 0,
-            landing: false,
-            fill: false,
-            bow: 0.0,
         },
     );
     let begun = cat_projection(true, 0, &cat);
@@ -287,11 +282,6 @@ fn real_cursor_cat_singing_bypass_still_requires_sixteen_travel_events() {
             aterm_effects::kitty_cursor::SingSync {
                 drive: 1.0,
                 beat: i as f32 * 0.1,
-                energy: 0.30,
-                class: 0,
-                landing: false,
-                fill: false,
-                bow: 0.0,
             },
         );
         let post = cat_projection(true, i, &cat);

@@ -18,8 +18,8 @@
 //!   graceful [`SING_WIND_DOWN`] crossfade — the drive eases 1 → 0, never a
 //!   hard cut. A DIFFERENT character that itself starts repeating is not a
 //!   release at all: it is a KEY SWITCH ([`KEY_SWITCH_REPS`]) — the singer
-//!   stays at full drive and the song reopens on the new key's own verse at
-//!   the next bar boundary (the SECTION seam of the held-key instrument).
+//!   stays at full drive and the song simply modulates onto the new key's
+//!   verse at the next bar boundary, over the same uninterrupted bar grid.
 //!   Bounded per-window state, exactly like `kitty_summon::TypedKittySummon`.
 //! * The BEAT CLOCK: [`sing_beat`]/[`sing_bar`] derive a deterministic beat
 //!   phase from the arm instant at [`SING_BPM`]. The audio riff runs on the
@@ -80,28 +80,6 @@ pub const SING_BAR_BEATS: f32 = 4.0;
 /// One riff bar in seconds.
 pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 
-/// Bars in the celebration's authored FORM (the A A' B A" | C C' B' D
-/// phrase the synth decodes from `bar % 8`). Pinned to the synth's
-/// `CELEBRATION_PHRASE_BARS` by
-/// `trail_sound::the_section_reopen_lands_on_the_forms_verse_opening`.
-pub const SING_FORM_BARS: u64 = 8;
-
-/// THE SECTION-REOPEN DECISION — where a committed KEY SWITCH re-enters the
-/// form: the next multiple of [`SING_FORM_BARS`] strictly above `current`,
-/// i.e. form slot 0, the new key's own A-section verse — never mid-form and
-/// never the shared chorus block, so the new tune announces itself on the
-/// very next bar boundary. Factored as its own seam on purpose: the
-/// held-key system is growing into an INSTRUMENT (owner: "to get the cursor
-/// to play your custom song, you press and hold different keys and
-/// transition to the different tunes smoothly like that" — hold sustains a
-/// key's verse, a switch is the next SECTION of the composition), and a
-/// future instrument spec may swap this decision for one with a turnaround
-/// FILL announcing the switch without touching the switch-commit plumbing.
-#[must_use]
-pub const fn section_reopen_bar(current: u64) -> u64 {
-    (current / SING_FORM_BARS + 1) * SING_FORM_BARS
-}
-
 // ---------------------------------------------------------------------------
 // Song signature
 // ---------------------------------------------------------------------------
@@ -133,208 +111,6 @@ pub fn song_signature(ch: char) -> u32 {
 pub const NEUTRAL_SIGNATURE: u32 = 12;
 
 // ---------------------------------------------------------------------------
-// The song arc (the SONG-BUILDER instrument)
-// ---------------------------------------------------------------------------
-//
-// OWNER: "to get the cursor to play your custom song, you press and hold
-// different keys and transition to the different tunes smoothly." The
-// instrument layer: every key belongs to a SECTION CLASS (verse / chorus /
-// bridge / percussive / breath) and a hold EARNS ENERGY per bar at the
-// class's rate. Energy is the escalation the synth renders (build: lowpass,
-// shimmer, sub) and the clap gate — carried in the riff payload
-// (`trail_sound::CelebrationGesture::riff_bar_arc`), so the synth stays a
-// pure function of the payload (the hand-over law) while the ARC — the
-// stateful half — lives here, host-side, exactly like the detector.
-//
-// The payoff the switch mechanic was built for: energy INHERITS across a
-// committed key switch, so a verse-key build cashed in on a chorus key
-// peaks faster than any single hold — the switch is the instrument's core
-// gesture, not a defect to smooth over.
-
-/// The energy a fresh arc opens on: the song starts warm, not silent.
-pub const ARC_START: f32 = 0.30;
-
-/// Bars of INTRO: while fewer than this many bars have played (and no warm
-/// carry skipped the intro), the RENDERED energy is capped at
-/// [`ARC_INTRO_CAP`] — the band walks on stage before it plays loud.
-pub const ARC_INTRO_BARS: u32 = 2;
-
-/// The intro's render cap (internal energy still accrues uncapped — the cap
-/// is presentation, not bookkeeping, so a chorus-key open still banks its
-/// full earn).
-pub const ARC_INTRO_CAP: f32 = 0.55;
-
-/// Energy at/above which the arc reads PEAK.
-pub const ARC_PEAK_GATE: f32 = 1.0;
-
-/// Peak exit (hysteresis): once peaked, the arc stays Peak until energy
-/// falls below this — no flapping at the gate.
-pub const ARC_PEAK_EXIT: f32 = 0.9;
-
-/// The energy ceiling. Above 1.0 is EARNED headroom: the synth clamps its
-/// build at 1.0, but the raw value still crosses the clap gate and scales
-/// the finale, so a long peak is worth holding.
-pub const ARC_ENERGY_MAX: f32 = 1.25;
-
-/// WARM RE-ARM window: a new hold within this many seconds of the wind-down
-/// start carries [`ARC_CARRY_KEEP`] of the released energy (floored at
-/// [`ARC_START`]) instead of opening cold. NOTE (pinned as intended): with
-/// the phase-3 deferred wind-down the effective window past the RELEASE
-/// stretches to ~3.4 s + carry slack — the band remembers you.
-pub const ARC_CARRY_SECONDS: f32 = 6.0;
-
-/// Fraction of the released energy a warm re-arm keeps.
-pub const ARC_CARRY_KEEP: f32 = 0.75;
-
-/// Minimum bars played for a release to earn the full finale cadence
-/// (shorter performances take the plain fade — a "ta-daa" needs a song).
-pub const ARC_FINALE_MIN_BARS: u32 = 4;
-
-/// THE FILL RUNWAY: a key switch that COMMITS before this many seconds
-/// into the sounding bar (beat 3.0) has room for the drummer's
-/// announcement — the authored four-sixteenth turnaround fill on the
-/// bar's LAST beat, in the OLD key ([`KittySing::take_fill_cue`]). A later
-/// commit takes the foundation's audible reopen alone: zero added
-/// latency, nothing fires early.
-pub const FILL_CUE_RUNWAY: f32 = 1.2;
-
-/// THE FINALE (owner-ratified): a gentle release after
-/// [`ARC_FINALE_MIN_BARS`] bars doesn't just fade — the sounding bar
-/// finishes, then ONE cadence bar plays a "ta-daa" in the released key
-/// ([`KittySing::take_cadence`] →
-/// `trail_sound::CelebrationGesture::RiffCadence`), the singer bows, and
-/// the note-fireworks scale with the performance. The DRIVE defers its
-/// wind-down until the cadence's tonic has landed (beat 2 =
-/// [`CADENCE_DRIVE_HOLD`] after the cadence downbeat), then takes the
-/// standard [`SING_WIND_DOWN`] smoothstep — worst-case post-release audio
-/// ≈ 3.6 s (the ratified tail; reduced motion and the sub-four-bar release
-/// keep today's plain fade).
-pub const CADENCE_DRIVE_HOLD: f32 = 0.8;
-
-/// THE BOW: at cadence beat 2 the singer dips over [`BOW_DOWN`] seconds,
-/// holds [`BOW_HOLD`], and rises over [`BOW_RISE`] — delivered to the
-/// renderer as a 0..=1 depth ([`KittySing::bow_depth`]).
-pub const BOW_DOWN: f32 = 0.3;
-/// Seconds the bow holds at full depth.
-pub const BOW_HOLD: f32 = 0.4;
-/// Seconds the bow takes to rise back to standing.
-pub const BOW_RISE: f32 = 0.3;
-
-/// Energy earned per bar, per section class (indexed by [`section_class`]):
-/// verse 0.125, chorus 0.25, bridge 0.1667, percussive 0.20, and BREATH
-/// −0.0625 — Space is the deliberate quiet passage that spends energy.
-pub const ARC_EARN: [f32; 5] = [0.125, 0.25, 0.1667, 0.20, -0.0625];
-
-/// The SECTION CLASS a held character plays as. Classes change the song's
-/// TIMBRE, DYNAMICS and EARN RATE only — never rhythm, form, swing, tempo
-/// or voice count (pinned synth-side by
-/// `trail_sound::sections_change_timbre_not_the_clock_or_the_form`).
-///
-/// * 0 VERSE — consonant letters (shifted included): the workhorse build.
-/// * 1 CHORUS — vowels `aeiouAEIOU`: the sing-along keys; fastest earn,
-///   open gain, the chorus-key lift, the most brilliant strike.
-/// * 2 BRIDGE — digits 0–9: moodier, a mid-weight strike.
-/// * 3 PERCUSSIVE — ASCII punctuation/symbols: rhythmic, EARLY clap gate.
-/// * 4 BREATH — Space: energy decays, dim gain, shimmer off — the quiet
-///   passage a finale wants in front of it.
-///
-/// Off-map characters (IME text, non-ASCII letters and symbols) are class
-/// 0: EVERY character still sings — the bijective signature already gives
-/// each its own verse; the class only shapes how it is played.
-#[must_use]
-pub fn section_class(ch: char) -> u8 {
-    if matches!(
-        ch,
-        'a' | 'e' | 'i' | 'o' | 'u' | 'A' | 'E' | 'I' | 'O' | 'U'
-    ) {
-        return 1;
-    }
-    if ch.is_ascii_digit() {
-        return 2;
-    }
-    if ch == ' ' {
-        return 4;
-    }
-    if ch.is_ascii_punctuation() {
-        return 3;
-    }
-    0
-}
-
-/// The arc's presentation phase — derived, never stored (the lazy-derive
-/// idiom every clock in this module already follows).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ArcPhase {
-    /// First [`ARC_INTRO_BARS`] bars of a cold arc: render energy capped.
-    Intro,
-    /// Earning toward the gate.
-    Build,
-    /// Energy crossed [`ARC_PEAK_GATE`]; holds until [`ARC_PEAK_EXIT`].
-    Peak,
-    /// Wind-down after a release that earned a finale
-    /// (≥ [`ARC_FINALE_MIN_BARS`] bars).
-    Outro,
-}
-
-/// The SONG ARC's folded state. Energy between events is DERIVED (base +
-/// per-bar earn × boundaries since the base fold — a pure function of
-/// `now`, like [`KittySing::drive`]); these scalars are the fold points.
-/// The spec's `SongArc { phase, energy, bars_played, peak_bars }` realized
-/// in the module's lazy idiom: `phase`/`bars_played` are derived reads
-/// ([`KittySing::arc_phase`], [`KittySing::bars_played`]), `peak_bars` is
-/// unconsumed by any payload or test and is deliberately not tracked.
-#[derive(Clone, Copy, Debug)]
-struct SongArc {
-    /// Energy at the last fold.
-    energy: f32,
-    /// Raw bar-grid index the fold happened at.
-    anchor_raw: u64,
-    /// The peak latch (entry ≥ [`ARC_PEAK_GATE`], exit < [`ARC_PEAK_EXIT`]).
-    peaked: bool,
-    /// A warm carry opened at/above [`ARC_INTRO_CAP`]: no intro this time.
-    intro_skip: bool,
-    /// The EMBER a wind-down leaves behind: (wind-down start, energy at
-    /// release). Consumed by the next arm's warm-carry decision. This is
-    /// the one datum that deliberately survives [`KittySing::settle`] — the
-    /// warm re-arm law needs memory across the rest; it goes stale (and is
-    /// ignored) [`ARC_CARRY_SECONDS`] after the wind start.
-    carry: Option<(Instant, f32)>,
-}
-
-impl Default for SongArc {
-    fn default() -> Self {
-        Self {
-            energy: ARC_START,
-            anchor_raw: 0,
-            peaked: false,
-            intro_skip: false,
-            carry: None,
-        }
-    }
-}
-
-/// THE FINALE PLAN: one cadence bar owed to a finished performance —
-/// due at the boundary after the sounding bar completes
-/// (`armed_at + (last_bar + 1) × 1.6 s`), in the RELEASED key, at the
-/// energy the performance earned. Built at a gentle release (or derived
-/// for the pure-lazy lift), consumed once by the host, canceled by a
-/// re-arm before due, vetoed outright by hard breaks and proven typing.
-#[derive(Clone, Copy, Debug)]
-struct Cadence {
-    /// The cadence bar's downbeat.
-    due: Instant,
-    /// The released key's signature — your song ends in YOUR key.
-    sig: u32,
-    /// RAW arc energy at the release, ×200 (the cadence's gain scale and
-    /// its fused-clap gate).
-    energy_q: u8,
-    /// Bars the performance played (the fireworks scale).
-    span_bars: u16,
-    /// Consumed — [`KittySing::take_cadence`] fires exactly once.
-    fired: bool,
-}
-
-// ---------------------------------------------------------------------------
 // Detector
 // ---------------------------------------------------------------------------
 
@@ -348,8 +124,8 @@ pub const SING_ARM_REPEATS: u32 = 16;
 /// celebration is PROVISIONAL — it may be typing; once it repeats this many
 /// times (each gap at cadence, real wall-time between presses) it has
 /// proven it is HELD, and the switch commits: the singer stays on stage and
-/// the form reopens on the new key's verse ([`section_reopen_bar`]). The
-/// same count recovers a celebration whose glow is still fading — the
+/// the song modulates onto the new key's verse at the next bar boundary.
+/// The same count recovers a celebration whose glow is still fading — the
 /// forgiveness law in [`KittySing::note_char`] — so a switch whose first
 /// auto-repeat arrives late (the OS initial repeat delay runs 250–500 ms,
 /// at or past [`SING_REPEAT_GAP`]) costs a breath, not a full re-earn.
@@ -410,59 +186,13 @@ pub struct KittySing {
     /// outright — the song stopped, went quiet, and cold-started from the
     /// top. The hand-over carries the run instead: the run IDENTITY changes
     /// (so [`Self::signature`] moves with the CURRENT key); the arm anchor,
-    /// the bar grid and the beat phase do NOT. On commit the form REOPENS
-    /// on the new key's own verse at the next bar boundary
-    /// ([`Self::reopen_section`]) — the switch is HEARD, not buried
-    /// mid-form under the shared chorus. Provisional because distinct
+    /// the bar grid and the beat phase do NOT — the tune keeps playing and
+    /// changes key on the next bar boundary. Provisional because distinct
     /// characters that do NOT repeat are TYPING: if another distinct
     /// character arrives before the commit, the crossfade is anchored at
     /// the DEPARTURE stored here, so ordinary typing loses exactly what it
     /// lost before this existed.
     handover_from: Option<Instant>,
-    /// The SECTION REMAP in force: the bar index the host pushes is the raw
-    /// 1.6 s grid index plus this shift ([`Self::bar`]). Zero for a cold
-    /// arm; each committed key switch raises it so the form reopens at
-    /// [`section_reopen_bar`] — mapped indices only ever move FORWARD, so
-    /// the host's per-bar latch can never swallow a section and the synth's
-    /// build/clap ramps (pure functions of the pushed index) never fall
-    /// back to the cold open once the celebration is rolling.
-    section_shift: u64,
-    /// A COMMITTED key switch awaiting its seam: from raw grid index `.0`
-    /// onward the shift becomes `.1`. Kept separate from [`Self::section_shift`]
-    /// so [`Self::bar`] stays a pure reader — the currently sounding bar keeps
-    /// its index until the boundary, and the swap lands exactly ON it (the
-    /// designed seamless seam: material is a pure function of the RiffBar
-    /// payload, the 1.6 s bar clock is untouched).
-    pending_section: Option<(u64, u64)>,
-    /// The SONG ARC (the instrument layer): per-bar energy earned at the
-    /// held key's class rate, inherited across switches, carried warm
-    /// across a quick re-arm. Folded at every press; derived between.
-    arc: SongArc,
-    /// The DEPARTED key's signature, captured when a provisional hand-over
-    /// begins — the OLD key the drummer's fill announcement speaks in if
-    /// the switch commits with runway. Meaningful only while
-    /// [`Self::handover_from`] is `Some`.
-    handover_prev_sig: u32,
-    /// A latched FILL ANNOUNCEMENT: `(old sig, new sig)`, set at a switch
-    /// commit that landed before [`FILL_CUE_RUNWAY`] into the bar,
-    /// consumed ONCE by the host ([`Self::take_fill_cue`]) and pushed as
-    /// `trail_sound::CelebrationGesture::RiffFillCue`. Both keys ride the
-    /// payload so the drummer can WALK the fill from the departed key's
-    /// shift into the arriving one (the graceful-merge pivot — owner: "the
-    /// tunes don't gracefully merge into the next tune"). The synth
-    /// quantizes the hits to its OWN sixteenth grid — this latch carries
-    /// identity, never timing.
-    fill_cue: Option<(u32, u32)>,
-    /// The raw bar the latched fill announces in — the singer's
-    /// sixteenth-rate head-bob window is that bar's last beat
-    /// ([`Self::fill_beat`]).
-    fill_bar: Option<u64>,
-    /// THE FINALE PLAN in force, if a gentle release earned one.
-    cadence: Option<Cadence>,
-    /// A HARD release happened (break key, session switch, proven
-    /// typing): no finale for this wind-down, whatever the span. Cleared
-    /// at the next arm.
-    finale_veto: bool,
 }
 
 impl KittySing {
@@ -470,10 +200,6 @@ impl KittySing {
     fn rekey(&mut self, now: Instant, session: u64) {
         if self.session != Some(session) {
             self.release(now);
-            // A session switch is a HARD release: no finale plays into
-            // another session's shell.
-            self.cadence = None;
-            self.finale_veto = true;
             self.session = Some(session);
         }
     }
@@ -485,42 +211,12 @@ impl KittySing {
             // A lazy release may already have begun the fade earlier than
             // this eager event; keep the EARLIER instant so the crossfade
             // never jumps back up.
-            let wind = self.lazy_release().map_or(at, |lazy| lazy.min(at));
-            // THE EMBER: fold the arc at the wind instant and remember
-            // (when, how hot) for the warm re-arm law. Boundaries stop
-            // counting at the wind start, so this fold is final.
-            let energy = self.arc_energy_at(wind);
-            self.arc.energy = energy;
-            self.arc.anchor_raw = self.raw_bar(wind).unwrap_or(self.arc.anchor_raw);
-            self.arc.carry = Some((wind, energy));
-            // THE FINALE PLAN — built here, the one place the released
-            // run's signature is still in hand. GENTLENESS IS THE
-            // CALLER'S KNOWLEDGE: hard callers (break keys, session
-            // switches, proven typing) veto immediately after; the
-            // backspace and the lazy lift leave it standing.
-            if let (Some(t0), Some(ch)) = (self.armed_at, self.run) {
-                let raw =
-                    (wind.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS) as u64;
-                if raw >= u64::from(ARC_FINALE_MIN_BARS) && self.cadence.is_none() {
-                    self.cadence = Some(Cadence {
-                        due: t0 + Duration::from_secs_f32((raw + 1) as f32 * SING_BAR_SECONDS),
-                        sig: song_signature(ch),
-                        energy_q: (energy * 200.0).round().clamp(0.0, 250.0) as u8,
-                        span_bars: raw.min(u64::from(u16::MAX)) as u16,
-                        fired: false,
-                    });
-                }
-            }
-            self.wind_from = Some(wind);
+            self.wind_from = Some(self.lazy_release().map_or(at, |lazy| lazy.min(at)));
         }
         self.run = None;
         self.count = 0;
         self.last = None;
         self.handover_from = None;
-        // A dead or dying song announces nothing: an unconsumed cue must
-        // not leak into the next celebration.
-        self.fill_cue = None;
-        self.fill_bar = None;
     }
 
     /// The SONG SIGNATURE the held character sings from — the single `u32`
@@ -542,270 +238,10 @@ impl KittySing {
     /// [`NEUTRAL_SIGNATURE`] when nothing is held — the reference voicing.
     /// The hand-over law: identity derives from the CURRENT run char per
     /// bar, so a mid-hold key change modulates on the next bar boundary
-    /// over the same uninterrupted bar grid — and a COMMITTED key switch
-    /// additionally reopens the form there on the new key's own verse
-    /// ([`Self::bar`]), so the change is heard at once, never buried under
-    /// the shared chorus.
+    /// over the same uninterrupted bar grid.
     #[must_use]
     pub fn signature(&self) -> u32 {
         self.run.map_or(NEUTRAL_SIGNATURE, song_signature)
-    }
-
-    /// The SECTION CLASS the current run plays as ([`section_class`]); 0
-    /// (verse) when nothing is held. Reads the CURRENT run character — a
-    /// provisional hand-over flips this on the very press that started it,
-    /// which is the visual PRE-ECHO's data source: the eye can follow the
-    /// destination class a full bar before the audio commits.
-    #[must_use]
-    pub fn section_class_now(&self) -> u8 {
-        self.run.map_or(0, section_class)
-    }
-
-    /// The raw bar index the ARC counts at `now`: the raw grid, frozen at
-    /// the wind-down start (released bars earn nothing). Also the
-    /// definition of "bars played" — see [`Self::bars_played`].
-    fn arc_raw(&self, now: Instant) -> u64 {
-        let Some(t0) = self.armed_at else {
-            return self.arc.anchor_raw;
-        };
-        let end = self.wind_start(now).map_or(now, |wind| wind.min(now));
-        (end.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS) as u64
-    }
-
-    /// INTERNAL energy at `now`: the folded base plus the current class's
-    /// per-bar earn for every raw boundary since the fold, clamped into
-    /// `0.0..=`[`ARC_ENERGY_MAX`]. A pure reader — the derive-don't-store
-    /// idiom (`drive`, `lazy_release`) applied to the arc.
-    fn arc_energy_at(&self, now: Instant) -> f32 {
-        if self.armed_at.is_none() {
-            return self.arc.energy;
-        }
-        let bars = self.arc_raw(now).saturating_sub(self.arc.anchor_raw);
-        if bars == 0 {
-            return self.arc.energy;
-        }
-        let earn = ARC_EARN[usize::from(self.section_class_now().min(4))];
-        (self.arc.energy + earn * bars as f32).clamp(0.0, ARC_ENERGY_MAX)
-    }
-
-    /// The peak latch at `now`: entered at [`ARC_PEAK_GATE`], held (the
-    /// hysteresis) until energy falls below [`ARC_PEAK_EXIT`].
-    fn arc_peak_at(&self, now: Instant) -> bool {
-        let e = self.arc_energy_at(now);
-        e >= ARC_PEAK_GATE || (self.arc.peaked && e >= ARC_PEAK_EXIT)
-    }
-
-    /// Fold the derived arc back into stored state (called on every press,
-    /// which the cadence law guarantees at least ~4× per bar while armed —
-    /// so the between-fold derivation only ever spans one earn segment of
-    /// one class).
-    fn fold_arc(&mut self, now: Instant) {
-        if self.armed_at.is_none() {
-            return;
-        }
-        let raw = self.arc_raw(now);
-        if raw > self.arc.anchor_raw {
-            self.arc.peaked = self.arc_peak_at(now);
-            self.arc.energy = self.arc_energy_at(now);
-            self.arc.anchor_raw = raw;
-        }
-    }
-
-    /// Bars the current performance has PLAYED at `now` (raw boundaries
-    /// since the arm anchor; frozen at the wind start; 0 when idle). Feeds
-    /// the intro gate, the finale threshold ([`ARC_FINALE_MIN_BARS`]) and
-    /// the fireworks scale — and the audience pet's dance intensity, via
-    /// the concert-scene seam.
-    #[must_use]
-    pub fn bars_played(&self, now: Instant) -> u32 {
-        if self.armed_at.is_none() {
-            return 0;
-        }
-        u32::try_from(self.arc_raw(now)).unwrap_or(u32::MAX)
-    }
-
-    /// True while the INTRO render cap is in force: a cold arc's first
-    /// [`ARC_INTRO_BARS`] bars (a warm carry at/above [`ARC_INTRO_CAP`]
-    /// skips it — the band is already warmed up).
-    fn intro_active(&self, now: Instant) -> bool {
-        !self.arc.intro_skip && self.armed_at.is_some() && self.bars_played(now) < ARC_INTRO_BARS
-    }
-
-    /// The arc ENERGY the riff payload carries: RENDER energy × 200,
-    /// rounded, structurally ≤ 250 ([`ARC_ENERGY_MAX`] × 200). Render
-    /// energy is internal energy with the intro cap applied — the one
-    /// number the synth reads twice (clamped at 200 for build, raw against
-    /// the class clap gate), resolving the build/clap double-booking by
-    /// construction. Takes `now` because energy is time-derived here
-    /// (documented deviation from the spec's `&self`-only signature — the
-    /// module's clocks are all lazy readers).
-    #[must_use]
-    pub fn arc_energy_q(&self, now: Instant) -> u8 {
-        let e = self.arc_energy_at(now);
-        let render = if self.intro_active(now) {
-            e.min(ARC_INTRO_CAP)
-        } else {
-            e
-        };
-        (render * 200.0).round().clamp(0.0, 250.0) as u8
-    }
-
-    /// The arc phase at `now` — the derived read of the spec's
-    /// `SongArc::phase`. Outro is the wind-down of a performance that
-    /// earned its finale; a short performance's fade reads Build/Intro
-    /// until it settles.
-    #[must_use]
-    pub fn arc_phase(&self, now: Instant) -> ArcPhase {
-        if self.armed_at.is_none() {
-            return ArcPhase::Intro;
-        }
-        if self.wind_start(now).is_some() {
-            if self.bars_played(now) >= ARC_FINALE_MIN_BARS {
-                return ArcPhase::Outro;
-            }
-        } else if self.intro_active(now) {
-            return ArcPhase::Intro;
-        }
-        if self.arc_peak_at(now) {
-            ArcPhase::Peak
-        } else {
-            ArcPhase::Build
-        }
-    }
-
-    /// Consume the latched FILL ANNOUNCEMENT, if a committed switch left
-    /// one: `(departed sig, arriving sig)`. The host polls this once per
-    /// frame beside the bar latch and pushes ONE
-    /// `CelebrationGesture::RiffFillCue` — consuming UNCONDITIONALLY (the
-    /// latch law: a muted riff must drain the cue, never bank it for an
-    /// unmuted later moment).
-    #[must_use]
-    pub fn take_fill_cue(&mut self) -> Option<(u32, u32)> {
-        self.fill_cue.take()
-    }
-
-    /// True while the drummer's announced fill is ROLLING: the last beat
-    /// (3.0..4.0) of the bar a fill cue was latched in, while armed. The
-    /// singer's head-bob clock-divides to sixteenth rate here — the visual
-    /// half of the announcement, zero new envelope machinery
-    /// (`kitty_cursor` reads it through the sing sync).
-    #[must_use]
-    pub fn fill_beat(&self, now: Instant) -> bool {
-        let Some(bar) = self.fill_bar else {
-            return false;
-        };
-        if !self.is_armed(now) || self.raw_bar(now) != Some(bar) {
-            return false;
-        }
-        let Some(t0) = self.armed_at else {
-            return false;
-        };
-        let in_bar = now.saturating_duration_since(t0).as_secs_f32() % SING_BAR_SECONDS;
-        // Beat 4 of the bar: the runway IS beat 3.0, so the fill owns
-        // everything from there to the bar edge.
-        in_bar >= FILL_CUE_RUNWAY
-    }
-
-    /// True during the FIRST beat of a committed switch's reopened bar —
-    /// the singer's one double-squash (the commit landing, ×1.6 for that
-    /// beat). Derived from the pending-section seam, so it fires exactly
-    /// when the new key's verse payload does.
-    #[must_use]
-    pub fn switch_landing(&self, now: Instant) -> bool {
-        let Some((from, _)) = self.pending_section else {
-            return false;
-        };
-        if !self.is_armed(now) || self.raw_bar(now) != Some(from) {
-            return false;
-        }
-        let Some(t0) = self.armed_at else {
-            return false;
-        };
-        let in_bar = now.saturating_duration_since(t0).as_secs_f32() % SING_BAR_SECONDS;
-        in_bar < SING_BEAT_SECONDS
-    }
-
-    /// The FINALE PLAN in force at `now`, eager or derived. The PURE-LAZY
-    /// lift (finger up, no event ever materializes the release) never ran
-    /// [`Self::release`], so its plan is derived here from live state —
-    /// the run character is still in hand exactly because nothing cleared
-    /// it. Vetoed plans are `None`, whatever the span.
-    fn cadence_plan(&self, now: Instant) -> Option<Cadence> {
-        if self.finale_veto {
-            return None;
-        }
-        if let Some(plan) = self.cadence {
-            return Some(plan);
-        }
-        let t0 = self.armed_at?;
-        let wind = self.wind_start(now)?;
-        let ch = self.run?;
-        let raw = (wind.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS) as u64;
-        if raw < u64::from(ARC_FINALE_MIN_BARS) {
-            return None;
-        }
-        Some(Cadence {
-            due: t0 + Duration::from_secs_f32((raw + 1) as f32 * SING_BAR_SECONDS),
-            sig: song_signature(ch),
-            energy_q: (self.arc_energy_at(wind) * 200.0).round().clamp(0.0, 250.0) as u8,
-            span_bars: raw.min(u64::from(u16::MAX)) as u16,
-            fired: false,
-        })
-    }
-
-    /// Consume the FINALE CADENCE once it is due: `(sig, energy_q,
-    /// span_bars)` for exactly ONE host push
-    /// (`trail_sound::CelebrationGesture::RiffCadence`). The host polls
-    /// every frame while any drive remains and consumes UNCONDITIONALLY —
-    /// with the riff muted the take still drains (the bow and the
-    /// fireworks are a motion contract; only the audio push is gated).
-    /// `None` before due, after the take, for spans under
-    /// [`ARC_FINALE_MIN_BARS`], and for vetoed (hard) releases.
-    #[must_use]
-    pub fn take_cadence(&mut self, now: Instant) -> Option<(u32, u8, u16)> {
-        let plan = self.cadence_plan(now)?;
-        // Materialize the (possibly derived) plan so the fired latch and
-        // later reads agree on one instance.
-        if plan.fired {
-            self.cadence = Some(plan);
-            return None;
-        }
-        if now < plan.due {
-            self.cadence = Some(plan);
-            return None;
-        }
-        self.cadence = Some(Cadence {
-            fired: true,
-            ..plan
-        });
-        Some((plan.sig, plan.energy_q, plan.span_bars))
-    }
-
-    /// THE BOW's depth 0..=1 at `now`: down over [`BOW_DOWN`] from cadence
-    /// beat 2 (`due + `[`CADENCE_DRIVE_HOLD`] — the tonic's landing), full
-    /// through [`BOW_HOLD`], up over [`BOW_RISE`]. Pure reader; 0 with no
-    /// finale in force. Rides the plan, not the audio — a muted riff still
-    /// bows (the motion contract), reduced motion never reads this (the
-    /// static frame pins the pose).
-    #[must_use]
-    pub fn bow_depth(&self, now: Instant) -> f32 {
-        let Some(plan) = self.cadence_plan(now) else {
-            return 0.0;
-        };
-        let start = plan.due + Duration::from_secs_f32(CADENCE_DRIVE_HOLD);
-        let t = now.saturating_duration_since(start).as_secs_f32();
-        let ease = |u: f32| u * u * (3.0 - 2.0 * u);
-        if t <= 0.0 {
-            0.0
-        } else if t < BOW_DOWN {
-            ease(t / BOW_DOWN)
-        } else if t < BOW_DOWN + BOW_HOLD {
-            1.0
-        } else if t < BOW_DOWN + BOW_HOLD + BOW_RISE {
-            ease(1.0 - (t - BOW_DOWN - BOW_HOLD) / BOW_RISE)
-        } else {
-            0.0
-        }
     }
 
     /// The derived "finger lifted" instant: one repeat gap after the last
@@ -824,51 +260,11 @@ impl KittySing {
     }
 
     /// The RAW bar-grid index at `now`: elapsed [`SING_BAR_SECONDS`] periods
-    /// since the arm anchor. This is the grid the section remap maps FROM —
-    /// bar BOUNDARIES live here and never move; only the INDEX a boundary
-    /// carries is remapped (see [`Self::bar`]).
+    /// since the arm anchor. Bar BOUNDARIES live here and never move — this
+    /// is the one uninterrupted grid the whole celebration plays on.
     fn raw_bar(&self, now: Instant) -> Option<u64> {
         let t0 = self.armed_at?;
         Some((now.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS) as u64)
-    }
-
-    /// The section shift in force at raw grid index `raw`: the pending
-    /// remap once its seam has been reached, the standing shift before it.
-    fn shift_at(&self, raw: u64) -> u64 {
-        match self.pending_section {
-            Some((from, shift)) if raw >= from => shift,
-            _ => self.section_shift,
-        }
-    }
-
-    /// Commit a KEY SWITCH's musical half: schedule the form to REOPEN on
-    /// the new key's own verse ([`section_reopen_bar`]) at the NEXT bar
-    /// boundary. The currently sounding bar finishes untouched — the seam
-    /// is exactly the boundary, where the host pushes the next `RiffBar`
-    /// with the new signature and the reopened index. The reopen DECISION
-    /// itself lives in [`section_reopen_bar`] — the instrument-layer seam.
-    ///
-    /// ONE BAR OF GRACE at the boundary race: the remap applies from
-    /// `raw + 1` — never retroactively to the raw index in flight — because
-    /// a commit landing within one frame AFTER a boundary cannot know
-    /// whether the host already pushed that boundary's index, and remapping
-    /// it after the fact would push a second, overlapping bar. In that
-    /// ~one-frame window the new key rides one bar of the old form position
-    /// first (its root/mode modulation already sounding — the switch is
-    /// heard) and reopens on its verse at the boundary after. Well inside
-    /// the module's documented ±60 ms AV sync tolerance.
-    fn reopen_section(&mut self, now: Instant) {
-        let Some(raw) = self.raw_bar(now) else { return };
-        // Fold a prior switch whose seam already passed into the standing
-        // shift, so `current` below is the index actually sounding now.
-        if let Some((from, shift)) = self.pending_section
-            && raw >= from
-        {
-            self.section_shift = shift;
-        }
-        let current = raw + self.section_shift;
-        let target = section_reopen_bar(current);
-        self.pending_section = Some((raw + 1, target - (raw + 1)));
     }
 
     /// Feed one committed PRINTED keystroke. The same character within
@@ -886,10 +282,6 @@ impl KittySing {
         if self.lazy_release().is_some_and(|release| now > release) {
             self.release(now);
         }
-        // Fold the ARC first, while the run (and so the earn class) is
-        // still the pre-press one: boundaries crossed since the last press
-        // earned at the key that was actually sounding across them.
-        self.fold_arc(now);
         if self.run != Some(ch)
             && self.armed_at.is_some()
             && self.wind_from.is_none()
@@ -902,9 +294,6 @@ impl KittySing {
             // changes key without stopping. Provisional until the new key proves
             // it is HELD ([`KEY_SWITCH_REPS`] at-cadence repeats); the count
             // restarts at 1 so those proving repeats are the NEW key's own.
-            // The DEPARTED key is remembered for the drummer: a committed
-            // switch with runway announces itself with the OLD key's fill.
-            self.handover_prev_sig = self.signature();
             self.run = Some(ch);
             self.count = 1;
             self.handover_from = Some(now);
@@ -926,41 +315,21 @@ impl KittySing {
             // KEY SWITCH COMMITTED: the handed-over key repeated its way to
             // [`KEY_SWITCH_REPS`] — this is a HOLD, not typing. A key switch
             // is NOT a release: the drive never left 1.0, the singer never
-            // left the stage, and no re-earn is owed. The musical half:
-            // reopen the form on the new key's own verse at the next bar
-            // boundary, so the switch is HEARD immediately instead of hiding
-            // for up to three bars behind the shared chorus.
+            // left the stage, and no re-earn is owed. The musical half needs
+            // no machinery at all: the signature already rides the CURRENT
+            // run char, so the next bar's payload sings the new key — the
+            // switch is heard as a modulation at the boundary.
             if self.handover_from.is_some() && self.count >= KEY_SWITCH_REPS {
                 self.handover_from = None;
-                // FILL ANNOUNCEMENT (the early path): runway to beat 3 —
-                // latch the OLD key's signature for the host to push as the
-                // drummer's cue. The synth quantizes the hits to its own
-                // sixteenth grid; a commit past the runway announces itself
-                // with the audible reopen alone (the late path — zero cost).
-                if let Some(t0) = self.armed_at {
-                    let in_bar = now.saturating_duration_since(t0).as_secs_f32() % SING_BAR_SECONDS;
-                    if in_bar < FILL_CUE_RUNWAY {
-                        self.fill_cue = Some((self.handover_prev_sig, self.signature()));
-                        self.fill_bar = self.raw_bar(now);
-                    }
-                }
-                self.reopen_section(now);
             }
         } else {
             // PROMISE BROKEN: another distinct character before the handed-over
             // key ever proved itself. That was typing, so wind down from the
             // DEPARTURE — the instant the original held key was abandoned —
             // rather than from here, so ordinary typing loses exactly what it
-            // lost before. Anchoring through `release(departure)` (instead of
-            // pre-setting `wind_from`, which would make release skip its
-            // wind-start block) keeps the arc EMBER: typing out of a song is
-            // still a release, and a quick re-arm after it stays warm.
+            // lost before.
             let departure = self.handover_from.take();
             self.release(departure.unwrap_or(now));
-            // Proven typing is a HARD release: the band does not play a
-            // ta-daa over the sentence you started writing.
-            self.cadence = None;
-            self.finale_veto = true;
             self.run = Some(ch);
             self.count = 1;
         }
@@ -988,48 +357,6 @@ impl KittySing {
             SING_ARM_REPEATS
         };
         if self.count >= threshold && (self.armed_at.is_none() || self.wind_from.is_some()) {
-            // The reopened section stays MONOTONE above everything the old
-            // one pushed: re-anchoring rewinds the raw grid to 0, so carry
-            // the last live mapped index (at the wind start) forward into
-            // the shift — the recovery, like a live switch, opens on the new
-            // key's own verse and can never replay a stale bar index.
-            self.section_shift = match (self.armed_at, self.wind_from) {
-                (Some(t0), Some(wind)) => {
-                    let raw = (wind.saturating_duration_since(t0).as_secs_f32() / SING_BAR_SECONDS)
-                        as u64;
-                    section_reopen_bar(raw + self.shift_at(raw))
-                }
-                _ => 0,
-            };
-            // THE WARM CARRY: a re-arm within [`ARC_CARRY_SECONDS`] of the
-            // wind-down start keeps [`ARC_CARRY_KEEP`] of the released
-            // energy (floored at the cold open) — and a carry already at
-            // performance temperature (≥ [`ARC_INTRO_CAP`]) skips the
-            // intro. Beyond the window the ember is cold: a fresh arc.
-            let carried = match self.arc.carry {
-                Some((wind, energy))
-                    if now.saturating_duration_since(wind).as_secs_f32() <= ARC_CARRY_SECONDS =>
-                {
-                    (ARC_CARRY_KEEP * energy).max(ARC_START)
-                }
-                _ => ARC_START,
-            };
-            self.arc = SongArc {
-                energy: carried,
-                anchor_raw: 0,
-                // Structurally below the gate: the hottest carry is
-                // ARC_CARRY_KEEP × ARC_ENERGY_MAX ≈ 0.94 — a peak must be
-                // re-earned, never inherited.
-                peaked: false,
-                intro_skip: carried >= ARC_INTRO_CAP,
-                carry: None,
-            };
-            // A re-arm before the cadence fires CANCELS it — the band was
-            // asked to keep playing, not to end; and a fresh performance
-            // clears any hard-release veto.
-            self.cadence = None;
-            self.finale_veto = false;
-            self.pending_section = None;
             self.armed_at = Some(now);
             self.wind_from = None;
         }
@@ -1041,14 +368,11 @@ impl KittySing {
         self.release(now);
     }
 
-    /// Any word-breaking / editing / navigation key: same release law as
-    /// backspace, but HARD — Enter/Tab/Escape/chords mean "done, back to
-    /// work", so the finale is vetoed along with the run (the plain fade
-    /// is the whole goodbye).
+    /// Any word-breaking / editing / navigation key (Enter/Tab/Escape/
+    /// chords mean "done, back to work"): same release law as backspace —
+    /// the plain fade is the whole goodbye.
     pub fn note_break(&mut self, now: Instant) {
         self.release(now);
-        self.cadence = None;
-        self.finale_veto = true;
     }
 
     /// The celebration drive 0..=1 at `now`: 1.0 while armed and held, a
@@ -1062,18 +386,6 @@ impl KittySing {
         }
         let Some(start) = self.wind_start(now) else {
             return 1.0;
-        };
-        // THE DEFERRED WIND-DOWN: while a finale is in force, the drive
-        // holds full through the finishing bar AND the cadence until its
-        // tonic lands (due + CADENCE_DRIVE_HOLD), then the standard
-        // smoothstep — the singer stays on stage for the ta-daa and the
-        // bow. `saturating_duration_since` reads a future start as "no
-        // time elapsed", i.e. drive 1.0. (This is also what stretches the
-        // warm re-arm window to ~3.4 s past the release — pinned as
-        // intended by the owner.)
-        let start = match self.cadence_plan(now) {
-            Some(plan) => plan.due + Duration::from_secs_f32(CADENCE_DRIVE_HOLD),
-            None => start,
         };
         let t = now.saturating_duration_since(start).as_secs_f32() / SING_WIND_DOWN;
         if t >= 1.0 {
@@ -1105,45 +417,21 @@ impl KittySing {
     /// The riff bar index at `now` while ARMED (wind-down schedules no new
     /// bars — the synth's own sing-duck release is the audio crossfade). The
     /// host pushes one `CelebrationGesture::RiffBar` per NEW index.
-    ///
-    /// The index is the raw 1.6 s grid plus the SECTION remap: a committed
-    /// key switch re-enters the form at [`section_reopen_bar`] on the
-    /// boundary after the commit, so the new key opens on its own verse
-    /// (form slot 0) instead of wherever the old key left the form. Mapped
-    /// indices only ever move forward — across switches AND recoveries —
-    /// so the host latch never swallows a section and the synth's
-    /// build/clap ramps never fall back to the cold open mid-medley.
     #[must_use]
     pub fn bar(&self, now: Instant) -> Option<u64> {
         if !self.is_armed(now) {
             return None;
         }
-        let raw = self.raw_bar(now)?;
-        Some(raw + self.shift_at(raw))
+        self.raw_bar(now)
     }
 
-    /// A drained detector at rest is byte-identical off — the idle contract,
-    /// with ONE documented ember: [`SongArc::carry`] survives (the warm
-    /// re-arm law needs memory across the rest; it goes stale on its own
-    /// clock). Called by the host once the drive reads 0 (or on hard resets).
+    /// A drained detector at rest is byte-identical off — the idle contract.
+    /// Called by the host once the drive reads 0 (or on hard resets).
     pub fn settle(&mut self, now: Instant) {
         if self.armed_at.is_some() && self.drive(now) <= 0.0 {
-            // A PURE-LAZY wind-down (finger lifted, no event ever
-            // materialized the release) still leaves its ember.
-            if self.arc.carry.is_none()
-                && let Some(wind) = self.wind_start(now)
-            {
-                self.arc.carry = Some((wind, self.arc_energy_at(wind)));
-            }
             self.armed_at = None;
             self.wind_from = None;
             self.handover_from = None;
-            self.section_shift = 0;
-            self.pending_section = None;
-            self.fill_cue = None;
-            self.fill_bar = None;
-            self.cadence = None;
-            self.finale_veto = false;
         }
     }
 }
@@ -1192,36 +480,7 @@ struct Note {
     kind: NoteKind,
     /// Per-note scatter seed: tint index, x offset, wobble phase.
     seed: u32,
-    /// The SECTION CLASS sounding at spawn ([`section_class`]) — picks the
-    /// stripe range ([`class_stripes`]). Flips on the very press that
-    /// starts a hand-over, so the notes are the PRE-ECHO: the eye sees the
-    /// destination key a bar before the audio commits.
-    class: u8,
-    /// A FIREWORK note (the finale burst): born radially scattered up to
-    /// [`FIREWORK_SPREAD`] cells out instead of at the mouth; same rise,
-    /// same fade, same ring — zero new particle systems.
-    burst: bool,
 }
-
-/// How far (in cells) the finale fireworks scatter from the mouth anchor.
-pub const FIREWORK_SPREAD: f32 = 3.0;
-
-/// The rainbow stripes a section class spawns notes in — `(offset, len)`
-/// into [`NOTE_TINTS`]: verse a modest two-stripe band, chorus the full
-/// six-stripe rainbow, bridge the cool half, percussive the warm half,
-/// breath a single dim violet ([`BREATH_NOTE_DIM`]).
-const fn class_stripes(class: u8) -> (usize, usize) {
-    match class {
-        1 => (0, 6),
-        2 => (3, 3),
-        3 => (0, 3),
-        4 => (5, 1),
-        _ => (2, 2),
-    }
-}
-
-/// The breath's single stripe renders dim — the quiet passage looks quiet.
-const BREATH_NOTE_DIM: f32 = 0.6;
 
 /// One frame's resolved note sprite, in CELL units relative to the singing
 /// cat's mouth anchor (+x ahead of the cat, −y upward). The emitter
@@ -1276,15 +535,9 @@ impl MusicNotes {
     /// notes leave the cat's mouth on the same clock the riff plays on).
     /// Any wind-down spawns nothing: the live notes finish their rise and
     /// fade — the visual crossfade. `streaming` is the detector's
-    /// `is_armed`, DELIBERATELY not the drive: the finale's deferred
-    /// wind-down holds the drive at 1.0 through the cadence tail, and a
-    /// mouth-stream continuing there drowned the firework burst (the
-    /// pixel review's one moderate defect) — the ending belongs to the
-    /// fireworks alone. `class` is the CURRENT section class
-    /// ([`KittySing::section_class_now`]): it picks the spawn's stripe
-    /// range, and because it reads the live run char it flips on the
-    /// hand-over press itself — the tint half of the visual pre-echo.
-    pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>, class: u8) {
+    /// `is_armed`, so the field stops spawning the instant the wind-down
+    /// begins, whatever the drive still reads.
+    pub fn update(&mut self, now: Instant, streaming: bool, beat: Option<f32>) {
         for slot in &mut self.ring {
             if slot
                 .is_some_and(|n| now.saturating_duration_since(n.born).as_secs_f32() >= NOTE_LIFE)
@@ -1314,37 +567,8 @@ impl MusicNotes {
             born: now,
             kind,
             seed,
-            class: class.min(4),
-            burst: false,
         });
         self.head = (self.head + 1) % MAX_NOTES;
-    }
-
-    /// THE FINALE FIREWORKS: burst `min(4 + bars_played / 2, 16)` notes
-    /// into the existing ring at once — a performance-scaled send-off
-    /// (test-pinned: 6 bars => 7 notes). Full-rainbow tints (the chorus
-    /// stripe range), radial scatter, standard rise and fade; the 16-cap
-    /// ring bounds it unconditionally. The HOST gates this on motion:
-    /// reduced motion spawns no fireworks (fade-only law), a muted riff
-    /// still gets them (motion contract).
-    pub fn fireworks(&mut self, now: Instant, bars_played: u32) {
-        let n = (4 + bars_played / 2).min(16) as usize;
-        for i in 0..n {
-            let seed = self.rnd();
-            let kind = if i % 2 == 0 {
-                NoteKind::Eighth
-            } else {
-                NoteKind::Beamed
-            };
-            self.ring[self.head] = Some(Note {
-                born: now,
-                kind,
-                seed,
-                class: 1,
-                burst: true,
-            });
-            self.head = (self.head + 1) % MAX_NOTES;
-        }
     }
 
     /// True while any note is alive (the host keeps its frame cadence going
@@ -1373,29 +597,15 @@ impl MusicNotes {
         // Fade: quick bloom in, long dissolve out.
         let fade_in = (u / 0.15).min(1.0);
         let fade_out = ((1.0 - u) / 0.4).min(1.0);
-        // The breath's single stripe renders dim — see [`class_stripes`].
-        let dim = if note.class == 4 {
-            BREATH_NOTE_DIM
-        } else {
-            1.0
-        };
-        let alpha = (fade_in * fade_out * dim * 255.0) as u8;
+        let alpha = (fade_in * fade_out * 255.0) as u8;
         let s = note.seed;
-        let (stripe0, stripes) = class_stripes(note.class);
-        let tint = NOTE_TINTS[stripe0 + (s as usize % stripes)];
+        let tint = NOTE_TINTS[(s % NOTE_TINTS.len() as u32) as usize];
         // Scatter: birth x in 0.1..0.9 cells ahead, wobble phase 0..1.
         let x0 = 0.1 + 0.8 * ((s >> 8) & 0xff) as f32 / 255.0;
         let phase = ((s >> 16) & 0xff) as f32 / 255.0;
         let (dx, dy) = if reduced_motion {
             // Fixed offsets: a static spray around the mouth.
             (x0, -0.3 - 0.8 * phase)
-        } else if note.burst {
-            // FIREWORK: a radial birth offset (seed-scattered angle and
-            // radius), then the standard rise — the burst blooms outward
-            // and floats up like every other note.
-            let ang = std::f32::consts::TAU * phase;
-            let r = FIREWORK_SPREAD * (0.5 + 0.5 * (((s >> 24) & 0xff) as f32 / 255.0));
-            (r * ang.cos(), 0.5 * r * ang.sin() - NOTE_RISE_CELLS * u)
         } else {
             (
                 x0 + 0.18 * (std::f32::consts::TAU * (u * 1.5 + phase)).sin(),
@@ -1682,8 +892,8 @@ mod tests {
     ///    bar index keeps counting UP across the switch. The old behaviour
     ///    released the run, stopped scheduling bars immediately, and then cold
     ///    started at bar 0 once the crossfade drained.
-    ///  * CHANGES — the signature moves to the new key, and the committed switch
-    ///    reopens the form on that key's own verse at the next boundary
+    ///  * CHANGES — the signature moves to the new key, so the next bar's
+    ///    payload sings the new verse over the same uninterrupted grid
     ///    (`switching_the_held_key_changes_the_verse_at_the_next_bar` pins the
     ///    pushed-bar half of that law).
     #[test]
@@ -1880,9 +1090,9 @@ mod tests {
         );
         assert_eq!(
             d.bar(t),
-            Some(SING_FORM_BARS),
-            "the recovery reopens the form on a verse, ABOVE the old bars — \
-             monotone, so the host latch always fires"
+            Some(0),
+            "the re-anchored grid opens at bar 0 — a fresh verse under the \
+             same finger"
         );
 
         // Path 2 — a stray other key mid-hold, then the hold resumes. The
@@ -1958,7 +1168,7 @@ mod tests {
         for hb in 0..40u64 {
             let now = t0 + Duration::from_millis(hb * 10); // 100 Hz "half-beats"
             let beat = hb as f32 * 0.5;
-            notes.update(now, true, Some(beat), 0);
+            notes.update(now, true, Some(beat));
         }
         let live = notes.ring.iter().flatten().count();
         assert!(live <= MAX_NOTES, "ring overflowed: {live}");
@@ -1975,16 +1185,16 @@ mod tests {
         let t0 = Instant::now();
         for hb in 0..8u64 {
             let now = t0 + Duration::from_millis(hb * 200);
-            notes.update(now, true, Some(hb as f32 * 0.5), 0);
+            notes.update(now, true, Some(hb as f32 * 0.5));
         }
         assert!(notes.is_active());
         // The wind-down (no longer armed): updates cull but never spawn.
         let later = t0 + Duration::from_millis(8 * 200);
-        notes.update(later, false, Some(8.0 * 0.5), 0);
+        notes.update(later, false, Some(8.0 * 0.5));
         let live_at_release = notes.ring.iter().flatten().count();
         for step in 0..20u64 {
             let now = later + Duration::from_millis(step * 100);
-            notes.update(now, false, Some((8 + step) as f32 * 0.5), 0);
+            notes.update(now, false, Some((8 + step) as f32 * 0.5));
             assert!(
                 notes.ring.iter().flatten().count() <= live_at_release,
                 "wind-down must never spawn"
@@ -2003,7 +1213,7 @@ mod tests {
     fn reduced_motion_notes_hold_still() {
         let mut notes = MusicNotes::default();
         let t0 = Instant::now();
-        notes.update(t0, true, Some(0.0), 0);
+        notes.update(t0, true, Some(0.0));
         // Both samples sit past the bloom-in peak, so the second reads the
         // dissolve tail (the envelope rises for the first ~15% of life).
         let (a, b) = (
@@ -2224,10 +1434,9 @@ mod tests {
 
     /// COMPLAINT #1, THE LAW: switching the held key changes the verse at
     /// the next bar boundary. The next RiffBar the host pushes after the
-    /// switch commits must carry the NEW key's signature AND a bar index
-    /// that reopens the form (a multiple of the 8-bar form — slot 0, the
-    /// new key's own A-section verse), so the new tune announces itself
-    /// immediately instead of hiding behind up to two shared-chorus bars.
+    /// switch commits must carry the NEW key's signature over the SAME
+    /// uninterrupted bar grid — the switch is heard as a modulation, never
+    /// announced, never a restart.
     #[test]
     fn switching_the_held_key_changes_the_verse_at_the_next_bar() {
         let t0 = Instant::now();
@@ -2248,12 +1457,6 @@ mod tests {
             "the next pushed RiffBar sings the NEW key"
         );
         assert_ne!(sig, song_signature('w'));
-        assert_eq!(
-            bar % SING_FORM_BARS,
-            0,
-            "the switch reopens the form on the new key's own verse \
-             (slot 0), not mid-form: got bar {bar}"
-        );
         assert!(bar > host.pushed[0].0, "the bar index stays monotone");
     }
 
@@ -2281,12 +1484,9 @@ mod tests {
     }
 
     /// THE INSTRUMENT SCENARIO: a six-key medley, each key held for a full
-    /// bar or more. The drive never dips, every key's section gets heard,
-    /// each new section opens on that key's own verse (form slot 0), and
-    /// the pushed bar indices stay strictly monotone (the host latch can
-    /// never swallow a section). Tenures are 1.95 s so every switch commit
-    /// lands clear of a bar boundary — the one-frame boundary race takes
-    /// the documented one bar of grace instead ([`KittySing::reopen_section`]).
+    /// bar or more. The drive never dips, every key's verse gets heard in
+    /// order, and the pushed bar indices stay strictly monotone on the one
+    /// raw grid (the host latch can never swallow a bar).
     #[test]
     fn a_six_key_medley_holds_the_stage_end_to_end() {
         let t0 = Instant::now();
@@ -2307,16 +1507,9 @@ mod tests {
             assert!(window[1].0 > window[0].0, "bar indices strictly monotone");
         }
         let mut heard = Vec::new();
-        for &(bar, sig) in &host.pushed {
+        for &(_, sig) in &host.pushed {
             if heard.last() != Some(&sig) {
                 heard.push(sig);
-                if heard.len() > 1 {
-                    assert_eq!(
-                        bar % SING_FORM_BARS,
-                        0,
-                        "every switched-to key opens on its own verse (slot 0)"
-                    );
-                }
             }
         }
         assert_eq!(
@@ -2348,36 +1541,6 @@ mod tests {
         assert_eq!(d.drive(gone), 0.0, "the crossfade completes");
         d.settle(gone);
         assert_eq!(d.beat(gone), None, "settled = byte-identical rest");
-    }
-
-    /// A SWITCH REOPENS ON THE NEW KEY'S VERSE, NOT THE CHORUS: switch late
-    /// in the form (during bar 6 — the chorus block 6/7 is next) and the
-    /// next pushed bar must still be a form-opening verse index, never the
-    /// shared chorus that would hide the new tune for two more bars.
-    #[test]
-    fn a_switch_reopens_on_the_new_keys_verse_not_the_chorus() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        // Hold 'w' deep into the form: past the bar-6 boundary.
-        let reps_past_bar_6 = SING_ARM_REPEATS + (6 * 1600 + 200) / 30;
-        let deep = host.hold(t0, 'w', reps_past_bar_6, 30);
-        assert_eq!(
-            host.pushed.last().expect("bars pushed").0 % SING_FORM_BARS,
-            6,
-            "the switch happens while the bridge (chorus block) sounds"
-        );
-        let n_before = host.pushed.len();
-        host.hold(deep + Duration::from_millis(30), 'a', 70, 30);
-        let &(bar, sig) = host
-            .pushed
-            .get(n_before)
-            .expect("the boundary after the switch pushed a bar");
-        assert_eq!(sig, song_signature('a'));
-        assert_eq!(
-            bar % SING_FORM_BARS,
-            0,
-            "the form reopens on the new key's verse — not chorus bar 7"
-        );
     }
 
     /// FORGIVENESS: the owner pauses a beat too long mid-switch (the OS
@@ -2412,15 +1575,9 @@ mod tests {
              (worst frame: {})",
             host.min_drive
         );
-        let bar = host.d.bar(recovered).expect("scheduling again");
-        assert_eq!(
-            bar % SING_FORM_BARS,
-            0,
-            "the recovery reopens on the new key's verse"
-        );
         assert!(
-            host.pushed.iter().all(|&(b, _)| b <= bar),
-            "monotone: the reopened section outruns everything pushed before"
+            host.d.bar(recovered).is_some(),
+            "the recovery schedules bars again"
         );
     }
 
@@ -2457,608 +1614,5 @@ mod tests {
             !d.is_armed(again),
             "after the glow is gone, three reps are just typing again"
         );
-    }
-
-    /// THE CLASS MAP: vowels are chorus keys, digits bridge, punctuation
-    /// percussive, Space the breath — and EVERYTHING ELSE (consonants,
-    /// shifted letters, IME/unicode) is a verse key. Every char still
-    /// sings; the class only shapes how it is played.
-    #[test]
-    fn section_classes_cover_every_character() {
-        for v in "aeiouAEIOU".chars() {
-            assert_eq!(section_class(v), 1, "{v:?} is a chorus key");
-        }
-        for c in "bcdfgqwrtzXYZ".chars() {
-            assert_eq!(section_class(c), 0, "{c:?} is a verse key");
-        }
-        for d in "0123456789".chars() {
-            assert_eq!(section_class(d), 2, "{d:?} is a bridge key");
-        }
-        for p in "!#$%&*.,;:~-_=+/\\'\"`^@?<>()[]{}|".chars() {
-            assert_eq!(section_class(p), 3, "{p:?} is a percussive key");
-        }
-        assert_eq!(section_class(' '), 4, "Space is the breath");
-        for off_map in ['é', 'ß', '猫', '—', '¿'] {
-            assert_eq!(
-                section_class(off_map),
-                0,
-                "{off_map:?} still sings, as a verse"
-            );
-        }
-        assert_eq!(ARC_EARN.len(), 5, "one earn rate per class");
-    }
-
-    /// ACCEPTANCE 1 — the arc reproduces today's build on a single hold: a
-    /// continuous consonant hold's per-bar payload walks the exact shim
-    /// curve `q = 60 + 25·bar` (energy 0.30 + 0.125/bar — build 1.0 at bar
-    /// 6, the clap gate 230 crossed from bar 7), the intro bars render
-    /// ≤ 0.55×200, and the rise is monotone.
-    #[test]
-    fn the_arc_reproduces_todays_build_on_a_single_hold() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 't', SING_ARM_REPEATS, 30);
-        assert_eq!(
-            d.arc_energy_q(armed),
-            60,
-            "the arc opens at ARC_START × 200"
-        );
-        let mut t = armed;
-        let mut prev_q = 0u8;
-        // Hold through 10 bars, sampling the payload at each bar's middle.
-        while d.bar(t).is_some_and(|b| b <= 10) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 't');
-            let bar = d.bar(t).expect("armed");
-            let q = d.arc_energy_q(t);
-            let expect = (60 + 25 * bar).min(250) as u8;
-            assert_eq!(
-                q, expect,
-                "bar {bar}: the single-hold verse curve is the shim curve"
-            );
-            if bar < u64::from(ARC_INTRO_BARS) {
-                assert!(
-                    f32::from(q) / 200.0 <= ARC_INTRO_CAP,
-                    "intro bars render capped (bar {bar}: q={q})"
-                );
-            }
-            assert!(q >= prev_q, "the verse build is monotone");
-            prev_q = q;
-            if bar == 6 {
-                assert!(q >= 200, "build hits 1.0 at bar 6 — the legacy pin");
-            }
-            if bar == 7 {
-                assert!(q >= 230, "bar 7 crosses the verse clap gate — the new law");
-            }
-        }
-        assert_eq!(d.arc_phase(t), ArcPhase::Peak, "a long hold peaks");
-    }
-
-    /// ACCEPTANCE 2 — a chorus key cashes in the verse build: hold 't' for
-    /// five bars (energy 0.30 + 5×0.125 = 0.925), switch to 'e' — the drive
-    /// never dips, and the first chorus-key bar's payload carries class 1
-    /// and energy_q 235 (0.925 + 0.25 = 1.175, INTERNAL encoding): PEAK on
-    /// the chorus key's first full bar, faster than either key alone.
-    #[test]
-    fn a_chorus_key_cashes_in_the_verse_build() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        // Hold 't' through five full bars (arm ≈ 0.45 s in, so ~5.6 s of
-        // presses at 30 ms cadence keeps bar 5 in flight at the switch).
-        let mut t = t0;
-        while host.d.bar(t).is_none_or(|b| b < 5) {
-            t += Duration::from_millis(30);
-            host.press(t, 't');
-        }
-        assert_eq!(host.d.section_class_now(), 0);
-        let energy_before = host.d.arc_energy_q(t);
-        assert_eq!(energy_before, 60 + 25 * 5, "five verse bars banked");
-        // The switch: 'e' commits within three at-cadence repeats.
-        for _ in 0..KEY_SWITCH_REPS {
-            t += Duration::from_millis(30);
-            host.press(t, 'e');
-        }
-        assert_eq!(host.d.section_class_now(), 1, "the chorus class is live");
-        // Keep holding 'e' across the next bar boundary.
-        let mut q_at_reopen = None;
-        let reopen_deadline = t + Duration::from_millis(1700);
-        while t < reopen_deadline {
-            t += Duration::from_millis(30);
-            host.press(t, 'e');
-            if q_at_reopen.is_none()
-                && host
-                    .pushed
-                    .last()
-                    .is_some_and(|&(_, sig)| sig == song_signature('e'))
-            {
-                q_at_reopen = Some(host.d.arc_energy_q(t));
-            }
-        }
-        host.run_to(t);
-        assert_eq!(
-            host.min_drive, 1.0,
-            "the drive never dips across the switch"
-        );
-        assert_eq!(
-            q_at_reopen,
-            Some(235),
-            "the chorus key's first bar carries the inherited build + its own earn"
-        );
-        assert_eq!(
-            host.d.arc_phase(t),
-            ArcPhase::Peak,
-            "peak on the first chorus bar"
-        );
-    }
-
-    /// The BREATH: Space earns NEGATIVE energy — the deliberate quiet
-    /// passage — and the energy floor is 0, never below.
-    #[test]
-    fn a_held_space_breathes_the_energy_down() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 'e', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        // Four chorus bars up…
-        while d.bar(t).is_none_or(|b| b < 4) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 'e');
-        }
-        let hot = d.arc_energy_q(t);
-        // …then hand over to Space and hold the breath for three bars.
-        let switch_bar = d.bar(t).unwrap();
-        while d.bar(t).is_none_or(|b| b < switch_bar + 4) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, ' ');
-        }
-        assert_eq!(d.section_class_now(), 4);
-        let quiet = d.arc_energy_q(t);
-        assert!(quiet < hot, "the breath decays energy ({hot} -> {quiet})");
-        assert_eq!(d.drive(t), 1.0, "a held breath is still a hold");
-    }
-
-    /// ACCEPTANCE 7 — energy carries across a quick re-arm but not a cold
-    /// one: 3.0 s after releasing at energy 1.0 the first payload reads
-    /// q == 150 (0.75 × 1.0), the intro is skipped and the bar payload
-    /// follows the monotone reopen mapping (asserted against
-    /// `section_reopen_bar`, not a literal 0); 8.0 s after, the arc is
-    /// fresh (q == 60) with the intro cap active. Pins the extended warm
-    /// window as INTENDED behavior.
-    #[test]
-    fn energy_carries_across_a_quick_rearm_but_not_a_cold_one() {
-        let t0 = Instant::now();
-        // Release "from energy 1.0", earned the instrument's way: a pure
-        // verse walk steps 0.925 → 1.05 and never lands on 1.0, so bank
-        // four 't' bars (0.30 + 4×0.125 = 0.80) and one '.' percussive bar
-        // (+0.20) — exactly 1.00 at the release.
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 't', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 4) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 't');
-        }
-        let base_bar = d.bar(t).unwrap();
-        while d.bar(t).is_none_or(|b| b < base_bar + 1) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, '.');
-        }
-        assert_eq!(d.arc_energy_q(t), 200, "energy 1.0 on the button");
-        let release = t + Duration::from_millis(30);
-        d.note_break(release);
-        // WARM: re-arm 3.0 s after the release (well inside the 6 s window,
-        // and past the drive-0 settle — the ember must survive `settle`).
-        let settled = release + Duration::from_secs_f32(SING_WIND_DOWN + 0.2);
-        assert_eq!(d.drive(settled), 0.0);
-        d.settle(settled);
-        let again = release + Duration::from_secs(3);
-        let rearmed = hold(&mut d, again, 'w', SING_ARM_REPEATS, 30);
-        assert!(d.is_armed(rearmed), "sixteen fresh reps re-arm");
-        assert_eq!(
-            d.arc_energy_q(rearmed),
-            150,
-            "0.75 of the released energy carries"
-        );
-        assert!(
-            !d.intro_active(rearmed),
-            "a carry at performance temperature skips the intro"
-        );
-        assert_eq!(
-            d.bar(rearmed),
-            Some(0),
-            "a post-settle re-arm follows the reopen mapping from rest \
-             (section_shift 0 — the mapping's cold branch, asserted against \
-             the mapping, not assumed)"
-        );
-        // COLD: the same dance 8.0 s after a release reads a fresh arc.
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 't', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 6) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 't');
-        }
-        let release = t + Duration::from_millis(30);
-        d.note_break(release);
-        let settled = release + Duration::from_secs_f32(SING_WIND_DOWN + 0.2);
-        d.settle(settled);
-        let much_later = release + Duration::from_secs(8);
-        let rearmed = hold(&mut d, much_later, 'w', SING_ARM_REPEATS, 30);
-        assert_eq!(d.arc_energy_q(rearmed), 60, "beyond the window: cold open");
-        assert!(d.intro_active(rearmed), "and the intro cap is active again");
-    }
-
-    /// A RECOVERY inside the live glow (the forgiveness path) is a WARM
-    /// re-arm too: the ember is fresh by construction, so the energy
-    /// carries — and the reopened bar payload still follows the monotone
-    /// reopen mapping (the live branch of acceptance 7's mapping clause).
-    #[test]
-    fn a_glow_recovery_carries_energy_onto_the_reopened_verse() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 't', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 4) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 't');
-        }
-        let e_before = d.arc_energy_q(t); // 0.80 × 200
-        assert_eq!(e_before, 160);
-        // A cadence hiccup: the next press lands past the repeat gap.
-        let raw_at_wind = d.bar(t).unwrap();
-        let after_gap = t + SING_REPEAT_GAP + Duration::from_millis(60);
-        d.note_char(after_gap, S, 't');
-        let mut t = after_gap;
-        for _ in 1..KEY_SWITCH_REPS {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 't');
-        }
-        assert!(d.is_armed(t), "the glow recovery re-armed");
-        assert_eq!(
-            d.arc_energy_q(t),
-            (0.75f32 * 0.80 * 200.0).round() as u8,
-            "the recovery keeps 0.75 of the ember"
-        );
-        let reopened = d.bar(t).expect("scheduling again");
-        assert_eq!(
-            reopened,
-            section_reopen_bar(raw_at_wind),
-            "the recovery bar follows the monotone reopen mapping"
-        );
-    }
-
-    /// ACCEPTANCE 3 (the host half) — an early switch fills beat four and
-    /// lands next bar: a commit before beat 3.0 latches EXACTLY ONE fill
-    /// cue carrying (old sig, new sig); the drive never dips; the next
-    /// pushed payload is the new key's; and the singer's head-bob window
-    /// (`fill_beat`) opens on the bar's final beat.
-    #[test]
-    fn an_early_switch_fills_beat_four_and_lands_next_bar() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        let armed = host.hold(t0, 't', 20, 30);
-        // Walk to ~0.7 s into a fresh bar, then commit the switch there:
-        // three at-cadence 'e' presses land the commit near 0.8 s — well
-        // inside the 1.2 s runway.
-        let bar_now = host.d.bar(armed).expect("armed");
-        let mut t = armed;
-        while host.d.bar(t) == Some(bar_now) {
-            t += Duration::from_millis(30);
-            host.press(t, 't');
-        }
-        // t is now just past a bar boundary; run 0.7 s into the bar.
-        let mut in_bar = t;
-        while in_bar < t + Duration::from_millis(700) {
-            in_bar += Duration::from_millis(30);
-            host.press(in_bar, 't');
-        }
-        let n_pushed = host.pushed.len();
-        for _ in 0..KEY_SWITCH_REPS {
-            in_bar += Duration::from_millis(30);
-            host.press(in_bar, 'e');
-        }
-        assert_eq!(
-            host.d.take_fill_cue(),
-            Some((song_signature('t'), song_signature('e'))),
-            "exactly one cue, old key then new"
-        );
-        assert_eq!(host.d.take_fill_cue(), None, "consumed once — never twice");
-        assert!(
-            !host.d.fill_beat(in_bar),
-            "beat 4 has not arrived yet at commit time (~0.8 s)"
-        );
-        // Hold 'e' to the bar's final beat: the head-bob window opens…
-        let mut t = in_bar;
-        while !host.d.fill_beat(t) {
-            t += Duration::from_millis(30);
-            host.press(t, 'e');
-            assert_eq!(host.d.drive(t), 1.0, "the drive never dips");
-        }
-        // …and the boundary lands the NEW key's payload.
-        while host.pushed.len() == n_pushed {
-            t += Duration::from_millis(30);
-            host.press(t, 'e');
-        }
-        let &(bar, sig) = host.pushed.last().unwrap();
-        assert_eq!(
-            sig,
-            song_signature('e'),
-            "the next payload sings the new key"
-        );
-        assert_eq!(
-            bar % SING_FORM_BARS,
-            0,
-            "…on its own verse (the reopen law)"
-        );
-        assert!(
-            host.d.switch_landing(t),
-            "the commit landing pulse covers the reopened bar's first beat"
-        );
-        host.run_to(t);
-        assert_eq!(host.min_drive, 1.0, "drive sampled every frame == 1.0");
-    }
-
-    /// ACCEPTANCE 4 — a late switch commits WITHOUT a cue: a commit past
-    /// beat 3.0 latches nothing; the reopen alone announces the switch at
-    /// the bar edge, exactly per the foundation contract.
-    #[test]
-    fn a_late_switch_commits_without_a_cue() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        let armed = host.hold(t0, 't', 20, 30);
-        let bar_now = host.d.bar(armed).expect("armed");
-        let mut t = armed;
-        while host.d.bar(t) == Some(bar_now) {
-            t += Duration::from_millis(30);
-            host.press(t, 't');
-        }
-        // 1.3 s into the fresh bar: past the runway.
-        let mut in_bar = t;
-        while in_bar < t + Duration::from_millis(1300) {
-            in_bar += Duration::from_millis(30);
-            host.press(in_bar, 't');
-        }
-        let n_pushed = host.pushed.len();
-        for _ in 0..KEY_SWITCH_REPS {
-            in_bar += Duration::from_millis(30);
-            host.press(in_bar, 'e');
-        }
-        assert_eq!(host.d.take_fill_cue(), None, "no runway ⇒ zero cues");
-        // The bar edge still lands the new key within one bar.
-        let mut t = in_bar;
-        while host.pushed.len() == n_pushed {
-            t += Duration::from_millis(30);
-            host.press(t, 'e');
-            assert!(
-                t.saturating_duration_since(in_bar).as_secs_f32() <= SING_BAR_SECONDS + 0.1,
-                "the new payload arrives within one bar of the commit"
-            );
-        }
-        assert_eq!(host.pushed.last().unwrap().1, song_signature('e'));
-    }
-
-    /// ACCEPTANCE 9 — the pre-echo flips within one frame: the very PRESS
-    /// that starts a hand-over flips `signature`/`section_class_now` (the
-    /// note tint + pose bias read them next frame) while the audio side —
-    /// the pushed payloads — stays untouched until the bar edge.
-    #[test]
-    fn the_pre_echo_flips_within_one_frame() {
-        let t0 = Instant::now();
-        let mut host = HostSim::new(t0);
-        let armed = host.hold(t0, 't', 20, 30);
-        let pushed_before = host.pushed.clone();
-        let press = armed + Duration::from_millis(30);
-        host.press(press, 'e'); // ONE press — provisional, not yet a switch
-        assert_eq!(
-            host.d.signature(),
-            song_signature('e'),
-            "identity flips on the hand-over press itself"
-        );
-        assert_eq!(host.d.section_class_now(), 1, "class flips with it");
-        assert_eq!(
-            host.pushed, pushed_before,
-            "no new payload before the bar edge — the sounding bar's audio \
-             is untouched"
-        );
-        // The tint half: the next spawned note carries the destination
-        // class's stripe range (chorus = the full rainbow, offset 0).
-        let mut notes = MusicNotes::default();
-        notes.update(press, true, Some(0.0), host.d.section_class_now());
-        let mut out = Vec::new();
-        notes.frames(press + Duration::from_millis(200), false, &mut out);
-        assert_eq!(out.len(), 1, "one spawn on the fresh half-beat");
-    }
-
-    /// The stripe ranges per class: verse two stripes, chorus all six,
-    /// bridge the cool half, percussive the warm half, breath a single dim
-    /// violet — and every range stays inside [`NOTE_TINTS`].
-    #[test]
-    fn note_stripes_follow_the_section_class() {
-        for class in 0u8..=4 {
-            let (off, len) = class_stripes(class);
-            assert!(len >= 1 && off + len <= NOTE_TINTS.len(), "class {class}");
-        }
-        assert_eq!(class_stripes(1), (0, 6), "chorus: the whole rainbow");
-        assert_eq!(class_stripes(4).1, 1, "breath: a single stripe");
-        // Spawn a chorus-class and a breath-class note; the breath renders
-        // dimmer at the same age and holds the violet stripe.
-        let t0 = Instant::now();
-        let mut chorus = MusicNotes::default();
-        chorus.update(t0, true, Some(0.0), 1);
-        let mut breath = MusicNotes::default();
-        breath.update(t0, true, Some(0.0), 4);
-        let sample = |n: &MusicNotes| {
-            let mut out = Vec::new();
-            n.frames(t0 + Duration::from_millis(300), false, &mut out);
-            out[0]
-        };
-        let (c, b) = (sample(&chorus), sample(&breath));
-        assert_eq!(b.tint, NOTE_TINTS[5], "breath notes are violet");
-        assert!(
-            u32::from(b.alpha) * 10 < u32::from(c.alpha) * 8,
-            "the breath's notes render dim ({} vs {})",
-            b.alpha,
-            c.alpha
-        );
-    }
-
-    /// ACCEPTANCE 6 — the finale cadence lands and bows. A lazy release
-    /// mid-bar-6: exactly one cadence at `armed_at + 7×1.6 s`, carrying
-    /// the released key, the earned energy and span 6; the drive holds
-    /// 1.0 until cadence + 0.8 s and reads 0 by + 1.8 s; the bow rides
-    /// beat 2; the fireworks count is `min(4 + 6/2, 16) == 7`. A
-    /// three-bar performance earns nothing; Escape earns nothing.
-    #[test]
-    fn the_finale_cadence_lands_and_bows() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 'w', SING_ARM_REPEATS, 30);
-        let anchor = armed; // armed_at == the threshold press instant
-        // Hold into bar 6, stop pressing at ~beat 1.5 of it (0.6 s in).
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 6) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 'w');
-        }
-        let mut last = t;
-        while last < t + Duration::from_millis(350) {
-            last += Duration::from_millis(30);
-            d.note_char(last, S, 'w');
-        }
-        // The finger lifts: the lazy release lands mid-bar 6.
-        let due = anchor + Duration::from_secs_f32(7.0 * SING_BAR_SECONDS);
-        let energy_expect = d.arc_energy_q(last);
-        assert_eq!(
-            d.take_cadence(due - Duration::from_millis(400)),
-            None,
-            "nothing fires before due"
-        );
-        let fired = d.take_cadence(due + Duration::from_millis(16));
-        assert_eq!(
-            fired,
-            Some((song_signature('w'), energy_expect, 6)),
-            "one cadence: the released key, the earned energy, span 6"
-        );
-        assert_eq!(
-            d.take_cadence(due + Duration::from_millis(32)),
-            None,
-            "consumed exactly once"
-        );
-        // The deferred wind-down: full through the tonic, gone by +1.8 s.
-        assert_eq!(
-            d.drive(due + Duration::from_secs_f32(CADENCE_DRIVE_HOLD - 0.01)),
-            1.0,
-            "the drive holds through the cadence"
-        );
-        assert_eq!(
-            d.drive(due + Duration::from_secs_f32(CADENCE_DRIVE_HOLD + SING_WIND_DOWN + 0.01)),
-            0.0,
-            "and completes the standard smoothstep after"
-        );
-        // The bow: beat 2 of the cadence bar, down-hold-rise.
-        let bow_start = due + Duration::from_secs_f32(CADENCE_DRIVE_HOLD);
-        assert_eq!(d.bow_depth(bow_start - Duration::from_millis(50)), 0.0);
-        assert_eq!(
-            d.bow_depth(bow_start + Duration::from_secs_f32(BOW_DOWN + 0.1)),
-            1.0,
-            "full depth through the hold"
-        );
-        assert_eq!(
-            d.bow_depth(bow_start + Duration::from_secs_f32(BOW_DOWN + BOW_HOLD + BOW_RISE + 0.05)),
-            0.0,
-            "risen and done"
-        );
-        // The fireworks scale: 6 bars ⇒ 7 notes into the ring.
-        let mut notes = MusicNotes::default();
-        notes.fireworks(due, 6);
-        assert_eq!(
-            notes.ring.iter().flatten().count(),
-            7,
-            "min(4 + 6/2, 16) == 7 firework notes"
-        );
-        // Three bars: no finale.
-        let mut short = KittySing::default();
-        let armed = hold(&mut short, t0, 'w', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while short.bar(t).is_none_or(|b| b < 3) {
-            t += Duration::from_millis(30);
-            short.note_char(t, S, 'w');
-        }
-        let never = t + Duration::from_secs(10);
-        assert_eq!(
-            short.take_cadence(never),
-            None,
-            "a three-bar performance takes the plain fade"
-        );
-        // Escape: a hard break vetoes whatever the span.
-        let mut broken = KittySing::default();
-        let armed = hold(&mut broken, t0, 'w', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while broken.bar(t).is_none_or(|b| b < 6) {
-            t += Duration::from_millis(30);
-            broken.note_char(t, S, 'w');
-        }
-        broken.note_break(t + Duration::from_millis(30));
-        assert_eq!(
-            broken.take_cadence(t + Duration::from_secs(10)),
-            None,
-            "Escape means done — no ta-daa"
-        );
-    }
-
-    /// ACCEPTANCE 11 (the detector half) — the cadence is canceled by a
-    /// re-arm before due: the band was asked to keep playing. (The audio
-    /// half — typing under the cadence bar ducks at full sing-duck depth
-    /// — is the synth's existing celebration-duck law, pinned in
-    /// `trail_sound`.)
-    #[test]
-    fn a_rearm_before_due_cancels_the_cadence() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 'w', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 5) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 'w');
-        }
-        // Gentle release…
-        d.note_backspace(t + Duration::from_millis(30));
-        assert!(
-            d.cadence.is_some(),
-            "the backspace release planned a finale"
-        );
-        // …but the player comes back before the downbeat: three reps
-        // inside the live glow re-arm (the forgiveness law) and cancel.
-        let mut back = t + Duration::from_millis(200);
-        for _ in 0..KEY_SWITCH_REPS {
-            d.note_char(back, S, 'w');
-            back += Duration::from_millis(30);
-        }
-        assert!(d.is_armed(back), "re-armed inside the glow");
-        assert_eq!(
-            d.take_cadence(back + Duration::from_secs(5)),
-            None,
-            "the canceled cadence never fires"
-        );
-    }
-
-    /// The BACKSPACE is the GENTLE release (the spec's owner-ratified
-    /// reading): it plans the same finale the lazy lift does — only the
-    /// break keys and proven typing are hard.
-    #[test]
-    fn backspace_earns_the_finale_too() {
-        let t0 = Instant::now();
-        let mut d = KittySing::default();
-        let armed = hold(&mut d, t0, 'w', SING_ARM_REPEATS, 30);
-        let mut t = armed;
-        while d.bar(t).is_none_or(|b| b < 4) {
-            t += Duration::from_millis(30);
-            d.note_char(t, S, 'w');
-        }
-        d.note_backspace(t + Duration::from_millis(30));
-        let plan = d.cadence.expect("planned");
-        assert_eq!(plan.sig, song_signature('w'));
-        assert!(!plan.fired);
-        assert_eq!(plan.span_bars, 4);
     }
 }

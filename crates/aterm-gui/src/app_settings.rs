@@ -1036,6 +1036,9 @@ impl App {
         key: &'static str,
         val: Option<String>,
     ) -> String {
+        // THE TYPING-SOUND AUDITION rides every commit gesture on its row
+        // (before the "unchanged" early return below — see the fn).
+        self.settings_commit_audition(key, val.as_deref());
         // Already the stored raw value → skip the writer outright. This is what makes
         // committing a preserved CUSTOM entry a true no-op: an unrecognized enum
         // spelling would otherwise be domain-REJECTED by the writer even though it is
@@ -1102,6 +1105,79 @@ impl App {
         }
         self.overlay_a11y_update();
         status
+    }
+
+    /// The commit-time half of the typing-sound audition: every commit
+    /// gesture on the "Typing sound" row — Enter on the highlighted entry, a
+    /// popup pick, a ←/→ step — auditions the committed voice
+    /// UNCONDITIONALLY, the "unchanged" case included: Enter on the current
+    /// voice is "play it again", and scrubbing the list with ←/→ auditions
+    /// each voice as it goes by. A cleared value is the default, `auto`; an
+    /// unparseable one (a preserved custom entry) is what the runtime would
+    /// play for it — `auto` too. Split from [`Self::settings_commit_value`]
+    /// so the hook is provable without touching the on-disk config.
+    fn settings_commit_audition(&mut self, key: &str, val: Option<&str>) {
+        if key != crate::prefs::EDIT_TRAIL_SOUND_STYLE {
+            return;
+        }
+        let voice = val
+            .and_then(aterm_effects::trail_sound::SoundVoice::parse)
+            .unwrap_or_default();
+        self.audition_typing_sound(voice);
+    }
+
+    /// The reload-time half of the typing-sound audition, decided BEFORE a
+    /// config swap against the latch: a native-window pick or a hand edit
+    /// that CHANGES the voice returns it for one audition after the swap;
+    /// the in-app row already auditioned at commit time and latched the same
+    /// voice, so its own reload is silent; startup never reaches the swap.
+    /// Pure over `(next config, latch)` so the dedupe law is provable.
+    pub(crate) fn typing_sound_to_audition_on_swap(
+        &self,
+        next: &crate::app_config::Config,
+    ) -> Option<aterm_effects::trail_sound::SoundVoice> {
+        let next_voice = next.trail_sound_voice();
+        (next_voice != self.typing_sound_auditioned).then_some(next_voice)
+    }
+
+    /// THE TYPING-SOUND AUDITION — "picking a voice plays one keystroke of
+    /// it, so you choose by ear." One [`aterm_effects::trail_sound::SoundKind::Typed`]
+    /// cue in `voice`, exactly as the loudness ladder measures a keystroke
+    /// (`mix_meter`'s stance: pan 0, heat 0.5, hue 0, `Tone::Technical`, no
+    /// bed) at the user's volume, riding the current trail look (which only
+    /// matters under `auto`, where the audition IS today's sound). Gated by
+    /// the SAME predicate the key-time click uses
+    /// ([`crate::app_input::keystroke_click_audible`]): a live audio host, the
+    /// "Music effects" master, a non-zero volume, and serious mode allowing
+    /// terminal sound — so the preview can never speak where a keystroke
+    /// could not. Latches `typing_sound_auditioned` either way, so the config
+    /// reload that follows an in-app commit does not play the voice twice.
+    pub(crate) fn audition_typing_sound(&mut self, voice: aterm_effects::trail_sound::SoundVoice) {
+        use aterm_effects::trail_sound::{SoundEvent, SoundGesture, SoundKind};
+        self.typing_sound_auditioned = voice;
+        let volume = self.config.trail_sound_volume();
+        let audible = crate::app_input::keystroke_click_audible(
+            self.trail_audio.is_live(),
+            self.config.trail_sounds_or_default(),
+            volume,
+            self.serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::TerminalSound),
+            false,
+        );
+        if !audible {
+            return;
+        }
+        self.trail_audio.push(SoundEvent {
+            style: self.glow_style(),
+            voice,
+            kind: SoundGesture::Trail(SoundKind::Typed),
+            pan: 0.0,
+            heat: 0.5,
+            hue: 0.0,
+            gain: volume,
+            tone: aterm_effects::tone::Tone::Technical,
+            bed: false,
+        });
     }
 
     /// The live [`crate::settings::SettingsGeom`] of the front window's settings card —
@@ -1731,6 +1807,8 @@ mod tests {
     use crate::native_app::{ActionInvocation, AppEffect, AppEvent, SemanticInput};
     use crate::native_ui::ActionId;
     use crate::settings::{canonical_hex, u32_rgb};
+    use aterm_effects::cursor_glow::GlowStyle;
+    use aterm_effects::trail_sound::{SoundGesture, SoundKind, SoundVoice};
 
     #[derive(Clone, Copy, Debug)]
     enum CursorDependent {
@@ -2536,6 +2614,134 @@ mod tests {
         app.settings_select(idx);
         app.settings_wheel_open();
         assert_eq!(wheel_hex(&app), canonical_hex(u32_rgb(app.theme.fg)));
+    }
+
+    // -- the typing-sound audition ----------------------------------------
+
+    /// One captured cue's `(voice, kind, gain)`.
+    fn captured_typed(app: &mut App) -> Vec<(SoundVoice, f32)> {
+        app.trail_audio
+            .take_captured_for_test()
+            .into_iter()
+            .map(|e| {
+                assert_eq!(
+                    e.kind,
+                    SoundGesture::Trail(SoundKind::Typed),
+                    "an audition is one keystroke, nothing else"
+                );
+                assert!(!e.bed, "the audition never feeds the bed");
+                assert_eq!(e.pan, 0.0);
+                (e.voice, e.gain)
+            })
+            .collect()
+    }
+
+    fn app_with_capture() -> App {
+        let mut app = App::headless_for_test();
+        app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+        app
+    }
+
+    /// Committing the "Typing sound" row plays EXACTLY ONE keystroke of the
+    /// committed voice at the user's volume — for a picker pick, and again
+    /// for the same value (Enter on the current entry is "play it again"),
+    /// and again per ←/→ step; a cleared value auditions `auto`. Other rows
+    /// audition nothing.
+    #[test]
+    fn committing_the_typing_sound_row_auditions_one_keystroke() {
+        let mut app = app_with_capture();
+        app.config.trail_sound_volume = Some(0.25);
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("glass bell"));
+        assert_eq!(
+            captured_typed(&mut app),
+            vec![(SoundVoice::Of(GlowStyle::RainbowKitty), 0.25)]
+        );
+        // "Play it again": the same value auditions again.
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("glass bell"));
+        assert_eq!(captured_typed(&mut app).len(), 1);
+        // Scrubbing: each step auditions the voice it lands on (aliases too).
+        for (raw, voice) in [
+            ("typewriter", SoundVoice::Typewriter),
+            ("Marimba", SoundVoice::Marimba),
+            ("water", SoundVoice::Of(GlowStyle::Water)),
+            ("felt", SoundVoice::Felt),
+        ] {
+            app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some(raw));
+            assert_eq!(captured_typed(&mut app), vec![(voice, 0.25)], "{raw}");
+        }
+        // Cleared = the default = auto; a preserved custom entry plays what
+        // the runtime would play for it, auto.
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, None);
+        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Style, 0.25)]);
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("kazoo"));
+        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Style, 0.25)]);
+        // Any other row is silent.
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_VOLUME, Some("0.5"));
+        app.settings_commit_audition(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water"));
+        assert!(captured_typed(&mut app).is_empty());
+    }
+
+    /// The audition is gated exactly like a keystroke: the "Music effects"
+    /// master off, a zero volume, or serious mode ⇒ nothing is pushed (the
+    /// latch still moves, so no later reload plays it either).
+    #[test]
+    fn the_audition_is_gated_like_a_keystroke() {
+        let mut app = app_with_capture();
+        app.config.trail_sounds = Some(false);
+        app.audition_typing_sound(SoundVoice::Marimba);
+        assert!(captured_typed(&mut app).is_empty(), "master off");
+        assert_eq!(app.typing_sound_auditioned, SoundVoice::Marimba);
+        app.config.trail_sounds = Some(true);
+        app.config.trail_sound_volume = Some(0.0);
+        app.audition_typing_sound(SoundVoice::Felt);
+        assert!(captured_typed(&mut app).is_empty(), "muted");
+        app.config.trail_sound_volume = Some(0.4);
+        app.serious_mode = true;
+        app.audition_typing_sound(SoundVoice::Typewriter);
+        assert!(captured_typed(&mut app).is_empty(), "serious mode");
+        app.serious_mode = false;
+        app.audition_typing_sound(SoundVoice::Typewriter);
+        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Typewriter, 0.4)]);
+        // An inert host (no audio backend / headless): silent.
+        app.trail_audio = crate::trail_audio::TrailAudio::new(false);
+        app.audition_typing_sound(SoundVoice::Mech);
+        assert_eq!(app.typing_sound_auditioned, SoundVoice::Mech);
+    }
+
+    /// The reload path auditions a CHANGED voice once, an unchanged one
+    /// never, and the in-app commit followed by its own reload plays ONE
+    /// keystroke in total (the latch dedupes).
+    #[test]
+    fn a_config_swap_auditions_only_a_changed_voice_and_never_twice() {
+        let mut app = app_with_capture();
+        let mut next = app.config.clone();
+        // Startup voice (auto) → an unchanged reload: silent.
+        assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
+        // A hand edit / native pick that CHANGES the voice: one audition.
+        next.trail_sound_style = Some("droplet".into());
+        assert_eq!(
+            app.typing_sound_to_audition_on_swap(&next),
+            Some(SoundVoice::Of(GlowStyle::Water))
+        );
+        // …and the swap latches it, so re-applying the same config is silent.
+        app.audition_typing_sound(SoundVoice::Of(GlowStyle::Water));
+        assert_eq!(captured_typed(&mut app).len(), 1);
+        assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
+        // Aliases dedupe by VOICE, not spelling: `water` is still droplet.
+        next.trail_sound_style = Some(" Water ".into());
+        assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
+        // THE PAIR: in-app commit (auditions + latches) then its own reload.
+        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("marimba"));
+        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Marimba, 0.4)]);
+        next.trail_sound_style = Some("marimba".into());
+        assert_eq!(
+            app.typing_sound_to_audition_on_swap(&next),
+            None,
+            "the commit's own reload must not play the voice a second time"
+        );
+        // Clearing the key back to auto from a file edit auditions auto once.
+        next.trail_sound_style = None;
+        assert_eq!(app.typing_sound_to_audition_on_swap(&next), Some(SoundVoice::Style));
     }
 
     /// PERF/CONTRACT: `push_a11y_tree` builds the whole visible-screen tree eagerly and only

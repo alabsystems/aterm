@@ -30,6 +30,8 @@ use crate::app_config::{
     MIN_TAB_STATUS_QUIET_AFTER_MS, MIN_TITLE_SUMMARY_CONTEXT_LINES,
     MIN_TITLE_SUMMARY_INTERVAL_SECONDS, MIN_TITLE_SUMMARY_TIMEOUT_SECONDS,
 };
+use aterm_effects::cursor_glow::GlowStyle;
+use aterm_effects::trail_sound::SoundVoice;
 
 /// The TOML keys the settings model edits, paired with how each should be TYPED
 /// when written back ([`apply_prefs_edits`]). The order matches the on-screen row order
@@ -77,10 +79,12 @@ pub(crate) const EDIT_ROBI: &str = "robi";
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
 /// (zero bed samples — the notes, brrrring, bonk and melody are untouched).
 pub(crate) const EDIT_TRAIL_SOUND_BED: &str = "trail_sound_bed";
-/// Typing-sound palette selector (`Config::trail_sound_style`, default
-/// `auto`): `auto` follows the visual trail style's signature palette;
-/// `mechanical` swaps every keystroke to the mechanical-keyboard palette
-/// (switch click + case thock) whatever the trail looks like.
+/// Typing-sound picker (`Config::trail_sound_style`, default `auto`): `auto`
+/// follows the visual trail style's signature palette; every other value
+/// ([`TRAIL_SOUND_STYLES`]) names an instrument — one of the nine palettes by
+/// what it sounds like (`glass bell`, `droplet`, …), the `mechanical`
+/// keyboard, or a sound-only voice (`typewriter`, `marimba`, `felt`) —
+/// spoken by every keystroke whatever the trail looks like.
 pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
 /// SING-ALONG RIFF toggle (`Config::trail_sound_riff`, default ON).
 ///
@@ -1113,17 +1117,54 @@ pub(crate) const CURSOR_TRAIL_STYLES: &[&str] = &[
     "off",
 ];
 
-/// `trail_sound_style` options — the typing-sound palette selector. Same
-/// single-source-of-truth law as [`CURSOR_TRAIL_STYLES`]: the picker, the
-/// save-time domain validation and the introspection dump all read this.
-/// `auto` = each visual style's signature palette (the default, today's
-/// sound); `mechanical` = the mechanical-keyboard palette (click + thock)
-/// regardless of the trail. Config-file alias spellings (`mech`, `thock`,
-/// `mechanical keyboard`) resolve in `Config::trail_sound_voice`.
-pub(crate) const TRAIL_SOUND_STYLES: &[&str] = &["auto", "mechanical"];
+/// `trail_sound_style` options — THE TYPING-SOUND PICKER (Settings ▸ Sound ▸
+/// "Typing sound"). Same single-source-of-truth law as
+/// [`CURSOR_TRAIL_STYLES`]: the picker, the save-time domain validation, the
+/// a11y option list and the introspection dump all read this — and the
+/// strings themselves are spelled ONCE, in the synth
+/// ([`aterm_effects::trail_sound::SoundVoice::name`]); this list is built
+/// from the roster ([`SoundVoice::ALL`]) in picker order, so a voice cannot
+/// join the synth without joining the picker (`trail_sound_styles_are_the_
+/// synth_roster` pins the bijection).
+///
+/// `auto` = follow the visual trail's own palette (the default, today's
+/// sound bit for bit); the next nine are the shipped palettes selectable by
+/// what they SOUND like whatever the trail looks like (`glass bell` = the
+/// rainbow kitty's bell, `droplet` = water's plip, …); `mechanical` is the
+/// keyboard; `typewriter` / `marimba` / `felt` are the sound-only
+/// instruments. Alias spellings (the trail-style names, `mech`, `thock`, …)
+/// resolve through [`trail_sound_style_canonical`] /
+/// `Config::trail_sound_voice` — accepted on load, never offered.
+pub(crate) const TRAIL_SOUND_STYLES: &[&str] = &[
+    SoundVoice::Style.name(),
+    SoundVoice::Of(GlowStyle::RainbowKitty).name(),
+    SoundVoice::Of(GlowStyle::Lumen).name(),
+    SoundVoice::Of(GlowStyle::Sparkle).name(),
+    SoundVoice::Of(GlowStyle::Comet).name(),
+    SoundVoice::Of(GlowStyle::Water).name(),
+    SoundVoice::Of(GlowStyle::Phaser).name(),
+    SoundVoice::Of(GlowStyle::Laser).name(),
+    SoundVoice::Of(GlowStyle::Beam).name(),
+    SoundVoice::Of(GlowStyle::Fire).name(),
+    SoundVoice::Mech.name(),
+    SoundVoice::Typewriter.name(),
+    SoundVoice::Marimba.name(),
+    SoundVoice::Felt.name(),
+];
 
 /// Default `trail_sound_style` (the `auto` follow-the-trail identity).
-pub(crate) const DEFAULT_TRAIL_SOUND_STYLE: &str = "auto";
+pub(crate) const DEFAULT_TRAIL_SOUND_STYLE: &str = SoundVoice::Style.name();
+
+/// Resolve a `trail_sound_style` spelling (canonical or documented alias,
+/// case-insensitive, whitespace-tolerant) to its canonical picker option, or
+/// `None` for a spelling the runtime would silently play as `auto` — the
+/// case the validator flags and the Settings row must not mistake for a
+/// custom entry. The [`cursor_trail_style_canonical`] twin, answered by the
+/// synth's own parser so the UI, the validator and the engine share one
+/// vocabulary.
+pub(crate) fn trail_sound_style_canonical(token: &str) -> Option<&'static str> {
+    SoundVoice::parse(token).map(SoundVoice::name)
+}
 
 /// The Settings picker's option list for `cursor_trail_style`: the built-in
 /// [`CURSOR_TRAIL_STYLES`] plus one `pack:<id>` entry per LOADED Trail Pack
@@ -2918,6 +2959,16 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "typing",
             "sound",
             "audio",
+            "bell",
+            "glass",
+            "typewriter",
+            "marimba",
+            "felt",
+            "piano",
+            "wood",
+            "droplet",
+            "voice",
+            "instrument",
         ],
         EDIT_CURSOR_NYAN_SPRITE => &[
             "kitty", "rainbow", "nyan", "cat", "sprite", "image", "png", "trail",
@@ -3644,11 +3695,14 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // WHICH palette the keystrokes speak with: `auto` follows the
-            // visual trail style's signature palette (today's sound);
-            // `mechanical` swaps every key to the mechanical-keyboard
-            // palette — switch click + case thock — whatever the trail
-            // looks like. Volume/on-off/bed gates apply unchanged.
+            // WHICH instrument the keystrokes speak with: `auto` follows the
+            // visual trail style's signature palette (today's sound); every
+            // other option is a voice of its own — the nine palettes by
+            // sound (`glass bell`, `droplet`, …), the `mechanical` keyboard,
+            // `typewriter` / `marimba` / `felt` — spoken whatever the trail
+            // looks like. Volume/on-off/bed gates apply unchanged; picking a
+            // voice auditions one keystroke of it (`App::audition_typing_
+            // sound`).
             label: "Typing sound",
             key: EDIT_TRAIL_SOUND_STYLE,
             kind: EditKind::Enum {
@@ -4764,8 +4818,13 @@ fn commit_prefs_bytes(
 /// semantics are proven here without a GUI.
 #[cfg(test)]
 mod trail_style_tests {
-    use super::CURSOR_TRAIL_STYLES;
+    use super::{CURSOR_TRAIL_STYLES, Config, apply_prefs_edits};
     use crate::cursor_glow::GlowStyle;
+
+    /// `Some(v)` helper to keep the edit lists terse.
+    fn set(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
 
     /// C5: the documented "single source" claim — every `CURSOR_TRAIL_STYLES`
     /// entry (the picker/cycler domain) is classified by `GlowStyle::parse`, and the
@@ -4953,6 +5012,101 @@ mod trail_style_tests {
         // …and a genuinely unknown spelling is refused (the validator's arm).
         assert_eq!(super::cursor_trail_style_canonical("plasma"), None);
         assert_eq!(super::cursor_trail_style_canonical(""), None);
+    }
+
+    /// THE TYPING-SOUND PICKER IS THE SYNTH'S ROSTER: `TRAIL_SOUND_STYLES` is
+    /// exactly `SoundVoice::ALL` by name, in order (a bijection — no voice
+    /// missing from the picker, no picker row without a voice), `auto` leads
+    /// and is the default, and every spelling is the lowercase-words form the
+    /// `cursor_trail_style` convention uses.
+    #[test]
+    fn trail_sound_styles_are_the_synth_roster() {
+        use aterm_effects::trail_sound::SoundVoice;
+        let names: Vec<&str> = SoundVoice::ALL.iter().map(|v| v.name()).collect();
+        assert_eq!(super::TRAIL_SOUND_STYLES, names.as_slice());
+        assert_eq!(super::TRAIL_SOUND_STYLES[0], "auto");
+        assert_eq!(super::DEFAULT_TRAIL_SOUND_STYLE, "auto");
+        assert_eq!(super::TRAIL_SOUND_STYLES.len(), 14);
+        for &o in super::TRAIL_SOUND_STYLES {
+            assert!(o.chars().all(|c| c.is_ascii_lowercase() || c == ' '), "{o:?}");
+        }
+        assert!(super::TRAIL_SOUND_STYLES.contains(&"glass bell"));
+        assert!(super::TRAIL_SOUND_STYLES.contains(&"typewriter"));
+        assert!(super::TRAIL_SOUND_STYLES.contains(&"marimba"));
+        assert!(super::TRAIL_SOUND_STYLES.contains(&"felt"));
+        assert!(
+            !super::TRAIL_SOUND_STYLES.contains(&"off"),
+            "no second off: `trail_sounds = false` already is off"
+        );
+        match super::edit_kind(super::EDIT_TRAIL_SOUND_STYLE) {
+            super::EditKind::Enum { options } => assert_eq!(options, super::TRAIL_SOUND_STYLES),
+            other => panic!("trail_sound_style should be Enum, got {other:?}"),
+        }
+    }
+
+    /// The typing-sound resolver: canonical spellings resolve to themselves
+    /// (case- and whitespace-insensitively), every documented synth alias
+    /// projects onto its canonical row, and an unknown spelling is refused —
+    /// while the WRITER accepts only canonical spellings (aliases are load-
+    /// only, exactly as for `cursor_trail_style`) and the loader
+    /// (`Config::trail_sound_voice`) accepts both and falls back to `auto`.
+    #[test]
+    fn trail_sound_style_canonical_resolves_aliases_and_the_loader_agrees() {
+        use aterm_effects::cursor_glow::GlowStyle;
+        use aterm_effects::trail_sound::SoundVoice;
+        for &s in super::TRAIL_SOUND_STYLES {
+            assert_eq!(super::trail_sound_style_canonical(s), Some(s));
+            assert_eq!(
+                super::trail_sound_style_canonical(&format!(" {} ", s.to_ascii_uppercase())),
+                Some(s)
+            );
+        }
+        for &(alias, voice) in SoundVoice::ALIASES {
+            assert_eq!(super::trail_sound_style_canonical(alias), Some(voice.name()), "{alias}");
+            // Aliases are accepted at LOAD…
+            let cfg = Config {
+                trail_sound_style: Some(alias.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(cfg.trail_sound_voice(), voice, "loader: {alias}");
+            // …and REJECTED by the writer (never offered, never persisted).
+            if !super::TRAIL_SOUND_STYLES.contains(&alias) {
+                assert!(
+                    apply_prefs_edits("", &[(super::EDIT_TRAIL_SOUND_STYLE, set(alias))]).is_err(),
+                    "writer must refuse alias {alias:?}"
+                );
+            }
+        }
+        for (raw, voice) in [
+            ("mech", SoundVoice::Mech),
+            ("mechanical", SoundVoice::Mech),
+            ("water", SoundVoice::Of(GlowStyle::Water)),
+            ("Glass Bell", SoundVoice::Of(GlowStyle::RainbowKitty)),
+            ("  felt ", SoundVoice::Felt),
+            ("auto", SoundVoice::Style),
+            ("garbage", SoundVoice::Style),
+            ("", SoundVoice::Style),
+        ] {
+            let cfg = Config {
+                trail_sound_style: Some(raw.to_string()),
+                ..Config::default()
+            };
+            assert_eq!(cfg.trail_sound_voice(), voice, "{raw:?}");
+        }
+        assert_eq!(Config::default().trail_sound_voice(), SoundVoice::Style);
+        assert_eq!(super::trail_sound_style_canonical("kazoo"), None);
+        assert_eq!(super::trail_sound_style_canonical(""), None);
+        // The writer takes every canonical spelling verbatim (case-folded).
+        for &o in super::TRAIL_SOUND_STYLES {
+            let out = apply_prefs_edits("", &[(super::EDIT_TRAIL_SOUND_STYLE, set(o))]).unwrap();
+            assert!(out.contains(&format!("trail_sound_style = \"{o}\"")), "{out}");
+            let up = apply_prefs_edits(
+                "",
+                &[(super::EDIT_TRAIL_SOUND_STYLE, set(&o.to_ascii_uppercase()))],
+            )
+            .unwrap();
+            assert!(up.contains(&format!("trail_sound_style = \"{o}\"")), "{up}");
+        }
     }
 
     /// The picker's dynamic option resolver lists the built-ins verbatim, then
@@ -6201,11 +6355,12 @@ listen = \"127.0.0.1:7777\" # local only
     /// spelling the config loader accepts — the loader mappings are tested in app_config).
     #[test]
     fn enum_domain_keys_classify_and_round_trip_canonical() {
-        let cases: [(&str, &[&str]); 4] = [
+        let cases: [(&str, &[&str]); 5] = [
             (EDIT_CURSOR_STYLE, super::CURSOR_STYLES),
             (super::EDIT_WINDOW_THEME, super::WINDOW_THEMES),
             (super::EDIT_BIDI, super::BIDI_MODES),
             (super::EDIT_AMBIGUOUS_WIDTH, super::AMBIGUOUS_WIDTHS),
+            (super::EDIT_TRAIL_SOUND_STYLE, super::TRAIL_SOUND_STYLES),
         ];
         for (key, opts) in cases {
             match super::edit_kind(key) {

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! INSTRUMENT AUDITION — evidence for EARS (the audio twin of the house
-//! verify-UX-with-pixels law). Renders the SONG-BUILDER instrument's core
+//! verify-UX-with-pixels law). Renders the sing-along celebration's core
 //! moments end-to-end — real [`KittySing`] detector fed a scripted press
 //! stream, real host-style bar latch, real [`TrailSynth`] — into
 //! double-clickable WAVs, so the owner auditions the voicing and the merge
@@ -12,16 +12,16 @@
 //!   afplay <out_dir>/hold-t.wav
 //!
 //! Scenarios:
-//! - `hold-t`      — one consonant held ~11 s: the verse build, bar 0 to the
-//!   clap. THE TIMBRE BENCH: render this before and after a voicing change
-//!   for the horn-vs-bell A/B.
-//! - `hold-e`      — one vowel held: the chorus class (the brilliant strike, the lift).
-//! - `switch-t-e`  — five verse bars banked on 't', then the hold slides to
-//!   'e': THE MERGE BENCH — energy inheritance + the announced fill (when
-//!   the build carries it) + ringing tails across the boundary.
-//! - `performance` — a ~30 s three-key arc: verse build → chorus cash-in →
-//!   a percussive turn → a breath → the final chorus, then release (the
-//!   finale rides once phase 3 lands).
+//! - `hold-t`      — one key held ~11 s: its verse, bar 0 through the build
+//!   to the clap. THE TIMBRE BENCH: render this before and after a voicing
+//!   change for the A/B.
+//! - `hold-e`      — a different key held: a different verse of the same
+//!   celebration.
+//! - `switch-t-e`  — five bars on 't', then the hold slides to 'e': THE
+//!   MERGE BENCH — the seamless modulation at the next bar boundary,
+//!   ringing tails across it.
+//! - `performance` — a ~30 s multi-key medley, ending in the plain
+//!   graceful wind-down.
 //!
 //! Deterministic: fixed seed, fixed press script, the pinned 150 BPM grid.
 
@@ -59,9 +59,8 @@ fn hold(from: f32, to: f32, ch: char, out: &mut Vec<Press>) {
 
 /// THE HOST SIM: feed the press script through a real [`KittySing`] and run
 /// `app_render`'s exact once-per-new-bar latch at ~60 Hz, collecting the
-/// riff payloads (and, as later phases land, the fill/cadence cues) with
-/// their frame times. This is the same data path the GUI speaks — the WAV
-/// is the shipping instrument, not a mock of it.
+/// riff payloads with their frame times. This is the same data path the GUI
+/// speaks — the WAV is the shipping instrument, not a mock of it.
 fn host_cues(presses: &[Press], seconds: f32) -> Vec<Cue> {
     let t0 = Instant::now(); // never awaited — pure arithmetic below
     let mut sing = KittySing::default();
@@ -80,38 +79,12 @@ fn host_cues(presses: &[Press], seconds: f32) -> Vec<Cue> {
                 latch = Some(bar);
                 cues.push((
                     clock,
-                    CelebrationGesture::riff_bar_arc(
-                        (bar & 0xffff) as u16,
-                        sing.signature(),
-                        sing.section_class_now(),
-                        sing.arc_energy_q(now),
-                    ),
+                    CelebrationGesture::riff_bar((bar & 0xffff) as u16, sing.signature()),
                 ));
             }
         } else if sing.drive(now) <= 0.0 {
             sing.settle(now);
             latch = None;
-        }
-        // The announced switch — the host's fill-cue drain, verbatim.
-        if let Some((old_sig, new_sig)) = sing.take_fill_cue() {
-            cues.push((
-                clock,
-                CelebrationGesture::RiffFillCue {
-                    sig: old_sig,
-                    sig_next: new_sig,
-                },
-            ));
-        }
-        // The finale — the host's cadence drain, verbatim.
-        if let Some((sig, energy_q, span_bars)) = sing.take_cadence(now) {
-            cues.push((
-                clock,
-                CelebrationGesture::RiffCadence {
-                    sig,
-                    energy_q,
-                    span_bars,
-                },
-            ));
         }
         clock += 1.0 / 60.0;
     }
@@ -196,7 +169,7 @@ fn main() {
         );
     }
 
-    // switch-t-e: five 't' bars banked, slide to 'e', four more bars.
+    // switch-t-e: five 't' bars, slide to 'e', four more bars.
     {
         let mut presses = Vec::new();
         hold(0.0, 8.6, 't', &mut presses); // arm ~0.5 s + 5 bars
@@ -211,9 +184,8 @@ fn main() {
         );
     }
 
-    // performance: verse build -> chorus cash-in -> percussive -> breath ->
-    // final chorus, release. (~27 s of holding; the finale tail follows
-    // once phase 3 lands.)
+    // performance: a multi-key medley — each key a verse of the one
+    // celebration — then release into the plain graceful wind-down.
     {
         let mut presses = Vec::new();
         hold(0.0, 7.0, 't', &mut presses);

@@ -191,14 +191,29 @@ impl ComplexCharRing {
     }
 
     /// Clear a `[left, right]` column span on one external row.
+    ///
+    /// Every column of one row shares a single `ring_row`, so the touched flat
+    /// indices are contiguous and a single `fill('\0')` (a memset — the value is
+    /// all-zero bytes) replaces the per-column `get_mut`. The all-or-nothing
+    /// `<= entries.len()` guard is exactly equivalent to the old per-element
+    /// bounds checks: `entries` is `vec!['\0'; visible_rows * cols]` in `new`
+    /// and `stride`/`visible_rows` are never reassigned, so `entries.len() ==
+    /// visible_rows * stride`; with `end <= stride`, `ring_row < visible_rows`
+    /// makes `base + end <= len` (guard always passes, same indices), and
+    /// `ring_row >= visible_rows` makes `base >= len` (old loop stored nothing
+    /// either). A PARTIAL clear is therefore unreachable — a future
+    /// resize-in-place of the ring would have to revisit this.
     #[inline]
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16) {
+        // Clamp exactly like the old `right_excl.min(self.stride)` range bound.
+        let end = right_excl.min(self.stride);
+        if left >= end {
+            return;
+        }
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
-        for col in left..right_excl.min(self.stride) {
-            let idx = base + col as usize;
-            if let Some(e) = self.entries.get_mut(idx) {
-                *e = '\0';
-            }
+        let (lo, hi) = (base + left as usize, base + end as usize);
+        if hi <= self.entries.len() {
+            self.entries[lo..hi].fill('\0');
         }
     }
 
@@ -645,24 +660,47 @@ impl RgbColorRing {
     /// Used by erase operations to remove stale truecolor data when cells
     /// are cleared. Without this, erased cells retain ring-buffer RGB values
     /// that shadow the cell's actual (default) colors (#7697).
+    ///
+    /// One `fill(0)` per plane, byte-identical to the old per-column loop and
+    /// mirroring `clear_row`/`fill_fg_run`: every column of one row shares a
+    /// single `ring_row`, so the touched flat indices are contiguous and the
+    /// per-column `index()` re-derivation (wrapping add, compare, conditional
+    /// subtract, imul) is hoisted to one `ring_row` call. EL-0/EL-1/ECH run this
+    /// once per erase over up to `cols` columns, so the scalar loop was a real
+    /// term next to the memset-class row clear it accompanies.
+    ///
+    /// The all-or-nothing `hi <= plane.len()` guard is exactly equivalent to the
+    /// old per-element `get_mut` checks: `stride`/`visible_rows` are written once
+    /// in `new` and never reassigned (resize drops the whole ring via
+    /// `invalidate_rings`), and each plane is allocated once as
+    /// `vec![0u32; capacity()].into_boxed_slice()`, with
+    /// `capacity() == visible_rows * stride`. So with `end <= stride`:
+    /// `ring_row < visible_rows` ⇒ `base + end <= len` (guard passes, identical
+    /// indices), and `ring_row >= visible_rows` ⇒ `base >= len` (the old loop
+    /// stored nothing either). A PARTIAL clear is unreachable — a future
+    /// resize-in-place of the ring would have to revisit this.
     #[inline]
     pub(crate) fn clear_range(&mut self, row: u16, start_col: u16, end_col: u16) {
-        for col in start_col..end_col {
-            if col >= self.stride {
-                break;
-            }
-            let idx = self.index(row, col);
-            // Clearing an absent plane is a no-op (already all-zero).
-            if let Some(fg) = self.fg.as_deref_mut()
-                && let Some(entry) = fg.get_mut(idx)
-            {
-                *entry = 0;
-            }
-            if let Some(bg) = self.bg.as_deref_mut()
-                && let Some(entry) = bg.get_mut(idx)
-            {
-                *entry = 0;
-            }
+        // Clamp exactly like the old per-column `col >= self.stride` break.
+        let end = end_col.min(self.stride);
+        if start_col >= end {
+            return;
+        }
+        // Both computed BEFORE the plane borrow (they read `self`).
+        let base = (self.ring_row(row) as usize) * (self.stride as usize);
+        let (lo, hi) = (base + start_col as usize, base + end as usize);
+        // Clearing an absent plane is a no-op (already all-zero) — `as_deref_mut`,
+        // never `fg_mut()`/`bg_mut()`, which would allocate a `capacity * 4 B`
+        // plane on every EL of an uncoloured screen.
+        if let Some(fg) = self.fg.as_deref_mut()
+            && hi <= fg.len()
+        {
+            fg[lo..hi].fill(0);
+        }
+        if let Some(bg) = self.bg.as_deref_mut()
+            && hi <= bg.len()
+        {
+            bg[lo..hi].fill(0);
         }
     }
 
@@ -1055,6 +1093,23 @@ pub struct CellExtras {
     /// Allocated on first RGB-only extras write. Bypasses HashMap for cells
     /// whose only extra is fg/bg RGB color (~15ns → ~2ns per cell).
     rgb_ring: Option<Box<RgbColorRing>>,
+    /// Resident scratch for [`Self::enforce_hyperlink_limit_cold`]'s candidate
+    /// walk. Always empty between calls — it exists only to carry CAPACITY.
+    ///
+    /// That cold path runs once per written OSC 8 run and after every row
+    /// shift, and it used to `collect()` a fresh `Vec<CellCoord>` on every
+    /// call. Measured on `hyperlink_screen/mixed_extras_under_limit` (a map of
+    /// 14_600 entries holding only 600 hyperlinks, i.e. over the map guard but
+    /// far under the hyperlink budget): 1_835 such allocations per MiB, every
+    /// one of them freed without a single entry being evicted.
+    ///
+    /// Capacity is retained rather than shrunk, deliberately: the grids that
+    /// grow it past a few hundred coords are exactly the ones holding >10_000
+    /// hyperlink entries in `data`, where the map itself is an order of
+    /// magnitude larger than this buffer's worst case (~40 KiB). Shrinking it
+    /// would just reintroduce the churn on the eviction path, which is the one
+    /// path that refills it every time.
+    hyperlink_scratch: Vec<CellCoord>,
 }
 
 impl CellExtras {
@@ -1067,6 +1122,9 @@ impl CellExtras {
             row_offset: 0,
             complex_ring: None,
             rgb_ring: None,
+            // Unallocated until the hyperlink cold path first runs; a grid that
+            // never sees an OSC 8 link never pays a byte for it.
+            hyperlink_scratch: Vec::new(),
         }
     }
 
@@ -1664,6 +1722,21 @@ impl CellExtras {
             return;
         }
 
+        // Build the shared (url, id) payload ONCE for the whole run. Previously
+        // every covered cell ran `set_hyperlink` on a freshly-defaulted entry,
+        // which did its own `HyperlinkData` heap allocation plus a second atomic
+        // refcount bump for the id — N mallocs and 2N atomic RMWs to store one
+        // immutable pair. The value written per cell is byte-identical: the old
+        // pair was `set_hyperlink(url)` (which clears any stale id) followed by
+        // `set_hyperlink_id(id)`, i.e. exactly `{url, id}`. Cells that later edit
+        // their link individually copy-on-write inside `CellExtra`.
+        let hyperlink = vals.hyperlink.map(|url| {
+            Arc::new(crate::extra::HyperlinkData {
+                url: Arc::clone(url),
+                id: vals.hyperlink_id.cloned(),
+            })
+        });
+
         let internal_row = self.internal_row(row);
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
@@ -1680,11 +1753,8 @@ impl CellExtras {
             if vals.extended_flags != 0 {
                 extra.set_extended_flags(vals.extended_flags);
             }
-            if let Some(url) = vals.hyperlink {
-                extra.set_hyperlink(Some(std::sync::Arc::clone(url)));
-                if let Some(hid) = vals.hyperlink_id {
-                    extra.set_hyperlink_id(Some(std::sync::Arc::clone(hid)));
-                }
+            if let Some(data) = &hyperlink {
+                extra.set_hyperlink_data(Some(Arc::clone(data)));
             }
         }
 
@@ -2048,32 +2118,52 @@ impl CellExtras {
     #[inline(never)]
     fn enforce_hyperlink_limit_cold(&mut self) {
         let mut compacted = false;
+        // ONE walk, and NO allocation on either outcome.
+        //
+        // The O(1) guard in `enforce_hyperlink_limit` tests `data.len()`, but
+        // the quantity actually bounded is the number of HYPERLINK-BEARING
+        // entries. The map also holds entries carrying no hyperlink at all —
+        // one inline image is ~3 * rows * cols entries (`place_image`), plus
+        // kitty placeholders, combining marks, underline colours and extended
+        // flags — so a map over 10k entries with far fewer hyperlinks reaches
+        // here on EVERY call and evicts nothing. That outcome is the common
+        // one, and it used to cost a fresh `Vec<CellCoord>` every time.
+        //
+        // Two shapes were measured against `hyperlink_screen` before this one
+        // was kept. Counting first and collecting only when genuinely over is
+        // 2.8% faster on the common outcome but 8.1% SLOWER when it does evict,
+        // because deciding and collecting then need two separate walks of the
+        // map. Filling a RESIDENT buffer instead needs neither the second walk
+        // nor the allocation, so it wins on both.
+        let mut coords = std::mem::take(&mut self.hyperlink_scratch);
         loop {
-            // One walk, not two: the old code counted, then collected the same
-            // set. The count IS the collected length.
-            let mut hyperlink_coords: Vec<CellCoord> = self
-                .data
-                .iter()
-                .filter(|(_, extra)| extra.hyperlink().is_some())
-                .map(|(coord, _)| *coord)
-                .collect();
+            coords.clear();
+            coords.extend(
+                self.data
+                    .iter()
+                    .filter(|(_, extra)| extra.hyperlink().is_some())
+                    .map(|(coord, _)| *coord),
+            );
 
             // The map may hold non-hyperlink extras (RGB, combining, underline)
             // that do not count toward the limit.
-            if hyperlink_coords.len() <= MAX_HYPERLINK_ENTRIES {
-                return;
+            if coords.len() <= MAX_HYPERLINK_ENTRIES {
+                break;
             }
 
             // Genuinely over. Entries the O(1) scroll-offset amortization has
             // already scrolled off are unreachable but still counted, so drop
             // those first and retry — at most once, since compaction zeroes
-            // `row_offset`.
+            // `row_offset`. The retry re-walks, exactly as before: compaction
+            // can bring the population back under the limit.
             if !compacted && self.row_offset != 0 {
                 compacted = true;
                 self.apply_offset_and_shift_only(0);
                 continue;
             }
 
+            // `coords.len() > MAX_HYPERLINK_ENTRIES > HYPERLINK_LOW_WATER`, so
+            // the `to_evict - 1` pivot below is always in range.
             // EVICT TO A LOW-WATER MARK, not to the ceiling. The single walk and
             // the `select_nth_unstable_by` below already made ONE pass cheap; what
             // remains is HOW OFTEN a pass runs. Trimming to exactly
@@ -2091,17 +2181,20 @@ impl CellExtras {
             // this evicts more, never less, so the map still never exceeds
             // `MAX_HYPERLINK_ENTRIES`.
             const HYPERLINK_LOW_WATER: usize = MAX_HYPERLINK_ENTRIES * 3 / 4;
-            let to_evict = hyperlink_coords.len() - HYPERLINK_LOW_WATER;
+            let to_evict = coords.len() - HYPERLINK_LOW_WATER;
 
             // Only the `to_evict` SMALLEST coords are needed, so partition
             // instead of sorting: O(n) rather than O(n log n), and the evicted
             // SET is identical (keys are unique, and eviction clears each
             // independently, so order within the prefix is unobservable).
-            hyperlink_coords.select_nth_unstable_by(to_evict - 1, |a, b| {
+            coords.select_nth_unstable_by(to_evict - 1, |a, b| {
                 a.row.cmp(&b.row).then(a.col.cmp(&b.col))
             });
 
-            for &coord in &hyperlink_coords[..to_evict] {
+            // `coords` is a LOCAL (moved out of `self` above), so iterating it
+            // by shared reference while `self.data` is mutated below is not a
+            // borrow conflict — which is what lets this stay a slice walk.
+            for &coord in &coords[..to_evict] {
                 if let Some(extra) = self.data.get_mut(&coord) {
                     extra.set_hyperlink(None);
                     if !extra.has_data() {
@@ -2111,8 +2204,12 @@ impl CellExtras {
             }
 
             self.maybe_shrink();
-            return;
+            break;
         }
+        // Hand the buffer back EMPTIED but with its capacity, on every exit —
+        // that capacity is the whole point of the field.
+        coords.clear();
+        self.hyperlink_scratch = coords;
     }
 
     /// The maximum number of hyperlink entries allowed before eviction.
@@ -2280,6 +2377,81 @@ mod tests {
         }
     }
 
+    /// PERF/parity: the hoisted double slice `fill` in `RgbColorRing::clear_range`
+    /// leaves the planes BYTE-IDENTICAL to the old per-column scalar loop (a fresh
+    /// `index()` derivation plus `get_mut` per column), across a lattice of
+    /// geometries and ranges — empty, inverted, overhanging `stride`, wholly
+    /// out-of-range, a stale `row >= visible_rows`, and non-zero ring offsets.
+    /// Also pins allocation parity: clearing must never materialize an absent
+    /// plane (`as_deref_mut`, not `fg_mut`).
+    #[test]
+    fn clear_range_matches_per_cell_clear() {
+        // The pre-optimization body, kept verbatim as the reference oracle.
+        fn clear_range_per_cell(ring: &mut RgbColorRing, row: u16, start_col: u16, end_col: u16) {
+            for col in start_col..end_col {
+                if col >= ring.stride {
+                    break;
+                }
+                let idx = ring.index(row, col);
+                if let Some(fg) = ring.fg.as_deref_mut()
+                    && let Some(entry) = fg.get_mut(idx)
+                {
+                    *entry = 0;
+                }
+                if let Some(bg) = ring.bg.as_deref_mut()
+                    && let Some(entry) = bg.get_mut(idx)
+                {
+                    *entry = 0;
+                }
+            }
+        }
+
+        // (visible_rows, cols, row, start_col, end_col, scroll_before)
+        let cases: &[(u16, u16, u16, u16, u16, u16)] = &[
+            (4, 10, 1, 3, 6, 0),   // interior run
+            (4, 10, 0, 0, 10, 0),  // full row
+            (4, 10, 2, 5, 5, 0),   // empty run (start == end)
+            (4, 10, 2, 7, 3, 0),   // inverted (start > end)
+            (4, 10, 3, 6, 20, 0),  // overhang past stride → clamp to 10
+            (4, 10, 0, 10, 12, 0), // wholly out of range
+            (4, 10, 0, 12, 15, 0), // fully past stride
+            (4, 10, 9, 2, 5, 0),   // stale row >= visible_rows → no writes
+            (4, 10, 1, 0, 10, 2),  // non-zero ring offset
+            (4, 10, 3, 2, 8, 3),   // non-zero ring offset, wrapped row
+            (24, 8, 23, 0, 8, 0),  // last ring row, full width
+            (24, 8, 5, 2, 6, 7),   // mid ring row, offset
+        ];
+        for &(vis, cols, row, cs, ce, scroll) in cases {
+            let mut seed = RgbColorRing::new(vis, cols);
+            for r in 0..vis {
+                for c in 0..cols {
+                    seed.set_fg(r, c, [r as u8, c as u8, 1]);
+                    seed.set_bg(r, c, [r as u8, c as u8, 2]);
+                }
+            }
+            if scroll > 0 {
+                seed.scroll_up(scroll);
+            }
+            let mut per_cell = seed.clone();
+            let mut bulk = seed;
+            clear_range_per_cell(&mut per_cell, row, cs, ce);
+            bulk.clear_range(row, cs, ce);
+            assert_eq!(
+                per_cell.fg, bulk.fg,
+                "fg plane mismatch for vis={vis} cols={cols} row={row} {cs}..{ce} scroll={scroll}"
+            );
+            assert_eq!(
+                per_cell.bg, bulk.bg,
+                "bg plane mismatch for vis={vis} cols={cols} row={row} {cs}..{ce} scroll={scroll}"
+            );
+            assert_eq!(
+                per_cell.heap_bytes(),
+                bulk.heap_bytes(),
+                "plane-allocation mismatch for vis={vis} cols={cols} row={row} {cs}..{ce}"
+            );
+        }
+    }
+
     /// Exactly `n == visible_rows` is the boundary of the over-scroll guard and
     /// must also fully clear and reset (the entire visible area scrolled off).
     #[test]
@@ -2291,6 +2463,55 @@ mod tests {
         assert_eq!(ring.get(3, 1), None);
         ring.set(0, 0, '\u{1F600}');
         assert_eq!(ring.get(0, 0), Some('\u{1F600}'));
+    }
+
+    /// Same parity argument for `ComplexCharRing::clear_range` (DECERA/DECCRA
+    /// path): one `fill('\0')` must equal the old per-column `get_mut` store.
+    #[test]
+    fn complex_clear_range_matches_per_cell_clear() {
+        fn clear_range_per_cell(ring: &mut ComplexCharRing, row: u16, left: u16, right_excl: u16) {
+            let base = (ring.ring_row(row) as usize) * (ring.stride as usize);
+            for col in left..right_excl.min(ring.stride) {
+                let idx = base + col as usize;
+                if let Some(e) = ring.entries.get_mut(idx) {
+                    *e = '\0';
+                }
+            }
+        }
+
+        // (visible_rows, cols, row, left, right_excl, scroll_before)
+        let cases: &[(u16, u16, u16, u16, u16, u16)] = &[
+            (4, 10, 1, 3, 6, 0),
+            (4, 10, 0, 0, 10, 0),
+            (4, 10, 2, 5, 5, 0),
+            (4, 10, 2, 7, 3, 0),
+            (4, 10, 3, 6, 20, 0),
+            (4, 10, 0, 10, 12, 0),
+            (4, 10, 9, 2, 5, 0),
+            (4, 10, 1, 0, 10, 2),
+            (24, 8, 23, 0, 8, 0),
+        ];
+        for &(vis, cols, row, left, right, scroll) in cases {
+            let mut seed = ComplexCharRing::new(vis, cols);
+            for r in 0..vis {
+                for c in 0..cols {
+                    let ch = char::from_u32(0x1F600 + u32::from(r) * 32 + u32::from(c))
+                        .expect("valid char");
+                    seed.set(r, c, ch);
+                }
+            }
+            if scroll > 0 {
+                seed.scroll_up(scroll);
+            }
+            let mut per_cell = seed.clone();
+            let mut bulk = seed;
+            clear_range_per_cell(&mut per_cell, row, left, right);
+            bulk.clear_range(row, left, right);
+            assert_eq!(
+                per_cell.entries, bulk.entries,
+                "entries mismatch for vis={vis} cols={cols} row={row} {left}..{right} scroll={scroll}"
+            );
+        }
     }
 
     // =========================================================================
@@ -2686,5 +2907,77 @@ mod tests {
         assert_eq!(data.fg_rgb(), Some([1, 2, 3]));
         assert_eq!(data.bg_rgb(), Some([4, 5, 6]));
         assert_eq!(extra.combining(), &['\u{0308}']);
+    }
+
+    /// Sharing must be UNOBSERVABLE. `set_range_uniform` hands every cell of an
+    /// OSC 8 run the SAME `Arc<HyperlinkData>`, so a later single-cell edit has
+    /// to copy-on-write and leave its neighbours' link alone — the one thing an
+    /// `Arc` payload could break that a per-cell `Box` could not. Written so it
+    /// passes under BOTH representations: it pins the behaviour, not the shape.
+    #[test]
+    fn per_cell_hyperlink_edit_does_not_leak_across_the_run() {
+        const RUN_URL: &str = "https://example.com/run";
+        let url: Arc<str> = Arc::from(RUN_URL);
+        let id: Arc<str> = Arc::from("run-1");
+        let mut extras = CellExtras::new();
+        extras.set_range_uniform(
+            0,
+            0,
+            4,
+            &crate::extra::UniformExtras {
+                fg_rgb: None,
+                bg_rgb: None,
+                underline_color: None,
+                extended_flags: 0,
+                hyperlink: Some(&url),
+                hyperlink_id: Some(&id),
+            },
+            24,
+            80,
+        );
+        for col in 0..4 {
+            let extra = extras
+                .get(CellCoord::new(0, col))
+                .expect("the bulk run must create an entry per covered cell");
+            assert_eq!(extra.hyperlink().map(|u| &**u), Some(RUN_URL));
+            assert_eq!(extra.hyperlink_id().map(|i| &**i), Some("run-1"));
+        }
+
+        // Edit ONE cell's URL (which also clears that cell's stale id) and a
+        // DIFFERENT cell's id — the two single-cell mutators, one each.
+        let other: Arc<str> = Arc::from("https://example.com/other");
+        extras
+            .get_or_create(CellCoord::new(0, 1))
+            .set_hyperlink(Some(other));
+        let other_id: Arc<str> = Arc::from("run-2");
+        extras
+            .get_or_create(CellCoord::new(0, 2))
+            .set_hyperlink_id(Some(other_id));
+
+        let c1 = extras.get(CellCoord::new(0, 1)).expect("entry 1");
+        assert_eq!(
+            c1.hyperlink().map(|u| &**u),
+            Some("https://example.com/other")
+        );
+        assert_eq!(c1.hyperlink_id(), None, "set_hyperlink clears the stale id");
+
+        let c2 = extras.get(CellCoord::new(0, 2)).expect("entry 2");
+        assert_eq!(c2.hyperlink().map(|u| &**u), Some(RUN_URL));
+        assert_eq!(c2.hyperlink_id().map(|i| &**i), Some("run-2"));
+
+        // The untouched cells of the run must still read the ORIGINAL pair.
+        for col in [0u16, 3] {
+            let extra = extras.get(CellCoord::new(0, col)).expect("untouched entry");
+            assert_eq!(
+                extra.hyperlink().map(|u| &**u),
+                Some(RUN_URL),
+                "col {col} lost its url to a neighbour's edit"
+            );
+            assert_eq!(
+                extra.hyperlink_id().map(|i| &**i),
+                Some("run-1"),
+                "col {col} lost its id to a neighbour's edit"
+            );
+        }
     }
 }

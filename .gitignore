@@ -34,6 +34,11 @@ target-trust
 # Trust-rustc lane; kept ignored so stale local dirs never get committed)
 /dist-trustc/
 
+# Ad-hoc local DEV bundles (a session's `dist-dev/aterm.app` for A/B runs):
+# regenerable build output like dist/, never committed — and, untracked, it
+# would otherwise block `pub stage`, which requires the whole tree clean.
+/dist-dev/
+
 # Trust verifier per-obligation JSON dump (trustc/tcargo emits one file per fn)
 /1/
 
