@@ -390,6 +390,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
     ));
     let _ = std::fs::remove_file(&path);
     let journal = publish::Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "0.55.0".into(),
         build_number: 3,

@@ -184,6 +184,7 @@ fn recutting_a_published_version_is_refused() {
 
 fn journal() -> Journal {
     Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "0.26.0".into(),
         build_number: 1_783_918_101,

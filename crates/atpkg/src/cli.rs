@@ -2560,6 +2560,24 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
 /// Only ever called after a seed install SUCCEEDED, so the bytes are provably
 /// redundant: they are now extracted in the store, and the seed lane refuses to
 /// read them again on a non-empty store.
+/// Is this seal inside a BUILD OUTPUT rather than an installed app?
+///
+/// `seed_dir` is `<app>/Contents/Resources/<SEED_DIR_NAME>`, so the directory
+/// holding the bundle is four levels up. `aterm-release`'s `bundle::assemble`
+/// writes `.metadata_never_index` into every directory it produces a bundle in —
+/// originally to keep a build-output app out of Spotlight, which makes it exactly
+/// the durable "this is not an install" marker this needs, written by the only
+/// thing that knows.
+///
+/// Fail-safe by construction: an unreadable or absent marker reads as "this is a
+/// real install", which is the pre-existing behaviour.
+fn is_build_output_bundle(seed_dir: &std::path::Path) -> bool {
+    seed_dir
+        .ancestors()
+        .nth(4)
+        .is_some_and(|dir| dir.join(".metadata_never_index").exists())
+}
+
 fn reclaim_bundled_seed(seed_dir: &std::path::Path) {
     // NOT OURS TO DELETE. `/Applications/aterm.app` is shared by every account on
     // the Mac, and the store this pass just filled belongs to ONE of them. If the
@@ -2583,6 +2601,25 @@ fn reclaim_bundled_seed(seed_dir: &std::path::Path) {
             );
             return;
         }
+    }
+    // NOR IS A BUILD OUTPUT. A bundle under a `dist/` the cutter marked
+    // `.metadata_never_index` is an ARTIFACT, not an install: something produced it
+    // and may still be signing, packaging or verifying it. On 2026-08-19 this exact
+    // delete removed a gigabyte from a release the cutter was mid-package — the app
+    // WAS ours and the payload WAS spent for this machine, so every test above
+    // passed, and the artifact was corrupted anyway. The same rule spares a
+    // developer who builds locally and runs their own `dist/aterm.app`: their next
+    // `make` would otherwise find the batteries silently gone.
+    //
+    // Reclaiming is a disk optimisation. Refusing to do it costs a directory; doing
+    // it to something that is not an install costs someone their release.
+    if is_build_output_bundle(seed_dir) {
+        println!(
+            "atpkg: leaving the bundled seed in place — {} sits in a build output \
+             directory, not an install; the payload belongs to whatever produced it",
+            seed_dir.display()
+        );
+        return;
     }
     /// Recursive byte count, best-effort: this only sizes a log line, so an
     /// unreadable entry contributes zero rather than derailing the reclaim.
@@ -3330,6 +3367,40 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A seal inside a build output belongs to whatever produced it. Deleting one
+    /// took a gigabyte out of a release mid-package on 2026-08-19; every other
+    /// guard passed, because the app really was ours and the payload really was
+    /// spent for this machine.
+    #[test]
+    fn a_seal_in_a_build_output_is_not_ours_to_reclaim() {
+        let root = std::env::temp_dir().join(format!("atpkg-buildout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let seed_in = |app: &std::path::Path| app.join("Contents/Resources/toolchain-seed.lproj");
+
+        // The cutter's own marker, written by `aterm-release`'s bundle::assemble.
+        let cut = root.join("dist/cut-app");
+        std::fs::create_dir_all(seed_in(&cut.join("aterm.app"))).unwrap();
+        std::fs::write(cut.join(".metadata_never_index"), "").unwrap();
+        assert!(
+            is_build_output_bundle(&seed_in(&cut.join("aterm.app"))),
+            "a bundle beside .metadata_never_index is an artifact, not an install"
+        );
+
+        // A real install has no such marker beside it, and still reclaims.
+        let installed = root.join("Applications");
+        std::fs::create_dir_all(seed_in(&installed.join("aterm.app"))).unwrap();
+        assert!(
+            !is_build_output_bundle(&seed_in(&installed.join("aterm.app"))),
+            "an ordinary install must still reclaim its spent payload"
+        );
+
+        // Fail-safe: an unreadable/absent marker reads as a real install.
+        assert!(!is_build_output_bundle(std::path::Path::new(
+            "/nonexistent/aterm.app/Contents/Resources/toolchain-seed.lproj"
+        )));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// [`VERBS`] must name EXACTLY the verbs `main_entry`'s match dispatches —
     /// no more (advertising a verb that no longer exists) and no fewer (a

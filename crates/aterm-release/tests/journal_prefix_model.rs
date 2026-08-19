@@ -59,6 +59,7 @@ use aterm_spec::derive::{Model, release_journal_prefix_model};
 fn journal(done: Vec<String>) -> publish::Journal {
     let release_id = done.iter().any(|step| step == "draft").then_some(55);
     publish::Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "0.55.0".into(),
         build_number: 55,

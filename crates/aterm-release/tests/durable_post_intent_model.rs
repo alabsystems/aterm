@@ -60,6 +60,7 @@ use std::path::{Path, PathBuf};
 
 fn journal() -> Journal {
     Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "0.55.0".into(),
         build_number: 55,
@@ -83,6 +84,7 @@ fn journal() -> Journal {
 fn context(root: &Path, with_journal: bool) -> CutCtx {
     let journal_path = root.join("nested/dist/cut-state.toml");
     CutCtx {
+        verify_pubkey: None,
         // No credentials: this model exercises journal/state transitions, not signing.
         credentials: None,
         // Tier APPLE inactive, as the shipped anchor is. This model covers the
@@ -340,8 +342,12 @@ fn absent_cleanup_selector_is_fail_closed_for_issued_or_unknown_intent() {
 
 #[test]
 fn curl_transport_preflight_requires_every_no_retry_post_option() {
+    // `--upload-file` is in this set because the asset leg STREAMS: a
+    // batteries-included DMG is over a gigabyte and `--data-binary @file`
+    // buffers it whole (2026-08-19, `out of memory` after a full notarized
+    // build). A curl that cannot stream must fail the preflight, not the upload.
     let help = "--data-binary --fail-with-body --header --request --retry \
-                --show-error --silent --url";
+                --show-error --silent --upload-file --url";
     publish::validate_one_shot_curl_help(help).unwrap();
     for missing in help.split_whitespace() {
         let mutant = help.replace(missing, "");

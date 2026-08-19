@@ -856,6 +856,17 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         st.is_failing_persistently(),
         st.outcome
     );
+    // STRUCTURALLY UNABLE, in the same one-glance line. A copy run from the mounted
+    // DMG, a Gatekeeper-translocated download, or a dev-marked build has no bundle
+    // to replace: no check thread ever starts, so every field above stays at the
+    // pristine default of a machine that will never update, and a controller reads
+    // `enabled=true failing=0 persistent=false` as health. Emitted ONLY when false,
+    // so a normal install's line is byte-identical to before and the abnormal state
+    // is the loud one (2026-08-19 round-6 audit; Settings gained the same guard).
+    if !st.installable {
+        let line = out.trim_end_matches('\n');
+        out = format!("{line} installable=false\n");
+    }
     // THE APPLY LANE, in the same one-glance line. `failing_applies=` counts hard
     // failures only, and by design a REFUSAL (blocked/deferred/held) is not one —
     // which is how a machine could sit on `staged_build=<new> relaunch_ready=true

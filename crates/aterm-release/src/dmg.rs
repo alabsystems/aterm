@@ -102,6 +102,7 @@ pub fn create_zip(
     out_dir: &Path,
     short_version: &str,
     notarized: bool,
+    seeded: bool,
 ) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -134,6 +135,23 @@ pub fn create_zip(
     // copy-then-delete is the simple mechanism, and `cp -R` preserves the seal
     // and xattrs exactly as `build_in_stage` relies on.)
     let staged = strip_seed_into_stage(app, out_dir)?;
+    // A SEEDED CUT WITH NO SEAL IS NOT A SEEDLESS CUT. `strip_seed_into_stage`
+    // answers `None` for both "this cut ships no toolchain" and "the seal that was
+    // here is gone", and on 2026-08-19 the second one happened: the live updater
+    // adopted the half-built bundle and its successor reclaimed the payload out of
+    // it. The strip became a no-op, so `verify_stripped_bundle` below never ran —
+    // the container shipped without the codesign + Gatekeeper proof that is the
+    // entire reason the lean zip is allowed to exist. Whoever knows this cut is
+    // seeded has to say so, because from in here the two states look identical.
+    if seeded && staged.is_none() {
+        return Err(format!(
+            "this cut seals a toolchain, but {} carries no {} — something removed it \
+             between bundle and package. Refusing to archive an updater container whose \
+             strip was a silent no-op",
+            app.display(),
+            atpkg::SEED_DIR_NAME
+        ));
+    }
     let source = staged.as_ref().map_or(app, |s| s.app.as_path());
     // PROVE the two things this artifact's whole design rests on, before it is
     // hashed and handed to the fleet. Everything downstream — one notarization,

@@ -1214,6 +1214,25 @@ pub struct Journal {
     /// definition; the private key is never journaled or printed.
     #[serde(default)]
     pub signature_pubkey: Option<String>,
+    /// The key the PUBLISHED artifacts must verify UNDER, when that is not this
+    /// machine's own signing key.
+    ///
+    /// `signature_pubkey` was doing both jobs, and for an ordinary cut they are the
+    /// same value, so nothing showed. They come apart in exactly the case the
+    /// plural-publisher design exists for: machine A publishes a release signed with
+    /// Ka and dies; machine B recovers it. B's `signature_pubkey` is Kb — correctly,
+    /// because that is what its local guards compare against — and `archive`/`verify`
+    /// then tried to verify A's manifest under B's key and failed. The release was
+    /// live but unmirrored, `unlock` was never reached, the lease stayed held by the
+    /// dead publisher, and no supported command could free it: `--abandon` refuses a
+    /// published release, `--retire-unmirrored` wants the mirror step, `yank` wants a
+    /// finished journal (2026-08-19 round-6 audit).
+    ///
+    /// `None` means "the same key this machine signs with", which is every journal a
+    /// normal cut writes. Set only by a recovery, and only from the RELEASE's own
+    /// master-roster-proven key.
+    #[serde(default)]
+    pub verify_pubkey: Option<String>,
     /// WHICH MACHINE signed, when the machine-roster tier is armed — the id the
     /// master-signed roster maps [`Self::signature_pubkey`] to. `None` with an
     /// unpinned paper master, which is every journal this tree writes.
@@ -1685,6 +1704,7 @@ pub fn validate_one_shot_curl_help(help: &str) -> Result<()> {
         "--retry",
         "--show-error",
         "--silent",
+        "--upload-file",
         "--url",
     ] {
         if !help
@@ -1784,6 +1804,45 @@ struct OneShotPost {
     args: Vec<String>,
 }
 
+/// curl's exit for "I could not even start": argument and initialisation failures,
+/// which happen strictly before any connection is attempted.
+const CURL_EXIT_FAILED_INIT: i32 = 2;
+
+/// Did this attempt PROVABLY not reach the network?
+///
+/// The whole one-shot POST design turns on a question it cannot normally answer —
+/// "did the server see my request?" — and answers it conservatively: assume yes,
+/// never repeat. This is the one case where the answer is knowable locally. curl
+/// exits 2 when it rejects its own arguments or fails to initialise, which is
+/// before connect(2); nothing was sent, so nothing can have been received, and the
+/// conservative assumption is simply false.
+///
+/// Narrow on purpose. A timeout, a reset, a 5xx, a killed process — none of those
+/// qualify, because each can hide a delivered request. Only the local refusal does.
+const fn transport_never_started(out: &RunOut) -> bool {
+    out.status == CURL_EXIT_FAILED_INIT
+}
+
+/// How curl is told to find the request body — the ONE decision that separates a
+/// request whose memory cost is its payload from one whose cost is constant.
+/// See [`OneShotPost::prepare_binary`] for the gigabyte that made it matter.
+#[derive(Clone, Copy)]
+pub(crate) enum BodySource<'a> {
+    /// `--data-binary @path`: read fully into memory first. Small JSON only.
+    Buffered(&'a str),
+    /// `--upload-file path`: streamed off disk, any size.
+    Streamed(&'a str),
+}
+
+impl<'a> BodySource<'a> {
+    pub(crate) const fn curl_pair(self) -> (&'static str, &'a str) {
+        match self {
+            Self::Buffered(arg) => ("--data-binary", arg),
+            Self::Streamed(path) => ("--upload-file", path),
+        }
+    }
+}
+
 impl OneShotPost {
     /// JSON-body POST (draft creates). `temp_label` distinguishes the
     /// private/mirror temp directories; `subject` names the request in errors.
@@ -1807,24 +1866,40 @@ impl OneShotPost {
         let data_arg = format!("@{payload_arg}");
         let auth = prepare_github_auth_headers()?;
         Ok(Self {
-            args: Self::curl_args(&auth, "Content-Type: application/json", &data_arg, endpoint),
+            args: Self::curl_args(
+                &auth.curl_header_arg,
+                "Content-Type: application/json",
+                // A draft-create body is a few hundred bytes; buffering it is free.
+                BodySource::Buffered(&data_arg),
+                endpoint,
+            ),
             _payload_dir: Some(payload_dir),
             _auth: auth,
         })
     }
 
     /// Raw file-body POST (asset uploads). `subject` names the file in errors.
+    ///
+    /// STREAMED FROM DISK, never buffered. `--data-binary @file` reads the whole
+    /// payload into memory before it opens the socket, and the batteries-included
+    /// DMG is over a gigabyte: the first seeded cut died here with
+    /// `curl: option --data-binary: out of memory`, after building, signing and
+    /// notarizing both containers. `--upload-file` streams the same bytes with a
+    /// `Content-Length` taken from the file's size, so the transport cost is
+    /// independent of the asset (2026-08-19). `--request POST` still fixes the
+    /// method — `--upload-file` would otherwise PUT — and the endpoint carries a
+    /// query string rather than a trailing `/`, so curl appends no file name of
+    /// its own.
     fn prepare_binary(subject: &str, endpoint: &str, file: &Path) -> Result<Self> {
         let file_arg = file
             .to_str()
             .ok_or_else(|| Error::new(format!("{subject} path is not UTF-8")))?;
-        let data_arg = format!("@{file_arg}");
         let auth = prepare_github_auth_headers()?;
         Ok(Self {
             args: Self::curl_args(
-                &auth,
+                &auth.curl_header_arg,
                 "Content-Type: application/octet-stream",
-                &data_arg,
+                BodySource::Streamed(file_arg),
                 endpoint,
             ),
             _payload_dir: None,
@@ -1832,12 +1907,16 @@ impl OneShotPost {
         })
     }
 
+    /// Takes the header ARGUMENT, not the `GithubAuthHeaders` that owns it: the
+    /// argv this builds is the whole security- and memory-relevant surface of a
+    /// one-shot POST, and a test must be able to inspect it without a token.
     fn curl_args(
-        auth: &GithubAuthHeaders,
+        auth_header_arg: &str,
         content_type: &str,
-        data_arg: &str,
+        body: BodySource<'_>,
         endpoint: &str,
     ) -> Vec<String> {
+        let (body_flag, body_arg) = body.curl_pair();
         [
             "--silent",
             "--show-error",
@@ -1847,11 +1926,11 @@ impl OneShotPost {
             "--request",
             "POST",
             "--header",
-            &auth.curl_header_arg,
+            auth_header_arg,
             "--header",
             content_type,
-            "--data-binary",
-            data_arg,
+            body_flag,
+            body_arg,
             "--url",
             endpoint,
         ]
@@ -5265,6 +5344,10 @@ pub struct CutCtx {
     /// Frozen pre-claim channel-signature ratchet and its actual public key.
     pub signature_required: bool,
     pub signature_pubkey: Option<String>,
+    /// The key the PUBLISHED artifacts must verify UNDER — see
+    /// [`Journal::verify_pubkey`]. `None` means [`Self::signature_pubkey`], which
+    /// is every cut except a cross-machine recovery of someone else's release.
+    pub verify_pubkey: Option<String>,
     /// The machine the roster authorized, journaled beside the public key. Set on
     /// every real cut and restored from the journal on resume — including a resume
     /// past `build`, where [`CutCtx::attribution`] is deliberately not restored.
@@ -5316,8 +5399,20 @@ impl CutCtx {
     fn zip_path(&self) -> PathBuf {
         self.dist.join(mirror::zip_asset_name(&self.version))
     }
+    /// What PUBLISHED bytes must verify under. Falls back to this machine's own
+    /// signing key, which is the same value on every cut that is not recovering
+    /// another machine's release.
+    fn verification_pubkey(&self) -> Option<&str> {
+        self.verify_pubkey
+            .as_deref()
+            .or(self.signature_pubkey.as_deref())
+    }
+
+    /// THIS CUT'S bundle — under `dist/cut-app/`, never the dev install at
+    /// `dist/aterm.app`. See [`bundle::staged_app_path`] for the release the live
+    /// updater ate when these were the same path.
     fn app_path(&self) -> PathBuf {
-        self.dist.join("aterm.app")
+        bundle::staged_app_path(&self.dist)
     }
     fn manifest_path(&self) -> PathBuf {
         self.dist.join(manifest_out::MANIFEST_ASSET)
@@ -5404,6 +5499,30 @@ impl CutCtx {
         Ok(DurablePostPermit(()))
     }
 
+    /// Undo an upload intent for a POST that PROVABLY never reached the network.
+    ///
+    /// The one-shot rule — record the intent, then never repeat a POST whose
+    /// response was lost — is right, and it is why a resume refuses to re-upload an
+    /// asset it cannot see. But it treats "the response was lost" and "the request
+    /// was never sent" as the same state, and on 2026-08-19 the second one wedged a
+    /// cut permanently: curl refused its own arguments (`--data-binary: out of
+    /// memory` on a gigabyte DMG), so no socket was ever opened, yet every later
+    /// resume declined to retry a POST that had never happened. The draft had zero
+    /// assets; no supported command could finish the release; the number had to be
+    /// abandoned.
+    ///
+    /// Only [`transport_never_started`] may lead here. That is a local, provable
+    /// fact — curl's exit 2 is argument/initialisation failure, before connect — and
+    /// nothing about it depends on what a server did or did not receive.
+    fn retract_upload_intent(&mut self, name: &str) -> Result<()> {
+        self.upload_intents.retain(|issued| issued != name);
+        if let Some(journal) = &mut self.journal {
+            journal.upload_intents.retain(|issued| issued != name);
+            journal.save(&self.journal_path)?;
+        }
+        Ok(())
+    }
+
     fn required_release_id(&self, operation: &str) -> Result<u64> {
         self.release_id.filter(|id| *id != 0).ok_or_else(|| {
             Error::new(format!(
@@ -5481,6 +5600,17 @@ impl CutCtx {
             journal.save(&self.journal_path)?;
         }
         Ok(DurablePostPermit(()))
+    }
+
+    /// The mirror twin of [`Self::retract_upload_intent`], under the same rule and
+    /// for the same reason: only a POST that never reached the network.
+    fn retract_mirror_upload_intent(&mut self, name: &str) -> Result<()> {
+        self.mirror_upload_intents.retain(|issued| issued != name);
+        if let Some(journal) = &mut self.journal {
+            journal.mirror_upload_intents.retain(|issued| issued != name);
+            journal.save(&self.journal_path)?;
+        }
+        Ok(())
     }
 
     /// Local paths of exactly the assets that cross to the public channel, in a
@@ -6831,6 +6961,11 @@ fn recover_published_cut(
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
+        // FROM THE RELEASE, not from this machine: the artifacts being recovered are
+        // already signed, by a machine that may not be this one. `signature_pubkey`
+        // above stays this machine's own key so the local guards keep comparing like
+        // with like (2026-08-19 round-6 audit).
+        verify_pubkey: recovered_pubkey.clone(),
         // FROM THE PUBLISHED BYTES, not from this machine. The manifest being
         // recovered is already signed, and `machine_id` is inside what that
         // signature covers — so the only truthful answer to "which machine cut
@@ -6895,6 +7030,7 @@ fn recover_published_cut(
         manifest_signed: signature_policy.required,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey.clone(),
+        verify_pubkey: recovered_pubkey.clone(),
         signature_machine_id: manifest.machine_id.clone(),
         // Nothing left to stamp and nothing left to stage: every build step is
         // already marked done, so the manifest that would carry an attribution and
@@ -7464,6 +7600,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         manifest_signed: false,
         signature_required: signature_policy.required,
         signature_pubkey: signature_policy.pubkey,
+        // This machine signs and this machine verifies: one key, no split.
+        verify_pubkey: None,
         signature_machine_id: attributed.machine_id,
         attribution: attributed.attribution,
         roster: attributed.roster,
@@ -7490,6 +7628,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             manifest_signed: ctx.manifest_signed,
             signature_required: ctx.signature_required,
             signature_pubkey: ctx.signature_pubkey.clone(),
+            verify_pubkey: ctx.verify_pubkey.clone(),
             signature_machine_id: ctx.signature_machine_id.clone(),
             release_id: None,
             draft_create_issued: false,
@@ -7636,6 +7775,9 @@ fn resume_cut(
         manifest_signed: journal.manifest_signed,
         signature_required: journal.signature_required,
         signature_pubkey: journal.signature_pubkey.clone(),
+        // A resume of a RECOVERED cut must keep verifying under the release's key,
+        // not this machine's; `None` on every ordinary journal.
+        verify_pubkey: journal.verify_pubkey.clone(),
         // The ID comes from the JOURNAL on every resume, including one past `build`:
         // it is the cut's fixed identity and every later step must keep agreeing with
         // it. The full attribution and the roster bytes come from the re-derivation
@@ -7752,15 +7894,42 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
     }
 
     match ctx.kind {
-        CutKind::Real => step(
-            "DONE",
-            &format!(
-                "v{} (build {}) — fleet stages within 6h.  [{}]  state: dist/cut-state.toml",
-                ctx.version,
-                ctx.build,
-                fmt_elapsed(t0)
-            ),
-        ),
+        CutKind::Real => {
+            // THE DEV INSTALL TAKES ITS OWN RELEASE — last, and only now. This
+            // machine runs `dist/aterm.app` and its updater watches it, so placing
+            // the bundle any earlier hands a live process something unfinished; that
+            // is exactly how a cut got its sealed toolchain deleted mid-package
+            // (see `bundle::staged_app_path`). A failure here costs nothing that
+            // matters: the release is already live, verified and mirrored, and the
+            // only casualty is this machine's convenience, so it warns rather than
+            // failing a completed cut.
+            match bundle::place_finished_bundle(&ctx.dist) {
+                Ok(bytes) => step(
+                    "place",
+                    &format!(
+                        "dist/aterm.app \u{2190} this cut's verified bundle ({}) \u{2014} the dev \
+                         install updates into it",
+                        atpkg::human_bytes(bytes)
+                    ),
+                ),
+                Err(error) => step(
+                    "place",
+                    &format!(
+                        "WARNING: the release is live, but dist/aterm.app was not updated to it \
+                         ({error}); this machine keeps running the older bundle"
+                    ),
+                ),
+            }
+            step(
+                "DONE",
+                &format!(
+                    "v{} (build {}) — fleet stages within 6h.  [{}]  state: dist/cut-state.toml",
+                    ctx.version,
+                    ctx.build,
+                    fmt_elapsed(t0)
+                ),
+            );
+        }
         CutKind::Rehearse => {
             step(
                 "DONE",
@@ -7978,8 +8147,17 @@ pub trait Packager {
     /// advisory (ad-hoc tier: spctl rejects everything, so a failure proves nothing) or
     /// FATAL (notarized tier: a rejection means the lean updater zip would fail on every
     /// client).
-    fn zip(&self, app: &Path, dist: &Path, version: &str, notarized: bool)
-    -> Result<dmg::Packaged>;
+    /// `seeded` is the CUT'S OWN claim about whether it sealed a toolchain — the
+    /// packager cannot infer it, and the difference between "no seal" and "the seal
+    /// was removed under us" is a shipped release either way.
+    fn zip(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        notarized: bool,
+        seeded: bool,
+    ) -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
 }
@@ -7997,8 +8175,9 @@ impl Packager for RealPackager {
         dist: &Path,
         version: &str,
         notarized: bool,
+        seeded: bool,
     ) -> Result<dmg::Packaged> {
-        dmg::create_zip(app, dist, version, notarized).map_err(Error::new)
+        dmg::create_zip(app, dist, version, notarized, seeded).map_err(Error::new)
     }
     fn sha256(&self, path: &Path) -> Result<String> {
         dmg::sha256_file(path).map_err(Error::new)
@@ -8051,6 +8230,7 @@ pub fn notarize_and_package(
     tier: &sign::AppleTier,
     tools: &dyn sign::AppleTools,
     pack: &dyn Packager,
+    seeded: bool,
 ) -> Result<PackagedCut> {
     // THE BUNDLE IS NOTARIZED FIRST, before either container exists.
     let notarized_app = sign::notarize_app(app, tier, tools).map_err(Error::new)?;
@@ -8094,7 +8274,7 @@ pub fn notarize_and_package(
     // signature and a stapled ticket; pass it through so the stripped-bundle
     // Gatekeeper check knows whether an spctl rejection is meaningless (ad-hoc) or
     // fleet-fatal (notarized).
-    let zip = pack.zip(app, dist, version, notarized_app)?;
+    let zip = pack.zip(app, dist, version, notarized_app, seeded)?;
     Ok(PackagedCut {
         dmg: dmg_out,
         dmg_sha256,
@@ -8255,6 +8435,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         &ctx.apple,
         &sign::RealAppleTools,
         &RealPackager,
+        spec.seed.is_some(),
     )?;
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
@@ -8381,6 +8562,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         journal.manifest_signed = ctx.manifest_signed;
         journal.signature_required = ctx.signature_required;
         journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
+        journal.verify_pubkey.clone_from(&ctx.verify_pubkey);
         journal
             .signature_machine_id
             .clone_from(&ctx.signature_machine_id);
@@ -9100,6 +9282,19 @@ fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) ->
         verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
         return Ok(());
     }
+    // NOTHING WAS SENT — so nothing can have been received, and the intent that
+    // exists only to stop a duplicate POST is protecting against a POST that never
+    // happened. Retract it, and this cut stays resumable once the local cause is
+    // fixed. Without this a curl that rejects its own arguments burns the release.
+    if transport_never_started(&out) {
+        ctx.retract_upload_intent(name)?;
+        return Err(Error::new(format!(
+            "upload of {name} never reached the network (curl exit {}): {}. The durable \
+             intent was retracted, so a resume will retry it once the local cause is fixed",
+            out.status,
+            out.stderr_utf8().trim()
+        )));
+    }
     Err(Error::new(format!(
         "exact-ID upload of {name} returned {} but no asset is visible; refusing an ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
         if out.success() { "success" } else { "failure" },
@@ -9471,7 +9666,7 @@ fn step_archive(ctx: &mut CutCtx) -> Result<()> {
         Some(&local_manifest),
         local_signature.as_deref(),
         ctx.signature_required,
-        ctx.signature_pubkey.as_deref(),
+        ctx.verification_pubkey(),
     )
     .map_err(|error| {
         Error::new(format!(
@@ -10172,6 +10367,18 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
         verify_release_asset_id_matches_local(slug, release_id, name, file)?;
         return Ok(());
     }
+    // Same rule as the private leg: a request that never left this machine cannot
+    // have been delivered, so the anti-duplicate intent has nothing to protect.
+    if transport_never_started(&out) {
+        ctx.retract_mirror_upload_intent(name)?;
+        return Err(Error::new(format!(
+            "mirror upload of {name} never reached the network (curl exit {}): {}. The \
+             durable intent was retracted, so a resume will retry it once the local cause \
+             is fixed",
+            out.status,
+            out.stderr_utf8().trim()
+        )));
+    }
     Err(Error::new(format!(
         "mirror upload of {name} returned {} but no asset is visible on {slug}; refusing an \
          ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
@@ -10305,10 +10512,117 @@ fn step_verify(ctx: &mut CutCtx) -> Result<()> {
         ctx.kind == CutKind::Rehearse,
         verify::PostPublishSignature {
             expected: Some(ctx.signature_required),
-            pubkey: ctx.signature_pubkey.as_deref(),
+            pubkey: ctx.verification_pubkey(),
             local_signature: Some(&signature),
         },
     )
+}
+
+#[cfg(test)]
+mod transport_body_tests {
+    //! THE ASSET LEG'S MEMORY COST. `--data-binary @file` buffers the whole
+    //! payload before the socket opens; the batteries-included DMG is over a
+    //! gigabyte, so the first seeded cut died with `curl: option --data-binary:
+    //! out of memory` AFTER building, signing and notarizing both containers —
+    //! the most expensive possible place to learn it. These assert the argv
+    //! itself, because that is the only artifact of the decision.
+
+    use super::*;
+
+    const AUTH: &str = "@/private/tmp/headers";
+    const ENDPOINT: &str = "https://uploads.github.com/repos/o/r/releases/1/assets?name=x.dmg";
+
+    #[test]
+    fn an_asset_upload_streams_off_disk_and_never_buffers() {
+        let args = OneShotPost::curl_args(
+            AUTH,
+            "Content-Type: application/octet-stream",
+            BodySource::Streamed("/dist/aterm-0.33.0.dmg"),
+            ENDPOINT,
+        );
+        assert!(
+            args.iter().any(|a| a == "--upload-file"),
+            "the asset leg must stream: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--data-binary"),
+            "a gigabyte payload must never be buffered: {args:?}"
+        );
+        // `--upload-file` PUTs by default; the API needs POST.
+        let request = args.iter().position(|a| a == "--request").unwrap();
+        assert_eq!(args[request + 1], "POST");
+        // No `@` prefix on this one: that spelling belongs to --data-binary, and
+        // curl would look for a file literally named "@/dist/…".
+        let flag = args.iter().position(|a| a == "--upload-file").unwrap();
+        assert_eq!(args[flag + 1], "/dist/aterm-0.33.0.dmg");
+    }
+
+    fn out(status: i32, stderr: &str) -> RunOut {
+        RunOut {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// The one case where "did the server see it?" is knowable locally. Everything
+    /// else must stay conservative, because each of those can hide a delivered
+    /// request — and a wrong `true` here would repeat a POST that landed.
+    #[test]
+    fn only_a_local_curl_refusal_counts_as_never_sent() {
+        assert!(
+            transport_never_started(&out(2, "curl: option --data-binary: out of memory")),
+            "curl exit 2 is argument/init failure, strictly before connect"
+        );
+        for (status, why) in [
+            (0, "success"),
+            (22, "HTTP error returned"),
+            (28, "timeout — the request may have been delivered"),
+            (56, "recv failure — likewise"),
+            (7, "connect failed, but after the attempt began"),
+            (-1, "killed; unknowable"),
+        ] {
+            assert!(
+                !transport_never_started(&out(status, why)),
+                "exit {status} ({why}) must NOT license a retry"
+            );
+        }
+    }
+
+    /// A retracted intent has to put the pipeline back where it was BEFORE the
+    /// permit was minted, or the retraction is cosmetic: the next resume has to
+    /// choose "persist and post", not "await visibility" forever.
+    #[test]
+    fn a_retracted_intent_makes_the_next_attempt_postable_again() {
+        assert_eq!(
+            durable_post_decision(true, false),
+            DurablePostDecision::AwaitVisibility,
+            "the wedge this fixes"
+        );
+        assert_eq!(
+            durable_post_decision(false, false),
+            DurablePostDecision::PersistIntentThenPost,
+            "after retraction the asset is uploadable again"
+        );
+        assert_eq!(
+            durable_post_decision(false, true),
+            DurablePostDecision::ConvergeVisible,
+            "and a visible object still converges rather than reposting"
+        );
+    }
+
+    #[test]
+    fn a_json_body_still_buffers_from_its_private_temp_file() {
+        let args = OneShotPost::curl_args(
+            AUTH,
+            "Content-Type: application/json",
+            BodySource::Buffered("@/private/tmp/request.json"),
+            ENDPOINT,
+        );
+        let flag = args.iter().position(|a| a == "--data-binary").unwrap();
+        assert_eq!(args[flag + 1], "@/private/tmp/request.json");
+        assert!(!args.iter().any(|a| a == "--upload-file"));
+    }
 }
 
 #[cfg(test)]
@@ -10325,6 +10639,38 @@ mod roster_wiring_tests {
     //! delay — and until these tests existed nothing in the tree would have failed.
 
     use super::*;
+
+    /// A cut signs with THIS machine's key and verifies published bytes under the
+    /// key that actually signed them. Those are the same value on an ordinary cut,
+    /// which is why one field did both jobs — until a machine recovered another
+    /// machine's published release and `archive` tried to verify a manifest signed
+    /// with Ka under Kb. The release went live, unmirrored, with its lease held by a
+    /// dead publisher and no supported command able to free it.
+    #[test]
+    fn a_recovery_verifies_under_the_release_key_and_signs_under_its_own() {
+        let mut ctx = ctx(Some("m3"));
+        ctx.signature_pubkey = Some("Kb-this-machine".to_string());
+        assert_eq!(
+            ctx.verification_pubkey(),
+            Some("Kb-this-machine"),
+            "an ordinary cut verifies under the key it signs with"
+        );
+
+        // A cross-machine recovery: the release was signed by the dead publisher.
+        ctx.verify_pubkey = Some("Ka-dead-publisher".to_string());
+        assert_eq!(
+            ctx.verification_pubkey(),
+            Some("Ka-dead-publisher"),
+            "archive/verify must use the key that actually signed the artifacts"
+        );
+        assert_eq!(
+            ctx.signature_pubkey.as_deref(),
+            Some("Kb-this-machine"),
+            "…while the local signing-configuration guards keep comparing this \
+             machine's own key, or they would reject their own recovery"
+        );
+    }
+
 
     /// A context shaped like a real cut, differing only in whether it is attributed.
     /// Every remote-facing field is inert; nothing here touches the network or a repo.
@@ -10345,6 +10691,7 @@ mod roster_wiring_tests {
             manifest_signed: true,
             signature_required: true,
             signature_pubkey: None,
+            verify_pubkey: None,
             signature_machine_id: machine_id.map(str::to_string),
             attribution: None,
             roster: None,

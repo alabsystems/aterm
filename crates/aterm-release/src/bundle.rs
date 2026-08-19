@@ -169,9 +169,138 @@ fn xml_escape(s: &str) -> String {
 /// Signing is NOT done here — the caller runs `sign::` next (inside-out), then
 /// dmg, then [`write_provenance`] (whose binary_sha256 must cover the SIGNED
 /// bytes, so it must run after signing — same order as the script).
+/// The scratch directory the cut ASSEMBLES in, under `dist/`.
+///
+/// Deliberately NOT `dist/aterm.app`: on the release machine that path is also a
+/// live, self-updating install (the owner runs it, and the activation lane watches
+/// it). Assembling there means the cut is writing a bundle another process owns,
+/// and the consequences are not theoretical — see [`staged_app_path`].
+pub const CUT_APP_DIR: &str = "cut-app";
+
+/// Where THIS cut's bundle is built, signed, notarized and packaged.
+///
+/// The cut used to assemble directly into `dist/aterm.app`. On 2026-08-19 that
+/// produced a corrupt release: the bundle step sealed the batteries-included
+/// toolchain into it, the running aterm's activation lane took the half-built
+/// bundle six minutes later (it was signed by then, and newer than the running
+/// build), and the successor's first-run `atpkg seed` pass judged the seal spent
+/// on an already-provisioned machine and DELETED it — a gigabyte removed from the
+/// artifact the cutter was still packaging. The DMG had been built and kept the
+/// seal; the updater zip had not, silently took the seedless path and skipped the
+/// gate that proves the stripped bundle still passes Gatekeeper. Only the
+/// provenance recount caught it, after two notarizations.
+///
+/// Assembling somewhere no running process owns fixes that for EVERY client
+/// version, including ones already installed — a marker the client must honour
+/// would only protect clients new enough to know about it. It also stops
+/// [`assemble`]'s `rm -rf` from deleting the bundle a live process is executing
+/// out of, which every cut on this machine had been doing.
+///
+/// The finished bundle is placed at `dist/aterm.app` after the release verifies,
+/// so the dev install still takes its own release — just a complete one.
+#[must_use]
+pub fn staged_app_path(dist: &Path) -> PathBuf {
+    dist.join(CUT_APP_DIR).join("aterm.app")
+}
+
+/// The DEV INSTALL path: `dist/aterm.app`, what the owner's machine runs and what
+/// its updater watches. The cut only ever writes here through
+/// [`place_finished_bundle`], and only once the release is live.
+#[must_use]
+pub fn dev_install_app_path(dist: &Path) -> PathBuf {
+    dist.join("aterm.app")
+}
+
+/// Put this cut's finished bundle at `dist/aterm.app`, where the dev install runs
+/// from — the LAST thing a cut does, after the release is live and verified.
+///
+/// Ordering is the whole point. The live updater on this machine watches that path
+/// and will adopt whatever appears there; before this split it could adopt a bundle
+/// mid-assembly. Now the only bundle it can ever see is one that has been signed,
+/// notarized, stapled, self-checked, published, verified and mirrored.
+///
+/// COPIED, not moved: `dist/cut-app/aterm.app` stays as the cut's artifact, so a
+/// late `--resume` still has the bytes its journal describes. `cp -Rc` clones on
+/// APFS, so a batteries-included bundle costs metadata rather than a second
+/// gigabyte, and `cp` (not a hand-rolled walk) is what preserves the symlinks,
+/// extended attributes and `_CodeSignature` layout the seal covers.
+///
+/// The swap is two renames within one directory rather than delete-then-copy, so
+/// there is no window in which `dist/aterm.app` does not exist — a launch during
+/// that window would simply fail to find the app.
+///
+/// Returns the number of bytes the placed bundle carries.
+pub fn place_finished_bundle(dist: &Path) -> Result<u64, String> {
+    let staged = staged_app_path(dist);
+    if !staged.is_dir() {
+        return Err(format!("{} is not a bundle", staged.display()));
+    }
+    let live = dev_install_app_path(dist);
+    let incoming = dist.join(".aterm.app.incoming");
+    let previous = dist.join(".aterm.app.previous");
+    for scratch in [&incoming, &previous] {
+        if scratch.exists() {
+            std::fs::remove_dir_all(scratch)
+                .map_err(|e| format!("clear {}: {e}", scratch.display()))?;
+        }
+    }
+    let clone = std::process::Command::new("cp")
+        .args(["-Rc"])
+        .arg(&staged)
+        .arg(&incoming)
+        .status();
+    let cloned = matches!(clone, Ok(status) if status.success());
+    if !cloned {
+        // A filesystem that cannot clone is the pre-existing behaviour, not a new
+        // failure mode.
+        let _ = std::fs::remove_dir_all(&incoming);
+        let plain = std::process::Command::new("cp")
+            .arg("-R")
+            .arg(&staged)
+            .arg(&incoming)
+            .status()
+            .map_err(|e| format!("cp -R into {}: {e}", incoming.display()))?;
+        if !plain.success() {
+            return Err(format!("cp -R {} -> {}", staged.display(), incoming.display()));
+        }
+    }
+    let had_live = live.exists();
+    if had_live {
+        std::fs::rename(&live, &previous)
+            .map_err(|e| format!("move the old dev install aside: {e}"))?;
+    }
+    if let Err(error) = std::fs::rename(&incoming, &live) {
+        // Put the old one back rather than leaving the machine with no app.
+        if had_live {
+            let _ = std::fs::rename(&previous, &live);
+        }
+        return Err(format!("place {}: {error}", live.display()));
+    }
+    if had_live {
+        let _ = std::fs::remove_dir_all(&previous);
+    }
+    Ok(dir_bytes(&live))
+}
+
+/// Recursive byte total, tolerating anything unreadable — this feeds a transcript
+/// line, never a decision.
+fn dir_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => dir_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     let mac_dir = spec.repo_root.join("apps/aterm-mac");
-    let app = spec.out_dir.join("aterm.app");
+    let app = staged_app_path(&spec.out_dir);
 
     // Keep the BUILD-OUTPUT bundle out of Spotlight: dist/aterm.app is a real,
     // launchable .app, so without this it shows up as a SECOND "aterm" in
@@ -181,6 +310,13 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&spec.out_dir)
         .map_err(|e| format!("create {}: {e}", spec.out_dir.display()))?;
     let _ = std::fs::write(spec.out_dir.join(".metadata_never_index"), "");
+    // The assembly directory needs its own marker: Spotlight's exclusion is
+    // per-directory, and this bundle is even less of an install than the dev one
+    // beside it — for most of its life it is not yet signed.
+    let staging_dir = spec.out_dir.join(CUT_APP_DIR);
+    std::fs::create_dir_all(&staging_dir)
+        .map_err(|e| format!("create {}: {e}", staging_dir.display()))?;
+    let _ = std::fs::write(staging_dir.join(".metadata_never_index"), "");
 
     // --- 2. lay out the bundle -------------------------------------------
     println!("==> assembling {}", app.display());

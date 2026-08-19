@@ -497,6 +497,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
 
     let owner = command(&repo, &["rev-parse", "HEAD"]);
     let journal = publish::Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "0.55.0".into(),
         build_number: 55,

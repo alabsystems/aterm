@@ -284,6 +284,7 @@ impl publish::Packager for FakePackager {
         _dist: &Path,
         _version: &str,
         notarized: bool,
+        _seeded: bool,
     ) -> ledger::Result<dmg::Packaged> {
         // Recorded so the ORDERING contract stays observable: the zip is built from a
         // bundle that has already been notarized and stapled, and the stripped-bundle
@@ -870,6 +871,7 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
     )
     .expect("the active packaging path");
     assert_eq!(
@@ -920,6 +922,7 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
     )
     .expect("the inactive packaging path");
     assert_eq!(
@@ -949,6 +952,7 @@ fn a_failed_bundle_notarization_stops_the_cut_before_anything_is_packaged() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
     );
     assert!(
         outcome.is_err(),
@@ -981,6 +985,7 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
     );
     assert!(
         outcome.is_err(),
@@ -1131,6 +1136,7 @@ fn each_artifact_gets_the_gatekeeper_assessment_it_actually_faces() {
 
 fn journal_with(done: &[&str]) -> Journal {
     Journal {
+        verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
         version: "9.9.9".into(),
         build_number: 1_783_918_101,

@@ -7615,6 +7615,28 @@ fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventC
     }
 }
 
+/// Input the SUCCESSOR queues while its adopted window is already visible but the
+/// handoff is not yet committed, replayed in arrival order once Commit lands.
+///
+/// This is the INCOMING side of the seam and is not the inverse of
+/// [`update_handoff_window_event_class`], which is the OUTGOING side's revocation
+/// policy. There a preedit revokes, because process-local composition state cannot
+/// survive `_exit`. Here the parent has already committed, the successor owns the
+/// composition, and dropping it loses text the user is watching themselves type.
+///
+/// IME belongs in this set, not just keys. `on_ime_commit` is the ONLY path that
+/// lowers a finished grapheme to the PTY, and a key the input method consumed never
+/// produces a `KeyboardInput` at all — the macOS backend suppresses it — so a
+/// dropped `Ime::Commit` cannot be reconstructed from anything else in the queue:
+/// the character is simply gone. That is every CJK writer and every `⌥e e` accent,
+/// in the one window an update creates (2026-08-19 round-6 audit).
+fn handoff_deferrable_input(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_) | WindowEvent::Ime(_)
+    )
+}
+
 /// Classify a user-event wake against a pending update overlap. PTY output and
 /// bells buffer through (the screen-carry digest is captured post-park at
 /// parser ground, so queued bytes replay through the child's fresh parser and
@@ -14858,10 +14880,8 @@ impl ApplicationHandler<Wake> for App {
             // Queue them and replay after Commit, bounded so a held key cannot grow
             // this without limit (2026-08-19 round-5 audit).
             const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
-            if matches!(
-                &event,
-                WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_)
-            ) && self.handoff_deferred_input.len() < MAX_DEFERRED_HANDOFF_INPUT
+            if handoff_deferrable_input(&event)
+                && self.handoff_deferred_input.len() < MAX_DEFERRED_HANDOFF_INPUT
             {
                 self.handoff_deferred_input.push((id, event));
             }
@@ -18497,8 +18517,8 @@ mod overlap_handoff_tests {
     #[test]
     fn overlap_event_classes_exempt_paint_tolerate_typing_and_revoke_structure() {
         use super::{
-            UpdateHandoffEventClass as Class, Wake, update_handoff_wake_class,
-            update_handoff_window_event_class,
+            UpdateHandoffEventClass as Class, Wake, handoff_deferrable_input,
+            update_handoff_wake_class, update_handoff_window_event_class,
         };
         use winit::dpi::{PhysicalPosition, PhysicalSize};
         use winit::event::{
@@ -18571,6 +18591,36 @@ mod overlap_handoff_tests {
                 update_handoff_window_event_class(&revoking),
                 Class::Revoking,
                 "{revoking:?} must revoke the overlap"
+            );
+        }
+
+        // THE INCOMING SIDE, which is a different question. A successor whose window
+        // is visible but uncommitted must QUEUE what the user types — including a
+        // composition, whose commit is the only path a finished grapheme has to the
+        // PTY. Dropping it loses the character outright (2026-08-19 round-6 audit).
+        for deferrable in [
+            WindowEvent::ModifiersChanged(winit::event::Modifiers::default()),
+            WindowEvent::Ime(winit::event::Ime::Preedit("に".to_string(), None)),
+            WindowEvent::Ime(winit::event::Ime::Commit("日本語".to_string())),
+            WindowEvent::Ime(winit::event::Ime::Enabled),
+            WindowEvent::Ime(winit::event::Ime::Disabled),
+        ] {
+            assert!(
+                handoff_deferrable_input(&deferrable),
+                "{deferrable:?} must be replayed after Commit, not discarded"
+            );
+        }
+        // Everything else still rides through or revokes; queueing it would replay
+        // stale geometry and pointer state into a window that has moved on.
+        for passthrough in [
+            WindowEvent::RedrawRequested,
+            WindowEvent::Resized(PhysicalSize::new(800, 600)),
+            WindowEvent::CloseRequested,
+            WindowEvent::HoveredFileCancelled,
+        ] {
+            assert!(
+                !handoff_deferrable_input(&passthrough),
+                "{passthrough:?} must not be queued as input"
             );
         }
 

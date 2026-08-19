@@ -991,7 +991,14 @@ pub fn run_verify(repo: &Path, version: Option<String>) -> Result<()> {
     let matching = journal
         .as_ref()
         .filter(|journal| journal.version == version);
-    let pubkey = matching.and_then(|journal| journal.signature_pubkey.as_deref());
+    // The VERIFICATION key, which is the release's own on a recovered cut and this
+    // machine's on every other (see `Journal::verify_pubkey`).
+    let pubkey = matching.and_then(|journal| {
+        journal
+            .verify_pubkey
+            .as_deref()
+            .or(journal.signature_pubkey.as_deref())
+    });
     post_publish(
         repo,
         &slug,
@@ -1200,7 +1207,12 @@ fn verification_pubkey_for(repo: &Path, version: &str) -> Result<Option<String>>
     if let Some(key) = journal
         .as_ref()
         .filter(|journal| journal.version == version)
-        .and_then(|journal| journal.signature_pubkey.clone())
+        .and_then(|journal| {
+            journal
+                .verify_pubkey
+                .clone()
+                .or_else(|| journal.signature_pubkey.clone())
+        })
     {
         return Ok(Some(key));
     }

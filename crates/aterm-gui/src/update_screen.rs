@@ -74,6 +74,14 @@ pub(crate) struct UpdateProjection {
     /// acquisition class (`manifest`, `pipeline`, …) says nothing about the stage
     /// in hand, so the "not applying" wording is reserved for this.
     pub(crate) apply_is_failing: bool,
+    /// Whether a replacement could be installed here AT ALL — false for a copy run
+    /// from the mounted disk image, a Gatekeeper-translocated download, or a
+    /// dev-marked build. EVERY surface on the page has to read it. Round five gave
+    /// the headline an honest sentence and left the rest of the page alone, so the
+    /// release-notes card went on printing "aterm X is the latest build" directly
+    /// under "This copy of aterm can't update itself" — a claim about a release
+    /// list this process never fetched (2026-08-19 round-6 audit).
+    pub(crate) installable: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
 }
@@ -185,6 +193,7 @@ impl UpdateState {
             checking: self.checking,
             failing_persistent: self.failing_persistent && self.enabled && !self.checking,
             apply_is_failing: self.apply_is_failing() && self.enabled && !self.checking,
+            installable: self.installable,
             headline: self.headline(),
             detail: self.detail(),
         }
@@ -940,6 +949,32 @@ mod tests {
             failing_persistent: false,
             rescues: 0,
         }
+    }
+
+    /// The projection is what every native surface reads, and it used to DROP
+    /// `installable` — which is how a page whose headline said "This copy of aterm
+    /// can't update itself" carried a card underneath saying the running version
+    /// was the latest build (2026-08-19 round-6 audit).
+    #[test]
+    fn the_projection_carries_whether_this_copy_can_be_replaced_at_all() {
+        let mut st = staged_status();
+        st.staged_build = None;
+        st.staged_version = None;
+        st.staged_dmg_sha256 = None;
+        st.changelog = None;
+        st.installable = false;
+        let projected = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+        assert!(
+            !projected.installable,
+            "a copy with no replaceable bundle must project that fact, not just headline it"
+        );
+        st.installable = true;
+        assert!(
+            UpdateState::from_status(828, "0.5.14", Some(&st), false)
+                .projection()
+                .installable,
+            "an ordinary install must stay installable"
+        );
     }
 
     fn geom(s: &UpdateState) -> SettingsGeom {

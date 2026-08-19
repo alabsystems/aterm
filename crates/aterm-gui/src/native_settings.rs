@@ -14016,6 +14016,10 @@ fn compact_update_headline(update: &UpdateProjection) -> String {
         "Ready".to_string()
     } else if update.failing_persistent {
         "Failing".to_string()
+    } else if !update.installable {
+        // Not "Current": nothing was compared, and this copy could not take a newer
+        // build if one existed (2026-08-19 round-6 audit).
+        "Can\u{2019}t update".to_string()
     } else if update.enabled {
         "Current".to_string()
     } else {
@@ -14034,6 +14038,8 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
         "Ready to install.".to_string()
     } else if update.failing_persistent {
         "Updates are failing.".to_string()
+    } else if !update.installable {
+        "This copy cannot be replaced in place.".to_string()
     } else if update.enabled {
         "No update staged.".to_string()
     } else {
@@ -14073,6 +14079,8 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         // Beside the Danger "Failing" headline; "None staged" there read as a
         // second, contradicting verdict (2026-08-19 audit).
         "Checks failing"
+    } else if !update.installable {
+        "Not installable"
     } else if update.enabled {
         "None staged"
     } else {
@@ -14375,6 +14383,14 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         // card contradicted the card above it every time (2026-08-19 round-5 audit).
         "Release notes appear here once a newer build is staged. This Mac is not \
          completing update checks — the cause is above."
+            .to_string()
+    } else if !update.installable {
+        // The headline above already says this copy can never replace itself, and
+        // nothing was ever fetched to compare against: no check thread starts when
+        // `bundle::resolve()` is None, so "is the latest build" here asserted a
+        // release list this process never read (2026-08-19 round-6 audit).
+        "Release notes appear here once a newer build is staged. This copy of aterm \
+         cannot be replaced in place \u{2014} the cause is above."
             .to_string()
     } else if update.enabled {
         format!(
