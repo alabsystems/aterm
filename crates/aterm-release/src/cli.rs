@@ -8,7 +8,9 @@
 //! [--min-build N] [--gate] [--rehearse OWNER/REPO] [--arm64-only]
 //! [--strand-pre-roster-clients]`,
 //! `recover vX.Y.Z <claim-sha> --old-publisher-stopped`, `status`,
-//! `verify [vX.Y.Z]`, `yank <build>`.
+//! `verify [vX.Y.Z]`,
+//! `yank <build> [--release-credentials <profile.toml>]
+//! [--strand-pre-roster-clients]`.
 
 use std::process::Command;
 
@@ -70,15 +72,22 @@ USAGE
   cargo ship status        version · ledger tail · dangling claims · newest
                            published build
   cargo ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
+        [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            explicit killed-machine recovery: exact-CAS rotate
                            its fence only after operator stop proof; abandon
                            unpublished state or validate + finish a published
                            exact-identity cut
   cargo ship verify [vX.Y.Z]
                            re-run the post-publish check anytime
-  cargo ship yank <build>  publish + fully verify a min_build-ratcheted
+  cargo ship yank <build> [--release-credentials <profile.toml>]
+        [--strand-pre-roster-clients]
+                           publish + fully verify a min_build-ratcheted
                            successor FIRST; only then remove the inert bad
-                           tag and release (crash-convergent cleanup)
+                           tag and release (crash-convergent cleanup). That
+                           successor is a REAL cut, so it takes the cut's two
+                           signing inputs and means exactly what they mean
+                           there — with the paper master armed it refuses
+                           pre-claim without them, having deleted nothing
 ";
 
 /// A parsed invocation. `Cut.abandon` rides outside [`publish::CutOptions`]
@@ -99,12 +108,19 @@ pub enum Cmd {
         version: String,
         owner: String,
         release_credentials: Option<std::path::PathBuf>,
+        /// `--no-draft-was-posted`: the operator has checked the releases page and
+        /// answers for a lost journal that no create POST ever landed.
+        no_draft_posted: bool,
     },
     Verify {
         version: Option<String>,
     },
     Yank {
         build: u64,
+        /// A yank PUBLISHES a successor before it deletes anything, so it takes
+        /// the cut's signing inputs — and since the paper master was armed it
+        /// must, or that cut refuses pre-claim. See [`verify::YankOptions`].
+        opts: verify::YankOptions,
     },
 }
 
@@ -191,6 +207,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             // else. It used to refuse every extra argument, which was correct when
             // the key was ambient and is wrong now that it must be named.
             let mut release_credentials: Option<std::path::PathBuf> = None;
+            let mut no_draft_posted = false;
             while let Some(arg) = it.next() {
                 if arg == "--release-credentials" {
                     if release_credentials.is_some() {
@@ -199,10 +216,16 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                     release_credentials = Some(std::path::PathBuf::from(
                         it.next().ok_or("--release-credentials needs a path")?,
                     ));
+                } else if arg == publish::RECOVERY_NO_DRAFT_POSTED_FLAG {
+                    if no_draft_posted {
+                        return Err("--no-draft-was-posted given twice".to_string());
+                    }
+                    no_draft_posted = true;
                 } else {
                     return Err(format!(
                         "recover takes a version, full claim SHA, --old-publisher-stopped, \
-                         and optionally --release-credentials (got {arg:?})"
+                         and optionally --release-credentials / --no-draft-was-posted \
+                         (got {arg:?})"
                     ));
                 }
             }
@@ -210,6 +233,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
                 version,
                 owner,
                 release_credentials,
+                no_draft_posted,
             })
         }
         "verify" => {
@@ -226,12 +250,44 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             let build: u64 = build
                 .parse()
                 .map_err(|_| format!("yank: {build:?} is not a build number (u64)"))?;
-            if let Some(extra) = it.next() {
-                return Err(format!(
-                    "yank takes exactly one build number (got {extra:?})"
-                ));
+            // Yank used to refuse every extra argument, which was right while a
+            // cut signed from an ambient key and asked nobody anything. With the
+            // paper master armed, the successor cut a yank publishes refuses
+            // pre-claim unless it is told which credentials profile signs and
+            // whether stranding pre-roster clients is acceptable — so a yank
+            // that cannot forward those answers cannot retire a bad build at
+            // all. Same two flags, same spellings, same meanings as `cut`.
+            //
+            // And ONLY those two: every other cut flag either contradicts what
+            // a yank's successor is (--dry-run/--rehearse publish nothing to
+            // prove, --resume belongs to the journal) or is the yank's own
+            // decision (--min-build is fixed at bad build + 1, --set-version at
+            // the workspace version), so accepting one could only mean ignoring
+            // it.
+            let mut opts = verify::YankOptions::default();
+            while let Some(flag) = it.next() {
+                match flag {
+                    "--release-credentials" => {
+                        if opts.release_credentials.is_some() {
+                            return Err("--release-credentials given twice".to_string());
+                        }
+                        opts.release_credentials = Some(std::path::PathBuf::from(
+                            it.next().ok_or("--release-credentials needs a path")?,
+                        ));
+                    }
+                    // An ACKNOWLEDGEMENT, not a parameter — publish::PreRosterClients
+                    // says why it is on the command line and in no file.
+                    publish::PRE_ROSTER_STRANDING_FLAG => opts.strand_pre_roster_clients = true,
+                    extra => {
+                        return Err(format!(
+                            "yank takes one build number and optionally --release-credentials \
+                             <profile.toml> / {PRE_ROSTER_STRANDING_FLAG} (got {extra:?})",
+                            PRE_ROSTER_STRANDING_FLAG = publish::PRE_ROSTER_STRANDING_FLAG,
+                        ));
+                    }
+                }
             }
-            Ok(Cmd::Yank { build })
+            Ok(Cmd::Yank { build, opts })
         }
         other => Err(format!("unknown command {other:?}")),
     }
@@ -351,6 +407,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             version,
             owner,
             release_credentials,
+            no_draft_posted,
         } => {
             // Recovery signs too, so it resolves credentials the SAME one-path way
             // as a fresh cut: the flag when given, else this machine's provisioned
@@ -360,10 +417,17 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
                 release_credentials.as_deref(),
                 &repo_root()?,
             )?;
-            publish::run_recover_lost(&repo_root()?, &version, &owner, true, creds.as_ref())
+            publish::run_recover_lost(
+                &repo_root()?,
+                &version,
+                &owner,
+                true,
+                no_draft_posted,
+                creds.as_ref(),
+            )
         }
         Cmd::Verify { version } => verify::run_verify(&repo_root()?, version),
-        Cmd::Yank { build } => verify::run_yank(&repo_root()?, build),
+        Cmd::Yank { build, opts } => verify::run_yank(&repo_root()?, build, &opts),
     }
 }
 

@@ -139,6 +139,13 @@ pub(crate) enum NativeUpdateReconcilePurpose {
     Startup,
     StageAvailable,
     ApplyControl,
+    /// Re-read the ledger with no announcement semantics: the background check's
+    /// health hook fired (a persistent failure streak), or the user opened
+    /// Settings ▸ Software Update. Either way the screen must show the CURRENT
+    /// verdict, not the last thing a stage or startup happened to import. Before
+    /// this existed a failing check staged nothing and requested nothing, so the
+    /// panel kept saying "You're up to date" while `health.toml` counted up.
+    Refresh,
 }
 
 #[must_use]
@@ -146,11 +153,12 @@ fn merge_reconcile_purpose(
     left: NativeUpdateReconcilePurpose,
     right: NativeUpdateReconcilePurpose,
 ) -> NativeUpdateReconcilePurpose {
-    use NativeUpdateReconcilePurpose::{ApplyControl, StageAvailable, Startup};
+    use NativeUpdateReconcilePurpose::{ApplyControl, Refresh, StageAvailable, Startup};
     match (left, right) {
         (ApplyControl, _) | (_, ApplyControl) => ApplyControl,
         (StageAvailable, _) | (_, StageAvailable) => StageAvailable,
-        (Startup, Startup) => Startup,
+        (Startup, _) | (_, Startup) => Startup,
+        (Refresh, Refresh) => Refresh,
     }
 }
 
@@ -226,6 +234,7 @@ fn read_native_update_reconcile_facts(
             aterm_update::installed_update_facts().map(|installed| InstalledUpdate {
                 build: installed.build_number,
                 commit: installed.git_commit,
+                version: installed.version,
                 receipt_build: installed.receipt_build_number,
                 receipt_dmg_sha256: installed.receipt_dmg_sha256,
             })
@@ -810,6 +819,8 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         changelog: status.changelog,
         outcome: status.outcome,
         failing_checks: status.failing_checks,
+        failing_persistent: status.failing_persistent,
+        failing_kind: status.failing_kind,
     }
 }
 
@@ -824,6 +835,8 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         changelog: None,
         outcome: message,
         failing_checks: 1,
+        failing_persistent: false,
+        failing_kind: String::new(),
     }
 }
 
@@ -4589,14 +4602,14 @@ impl App {
     fn spawn_staged_handoff_preverification(&mut self, build: u64) {
         let snapshot = self.native_updater_service.snapshot();
         let current_build = snapshot.current_build;
-        let commit = snapshot
-            .staged
-            .as_ref()
-            .filter(|staged| staged.build == build)
-            .and_then(|staged| staged.commit.clone());
+        let stage = snapshot.staged.as_ref().filter(|staged| staged.build == build);
+        // An ACTIVATION verifies the bundle under the executable, not a staged `.app`.
+        let installed_activation = stage.is_some_and(|staged| staged.is_installed_activation());
+        let commit = stage.and_then(|staged| staged.commit.clone());
+        let artifact = stage.map(|staged| staged.dmg_sha256.clone());
         // Without a pinned commit the worker's own call would be a different
         // (weaker) query, so do not cache a verdict that would not match it.
-        let Some(commit) = commit else {
+        let (Some(commit), Some(artifact)) = (commit, artifact) else {
             return;
         };
         {
@@ -4607,6 +4620,7 @@ impl App {
             if cached.as_ref().is_some_and(|entry| {
                 entry.build == build
                     && entry.commit == commit
+                    && entry.artifact == artifact
                     && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
             }) {
                 return;
@@ -4616,14 +4630,19 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("aterm-update-preverify".to_string())
             .spawn(move || {
-                let passed = aterm_update::preverify_staged_for_handoff(
-                    current_build,
-                    Some(build),
-                    Some(&commit),
-                );
+                let passed = if installed_activation {
+                    aterm_update::preverify_installed_for_handoff(current_build, build, &commit)
+                } else {
+                    aterm_update::preverify_staged_for_handoff(
+                        current_build,
+                        Some(build),
+                        Some(&commit),
+                    )
+                };
                 if let Err(error) = passed.as_ref() {
                     aterm_log::warn!(
-                        "update apply: staged build {build} failed pre-park verification: {error}"
+                        "update apply: {} build {build} failed pre-park verification: {error}",
+                        if installed_activation { "installed" } else { "staged" }
                     );
                 }
                 *slot
@@ -4632,6 +4651,7 @@ impl App {
                     Some(crate::HandoffPreverification {
                         build,
                         commit,
+                        artifact,
                         at: std::time::Instant::now(),
                         passed: passed.is_ok(),
                     });
@@ -5211,6 +5231,41 @@ impl App {
             installed,
         } = facts;
         let build = self.native_updater_service.snapshot().current_build;
+        // THE INSTALLED BUNDLE OUTRANKS A STAGED DOWNLOAD once it is newer than this
+        // process (the activation lane below): a downloaded stage still in memory is
+        // retired first, so the activation can be imported through the ordinary
+        // check/stage transitions (`request_check` refuses while a stage is held).
+        if let Some(installed) = installed.as_ref()
+            && installed.activation_stage(build, 0).is_some()
+        {
+            let retired = self
+                .native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .filter(|staged| !staged.is_installed_activation())
+                .map(|staged| staged.build);
+            if let Some(retired_build) = retired
+                && self.native_updater_service.retire_stage_for_activation()
+            {
+                self.auto_apply_intent = None;
+                // The retired download's manual-only latch retires with it (a latch
+                // naming a STRICTLY NEWER artifact survives — same rule as the
+                // `InstalledNeedsRelaunch` arm below).
+                if self
+                    .auto_apply_manual_only
+                    .is_some_and(|manual| manual.build <= retired_build)
+                {
+                    self.auto_apply_manual_only = None;
+                }
+                aterm_log::info!(
+                    "update sync: staged download {retired_build} retired — the bundle at this \
+                     path is already build {}, activating it instead",
+                    installed.build
+                );
+                self.publish_native_update_state();
+            }
+        }
         let current = self
             .native_updater_service
             .snapshot()
@@ -5274,7 +5329,8 @@ impl App {
                         // state and the remedy, and do not attribute the installer
                         // to a process this reducer cannot identify.
                         let message = format!(
-                            "Build {build} is already installed on disk; relaunch once to activate it"
+                            "Build {build} is already installed on disk; activating it in place \
+                             (a relaunch also picks it up)"
                         );
                         aterm_log::warn!("update sync: {message}");
                     }
@@ -5315,36 +5371,58 @@ impl App {
         // plist cannot change under a running process. That was a fixed point: every
         // later reconcile blanked the stage and reported no update was staged.
         let stage_floor = build.max(observed_stage_floor);
-        // The same bundle state is still meaningful — as a DISPOSITION, not as
-        // silence. The bytes are already on disk; only a relaunch activates them.
-        let installed_stage_build = installed.as_ref().and_then(|installed| {
-            (installed.build > build && durable_build == Some(installed.build))
-                .then_some(installed.build)
-        });
+        // THE INSTALLED BUNDLE IS NEWER THAN THIS PROCESS — activate it. The bytes are
+        // already at our own path (another producer put them there: the release
+        // cutter writing into the bundle it was launched from, a user dragging a new
+        // `.app` over the old one, a sibling aterm that swapped it, or our own
+        // overlap child that swapped and then failed to prove readiness). Until
+        // 2026-08-18 this state was reported as "relaunch once to activate it" and
+        // then left alone — a verified, notarized, installed build sat inert until a
+        // human read a log line. It is exactly a staged update whose swap has already
+        // happened, so it is imported as an ACTIVATION stage: the sealed identity of
+        // the installed bundle under `installed_activation_digest`, which then rides
+        // the ordinary stage → automatic apply (quiet preference, bounded grace,
+        // budget, manual-only latch) → seamless handoff path; the successor finds
+        // nothing to swap and simply IS the newer build, adopting every window and
+        // shell. Why not import the durable download as the stage instead: with the
+        // bundle already replaced, a swap-apply reaches the rollback-source proof and
+        // defers forever, since the installed bundle no longer matches the running
+        // build. Activation outranks any durable stage while the bundle is newer;
+        // the successor will observe that stage on its own terms.
+        let activation = installed
+            .as_ref()
+            .and_then(|installed| installed.activation_stage(build, 0));
         if let Some(mut durable) = durable {
-            let eligible = durable.enabled
-                && installed_stage_build.is_none()
-                && durable
-                    .staged_build
-                    .is_some_and(|staged| staged > stage_floor);
-            if !eligible {
-                durable.staged_build = None;
-                durable.staged_version = None;
-                durable.staged_commit = None;
-                durable.staged_dmg_sha256 = None;
+            if let Some(activation) = &activation {
+                durable.staged_build = Some(activation.build);
+                durable.staged_version = Some(activation.version.clone());
+                durable.staged_commit = activation.commit.clone();
+                durable.staged_dmg_sha256 = Some(activation.dmg_sha256.clone());
                 durable.changelog = None;
-            }
-            // Why not import it as an applicable stage: the apply would reach the
-            // rollback-source proof and Defer forever, since the installed bundle no
-            // longer matches the running build. Retire and say "relaunch" instead —
-            // and SAY it, so `update status` stops attributing this to a broken
-            // download pipeline when the bytes are already on disk.
-            if let Some(installed_build) = installed_stage_build {
-                durable.outcome =
-                    format!("build {installed_build} is installed; relaunch once to activate it");
-                aterm_log::warn!("update sync: {}", durable.outcome);
+                durable.outcome = format!(
+                    "build {} is already installed on disk; activating it in place",
+                    activation.build
+                );
+            } else {
+                let eligible = durable.enabled
+                    && durable
+                        .staged_build
+                        .is_some_and(|staged| staged > stage_floor);
+                if !eligible {
+                    durable.staged_build = None;
+                    durable.staged_version = None;
+                    durable.staged_commit = None;
+                    durable.staged_dmg_sha256 = None;
+                    durable.changelog = None;
+                }
             }
             if let CheckStart::Start(ticket) = self.native_updater_service.request_check() {
+                // Logged only when the import actually happens: while an activation is
+                // HELD, `request_check` refuses and every ~75 s reconcile lands here
+                // again with nothing new to say.
+                if activation.is_some() {
+                    aterm_log::info!("update sync: {}", durable.outcome);
+                }
                 let _ = self.native_updater_service.finish_check(ticket, durable);
                 self.publish_native_update_state();
             }
@@ -5949,7 +6027,8 @@ impl App {
                 self.finish_deferred_native_update_reconcile();
                 Some(UpdateOutcome::InstalledNeedsRelaunch {
                     build,
-                    message: "The update is already on disk; relaunch aterm once to activate it"
+                    message: "The update is already on disk; aterm activates it at the next \
+                              quiet moment (a relaunch also picks it up)"
                         .to_string(),
                 })
             }
@@ -7817,6 +7896,8 @@ mod tests {
                 "network failed".to_string()
             },
             failing_checks,
+            failing_persistent: false,
+            failing_kind: String::new(),
         }
     }
 
@@ -7848,72 +7929,129 @@ mod tests {
         InstalledUpdate {
             build,
             commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            version: None,
             receipt_build: None,
             receipt_dmg_sha256: None,
         }
     }
 
-    #[test]
-    fn a_bundle_already_carrying_the_stage_asks_for_a_relaunch_instead_of_going_silent() {
-        // The post-seamless-update survivor state: the on-disk bundle's sealed plist
-        // is ALREADY the staged build while the process still executes the older
-        // image. Folding that bundle into the newness floor made `staged > floor`
-        // false, so the reducer blanked the stage and reported that nothing newer was
-        // staged — permanently, because a sealed plist cannot change under a running
-        // process. Observed in the field: 0.12.0 held for 17.6 hours this way.
-        let mut app = App::headless_for_test();
-        let running = app.native_updater_service.snapshot().current_build;
-        assert!(running < 12, "fixture must model a newer staged build");
-        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
-            1,
-            1,
-            Some(status(Some(12), 0)),
-            Some(installed_update(12)),
-        ));
-        let outcome = app.native_updater_service.snapshot().outcome.clone();
+    /// The stage the ACTIVATION lane imports for an installed bundle: the sealed
+    /// identity under `installed_activation_digest`, and nothing else.
+    fn assert_activation_stage(app: &App, build: u64, commit: &str) {
+        let staged = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .clone()
+            .expect("an installed bundle newer than the process is imported as an activation stage");
+        assert_eq!(staged.build, build, "the activation names the installed build");
+        assert_eq!(staged.commit.as_deref(), Some(commit), "…and its sealed commit");
         assert!(
-            outcome.contains("relaunch"),
-            "an on-disk stage must be reported as needing a relaunch, got {outcome:?}"
+            staged.is_installed_activation(),
+            "…under the activation identity, not any DMG digest: {}",
+            staged.dmg_sha256
         );
-
-        // It must be a STABLE answer. The original defect was a fixed point: every
-        // later reconcile recomputed the same floor and blanked the stage again.
-        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
-            2,
-            2,
-            Some(status(Some(12), 0)),
-            Some(installed_update(12)),
-        ));
-        assert!(
-            app.native_updater_service
-                .snapshot()
-                .outcome
-                .contains("relaunch"),
-            "repeating the reconcile must not fall back to reporting nothing staged"
+        assert_eq!(
+            staged.dmg_sha256,
+            crate::native_updater_service::installed_activation_digest(build, commit)
         );
     }
 
+    /// THE ACTIVATION LANE (owner, 2026-08-18: "this cannot happen again"). The
+    /// post-seamless-update survivor state — the on-disk bundle's sealed plist is
+    /// ALREADY the staged build while the process still executes the older image —
+    /// used to be reported as "relaunch once to activate it" and then left alone: a
+    /// verified, installed build sat inert until a human read a log line (0.12.0 held
+    /// 17.6 hours that way; the v0.25.0 roll-forward stayed un-activated in the very
+    /// window it was cut from). Now that bundle is imported as an ACTIVATION stage —
+    /// the ordinary stage → automatic apply → seamless handoff path, with the bundle
+    /// under the executable as the artifact — and the answer is STABLE across
+    /// reconciles (the original defect was a fixed point that blanked the stage on
+    /// every pass; the activation is Unchanged while the bundle still backs it).
     #[test]
-    fn an_unrelated_installed_bundle_cannot_suppress_a_newer_stage() {
-        // The regression the floor was accidentally providing cover for: an installed
-        // bundle NEWER than the running image but NOT the staged artifact must not
-        // veto the stage. Newness is the stager's test against the running image.
+    fn a_bundle_newer_than_the_process_becomes_an_activation_stage_and_stays_one() {
         let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        assert!(running < 12, "fixture must model a newer installed build");
+        let installed = installed_update(12);
         let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
             1,
             1,
             Some(status(Some(12), 0)),
-            Some(installed_update(11)),
+            Some(installed.clone()),
+        ));
+        assert_activation_stage(&app, 12, &installed.commit);
+        let outcome = app.native_updater_service.snapshot().outcome.clone();
+        assert!(
+            outcome.contains("already installed") && outcome.contains("activating"),
+            "the durable outcome says the bytes are on disk and being activated, got {outcome:?}"
+        );
+
+        // STABLE: the same facts again keep the same activation stage (no retire,
+        // no re-import churn — the automatic intent would be reset every pass).
+        let before = app.native_updater_service.snapshot().staged.clone();
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            2,
+            2,
+            Some(status(Some(12), 0)),
+            Some(installed.clone()),
         ));
         assert_eq!(
-            app.native_updater_service
-                .snapshot()
-                .staged
-                .as_ref()
-                .map(|stage| stage.build),
-            Some(12),
-            "a newer stage must still import when the installed bundle is not that stage"
+            app.native_updater_service.snapshot().staged,
+            before,
+            "repeating the reconcile must not disturb the activation stage"
         );
+
+        // AND IT RETIRES WHEN THE BUNDLE MOVES ON: a bundle that is no longer newer
+        // (rolled back under us) drops the activation instead of activating stale
+        // bytes; the next observation imports whatever is really there.
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            3,
+            3,
+            Some(status(None, 0)),
+            Some(installed_update(running)),
+        ));
+        assert!(
+            app.native_updater_service.snapshot().staged.is_none(),
+            "an activation whose bundle is no longer newer must retire"
+        );
+    }
+
+    /// A newer INSTALLED bundle outranks a newer staged DOWNLOAD: once the bundle
+    /// under the executable is not the running build, a swap-apply of any download
+    /// can no longer proceed (its rollback-source proof needs the running build on
+    /// disk), so the download stage retires and the activation takes its place —
+    /// the successor observes the download on its own terms. (Before the activation
+    /// lane this test asserted the opposite: that the download stayed staged while
+    /// the installed bundle "got no vote" — which left the machine wedged: a stage
+    /// that could never apply and a bundle that never activated.)
+    #[test]
+    fn a_newer_installed_bundle_outranks_a_newer_staged_download() {
+        let mut app = App::headless_for_test();
+        let installed = installed_update(11);
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            1,
+            1,
+            Some(status(Some(12), 0)),
+            Some(installed.clone()),
+        ));
+        assert_activation_stage(&app, 11, &installed.commit);
+    }
+
+    /// The drag-a-new-app-over-the-old-one case: NOTHING is staged or downloaded,
+    /// the bundle under the executable is simply newer. That is an activation too —
+    /// the lane keys off the bare installed fact, not off any durable stage marker.
+    #[test]
+    fn a_newer_installed_bundle_with_nothing_staged_is_still_an_activation() {
+        let mut app = App::headless_for_test();
+        let installed = installed_update(12);
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            1,
+            1,
+            Some(status(None, 0)),
+            Some(installed.clone()),
+        ));
+        assert_activation_stage(&app, 12, &installed.commit);
     }
 
     #[test]
@@ -7975,6 +8113,18 @@ mod tests {
                 .map(|stage| stage.dmg_sha256.as_str()),
             Some("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd")
         );
+    }
+
+    #[test]
+    fn a_refresh_never_outranks_a_purpose_that_announces_or_applies() {
+        use NativeUpdateReconcilePurpose::{ApplyControl, Refresh, StageAvailable, Startup};
+        for other in [Startup, StageAvailable, ApplyControl] {
+            assert_eq!(merge_reconcile_purpose(Refresh, other), other);
+            assert_eq!(merge_reconcile_purpose(other, Refresh), other);
+        }
+        assert_eq!(merge_reconcile_purpose(Refresh, Refresh), Refresh);
+        // And a startup fact import coalesced with a refresh still announces.
+        assert_eq!(merge_reconcile_purpose(Startup, Refresh), Startup);
     }
 
     #[test]
@@ -8847,6 +8997,7 @@ mod tests {
             Some(crate::HandoffPreverification {
                 build,
                 commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                artifact: "ab".repeat(32),
                 at: std::time::Instant::now(),
                 passed: true,
             });
@@ -8878,6 +9029,8 @@ mod tests {
                     changelog: None,
                     outcome: "staged".to_string(),
                     failing_checks: 0,
+                    failing_persistent: false,
+                    failing_kind: String::new(),
                 },
             ),
             CheckCompletion::Reduced,
@@ -8942,20 +9095,32 @@ mod tests {
                         changelog: None,
                         outcome: "staged".to_string(),
                         failing_checks: 0,
+                        failing_persistent: false,
+                        failing_kind: String::new(),
                     }),
                     Some(InstalledUpdate {
                         build,
                         commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                        version: None,
                         receipt_build: Some(build),
                         receipt_dmg_sha256: Some("ab".repeat(32)),
                     }),
                 ),
             );
 
+            // THE DOWNLOAD STAGE RETIRES AND THE ACTIVATION TAKES ITS PLACE (the
+            // installed bundle is newer than the process): the stage on record is
+            // now the activation of `build`, under the activation identity — not
+            // the retired download's DMG digest.
+            let staged = app
+                .native_updater_service
+                .snapshot()
+                .staged
+                .clone()
+                .expect("PRECONDITION: the newer installed bundle became an activation stage");
             assert!(
-                app.native_updater_service.snapshot().staged.is_none(),
-                "PRECONDITION: the receipt must actually retire the stage, or this \
-                 reconcile never reached the disposition under test"
+                staged.build == build && staged.is_installed_activation(),
+                "the stage on record is the activation, got {staged:?}"
             );
             assert_eq!(
                 app.auto_apply_manual_only.is_none(),
@@ -9448,6 +9613,55 @@ mod tests {
     /// WHAT IS THEREFORE PINNED: the strongest APPLIED state a surviving process can
     /// observe — the stage is CONSUMED and the durable outcome names the installed
     /// build — reached only after a re-armed automatic apply really attempted again.
+    /// The pre-park verdict is about ONE artifact. A downloaded `.app` and the same
+    /// build already installed under our executable share (build, commit) but are
+    /// different bytes checked by different probes; the download's `passed` must
+    /// not answer for the activation (that would skip the last codesign check
+    /// before an exec that swaps nothing), and a corrupt download's `false` must
+    /// not refuse a good installed bundle.
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_park_verdict_answers_only_for_its_own_artifact() {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        let download = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+        let activation = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &crate::native_updater_service::installed_activation_digest(
+                build,
+                PREFLIGHT_TEST_COMMIT,
+            ),
+        );
+        assert_eq!(app.cached_handoff_preverification(&download), Some(true));
+        assert_eq!(
+            app.cached_handoff_preverification(&activation),
+            None,
+            "the download's verdict must not be reused for the installed bundle"
+        );
+        *app.handoff_preverified
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::HandoffPreverification {
+                build,
+                commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                artifact: "ab".repeat(32),
+                at: std::time::Instant::now(),
+                passed: false,
+            });
+        assert_eq!(app.cached_handoff_preverification(&download), Some(false));
+        assert_eq!(
+            app.cached_handoff_preverification(&activation),
+            None,
+            "a corrupt download must not refuse a good installed bundle"
+        );
+    }
+
     #[test]
     fn a_busy_user_eventually_gets_the_update() {
         let mut app = App::headless_for_test();
@@ -9684,10 +9898,13 @@ mod tests {
                 changelog: None,
                 outcome: "staged".to_string(),
                 failing_checks: 0,
+                failing_persistent: false,
+                failing_kind: String::new(),
             }),
             Some(InstalledUpdate {
                 build,
                 commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                version: None,
                 receipt_build: Some(build),
                 receipt_dmg_sha256: Some("ab".repeat(32)),
             }),
@@ -9695,46 +9912,46 @@ mod tests {
         app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Startup, facts);
 
         // THE ASSERTION THE OLD TESTS DID NOT MAKE, ON THE PATH A WORKER TAKES: the
-        // update is INSTALLED. The stage is consumed (a retained one would keep
-        // painting an update arrow for bytes already on disk) and the durable
-        // outcome — the same string `aterm-ctl update status` prints — names the
-        // installed build.
+        // update is INSTALLED — the child swapped the bundle before it failed to
+        // commit — and the surviving parent does not just SAY "relaunch": the
+        // installed bundle is newer than this process, so it becomes an ACTIVATION
+        // stage under its own identity, and the automatic lane arms for it with a
+        // fresh, bounded budget (the failed swap's DMG digest and its manual-only
+        // latch are about the download, which has retired with the stage).
+        let staged = app
+            .native_updater_service
+            .snapshot()
+            .staged
+            .clone()
+            .expect("the swapped-in bundle becomes an activation stage");
         assert!(
-            app.native_updater_service.snapshot().staged.is_none(),
-            "the swap consumed the stage; a surviving stage means the receipt was \
-             not believed and the lane would re-attempt installed bytes forever"
+            staged.build == build && staged.is_installed_activation(),
+            "the stage on record is the activation of the installed build, got {staged:?}"
         );
         let outcome = app.native_updater_service.snapshot().outcome.clone();
         assert!(
-            outcome.contains(&format!("build {build} is installed")),
+            outcome.contains(&format!("build {build} is already installed")),
             "the durable outcome names the installed build, got {outcome:?}"
         );
         assert!(
-            outcome.contains("relaunch"),
-            "…and says the one thing left to do about it, got {outcome:?}"
+            outcome.contains("activating"),
+            "…and says what happens next — activation, not a manual relaunch, got {outcome:?}"
         );
         assert!(
-            app.auto_apply_intent.is_none(),
-            "an installed artifact must not leave an intent re-probing"
+            app.auto_apply_intent
+                .is_some_and(|intent| intent.build == build
+                    && intent.dmg_sha256 == decode_dmg_sha256(&staged.dmg_sha256).unwrap()),
+            "the automatic lane arms for the ACTIVATION (its own identity, its own budget)"
         );
-        // …AND NOT A LATCH EITHER. A manual-only latch is a promise about ONE
-        // artifact — do not spend automatic apply on these bytes — and the reducer
-        // has just retired those exact bytes as INSTALLED. Nothing is left for the
-        // promise to refuse, so keeping it is state that says something false about
-        // the world; `arm` refusing a no-longer-newer build is a second mechanism
-        // agreeing, not a reason to leave the first one lying.
+        // …AND THE DOWNLOAD'S LATCH IS GONE. A manual-only latch is a promise about
+        // ONE artifact — do not spend automatic apply on these bytes — and the
+        // reducer has just retired those exact bytes with their stage. Nothing is
+        // left for the promise to refuse, so keeping it is state that says something
+        // false about the world.
         assert!(
             app.auto_apply_manual_only.is_none(),
-            "the retired-as-installed build must not keep its manual-only latch"
+            "the retired download must not keep its manual-only latch"
         );
-        {
-            use crate::native_update_auto_intent::{AttemptDisposition, AttemptResult, finish};
-            assert_eq!(
-                finish(AttemptResult::InstalledNeedsRelaunch),
-                AttemptDisposition::Complete,
-                "and the lane's own policy calls that outcome COMPLETE, not a retry"
-            );
-        }
         assert_no_probe_disturbance(&app, wid, working_tab);
     }
 

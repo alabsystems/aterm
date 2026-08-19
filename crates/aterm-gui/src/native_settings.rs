@@ -14001,6 +14001,8 @@ fn compact_update_headline(update: &UpdateProjection) -> String {
         "Checking".to_string()
     } else if update.staged.is_some() {
         "Ready".to_string()
+    } else if update.failing_persistent {
+        "Failing".to_string()
     } else if update.enabled {
         "Current".to_string()
     } else {
@@ -14013,6 +14015,8 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
         "Contacting service…".to_string()
     } else if update.staged.is_some() {
         "Ready to install.".to_string()
+    } else if update.failing_persistent {
+        "Updates are failing.".to_string()
     } else if update.enabled {
         "No update staged.".to_string()
     } else {
@@ -14090,7 +14094,9 @@ fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (U
         identity_width,
         11.0 * crate::native_appearance::text_scale(),
     );
-    let headline_style = if large_type {
+    let headline_style = if update.failing_persistent {
+        StyleRef::Danger
+    } else if large_type {
         StyleRef::Plain
     } else {
         StyleRef::Hero
@@ -14413,7 +14419,14 @@ fn update_status_card(
             UiContent::Text(TextSpec {
                 text: visual_headline,
                 role: SemanticRole::Heading,
-                style: StyleRef::Hero,
+                // A persistent failure is a warning, not a hero: the same treatment
+                // the configuration-reload warning gets, so it cannot be mistaken
+                // for the accent "You're up to date" line it replaces.
+                style: if update.failing_persistent {
+                    StyleRef::Danger
+                } else {
+                    StyleRef::Hero
+                },
             }),
         )
         .layout(Layout::default().height(Length::Fixed(headline_height))),

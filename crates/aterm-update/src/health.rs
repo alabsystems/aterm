@@ -98,6 +98,32 @@ pub struct Health {
     /// healthy download check — see the module SCOPE note.
     #[serde(default)]
     pub apply_failures: u32,
+    /// RFC3339 UTC at which each class's CURRENT streak began (empty when that
+    /// class is not failing) — the class's own clock, read via
+    /// [`Self::class_since`].
+    ///
+    /// [`Self::failing_since`] is any-class by definition: it stamps the moment the
+    /// ledger stopped being clean and does not move again until it is. Reporting a
+    /// per-class streak COUNT beside it therefore splices two different failures
+    /// into one sentence. Observed in the field on 2026-08-17: a machine carrying a
+    /// long-standing `apply` streak from 08-11 met a `manifest` failure on 08-15 and
+    /// `update status` read "FAILING (6 consecutive checks since 2026-08-11…)" — the
+    /// count from one class, the date from another, describing a problem as four
+    /// days older than it was and sending the diagnosis down the wrong lane.
+    #[serde(default)]
+    pub network_since: String,
+    /// See [`Self::network_since`].
+    #[serde(default)]
+    pub pipeline_since: String,
+    /// See [`Self::network_since`].
+    #[serde(default)]
+    pub manifest_since: String,
+    /// See [`Self::network_since`].
+    #[serde(default)]
+    pub stage_since: String,
+    /// See [`Self::network_since`].
+    #[serde(default)]
+    pub apply_since: String,
     /// Class of the MOST RECENT failure (`""` when healthy).
     #[serde(default)]
     pub kind: String,
@@ -192,6 +218,64 @@ impl Health {
             .saturating_add(self.apply_failures)
     }
 
+    /// Consecutive failed checks of the ACQUISITION classes only — network,
+    /// pipeline, manifest, stage — which is what `failing_checks` means.
+    ///
+    /// The apply streak is deliberately excluded. It is reported separately as
+    /// `failing_applies` because it answers a different question ("can this machine
+    /// move to an update?" versus "can it fetch one?"), and summing the two made the
+    /// `failing=` field double-count: a machine with two network blips beside a
+    /// standing apply streak of 7 printed `failing=9:network failing_applies=7` —
+    /// nine consecutive failures of class `network` when two checks had failed —
+    /// sending a reader after an acquisition fault that did not exist.
+    #[must_use]
+    pub fn acquisition_failures(&self) -> u32 {
+        self.network_failures
+            .saturating_add(self.pipeline_failures)
+            .saturating_add(self.manifest_failures)
+            .saturating_add(self.stage_failures)
+    }
+
+    /// The `(streak, start-of-streak)` pair a failure class owns, or `None` for an
+    /// unrecognised kind. Both halves move together — that is the point: a count
+    /// without its own clock is what produced the spliced status line
+    /// [`Self::network_since`] documents.
+    fn class_streak_mut(&mut self, kind: &str) -> Option<(&mut u32, &mut String)> {
+        match kind {
+            "network" => Some((&mut self.network_failures, &mut self.network_since)),
+            "pipeline" => Some((&mut self.pipeline_failures, &mut self.pipeline_since)),
+            "manifest" => Some((&mut self.manifest_failures, &mut self.manifest_since)),
+            "stage" => Some((&mut self.stage_failures, &mut self.stage_since)),
+            "apply" => Some((&mut self.apply_failures, &mut self.apply_since)),
+            _ => None,
+        }
+    }
+
+    /// When THIS class's current streak began — the timestamp to print beside that
+    /// class's count.
+    ///
+    /// Falls back to [`Self::failing_since`] when the class carries no stamp, which
+    /// covers both an unrecognised kind and a ledger written before per-class clocks
+    /// existed. The fallback is the any-class answer such a ledger has always given,
+    /// so an in-place upgrade never prints an empty date; the class stamp appears on
+    /// the next failure that starts a streak.
+    #[must_use]
+    pub fn class_since(&self, kind: &str) -> &str {
+        let since = match kind {
+            "network" => &self.network_since,
+            "pipeline" => &self.pipeline_since,
+            "manifest" => &self.manifest_since,
+            "stage" => &self.stage_since,
+            "apply" => &self.apply_since,
+            _ => &self.failing_since,
+        };
+        if since.is_empty() {
+            &self.failing_since
+        } else {
+            since
+        }
+    }
+
     /// The class whose streak has crossed [`PERSISTENT_AFTER`], with its own count —
     /// or `None` while nothing is persistently failing.
     ///
@@ -256,14 +340,23 @@ impl Health {
         // update.
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
+        Self::advance_failure_streak(&mut h, kind, error);
+        h.write(path);
+        h
+    }
+
+    /// The streak arithmetic shared by [`Self::record_failure`] and
+    /// [`Self::record_apply_failure`], applied to an ALREADY-LOCKED, already-read
+    /// record so a caller that must do more under the same lock can.
+    fn advance_failure_streak(h: &mut Self, kind: &str, error: &str) {
         let now = crate::install::now_rfc3339();
-        match kind {
-            "network" => h.network_failures = h.network_failures.saturating_add(1),
-            "pipeline" => h.pipeline_failures = h.pipeline_failures.saturating_add(1),
-            "manifest" => h.manifest_failures = h.manifest_failures.saturating_add(1),
-            "stage" => h.stage_failures = h.stage_failures.saturating_add(1),
-            "apply" => h.apply_failures = h.apply_failures.saturating_add(1),
-            _ => {}
+        // The class's clock starts when ITS streak does. An unknown kind still
+        // counts toward `kind`/timestamps below, exactly as before.
+        if let Some((count, since)) = h.class_streak_mut(kind) {
+            if *count == 0 {
+                *since = now.clone();
+            }
+            *count = count.saturating_add(1);
         }
         h.kind = kind.to_string();
         if h.failing_since.is_empty() {
@@ -272,8 +365,6 @@ impl Health {
         h.last_failure_at = now;
         // Cap the stored error so a pathological message can't bloat the ledger.
         h.last_error = error.chars().take(400).collect();
-        h.write(path);
-        h
     }
 
     /// Record a fully-healthy CHECK: every ACQUISITION streak clears.
@@ -302,8 +393,13 @@ impl Health {
         h.pipeline_failures = 0;
         h.manifest_failures = 0;
         h.stage_failures = 0;
+        h.network_since = String::new();
+        h.pipeline_since = String::new();
+        h.manifest_since = String::new();
+        h.stage_since = String::new();
         h.apply_failures = apply_streak_survives;
         if apply_streak_survives == 0 {
+            h.apply_since = String::new();
             h.kind = String::new();
             h.failing_since = String::new();
             h.last_failure_at = String::new();
@@ -320,16 +416,86 @@ impl Health {
         h
     }
 
+    /// The acquisition class whose streak still stands, in the same
+    /// severity-of-diagnosis order [`Self::persistent_class`] uses — or `None` when
+    /// every acquisition streak is clear.
+    ///
+    /// Exists because `""` is the documented HEALTHY sentinel for [`Self::kind`], so
+    /// blanking that field while a streak is still standing reports a healthy class on
+    /// an unhealthy machine.
+    #[must_use]
+    fn standing_acquisition_class(&self) -> Option<&'static str> {
+        [
+            ("pipeline", self.pipeline_failures),
+            ("manifest", self.manifest_failures),
+            ("stage", self.stage_failures),
+            ("network", self.network_failures),
+        ]
+        .into_iter()
+        .find(|(_, n)| *n > 0)
+        .map(|(class, _)| class)
+    }
+
+    /// Record a check that proved ACQUISITION works but deliberately did not attempt a
+    /// stage — the `FailedMark` backoff path, where a known-bad candidate is being
+    /// skipped on purpose.
+    ///
+    /// Clears network/pipeline/manifest and their clocks, and preserves BOTH
+    /// `stage_failures` and `apply_failures` (with their clocks). Preserving the stage
+    /// streak is the whole point: the reason this check skipped the download is the
+    /// memo that streak represents, so a full [`Self::record_success`] here would erase
+    /// the evidence of the very thing being backed off from, and the machine would
+    /// report a clean stage lane for as long as it kept refusing to use it.
+    ///
+    /// Same shape, and the same reasoning, as `record_success` preserving the apply
+    /// streak — see this module's SCOPE note.
+    pub fn record_acquisition_success(path: &Path) -> Self {
+        let _lock = Self::lock(path);
+        let mut h = Self::read(path);
+        if h.network_failures == 0 && h.pipeline_failures == 0 && h.manifest_failures == 0 {
+            return h;
+        }
+        h.network_failures = 0;
+        h.pipeline_failures = 0;
+        h.manifest_failures = 0;
+        h.network_since = String::new();
+        h.pipeline_since = String::new();
+        h.manifest_since = String::new();
+        if h.total_failures() == 0 {
+            h.kind = String::new();
+            h.failing_since = String::new();
+            h.last_failure_at = String::new();
+            h.last_error = String::new();
+        } else if let Some(standing) = h.standing_acquisition_class() {
+            h.kind = standing.to_string();
+        } else {
+            // Only the apply streak survived; describe the ledger by IT, exactly as
+            // `record_success` does, or status would explain a standing apply failure
+            // with whatever acquisition message happened to land last.
+            h.kind = "apply".to_string();
+            h.last_error = h.last_apply_error.clone();
+        }
+        h.write(path);
+        h
+    }
+
     /// Record that a staged build FAILED to become the running build, as
     /// observed by `current_build`. `reason` is the typed handoff/apply
     /// outcome (e.g. `ChildDied`, `AdoptionMismatch`, `ActivityRevoked`,
     /// `re-exec failed`), stored for `update status`.
     pub fn record_apply_failure(path: &Path, current_build: u64, reason: &str) -> Self {
-        Self::record_failure(path, "apply", reason);
-        // Mirror the reason into the apply-owned slot so a later acquisition-lane
-        // failure cannot overwrite the description of a still-standing apply streak.
+        // ONE LOCK SCOPE, deliberately. This used to call `record_failure` (which
+        // locks, writes and releases) and then re-lock to mirror the reason. Between
+        // the two scopes another writer could land — `expire_stale_apply_streak` runs
+        // from the check lane on its own cadence — read the just-incremented ledger,
+        // decide the streak was recorded by a different build, zero it, and write. The
+        // increment was then durably gone, and the apply lane under-counted exactly
+        // when it was failing often enough to interleave.
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
+        Self::advance_failure_streak(&mut h, "apply", reason);
+        // Mirror the reason into the apply-owned slot so a later acquisition-lane
+        // failure cannot overwrite the description of a still-standing apply streak.
         h.last_apply_error = reason.chars().take(400).collect();
         h.last_apply_failure_at = crate::install::now_rfc3339();
         h.last_apply_failure_build = current_build;
@@ -358,6 +524,7 @@ impl Health {
             return h;
         }
         h.apply_failures = 0;
+        h.apply_since = String::new();
         h.last_apply_error = String::new();
         h.last_apply_failure_at = String::new();
         h.last_apply_failure_build = 0;
@@ -367,8 +534,14 @@ impl Health {
             h.last_failure_at = String::new();
             h.last_error = String::new();
         } else if h.kind == "apply" {
-            // Some acquisition streak still stands; let it own the headline.
-            h.kind = String::new();
+            // Some acquisition streak still stands; let it own the headline. NAMING it
+            // matters: `kind == ""` is the documented HEALTHY sentinel, so blanking it
+            // here reported a healthy class on a machine with a live streak, and
+            // `update status` printed a non-zero `failing=` beside no class at all.
+            h.kind = h
+                .standing_acquisition_class()
+                .unwrap_or_default()
+                .to_string();
             h.last_error = String::new();
         }
         h.write(path);
@@ -423,6 +596,7 @@ impl Health {
         h.clear_apply_refusal();
         if h.apply_failures > 0 {
             h.apply_failures = 0;
+            h.apply_since = String::new();
             h.last_apply_error = String::new();
             if h.total_failures() == 0 {
                 h.kind = String::new();
@@ -431,8 +605,12 @@ impl Health {
                 h.last_error = String::new();
             } else if h.kind == "apply" {
                 // Acquisition failures are still standing; stop describing the ledger
-                // by the apply failure that just resolved.
-                h.kind = String::new();
+                // by the apply failure that just resolved — and NAME the one that is
+                // still standing, because `kind == ""` means healthy.
+                h.kind = h
+                    .standing_acquisition_class()
+                    .unwrap_or_default()
+                    .to_string();
             }
         }
         h.write(path);
@@ -482,6 +660,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("health.toml")
+    }
+
+    /// The stage-backoff check proves ACQUISITION works while deliberately declining to
+    /// download, so it must not vouch for the lane it just refused to exercise. A full
+    /// `record_success` there erases the very streak the `FailedMark` memo exists
+    /// because of, and the machine then reports a clean stage lane for as long as it
+    /// keeps skipping the candidate.
+    #[test]
+    fn an_acquisition_only_success_preserves_the_stage_and_apply_streaks() {
+        let p = tmp("acquisition-success");
+        Health::record_failure(&p, "network", "dns");
+        Health::record_failure(&p, "stage", "bundle would not verify");
+        Health::record_apply_failure(&p, 9, "ActivityRevoked");
+        let h = Health::read(&p);
+        assert_eq!((h.network_failures, h.stage_failures, h.apply_failures), (1, 1, 1));
+
+        let h = Health::record_acquisition_success(&p);
+        assert_eq!(h.network_failures, 0, "acquisition streak clears");
+        assert!(h.network_since.is_empty(), "and so does its clock");
+        assert_eq!(h.stage_failures, 1, "the skipped lane keeps its streak");
+        assert!(!h.stage_since.is_empty(), "and its clock");
+        assert_eq!(h.apply_failures, 1, "a check never vouches for the apply lane");
+        assert_eq!(h.kind, "stage", "the standing streak owns the headline");
+    }
+
+    /// `kind == ""` is the documented HEALTHY sentinel, so the apply-lane clears must
+    /// never blank it while an acquisition streak is still standing — that reported a
+    /// healthy class on an unhealthy machine, and `update status` printed a non-zero
+    /// `failing=` beside no class at all.
+    #[test]
+    fn clearing_the_apply_lane_names_the_streak_that_is_still_standing() {
+        let p = tmp("apply-clear-names-standing");
+        Health::record_failure(&p, "manifest", "bad signature");
+        Health::record_apply_failure(&p, 11, "AdoptionMismatch");
+        assert_eq!(Health::read(&p).kind, "apply");
+
+        let h = Health::record_apply_success(&p);
+        assert_eq!(h.apply_failures, 0);
+        assert_eq!(h.manifest_failures, 1, "the acquisition streak survives");
+        assert_eq!(h.kind, "manifest", "and is NAMED, not blanked to healthy");
+
+        // The expiry path is the same rule from the other direction.
+        let p = tmp("apply-expire-names-standing");
+        Health::record_failure(&p, "pipeline", "asset fetch failed");
+        Health::record_apply_failure(&p, 11, "ChildDied");
+        let h = Health::expire_stale_apply_streak(&p, 12);
+        assert_eq!(h.apply_failures, 0, "a streak from another build is stale");
+        assert_eq!(h.pipeline_failures, 1);
+        assert_eq!(h.kind, "pipeline", "named, not blanked");
+    }
+
+    /// One lock scope: the apply-lane increment and the apply-owned reason must land
+    /// together. They used to be two locked writes with a window between them, and
+    /// `expire_stale_apply_streak` landing in that window durably dropped the
+    /// increment.
+    #[test]
+    fn an_apply_failure_records_its_streak_and_its_reason_together() {
+        let p = tmp("apply-failure-atomic");
+        let h = Health::record_apply_failure(&p, 77, "AdoptionMismatch");
+        assert_eq!(h.apply_failures, 1);
+        assert_eq!(h.kind, "apply");
+        assert_eq!(h.last_apply_error, "AdoptionMismatch");
+        assert_eq!(h.last_apply_failure_build, 77);
+        assert!(!h.apply_since.is_empty(), "the class clock started");
+        // The returned record must equal what a reader sees on disk — i.e. the whole
+        // mutation was one write, not a partial one another writer could interleave.
+        let reread = Health::read(&p);
+        assert_eq!(reread.apply_failures, h.apply_failures);
+        assert_eq!(reread.last_apply_error, h.last_apply_error);
+        assert_eq!(reread.last_apply_failure_build, h.last_apply_failure_build);
+    }
+
+    /// THE SPLICE THIS LEDGER USED TO REPORT. `failing_since` is any-class: it
+    /// stamps when the ledger stopped being clean and does not move again until it
+    /// is clean. A machine that had been failing to APPLY for days, and only later
+    /// met a bad manifest, therefore had its MANIFEST streak dated to the APPLY
+    /// streak's start — `update status` read "FAILING (6 consecutive checks since
+    /// <four days before the manifest problem existed>)". Each class owns its clock.
+    #[test]
+    fn each_failure_class_carries_its_own_clock() {
+        let p = tmp("per-class-clock");
+        Health::record_apply_failure(&p, 5, "ActivityRevoked");
+        let after_apply = Health::read(&p);
+        assert_eq!(after_apply.apply_failures, 1);
+        assert!(!after_apply.failing_since.is_empty());
+        let unhealthy_since = after_apply.failing_since.clone();
+        assert_eq!(after_apply.class_since("apply"), unhealthy_since);
+
+        // The manifest lane breaks LATER. The any-class stamp must not move (the
+        // ledger never became clean), and the manifest class starts its own clock.
+        Health::record_failure(&p, "manifest", "bad signature");
+        let h = Health::read(&p);
+        assert_eq!(
+            h.failing_since, unhealthy_since,
+            "the any-class stamp is sticky until the ledger is clean"
+        );
+        assert_eq!(h.manifest_failures, 1);
+        assert_eq!(
+            h.class_since("apply"),
+            unhealthy_since,
+            "the apply streak still dates from when IT started"
+        );
+        assert!(
+            !h.manifest_since.is_empty(),
+            "the manifest class started its own clock"
+        );
+
+        // A healthy check clears the acquisition class AND its clock; the apply
+        // streak and its clock survive, because a check vouches for neither.
+        Health::record_success(&p);
+        let h = Health::read(&p);
+        assert_eq!(h.manifest_failures, 0);
+        assert!(
+            h.manifest_since.is_empty(),
+            "a cleared class must not keep a start time"
+        );
+        assert_eq!(h.apply_failures, 1);
+        assert_eq!(h.class_since("apply"), unhealthy_since);
+
+        // A real apply success clears the last class and its clock.
+        Health::record_apply_success(&p);
+        let h = Health::read(&p);
+        assert_eq!(h.apply_failures, 0);
+        assert!(h.apply_since.is_empty());
+    }
+
+    /// A ledger written BEFORE per-class clocks existed carries no class stamp.
+    /// Reading one must not print an empty date: it falls back to the any-class
+    /// answer such a ledger has always given, so an in-place upgrade is silent.
+    #[test]
+    fn a_pre_upgrade_ledger_falls_back_to_the_any_class_clock() {
+        let h = Health {
+            manifest_failures: 6,
+            failing_since: "2026-08-11T07:16:17Z".to_string(),
+            ..Health::default()
+        };
+        assert!(h.manifest_since.is_empty(), "the field is new; old files lack it");
+        assert_eq!(h.class_since("manifest"), "2026-08-11T07:16:17Z");
+        assert_eq!(
+            h.class_since("not-a-class"),
+            "2026-08-11T07:16:17Z",
+            "an unrecognised kind falls back too"
+        );
     }
 
     /// THE regression this class exists for. Through 2026-07 the apply lane failed

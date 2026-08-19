@@ -15,7 +15,7 @@
 //! tests/resume.rs pins the table), `cut --abandon`, and `ship yank`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use aterm_update_core::Manifest;
@@ -1413,11 +1413,76 @@ fn delete_yank_release_convergently(
     Ok(())
 }
 
+/// What `cargo ship yank` must be told before it can publish anything: the
+/// SIGNING inputs of the successor cut, and only those.
+///
+/// A yank's first act is a real, published cut — [`run_yank`] publishes the
+/// ratcheted successor before it deletes one byte — so it is held to every rule
+/// a cut is held to. It needed no inputs at all for as long as an unarmed tree
+/// signed from an ambient key and asked nobody anything. Arming the paper
+/// master (`aterm_update_core::pins::PAPER_MASTER_PUBKEYS`, 2026-08-15) changed
+/// what a publish requires, in two ways that both land on this command:
+///
+/// * `publish::channel_signature_policy` refuses pre-claim when no signing
+///   material resolves at all, and the only material that resolves without the
+///   flag — the bare `~/.aterm/machine.key` fallback in
+///   `sign::ReleaseCredentials::resolve` — names no notarytool credential, so
+///   with `pins::APPLE_TEAM_ID` pinned `sign::resolve_apple_tier` refuses that
+///   machine's artifact anyway. Either way the profile has to be nameable.
+/// * When the rostered signing key is not the committed channel head — the
+///   ordinary case the roster tier exists to enable — the cut refuses until the
+///   operator answers the pre-roster stranding question out loud
+///   ([`publish::PreRosterClients`]).
+///
+/// `yank` had no way to be told either answer, so the one command whose whole
+/// purpose is to retire a bad published build could not run at all on the armed
+/// tree: it refused inside its own successor cut, having published nothing and
+/// deleted nothing.
+///
+/// The remaining cut flags are deliberately absent rather than merely
+/// unforwarded: `--dry-run`/`--rehearse` would leave no published successor to
+/// prove, `--resume` belongs to the journal (and [`run_yank`] already refuses an
+/// unfinished journaled cut outright), and `--min-build`/`--set-version` are the
+/// yank's own decision — the floor is `bad build + 1`, from
+/// `yank_required_floor`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct YankOptions {
+    /// Path to the ONE credentials profile, forwarded verbatim to the successor
+    /// cut. `None` resolves exactly the way a bare `cargo ship cut` does — this
+    /// machine's provisioned identity — so an unarmed or single-machine tree
+    /// still needs no flag.
+    pub release_credentials: Option<PathBuf>,
+    /// The operator's `--strand-pre-roster-clients` acknowledgement, forwarded
+    /// verbatim. It is never inferred here: only the operator knows whether a
+    /// pre-roster client is left in the field, and "I am yanking" is not an
+    /// answer to that question.
+    pub strand_pre_roster_clients: bool,
+}
+
+/// The successor cut a yank of a bad build must publish: the ratcheted floor
+/// plus the operator's signing inputs, and nothing else.
+///
+/// Pure, and split out of [`run_yank`], because the defect it fixes was a
+/// silently DROPPED field — a `..Default::default()` that quietly answered the
+/// armed tree's two new questions with "nothing" — and no test of a
+/// network-driving command would ever have caught that.
+fn successor_cut_options(required_floor: u64, opts: &YankOptions) -> publish::CutOptions {
+    publish::CutOptions {
+        min_build: Some(required_floor),
+        release_credentials: opts.release_credentials.clone(),
+        strand_pre_roster_clients: opts.strand_pre_roster_clients,
+        ..Default::default()
+    }
+}
+
 /// `cargo ship yank <build>` (spec decision 21): FIRST publish/prove a
 /// min_build-ratcheted successor under a fresh claim, THEN optionally remove
 /// the now-inert bad release/tag. A crash at every cleanup edge leaves the
 /// successor authoritative; delete-before-successor is structurally absent.
-pub fn run_yank(repo: &Path, build: u64) -> Result<()> {
+///
+/// `opts` is the successor cut's signing input and nothing else; see
+/// [`YankOptions`] for why a yank has to carry one at all.
+pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     let slug = slug_of(repo)?;
     println!("aterm-release · yank build {build} ({slug})");
     let git = ledger::GitCli::new(repo);
@@ -1478,13 +1543,19 @@ pub fn run_yank(repo: &Path, build: u64) -> Result<()> {
                 "publishing successor FIRST with min_build = {required_floor}; bad release remains live until proof passes"
             ),
         );
-        publish::run_cut(
-            repo,
-            &publish::CutOptions {
-                min_build: Some(required_floor),
-                ..Default::default()
-            },
-        )?;
+        // The successor is an ORDINARY cut and is held to every rule one is, so
+        // the operator's credentials profile and stranding acknowledgement ride
+        // through unchanged. Building these options from `Default` alone was the
+        // bug: on the armed tree the cut then refused pre-claim ("no signing
+        // material was supplied" / "pass --strand-pre-roster-clients"), naming
+        // flags `yank` had no way to accept — so the bad build stayed live and
+        // un-poisoned, which is the exact outcome this command exists to end.
+        //
+        // Nothing is pre-validated here on purpose. A missing answer earns the
+        // cut's own pre-claim refusal, which is free, burns no ledger number,
+        // and states the remedy far better than a second copy of the rule here
+        // could — a copy that would also drift the moment the tier changes again.
+        publish::run_cut(repo, &successor_cut_options(required_floor, opts))?;
     } else {
         step(
             "yank",
@@ -1735,6 +1806,43 @@ mod tests {
             publish::parse_release_object_identity_rows("")
                 .expect("an empty selection parses")
                 .is_empty()
+        );
+    }
+
+    /// The successor a yank publishes is a real cut, and since the paper master
+    /// was armed a real cut refuses pre-claim unless it is told WHICH profile
+    /// signs and whether stranding pre-roster clients is acceptable. Those two
+    /// answers used to be dropped on the floor here, which made `cargo ship
+    /// yank` unable to publish anything at all on the armed tree. Nothing else
+    /// may leak in either: a yank's successor is always a real, published,
+    /// floor-ratcheted cut, never a dry run, a rehearsal, or a resume.
+    #[test]
+    fn the_successor_cut_carries_the_operators_signing_inputs_and_stays_a_real_cut() {
+        let cut = successor_cut_options(
+            1_783_918_102,
+            &YankOptions {
+                release_credentials: Some(PathBuf::from("/keys/m3.toml")),
+                strand_pre_roster_clients: true,
+            },
+        );
+        assert_eq!(cut.min_build, Some(1_783_918_102));
+        assert_eq!(
+            cut.release_credentials.as_deref(),
+            Some(Path::new("/keys/m3.toml"))
+        );
+        assert!(cut.strand_pre_roster_clients);
+        assert!(!cut.dry_run && !cut.resume && !cut.gate && !cut.arm64_only);
+        assert!(cut.rehearse.is_none() && cut.set_version.is_none());
+
+        // A flagless yank must still ask for exactly the cut it always asked
+        // for, so an unarmed tree (and every fork with no master pinned) sees no
+        // behaviour change from the fix.
+        assert_eq!(
+            successor_cut_options(7, &YankOptions::default()),
+            publish::CutOptions {
+                min_build: Some(7),
+                ..Default::default()
+            }
         );
     }
 }

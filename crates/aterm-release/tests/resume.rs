@@ -2560,6 +2560,26 @@ fn cli_parses_the_whole_spec_5_surface() {
             version: "0.55.0".into(),
             owner: "a".repeat(40),
             release_credentials: None,
+            no_draft_posted: false,
+        }
+    );
+    // The absent-draft assertion is OPT-IN and separate from the mandatory
+    // stopped-publisher one: they claim different things, and folding them would make
+    // the weaker claim silently every time the stronger one is required.
+    assert_eq!(
+        parse(&[
+            "recover",
+            "v0.55.0",
+            &"a".repeat(40),
+            publish::RECOVERY_STOPPED_PROCESS_FLAG,
+            publish::RECOVERY_NO_DRAFT_POSTED_FLAG,
+        ])
+        .unwrap(),
+        cli::Cmd::Recover {
+            version: "0.55.0".into(),
+            owner: "a".repeat(40),
+            release_credentials: None,
+            no_draft_posted: true,
         }
     );
     assert_eq!(
@@ -2576,8 +2596,37 @@ fn cli_parses_the_whole_spec_5_surface() {
     assert_eq!(
         parse(&["yank", "1783918101"]).unwrap(),
         cli::Cmd::Yank {
-            build: 1_783_918_101
+            build: 1_783_918_101,
+            opts: verify::YankOptions::default()
         }
+    );
+    // A yank publishes a real cut before it deletes anything, and since the paper
+    // master was armed that cut refuses pre-claim unless it is told which profile
+    // signs and whether stranding pre-roster clients is acceptable. Pinned here
+    // because the way this breaks is a parse that SUCCEEDS and drops the answers.
+    assert_eq!(
+        parse(&[
+            "yank",
+            "1783918101",
+            "--release-credentials",
+            "/keys/m3.toml",
+            publish::PRE_ROSTER_STRANDING_FLAG,
+        ])
+        .unwrap(),
+        cli::Cmd::Yank {
+            build: 1_783_918_101,
+            opts: verify::YankOptions {
+                release_credentials: Some(PathBuf::from("/keys/m3.toml")),
+                strand_pre_roster_clients: true,
+            }
+        }
+    );
+    // Every OTHER cut flag stays refused: a yank fixes its own min_build and
+    // publishes a real successor, so accepting one could only mean ignoring it.
+    let yank_flag_error = parse(&["yank", "1783918101", "--dry-run"]).unwrap_err();
+    assert!(
+        yank_flag_error.contains("--release-credentials"),
+        "{yank_flag_error}"
     );
 
     let cli::Cmd::Cut { opts, abandon } = parse(&[
@@ -2651,7 +2700,34 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
         ),
         (vec!["yank"], "build number"),
         (vec!["yank", "abc"], "not a build number"),
-        (vec!["yank", "1", "2"], "exactly one"),
+        // The stray-argument refusal changed WORDING when yank grew the two
+        // signing flags its successor cut needs on the armed tree: it can no
+        // longer say a yank takes "exactly one" argument, because a yank now
+        // legitimately takes more. Only the BUILD NUMBER is still one-of, so the
+        // needle moves onto that surviving guarantee instead of being deleted —
+        // dropping the row would leave the extra-positional arm of the new parse
+        // loop with no test at all.
+        (vec!["yank", "1", "2"], "yank takes one build number"),
+        // And the value-taking flag must not swallow a trailing positional, must
+        // not accept a missing value, and must not be given twice: two profiles
+        // mean one of them is ignored, and the ignored one may be the one that
+        // was supposed to sign the successor.
+        (
+            vec!["yank", "1", "--release-credentials", "/keys/m3.toml", "2"],
+            "yank takes one build number",
+        ),
+        (vec!["yank", "1", "--release-credentials"], "needs a path"),
+        (
+            vec![
+                "yank",
+                "1",
+                "--release-credentials",
+                "/keys/m3.toml",
+                "--release-credentials",
+                "/keys/m4.toml",
+            ],
+            "--release-credentials given twice",
+        ),
         (vec!["status", "extra"], "no arguments"),
         (vec!["recover", "v0.55.0"], "full claim SHA"),
         (
@@ -2765,6 +2841,7 @@ fn recovery_requires_and_labels_the_external_stop_precondition() {
         &PathBuf::from("/definitely/not/an/aterm/repository"),
         "0.55.0",
         &owner,
+        false,
         false,
         None,
     )

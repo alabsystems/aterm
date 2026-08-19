@@ -442,6 +442,26 @@ pub const PUBLISHER_FENCE_REF: &str = "refs/tags/aterm-release-fence";
 /// an external, operator-established precondition. This is deliberately an
 /// assertion, not a claim that the program can prove process quiescence.
 pub const RECOVERY_STOPPED_PROCESS_FLAG: &str = "--old-publisher-stopped";
+
+/// The operator's assertion that NO draft was ever posted for this tag, for the one
+/// recovery state nothing else can answer.
+///
+/// A publisher that died with its journal takes `create_intent_knowledge` to `None`,
+/// and an ABSENT release object then means one of two things a machine cannot tell
+/// apart: no create POST was ever issued, or one was issued and has not become
+/// visible yet. Refusing (the safe reading) left no command that could release
+/// `refs/tags/aterm-release-lease`, so every later `cargo ship cut` refused on every
+/// machine and the refs had to be deleted by hand — the pipeline stayed wedged by a
+/// safety rule protecting against a draft that did not exist.
+///
+/// Only a human can close that gap, by looking at the releases page. This flag is
+/// that answer, and it is deliberately SEPARATE from
+/// [`RECOVERY_STOPPED_PROCESS_FLAG`] — which is mandatory and asserts something else
+/// entirely — so the weaker claim is never made silently as a side effect of the
+/// stronger one. It relaxes nothing when the journal actually knows: a journal that
+/// PROVES a POST was issued still wins, because delayed visibility is then the only
+/// explanation and waiting is correct.
+pub const RECOVERY_NO_DRAFT_POSTED_FLAG: &str = "--no-draft-was-posted";
 pub const RECOVERY_STOPPED_PROCESS_REFUSAL: &str = "lost-machine recovery requires explicit proof that the old publisher process is stopped; \
      a fence rotation cannot cancel an already in-flight GitHub REST request";
 pub const RECOVERY_STOPPED_PROCESS_BANNER: &str =
@@ -1550,12 +1570,19 @@ pub enum AbsentDraftDecision {
 
 /// An absent listing is destructive-cleanup authority only when a current
 /// durable journal proves no create POST was ever issued. `None` represents a
-/// lost/legacy journal and is deliberately as unsafe as a known issued intent.
+/// lost/legacy journal and is deliberately as unsafe as a known issued intent —
+/// unless the operator answers for it with [`RECOVERY_NO_DRAFT_POSTED_FLAG`], the
+/// only way out of a wedge no machine can reason its way through (see that
+/// constant). `Some(true)` is never overridable: there, delayed visibility is the
+/// only explanation left and waiting is the correct behaviour.
 #[must_use]
-pub const fn absent_draft_decision(durable_create_intent: Option<bool>) -> AbsentDraftDecision {
-    match durable_create_intent {
-        Some(false) => AbsentDraftDecision::AbandonProvenNoPost,
-        Some(true) | None => AbsentDraftDecision::RetainOwnerAwaitVisibility,
+pub const fn absent_draft_decision(
+    durable_create_intent: Option<bool>,
+    operator_asserts_no_post: bool,
+) -> AbsentDraftDecision {
+    match (durable_create_intent, operator_asserts_no_post) {
+        (Some(false), _) | (None, true) => AbsentDraftDecision::AbandonProvenNoPost,
+        (Some(true), _) | (None, false) => AbsentDraftDecision::RetainOwnerAwaitVisibility,
     }
 }
 
@@ -1567,16 +1594,37 @@ pub enum DraftCleanupDecision {
     RefuseUnknownOrInconsistent,
 }
 
+/// `claim_bound_draft` means the visible draft under this tag targets the very commit
+/// the recovery claim names — the remote's own answer to "is this object mine?".
+///
+/// # A LOST JOURNAL IS NOT AN UNKNOWN OBJECT
+///
+/// `None` intent is correctly as unsafe as `Some(true)` when nothing else can speak
+/// for the object. But a recovery on a second machine always has `None` (the journal
+/// died with the publisher), and refusing on that alone made the pipeline
+/// unrecoverable rather than merely careful: a publisher that died between
+/// `step_upload` and `step_flip` left a draft no machine could clean and
+/// `refs/tags/aterm-release-lease` held by a process that no longer exists. Every
+/// later `cargo ship cut` refused at `preflight_release_lease`, `--abandon` refused
+/// for want of the same journal, and the only remedy was deleting refs by hand.
+///
+/// When the remote binds the draft to this claim's commit, the missing local intent
+/// adds nothing: that binding is the same one `validate_release_object_capability`
+/// enforces before the delete, and `recover` already requires the operator to have
+/// proven the old publisher exited ([`RECOVERY_STOPPED_PROCESS_FLAG`]). An unbound
+/// draft — someone else's object sitting on this tag — still refuses.
 #[must_use]
 pub const fn draft_cleanup_decision(
     durable_create_intent: Option<bool>,
     exact_draft_visible: bool,
+    claim_bound_draft: bool,
 ) -> DraftCleanupDecision {
-    match (durable_create_intent, exact_draft_visible) {
-        (Some(false), false) => DraftCleanupDecision::AbandonProvenNoPost,
-        (Some(true), true) => DraftCleanupDecision::DeleteIssuedVisible,
-        (Some(true), false) => DraftCleanupDecision::RetainIssuedAwaitVisibility,
-        (Some(false), true) | (None, false) | (None, true) => {
+    match (durable_create_intent, exact_draft_visible, claim_bound_draft) {
+        (Some(false), false, _) => DraftCleanupDecision::AbandonProvenNoPost,
+        (Some(true), true, _) => DraftCleanupDecision::DeleteIssuedVisible,
+        (Some(true), false, _) => DraftCleanupDecision::RetainIssuedAwaitVisibility,
+        (None, true, true) => DraftCleanupDecision::DeleteIssuedVisible,
+        (Some(false), true, _) | (None, false, _) | (None, true, false) => {
             DraftCleanupDecision::RefuseUnknownOrInconsistent
         }
     }
@@ -5823,7 +5871,12 @@ pub fn delete_owned_draft_release(
     let git = GitCli::new(repo);
     assert_publisher_session(&git, lease, fence)?;
     let by_tag = unique_release_object_by_tag(slug, tag)?;
-    match draft_cleanup_decision(create_intent_knowledge, by_tag.is_some()) {
+    // The remote's own binding, for the lost-journal recovery path: a draft under this
+    // tag that targets the claim commit is provably this claim's object.
+    let claim_bound = by_tag
+        .as_ref()
+        .is_some_and(|release| release.target_commitish == lease.owner());
+    match draft_cleanup_decision(create_intent_knowledge, by_tag.is_some(), claim_bound) {
         DraftCleanupDecision::AbandonProvenNoPost => return Ok(false),
         DraftCleanupDecision::DeleteIssuedVisible => {}
         DraftCleanupDecision::RetainIssuedAwaitVisibility => {
@@ -6072,6 +6125,7 @@ pub fn run_recover_lost(
     version: &str,
     owner: &str,
     old_process_stopped: bool,
+    operator_asserts_no_post: bool,
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
     if !old_process_stopped {
@@ -6222,6 +6276,7 @@ pub fn run_recover_lost(
                 create_intent_knowledge,
                 expected_release_id,
                 abandoned_journal,
+                operator_asserts_no_post,
             },
             &fence,
             credentials,
@@ -6237,6 +6292,8 @@ struct LostRecoveryPlan<'a> {
     create_intent_knowledge: Option<bool>,
     expected_release_id: Option<u64>,
     abandoned_journal: Option<&'a Path>,
+    /// [`RECOVERY_NO_DRAFT_POSTED_FLAG`] was given.
+    operator_asserts_no_post: bool,
 }
 
 fn recover_under_fence(
@@ -6253,6 +6310,7 @@ fn recover_under_fence(
         create_intent_knowledge,
         expected_release_id,
         abandoned_journal,
+        operator_asserts_no_post,
     } = plan;
     let git = GitCli::new(repo);
     let lease = confirm_release_lease_owner(&git, owner)?;
@@ -6298,18 +6356,26 @@ fn recover_under_fence(
                     step("recover", &format!("unpublished exact draft {tag} deleted"));
                 }
                 verify::ReleaseState::Absent => {
-                    if absent_draft_decision(create_intent_knowledge)
+                    if absent_draft_decision(create_intent_knowledge, operator_asserts_no_post)
                         == AbsentDraftDecision::RetainOwnerAwaitVisibility
                     {
+                        let (why, remedy) = if create_intent_knowledge == Some(true) {
+                            (
+                                "known issued",
+                                "wait for the exact draft to converge and run recover again",
+                            )
+                        } else {
+                            (
+                                "unknown because the current journal is unavailable",
+                                "if the releases page shows NO draft for this tag, re-run with \
+                                 --no-draft-was-posted to release the claim lease",
+                            )
+                        };
                         return Err(Error::new(format!(
-                            "release {tag} is currently absent, but draft-create intent is {}. \
-                             An accepted POST may still become visible; retaining the claim lease \
-                             and refusing tag/journal cleanup until the exact draft converges",
-                            if create_intent_knowledge == Some(true) {
-                                "known issued"
-                            } else {
-                                "unknown because the current journal is unavailable"
-                            }
+                            "release {tag} is currently absent, but draft-create intent is \
+                             {why}. An accepted POST may still become visible; retaining the \
+                             claim lease and refusing tag/journal cleanup until the exact draft \
+                             converges — {remedy}"
                         )));
                     }
                 }
@@ -6415,6 +6481,132 @@ fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
 /// `machines::verify_published_roster`: the master signature proves authorship, and the
 /// `roster_seq`/`machine_id` pair proves it is THIS release's roster. That is strictly
 /// stronger than the digest check the other assets get.
+/// Refuse to reconstruct a roster OLDER than the one this machine is already
+/// authorized by.
+///
+/// `dist/aterm-machines.toml` is not a build artifact. It is the machine's
+/// AUTHORIZING roster — the same file `atpkg-keys` writes and
+/// `ReleaseCredentials::resolve` adopts — and `dist/` is gitignored, so it is the
+/// only copy on the machine. Recovery used to overwrite it unconditionally with
+/// whatever generation the recovered release happened to carry, which silently
+/// DOWNGRADES it: revoke a stolen machine (seq N+1, written locally, not yet
+/// published), then recover an older cut made under seq N, and the revocation is
+/// gone — recreatable only by re-entering the 52-character paper master.
+///
+/// Nothing reported it, either. `roster_floor_covered` compares the carried
+/// generation against the published head, and after such a recovery both are N, so
+/// the next cut from this machine re-publishes a roster that still authorizes the
+/// machine the owner had just revoked.
+///
+/// A recovery may reconstruct the release's roster. It may not retire a newer one.
+/// The public key a PUBLISHED release's manifest signature must actually verify
+/// under.
+///
+/// Recovery validates bytes that ALREADY SHIPPED, so the verification key is a
+/// property of the release, not of the machine running the command. A
+/// [`RosterDuty::Finish`] policy carries this machine's own key — right for an entry
+/// that will still sign something, wrong here — and using it made cross-machine
+/// recovery structurally impossible: m3 cuts v0.24.0 and dies after the flip, the
+/// owner runs `recover` on m11, and m3's shipped signature is checked against m11's
+/// key. It fails with "manifest signature does not verify under the channel public
+/// key", the release never reaches the public channel, and
+/// `refs/tags/aterm-release-lease` stays held by the dead machine — so every later
+/// `cargo ship cut` refuses at `preflight_release_lease` with no command able to
+/// un-wedge it.
+///
+/// On the armed path the release names its own signer and the master-signed roster
+/// beside it maps that name to a key: the same binding a client checks
+/// (`Attribution::bind`). Revocation is deliberately NOT re-judged, for the reason
+/// [`machines::verify_published_roster`] gives about this exact document — these
+/// bytes are already published, and revoking a machine afterwards does not
+/// retroactively unsign what it signed.
+///
+/// A release with no `machine_id` predates the roster tier; there the committed
+/// channel keyset is the authority, which is what the policy already carries.
+fn published_manifest_signature_pubkey(
+    slug: &str,
+    release_id: u64,
+    manifest_bytes: &[u8],
+    policy_pubkey: Option<&str>,
+) -> Result<Option<String>> {
+    let text = std::str::from_utf8(manifest_bytes)
+        .map_err(|_| Error::new("published manifest is not UTF-8"))?;
+    let manifest = Manifest::parse(text)
+        .map_err(|error| Error::new(format!("published manifest parse failed: {error}")))?;
+    let Some(machine_id) = manifest.machine_id.as_deref() else {
+        return Ok(policy_pubkey.map(str::to_string));
+    };
+    let roster_bytes =
+        download_release_asset_for_release_id(slug, release_id, roster::ROSTER_ASSET)?;
+    let roster_sig =
+        download_release_asset_for_release_id(slug, release_id, roster::ROSTER_SIG_ASSET)?;
+    // Proves authorship (paper master) AND that this is THIS release's roster — the
+    // manifest's signed `machine_id`/`roster_seq` must match the document.
+    machines::verify_published_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        roster_bytes.clone(),
+        &roster_sig,
+        machine_id,
+        manifest.roster_seq,
+    )?;
+    let verified = roster::verify_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        roster_bytes,
+        &roster_sig,
+    )
+    .map_err(|e| Error::new(format!("published machine roster does not verify ({e:?})")))?;
+    let parsed = roster::Roster::parse(&verified)
+        .map_err(|e| Error::new(format!("published machine roster is unusable ({e:?})")))?;
+    let machine = parsed
+        .machines
+        .iter()
+        .find(|m| m.id == machine_id)
+        .ok_or_else(|| {
+            Error::new(format!(
+                "the published release is attributed to machine {machine_id:?}, which its \
+                 own master-signed roster does not name"
+            ))
+        })?;
+    Ok(Some(machine.pubkey.clone()))
+}
+
+fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
+    let local = dist.join(roster::ROSTER_ASSET);
+    let (Ok(bytes), Ok(sig)) = (
+        fs::read(&local),
+        fs::read(dist.join(roster::ROSTER_SIG_ASSET)),
+    ) else {
+        // No local pair (or half of one): there is nothing here to protect.
+        return Ok(());
+    };
+    // Only a MASTER-SIGNED local roster can outrank the release's. An unverifiable
+    // file is not an authorizing document, and letting one block a recovery would
+    // hand any stray bytes in `dist/` a veto over un-wedging the release pipeline.
+    let Ok(verified) = roster::verify_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        bytes,
+        &sig,
+    ) else {
+        return Ok(());
+    };
+    let Ok(existing) = roster::Roster::parse(&verified) else {
+        return Ok(());
+    };
+    if existing.roster_seq > incoming_seq {
+        return Err(Error::new(format!(
+            "{} already holds roster_seq {}, which is NEWER than the roster_seq \
+             {incoming_seq} carried by the release being recovered. Overwriting it \
+             would destroy the only copy of a master-signed generation — including \
+             any revocation it carries — and it can be recreated only from the paper \
+             master. Publish the newer roster first (so the channel head carries it), \
+             or move the pair aside deliberately if you really do mean to go back",
+            local.display(),
+            existing.roster_seq
+        )));
+    }
+    Ok(())
+}
+
 fn reconstruct_roster_assets(
     slug: &str,
     release_id: u64,
@@ -6450,6 +6642,12 @@ fn reconstruct_roster_assets(
         machine_id,
         manifest.roster_seq,
     )?;
+    // `verify_published_roster` just proved the manifest's `roster_seq` equals the
+    // downloaded roster's, so this is the generation about to be written.
+    let incoming_seq = manifest
+        .roster_seq
+        .expect("verify_published_roster proved the manifest names this roster's seq");
+    refuse_roster_downgrade(dist, incoming_seq)?;
     fs::write(dist.join(roster::ROSTER_ASSET), &roster_bytes)
         .map_err(|error| Error::new(format!("reconstruct machine roster: {error}")))?;
     fs::write(dist.join(roster::ROSTER_SIG_ASSET), &roster_sig)
@@ -6507,6 +6705,15 @@ fn recover_published_cut(
     )?;
     let (manifest_bytes, signature_bytes) =
         download_live_manifest_pair(slug, release_object.id, &tag)?;
+    // The key comes from the RELEASE, never from this machine — see
+    // `published_manifest_signature_pubkey` for the cross-machine recovery this
+    // un-wedges.
+    let recovered_pubkey = published_manifest_signature_pubkey(
+        slug,
+        release_object.id,
+        &manifest_bytes,
+        signature_policy.pubkey.as_deref(),
+    )?;
     let manifest = validate_live_release_identity(
         ExpectedReleaseIdentity {
             version,
@@ -6518,7 +6725,7 @@ fn recover_published_cut(
         None,
         signature_bytes.as_deref(),
         signature_policy.required,
-        signature_policy.pubkey.as_deref(),
+        recovered_pubkey.as_deref(),
     )?;
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_object.id)?
         .into_iter()
@@ -9360,6 +9567,17 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
             // bytes as this cut.
             let release = observed.expect("visible published decision");
             prove_mirror_channel_head(ctx, &slug, release.id)?;
+            // AND THE ANONYMOUS PROOF, for the same reason the flip path runs it —
+            // every check above rode the release-org credential. Omitting it here made
+            // the probe bypassable by the one action an operator always takes when it
+            // fails: `step_mirror` PATCHes the release live, the anonymous probe then
+            // fails (mirror still membership-restricted, or the CDN not yet serving
+            // the DMG inside the probe's window), so the step returns Err and the
+            // journal never marks "mirror". The re-run resolves to ConvergePublished,
+            // passes the authenticated head proof, and reports the channel live while
+            // an unauthenticated GET of the DMG still 404s — the silent
+            // never-updates state this probe was added after v0.8.0 to remove.
+            prove_channel_is_anonymously_readable(ctx, &slug)?;
             step(
                 "mirror",
                 &format!(
@@ -10164,4 +10382,85 @@ mod roster_wiring_tests {
         }
         assert_eq!(rebuilt.len(), 2, "{rebuilt:?}");
     }
+
+    /// A RECOVERY MUST NOT RETIRE A NEWER ROSTER.
+    ///
+    /// `dist/aterm-machines.toml` is the machine's AUTHORIZING roster — the file
+    /// `atpkg-keys` writes and `ReleaseCredentials::resolve` adopts — and `dist/` is
+    /// gitignored, so it is the only copy. Recovery used to overwrite it in place with
+    /// whatever generation the recovered release carried, which silently destroys a
+    /// newer master-signed document and any revocation inside it, recreatable only from
+    /// the paper master. Nothing downstream noticed: `roster_floor_covered` compares the
+    /// carried generation against the published head, and after the downgrade both
+    /// agree.
+    ///
+    /// The fixture is the real generation-2 pair published on the channel, so the guard
+    /// is exercised against bytes that genuinely verify under the pinned paper master.
+    #[test]
+    fn recovery_refuses_to_overwrite_a_newer_local_roster() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-roster-downgrade-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Nothing local: there is nothing to protect, so a recovery proceeds.
+        assert!(refuse_roster_downgrade(&dir, 1).is_ok());
+
+        let engine = base64::engine::general_purpose::STANDARD;
+        let bytes = engine.decode(ROSTER_SEQ2.concat()).unwrap();
+        let sig = engine.decode(ROSTER_SEQ2_SIG).unwrap();
+        std::fs::write(dir.join(roster::ROSTER_ASSET), &bytes).unwrap();
+        std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), &sig).unwrap();
+
+        // An OLDER release: refused, naming the file it just protected.
+        let err = refuse_roster_downgrade(&dir, 1).unwrap_err();
+        assert!(err.0.contains("NEWER"), "{}", err.0);
+        assert!(err.0.contains(roster::ROSTER_ASSET), "{}", err.0);
+
+        // Same generation, or a newer one: nothing is being lost.
+        assert!(refuse_roster_downgrade(&dir, 2).is_ok());
+        assert!(refuse_roster_downgrade(&dir, 3).is_ok());
+
+        // A pair that does NOT verify under the pinned master is not an authorizing
+        // document, and must never be able to veto un-wedging the release pipeline.
+        std::fs::write(dir.join(roster::ROSTER_SIG_ASSET), [0u8; 64]).unwrap();
+        assert!(refuse_roster_downgrade(&dir, 1).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A release that names no machine predates the roster tier, so the committed
+    /// channel keyset the policy already carries stays the authority. This path must
+    /// not touch the network — it returns before any asset download.
+    #[test]
+    fn an_unattributed_release_keeps_the_policy_key() {
+        let manifest = b"schema = 1\nversion = \"0.20.0\"\nbuild_number = 1786405661\n\
+sha256 = \"aa\"\ndmg = \"aterm-0.20.0.dmg\"\n";
+        let resolved = published_manifest_signature_pubkey(
+            "unused/slug",
+            0,
+            manifest,
+            Some("cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8="),
+        )
+        .expect("a pre-roster manifest resolves without any download");
+        assert_eq!(
+            resolved.as_deref(),
+            Some("cw5gIGYQzX6xrhTXjXU9nYfLWeoIkiZ1yUX7d1wmdz8=")
+        );
+    }
+
+    /// The real generation-2 machine roster published on the update channel, base64 so
+    /// the master signature covers the exact bytes.
+    const ROSTER_SEQ2: &[&str] = &[
+        "c2NoZW1hID0gMQpyb3N0ZXJfc2VxID0gMgp2YWxpZF91bnRpbCA9ICI5OTk5LTEyLTMxVDAwOjAwOjAwWiIKcmV2",
+        "b2tlZCA9IFtdCgpbW21hY2hpbmVdXQppZCA9ICJpbmN1bWJlbnQtaGVhZCIKcHVia2V5ID0gImN3NWdJR1lRelg2",
+        "eHJoVFhqWFU5bllmTFdlb0lraVoxeVVYN2Qxd21kejg9IgphZGRlZF9hdCA9ICIyMDI2LTA4LTE1VDIxOjU1OjA0",
+        "WiIKCltbbWFjaGluZV1dCmlkID0gIm0zIgpwdWJrZXkgPSAiWU9IdzBPb2VmUTc5TmRFOHFzUUZvYklNUjdRWENo",
+        "cHJlWUJpMk9mNzRVbz0iCmFkZGVkX2F0ID0gIjIwMjYtMDgtMTVUMjE6NTU6MDRaIgo=",
+    ];
+    const ROSTER_SEQ2_SIG: &str =
+        "vNOvNYPssbUN3F/SmnoPDk6za2BAaewu9Vopl5YU7EDd+KUM0Y84eUryvFE9OWUywT/yggXE92SYQ2Qz7k56DA==";
+
 }

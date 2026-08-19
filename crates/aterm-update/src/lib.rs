@@ -620,6 +620,10 @@ pub fn confirm_boot_health_exact(_current_build: u64, _current_commit: &str) -> 
 pub struct InstalledUpdateFacts {
     pub build_number: u64,
     pub git_commit: String,
+    /// The bundle's marketing version (`CFBundleShortVersionString`), display only —
+    /// what the update screen names when the installed bundle is newer than the running
+    /// process and is about to be ACTIVATED in place. `None` when the plist lacks it.
+    pub version: Option<String>,
     pub receipt_build_number: Option<u64>,
     pub receipt_dmg_sha256: Option<String>,
 }
@@ -638,15 +642,83 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
     verify::verify_bundle_policy(&installed.app_root, effective_team_id()).ok()?;
     let build_number = verify::bundle_build_number(&installed.app_root).ok()?;
     let git_commit = verify::bundle_git_commit(&installed.app_root).ok()?;
+    let version = verify::bundle_short_version(&installed.app_root).ok();
     let receipt = paths::Staging::resolve()
         .and_then(|staging| manifest::InstalledReceipt::read(&staging.installed_receipt()))
         .filter(|receipt| receipt.matches_sealed(build_number, &git_commit));
     Some(InstalledUpdateFacts {
         build_number,
         git_commit,
+        version,
         receipt_build_number: receipt.as_ref().map(|receipt| receipt.build_number),
         receipt_dmg_sha256: receipt.map(|receipt| receipt.dmg_sha256),
     })
+}
+
+/// THE ACTIVATION PRE-VERIFY (seamless seam 1 for an INSTALLED bundle): before the
+/// GUI parks a single reader to hand off to a NEWER build that is already at its own
+/// bundle path (installed by another producer — the release cutter writing into the
+/// bundle it launched from, a user dragging a new `.app` over the old one, a sibling
+/// aterm process that swapped it), prove that bundle is exactly what the reducer
+/// authorized: a non-symlink directory that passes the complete configured codesign
+/// policy, whose SEALED build and commit equal `expected_build` / `expected_commit`,
+/// and whose build is strictly newer than the running one. Anything else refuses, so
+/// a bundle swapped again between the observation and the handoff is caught before
+/// the terminal is touched. Runs on the handoff worker (codesign is not free), never
+/// the event loop.
+#[cfg(target_os = "macos")]
+pub fn preverify_installed_for_handoff(
+    current_build: u64,
+    expected_build: u64,
+    expected_commit: &str,
+) -> Result<(), String> {
+    let installed =
+        bundle::resolve_layout().ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
+    let (build, commit) = install::verified_bundle_identity_at(&installed.app_root)?;
+    if build != expected_build {
+        return Err(format!(
+            "installed bundle is build {build}, not the authorized build {expected_build}"
+        ));
+    }
+    if !commit_matches(&commit, expected_commit) {
+        return Err(format!(
+            "installed bundle commit {commit} is not the authorized commit {expected_commit}"
+        ));
+    }
+    if build <= current_build {
+        return Err(format!(
+            "installed bundle build {build} is not newer than the running build {current_build}"
+        ));
+    }
+    Ok(())
+}
+
+/// The OUTGOING process killed an overlap-handoff candidate of `target_build` for a
+/// reason of its own (readiness deadline, user activity, proof mismatch, a session
+/// closing) — NOT because the candidate died. That candidate observed a trial launch
+/// at boot exactly as a crash would have; give it back, so a busy machine's bounded
+/// automatic re-attempts cannot walk a healthy build to `MAX_BOOT_ATTEMPTS`, revert
+/// it and poison it. Runs on the handoff worker after the reap; the apply lock
+/// serializes it against a concurrent swap/confirm exactly like `check_boot_health`.
+/// Best-effort: nothing here can fail an apply, and a sentinel for any other build
+/// (or none) is untouched.
+#[cfg(target_os = "macos")]
+pub fn forgive_trial_launch(target_build: u64) {
+    install::forgive_trial_launch(target_build);
+}
+
+/// Non-macOS: no boot sentinel is ever armed by a swap.
+#[cfg(not(target_os = "macos"))]
+pub fn forgive_trial_launch(_target_build: u64) {}
+
+/// Non-macOS: there is no `.app` bundle to activate.
+#[cfg(not(target_os = "macos"))]
+pub fn preverify_installed_for_handoff(
+    _current_build: u64,
+    _expected_build: u64,
+    _expected_commit: &str,
+) -> Result<(), String> {
+    Err("installed-bundle activation is macOS-only".to_string())
 }
 
 /// Non-macOS has neither an installed bundle nor a self-update receipt.
@@ -674,6 +746,66 @@ pub type StagedNotify = Box<dyn Fn(u64, String) + Send>;
 fn check_lane() -> &'static std::sync::Mutex<()> {
     static LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LANE
+}
+
+/// Whether the persistent-failure notice should be spoken for `class`, given the class
+/// this process has already announced (`None` = none yet).
+///
+/// The latch behind this used to be a bare `bool`, which made the answer "no" for every
+/// class after the first: one notice per process, whatever else broke afterwards. That
+/// is the wrong dedup key, because each class asks the user for a different thing — a
+/// `manifest` escalation says the newest release cannot be trusted, an `apply` one says
+/// a verified build will not start — so a machine that announced one lane and then
+/// stranded another told the user about the lane that was no longer the problem.
+///
+/// Keying on the class keeps the property that mattered (the SAME class never nags once
+/// per check) and re-opens the one that was lost. A class that heals and later breaks
+/// again is a new episode and speaks again; the caller's 30-minute persistence gate,
+/// measured on that class's own clock, is what bounds how often that can happen.
+#[cfg(target_os = "macos")]
+fn persistent_notice_is_new(announced: Option<&str>, class: &str) -> bool {
+    announced != Some(class)
+}
+
+/// Whether the loud "auto-update is failing" notice is OWED right now, given what was
+/// last announced and which class (if any) has currently escalated.
+///
+/// Folds the "nothing is persistently failing, so nothing is owed" case into the same
+/// predicate as the keyed latch, so the caller cannot answer one of the two questions
+/// and forget the other.
+#[cfg(target_os = "macos")]
+fn persistent_notice_is_owed(announced: Option<&str>, class: Option<&str>) -> bool {
+    class.is_some_and(|class| persistent_notice_is_new(announced, class))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod persistent_notice_tests {
+    use super::persistent_notice_is_new;
+
+    #[test]
+    fn a_second_persistent_class_still_speaks_while_the_announced_one_stays_quiet() {
+        let mut announced: Option<&'static str> = None;
+        assert!(
+            persistent_notice_is_new(announced, "pipeline"),
+            "the first escalation of the process is always news"
+        );
+        announced = Some("pipeline");
+        assert!(
+            !persistent_notice_is_new(announced, "pipeline"),
+            "the same class must not re-announce itself every check"
+        );
+        assert!(
+            persistent_notice_is_new(announced, "apply"),
+            "a DIFFERENT stranded lane is a different message and must still be told — \
+             the bare-bool latch swallowed exactly this one"
+        );
+        announced = Some("apply");
+        assert!(!persistent_notice_is_new(announced, "apply"));
+        assert!(
+            persistent_notice_is_new(announced, "pipeline"),
+            "and a class that is escalating again after healing is a new episode"
+        );
+    }
 }
 
 /// Spawn the background update check + stage on a detached thread. Returns
@@ -740,8 +872,41 @@ pub fn spawn_background_check(
             // strings compare chronologically), so a stale streak from a build that
             // isn't even checking any more (e.g. no token) stays quiet.
             let started = install::now_rfc3339();
-            let mut notified_failing = false;
+            // KEYED on the class that was announced, not a bare bool. As a bool this
+            // latch swallowed every class after the first for the life of the process:
+            // a machine whose downloads broke (announced) and whose apply lane then
+            // stranded it heard about the download only. The two notices name
+            // different lanes and ask for different fixes, so dropping the second is
+            // losing a message, not deduping one. `None` = nothing announced yet.
+            let mut notified_failing: Option<&'static str> = None;
+            // The installed bundle we last told the GUI about (by build). Announced
+            // once per build, re-announced when the bundle moves again.
+            let mut announced_installed: Option<u64> = None;
             loop {
+                // THE BUNDLE UNDER OUR OWN EXECUTABLE MAY HAVE MOVED ON WITHOUT A STAGE.
+                // The release cutter rewrites the bundle it was launched from, a user
+                // drags a new `.app` over the running one, a sibling process swaps
+                // it — none of that writes `ready.toml`, so `on_staged` above never
+                // fires and, before 2026-08-18, the running process learned about the
+                // newer bundle only at startup or when a stage happened to land. A
+                // plist read per cycle (no codesign here — the GUI's facts worker
+                // verifies before it imports anything) is what makes the activation
+                // lane fire on its own instead of waiting for a coincidence.
+                if let Some(cb) = on_staged.as_ref()
+                    && let Some(installed) = bundle::resolve_layout()
+                    && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
+                    && installed_build > current_build
+                    && announced_installed != Some(installed_build)
+                {
+                    announced_installed = Some(installed_build);
+                    let version = verify::bundle_short_version(&installed.app_root)
+                        .unwrap_or_else(|_| format!("build {installed_build}"));
+                    log(&format!(
+                        "the bundle at this executable's path is already build \
+                         {installed_build} (running {current_build}) — the GUI activates it"
+                    ));
+                    cb(installed_build, version);
+                }
                 match check_lane().try_lock() {
                     Ok(_lane) => {
                         // Stamped BEFORE the check so the ledger can be asked, after
@@ -776,8 +941,11 @@ pub fn spawn_background_check(
                                 // re-spawns `security`/`gh` and burns requests
                                 // forever. The backoff clears on the first readable
                                 // check, so fixing the channel (or provisioning a
-                                // token) mid-session is noticed within one
-                                // MAX_BACKOFF at worst.
+                                // token) mid-session is noticed within one backoff
+                                // ceiling at worst — `max(MAX_BACKOFF,
+                                // MAX_BACKOFF_INTERVALS × base)`, i.e. ~15 min on the
+                                // authenticated lane and ~1 h on the slow anonymous
+                                // one, which is the lane a missing token puts you on.
                                 schedule.failed();
                             }
                             Ok(None) if github::rate_limited() => {
@@ -859,15 +1027,29 @@ pub fn spawn_background_check(
                     // not the "pipeline is broken" signal the loud notice promises.
                     // Require the streak to have PERSISTED (>= 30 min of failing)
                     // like it inherently did at the old 6h cadence.
-                    let streak_secs =
-                        install::rfc3339_delta_secs(&h.failing_since, &install::now_rfc3339());
-                    let long_lived = streak_secs.is_some_and(|d| d >= 30 * 60);
-                    if let Some((class, count)) = h.persistent_class()
+                    //
+                    // MEASURED ON THE ESCALATING CLASS'S OWN CLOCK. `failing_since` is
+                    // any-class: it is stamped by the FIRST class to break and is
+                    // deliberately never cleared while an apply streak survives
+                    // (`Health::record_success`). Reading the gate from it meant a
+                    // single stale apply failure from days ago backdated every later
+                    // streak, so a four-minute manifest blip cleared a thirty-minute
+                    // gate the instant it crossed the count — firing the loud notice
+                    // for exactly the transient this gate exists to swallow, and
+                    // dating it days before the problem existed.
+                    let escalated = h.persistent_class();
+                    let long_lived = escalated.is_some_and(|(class, _)| {
+                        install::rfc3339_delta_secs(h.class_since(class), &install::now_rfc3339())
+                            .is_some_and(|d| d >= 30 * 60)
+                    });
+                    let notice_owed =
+                        persistent_notice_is_owed(notified_failing, escalated.map(|(c, _)| c));
+                    if let Some((class, count)) = escalated
                         && active
                         && long_lived
-                        && !notified_failing
+                        && notice_owed
                     {
-                        notified_failing = true;
+                        notified_failing = Some(class);
                         // The COUNT and the sentence both come from the class that
                         // escalated. A single hardcoded pipeline story told an
                         // apply-stranded machine "0 consecutive checks … cannot be
@@ -898,11 +1080,11 @@ pub fn spawn_background_check(
                             format!(
                                 "{count} consecutive checks since {}: {cause}. Run \
                                  `aterm-ctl update status` for details.",
-                                h.failing_since
+                                h.class_since(class)
                             ),
                         );
                     } else if !h.is_persistent() {
-                        notified_failing = false; // streak healed → re-arm for a new one
+                        notified_failing = None; // all healed → any class may speak again
                     }
                 }
                 if interval == 0 {
@@ -1315,7 +1497,7 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         changelog: ready.as_ref().and_then(|r| r.changelog.clone()),
         outcome,
         updated_at,
-        failing_checks: h.total_failures(),
+        failing_checks: h.acquisition_failures(),
         failing_persistent: h.is_persistent(),
         failing_kind: h.kind,
         failing_applies: h.apply_failures,
@@ -1413,8 +1595,8 @@ mod commit_match_tests {
 
     use super::{
         ReconciledStatusOutcome, StatusReconciliation, commit_matches, compiled_update_pin_sha256,
-        persisted_claims_stage, reconcile_status_outcome, status_reconciliation_projection,
-        update_pubkey_sha256,
+        persisted_claims_stage, persistent_notice_is_owed, reconcile_status_outcome,
+        status_reconciliation_projection, update_pubkey_sha256,
     };
 
     #[test]
@@ -1796,6 +1978,29 @@ mod commit_match_tests {
             "4e91d33",
             "4e91d3334041788ad92f5b6568cb648cb25805d6"
         ));
+    }
+
+    /// A SECOND persistent class must still be able to speak. The latch used to be one
+    /// unkeyed bool, so a machine that could not download (`pipeline`) and later also
+    /// could not APPLY what it had staged told the user about the first fault only —
+    /// for however long that process ran.
+    ///
+    /// MUTATION: make the predicate `announced.is_none()` (the old bool) and the
+    /// different-class assertion fails.
+    #[test]
+    fn a_second_persistent_class_still_speaks_but_the_same_one_stays_quiet() {
+        // Nothing escalating: nothing to say, whatever was announced before.
+        assert!(!persistent_notice_is_owed(None, None));
+        assert!(!persistent_notice_is_owed(Some("pipeline"), None));
+        // The first escalation always speaks.
+        assert!(persistent_notice_is_owed(None, Some("pipeline")));
+        // The SAME class on the next tick is the "once per streak" promise: the loud
+        // notice must not become a nag.
+        assert!(!persistent_notice_is_owed(Some("pipeline"), Some("pipeline")));
+        // A DIFFERENT class is news. THIS is the regression.
+        assert!(persistent_notice_is_owed(Some("pipeline"), Some("apply")));
+        // …and having spoken about it, it goes quiet too.
+        assert!(!persistent_notice_is_owed(Some("apply"), Some("apply")));
     }
 }
 

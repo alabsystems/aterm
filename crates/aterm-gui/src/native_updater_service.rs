@@ -66,6 +66,16 @@ pub(crate) struct DurableUpdateStatus {
     pub(crate) changelog: Option<String>,
     pub(crate) outcome: String,
     pub(crate) failing_checks: u32,
+    /// The durable health ledger's verdict that the streak is PERSISTENT (≥ the
+    /// updater's `PERSISTENT_AFTER` consecutive failures of one class): "this Mac
+    /// cannot update until X is fixed", not "one check blipped". Carried so the app
+    /// can SHOW it — measured 2026-08-18: a fleet-wide publisher-side rejection ran
+    /// for eight hours, visible only in `aterm ctl update status` and the log,
+    /// while the update screen said "You're up to date."
+    pub(crate) failing_persistent: bool,
+    /// The failing class the ledger recorded (`network` / `pipeline` / `manifest` /
+    /// `stage` / `apply`), empty when not failing.
+    pub(crate) failing_kind: String,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -77,6 +87,58 @@ pub(crate) struct StagedUpdate {
     pub(crate) dmg_sha256: String,
     pub(crate) changelog: Option<String>,
     pub(crate) generation: u64,
+}
+
+impl StagedUpdate {
+    /// Whether this stage is an INSTALLED-BUNDLE ACTIVATION rather than a downloaded
+    /// artifact: its identity is [`installed_activation_digest`] over its own build and
+    /// sealed commit, and its backing is the bundle at the running executable's path,
+    /// not a `ready.toml` marker (see [`installed_activation_digest`]).
+    #[must_use]
+    pub(crate) fn is_installed_activation(&self) -> bool {
+        self.commit
+            .as_deref()
+            .is_some_and(|commit| installed_activation_digest(self.build, commit) == self.dmg_sha256)
+    }
+}
+
+/// THE ACTIVATION IDENTITY. When the bundle at this process's own path is already a
+/// NEWER build than the process itself — installed by another producer: the release
+/// cutter writing into the bundle it was launched from, a user dragging a new `.app`
+/// over the old one, a sibling aterm that swapped it — there is no downloaded DMG to
+/// name, but every latch, budget and ticket in this reducer keys on an artifact digest.
+/// So the activation IS an artifact: a well-formed 64-hex identity derived from the
+/// sealed build number and commit, distinct per installed build, impossible to confuse
+/// with any real DMG digest by construction (a real digest is a hash of bytes nobody
+/// can choose to collide with this domain-separated one). It flows through the SAME
+/// stage → apply → returned machinery as a download; the two places that must know
+/// the difference — durable/returned reconciliation (backed by the installed bundle,
+/// not by `ready.toml`) and the handoff's pre-park verification (verify the bundle
+/// under the executable, bind no expected artifact for the successor) — ask
+/// [`StagedUpdate::is_installed_activation`] / [`ApplyAttemptTicket::is_installed_activation`].
+///
+/// Why activate at all instead of asking for a relaunch: the seamless handoff exists
+/// precisely so a newer build takes over without losing a shell. "Relaunch once to
+/// activate it" (the previous answer) left a verified, notarized, already-installed
+/// build sitting inert until a human noticed a log line — measured 2026-08-18: the
+/// v0.25.0 roll-forward stayed un-activated for hours in the very window it was cut
+/// from. A bundle newer than the process is exactly a staged update whose swap has
+/// already happened; the only remaining step is the handoff.
+#[must_use]
+pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"aterm installed-bundle activation\0");
+    hasher.update(build.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(commit.trim().to_ascii_lowercase().as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Compare one durable marker to an already-canonical artifact identity.
@@ -120,6 +182,8 @@ pub(crate) fn durable_artifact_identity_matches(
 pub(crate) struct InstalledUpdate {
     pub(crate) build: u64,
     pub(crate) commit: String,
+    /// Marketing version of the installed bundle (display only; `None` when unread).
+    pub(crate) version: Option<String>,
     pub(crate) receipt_build: Option<u64>,
     pub(crate) receipt_dmg_sha256: Option<String>,
 }
@@ -134,6 +198,37 @@ impl InstalledUpdate {
                 .receipt_dmg_sha256
                 .as_deref()
                 .is_some_and(|trial| trial.eq_ignore_ascii_case(dmg_sha256))
+    }
+
+    /// Whether this installed bundle BACKS an activation of `(build, commit)`: it is that
+    /// exact sealed identity and it is strictly newer than the running process. This is
+    /// the activation's counterpart of `proves_artifact` — the bundle under the executable
+    /// is the artifact, so no receipt is involved.
+    #[must_use]
+    pub(crate) fn backs_activation(&self, running_build: u64, build: u64, commit: &str) -> bool {
+        self.build == build
+            && self.build > running_build
+            && aterm_update::commit_matches(&self.commit, commit)
+    }
+
+    /// The activation stage this installed bundle would present, when it is newer than
+    /// the running build: the sealed identity as a [`StagedUpdate`] whose digest is the
+    /// [`installed_activation_digest`]. `None` when the bundle is not newer.
+    #[must_use]
+    pub(crate) fn activation_stage(&self, running_build: u64, generation: u64) -> Option<StagedUpdate> {
+        (self.build > running_build).then(|| StagedUpdate {
+            build: self.build,
+            version: bounded(
+                self.version
+                    .clone()
+                    .unwrap_or_else(|| format!("build {}", self.build)),
+                MAX_SHORT_TEXT_BYTES,
+            ),
+            commit: Some(self.commit.clone()),
+            dmg_sha256: installed_activation_digest(self.build, &self.commit),
+            changelog: None,
+            generation,
+        })
     }
 }
 
@@ -156,6 +251,14 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) acknowledged_attention_revision: Option<u64>,
     pub(crate) ignored_completions: u64,
     pub(crate) reexec_count: u64,
+    /// The health ledger's PERSISTENT-failure verdict as of the last reduced check
+    /// (`DurableUpdateStatus::failing_persistent`): the update screen headlines it,
+    /// and the Settings tab's attention badge lights for it exactly as it does for a
+    /// staged build — a machine that cannot update is at least as worth a glance as
+    /// one that can. Cleared the moment a check reduces to staged or up-to-date.
+    pub(crate) failing_persistent: bool,
+    /// The failing class behind `failing_persistent` (empty otherwise).
+    pub(crate) failing_kind: String,
 }
 
 impl UpdaterSnapshot {
@@ -365,6 +468,14 @@ impl ApplyAttemptTicket {
     pub(crate) fn target_commit(&self) -> &str {
         &self.artifact_commit
     }
+
+    /// Whether this attempt activates the INSTALLED bundle at the executable's path
+    /// (see [`installed_activation_digest`]) rather than swapping in a staged download.
+    #[must_use]
+    pub(crate) fn is_installed_activation(&self) -> bool {
+        installed_activation_digest(self.artifact_build, &self.artifact_commit)
+            == self.artifact_dmg_sha256
+    }
 }
 
 #[derive(Debug)]
@@ -532,6 +643,8 @@ impl NativeUpdaterService {
                 acknowledged_attention_revision: None,
                 ignored_completions: 0,
                 reexec_count: 0,
+                failing_persistent: false,
+                failing_kind: String::new(),
             },
             next_operation: 1,
             work_generation: 0,
@@ -679,6 +792,16 @@ impl NativeUpdaterService {
 
         self.snapshot.outcome = bounded(status.outcome.clone(), MAX_MESSAGE_BYTES);
         self.snapshot.enabled = status.enabled;
+        // The persistent-failure verdict rides every reduced check: it is what the
+        // update screen shows instead of "You're up to date" while the ledger says
+        // this Mac cannot update. A staged or up-to-date reduction clears it below.
+        let was_persistent = self.snapshot.failing_persistent;
+        self.snapshot.failing_persistent = status.enabled && status.failing_persistent;
+        self.snapshot.failing_kind = if self.snapshot.failing_persistent {
+            bounded(status.failing_kind.clone(), MAX_SHORT_TEXT_BYTES)
+        } else {
+            String::new()
+        };
         if !status.enabled {
             let before = self.model_state();
             self.snapshot.active = None;
@@ -738,6 +861,12 @@ impl NativeUpdaterService {
         if self.snapshot.phase == UpdaterPhase::Staged {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
         }
+        // A NEWLY persistent failure asks for attention like a staged build does —
+        // the same badge, acknowledged the same way (opening the update screen); a
+        // continuing streak does not re-badge on every check.
+        if self.snapshot.failing_persistent && !was_persistent {
+            self.snapshot.attention_revision = Some(self.snapshot.revision);
+        }
         CheckCompletion::Reduced
     }
 
@@ -767,6 +896,39 @@ impl NativeUpdaterService {
         let before = self.model_state();
         self.snapshot.install_on_clean_quit = true;
         self.record(UpdaterTransitionAction::InstallOnCleanQuit, before);
+        self.publish();
+        true
+    }
+
+    /// Retire a staged DOWNLOAD so an installed-bundle ACTIVATION can be imported in
+    /// its place: once the bundle under the executable is newer than the running
+    /// process, a swap-apply of any downloaded stage can no longer proceed (its
+    /// rollback-source proof needs the installed bundle to still be the running
+    /// build), so the activation outranks it. A no-op — `false` — unless the reducer
+    /// holds a non-activation stage in `Staged` (an in-flight apply, an activation
+    /// already in place, or nothing staged all keep their state).
+    pub(crate) fn retire_stage_for_activation(&mut self) -> bool {
+        self.last_transitions.clear();
+        let Some(staged) = self.snapshot.staged.as_ref() else {
+            return false;
+        };
+        if self.snapshot.phase != UpdaterPhase::Staged || staged.is_installed_activation() {
+            return false;
+        }
+        let before = self.model_state();
+        self.snapshot.phase = UpdaterPhase::Idle;
+        self.snapshot.staged = None;
+        self.snapshot.error = None;
+        self.snapshot.install_on_clean_quit = false;
+        self.snapshot.attention_revision = None;
+        self.snapshot.acknowledged_attention_revision = None;
+        self.snapshot.reexec_count = 0;
+        self.close_preflight_ready = false;
+        self.pending_preflight = None;
+        self.active_apply = None;
+        self.snapshot.outcome =
+            "A newer build is already installed at this bundle's path; activating it".to_string();
+        self.record(UpdaterTransitionAction::RetireStage, before);
         self.publish();
         true
     }
@@ -936,6 +1098,47 @@ impl NativeUpdaterService {
             self.last_transitions.clear();
             return ReturnedApplyDisposition::Ignored;
         }
+        // A returned ACTIVATION attempt: the installed bundle is the artifact. While it
+        // still backs the ticket the stage is re-armed exactly like a durable download
+        // (the App's bounded automatic budget decides how many more times, then the
+        // manual-only latch); once the bundle has moved on, retire.
+        if ticket.is_installed_activation() {
+            let backed = self.snapshot.enabled
+                && facts.installed.is_some_and(|installed| {
+                    installed.backs_activation(
+                        self.snapshot.current_build,
+                        ticket.artifact_build,
+                        &ticket.artifact_commit,
+                    )
+                });
+            if backed {
+                return if self.abort_apply(ticket, message) {
+                    ReturnedApplyDisposition::Rearmed
+                } else {
+                    ReturnedApplyDisposition::Ignored
+                };
+            }
+            self.last_transitions.clear();
+            let before = self.model_state();
+            let message = bounded(message.into(), MAX_MESSAGE_BYTES);
+            self.snapshot.phase = UpdaterPhase::Idle;
+            self.snapshot.staged = None;
+            self.snapshot.reexec_count = 0;
+            self.snapshot.install_on_clean_quit = false;
+            self.snapshot.attention_revision = None;
+            self.snapshot.acknowledged_attention_revision = None;
+            self.snapshot.error = None;
+            self.snapshot.outcome = bounded(
+                format!("Returned activation attempt was retired because the installed bundle changed: {message}"),
+                MAX_MESSAGE_BYTES,
+            );
+            self.close_preflight_ready = false;
+            self.pending_preflight = None;
+            self.active_apply = None;
+            self.record(UpdaterTransitionAction::RetireApply, before);
+            self.publish();
+            return ReturnedApplyDisposition::Retired;
+        }
         let installed = facts.installed.filter(|installed| {
             installed.build > self.snapshot.current_build
                 && installed.proves_artifact(
@@ -1015,6 +1218,39 @@ impl NativeUpdaterService {
         };
         if self.snapshot.phase != UpdaterPhase::Staged {
             return DurableStageDisposition::Unchanged;
+        }
+
+        // AN ACTIVATION STAGE IS BACKED BY THE INSTALLED BUNDLE, not by `ready.toml`:
+        // it stays exactly as long as the bundle under the executable is still that
+        // build and still newer than the running process. When the bundle changes
+        // again (a newer one lands, or it is rolled back under us) the stage retires
+        // and the next observation imports whatever is there now.
+        if staged.is_installed_activation() {
+            let backed = self.snapshot.enabled
+                && installed.is_some_and(|installed| {
+                    staged.commit.as_deref().is_some_and(|commit| {
+                        installed.backs_activation(self.snapshot.current_build, staged.build, commit)
+                    })
+                });
+            if backed {
+                return DurableStageDisposition::Unchanged;
+            }
+            let before = self.model_state();
+            self.snapshot.phase = UpdaterPhase::Idle;
+            self.snapshot.staged = None;
+            self.snapshot.error = None;
+            self.snapshot.install_on_clean_quit = false;
+            self.snapshot.attention_revision = None;
+            self.snapshot.acknowledged_attention_revision = None;
+            self.snapshot.reexec_count = 0;
+            self.close_preflight_ready = false;
+            self.pending_preflight = None;
+            self.active_apply = None;
+            self.snapshot.outcome =
+                "The installed bundle changed under this process; re-observing".to_string();
+            self.record(UpdaterTransitionAction::RetireStage, before);
+            self.publish();
+            return DurableStageDisposition::Retired;
         }
 
         let installed = installed.filter(|installed| {
@@ -1202,6 +1438,8 @@ mod tests {
                 "up to date".to_string()
             },
             failing_checks: 0,
+            failing_persistent: false,
+            failing_kind: String::new(),
         }
     }
 
@@ -1214,6 +1452,7 @@ mod tests {
         InstalledUpdate {
             build,
             commit: commit.to_string(),
+            version: None,
             receipt_build,
             receipt_dmg_sha256: receipt_digest.map(str::to_string),
         }
@@ -1435,6 +1674,173 @@ mod tests {
             ReturnedApplyDisposition::Ignored,
             "an async completion carries its exact ticket, never current-by-lookup authority"
         );
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Applying);
+    }
+
+    // ── the ACTIVATION lane (an installed bundle newer than the process) ──────
+
+    /// A durable status shaped the way the App imports an installed-bundle
+    /// activation: the sealed identity under `installed_activation_digest`.
+    fn activation_status(build: u64) -> DurableUpdateStatus {
+        let mut status = status(Some(build));
+        status.staged_dmg_sha256 = Some(installed_activation_digest(build, TEST_COMMIT));
+        status
+    }
+
+    fn stage_activation(service: &mut NativeUpdaterService, build: u64) -> UpdaterWorkTicket {
+        let ticket = started(service);
+        assert_eq!(
+            service.finish_check(ticket, activation_status(build)),
+            CheckCompletion::Reduced
+        );
+        assert!(
+            service.snapshot().staged.as_ref().is_some_and(StagedUpdate::is_installed_activation),
+            "the imported stage carries the activation identity"
+        );
+        ticket
+    }
+
+    /// The activation identity is a well-formed 64-hex artifact digest, a pure
+    /// function of (build, commit), and can never be mistaken for a download.
+    #[test]
+    fn the_activation_identity_is_well_formed_pure_and_distinct() {
+        let a = installed_activation_digest(11, TEST_COMMIT);
+        assert_eq!(a.len(), 64);
+        assert!(a.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(a, installed_activation_digest(11, TEST_COMMIT), "pure");
+        assert_eq!(
+            a,
+            installed_activation_digest(11, &TEST_COMMIT.to_ascii_uppercase()),
+            "commit case does not fork the identity"
+        );
+        assert_ne!(a, installed_activation_digest(12, TEST_COMMIT), "per build");
+        assert_ne!(a, TEST_DIGEST, "not a download digest");
+        let ticket = ApplyAttemptTicket::for_test(11, TEST_COMMIT, &a);
+        assert!(ticket.is_installed_activation());
+        assert!(!ApplyAttemptTicket::for_test(11, TEST_COMMIT, TEST_DIGEST).is_installed_activation());
+    }
+
+    /// An activation stage is BACKED BY THE INSTALLED BUNDLE, not by `ready.toml`:
+    /// with no durable marker at all it is Unchanged while the bundle under the
+    /// executable is still that build and still newer; the moment the bundle is no
+    /// longer newer (or is a different build) it retires.
+    #[test]
+    fn an_activation_stage_is_backed_by_the_installed_bundle_not_the_ready_marker() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        stage_activation(&mut service, 11);
+        let backing = installed(11, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.reconcile_durable_stage(true, None, None, None, Some(&backing)),
+            DurableStageDisposition::Unchanged,
+            "no durable marker is needed; the bundle is the backing"
+        );
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
+        // A different (also newer) build under the executable: this activation is
+        // stale — retire, and let the next observation import the real one.
+        let moved_on = installed(12, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.reconcile_durable_stage(true, None, None, None, Some(&moved_on)),
+            DurableStageDisposition::Retired
+        );
+        assert!(service.snapshot().staged.is_none());
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
+        assert_eq!(
+            service.last_transitions()[0].action,
+            UpdaterTransitionAction::RetireStage
+        );
+        // Rolled back under us (no longer newer): retire too.
+        stage_activation(&mut service, 11);
+        let rolled_back = installed(10, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.reconcile_durable_stage(true, None, None, None, Some(&rolled_back)),
+            DurableStageDisposition::Retired
+        );
+        // And with no installed observation at all: nothing backs it — retire.
+        stage_activation(&mut service, 11);
+        assert_eq!(
+            service.reconcile_durable_stage(true, None, None, None, None),
+            DurableStageDisposition::Retired
+        );
+    }
+
+    /// A RETURNED activation attempt (the handoff came back without committing)
+    /// re-arms while the bundle still backs it — the App's bounded automatic budget
+    /// and manual-only latch decide how many more times — and retires once the
+    /// bundle has moved on. Never a "relaunch once" dead end, never a loop.
+    #[test]
+    fn a_returned_activation_rearms_while_backed_and_retires_when_the_bundle_moves_on() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        stage_activation(&mut service, 11);
+        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+            ApplyPreflightStart::Inspect(ticket) => ticket,
+            other => panic!("expected preflight, got {other:?}"),
+        };
+        let command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
+            ApplyDecision::Execute(command) => command,
+            other => panic!("expected execute decision, got {other:?}"),
+        };
+        let attempt = command.attempt();
+        assert!(attempt.is_installed_activation());
+        let backing = installed(11, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.finish_returned_apply(
+                &attempt,
+                ReturnedApplyFacts::new(true, None, None, None, Some(&backing)),
+                "overlap handoff failed safely: handoff proof ended TimedOut"
+            ),
+            ReturnedApplyDisposition::Rearmed,
+            "the bundle still backs the activation: re-armed for the budget to decide"
+        );
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Staged);
+        assert!(service.snapshot().staged.as_ref().is_some_and(StagedUpdate::is_installed_activation));
+
+        // Second attempt, but by the time it returns the bundle moved on: retire.
+        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+            ApplyPreflightStart::Inspect(ticket) => ticket,
+            other => panic!("expected preflight, got {other:?}"),
+        };
+        let command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
+            ApplyDecision::Execute(command) => command,
+            other => panic!("expected execute decision, got {other:?}"),
+        };
+        let attempt = command.attempt();
+        let moved_on = installed(12, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.finish_returned_apply(
+                &attempt,
+                ReturnedApplyFacts::new(true, None, None, None, Some(&moved_on)),
+                "overlap handoff failed safely: handoff proof ended ChildDied"
+            ),
+            ReturnedApplyDisposition::Retired
+        );
+        assert!(service.snapshot().staged.is_none());
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
+    }
+
+    /// A staged DOWNLOAD retires in favour of an activation (the App calls this when
+    /// the bundle under the executable turns out newer than the process); an
+    /// activation already in place, an in-flight apply, and an empty reducer are
+    /// all left alone.
+    #[test]
+    fn a_download_stage_retires_for_activation_but_nothing_else_does() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        assert!(!service.retire_stage_for_activation(), "nothing staged: no-op");
+        stage(&mut service, 11);
+        assert!(service.retire_stage_for_activation(), "a download stage retires");
+        assert!(service.snapshot().staged.is_none());
+        assert_eq!(service.snapshot().phase, UpdaterPhase::Idle);
+        stage_activation(&mut service, 12);
+        assert!(!service.retire_stage_for_activation(), "an activation stays");
+        assert!(service.snapshot().staged.is_some());
+        let preflight = match service.begin_apply_preflight(ApplyMode::Immediate) {
+            ApplyPreflightStart::Inspect(ticket) => ticket,
+            other => panic!("expected preflight, got {other:?}"),
+        };
+        let _command = match service.finish_apply_preflight(preflight, ClosePreflight::Ready) {
+            ApplyDecision::Execute(command) => command,
+            other => panic!("expected execute decision, got {other:?}"),
+        };
+        assert!(!service.retire_stage_for_activation(), "an in-flight apply is untouchable");
         assert_eq!(service.snapshot().phase, UpdaterPhase::Applying);
     }
 

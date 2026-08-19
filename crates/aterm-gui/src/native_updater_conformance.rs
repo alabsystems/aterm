@@ -46,6 +46,8 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
             "network failed".to_string()
         },
         failing_checks,
+        failing_persistent: false,
+        failing_kind: String::new(),
     }
 }
 

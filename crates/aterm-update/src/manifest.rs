@@ -128,6 +128,26 @@ pub struct Ready {
     /// changelog is queryable (status / menu) without re-fetching. Absent ⇒ None.
     #[serde(default)]
     pub changelog: Option<String>,
+    /// ATTRIBUTION recorded at stage time: which MACHINE's key authorized this bundle,
+    /// and under which roster generation.
+    ///
+    /// Without these a stage was a promise nothing could withdraw. A revocation reaches
+    /// a client as a NEW roster generation, which the check lane ratchets into
+    /// [`Floor::roster_seq`] and enforces via `roster_authority_superseded` — but the
+    /// apply lane re-read only `min_build`, so a bundle staged at 10:00 by a machine
+    /// revoked at 10:30 installed at the next launch anyway, and only a separate
+    /// `min_build` yank could have stopped a withdrawn machine's artifact. Recording
+    /// the generation here is what lets the apply gate ask the question the stage gate
+    /// already asks.
+    ///
+    /// Absent ⇒ None: a marker written before these fields existed, or a release with
+    /// no attribution at all (every pre-roster cut). `None` means UNKNOWN, never
+    /// "exempt" — see the apply gate for what that costs and why.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+    /// See [`Self::machine_id`].
+    #[serde(default)]
+    pub roster_seq: Option<u64>,
 }
 
 impl Ready {
@@ -345,8 +365,17 @@ pub struct Floor {
     ///
     /// Its limit is the honest one and belongs here rather than in a design doc: it is
     /// worth exactly nothing to a FRESH INSTALL, which has no recorded sequence and so
-    /// accepts whatever it is first shown. That client is protected only by the roster's
-    /// own `valid_until`, which is why that window is a deliberate number.
+    /// accepts whatever it is first shown. Nor is anything else covering that client:
+    /// the roster's `valid_until` was once a 180-day freshness window, but every roster
+    /// this tooling mints now stamps 9999-12-31 (`atpkg_keys::roster_ops::
+    /// VALID_UNTIL_FOREVER`), so the freshness gate always passes and first contact has
+    /// NO replay defence at all. That is a recorded owner decision, not an oversight —
+    /// the window's residual protection did not pay for a mandatory twice-yearly
+    /// re-sign plus a fleet-wide fail-closed outage if the date ever lapsed unattended,
+    /// and revocation is the answer to a stolen key either way. It is written down here
+    /// because the previous wording called that window "a deliberate number", which
+    /// reads as a protection still being relied on; the only thing this ratchet
+    /// actually gives a fresh install is protection from the SECOND roster onwards.
     ///
     /// Absent ⇒ 0, the permissive first-contact value, matching the other two.
     #[serde(default)]
@@ -368,16 +397,70 @@ impl Floor {
     /// read/max/write transaction, preventing two processes from overwriting each
     /// other's independent maxima. A no-op write is skipped. Best-effort — a
     /// failure to persist the floor never blocks an update decision.
+    ///
+    /// Best-effort, but no longer SILENT. Every step here used to discard its error,
+    /// so a full disk, a read-only remount, or a floor file this uid cannot replace
+    /// froze `min_build`, `high_water` and `roster_seq` at their recorded values
+    /// indefinitely — a replayed pre-revocation roster generation and an operator-
+    /// yanked build are then re-accepted every single cycle — while `update status`
+    /// went on describing a perfectly healthy machine, so the one party who could fix
+    /// the disk was never told. `atpkg`'s sibling ratchet (`atpkg::sig`,
+    /// `Floor::write` / `read_floor`) makes exactly this call in the other direction
+    /// and documents why: report the failure, then carry on under the old value,
+    /// because refusing outright would let anyone who can wedge the file wedge the
+    /// updater. Same shape here.
     pub fn bump_and_write(
         path: &Path,
         seen_min_build: u64,
         staged_build: u64,
         seen_roster_seq: u64,
     ) {
-        let Ok(_lock) = aterm_update_core::FileLock::acquire(&path.with_extension("toml.lock"))
-        else {
-            return;
-        };
+        if let Err(error) =
+            Self::bump_and_write_reporting(path, seen_min_build, staged_build, seen_roster_seq)
+        {
+            crate::warn(&format!(
+                "{error} — replay/rollback protection stays frozen at the values \
+                 already on disk"
+            ));
+        }
+    }
+
+    /// [`Self::bump_and_write`]'s fallible body: the same ratchet, but handing the
+    /// caller the failure instead of only warning about it, so a test can pin BOTH
+    /// halves of a failed commit — the error is reported rather than swallowed, and the
+    /// temp file is gone afterwards.
+    fn bump_and_write_reporting(
+        path: &Path,
+        seen_min_build: u64,
+        staged_build: u64,
+        seen_roster_seq: u64,
+    ) -> Result<(), String> {
+        Self::commit_bump(path, seen_min_build, staged_build, seen_roster_seq).map_err(|error| {
+            // NAME THE ADVANCE THAT WAS LOST, not just the step that failed. The raw
+            // step error reads "commit /…/floor.toml: Is a directory", which leaves the
+            // reader to work out on their own that replay and rollback protection just
+            // stopped moving. Attaching the floor here makes that consequence legible at
+            // EVERY call site instead of only at whichever one remembers to add it.
+            format!(
+                "could not raise the update floor at {} to (min_build {seen_min_build}, \
+                 high_water {staged_build}, roster_seq {seen_roster_seq}): {error}",
+                path.display()
+            )
+        })
+    }
+
+    /// The locked read/max/write transaction itself, reporting the STEP that failed.
+    fn commit_bump(
+        path: &Path,
+        seen_min_build: u64,
+        staged_build: u64,
+        seen_roster_seq: u64,
+    ) -> Result<(), String> {
+        let lock_path = path.with_extension("toml.lock");
+        // `_lock`, never `_`: the guard must live until this function returns, since
+        // it covers the whole read/max/write transaction.
+        let _lock = aterm_update_core::FileLock::acquire(&lock_path)
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
         let cur = Self::read(path);
         let next = Self {
             min_build: cur.min_build.max(seen_min_build),
@@ -385,17 +468,24 @@ impl Floor {
             roster_seq: cur.roster_seq.max(seen_roster_seq),
         };
         if next == cur {
-            return;
+            return Ok(());
         }
-        let Ok(text) = toml::to_string(&next) else {
-            return;
-        };
+        let text = toml::to_string(&next).map_err(|error| format!("encode floor: {error}"))?;
         let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        } else {
+        // The temp is swept on EVERY failing path, not just a failed write. The rename
+        // arm used to leak it, and a failing rename is precisely the case that repeats
+        // forever (a full disk, a read-only remount): one `floor.toml.<pid>.tmp` per
+        // failing cycle piling up in the 0700 Updates root, which nothing sweeps.
+        let committed = std::fs::write(&tmp, text)
+            .map_err(|error| format!("write {}: {error}", tmp.display()))
+            .and_then(|()| {
+                std::fs::rename(&tmp, path)
+                    .map_err(|error| format!("commit {}: {error}", path.display()))
+            });
+        if committed.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
+        committed
     }
 }
 
@@ -1002,6 +1092,8 @@ changelog = '''
             team_id: "T".into(),
             staged_at: "2026-06-21T00:00:00Z".into(),
             changelog: Some("### Fixes\n- a thing".into()),
+            machine_id: Some("m3".into()),
+            roster_seq: Some(2),
         };
         let parsed: Ready = toml::from_str(&r.to_toml().unwrap()).unwrap();
         assert_eq!(parsed.build_number, 9);
@@ -1033,6 +1125,8 @@ changelog = '''
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
         assert!(
@@ -1175,6 +1269,50 @@ changelog = '''
         let _ = std::fs::remove_file(&p);
     }
 
+    /// THE LEAK AND THE SILENCE, TOGETHER. The ratchet removed its temp file only when
+    /// the WRITE failed, so a failed RENAME left `floor.toml.<pid>.tmp` in the Updates
+    /// root forever — and it returned `()` either way, so a frozen floor (replayed
+    /// roster generations and yanked builds accepted again on every single check) was
+    /// indistinguishable from a healthy one to every observer the machine has.
+    ///
+    /// MUTATION: move the `remove_file` back into a write-failure-only arm, or discard
+    /// the commit error, and one of the two assertions below fails.
+    #[test]
+    fn a_floor_that_cannot_be_committed_is_reported_and_leaves_no_temp_file() {
+        let root =
+            std::env::temp_dir().join(format!("aterm-floor-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A DIRECTORY where the floor file belongs: the temp write succeeds and the
+        // rename over it cannot, which is exactly the arm that used to leak.
+        let path = root.join("floor.toml");
+        std::fs::create_dir(&path).unwrap();
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+
+        let error = Floor::bump_and_write_reporting(&path, 5, 12, 3)
+            .expect_err("a floor that cannot be committed must not report success");
+        assert!(
+            error.contains("roster_seq 3"),
+            "the report must name the advance that was lost: {error}"
+        );
+        assert!(
+            !tmp.exists(),
+            "the temp file must never outlive a failed commit"
+        );
+        // The consequence the report exists to explain: the floor is still all-zero, so
+        // the same roster generation is accepted again on the next check.
+        assert_eq!(Floor::read(&path), Floor::default());
+
+        // NEGATIVE CONTROL: on an ordinary path the same advance commits, reports
+        // nothing, and also leaves no temp file behind.
+        let ok_path = root.join("ok.toml");
+        assert_eq!(Floor::bump_and_write_reporting(&ok_path, 5, 12, 3), Ok(()));
+        assert_eq!(Floor::read(&ok_path).roster_seq, 3);
+        let ok_tmp = ok_path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        assert!(!ok_tmp.exists(), "a successful commit leaves no temp file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn failed_mark_matches_on_build_and_hash_only() {
         let p = std::env::temp_dir().join(format!("aterm-failed-{}.toml", std::process::id()));
@@ -1190,5 +1328,43 @@ changelog = '''
         );
         FailedMark::clear(&p);
         assert!(FailedMark::read(&p).is_none());
+    }
+
+    /// The floor used to fail in the worst possible way: silently, AND leaking. A
+    /// commit that cannot land (full disk, read-only remount, a floor file this uid
+    /// may not replace) freezes the replay/rollback ratchet while status still reads
+    /// healthy, and the old code's `remove_file` sat only in the write-failure arm, so
+    /// each failing cycle also dropped one `floor.toml.<pid>.tmp` into the 0700
+    /// Updates root that nothing ever collects.
+    #[test]
+    fn an_uncommittable_floor_is_reported_and_sweeps_its_own_temp_file() {
+        let root =
+            std::env::temp_dir().join(format!("aterm-floor-uncommittable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // A directory standing where the floor file belongs is the cheapest portable
+        // way to make the RENAME fail while the temp write still succeeds — i.e. the
+        // exact arm that used to leak.
+        let path = root.join("floor.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let error = Floor::bump_and_write_reporting(&path, 5, 12, 3)
+            .expect_err("a floor cannot be committed over a directory");
+        assert!(
+            error.contains("commit"),
+            "the reported error must name the step that failed: {error}"
+        );
+
+        let leaked: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a failed commit must leave no temp behind: {leaked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

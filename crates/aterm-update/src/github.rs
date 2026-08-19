@@ -536,10 +536,18 @@ fn select_authoritative_release(
 /// [`RosterPolicy::INERT`] is the fail-closed default: no master pinned, which makes
 /// `verify_roster` return `Disabled` for every input and authorizes nothing. With
 /// `master_pubkeys` empty the tier is ABSENT and the compiled-in channel keyset is the
-/// authority, exactly as it is in every shipped build — the same shape as an empty
-/// `APPLE_TEAM_ID` removing the Developer-ID tier without loosening anything beside it.
+/// authority — the same shape as an empty `APPLE_TEAM_ID` removing the Developer-ID tier
+/// without loosening anything beside it.
 ///
-/// ARMED, this tier does not sit BESIDE the keyset gate, it REPLACES it: the roster is
+/// THAT IS NOT THIS TREE. This sentence used to end "exactly as it is in every shipped
+/// build", which stopped being true on 2026-08-15 when `pins::PAPER_MASTER_PUBKEYS` was
+/// armed (`atpkg-keys setup --id m3`). The empty-anchor shape is now the PRE-ROSTER /
+/// FORK path — a checkout that has not committed a master of its own — and every build
+/// cut from this tree takes the armed one, so the armed branch is production code and
+/// must be read as such.
+///
+/// ARMED — the production path here — this tier does not sit BESIDE the keyset gate, it
+/// REPLACES it: the roster is
 /// the sole authority over who may have signed the appcast. See
 /// [`fetch_authoritative_release`] for why an OR of the two would give up revocation,
 /// which is the one thing a compiled-in keyset can never express.
@@ -569,9 +577,13 @@ impl RosterPolicy<'static> {
     /// The tier switched off — the fixture every test that is not about the roster uses.
     ///
     /// `#[cfg(test)]` because production never names it: the real path always builds a
-    /// policy from `pins::PAPER_MASTER_PUBKEYS`, which is empty today and therefore
-    /// already inert. Two ways to spell "off" would be one too many, and this is the one
-    /// that is only a fixture.
+    /// policy from `pins::PAPER_MASTER_PUBKEYS`, which has been ARMED since 2026-08-15 —
+    /// so production never reaches the off state through this constant, and in this tree
+    /// never reaches it at all. (This doc used to say the anchor "is empty today and
+    /// therefore already inert", which described the pre-arming tree. A fork with no
+    /// master of its own gets the off state from its own empty anchor, not from here.)
+    /// Two ways to spell "off" would be one too many, and this is the one that is only a
+    /// fixture.
     #[cfg(test)]
     pub(crate) const INERT: RosterPolicy<'static> = RosterPolicy {
         master_pubkeys: &[],
@@ -816,14 +828,19 @@ fn fetch_authoritative_release(
     // roster unable to do the one job the owner asked of it.
     //
     // (A) NO MASTER PINNED — the compiled-in keyset decides, exactly as it always has.
-    //     This is every build ever shipped, and the branch below is deliberately
-    //     unchanged code rather than a re-expression of it:
+    //     This was every build shipped BEFORE 2026-08-15; since the paper master was
+    //     armed in `pins::PAPER_MASTER_PUBKEYS` this is the PRE-ROSTER / FORK branch —
+    //     a checkout with no master of its own — and (B) is what every build cut from
+    //     this tree takes. It is still deliberately unchanged code rather than a
+    //     re-expression of it:
     //     `select_authoritative_release` yields exactly ONE candidate with no fallback
     //     to an older release, so a client that meets a release it cannot verify does
     //     not wait — it is WEDGED there permanently. Any behaviour change on this path
     //     is a fleet-bricking bug.
     //
-    // (B) MASTER ARMED — the master-signed roster decides, and it decides ALONE. The
+    // (B) MASTER ARMED — THE PRODUCTION PATH IN THIS TREE, since 2026-08-15; (A) above
+    //     is the compatibility shape a fork with no pinned master takes. The
+    //     master-signed roster decides, and it decides ALONE. The
     //     keyset is not consulted, so it cannot refuse a machine the roster authorized;
     //     that is the whole point of the tier, because it is what makes adding a machine
     //     a LOCAL act (mint, roster, publish) instead of one that needs a release cut
@@ -1008,8 +1025,11 @@ fn fetch_authoritative_release(
 /// Whether the roster generation that authorized this check's release has been
 /// SUPERSEDED by the durable floor while the check was in flight.
 ///
-/// `observed` is the sequence the chain admitted for this release (`None` when the roster
-/// tier is inert, which can never be superseded); `floor_now` is a FRESH read of the
+/// `observed` is the sequence the chain admitted for this release — `None`, which can
+/// never be superseded, whenever no master-verified roster reached `admit`: the UNARMED
+/// tier (a fork with no pinned master), or an armed tier whose roster was unfetchable or
+/// refused. This tree has been armed since 2026-08-15, so `None` here is the second case,
+/// not the first. `floor_now` is a FRESH read of the
 /// durable floor. This run's own ratchet write makes `floor_now >= observed` in the
 /// quiescent case, so a strict `<` fires only when a CONCURRENT instance recorded a newer
 /// generation — at which point staging an artifact authorized under the older generation
@@ -1037,6 +1057,38 @@ fn publishable_stage_covers(staging: &Staging, manifest: &Manifest) -> bool {
                     })
                 }))
     })
+}
+
+/// Record the "a verified stage already covers this candidate" decision in
+/// `status.toml`.
+///
+/// WHAT WENT WRONG: both [`publishable_stage_covers`] short-circuits returned
+/// `Ok(None)` having written NOTHING. The attribution note ("authoritative release
+/// signed by machine m3") is written earlier in the SAME check, before the staging
+/// decision — and with the paper master armed that note lands on every cycle. So on a
+/// machine holding a pending, verified stage — which is its steady state until the
+/// apply lane runs — the last decision in `status.toml` was a note about who SIGNED a
+/// release, and the one fact an operator reading this file was after, that a build is
+/// already on disk waiting to apply, appeared nowhere. Every other terminal outcome of
+/// the check records its decision; these two were the hole.
+fn record_covered_stage_status(staging: &Staging, current_build: u64, manifest: &Manifest) {
+    // Re-read the marker rather than plumbing a value out of the predicate: the marker
+    // IS the authority for what is on disk, and this read is local and cheap. It can
+    // legitimately have vanished since the predicate ran (a concurrent retire), and in
+    // that case we still record a decision — naming the candidate instead of inventing
+    // a stage — because leaving the previous line standing is the very failure above.
+    let msg = match Ready::read_publishable(staging) {
+        Some(ready) => format!(
+            "staged {} (build {}) — verified and ready to apply; release build {} needs \
+             no download",
+            ready.version, ready.build_number, manifest.build_number
+        ),
+        None => format!(
+            "a verified stage already covers release build {}",
+            manifest.build_number
+        ),
+    };
+    crate::status::record(staging, current_build, &msg);
 }
 
 /// The download path's counterpart to `install::sweep_stale_mounts` /
@@ -1382,11 +1434,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                 // untrustworthy authoritative release stays untrustworthy until the
                 // PUBLISHER republishes, so retrying changes nothing. A machine sat at
                 // failure 597 still being told its check was "deferred".
-                let msg = if h.is_persistent() {
+                let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
                     format!(
                         "FAILING ({} consecutive checks since {}): {error} — this Mac \
                      cannot install any release until that is fixed at the publisher",
-                        h.manifest_failures, h.failing_since
+                        h.manifest_failures,
+                        h.class_since("manifest")
                     )
                 } else {
                     format!(
@@ -1404,8 +1457,13 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         aterm_update_core::download_bytes(url, tok.as_deref(), max_bytes)
     };
     // The roster tier's inputs, resolved from the anchor and this client's durable state.
-    // `PAPER_MASTER_PUBKEYS` is empty in the shipped tree, which makes this policy inert
-    // and the whole tier a no-op — see `RosterPolicy::INERT`.
+    // `PAPER_MASTER_PUBKEYS` is ARMED (2026-08-15, `atpkg-keys setup --id m3`), so this
+    // policy is LIVE: the master-signed roster — not the compiled-in channel keyset —
+    // decides who may have signed the appcast this check accepts, and every field below
+    // is load-bearing. This comment used to say the anchor was empty and the whole tier
+    // a no-op, which is how a production path came to be read as dead code; the only
+    // build still taking the unarmed keyset path is a fork that has not committed a
+    // master of its own (branch (A) of `fetch_authoritative_release`).
     //
     // `floor_seq` is a snapshot read before the (network) list fetch above, so it can be
     // stale by the time a roster is admitted; `floor_refresh` re-reads the durable floor
@@ -1473,12 +1531,13 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                 "pipeline",
                 "release manifests exist but could not be fetched",
             );
-            if h.is_persistent() {
+            if h.pipeline_failures >= crate::PERSISTENT_AFTER {
                 format!(
                     "FAILING ({} consecutive checks since {}): release manifests exist \
                      but cannot be downloaded — this build's download pipeline is \
                      likely broken",
-                    h.pipeline_failures, h.failing_since
+                    h.pipeline_failures,
+                    h.class_since("pipeline")
                 )
             } else {
                 format!(
@@ -1496,12 +1555,13 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                 "manifest",
                 "manifest(s) fetched but rejected (signature/parse)",
             );
-            if h.is_persistent() {
+            if h.manifest_failures >= crate::PERSISTENT_AFTER {
                 format!(
                     "FAILING ({} consecutive checks since {}): manifest(s) fetched but \
                      rejected (signature/parse) — this Mac cannot install any release \
                      until that is fixed at the publisher",
-                    h.manifest_failures, h.failing_since
+                    h.manifest_failures,
+                    h.class_since("manifest")
                 )
             } else {
                 "no stageable release: manifest(s) fetched but rejected (signature/parse)"
@@ -1540,7 +1600,18 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // Recency floors (F5/F6): refuse a genuine build below the operator floor (yank),
     // or below our high-water (an attacker re-pointing the newest release at an older
     // genuine build cannot roll a client that has already advanced back down).
+    //
+    // BOTH holds are TERMINAL HEALTHY outcomes and must clear the acquisition streaks,
+    // for exactly the reason the downgrade gate immediately above does: everything this
+    // check exercised — the releases list, the appcast fetch, the signature/roster
+    // admission — WORKED, and the only reason it stops here is a deliberate policy
+    // decision about the build it found. Returning without `record_success` left the
+    // network/pipeline/manifest streaks standing, and a machine parked under a yank
+    // floor stays parked for days, so ordinary non-consecutive blips accumulated check
+    // after check until one crossed PERSISTENT_AFTER and fired "your update pipeline is
+    // likely broken" at a machine whose pipeline had just run end to end in front of it.
     if manifest.build_number < effective_min_build {
+        crate::health::Health::record_success(&staging.health());
         crate::status::record(
             &staging,
             current_build,
@@ -1552,6 +1623,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Ok(None);
     }
     if manifest.build_number < floor.high_water {
+        crate::health::Health::record_success(&staging.health());
         crate::status::record(
             &staging,
             current_build,
@@ -1572,6 +1644,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // a stage waiting to apply.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
+        record_covered_stage_status(&staging, current_build, &manifest);
         return Ok(None);
     }
 
@@ -1591,6 +1664,25 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         current_build,
         crate::install::unix_now_secs(),
     ) {
+        // A backed-off re-stage is still a terminal healthy end to the ACQUISITION half
+        // of this check: the list, the appcast and its authorization all worked, and we
+        // stop only because a memo says these exact bytes already refused to stage.
+        // Recording nothing left the network/pipeline/manifest streaks standing for the
+        // whole life of the memo — up to 24 h, and a quarantine's window never opens at
+        // all — so unrelated blips accumulated to PERSISTENT_AFTER and reported a broken
+        // pipeline on a machine whose pipeline demonstrably ran every cycle.
+        //
+        // DELIBERATELY NOT `record_success`: that also zeroes `stage_failures`. The
+        // backoff itself lives in `failed.toml`, so clearing the ledger streak would not
+        // re-open the window — it would do something worse. A machine that fails to
+        // stage interleaves failed checks with backed-off ones, so a `record_success`
+        // here would reset the stage streak between every pair of failures and it could
+        // never reach PERSISTENT_AFTER: the one class whose escalation says "the bytes
+        // arrive and will not become a bundle" would be silenced by the very backoff it
+        // caused. `record_acquisition_success` clears the acquisition classes and their
+        // clocks and preserves `stage_failures`/`stage_since`, exactly the way
+        // `record_success` already preserves the apply streak.
+        crate::health::Health::record_acquisition_success(&staging.health());
         crate::status::record(
             &staging,
             current_build,
@@ -1612,6 +1704,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // Same terminal-healthy reasoning as the pre-lock check above.
     if publishable_stage_covers(&staging, &manifest) {
         crate::health::Health::record_success(&staging.health());
+        record_covered_stage_status(&staging, current_build, &manifest);
         return Ok(None);
     }
     // Under the same lock, re-read the roster floor: a concurrent instance may have
@@ -1621,6 +1714,14 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         observed_roster_seq,
         crate::manifest::Floor::read(&staging.floor()).roster_seq,
     ) {
+        // Terminal healthy: acquisition ran end to end and a CONCURRENT instance simply
+        // ratcheted the roster generation under us. Losing that benign race is not a
+        // pipeline failure, and without a success record the streaks from earlier blips
+        // survived it — on a machine running two app instances this hold is common
+        // enough to keep a stale streak alive and eventually push it past
+        // PERSISTENT_AFTER. The refusal is transient; the next check re-runs under the
+        // advanced floor.
+        crate::health::Health::record_success(&staging.health());
         crate::status::record(
             &staging,
             current_build,
@@ -1668,6 +1769,18 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                 "{container} size mismatch: got {got} bytes, expected {}",
                 asset.size
             );
+            // MEMOIZE, exactly as the post-stage failure below does. Without this the
+            // bytes-arrived-but-wrong path had no retry budget at all: `stage_backoff`
+            // consults only this memo, so an asset re-uploaded after its manifest was
+            // signed (or a stale CDN object) was re-downloaded IN FULL every cycle —
+            // ~3 GB/hour/machine, forever, while the sibling container whose identity
+            // was already proven was never tried.
+            crate::manifest::FailedMark::record_stage_failure(
+                &staging.failed(),
+                manifest.build_number,
+                &manifest.sha256,
+                crate::install::unix_now_secs(),
+            );
             crate::health::Health::record_failure(&staging.health(), "stage", &msg);
             return Err(msg);
         }
@@ -1679,12 +1792,38 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     }
 
     // Integrity: SHA-256 must equal the manifest's digest FOR THIS CONTAINER.
-    let got = aterm_update_core::sha256_file(&container_path)?;
+    //
+    // A bare `?` here was the ONE exit in this function that recorded nothing at all.
+    // A missing or non-executable `shasum` therefore left `failing=0 persistent=false`
+    // forever — and `Health::is_persistent()` is the sole gate on the "aterm
+    // auto-update is failing" notice, so the machine that could never hash a download
+    // was also the one machine guaranteed never to say so.
+    let got = match aterm_update_core::sha256_file(&container_path) {
+        Ok(got) => got,
+        Err(e) => {
+            let _ = std::fs::remove_file(&container_path);
+                crate::manifest::FailedMark::record_stage_failure(
+                    &staging.failed(),
+                    manifest.build_number,
+                    &manifest.sha256,
+                    crate::install::unix_now_secs(),
+                );
+            crate::health::Health::record_failure(&staging.health(), "stage", &e);
+            return Err(e);
+        }
+    };
     if !got.eq_ignore_ascii_case(&artifact.sha256) {
         let _ = std::fs::remove_file(&container_path);
         let msg = format!(
             "{container} sha256 mismatch: got {got}, manifest {}",
             artifact.sha256
+        );
+        // Same budget as every other bytes-arrived failure — see the size arm above.
+        crate::manifest::FailedMark::record_stage_failure(
+            &staging.failed(),
+            manifest.build_number,
+            &manifest.sha256,
+            crate::install::unix_now_secs(),
         );
         crate::health::Health::record_failure(&staging.health(), "stage", &msg);
         return Err(msg);
@@ -3341,6 +3480,8 @@ mod tests {
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
     }
@@ -3462,6 +3603,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
+    /// A pending, verified stage must SAY SO. Both `publishable_stage_covers`
+    /// short-circuits used to return having recorded nothing, while the attribution note
+    /// ("authoritative release signed by machine m3") is written earlier in the same
+    /// check — so `status.toml` on a machine holding a ready build showed the SIGNER of a
+    /// release it had already staged as its last decision, and the fact an operator was
+    /// actually looking for appeared nowhere.
+    #[test]
+    fn a_stage_that_already_covers_the_candidate_records_the_staged_decision() {
+        let staging = test_staging("covered-status");
+        let manifest = candidate_manifest();
+        let commit = manifest.commit.as_deref().unwrap();
+        write_ready(&staging, manifest.build_number, commit, &manifest.sha256);
+        write_bundle_identity(&staging, manifest.build_number, commit);
+        assert!(
+            publishable_stage_covers(&staging, &manifest),
+            "precondition: this stage covers the candidate"
+        );
+
+        // The signer note is what the real check writes just before the staging
+        // decision, so it is the line the decision has to overwrite.
+        crate::status::record(&staging, 1, "authoritative release signed by machine m3");
+        record_covered_stage_status(&staging, 1, &manifest);
+        let text = std::fs::read_to_string(&staging.status).expect("status written");
+        assert!(
+            text.contains("verified and ready to apply"),
+            "the staged decision must be the last thing recorded: {text}"
+        );
+        assert!(
+            text.contains(&format!("build {}", manifest.build_number)),
+            "the staged build must be named: {text}"
+        );
+        assert!(
+            !text.contains("signed by machine"),
+            "the attribution note must not survive as the last decision: {text}"
+        );
+
+        // The marker can vanish between the predicate and the record (a concurrent
+        // retire). Even then the arm records a DECISION rather than leaving the previous
+        // line standing, which is the whole failure this exists to prevent.
+        std::fs::remove_file(&staging.ready).unwrap();
+        record_covered_stage_status(&staging, 1, &manifest);
+        let text = std::fs::read_to_string(&staging.status).expect("status written");
+        assert!(
+            text.contains("already covers release build"),
+            "the fallback must still record a decision: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
     /// THE regression this split exists for: a DOWNLOAD backoff must never hold an
     /// already-staged build hostage.
     ///
@@ -3472,6 +3663,35 @@ mod tests {
     /// 24 h re-download window was also refusing to apply a bundle that was already
     /// downloaded, verified, extracted and marked ready. Different failures, different
     /// remedies — they must not share a timer.
+    /// The health half of the same arm, pinned separately because it is the half that
+    /// silently mis-reported healthy machines: a backed-off check must clear the
+    /// ACQUISITION streaks (the list, appcast and authorization all worked, so unrelated
+    /// blips must not accumulate toward PERSISTENT_AFTER for the whole 24 h life of the
+    /// memo) and must NOT clear `stage_failures` — a machine that keeps failing to stage
+    /// interleaves failures with backed-off checks, so resetting that streak here would
+    /// mean the one class whose escalation says "the bytes arrive and will not become a
+    /// bundle" could never reach PERSISTENT_AFTER.
+    #[test]
+    fn a_backed_off_check_clears_the_acquisition_streaks_but_never_the_stage_streak() {
+        let staging = test_staging("backoff-health");
+        let ledger = staging.health();
+        crate::health::Health::record_failure(&ledger, "network", "dns");
+        crate::health::Health::record_failure(&ledger, "pipeline", "asset fetch failed");
+        crate::health::Health::record_failure(&ledger, "manifest", "bad signature");
+        crate::health::Health::record_failure(&ledger, "stage", "sha256 mismatch");
+
+        let h = crate::health::Health::record_acquisition_success(&ledger);
+        assert_eq!(h.network_failures, 0, "network streak must clear");
+        assert_eq!(h.pipeline_failures, 0, "pipeline streak must clear");
+        assert_eq!(h.manifest_failures, 0, "manifest streak must clear");
+        assert_eq!(
+            h.stage_failures, 1,
+            "the stage streak is the one this arm must preserve"
+        );
+
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
     #[test]
     fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         use crate::manifest::{FailedMark, RETRY_BACKOFF_SECS};

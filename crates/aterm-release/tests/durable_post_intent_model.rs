@@ -263,31 +263,48 @@ fn lost_response_converges_visible_create_and_upload_without_repost() {
 #[test]
 fn absent_cleanup_selector_is_fail_closed_for_issued_or_unknown_intent() {
     assert_eq!(
-        publish::absent_draft_decision(Some(false)),
+        publish::absent_draft_decision(Some(false), false),
         publish::AbsentDraftDecision::AbandonProvenNoPost
     );
     for knowledge in [Some(true), None] {
         assert_eq!(
-            publish::absent_draft_decision(knowledge),
+            publish::absent_draft_decision(knowledge, false),
             publish::AbsentDraftDecision::RetainOwnerAwaitVisibility
         );
     }
+    // The operator answers for a LOST journal only. A journal that PROVES a POST was
+    // issued still wins — there, delayed visibility is the only explanation left.
+    assert_eq!(
+        publish::absent_draft_decision(None, true),
+        publish::AbsentDraftDecision::AbandonProvenNoPost
+    );
+    assert_eq!(
+        publish::absent_draft_decision(Some(true), true),
+        publish::AbsentDraftDecision::RetainOwnerAwaitVisibility
+    );
     use publish::DraftCleanupDecision::{
         AbandonProvenNoPost, DeleteIssuedVisible, RefuseUnknownOrInconsistent,
         RetainIssuedAwaitVisibility,
     };
-    for (knowledge, visible, expected) in [
-        (Some(false), false, AbandonProvenNoPost),
-        (Some(false), true, RefuseUnknownOrInconsistent),
-        (Some(true), false, RetainIssuedAwaitVisibility),
-        (Some(true), true, DeleteIssuedVisible),
-        (None, false, RefuseUnknownOrInconsistent),
-        (None, true, RefuseUnknownOrInconsistent),
+    // `bound` = the visible draft targets the recovery claim's commit, i.e. the remote
+    // itself proves the object is this claim's. It is the ONLY thing that may stand in
+    // for a lost journal, and only when a draft is actually visible.
+    for (knowledge, visible, bound, expected) in [
+        (Some(false), false, false, AbandonProvenNoPost),
+        (Some(false), true, false, RefuseUnknownOrInconsistent),
+        (Some(false), true, true, RefuseUnknownOrInconsistent),
+        (Some(true), false, false, RetainIssuedAwaitVisibility),
+        (Some(true), true, false, DeleteIssuedVisible),
+        (None, false, false, RefuseUnknownOrInconsistent),
+        (None, false, true, RefuseUnknownOrInconsistent),
+        (None, true, false, RefuseUnknownOrInconsistent),
+        // The cross-machine recovery this exists for.
+        (None, true, true, DeleteIssuedVisible),
     ] {
         assert_eq!(
-            publish::draft_cleanup_decision(knowledge, visible),
+            publish::draft_cleanup_decision(knowledge, visible, bound),
             expected,
-            "cleanup matrix drift for {knowledge:?}, visible={visible}"
+            "cleanup matrix drift for {knowledge:?}, visible={visible}, bound={bound}"
         );
     }
 

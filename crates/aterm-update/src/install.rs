@@ -614,8 +614,12 @@ fn trial_authorizes_candidate(staging: &Staging, build: u64, sealed_commit: &str
 
 /// Recover the crash cut after same-volume staged_app→fixed but before the
 /// sentinel commit marker. Exact ready+verified-bundle identity is sufficient to
-/// put the bytes back; a mismatched/corrupt fixed path is preserved and fails
-/// closed rather than being mistaken for this transaction.
+/// put the bytes back; a mismatched/corrupt fixed path is preserved and never
+/// adopted, so an unproven candidate is still refused.
+///
+/// When there is nothing to adopt, though, the marker itself is DANGLING and this
+/// function retires it — see the comment on that branch for why deferring instead
+/// wedged every future launch.
 fn recover_orphaned_prepared_candidate(
     staging: &Staging,
     installed: &Path,
@@ -625,14 +629,37 @@ fn recover_orphaned_prepared_candidate(
     if is_non_symlink_dir(&staging.staged_app) || boot_sentinel(staging).read_state().is_some() {
         return Ok(());
     }
+    // Past this point `ready.toml` advertises bytes that are NOT at `staged_app`, and
+    // the fixed path is the only place they could still be.
     let fixed = rollback_path(installed);
-    let (build, commit) = verified_bundle_identity(&fixed)
-        .map_err(|error| format!("orphaned fixed candidate is invalid: {error}"))?;
-    if !same_volume(&fixed, installed)
-        || build <= current_build
-        || !ready_matches_verified_identity(ready, build, &commit)
-    {
-        return Err("orphaned fixed candidate does not match ready authority".to_string());
+    let recoverable = verified_bundle_identity(&fixed).is_ok_and(|(build, commit)| {
+        same_volume(&fixed, installed)
+            && build > current_build
+            && ready_matches_verified_identity(ready, build, &commit)
+    });
+    if !recoverable {
+        // The marker names bytes that exist NOWHERE — the ordinary shape being a fixed
+        // path that is just the previous build's retained rollback, or no fixed path at
+        // all. Returning Err here made every launch a `Deferred` whose message was about
+        // an "orphaned fixed candidate", i.e. a rollback path with nothing to do with the
+        // operator's actual problem; and because this runs BEFORE the `is_publishable`
+        // gate further down, the retirement that would have cleared the dangling marker
+        // was unreachable. Nothing on disk could ever satisfy it, so the deferral was
+        // permanent with no client-side repair short of deleting the file by hand.
+        //
+        // Retire it and report success instead: retirement touches only `ready` and the
+        // already-absent `staged_app`, the caller re-reads and sees `Absent` → `NoUpdate`,
+        // and the next check re-stages. The fixed path is deliberately LEFT ALONE — it may
+        // be the genuine rollback source crash recovery depends on, and declining to adopt
+        // an unproven candidate is exactly the fail-closed behavior kept from before.
+        crate::warn(&format!(
+            "ready.toml advertises build {} but its staged bundle is gone and {} holds no \
+             matching candidate; retiring the dangling marker so the next check re-stages",
+            ready.build_number,
+            fixed.display()
+        ));
+        staging.retire_published();
+        return Ok(());
     }
     std::fs::rename(&fixed, &staging.staged_app)
         .map_err(|error| format!("restore orphaned fixed candidate to staged app: {error}"))
@@ -769,6 +796,14 @@ fn checked_bundle_exchange(a: &Path, b: &Path, operation: &str) -> Result<(), St
 
 /// Read a bundle's SEALED identity (build + commit), refusing anything that is
 /// not a plain directory carrying an intact, policy-satisfying signature.
+/// Crate-visible door onto [`verified_bundle_identity`] for the installed-bundle
+/// activation pre-verify (`crate::preverify_installed_for_handoff`): the same policy
+/// gate + sealed identity read the staged-candidate path uses, aimed at the bundle
+/// under the running executable.
+pub(crate) fn verified_bundle_identity_at(app: &Path) -> Result<(u64, String), String> {
+    verified_bundle_identity(app)
+}
+
 fn verified_bundle_identity(app: &Path) -> Result<(u64, String), String> {
     let metadata =
         std::fs::symlink_metadata(app).map_err(|error| format!("bundle metadata: {error}"))?;
@@ -1236,6 +1271,40 @@ fn preverify_staged_handoff_candidate_at(
     Ok(())
 }
 
+/// Upper bound on the changelog text a `ready.toml` may carry.
+///
+/// The marker is a SMALL ledger: every reader reaches it through
+/// `read_ledger_text`, which returns `None` for a file above `MAX_LEDGER_BYTES`. So
+/// an oversized changelog does not make the marker BIG, it makes it INVISIBLE — and
+/// nothing upstream bounded it: the publisher's changelog extraction runs to EOF when
+/// a heading is malformed, and CHANGELOG.md is ~382 KiB. The result was the worst
+/// shape this crate can produce: the stage reported success and the status file said
+/// "verified and ready to apply", while `publishable_stage_covers` read the marker as
+/// absent and re-downloaded the whole container every cadence tick forever, and every
+/// launch read the marker as `Corrupt` so the build never applied.
+///
+/// A few thousand characters is far more release note than any surface shows, and the
+/// authoritative changelog lives in the release itself.
+const MAX_READY_CHANGELOG_CHARS: usize = 4096;
+
+/// Appended in place of the discarded tail so a clamped changelog reads as truncated
+/// rather than as a release note that stops mid-sentence.
+const READY_CHANGELOG_TRUNCATED: &str = "\n… (changelog truncated)";
+
+/// Clamp the manifest's changelog to what a marker may carry.
+///
+/// The cut is by CHARACTERS, never bytes: release notes routinely contain em dashes
+/// and emoji, and slicing a `str` at a byte offset inside a multi-byte UTF-8 sequence
+/// panics. `char_indices().nth(N)` yields an offset that is a char boundary by
+/// construction, so the slice below cannot split a sequence.
+fn clamp_ready_changelog(changelog: Option<&str>) -> Option<String> {
+    let text = changelog?;
+    match text.char_indices().nth(MAX_READY_CHANGELOG_CHARS) {
+        None => Some(text.to_string()),
+        Some((cut, _)) => Some(format!("{}{READY_CHANGELOG_TRUNCATED}", &text[..cut])),
+    }
+}
+
 /// Publish one already-verified incoming bundle as a short transaction shared
 /// with the apply path. The long download/extract/verification work remains under
 /// `stage_lock` only; compliant callers therefore acquire locks in the sole nested
@@ -1243,6 +1312,24 @@ fn preverify_staged_handoff_candidate_at(
 /// cannot wait on a download and the two lanes cannot deadlock.
 fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> Result<(), String> {
     let marker = ready.to_toml()?;
+    // A marker above the shared ledger cap is not a big marker, it is an ABSENT one:
+    // `read_ledger_text` refuses it, so the status surface, the stage-coverage check
+    // and the apply gate all see "nothing staged" while a fully verified bundle sits on
+    // disk — the container then re-downloads forever and the build never applies.
+    // `clamp_ready_changelog` bounds today's only unbounded field; THIS guard is what
+    // stops a future field from silently reintroducing an unreadable marker.
+    //
+    // It runs before the lock and before the old generation is invalidated, so a
+    // rejected publish leaves the previously staged (readable) generation exactly as it
+    // was rather than trading a working stage for an invisible one.
+    if u64::try_from(marker.len()).unwrap_or(u64::MAX) > crate::MAX_LEDGER_BYTES {
+        return Err(format!(
+            "refusing to commit a {}-byte ready marker: the ledger cap every reader \
+             enforces is {} bytes, and a marker above it reads as absent",
+            marker.len(),
+            crate::MAX_LEDGER_BYTES
+        ));
+    }
     let _publish_lock =
         FileLock::acquire(&staging.apply_lock).map_err(|error| format!("publish lock: {error}"))?;
 
@@ -1924,7 +2011,17 @@ fn verify_and_publish_incoming(
         dmg_sha256: manifest.sha256.to_ascii_lowercase(),
         team_id: team,
         staged_at: now_rfc3339(),
-        changelog: manifest.changelog.clone(),
+        // Clamped, never copied verbatim. The manifest's changelog is publisher-side
+        // text with no length bound anywhere in the pipeline, and an oversized one
+        // pushes the whole marker past `MAX_LEDGER_BYTES` — which does not make the
+        // marker large, it makes it unreadable to every consumer. See
+        // `clamp_ready_changelog` for the failure this prevents.
+        changelog: clamp_ready_changelog(manifest.changelog.as_deref()),
+        // The pair the apply gate re-checks against the ratcheted floor. Both sit
+        // inside the manifest's SIGNED bytes, so recording them here carries the
+        // stage-time authorization forward without trusting anything new.
+        machine_id: manifest.machine_id.clone(),
+        roster_seq: manifest.roster_seq,
     };
     publish_verified_stage(staging, incoming, &ready)
 }
@@ -2001,6 +2098,29 @@ pub fn apply_staged_if_ready(
         }
     }
     outcome
+}
+
+/// Whether a staged marker's recorded roster generation has been SUPERSEDED by the
+/// newest generation this client has accepted ([`crate::manifest::Floor::roster_seq`]).
+///
+/// Split out because it is the only part of the apply gate a unit test can hold still —
+/// `apply_staged_if_ready_inner` swaps bundles and execs — and because the `None` case
+/// is a judgement worth stating once, in one place.
+///
+/// `None` means the marker records NO generation, which is UNKNOWN rather than exempt:
+/// it was written by a build that predates the field, so it is evidence of nothing. Two
+/// readings were available and they are not symmetric. Treating it as exempt keeps a
+/// stage that a revocation may already have withdrawn — the exact hole this gate exists
+/// to close. Treating it as superseded costs one re-download, once, on the upgrade that
+/// introduced the field, and only on a client whose floor has actually accepted a
+/// roster: `accepted_floor == 0` means there is no generation to be behind, so an
+/// unarmed or pre-roster client pays nothing at all.
+#[must_use]
+fn roster_generation_superseded(recorded: Option<u64>, accepted_floor: u64) -> bool {
+    match recorded {
+        Some(seq) => seq < accepted_floor,
+        None => accepted_floor > 0,
+    }
 }
 
 fn apply_staged_if_ready_inner(
@@ -2164,6 +2284,35 @@ fn apply_staged_if_ready_inner(
             &format!(
                 "held: staged build {} below floor {} (yanked)",
                 ready.build_number, floor.min_build
+            ),
+        );
+        return ApplyOutcome::NoUpdate;
+    }
+    // 4c. Honor the ROSTER GENERATION the same way. A stage is an authorization made
+    //     at stage time by a machine the roster named THEN; a revocation lands later,
+    //     and nothing re-asked the question — `roster_authority_superseded` guards the
+    //     stage lane and had no apply-time twin, so a build staged at 10:00 by a
+    //     machine revoked at 10:30 installed at the next launch regardless.
+    //
+    //     A marker with NO recorded generation is UNKNOWN, not exempt: it was written
+    //     by a build that predates these fields and carries no evidence either way.
+    //     Under a floor that has actually accepted a roster the safe reading is to
+    //     re-stage under the current generation — one re-download, once, on the
+    //     upgrade that introduced the fields. A client that has never accepted a
+    //     roster has no generation to be behind and pays nothing.
+    if roster_generation_superseded(ready.roster_seq, floor.roster_seq) {
+        crate::warn(&format!(
+            "staged build {} was authorized under roster generation {:?}, below the \
+             accepted generation {}; discarding so the next check re-authorizes it",
+            ready.build_number, ready.roster_seq, floor.roster_seq
+        ));
+        staging.retire_published();
+        crate::status::record(
+            &staging,
+            current_build,
+            &format!(
+                "held: staged build {} predates roster generation {} (re-authorizing)",
+                ready.build_number, floor.roster_seq
             ),
         );
         return ApplyOutcome::NoUpdate;
@@ -2694,6 +2843,34 @@ fn confirm_health_under_apply_lock(
     })
 }
 
+/// See [`crate::forgive_trial_launch`]. Under the apply lock so it cannot interleave
+/// with a `check_boot_health` observation or a `confirm_boot_health` disarm.
+pub(crate) fn forgive_trial_launch(target_build: u64) {
+    let Some(staging) = Staging::resolve() else {
+        return;
+    };
+    let sentinel = boot_sentinel(&staging);
+    if !matches!(sentinel.read_state(), Some((b, _)) if b == target_build) {
+        return;
+    }
+    let Ok(_apply_lock) = FileLock::acquire(&staging.apply_lock) else {
+        crate::warn(&format!(
+            "could not take the apply lock to forgive a killed trial launch of build \
+             {target_build}; the launch stays counted"
+        ));
+        return;
+    };
+    match sentinel.forgive_launch(target_build) {
+        Ok(remaining) => crate::log(&format!(
+            "trial launch of build {target_build} forgiven — the outgoing process ended \
+             that candidate itself ({remaining} unconfirmed launch(es) still counted)"
+        )),
+        Err(error) => crate::warn(&format!(
+            "could not forgive a killed trial launch of build {target_build}: {error}"
+        )),
+    }
+}
+
 /// Confirm the running build reached a healthy checkpoint (window up / first
 /// frame): clear the boot sentinel and GC the retained rollback bundle + orphaned
 /// post-swap copy. Idempotent and best-effort — call once from the GUI after deep init so
@@ -2952,8 +3129,165 @@ mod tests {
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
+    }
+
+    /// A REVOCATION MUST REACH AN ALREADY-STAGED BUILD. The stage lane refuses a
+    /// release whose roster generation the client has moved past
+    /// (`roster_authority_superseded`); the apply lane had no twin, so a build staged
+    /// at 10:00 by a machine revoked at 10:30 installed at the next launch anyway and
+    /// only a separate `min_build` yank could have stopped it.
+    #[test]
+    fn a_stage_below_the_accepted_roster_generation_is_superseded() {
+        // Authorized under the generation the client is on: apply.
+        assert!(!roster_generation_superseded(Some(7), 7));
+        // Authorized under a LATER generation than this client has accepted — the
+        // ratchet is monotonic, so this is not a downgrade to refuse here.
+        assert!(!roster_generation_superseded(Some(8), 7));
+        // Staged under 6, client has since accepted 7 (the revocation): withdraw it.
+        assert!(roster_generation_superseded(Some(6), 7));
+    }
+
+    /// An unrecorded generation is UNKNOWN, and the cost of the safe reading is bounded
+    /// to clients that have actually accepted a roster.
+    #[test]
+    fn an_unrecorded_roster_generation_is_unknown_not_exempt() {
+        // A client that has never accepted a roster has no generation to be behind, so
+        // a pre-field marker still applies and nobody pays a re-download.
+        assert!(!roster_generation_superseded(None, 0));
+        // Once a generation HAS been accepted, a marker that cannot say which one it
+        // was authorized under is re-staged rather than trusted.
+        assert!(roster_generation_superseded(None, 1));
+    }
+
+    /// A `ready.toml` whose staged bundle is GONE must clear itself. This recovery runs
+    /// before the `is_publishable` retirement, so returning Err made that retirement
+    /// unreachable and turned every launch into a permanent `Deferred` naming a rollback
+    /// path the operator has no reason to care about.
+    #[test]
+    fn a_ready_marker_whose_staged_bundle_vanished_retires_instead_of_deferring_forever() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 7);
+        let installed = root.join("Applications").join("aterm.app");
+        std::fs::create_dir_all(&installed).unwrap();
+        let ready = Ready::read(&s.ready).unwrap();
+        assert!(!s.staged_app.exists(), "the staged bundle is the missing half");
+        assert!(
+            !rollback_path(&installed).exists(),
+            "and nothing at the fixed path could ever satisfy the marker"
+        );
+
+        assert!(
+            recover_orphaned_prepared_candidate(&s, &installed, 6, &ready).is_ok(),
+            "a dangling marker is a self-healing condition, not a permanent refusal"
+        );
+        assert!(!s.ready.exists(), "the dangling marker cleared itself");
+        assert!(matches!(read_ready(&s, 6), ReadyState::Absent));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The new attribution fields must be OPTIONAL on the wire: a `ready.toml` written
+    /// before they existed has to keep parsing, or an upgrade would strand every
+    /// already-staged build behind a `Corrupt` marker.
+    #[test]
+    fn a_ready_marker_without_attribution_still_parses() {
+        let legacy = r#"
+build_number = 42
+version = "0.42.0"
+dmg_sha256 = "abcd"
+team_id = "T"
+staged_at = "2026-08-17T00:00:00Z"
+"#;
+        let ready: Ready = toml::from_str(legacy).expect("pre-attribution marker parses");
+        assert_eq!(ready.build_number, 42);
+        assert_eq!(ready.machine_id, None);
+        assert_eq!(ready.roster_seq, None);
+    }
+
+    /// AN OVERSIZED CHANGELOG MAKES THE MARKER INVISIBLE, NOT LARGE: every reader goes
+    /// through `read_ledger_text`, which returns `None` above `MAX_LEDGER_BYTES`. The
+    /// clamp must count CHARACTERS — a byte-offset cut inside a multi-byte sequence
+    /// panics, and release notes are full of em dashes.
+    #[test]
+    fn an_oversized_manifest_changelog_is_clamped_by_characters_not_bytes() {
+        assert_eq!(clamp_ready_changelog(None), None);
+        assert_eq!(
+            clamp_ready_changelog(Some("a short release note")).as_deref(),
+            Some("a short release note")
+        );
+
+        // Three bytes per char, so any byte-indexed cut would land mid-sequence.
+        let wide = "—".repeat(MAX_READY_CHANGELOG_CHARS * 4);
+        let clamped = clamp_ready_changelog(Some(&wide)).unwrap();
+        assert!(clamped.starts_with('—'), "the head survives verbatim");
+        assert!(clamped.ends_with(READY_CHANGELOG_TRUNCATED));
+        assert_eq!(
+            clamped.chars().count(),
+            MAX_READY_CHANGELOG_CHARS + READY_CHANGELOG_TRUNCATED.chars().count()
+        );
+
+        // The defect's real scale: the whole ~382 KiB CHANGELOG.md in one manifest
+        // field. Clamped, the committed marker stays inside the cap every reader
+        // enforces, so the stage stays visible instead of reading as absent/corrupt.
+        let whole_changelog_md = "x".repeat(382 * 1024);
+        let ready = Ready {
+            build_number: 9,
+            version: "0.9.0".into(),
+            commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            dmg_sha256: "ab".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: clamp_ready_changelog(Some(&whole_changelog_md)),
+            machine_id: None,
+            roster_seq: None,
+        };
+        let marker = ready.to_toml().unwrap();
+        assert!(
+            u64::try_from(marker.len()).unwrap() <= crate::MAX_LEDGER_BYTES,
+            "clamped marker is {} bytes",
+            marker.len()
+        );
+        assert!(crate::read_ledger_text(&{
+            let (s, _root) = temp_staging();
+            std::fs::write(&s.ready, &marker).unwrap();
+            s.ready
+        })
+        .is_some());
+    }
+
+    /// A marker that would read as ABSENT must never be committed — and refusing it
+    /// must not cost the readable generation that is already staged, which is why the
+    /// size guard runs before the lock and before the old marker/bundle are removed.
+    #[test]
+    fn publish_refuses_a_marker_that_would_exceed_the_ledger_cap() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 5);
+        make_app(&s.staged_app, "OLD-STAGE");
+        let incoming = s.staged_dir().join("aterm.app.incoming");
+        make_app(&incoming, "NEW-STAGE");
+
+        let mut ready = Ready::read(&s.ready).unwrap();
+        ready.build_number = 6;
+        ready.changelog = Some("y".repeat(usize::try_from(crate::MAX_LEDGER_BYTES).unwrap() + 1));
+        let error = publish_verified_stage(&s, &incoming, &ready).unwrap_err();
+        assert!(error.contains("ready marker"), "{error}");
+
+        assert!(
+            matches!(
+                read_ready(&s, 4),
+                ReadyState::Newer(Ready {
+                    build_number: 5,
+                    ..
+                })
+            ),
+            "a rejected publish leaves the previous readable generation staged"
+        );
+        assert_eq!(read_id(&s.staged_app), "OLD-STAGE");
+        assert_eq!(read_id(&incoming), "NEW-STAGE");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3097,6 +3431,8 @@ mod tests {
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         let exact = ExpectedArtifact {
             build: 54,
@@ -3256,6 +3592,8 @@ mod tests {
                 team_id: "T".into(),
                 staged_at: String::new(),
                 changelog: None,
+                machine_id: None,
+                roster_seq: None,
             };
             publish_verified_stage(&stage, &incoming, &ready)
         });
@@ -3979,6 +4317,8 @@ mod tests {
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         let exact = ExpectedArtifact {
             build,

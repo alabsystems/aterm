@@ -51,6 +51,12 @@ struct HandoffWorkerJob {
     /// as the worker's first action, off the GUI main thread. False for the
     /// same-binary debug re-exec, which has no staged `.app` to authenticate.
     verify_staged_candidate: bool,
+    /// This attempt ACTIVATES the installed bundle at the executable's own path
+    /// (`ApplyAttemptTicket::is_installed_activation`): the pre-verification runs
+    /// against THAT bundle (there is no staged `.app`), and the successor is
+    /// handed no expected-artifact triple (it has nothing to swap; it simply IS
+    /// the newer build).
+    installed_activation: bool,
     command: std::process::Command,
     manifest: crate::session_store::SessionHandoff,
     fds: crate::session_store::HandoffFds,
@@ -247,6 +253,95 @@ struct HandoffCommitFacts {
     native_safe: bool,
     proof_exact: bool,
     commit_channel: bool,
+}
+
+/// The Commit-time layout comparison, reduced to the fields that actually mean
+/// "window/tab/pane topology". Two of them are normalized away, and each was
+/// independently killing healthy in-flight seamless updates:
+///
+/// WINDOW POSITION. `capture_restore_manifest` reads `outer_position()` LIVE
+/// into `outer_x`/`outer_y`, and `WindowLayout` derives `PartialEq` over them,
+/// so simply DRAGGING the window during the successor's boot rejected the
+/// Commit as "window/tab/pane topology changed". `WindowEvent::Moved` is
+/// classified `Tolerated` in `lib.rs` precisely so a drag can never revoke an
+/// overlap, and that classification was being defeated right here. The carried
+/// position is NOT re-read at spawn: `start_unix_update_handoff` snapshots the
+/// `WindowCarry` once, before the readers park, and the worker ships that
+/// snapshot verbatim — so a drag during the boot was never going to follow the
+/// window across the swap anyway. The successor reappearing at the pre-drag
+/// position is cosmetic; losing the whole update over it was not.
+///
+/// PER-SESSION cwd/title. The post-park capture is proof-protected — the
+/// checkpoint loop above it proved every `term` was lockable — but this
+/// re-capture has no such proof: it runs later, on the live event loop, where
+/// the scrollback-compression worker can still hold a `term` transiently.
+/// `restore_session_meta` degrades to `(None, String::new())` on a `WouldBlock`
+/// try_lock, so a contended mutex turned real cwd/title into empty ones and the
+/// derived `PartialEq` reported that DEGRADATION as a topology change —
+/// nondeterministically, for a session that had not changed at all.
+///
+/// Comparing the projection rather than probing the locks is the race-free fix:
+/// a probe-then-capture would only move the contention window, while full
+/// equality implies projection equality, so this can only ever admit
+/// differences confined to those degradable metadata fields. Admitting them is
+/// safe: the child inherits the live shells (cwd/title matter only to a cold
+/// respawn), and the digest the child re-proves is taken over the PENDING
+/// layout captured at attempt start, never over this re-capture.
+#[cfg(unix)]
+fn commit_layout_topology(
+    layout: &crate::restore::RestoreManifest,
+) -> crate::restore::RestoreManifest {
+    fn strip_pane(node: &mut crate::restore::PaneLayout) {
+        match node {
+            crate::restore::PaneLayout::Leaf { cwd, title, .. } => {
+                *cwd = None;
+                title.clear();
+            }
+            crate::restore::PaneLayout::Split { first, second, .. } => {
+                strip_pane(first);
+                strip_pane(second);
+            }
+        }
+    }
+
+    fn strip_tree(node: &mut crate::restore::RestoredSplitTree) {
+        match node {
+            crate::restore::RestoredSplitTree::Leaf {
+                view: crate::restore::RestoredView::Terminal(terminal),
+            } => {
+                terminal.cwd = None;
+                terminal.title.clear();
+            }
+            // Native/placeholder leaves carry no session-lock-derived field, so
+            // they keep comparing in full — a native tab appearing or changing
+            // IS structural. The terminal leaf's USER metadata
+            // (`user_title`/`description`/`icon`/`role`/`attention`) is read
+            // under a BLOCKING lock in `view_restore_descriptor`, so it cannot
+            // degrade and is deliberately left in the comparison too.
+            crate::restore::RestoredSplitTree::Leaf { .. } => {}
+            crate::restore::RestoredSplitTree::Split { first, second, .. } => {
+                strip_tree(first);
+                strip_tree(second);
+            }
+        }
+    }
+
+    let mut topology = layout.clone();
+    for window in &mut topology.windows {
+        window.outer_x = None;
+        window.outer_y = None;
+        // BOTH projections, deliberately: the capture writes the same live
+        // session's cwd/title into the legacy `tabs` mirror and the canonical
+        // `restored_tabs` tree, so normalizing only one of them would leave the
+        // other still reporting a degraded read as a changed layout.
+        for tab in &mut window.tabs {
+            strip_pane(tab);
+        }
+        for tab in &mut window.restored_tabs {
+            strip_tree(&mut tab.root);
+        }
+    }
+    topology
 }
 
 #[cfg(unix)]
@@ -1193,6 +1288,17 @@ fn worker_reject_and_reap_handoff_child(
         completed,
         "the worker must retain its unique reaper ownership"
     );
+    // WE ended this candidate — it did not crash. Its boot observed a trial launch of
+    // the target build (a swapped candidate arms the sentinel and re-execs; an
+    // activation candidate finds it already armed by an earlier swap), and left
+    // counted, the bounded automatic re-attempts a busy machine legitimately makes
+    // (TimedOut / ActivityRevoked are scheduling facts, not evidence against the
+    // artifact) reach `MAX_BOOT_ATTEMPTS`, revert to the OLD bundle and poison a
+    // build that never failed. `ChildDied` is the one outcome that IS the crash
+    // signal and keeps its count. Real apply only: the QA seam has no target.
+    if outcome != crate::UpdateHandoffOutcome::ChildDied && job.target_build > job.current_build {
+        aterm_update::forgive_trial_launch(job.target_build);
+    }
     send_warranted_handoff_failure(
         warrant,
         &job.cleanup,
@@ -1302,20 +1408,30 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     // any child is spawned — and the UI thread never blocks on it. Still strictly
     // additive: the child re-runs the complete gate under the apply lock at swap
     // time. A refusal is an ordinary `PreparationFailed` (manual-only).
-    if job.verify_staged_candidate
-        && let Err(error) = aterm_update::preverify_staged_for_handoff(
-            job.current_build,
-            Some(job.target_build),
-            Some(&job.target_commit),
-        )
-    {
-        send_handoff_preparation_failure(
-            &job,
-            &proxy,
-            None,
-            format!("staged update failed pre-park verification: {error}"),
-        );
-        return;
+    if job.verify_staged_candidate {
+        let verified = if job.installed_activation {
+            // ACTIVATION: the artifact is the bundle under the running executable.
+            // Prove it is exactly the authorized sealed identity, codesign-valid and
+            // newer than this process — a bundle swapped again since the observation
+            // is refused before a single reader is parked.
+            aterm_update::preverify_installed_for_handoff(
+                job.current_build,
+                job.target_build,
+                &job.target_commit,
+            )
+            .map_err(|error| format!("installed bundle failed pre-park verification: {error}"))
+        } else {
+            aterm_update::preverify_staged_for_handoff(
+                job.current_build,
+                Some(job.target_build),
+                Some(&job.target_commit),
+            )
+            .map_err(|error| format!("staged update failed pre-park verification: {error}"))
+        };
+        if let Err(error) = verified {
+            send_handoff_preparation_failure(&job, &proxy, None, error);
+            return;
+        }
     }
     if handoff_preparation_cancelled(&job, &proxy, None) {
         return;
@@ -2466,7 +2582,17 @@ impl App {
                 command
                     .args(std::env::args_os().skip(1))
                     .env("ATERM_UPDATED_FROM", build.to_string());
-                bind_expected_update_artifact(&mut command, apply_attempt.as_ref());
+                // Same rule as the seamless lane below: an ACTIVATION binds no
+                // expected artifact. The successor swaps nothing; binding the
+                // activation digest would make its `apply_staged_if_ready` refuse a
+                // newer `ready.toml` as "no longer matches" and write a spurious
+                // apply refusal into the ledger.
+                bind_expected_update_artifact(
+                    &mut command,
+                    apply_attempt
+                        .as_ref()
+                        .filter(|attempt| !attempt.is_installed_activation()),
+                );
                 // Headless survives the re-exec. The ENV channel, not the flag,
                 // is right here even though `--headless` is the canonical
                 // user-facing spelling: the successor inherits our argv verbatim
@@ -2924,7 +3050,16 @@ impl App {
         command
             .args(std::env::args_os().skip(1))
             .env("ATERM_UPDATED_FROM", build.to_string());
-        bind_expected_update_artifact(&mut command, apply_attempt.as_ref());
+        // An ACTIVATION binds no expected artifact: the successor has nothing to swap
+        // (its `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and
+        // it simply IS the authorized build — the identity check below still names it.
+        let installed_activation = apply_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.is_installed_activation());
+        bind_expected_update_artifact(
+            &mut command,
+            apply_attempt.as_ref().filter(|_| !installed_activation),
+        );
         let target_build = apply_attempt
             .as_ref()
             .map_or(build, |attempt| attempt.target_build());
@@ -3043,6 +3178,7 @@ impl App {
             target_build,
             target_commit,
             verify_staged_candidate,
+            installed_activation,
             command,
             manifest,
             fds,
@@ -3217,7 +3353,22 @@ impl App {
         let mut expected_live = pending_live.clone();
         expected_live.sort_unstable();
         let exact_sessions = current_live == expected_live;
-        let exact_layout = self.capture_restore_manifest() == pending_layout;
+        // TOPOLOGY, not the raw capture — see `commit_layout_topology` for the
+        // two fields it normalizes away and why each of them was rejecting
+        // perfectly healthy attempts. The raw inequality is still worth one log
+        // line: it is the only place a window drag or a contended session lock
+        // becomes visible in the field, and the whole point of this change is
+        // that neither may ever again be REPORTED as a topology change.
+        let live_layout = self.capture_restore_manifest();
+        let exact_layout =
+            commit_layout_topology(&live_layout) == commit_layout_topology(&pending_layout);
+        if exact_layout && live_layout != pending_layout {
+            aterm_log::info!(
+                "update apply: the Commit-time capture differs from the committed snapshot \
+                 only in window position or degradable session metadata — topology is \
+                 unchanged, so Commit stays admitted"
+            );
+        }
         let parent_still_parked = self
             .pool
             .iter()
@@ -3531,6 +3682,7 @@ impl App {
             .filter(|entry| {
                 entry.build == attempt.target_build()
                     && entry.commit == attempt.target_commit()
+                    && entry.artifact == attempt.target_dmg_sha256()
                     && entry.at.elapsed() < crate::HANDOFF_PREVERIFY_FRESHNESS
             })
             .map(|entry| entry.passed)
@@ -3601,6 +3753,15 @@ impl App {
             (_, teardown) => teardown,
         };
         self.rollback_overlap(nonce.as_deref(), &pending.live);
+        // QA SEAM, READ BEFORE THE MATCH CONSUMES IT. A `None` ticket reaches this
+        // reduction from exactly one place — `ATERM_DEBUG_SEAMLESS_REEXEC`, which
+        // `start_native_update_handoff` is the only caller allowed to pair with a
+        // missing attempt — so this outcome describes a SIMULATED apply of the
+        // running binary, not a staged build that would not run. It must be logged
+        // and shown, and it must not touch the durable ledger; the apply streak it
+        // used to write is cleared only by a real successful apply, so QA runs
+        // accrued forever and escalated to the persistent-failure notification.
+        let debug_seam = pending.apply_attempt.is_none();
         let surfaced = match (pending.apply_attempt, reconcile) {
             (Some(attempt), Some(facts)) => self.finish_async_native_update_handoff(
                 attempt,
@@ -3625,7 +3786,11 @@ impl App {
             } else {
                 "manual handoff"
             };
-            self.surface_update_apply_outcome(source, surfaced, false);
+            if debug_seam {
+                self.react_to_update_apply_outcome(source, surfaced, false);
+            } else {
+                self.surface_update_apply_outcome(source, surfaced, false);
+            }
         }
         Some(teardown)
     }
@@ -3974,6 +4139,147 @@ mod capture_budget_reservation_tests {
             "one pane past the visible-only ceiling must be refused, and refused as the \
              LAST session — never an earlier one that lost its budget to somebody \
              else's scrollback"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod commit_layout_topology_tests {
+    use super::commit_layout_topology;
+    use crate::restore::{
+        PaneLayout, RestoreManifest, RestoredSplitTree, RestoredTab, RestoredView, TabOrderEntry,
+        TerminalLeafRestore, WindowLayout,
+    };
+
+    /// One window, one terminal tab, in the shape `capture_restore_manifest`
+    /// really produces: the legacy `tabs` mirror and the canonical
+    /// `restored_tabs` tree both carry the SAME live session's cwd/title, so a
+    /// degraded read corrupts two places at once and a projection that missed
+    /// either one would still reject the Commit.
+    fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> RestoreManifest {
+        RestoreManifest::new(vec![WindowLayout {
+            rows: 40,
+            cols: 120,
+            active_tab: 0,
+            outer_x: position.map(|(x, _)| x),
+            outer_y: position.map(|(_, y)| y),
+            tabs: vec![PaneLayout::Leaf {
+                cwd: cwd.map(str::to_string),
+                title: title.to_string(),
+                focused: true,
+                local_id: Some(7),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: vec![TabOrderEntry::Terminal { index: 0 }],
+            active_item: Some(0),
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                    cwd: cwd.map(str::to_string),
+                    title: title.to_string(),
+                    profile: None,
+                    local_id: Some(7),
+                    user_title: None,
+                    description: None,
+                    icon: None,
+                    role: None,
+                    attention: None,
+                })),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        }])
+    }
+
+    #[test]
+    fn dragging_the_window_while_the_successor_boots_is_not_a_topology_change() {
+        let committed = captured(Some((120, 80)), Some("/work"), "zsh");
+        let dragged = captured(Some((640, 310)), Some("/work"), "zsh");
+        assert_ne!(
+            committed, dragged,
+            "PRECONDITION: the derived PartialEq must still see the raw position difference — \
+             that is exactly what used to reject the Commit"
+        );
+        assert_eq!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&dragged),
+            "a drag during the child's boot must not be reported as changed topology; \
+             `WindowEvent::Moved` is classified Tolerated for this very reason"
+        );
+    }
+
+    #[test]
+    fn a_contended_session_lock_that_empties_cwd_and_title_is_not_a_topology_change() {
+        let committed = captured(Some((120, 80)), Some("/work"), "zsh");
+        // EXACTLY what `restore_session_meta` yields on a `WouldBlock` try_lock
+        // (a scrollback drain holding the `term` mutex): no cwd, empty title,
+        // every structural field untouched.
+        let degraded = captured(Some((120, 80)), None, "");
+        assert_ne!(
+            committed, degraded,
+            "PRECONDITION: a degraded capture is not equal to the committed one"
+        );
+        assert_eq!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&degraded),
+            "a degraded metadata read must never masquerade as a changed layout — it made the \
+             rejection nondeterministic for a session that did not change"
+        );
+    }
+
+    #[test]
+    fn a_real_topology_change_still_rejects_the_commit() {
+        let committed = captured(Some((120, 80)), Some("/work"), "zsh");
+
+        let mut resized = captured(Some((120, 80)), Some("/work"), "zsh");
+        resized.windows[0].cols = 200;
+        assert_ne!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&resized),
+            "the grid the proof committed to is structural and must still reject"
+        );
+
+        let mut readopted = captured(Some((120, 80)), Some("/work"), "zsh");
+        readopted.windows[0].restored_tabs[0].root =
+            RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+                cwd: Some("/work".to_string()),
+                title: "zsh".to_string(),
+                profile: None,
+                local_id: Some(9),
+                user_title: None,
+                description: None,
+                icon: None,
+                role: None,
+                attention: None,
+            }));
+        assert_ne!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&readopted),
+            "`local_id` is the layout↔live-fd bridge the child adopts by, not degradable \
+             metadata, so it must survive the projection"
+        );
+
+        let mut relabelled = captured(Some((120, 80)), Some("/work"), "zsh");
+        let RestoredSplitTree::Leaf {
+            view: RestoredView::Terminal(terminal),
+        } = &mut relabelled.windows[0].restored_tabs[0].root
+        else {
+            unreachable!("the fixture builds a single terminal leaf");
+        };
+        terminal.user_title = Some("deploy".to_string());
+        assert_ne!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&relabelled),
+            "USER metadata is captured under a BLOCKING lock, so it cannot degrade and must \
+             not be swept up by the cwd/title normalization"
+        );
+
+        let mut extra_tab = captured(Some((120, 80)), Some("/work"), "zsh");
+        let tab = extra_tab.windows[0].restored_tabs[0].clone();
+        extra_tab.windows[0].restored_tabs.push(tab);
+        assert_ne!(
+            commit_layout_topology(&committed),
+            commit_layout_topology(&extra_tab),
+            "a tab that appeared during async preparation is what this gate exists to catch"
         );
     }
 }
@@ -4965,6 +5271,8 @@ mod returned_handoff_completion_lane_tests {
                     changelog: None,
                     outcome: "staged".to_string(),
                     failing_checks: 0,
+                    failing_persistent: false,
+                    failing_kind: String::new(),
                 },
             ),
             CheckCompletion::Reduced,

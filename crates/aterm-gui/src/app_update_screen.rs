@@ -149,7 +149,14 @@ impl App {
             } else {
                 self.apply_native_update(crate::native_updater_service::ApplyMode::Immediate)
             };
-            self.surface_update_apply_outcome("manual", outcome.clone(), true);
+            // A simulated apply is still fully visible — it just does not get to
+            // leave an `apply`-class failure in the durable ledger, which nothing
+            // but a real successful apply can clear.
+            if debug_seamless {
+                self.react_to_update_apply_outcome("manual", outcome.clone(), true);
+            } else {
+                self.surface_update_apply_outcome("manual", outcome.clone(), true);
+            }
             Some(outcome)
         } else {
             let _ = self.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
@@ -160,34 +167,43 @@ impl App {
     /// Make every returned updater outcome observable. A manual click opens the native
     /// Software Update route on failure/block so the enabled menu item can never look
     /// inert; automatic/control paths retain the non-disruptive notification + log.
+    ///
+    /// The durable ledger is written FIRST, then the UI reacts. A simulated apply takes
+    /// the other door ([`Self::react_to_update_apply_outcome`]) so it stays visible
+    /// without leaving a real failure behind it.
     pub(crate) fn surface_update_apply_outcome(
         &mut self,
         source: &str,
         outcome: crate::native_app::UpdateOutcome,
         open_details: bool,
     ) {
-        // Persist the apply-lane verdict into the updater's own health ledger and
-        // status file BEFORE any UI reaction. Until this existed the apply lane was
-        // invisible to `aterm-ctl update status`: a handoff could fail every single
-        // time for three releases while `health.toml` stayed all-zero and status
-        // said "up to date", because only the download lane was ever recorded.
-        //
-        // `Deferred`/`Blocked` mean "not yet, conditions were not met" — normal and
-        // self-correcting, so they must NOT touch the failure streak: doing that
-        // would manufacture an escalation every time the user happened to be typing.
-        //
-        // But silent was the wrong other extreme, and it is what the owner actually
-        // hit: a staged build sat unapplied across two releases while `update
-        // status` reported `failing=0 failing_applies=0` and advised a relaunch,
-        // because the refusal reached this function and stopped here. "Nothing is
-        // wrong" and "we declined, here is why" are different answers and the file
-        // could only say the first. `record_apply_refusal` is the separate,
-        // non-streak slot for the second; it is expiry-bound to the RUNNING build,
-        // since a successful in-session apply execs away and never returns to clear
-        // it. Which outcome is which — and why nothing here can record a SUCCESS —
-        // is [`apply_ledger_verdict`].
+        self.record_apply_outcome_in_ledger(&outcome);
+        self.react_to_update_apply_outcome(source, outcome, open_details);
+    }
+
+    /// Persist the apply-lane verdict into the updater's own health ledger and
+    /// status file. Until this existed the apply lane was invisible to
+    /// `aterm-ctl update status`: a handoff could fail every single time for three
+    /// releases while `health.toml` stayed all-zero and status said "up to date",
+    /// because only the download lane was ever recorded.
+    ///
+    /// `Deferred`/`Blocked` mean "not yet, conditions were not met" — normal and
+    /// self-correcting, so they must NOT touch the failure streak: doing that
+    /// would manufacture an escalation every time the user happened to be typing.
+    ///
+    /// But silent was the wrong other extreme, and it is what the owner actually
+    /// hit: a staged build sat unapplied across two releases while `update
+    /// status` reported `failing=0 failing_applies=0` and advised a relaunch,
+    /// because the refusal reached this function and stopped here. "Nothing is
+    /// wrong" and "we declined, here is why" are different answers and the file
+    /// could only say the first. `record_apply_refusal` is the separate,
+    /// non-streak slot for the second; it is expiry-bound to the RUNNING build,
+    /// since a successful in-session apply execs away and never returns to clear
+    /// it. Which outcome is which — and why nothing here can record a SUCCESS —
+    /// is [`apply_ledger_verdict`].
+    fn record_apply_outcome_in_ledger(&mut self, outcome: &crate::native_app::UpdateOutcome) {
         let current_build = self.native_updater_service.snapshot().current_build;
-        match apply_ledger_verdict(&outcome) {
+        match apply_ledger_verdict(outcome) {
             ApplyLedgerVerdict::Failed(message) => {
                 aterm_update::record_apply_failure(current_build, &message);
             }
@@ -196,6 +212,30 @@ impl App {
             }
             ApplyLedgerVerdict::Silent => {}
         }
+    }
+
+    /// React to an apply outcome in the UI and the log WITHOUT writing the durable
+    /// health ledger.
+    ///
+    /// THE QA SEAM ENTERS HERE, AND THAT IS THE WHOLE POINT. Under
+    /// `ATERM_DEBUG_SEAMLESS_REEXEC` the handoff runs with no
+    /// `ApplyAttemptTicket` (`start_native_update_handoff` refuses a `None` ticket
+    /// in every other case), so a failed debug handoff describes a SIMULATED apply
+    /// of the running binary — not a staged build that could not be made to run.
+    /// Routing it through [`Self::surface_update_apply_outcome`] recorded it as a
+    /// genuine `apply`-class failure, and that streak is cleared only by a
+    /// successful apply ([`Health::record_apply_success`]) — never by a healthy
+    /// check. So QA runs accumulated permanently and drove the machine to
+    /// `is_persistent()`, raising the "aterm auto-update is failing" notification
+    /// on a machine whose apply lane had never actually been asked to do anything.
+    /// Observed in the field: 497 counted apply failures, every one of them a
+    /// `"debug overlap handoff failed safely"` from this seam.
+    pub(crate) fn react_to_update_apply_outcome(
+        &mut self,
+        source: &str,
+        outcome: crate::native_app::UpdateOutcome,
+        open_details: bool,
+    ) {
         match outcome {
             crate::native_app::UpdateOutcome::Accepted => {
                 aterm_log::info!("update apply ({source}): accepted");
@@ -662,6 +702,8 @@ mod tests {
                     changelog: None,
                     outcome: "staged".to_string(),
                     failing_checks: 0,
+                    failing_persistent: false,
+                    failing_kind: String::new(),
                 },
             ),
             crate::native_updater_service::CheckCompletion::Reduced,

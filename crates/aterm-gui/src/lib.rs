@@ -7391,6 +7391,15 @@ struct AutoOverlapRetry {
 struct HandoffPreverification {
     build: u64,
     commit: String,
+    /// The ARTIFACT the verdict is about: a download's DMG digest, or an
+    /// activation's `installed_activation_digest`. Two stages can share a
+    /// (build, commit) — the downloaded `.app` in `Updates/` and the same build
+    /// already installed under our executable — and they are verified by
+    /// different probes against different bytes. Without this term a download's
+    /// verdict was reused for the activation (skipping the last codesign check
+    /// before an exec that swaps nothing) and a corrupt download's `false`
+    /// refused a perfectly good installed bundle for ten minutes.
+    artifact: String,
     at: std::time::Instant,
     passed: bool,
 }
@@ -7514,10 +7523,23 @@ fn update_handoff_window_event_class(event: &WindowEvent) -> UpdateHandoffEventC
         WindowEvent::HoveredFile(_) | WindowEvent::HoveredFileCancelled => {
             UpdateHandoffEventClass::Tolerated
         }
-        // The window MOVED, it did not RESIZE: `outer_x`/`outer_y` ride the
-        // window carry and are re-read when the child is spawned; the grid the
-        // proof committed to is unchanged. This one streams continuously during
-        // a drag and used to kill an overlap outright.
+        // The window MOVED, it did not RESIZE: the grid the proof committed to
+        // is unchanged. This one streams continuously during a drag and used to
+        // kill an overlap outright.
+        //
+        // CORRECTED PREMISE: this comment used to claim `outer_x`/`outer_y`
+        // "ride the window carry and are re-read when the child is spawned".
+        // The first half is true, the second is not:
+        // `start_unix_update_handoff` builds the `WindowCarry` ONCE, before the
+        // readers park, and `seamless::write_outgoing` ships that snapshot
+        // verbatim, so a drag after that instant is simply not carried — the
+        // successor reappears where the window was when the attempt started,
+        // which is cosmetic. The DANGEROUS half of the false premise was the
+        // Commit-time layout gate, which did compare the live position against
+        // its snapshot and rejected the whole update as "window/tab/pane
+        // topology changed"; `commit_layout_topology` now normalizes position
+        // out of that comparison, which is what actually makes this Tolerated
+        // classification effective rather than merely intended.
         WindowEvent::Moved(_) => UpdateHandoffEventClass::Tolerated,
         // The SYSTEM light/dark switch at sunset, with no user intent toward
         // this window at all. Appearance is not proof input.
@@ -14351,8 +14373,15 @@ impl ApplicationHandler<Wake> for App {
             // thread (persistent failure) — surface it.
             Wake::UpdateHealth { title, body } => {
                 aterm_log::warn!("update-health: {title}: {body}");
-                self.surface_nonmodal_update_status(
-                    "Update needs attention — open the Version menu for details",
+                // SAY WHAT IS WRONG, where the user is looking: the typed body carries
+                // the cause and the count; the pill used to discard it and point at a
+                // menu that has no failure text (measured 2026-08-18: eight hours of
+                // publisher-side rejections, invisible in the app). And re-read the
+                // ledger so Settings ▸ Software Update headlines the same verdict.
+                let text = format!("{title}: {body} — see Settings ▸ Software Update");
+                self.surface_nonmodal_update_status(&text);
+                self.request_native_update_reconcile(
+                    crate::app_native::NativeUpdateReconcilePurpose::Refresh,
                 );
             }
             // Proof-carrying DSU (RFC Rung 1): apply a staged update now by re-exec —
@@ -14363,7 +14392,8 @@ impl ApplicationHandler<Wake> for App {
             Wake::ApplyStagedUpdate => {
                 if std::env::var_os("ATERM_DEBUG_SEAMLESS_REEXEC").is_some() {
                     let outcome = self.apply_debug_seamless_update();
-                    self.surface_update_apply_outcome("debug control request", outcome, false);
+                    // QA seam: visible, but never written to the health ledger.
+                    self.react_to_update_apply_outcome("debug control request", outcome, false);
                 } else {
                     // The controller has ALREADY been told "OK apply requested" —
                     // that reply acknowledges delivery, nothing more — so every way

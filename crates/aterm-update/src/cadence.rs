@@ -13,8 +13,9 @@
 //!   the network [`WAKE_SETTLE`] to come up instead of burning a guaranteed failure.
 //! * **No backoff.** Offline for an hour meant 48 identical failures, 48 health-ledger
 //!   increments, and 48 identical log lines. [`Cadence::delay`] doubles the interval
-//!   per consecutive failure up to [`MAX_BACKOFF`], and snaps back to the base
-//!   interval the moment a check succeeds.
+//!   per consecutive failure up to a ceiling of [`MAX_BACKOFF_INTERVALS`] base
+//!   intervals (never below [`MAX_BACKOFF`]), and snaps back to the base interval the
+//!   moment a check succeeds.
 //! * **No jitter.** Every aterm on every machine woke on the same 75 s grid relative
 //!   to its own launch; a fleet restarted together stays in lockstep and hits the API
 //!   in a thundering herd. [`Cadence::delay`] spreads each wait by ±[`JITTER_PCT`]%.
@@ -33,10 +34,28 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-/// The ceiling on backoff. Fifteen minutes is long enough that an offline laptop
-/// costs ~4 log lines an hour instead of 48, and short enough that reconnecting
-/// still gets an update within a coffee break.
+/// The FLOOR on the backoff ceiling — i.e. the ceiling that applies to a fast base
+/// interval. Fifteen minutes is long enough that an offline laptop costs ~4 log lines
+/// an hour instead of 48, and short enough that reconnecting still gets an update
+/// within a coffee break.
 pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
+
+/// How many base intervals the backoff may grow to. The real ceiling is
+/// `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)` — see [`Cadence::cap`].
+///
+/// The ceiling used to be [`MAX_BACKOFF`] alone, raised to the base so that an
+/// operator's long interval could never be silently SHORTENED by it:
+/// `min(MAX_BACKOFF.max(base))`. On the anonymous lane that expression is
+/// arithmetically inert — its base is 15 minutes, which IS `MAX_BACKOFF`, so the
+/// ceiling equalled the base and every doubling was clamped straight back down to it.
+/// The one lane that most needs to retreat while failing (a ~60 requests/hour budget
+/// shared by every machine behind one NAT) was the one lane with no backoff at all,
+/// and the same silent no-op applied to any operator interval at or above the cap.
+/// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
+/// retreat (15 min → 30 → 60) while bounding the worst case at 4× a cadence the lane
+/// or the operator has already accepted — and a wake, or one healthy check, still
+/// snaps all the way back to the base, so recovery is never rate-limited by the cap.
+pub(crate) const MAX_BACKOFF_INTERVALS: u32 = 4;
 
 /// Jitter applied to every wait, as a percentage either side of the nominal delay.
 pub(crate) const JITTER_PCT: u64 = 20;
@@ -107,16 +126,23 @@ impl Cadence {
         self.failures = 0;
     }
 
+    /// The ceiling on [`Self::nominal`] for THIS base: at least [`MAX_BACKOFF`], at
+    /// least the base itself (a configured interval is a floor on the wait, never
+    /// something a cap may shorten), and at most [`MAX_BACKOFF_INTERVALS`] × base —
+    /// the term that keeps the ceiling strictly above the base for every lane, so a
+    /// slow lane still backs off instead of clamping to where it started.
+    fn cap(&self) -> Duration {
+        MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
+    }
+
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
-    /// clamped to [`MAX_BACKOFF`]. Exposed for tests; [`Self::delay`] is what the
+    /// clamped to [`Self::cap`]. Exposed for tests; [`Self::delay`] is what the
     /// loop uses.
     pub(crate) fn nominal(&self) -> Duration {
-        // `1 << 20` already exceeds any sane base × MAX_BACKOFF ratio; the shift is
+        // `1 << 20` already exceeds any sane base × ceiling ratio; the shift is
         // clamped so a long outage can never overflow the multiply.
         let doublings = self.failures.saturating_sub(1).min(20);
-        self.base
-            .saturating_mul(1u32 << doublings)
-            .min(MAX_BACKOFF.max(self.base))
+        self.base.saturating_mul(1u32 << doublings).min(self.cap())
     }
 
     /// The actual wait: [`Self::nominal`] spread by ±[`JITTER_PCT`]%. `entropy` is a
@@ -374,17 +400,57 @@ mod tests {
     }
 
     #[test]
-    fn a_base_longer_than_the_cap_is_respected() {
+    fn a_base_longer_than_the_cap_is_respected_and_still_backs_off() {
         // `ATERM_UPDATE_INTERVAL_SECS=3600` must not be silently shortened to 15 min
         // by the cap; the cap bounds BACKOFF, it is not a ceiling on the operator's
-        // configured interval.
+        // configured interval. It must not silently DELETE the backoff either, which
+        // is what `min(MAX_BACKOFF.max(base))` did for every base at or above the cap:
+        // the wait stayed at exactly the base no matter how many checks in a row
+        // failed.
         let hour = Duration::from_secs(3600);
         let mut c = Cadence::new(hour);
         assert_eq!(c.nominal(), hour);
+        c.failed();
+        assert_eq!(c.nominal(), hour, "the first retry is still the base interval");
+        c.failed();
+        assert!(
+            c.nominal() > hour,
+            "a configured interval is a floor on the wait, not a cap on the backoff"
+        );
         for _ in 0..5 {
             c.failed();
         }
-        assert_eq!(c.nominal(), hour);
+        assert_eq!(c.nominal(), hour * MAX_BACKOFF_INTERVALS);
+    }
+
+    /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and
+    /// [`ANONYMOUS_INTERVAL_SECS`] are BOTH 15 minutes, so the old
+    /// `min(MAX_BACKOFF.max(base))` clamp returned the base for every failure count —
+    /// a tokenless client that could not reach GitHub retried at full speed forever,
+    /// against the very ~60 requests/hour per-IP budget the slow lane exists to
+    /// respect. The lane with the least request headroom had the least backoff.
+    #[test]
+    fn the_anonymous_lane_genuinely_backs_off_instead_of_clamping_to_its_own_base() {
+        let anon = Duration::from_secs(ANONYMOUS_INTERVAL_SECS);
+        let mut c = Cadence::new(anon);
+        c.failed();
+        assert_eq!(c.nominal(), anon, "the first retry is still the base interval");
+        c.failed();
+        assert!(
+            c.nominal() > anon,
+            "a second consecutive failure must lengthen the wait — the assertion the \
+             two equal constants used to make unfalsifiable"
+        );
+        for _ in 0..20 {
+            c.failed();
+        }
+        assert_eq!(
+            c.nominal(),
+            anon * MAX_BACKOFF_INTERVALS,
+            "and it climbs to the RELATIVE ceiling, above the absolute 15-minute one"
+        );
+        c.succeeded();
+        assert_eq!(c.nominal(), anon, "recovery snaps back to the lane's base");
     }
 
     #[test]

@@ -180,6 +180,8 @@ mod tests {
             team_id: "T".into(),
             staged_at: String::new(),
             changelog: None,
+            machine_id: None,
+            roster_seq: None,
         };
         std::fs::write(&staging.ready, ready.to_toml().unwrap()).unwrap();
 

@@ -90,6 +90,31 @@ impl Sentinel {
         }
     }
 
+    /// Un-count one observed launch of `running_build` (attempts −= 1, floored at 0),
+    /// returning the new count. For the launch the OUTGOING process ended itself: an
+    /// overlap-handoff candidate the parent killed for missing its readiness deadline,
+    /// for the user's activity, or for a proof mismatch counted a launch at boot like
+    /// any other, but it did not crash — the parent decided its fate. Left counted,
+    /// three automatic re-attempts on a busy machine reached `max_attempts`, reverted
+    /// to the OLD bundle, and PERMANENTLY poisoned a release that never failed. Only
+    /// the killer may forgive, and only for the build it killed; a sentinel for another
+    /// build, or none, is untouched (`0`). A candidate that DIED on its own is not
+    /// forgiven — that launch is the crash signal this file exists to count.
+    // Skip: same typed-TrustIr lowering gap as `observe_launch`; unit-tested.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn forgive_launch(&self, running_build: u64) -> io::Result<u32> {
+        match self.read_state() {
+            Some((b, attempts)) if b == running_build => {
+                let next = attempts.saturating_sub(1);
+                if next != attempts {
+                    self.write_state(b, next)?;
+                }
+                Ok(next)
+            }
+            Some(_) | None => Ok(0),
+        }
+    }
+
     /// Whether `running_build` should be reverted: it is armed AND has been observed
     /// unconfirmed at least `max_attempts` times (a crash loop). Pure read.
     #[must_use]
@@ -211,6 +236,31 @@ mod tests {
         );
         assert_eq!(s.observe_launch(1235).unwrap(), 2);
         assert!(s.should_revert(1235, 2), "two unconfirmed boots ⇒ revert");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_launch_the_killer_forgives_is_not_a_crash() {
+        let (s, dir) = sentinel("forgive");
+        s.arm(1235).unwrap();
+        // The parent's candidate boots (launch 1) and is then killed by the parent
+        // for missing its readiness deadline: given back.
+        assert_eq!(s.observe_launch(1235).unwrap(), 1);
+        assert_eq!(s.forgive_launch(1235).unwrap(), 0);
+        assert_eq!(s.read_state(), Some((1235, 0)));
+        // Three parent-killed candidates in a row never reach a revert...
+        for _ in 0..3 {
+            assert_eq!(s.observe_launch(1235).unwrap(), 1);
+            assert_eq!(s.forgive_launch(1235).unwrap(), 0);
+        }
+        assert!(!s.should_revert(1235, 3), "forgiven launches are not a loop");
+        // ...but a candidate that DIED keeps its count, and forgiveness never
+        // undercounts below zero or reaches into another build's sentinel.
+        assert_eq!(s.observe_launch(1235).unwrap(), 1);
+        assert_eq!(s.forgive_launch(1235).unwrap(), 0);
+        assert_eq!(s.forgive_launch(1235).unwrap(), 0, "floored at zero");
+        assert_eq!(s.forgive_launch(9999).unwrap(), 0);
+        assert_eq!(s.read_state(), Some((1235, 0)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

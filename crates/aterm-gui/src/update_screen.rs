@@ -38,6 +38,10 @@ pub(crate) struct UpdateState {
     enabled: bool,
     /// The last updater outcome string (from the health ledger) — shown small.
     outcome: String,
+    /// The health ledger says this Mac's updates are FAILING PERSISTENTLY (a streak
+    /// of one failure class, not a blip): the headline says so instead of "You're
+    /// up to date", and `outcome` carries the ledger's own sentence with the cause.
+    failing_persistent: bool,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
 }
@@ -54,6 +58,9 @@ pub(crate) struct UpdateProjection {
     pub(crate) enabled: bool,
     pub(crate) outcome: String,
     pub(crate) checking: bool,
+    /// The ledger's persistent-failure verdict — the surfaces style the headline
+    /// as a warning and never say "current" while it holds.
+    pub(crate) failing_persistent: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
 }
@@ -96,6 +103,7 @@ impl UpdateState {
             changelog,
             enabled: snapshot.enabled,
             outcome: snapshot.outcome.clone(),
+            failing_persistent: snapshot.failing_persistent,
             checking,
         }
     }
@@ -140,6 +148,7 @@ impl UpdateState {
             changelog,
             enabled: status.map(|s| s.enabled).unwrap_or(false),
             outcome: status.map(|s| s.outcome.clone()).unwrap_or_default(),
+            failing_persistent: status.is_some_and(|s| s.enabled && s.is_failing_persistently()),
             checking,
         }
     }
@@ -155,6 +164,7 @@ impl UpdateState {
             enabled: self.enabled,
             outcome: self.outcome.clone(),
             checking: self.checking,
+            failing_persistent: self.failing_persistent && self.enabled && !self.checking && self.staged.is_none(),
             headline: self.headline(),
             detail: self.detail(),
         }
@@ -206,6 +216,12 @@ impl UpdateState {
             "Update ready".to_string()
         } else if !self.enabled {
             "Automatic updates are off.".to_string()
+        } else if self.failing_persistent {
+            // NEVER "up to date" while the ledger says otherwise: for eight hours on
+            // 2026-08-18 every check was rejected publisher-side and this line said
+            // "You're up to date." The cause rides in `outcome` (the same sentence
+            // `aterm ctl update status` prints), shown as the detail below.
+            "Updates are failing on this Mac.".to_string()
         } else {
             "You\u{2019}re up to date.".to_string()
         }
@@ -214,9 +230,18 @@ impl UpdateState {
     /// The secondary detail line under the headline: the staged build's version + number
     /// (`Some` only when a build is ready), rendered small under the accent headline.
     fn detail(&self) -> Option<String> {
-        self.staged
-            .as_ref()
-            .map(|(b, v)| format!("Version {v} \u{00b7} build {b}"))
+        if let Some((b, v)) = self.staged.as_ref() {
+            return Some(format!("Version {v} \u{00b7} build {b}"));
+        }
+        if self.failing_persistent && !self.checking && self.enabled {
+            let cause = self.outcome.trim();
+            return Some(if cause.is_empty() {
+                "Every recent check failed the same way; run `aterm ctl update status` for the ledger.".to_string()
+            } else {
+                cause.to_string()
+            });
+        }
+        None
     }
 
     /// `(scroll, total, visible)` for `controls front`. Update does not scroll; it shows at

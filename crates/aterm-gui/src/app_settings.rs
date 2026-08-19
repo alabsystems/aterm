@@ -481,6 +481,13 @@ impl App {
         self.sync_settings_title_summary_health();
         if route == crate::native_settings::SettingsRoute::SoftwareUpdate {
             self.acknowledge_native_update_attention();
+            // The screen paints the reducer's snapshot, and the reducer only learns
+            // ledger changes on a reconcile. Opening the screen IS the moment the
+            // user wants the current verdict (a check that failed persistently
+            // stages nothing, so nothing else would have imported it).
+            self.request_native_update_reconcile(
+                crate::app_native::NativeUpdateReconcilePurpose::Refresh,
+            );
         }
         // Seed + refresh the shared Packages projection whenever Settings
         // surfaces: publication is memory-only (the controller starts honest

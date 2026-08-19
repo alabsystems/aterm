@@ -168,6 +168,33 @@ pub fn bundle_build_number(app: &Path) -> Result<u64, String> {
         .map_err(|_| format!("CFBundleVersion {text:?} is not an integer"))
 }
 
+/// Read the marketing version (`CFBundleShortVersionString`) from a bundle's sealed
+/// `Contents/Info.plist` — display only (the update screen names the build it is about
+/// to activate); authority is always the build number and the sealed commit.
+pub fn bundle_short_version(app: &Path) -> Result<String, String> {
+    let plist = app.join("Contents/Info.plist");
+    let out = output_bounded(
+        Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Print :CFBundleShortVersionString"])
+            .arg(&plist),
+        "PlistBuddy CFBundleShortVersionString",
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "read CFBundleShortVersionString: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if out.stdout.len() > 64 {
+        return Err("CFBundleShortVersionString exceeds 64 bytes".to_string());
+    }
+    let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if version.is_empty() {
+        return Err("CFBundleShortVersionString is empty".to_string());
+    }
+    Ok(version)
+}
+
 /// Read the codesign-sealed source provenance from `ATermGitCommit` in Info.plist.
 /// Callers compare it through [`crate::commit_matches`]; this reader only enforces a
 /// small, valid UTF-8 value so process output cannot become an allocation surface.
