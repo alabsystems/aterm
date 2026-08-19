@@ -347,7 +347,7 @@ pub fn enabled() -> bool {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn apply_staged_if_ready(current_build: u64) -> ApplyOutcome {
-    install::apply_staged_if_ready(current_build, None, &[], &[])
+    install::apply_staged_if_ready(current_build, None, &[], &[], false)
 }
 
 /// GUI handoff variant: inherited PTY/proof descriptors stay CLOEXEC for every
@@ -363,7 +363,7 @@ pub fn apply_staged_if_ready_preserving_fds(
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> ApplyOutcome {
-    install::apply_staged_if_ready(current_build, None, handoff_fds, handoff_env)
+    install::apply_staged_if_ready(current_build, None, handoff_fds, handoff_env, false)
 }
 
 /// Exact-identity GUI handoff variant. In addition to preserving descriptors,
@@ -376,12 +376,14 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     current_commit: &str,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
     install::apply_staged_if_ready(
         current_build,
         Some(current_commit),
         handoff_fds,
         handoff_env,
+        handoff_target_is_this_build,
     )
 }
 
@@ -589,6 +591,7 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
     _current_commit: &str,
     _handoff_fds: &[i32],
     _handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    _handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
     ApplyOutcome::NotApplicable
 }
@@ -880,8 +883,11 @@ pub fn spawn_background_check(
             // losing a message, not deduping one. `None` = nothing announced yet.
             let mut notified_failing: Option<&'static str> = None;
             // The installed bundle we last told the GUI about (by build). Announced
-            // once per build, re-announced when the bundle moves again.
+            // once per build, re-announced when the bundle moves again. And the last
+            // (build, error) we could NOT verify, so a permanently unverifiable bundle
+            // is logged once, not every cycle.
             let mut announced_installed: Option<u64> = None;
+            let mut unverifiable_installed: Option<(u64, String)> = None;
             loop {
                 // THE BUNDLE UNDER OUR OWN EXECUTABLE MAY HAVE MOVED ON WITHOUT A STAGE.
                 // The release cutter rewrites the bundle it was launched from, a user
@@ -889,23 +895,54 @@ pub fn spawn_background_check(
                 // it — none of that writes `ready.toml`, so `on_staged` above never
                 // fires and, before 2026-08-18, the running process learned about the
                 // newer bundle only at startup or when a stage happened to land. A
-                // plist read per cycle (no codesign here — the GUI's facts worker
-                // verifies before it imports anything) is what makes the activation
-                // lane fire on its own instead of waiting for a coincidence.
+                // plist read per cycle, and — only when it says newer — the same
+                // codesign policy the GUI's facts worker applies, is what makes the
+                // activation lane fire on its own instead of waiting for a coincidence.
+                // A DEV-MARKED bundle is skipped outright (`bundle::resolve` is the
+                // dev-mark-aware resolver): it can never pass the shipped tier, so
+                // verifying it every cycle would only spawn codesign forever.
                 if let Some(cb) = on_staged.as_ref()
-                    && let Some(installed) = bundle::resolve_layout()
+                    && let Some(installed) = bundle::resolve()
                     && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
                     && installed_build > current_build
                     && announced_installed != Some(installed_build)
                 {
-                    announced_installed = Some(installed_build);
-                    let version = verify::bundle_short_version(&installed.app_root)
-                        .unwrap_or_else(|_| format!("build {installed_build}"));
-                    log(&format!(
-                        "the bundle at this executable's path is already build \
-                         {installed_build} (running {current_build}) — the GUI activates it"
-                    ));
-                    cb(installed_build, version);
+                    // ANNOUNCE ONLY WHAT THE GUI CAN IMPORT. The plist is written
+                    // first and signed/notarized minutes later (the cutter lays the
+                    // bundle out in place; Gatekeeper refuses it until the ticket is
+                    // stapled), and the GUI's facts worker imports nothing it cannot
+                    // verify — so an announcement latched on plist evidence alone
+                    // landed inside that window, the import failed silently, and
+                    // nothing ever re-announced the same build (2026-08-19 audit).
+                    // Verify HERE, on this thread, before latching: an unverifiable
+                    // newer bundle is retried next cycle, not remembered.
+                    match verify::verify_bundle_policy(&installed.app_root, effective_team_id()) {
+                        Ok(()) => {
+                            announced_installed = Some(installed_build);
+                            let version = verify::bundle_short_version(&installed.app_root)
+                                .unwrap_or_else(|_| format!("build {installed_build}"));
+                            log(&format!(
+                                "the bundle at this executable's path is already build \
+                                 {installed_build} (running {current_build}) — the GUI \
+                                 activates it"
+                            ));
+                            cb(installed_build, version);
+                        }
+                        Err(error) => {
+                            // Once per (build, reason): the notarize window is minutes,
+                            // a broken seal is forever, and neither deserves a log line
+                            // per cycle.
+                            let key = (installed_build, error.clone());
+                            if unverifiable_installed.as_ref() != Some(&key) {
+                                log(&format!(
+                                    "the bundle at this executable's path reports build \
+                                     {installed_build} (running {current_build}) but does not \
+                                     verify ({error}); re-checking each cycle until it does"
+                                ));
+                                unverifiable_installed = Some(key);
+                            }
+                        }
+                    }
                 }
                 match check_lane().try_lock() {
                     Ok(_lane) => {

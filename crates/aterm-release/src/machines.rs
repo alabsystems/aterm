@@ -449,7 +449,7 @@ pub fn verify_published_roster(
     roster_sig: &[u8],
     machine_id: &str,
     roster_seq: Option<u64>,
-) -> Result<()> {
+) -> Result<u64> {
     let verified = verify_roster(master_pubkeys, roster_bytes, roster_sig).map_err(|e| {
         Error::new(format!(
             "the published release's machine roster does not verify under this tree's \
@@ -460,17 +460,27 @@ pub fn verify_published_roster(
     })?;
     let roster = Roster::parse(&verified)
         .map_err(|e| Error::new(format!("the published machine roster is unusable ({e:?})")))?;
-    // The pair (`machine_id`, `roster_seq`) is inside the manifest's SIGNED bytes, so
-    // requiring the downloaded roster to match both is what stops a recovery from
-    // reconstructing a different — even validly master-signed — roster beside a manifest
-    // that names another one. A client checks exactly this binding (`Attribution::bind`).
-    if roster_seq != Some(roster.roster_seq) {
-        return Err(Error::new(format!(
-            "the published release's manifest claims roster_seq {roster_seq:?} but the \
-             roster asset carries {}; refusing to reconstruct a roster the signed manifest \
-             does not name",
-            roster.roster_seq
-        )));
+    // The pair (`machine_id`, `roster_seq`) is inside the manifest's SIGNED bytes. The
+    // roster asset beside a published release may legitimately be NEWER than the
+    // manifest's attribution — a machine joining the roster attaches the new pair to
+    // releases that already shipped — and every v0.25+ client admits exactly that
+    // (`Attribution::bind`: manifest.roster_seq <= roster.roster_seq). Recovery mirrors
+    // the client: an OLDER asset than the manifest names, or no attribution at all,
+    // is a roster the signed manifest does not name and is refused; a newer one is
+    // the channel's steady state after a join (2026-08-19 audit — equality here
+    // wedged `recover-lost` behind a lease forever once a join had re-dressed the
+    // origin release).
+    match roster_seq {
+        Some(claimed) if claimed <= roster.roster_seq => {}
+        _ => {
+            return Err(Error::new(format!(
+                "the published release's manifest claims roster_seq {roster_seq:?} but the \
+                 roster asset carries {}; refusing to reconstruct a roster the signed \
+                 manifest does not name (a newer asset over an older attribution is \
+                 admissible; this is not that)",
+                roster.roster_seq
+            )));
+        }
     }
     if !roster.machines.iter().any(|m| m.id == machine_id) {
         return Err(Error::new(format!(
@@ -479,7 +489,9 @@ pub fn verify_published_roster(
              contradicts the signed manifest"
         )));
     }
-    Ok(())
+    // The generation actually carried by the asset — what a recovery WRITES — which
+    // may be newer than the manifest's attribution.
+    Ok(roster.roster_seq)
 }
 
 /// Stamp attribution INTO the manifest, before it is serialized and signed.
@@ -651,10 +663,17 @@ mod tests {
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(6))
             .expect("recovery does not re-judge a window it cannot change");
 
-        // The bindings that DO refuse.
+        // The bindings that DO refuse: a manifest claiming a NEWER generation than the
+        // asset (7 over 6), or none at all. An asset NEWER than the attribution (a
+        // join re-dressed the release) is the channel's steady state and recovers.
         let err =
             verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(7)).unwrap_err();
         assert!(err.to_string().contains("roster_seq"), "{err}");
+        let err =
+            verify_published_roster(&[&master], bytes.clone(), &sig, "m3", None).unwrap_err();
+        assert!(err.to_string().contains("roster_seq"), "{err}");
+        verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(5))
+            .expect("a newer roster asset over an older attribution is what a join produces");
         let err =
             verify_published_roster(&[&master], bytes.clone(), &sig, "m99", Some(6)).unwrap_err();
         assert!(err.to_string().contains("m99"), "{err}");

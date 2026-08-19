@@ -281,12 +281,14 @@ fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn prepare_trial(staging: &Staging, ready: &Ready) -> Result<Sentinel, String> {
+fn prepare_trial(staging: &Staging, ready: &Ready, install_root: &Path) -> Result<Sentinel, String> {
     let sentinel = boot_sentinel(staging);
+    // The trial is bound to the install it swaps: see `trial_owned_by`.
     if let Err(error) = crate::manifest::FailedMark::record_required(
         &staging.trial(),
         ready.build_number,
         &ready.dmg_sha256,
+        Some(install_root),
     ) {
         return Err(format!("persist trial identity: {error}"));
     }
@@ -302,6 +304,41 @@ fn prepare_trial(staging: &Staging, ready: &Ready) -> Result<Sentinel, String> {
     // unrelated trials.
     let _ = foreign_trial_counter(staging).confirm();
     Ok(sentinel)
+}
+
+/// Is the armed trial (if any) OWNED by the install at `app_root`? The sentinel and
+/// `trial.toml` are per user, but a build can be installed at several paths at once
+/// (a dev machine's `dist/aterm.app` beside `/Applications/aterm.app`, a duplicate
+/// copy of a release). A same-build process launched from a bundle the trial did
+/// not swap must neither count launches against it (three sibling launches used to
+/// revert and poison a build that never crashed), nor confirm it, nor disarm it as
+/// dead authority. A marker without a recorded root (written before the field
+/// existed) is treated as owned, which is the historical behaviour.
+#[must_use]
+fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
+    match crate::manifest::FailedMark::read(&staging.trial()).and_then(|trial| trial.install_root) {
+        None => true,
+        Some(recorded) => {
+            let recorded = Path::new(&recorded);
+            // An install that is GONE (moved or deleted mid-trial) owns nothing: if
+            // only its ghost could count, confirm or budget the sentinel, every
+            // launch of this build from anywhere else would defer forever. Whoever
+            // runs this build now inherits the trial and its escapes.
+            !recorded.exists() || same_install_root(recorded, app_root)
+        }
+    }
+}
+
+/// Path equality for install roots, tolerant of a canonicalizable spelling.
+#[must_use]
+fn same_install_root(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
 }
 
 #[must_use]
@@ -406,8 +443,12 @@ fn recover_abandoned_preswap_trial_if_exact(
         return false;
     };
     // Placed AFTER the identity resolution on purpose: an installed bundle we
-    // cannot verify still fails closed, disarming nothing.
+    // cannot verify still fails closed, disarming nothing. And ONLY the install the
+    // trial swapped may retire it: a newer sibling bundle at another path sees
+    // "armed for an older build than me" too, and disarming from there stripped
+    // the live install's crash-loop protection and cleared its receipt.
     if dead_authority_trial(process_build, installed_build, armed_build)
+        && trial_owned_by(staging, installed)
         && identity_matches_running(
             installed_build,
             &installed_commit,
@@ -2083,9 +2124,15 @@ pub fn apply_staged_if_ready(
     current_commit: Option<&str>,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
-    let outcome =
-        apply_staged_if_ready_inner(current_build, current_commit, handoff_fds, handoff_env);
+    let outcome = apply_staged_if_ready_inner(
+        current_build,
+        current_commit,
+        handoff_fds,
+        handoff_env,
+        handoff_target_is_this_build,
+    );
     if let Some(reason) = boot_apply_refusal_reason(&outcome) {
         crate::warn(&format!("boot apply refused: {reason}"));
         if let Some(staging) = Staging::resolve() {
@@ -2105,6 +2152,7 @@ fn apply_staged_if_ready_inner(
     current_commit: Option<&str>,
     handoff_fds: &[i32],
     handoff_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    handoff_target_is_this_build: bool,
 ) -> ApplyOutcome {
     let reexec_nonce = take_reexec_nonce();
     // Consume/clear child authority while startup is single-threaded, but do not
@@ -2160,6 +2208,22 @@ fn apply_staged_if_ready_inner(
     };
     if !crate::enabled() {
         return ApplyOutcome::NotApplicable;
+    }
+    // WE ARE THE AUTHORIZED CANDIDATE of a seamless handoff (the outgoing process's
+    // target names THIS build): an activation successor, or a download successor
+    // already swapped and re-exec'd into its target. Everything above still ran —
+    // the re-exec nonce and stamp are consumed, the boot-trial launch is counted,
+    // startup authority is settled — but nothing below may SWAP: a newer stage on
+    // disk re-exec'd from here would be a build the parent did not authorize; it
+    // would refuse the target, drop the adopted PTYs and be booked as a structural
+    // failure against a healthy candidate (2026-08-19 audit). The newer stage keeps
+    // for the next launch. `NoUpdate` is not a refusal, so the ledger stays quiet.
+    if handoff_target_is_this_build {
+        crate::log(&format!(
+            "boot apply: build {current_build} is the handoff's authorized target; leaving any \
+             newer stage on disk for the next launch"
+        ));
+        return ApplyOutcome::NoUpdate;
     }
     // 2. Must be a real installed bundle.
     let Some(b) = bundle::resolve() else {
@@ -2404,7 +2468,7 @@ fn apply_staged_if_ready_inner(
     // 8. Arm exact crash-loop authority only after fixed NEW is fully verified and
     // immediately before the atomic swap. A crash after this boundary has one
     // deterministic pre-swap shape: installed=OLD, fixed=NEW, ready+trial exact.
-    let sentinel = match prepare_trial(&staging, &ready) {
+    let sentinel = match prepare_trial(&staging, &ready, &b.app_root) {
         Ok(sentinel) => sentinel,
         Err(error) => {
             recover_prepared_candidate(&prepared, &staging);
@@ -2566,6 +2630,16 @@ fn check_boot_health(
     // Finalizing a swap a previous run already made — installs nothing — so the dev
     // mark must not strand an armed trial. See `bundle::resolve_layout`.
     let b = bundle::resolve_layout()?;
+    // NOT OUR TRIAL: a same-build process launched from a bundle the trial did not
+    // swap must not count, revert or disarm it — see `trial_owned_by`.
+    if !trial_owned_by(staging, &b.app_root) {
+        crate::log(&format!(
+            "boot sentinel armed for build {current_build} belongs to another install of \
+             this build; this launch from {} is not counted against it",
+            b.app_root.display()
+        ));
+        return None;
+    }
     // COUNT THE LAUNCH FIRST. This used to run after the recovery proof below, so a
     // trial whose proof failed every boot never advanced its attempt counter, never
     // reached MAX_BOOT_ATTEMPTS, and therefore never reverted OR confirmed: the
@@ -2870,6 +2944,12 @@ pub fn confirm_boot_health(current_build: u64, current_commit: Option<&str>) -> 
     let Some(installed) = bundle::resolve_layout() else {
         return false;
     };
+    // A trial another install of this build owns is not ours to confirm (nor could
+    // we: its rollback lives beside THAT bundle). Answer "nothing to do" instead of
+    // failing the proof forever from a sibling process — see `trial_owned_by`.
+    if !trial_owned_by(&staging, &installed.app_root) {
+        return true;
+    }
     confirm_health_under_apply_lock(
         &staging,
         current_build,
@@ -3574,7 +3654,7 @@ staged_at = "2026-08-17T00:00:00Z"
         std::fs::create_dir_all(s.root.join("boot.sentinel")).unwrap();
         let ready = Ready::read(&s.ready).unwrap();
 
-        assert!(prepare_trial(&s, &ready).is_err());
+        assert!(prepare_trial(&s, &ready, Path::new("/Applications/aterm.app")).is_err());
         assert!(s.ready.exists());
         assert_eq!(read_id(&s.staged_app), "VERIFIED-NEW");
         assert!(
@@ -3969,6 +4049,41 @@ staged_at = "2026-08-17T00:00:00Z"
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A trial belongs to the install it swapped. A same-build process launched
+    /// from ANOTHER bundle (a dev machine's `dist/aterm.app` beside
+    /// `/Applications/aterm.app`, a duplicate copy) is not its owner: it must not
+    /// count launches against it, confirm it, or disarm it as dead authority.
+    /// Legacy markers without a recorded root stay owned by whoever asks.
+    #[test]
+    fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
+        let (s, root) = temp_staging();
+        let owner = root.join("Applications").join("aterm.app");
+        let sibling = root.join("dist").join("aterm.app");
+        make_app(&owner, "OWNER");
+        make_app(&sibling, "SIBLING");
+        write_ready(&s, 6);
+        let ready = Ready::read(&s.ready).unwrap();
+        let sentinel = prepare_trial(&s, &ready, &owner).unwrap();
+        assert!(trial_owned_by(&s, &owner));
+        assert!(!trial_owned_by(&s, &sibling));
+        // A sibling launch of the trialed build does not count against it…
+        // (`check_boot_health` early-outs before `observe_launch` for a non-owner —
+        // exercised through the pure predicate here, and through
+        // `recover_abandoned_preswap_trial_if_exact` below).
+        assert_eq!(sentinel.read_state(), Some((6, 0)));
+        // …and a sibling that is NEWER than the armed build may not retire it as
+        // dead authority either: the pure gate is the ownership test.
+        assert!(dead_authority_trial(7, 7, 6) && !trial_owned_by(&s, &sibling));
+        // The owner install GONE (moved/deleted mid-trial): whoever runs the build
+        // now inherits the trial, so it can still be counted, confirmed or escaped.
+        std::fs::remove_dir_all(&owner).unwrap();
+        assert!(trial_owned_by(&s, &sibling), "a ghost owns nothing");
+        // A legacy marker (no recorded root) is owned by whoever asks.
+        crate::manifest::FailedMark::record(&s.trial(), 6, &"ab".repeat(32));
+        assert!(trial_owned_by(&s, &sibling) && trial_owned_by(&s, &owner));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// The unrecoverable mismatched-sentinel shapes get a budgeted escape of
     /// their own. The budget must be counted in a SEPARATE file: incrementing the
     /// boot sentinel would advance the trialed build's attempt count from
@@ -4282,7 +4397,7 @@ staged_at = "2026-08-17T00:00:00Z"
         let failed_installed = failed_root.join("Applications/aterm.app");
         make_app(&failed_installed, "OLD");
         let failed_ready = Ready::read(&failed_staging.ready).unwrap();
-        let failed_sentinel = prepare_trial(&failed_staging, &failed_ready).unwrap();
+        let failed_sentinel = prepare_trial(&failed_staging, &failed_ready, &failed_installed).unwrap();
         let mut failed_state = disk_model_ready(&model);
         disk_model_step(&model, &mut failed_state, "RemovePreviousReceipt");
         disk_model_step(&model, &mut failed_state, "PrepareFixedNew");
@@ -4316,7 +4431,7 @@ staged_at = "2026-08-17T00:00:00Z"
         assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
 
         let ready = Ready::read(&staging.ready).unwrap();
-        let _sentinel = prepare_trial(&staging, &ready).unwrap();
+        let _sentinel = prepare_trial(&staging, &ready, &installed).unwrap();
         disk_model_step(&model, &mut state, "ArmExactTrial");
         assert_real_disk_projection(&state, &staging, &installed, build, commit, &digest);
 
@@ -4380,7 +4495,7 @@ staged_at = "2026-08-17T00:00:00Z"
         make_app(&rollback_installed, "OLD");
         make_app(&rollback_fixed, "NEW");
         let rollback_ready = Ready::read(&rollback_staging.ready).unwrap();
-        let rollback_sentinel = prepare_trial(&rollback_staging, &rollback_ready).unwrap();
+        let rollback_sentinel = prepare_trial(&rollback_staging, &rollback_ready, &rollback_installed).unwrap();
         let mut rollback_state = disk_model_ready(&model);
         disk_model_step(&model, &mut rollback_state, "RemovePreviousReceipt");
         for action in ["PrepareFixedNew", "ArmExactTrial"] {

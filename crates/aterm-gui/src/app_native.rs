@@ -1481,6 +1481,30 @@ impl App {
         purpose: NativeUpdateReconcilePurpose,
         facts: NativeUpdateReconcileFacts,
     ) {
+        // Read BEFORE reducing: `reconcile_native_update_facts` publishes the new
+        // stage into `self.relaunch` on its way out, so a comparison made after it
+        // always found the notice already naming the stage and `newly_announced`
+        // was false for every real import — no "Update ready" toast, no level-up,
+        // and the first preflight-block pill suppressed (2026-08-19 audit).
+        let announced_before = self.relaunch.as_ref().map(|notice| notice.build);
+        // A DEFERRED PURPOSE RIDES THE NEXT NEWER FACTS. A request parked while the
+        // reducer was busy (a control `update apply` deferred behind an attempt)
+        // used to wait for the idle backstop's replay — and if any newer observation
+        // (the failed attempt's own Startup facts) was reduced first, that replay was
+        // IgnoredStale and the request vanished with nothing surfaced. Merge it here,
+        // into whichever facts are newest, so the purpose is never dropped.
+        let (purpose, facts) = match self.deferred_native_update_reconcile.take() {
+            Some((deferred_purpose, deferred_facts))
+                if deferred_facts.observation_sequence <= facts.observation_sequence =>
+            {
+                (merge_reconcile_purpose(deferred_purpose, purpose), facts)
+            }
+            Some(newer) => {
+                self.deferred_native_update_reconcile = Some(newer);
+                (purpose, facts)
+            }
+            None => (purpose, facts),
+        };
         match self.reconcile_native_update_facts(facts) {
             NativeUpdateFactsResult::IgnoredStale => {}
             NativeUpdateFactsResult::Deferred(facts) => {
@@ -1500,9 +1524,9 @@ impl App {
                     });
             }
             NativeUpdateFactsResult::Reduced { effective_stage } => {
-                let newly_announced = effective_stage.as_ref().is_some_and(|stage| {
-                    self.relaunch.as_ref().map(|notice| notice.build) != Some(stage.build)
-                });
+                let newly_announced = effective_stage
+                    .as_ref()
+                    .is_some_and(|stage| announced_before != Some(stage.build));
                 self.publish_native_update_state();
 
                 if let Some(stage) = effective_stage {
@@ -1518,10 +1542,19 @@ impl App {
                             stage.build,
                             std::time::Instant::now(),
                         ));
-                        self.level_up = Some(crate::level_up::LevelUp::new(
-                            stage.build,
-                            std::time::Instant::now(),
-                        ));
+                        // The border glow is a motion effect: gated exactly like its
+                        // two sibling producers (JUST_UPDATED, the QA seam). This
+                        // block was dead until the announcement fix landed, which is
+                        // how an ungated producer survived.
+                        if self
+                            .serious_mode_policy()
+                            .allows(crate::motion::SeriousEffect::LevelUp)
+                        {
+                            self.level_up = Some(crate::level_up::LevelUp::new(
+                                stage.build,
+                                std::time::Instant::now(),
+                            ));
+                        }
                         self.request_redraw_all_windows();
                     }
 
@@ -1547,6 +1580,22 @@ impl App {
 
     /// Retry already-collected facts after service-owned check/apply work releases the
     /// reducer. No disk is reread and only the newest deferred sequence survives.
+    /// Reduce the disk facts a RETURNED apply carried, through the same door every
+    /// other reconcile uses, so whatever they import is also ARMED. The five
+    /// returned-apply arms used to `let _ = reconcile_native_update_facts(facts)`
+    /// and then replay a deferred purpose against facts that were by then stale:
+    /// an activation imported after our own child swapped the bundle sat un-armed
+    /// ("activates at the next quiet moment" — nothing scheduled), and a control
+    /// `update apply` deferred behind the attempt was dropped as IgnoredStale.
+    /// A pending deferred purpose rides these newer facts; otherwise this is a
+    /// plain refresh (arms, never announces).
+    fn reduce_returned_apply_facts(&mut self, facts: NativeUpdateReconcileFacts) {
+        // A pending deferred purpose merges in (and the newest observation wins) —
+        // `finish_native_update_reconcile` does that for every caller now.
+        self.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Refresh, facts);
+        self.finish_deferred_native_update_reconcile();
+    }
+
     pub(crate) fn finish_deferred_native_update_reconcile(&mut self) {
         if self.native_updater_service.snapshot().active.is_none()
             && self.native_updater_service.snapshot().phase != UpdaterPhase::Applying
@@ -4725,6 +4774,17 @@ impl App {
                 // distinct budget. Older wakes were suppressed by `arm` above.
                 self.auto_apply_manual_only = None;
                 let now = std::time::Instant::now();
+                // Say so at the default log level. The automatic lane's waits and
+                // its first blocked attempt used to be debug-only, so an operator
+                // reading aterm.log could not tell an armed-and-waiting lane from a
+                // dead one (2026-08-19: twenty minutes staring at a stage that never
+                // applied, until a control apply exposed the reason).
+                aterm_log::info!(
+                    "update auto-apply armed for build {build} ({}…): lands at the first \
+                     quiet moment, forced no later than {} s from now",
+                    &digest[..digest.len().min(12)],
+                    crate::AUTOMATIC_UPDATE_ACTIVITY_GRACE.as_secs()
+                );
                 self.auto_apply_intent = Some(crate::AutoApplyIntent {
                     build,
                     dmg_sha256,
@@ -4857,9 +4917,19 @@ impl App {
                     crate::AUTOMATIC_UPDATE_QUIET_EPOCH
                 };
             self.auto_apply_intent = Some(intent);
-            aterm_log::debug!(
-                "automatic update retained exact intent after activity deferral: {reason}"
-            );
+            if past_grace {
+                // Paced by the grace window, so this is one line per two minutes at
+                // most — and it is the line that says the lane is alive but held.
+                aterm_log::info!(
+                    "update auto-apply for build {} is past its idle grace and still \
+                     deferred: {reason}",
+                    intent.build
+                );
+            } else {
+                aterm_log::debug!(
+                    "automatic update retained exact intent after activity deferral: {reason}"
+                );
+            }
             return;
         }
         intent.attempts = intent.attempts.saturating_add(1);
@@ -5000,6 +5070,16 @@ impl App {
                 let first_exhaustion =
                     cooling_down && intent.attempts == MAX_AUTOMATIC_UPDATE_CYCLES;
                 self.auto_apply_intent = Some(intent);
+                if intent.attempts == 1 {
+                    // The FIRST block of an intent is always logged (the pill below
+                    // stays gated on `announce`, which is the UI's business): a
+                    // preflight blocker is the one thing an operator can act on.
+                    aterm_log::info!(
+                        "update auto-apply attempt 1 for build {} blocked by preflight: {}",
+                        intent.build,
+                        reasons.join(" · ")
+                    );
+                }
                 if announce && intent.attempts == 1 {
                     self.surface_update_apply_outcome(
                         "automatic",
@@ -5977,8 +6057,7 @@ impl App {
                 // are left precisely as they were. See [`HandoffFailureLane`].
                 if !lane.charges_the_automatic_lane() {
                     self.publish_native_update_state();
-                    let _ = self.reconcile_native_update_facts(facts);
-                    self.finish_deferred_native_update_reconcile();
+                    self.reduce_returned_apply_facts(facts);
                     return Some(UpdateOutcome::Failed { message });
                 }
                 // ACTIVITY-REVOKED + budget remaining: the exact stage was
@@ -5990,8 +6069,7 @@ impl App {
                     && let Some(delay) = self.arm_activity_revoked_overlap_retry(&attempt)
                 {
                     self.publish_native_update_state();
-                    let _ = self.reconcile_native_update_facts(facts);
-                    self.finish_deferred_native_update_reconcile();
+                    self.reduce_returned_apply_facts(facts);
                     aterm_log::info!(
                         "update apply: activity revoked the overlap; automatic retry in {:?}",
                         delay
@@ -6013,8 +6091,7 @@ impl App {
                 }
                 self.auto_apply_intent = None;
                 self.publish_native_update_state();
-                let _ = self.reconcile_native_update_facts(facts);
-                self.finish_deferred_native_update_reconcile();
+                self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::Failed { message })
             }
             ReturnedApplyDisposition::InstalledNeedsRelaunch { build } => {
@@ -6023,8 +6100,7 @@ impl App {
                 self.publish_native_update_state();
                 // A newer artifact is imported only when it exceeds the canonical
                 // installed build; the fact reducer enforces that floor.
-                let _ = self.reconcile_native_update_facts(facts);
-                self.finish_deferred_native_update_reconcile();
+                self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::InstalledNeedsRelaunch {
                     build,
                     message: "The update is already on disk; aterm activates it at the next \
@@ -6043,8 +6119,7 @@ impl App {
                     self.auto_apply_manual_only = None;
                 }
                 self.publish_native_update_state();
-                let _ = self.reconcile_native_update_facts(facts);
-                self.finish_deferred_native_update_reconcile();
+                self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::Failed {
                     message: format!(
                         "{message}; the durable stage changed and the old apply intent was retired"
@@ -7973,6 +8048,135 @@ mod tests {
     /// under the executable as the artifact — and the answer is STABLE across
     /// reconciles (the original defect was a fixed point that blanked the stage on
     /// every pass; the activation is Unchanged while the bundle still backs it).
+    /// The "Update ready" toast and the level-up fire on a REAL stage import through
+    /// the production door (`finish_native_update_reconcile`). They never did: the
+    /// reconcile published the stage into `self.relaunch` before `newly_announced`
+    /// was computed, so every import compared equal to itself and stayed silent.
+    /// The RETURNED-apply arms can carry disk facts (`finish_async_native_update_handoff`
+    /// with `reconcile: Some` — a lane every shipping completion site today leaves
+    /// `None`, posting facts as a separate Startup wake instead; this pins the arms
+    /// for whoever wires it). Our own child swapped the bundle to the target and
+    /// then failed to commit: the facts say the installed bundle is newer, the
+    /// stage is consumed (InstalledNeedsRelaunch), and what those arms did next was
+    /// `let _ = reconcile(...)` — an activation imported and never ARMED, with the
+    /// outcome promising "activates at the next quiet moment". Every arm now reduces
+    /// through the arming door.
+    #[test]
+    fn a_returned_apply_whose_child_swapped_the_bundle_arms_the_activation() {
+        let mut app = App::headless_for_test();
+        let (_, _settings) = park_a_settings_draft_in_a_background_tab(&mut app);
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        let ApplyPreflightStart::Inspect(preflight) = app
+            .native_updater_service
+            .begin_apply_preflight(ApplyMode::AutomaticPastGrace)
+        else {
+            panic!("the stage must admit an apply preflight");
+        };
+        let ApplyDecision::Execute(command) = app
+            .native_updater_service
+            .finish_apply_preflight(preflight, ClosePreflight::Ready)
+        else {
+            panic!("a ready close preflight must authorize the replacement");
+        };
+        let attempt = command.attempt();
+        command.execute(|| ());
+        app.auto_apply_intent = None;
+        // The child swapped the bundle (installed == target, receipt names the
+        // download) and then failed to prove readiness.
+        let facts = reconcile_facts_with_installed(
+            7,
+            7,
+            Some(DurableUpdateStatus {
+                enabled: true,
+                current_build: app.native_updater_service.snapshot().current_build,
+                staged_build: Some(build),
+                staged_version: Some(format!("1.0.{build}")),
+                staged_commit: Some(PREFLIGHT_TEST_COMMIT.to_string()),
+                staged_dmg_sha256: Some("ab".repeat(32)),
+                changelog: None,
+                outcome: "staged".to_string(),
+                failing_checks: 0,
+                failing_persistent: false,
+                failing_kind: String::new(),
+            }),
+            Some(InstalledUpdate {
+                build,
+                commit: PREFLIGHT_TEST_COMMIT.to_string(),
+                version: None,
+                receipt_build: Some(build),
+                receipt_dmg_sha256: Some("ab".repeat(32)),
+            }),
+        );
+        let outcome = app.finish_async_native_update_handoff(
+            attempt,
+            facts,
+            "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+        assert!(
+            matches!(outcome, Some(UpdateOutcome::InstalledNeedsRelaunch { .. })),
+            "the disposition names the installed build, got {outcome:?}"
+        );
+        assert_activation_stage(&app, build, PREFLIGHT_TEST_COMMIT);
+        let staged = app.native_updater_service.snapshot().staged.clone().unwrap();
+        assert!(
+            app.auto_apply_intent.is_some_and(|intent| intent.build == build
+                && intent.dmg_sha256 == decode_dmg_sha256(&staged.dmg_sha256).unwrap()),
+            "the activation the returned facts imported is ARMED, not merely described"
+        );
+    }
+
+    #[test]
+    fn a_freshly_imported_stage_is_announced_once_and_then_stays_quiet() {
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        let build = running + 1;
+        assert!(app.notice.is_none() && app.level_up.is_none() && app.relaunch.is_none());
+        let facts = || {
+            reconcile_facts_with_installed(
+                1,
+                1,
+                Some(DurableUpdateStatus {
+                    enabled: true,
+                    current_build: running,
+                    staged_build: Some(build),
+                    staged_version: Some("9.9.0".to_string()),
+                    staged_commit: Some(PREFLIGHT_TEST_COMMIT.to_string()),
+                    staged_dmg_sha256: Some("ab".repeat(32)),
+                    changelog: None,
+                    outcome: "staged".to_string(),
+                    failing_checks: 0,
+                    failing_persistent: false,
+                    failing_kind: String::new(),
+                }),
+                Some(installed_update(running)),
+            )
+        };
+        app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::StageAvailable, facts());
+        assert_eq!(
+            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            Some(build),
+            "PRECONDITION: the stage imported"
+        );
+        assert!(
+            app.notice.as_ref().is_some_and(crate::notice::TransientNotice::is_update_ready),
+            "a newly imported stage shows the Update ready toast (present: {})",
+            app.notice.is_some()
+        );
+        assert!(app.level_up.is_some(), "…and the level-up");
+        // The SAME stage again is not news.
+        app.notice = None;
+        app.level_up = None;
+        let mut again = facts();
+        again.observation_sequence = 2;
+        again._ticket = NativeUpdateReconcileTicket {
+            request_sequence: 2,
+        };
+        app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::StageAvailable, again);
+        assert!(app.notice.is_none() && app.level_up.is_none(), "a repeat import is quiet");
+    }
+
     #[test]
     fn a_bundle_newer_than_the_process_becomes_an_activation_stage_and_stays_one() {
         let mut app = App::headless_for_test();
@@ -8175,6 +8379,59 @@ mod tests {
                 "purpose merge and newest-facts selection are independent"
             );
         }
+    }
+
+    /// The SHIPPING returned-apply lane: a control apply parked while the reducer
+    /// was busy, then the failed attempt's own (newer) Startup facts arrive first.
+    /// The parked ApplyControl used to wait for the idle backstop's replay, which
+    /// found its facts stale and dropped the request with nothing surfaced. It now
+    /// rides the newer facts: the reduction that lands them acts on ApplyControl.
+    #[test]
+    fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        let build = running + 1;
+        // Park an ApplyControl behind an active check (the reducer defers facts
+        // while work is active).
+        let active = start(&mut app.native_updater_service);
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::ApplyControl,
+            reconcile_facts(1, 5, Some(status(Some(build), 0))),
+        );
+        assert!(
+            app.deferred_native_update_reconcile
+                .as_ref()
+                .is_some_and(|(p, f)| *p == NativeUpdateReconcilePurpose::ApplyControl
+                    && f.observation_sequence == 5),
+            "PRECONDITION: the control apply is parked"
+        );
+        // The check completes with nothing (the reducer is free again)…
+        let _ = app
+            .native_updater_service
+            .finish_check(active, status(None, 0));
+        // …and NEWER facts arrive under a plain Startup purpose, exactly like the
+        // failed attempt's own facts wake. Before the fix these reduced on their own,
+        // the parked pair replayed later, went IgnoredStale, and the apply was lost.
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::Startup,
+            reconcile_facts(2, 9, Some(status(Some(build), 0))),
+        );
+        assert!(
+            app.deferred_native_update_reconcile.is_none(),
+            "the parked purpose merged into the newer facts instead of waiting to go stale"
+        );
+        // ApplyControl acted: an Immediate apply was attempted on the imported stage,
+        // which in a headless host is refused by preflight (no event-loop service) —
+        // observable as a surfaced control-request outcome rather than silence.
+        let outcome = app.native_updater_service.snapshot().outcome.clone();
+        assert!(
+            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build) == Some(build),
+            "the newer facts imported the stage, got outcome {outcome:?}"
+        );
+        assert!(
+            app.notice.is_some() || app.native_updater_service.snapshot().phase != UpdaterPhase::Staged,
+            "the control apply was acted on (surfaced or moved the phase), not dropped"
+        );
     }
 
     fn start(service: &mut NativeUpdaterService) -> UpdaterWorkTicket {

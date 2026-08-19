@@ -551,6 +551,16 @@ pub struct FailedMark {
     /// keeps its (safe) retryable reading.
     #[serde(default)]
     pub quarantined: bool,
+    /// TRIAL markers only: the install root (`…/aterm.app`) the armed trial belongs
+    /// to. The sentinel and this marker are per USER, while a build can sit at
+    /// several paths at once (a dev machine's `dist/aterm.app` beside
+    /// `/Applications/aterm.app`, a duplicate copy of a release): a same-build
+    /// process launched from a DIFFERENT bundle used to count launches against, or
+    /// disarm, a trial it did not own — three sibling launches could revert and
+    /// poison a build that never crashed. Absent in markers written before this
+    /// field existed ⇒ unbound (the historical behaviour, for one trial's lifetime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_root: Option<String>,
 }
 
 /// The widening retry schedule for a candidate that failed to stage, in seconds:
@@ -640,7 +650,7 @@ impl FailedMark {
     /// convenience used to have was changed to, leaving it to the fixtures.
     #[cfg(test)]
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
-        let _ = Self::record_required(path, build_number, sha256);
+        let _ = Self::record_required(path, build_number, sha256, None);
     }
 
     /// QUARANTINE `(build_number, sha256)`: it was swapped in, failed to confirm boot
@@ -662,6 +672,7 @@ impl FailedMark {
             attempts: 0,
             retry_after: 0,
             quarantined: true,
+            install_root: None,
         };
         let Ok(text) = toml::to_string(&m) else {
             return;
@@ -692,6 +703,7 @@ impl FailedMark {
             // A timed backoff, never a quarantine: this failure is about fetching or
             // staging the artifact, not about the artifact having proved itself bad.
             quarantined: false,
+            install_root: None,
         };
         let Ok(text) = toml::to_string(&m) else {
             return;
@@ -711,6 +723,7 @@ impl FailedMark {
         path: &Path,
         build_number: u64,
         sha256: &str,
+        install_root: Option<&Path>,
     ) -> Result<(), String> {
         let m = FailedMark {
             build_number,
@@ -719,6 +732,7 @@ impl FailedMark {
             attempts: 0,
             retry_after: 0,
             quarantined: false,
+            install_root: install_root.map(|root| root.to_string_lossy().into_owned()),
         };
         let text =
             toml::to_string(&m).map_err(|error| format!("serialize artifact marker: {error}"))?;

@@ -1968,6 +1968,30 @@ pub(crate) fn encode_target_identity(build: u64, commit: &str) -> String {
     format!("{build} {}", commit.trim())
 }
 
+/// Does the parent's [`ENV_TARGET`] name THIS build? A non-consuming peek for the
+/// boot-apply gate (`take_target_identity` consumes it moments later, in the same
+/// single-threaded launcher). When it does, this process IS the authorized
+/// candidate — an ACTIVATION successor, or a swapped download successor already
+/// re-exec'd into the target — and a further boot swap into any newer stage on
+/// disk would turn it into a build the parent did not authorize: the re-exec'd
+/// image refuses `take_target_identity`, closes the adopted fds and exits, and
+/// the parent books a `ChildDied` structural failure for a candidate that was
+/// perfectly healthy (found by the 2026-08-19 audit; the newer stage on disk is
+/// left for the next launch instead). Malformed values answer `false`: the
+/// consuming reader is the one that diagnoses them.
+#[must_use]
+pub(crate) fn target_identity_names_this_build() -> bool {
+    let Some(raw) = std::env::var_os(ENV_TARGET) else {
+        return false;
+    };
+    let raw = raw.to_string_lossy();
+    let Some((build, _commit)) = raw.trim().split_once(' ') else {
+        return false;
+    };
+    let own = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
+    build.parse::<u64>().ok() == Some(own)
+}
+
 /// Consume [`ENV_TARGET`] and PROVE this process is the binary the parent
 /// authorized. Returns the agreed identity, or `None` after logging exactly
 /// which component disagreed — the diagnostic that was missing when every

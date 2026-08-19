@@ -15341,11 +15341,22 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let boot_apply = if incoming_exec_fds.blocks_boot_apply() {
         aterm_update::ApplyOutcome::NotApplicable
     } else {
+        // WHEN WE ARE THE AUTHORIZED CANDIDATE (the outgoing process's target names
+        // this build — an activation successor, or a download successor already
+        // swapped and re-exec'd into its target) the updater still runs its whole
+        // startup prologue — consuming the re-exec nonce and stamp, counting the
+        // boot-trial launch, settling startup authority — but refuses to SWAP: a
+        // newer stage on disk re-exec'd from here would be a build the parent did
+        // not authorize, and that image would refuse the target, drop the adopted
+        // PTYs and be booked as ChildDied against a healthy candidate. Skipping the
+        // call outright was tried and left ATERM_UPDATE_REEXEC and its stamp
+        // unconsumed, which made the NEXT apply from the survivor a silent no-op.
         aterm_update::apply_staged_if_ready_preserving_fds_exact(
             build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
             build_info::GIT_COMMIT,
             incoming_exec_fds.final_exec_fds(),
             &incoming_exec_fds.final_exec_env(),
+            seamless::target_identity_names_this_build(),
         )
     };
     match boot_apply {

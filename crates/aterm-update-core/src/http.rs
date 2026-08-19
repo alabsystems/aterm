@@ -529,14 +529,49 @@ pub fn download_bytes(
             return Ok(out.stdout);
         }
         // With `-f` every failure — HTTP error, timeout, DNS — is a non-zero exit.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // A RATE LIMIT is not a broken download. `-f` folds "429" / "403 rate limit"
+        // into exit 22 with the status in curl's own message; name it, so the check
+        // lane can take its deferred, no-ledger path instead of booking a
+        // `pipeline` failure and — three checks later on a saturated anonymous IP —
+        // the loud "download pipeline is likely broken" notice (2026-08-19 audit).
+        // On the asset endpoint the only 403 an anonymous public-channel client
+        // ever meets is the rate limit (a private asset answers 404), and with a
+        // token an auth failure has already been classified by the releases list.
+        if let Some(code) = curl_http_error_code(&stderr)
+            && (code == 429 || code == 403)
+        {
+            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+        }
         if attempt >= CURL_ATTEMPTS {
             return Err(format!(
                 "curl asset download failed ({}): {}",
                 out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+                stderr.trim()
             ));
         }
     }
+}
+
+/// The marker [`download_bytes`] puts in front of a rate-limited asset fetch, so a
+/// caller holding only the error string can classify it ([`download_error_is_rate_limit`]).
+const RATE_LIMIT_ERROR_PREFIX: &str = "rate limited (HTTP ";
+
+/// Whether a [`download_bytes`] error describes a GitHub rate limit (HTTP 429/403 on
+/// the asset endpoint) rather than a broken download.
+#[must_use]
+pub fn download_error_is_rate_limit(error: &str) -> bool {
+    error.contains(RATE_LIMIT_ERROR_PREFIX)
+}
+
+/// The HTTP status curl reports for a `-f` failure ("The requested URL returned
+/// error: 429" — the exit is 22 for every 4xx/5xx, so the code lives in the text).
+#[must_use]
+fn curl_http_error_code(stderr: &str) -> Option<u16> {
+    let idx = stderr.find("returned error: ")?;
+    let rest = &stderr[idx + "returned error: ".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 /// GitHub's per-release-asset ceiling, and THE one number both sides of the
@@ -638,17 +673,44 @@ pub fn download_to(
     let max_time = download_max_time_secs(max_filesize).to_string();
     let out = curl_fetch(&download_to_args(&cap, &max_time, dest_s), asset_url, token)?;
     if !out.status.success() {
-        return Err(format!(
-            "curl download failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Same classification as `download_bytes`: a 429/403 on the asset lane is
+        // named as a rate limit so the check lane can defer instead of booking a
+        // broken pipeline (the caller bounds how long that classification is trusted).
+        if let Some(code) = curl_http_error_code(&stderr)
+            && (code == 429 || code == 403)
+        {
+            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+        }
+        return Err(format!("curl download failed ({}): {}", out.status, stderr.trim()));
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rate_limited_asset_fetch_is_named_and_a_broken_one_is_not() {
+        assert_eq!(
+            super::curl_http_error_code("curl: (22) The requested URL returned error: 429"),
+            Some(429)
+        );
+        assert_eq!(
+            super::curl_http_error_code(
+                "curl: (22) The requested URL returned error: 403 rate limit exceeded"
+            ),
+            Some(403)
+        );
+        assert_eq!(super::curl_http_error_code("curl: (56) Recv failure"), None);
+        assert!(super::download_error_is_rate_limit(&format!(
+            "{}429) fetching asset",
+            super::RATE_LIMIT_ERROR_PREFIX
+        )));
+        assert!(!super::download_error_is_rate_limit(
+            "curl asset download failed (exit status: 22): 404"
+        ));
+    }
+
     use super::{
         HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, curl_argv, curl_bin, curl_fetch,
         curl_prepared, download_bytes_args, download_max_time_secs, download_to_args,

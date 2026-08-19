@@ -64,6 +64,27 @@ static LANE: AtomicU8 = AtomicU8::new(0);
 /// to LENGTHEN the next wait without recording a failure: a rate limit means "you
 /// asked too often", which is a cadence problem, not a broken updater.
 static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
+/// Consecutive checks whose ASSET fetch (manifest/signature/roster/container) met an
+/// HTTP 429/403 while the releases list itself succeeded. GitHub's real rate limit
+/// answers the LIST first (it is the first request of every check and is classified
+/// by body), so a long run of asset-only 4xx with a healthy list is not a rate limit
+/// — it is a blocked object host (a filtering proxy) or a rejected signed URL, and
+/// after [`ASSET_RATE_LIMIT_DEFERRALS`] such checks it is booked as the `pipeline`
+/// failure it is, so the persistent notice can still reach the user. Reset by any
+/// successful asset fetch. Process-local on purpose: it bounds a misdiagnosis, it is
+/// not a ledger.
+static ASSET_RATE_LIMIT_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// How many consecutive asset-lane 429/403 checks are trusted as "rate limit" before
+/// they are booked as a broken download path. Three checks at the anonymous cadence
+/// spans ~45 min, well past a shared IP's hourly budget renewing.
+const ASSET_RATE_LIMIT_DEFERRALS: u32 = 3;
+
+/// Whether an asset-lane rate-limit shaped failure should still be treated as a
+/// deferral (true) or has persisted long enough to be a broken download path (false).
+fn asset_rate_limit_still_deferrable() -> bool {
+    let streak = ASSET_RATE_LIMIT_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    streak <= ASSET_RATE_LIMIT_DEFERRALS
+}
 
 /// Whether this process has already logged that it is updating without a token. Once
 /// per process: it is a standing condition, not an event.
@@ -599,6 +620,10 @@ struct AuthoritativeFetch {
     /// (zip when the manifest carries a resolvable one, else the DMG).
     selected: Option<(Manifest, Release, StageArtifact)>,
     appcast_fetch_error: bool,
+    /// The `appcast_fetch_error` was a GitHub RATE LIMIT on an asset fetch, not a
+    /// broken download: the anonymous lane's ordinary weather, and never a
+    /// `pipeline`-class failure.
+    asset_fetch_rate_limited: bool,
     manifest_rejected: bool,
     /// Candidate-manifest fetches only. Detached-signature downloads are a
     /// subordinate verification step and intentionally do not increment this.
@@ -829,6 +854,8 @@ fn fetch_authoritative_release(
         Err(error) => {
             crate::warn(&format!("fetch appcast: {error}"));
             fetched.appcast_fetch_error = true;
+            fetched.asset_fetch_rate_limited =
+                aterm_update_core::download_error_is_rate_limit(&error);
             return fetched;
         }
     };
@@ -884,6 +911,8 @@ fn fetch_authoritative_release(
                 Err(error) => {
                     crate::warn(&format!("fetch appcast signature: {error}"));
                     fetched.appcast_fetch_error = true;
+                    fetched.asset_fetch_rate_limited =
+                        aterm_update_core::download_error_is_rate_limit(&error);
                     return fetched;
                 }
             };
@@ -963,6 +992,8 @@ fn fetch_authoritative_release(
                     candidate.release.tag_name
                 ));
                 fetched.appcast_fetch_error = true;
+                fetched.asset_fetch_rate_limited =
+                    aterm_update_core::download_error_is_rate_limit(&error);
                 return fetched;
             }
             Err(RosterFailure::Refused(error)) => {
@@ -1529,6 +1560,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         );
     }
     let appcast_fetch_error = fetched.appcast_fetch_error;
+    let asset_fetch_rate_limited = fetched.asset_fetch_rate_limited;
     let manifest_rejected = fetched.manifest_rejected;
     let observed_roster_seq = fetched.observed_roster_seq;
     let best = fetched.selected;
@@ -1619,6 +1651,24 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
+        if appcast_fetch_error && asset_fetch_rate_limited && asset_rate_limit_still_deferrable() {
+            // The manifest/roster/signature GET met GitHub's rate limit — the same
+            // verdict `ListDecision::RateLimited` gets one request earlier, and for
+            // the same reason no `record_failure`: three saturated checks in a row
+            // on a shared anonymous IP used to book a persistent `pipeline` streak
+            // and fire the "download pipeline is likely broken" notice at a
+            // perfectly healthy machine (2026-08-19 audit). Latch the back-off and
+            // say "deferred", exactly as the list-level path does.
+            RATE_LIMITED.store(true, Ordering::Relaxed);
+            let message = "GitHub rate limit hit while fetching a release asset — \
+                           backing off, will retry on the next check";
+            crate::status::record(
+                &staging,
+                current_build,
+                &format!("update check deferred: {message}"),
+            );
+            return Ok(None);
+        }
         let msg = if appcast_fetch_error {
             // Manifests exist but could not be downloaded while the releases list
             // succeeded — a `pipeline`-class failure. The ledger decides the honest
@@ -1626,7 +1676,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             let h = crate::health::Health::record_failure(
                 &staging.health(),
                 "pipeline",
-                "release manifests exist but could not be fetched",
+                if asset_fetch_rate_limited {
+                    "release assets answer HTTP 403/429 check after check while the release \
+                     list succeeds — a blocked download host, not GitHub's rate limit"
+                } else {
+                    "release manifests exist but could not be fetched"
+                },
             );
             if h.pipeline_failures >= crate::PERSISTENT_AFTER {
                 format!(
@@ -1828,6 +1883,9 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Ok(None);
     }
 
+    // Every asset of the authoritative release fetched: whatever the asset lane's
+    // 4xx streak was, it is over.
+    ASSET_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
     // Download the exact unique same-release container identity already proven
     // while accepting the authoritative manifest — the zip when the release
     // carries one, else the DMG. No order-dependent asset lookup is permitted
@@ -1847,6 +1905,22 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         aterm_update_core::RELEASE_ASSET_DOWNLOAD_BOUND,
     ) {
         let _ = std::fs::remove_file(&part);
+        // The container's own 429/403 is the same weather as the manifest's, one
+        // request later in the check: deferred (bounded by the streak), not a
+        // pipeline failure.
+        if aterm_update_core::download_error_is_rate_limit(&e) && asset_rate_limit_still_deferrable()
+        {
+            RATE_LIMITED.store(true, Ordering::Relaxed);
+            crate::status::record(
+                &staging,
+                current_build,
+                &format!(
+                    "update check deferred: GitHub rate limit hit while downloading the \
+                     {container} — backing off, will retry on the next check"
+                ),
+            );
+            return Ok(None);
+        }
         crate::health::Health::record_failure(
             &staging.health(),
             "pipeline",

@@ -6542,7 +6542,7 @@ fn published_manifest_signature_pubkey(
         download_release_asset_for_release_id(slug, release_id, roster::ROSTER_SIG_ASSET)?;
     // Proves authorship (paper master) AND that this is THIS release's roster — the
     // manifest's signed `machine_id`/`roster_seq` must match the document.
-    machines::verify_published_roster(
+    let _asset_generation = machines::verify_published_roster(
         aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
         roster_bytes.clone(),
         &roster_sig,
@@ -6635,18 +6635,18 @@ fn reconstruct_roster_assets(
         download_release_asset_for_release_id(slug, release_id, roster::ROSTER_ASSET)?;
     let roster_sig =
         download_release_asset_for_release_id(slug, release_id, roster::ROSTER_SIG_ASSET)?;
-    machines::verify_published_roster(
+    // The ASSET's generation is what gets written — it may be newer than the
+    // manifest's attribution after a join re-dressed the release, and the local
+    // no-downgrade check must compare against the bytes actually landing in dist/,
+    // not the number the manifest names (comparing the manifest seq refused a
+    // recovery from any machine already holding the joined generation).
+    let incoming_seq = machines::verify_published_roster(
         aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
         roster_bytes.clone(),
         &roster_sig,
         machine_id,
         manifest.roster_seq,
     )?;
-    // `verify_published_roster` just proved the manifest's `roster_seq` equals the
-    // downloaded roster's, so this is the generation about to be written.
-    let incoming_seq = manifest
-        .roster_seq
-        .expect("verify_published_roster proved the manifest names this roster's seq");
     refuse_roster_downgrade(dist, incoming_seq)?;
     fs::write(dist.join(roster::ROSTER_ASSET), &roster_bytes)
         .map_err(|error| Error::new(format!("reconstruct machine roster: {error}")))?;
@@ -6656,7 +6656,8 @@ fn reconstruct_roster_assets(
         "recover",
         &format!(
             "reconstructed {} + {} and proved them under the pinned paper master \
-             (machine {machine_id}, roster_seq {:?})",
+             (machine {machine_id}, roster generation {incoming_seq}; the manifest is \
+             attributed under {:?})",
             roster::ROSTER_ASSET,
             roster::ROSTER_SIG_ASSET,
             manifest.roster_seq
@@ -8604,7 +8605,33 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     // for the same reason: another publisher's release can land between this cut's
     // pre-claim scan and its flip, and a channel head is never allowed to become
     // visible under a roster generation the fleet has already moved past.
-    roster_floor_covered(cut_roster_seq(ctx)?, published_roster_seq(best)?)?;
+    //
+    // BOTH numbers, as at pre-claim: the head MANIFEST's attribution and the roster
+    // ASSET the public channel actually serves. A machine joining the roster attaches
+    // the new pair to already-published releases WITHOUT re-signing their manifests,
+    // and every client ratchets on the asset it observed — so a join that lands
+    // between this cut's pre-claim and its flip moves the fleet's floor while the
+    // manifest number stays put. Reading only the manifest here let such a cut flip
+    // under the old generation and strand every client that had ratcheted (2026-08-19
+    // audit). A public channel that cannot be read fails closed: a wrong answer here
+    // burns a build number and strands the fleet.
+    let manifest_roster_seq = published_roster_seq(best)?;
+    let observed_roster_seq = match (&ctx.mirror_slug, ctx.kind) {
+        (Some(slug), CutKind::Real) if *slug != ctx.slug => {
+            machines::channel_roster_seq(slug).map_err(|e| {
+                Error::new(format!(
+                    "cannot read the machine roster on the public channel {slug}'s latest \
+                     release ({e}); refusing to reason about the fleet's roster floor"
+                ))
+            })?
+        }
+        _ => None,
+    };
+    let newest_roster_seq = match (manifest_roster_seq, observed_roster_seq) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    roster_floor_covered(cut_roster_seq(ctx)?, newest_roster_seq)?;
     if ctx.kind == CutKind::Real {
         let guard = ctx.lease.as_ref().ok_or_else(|| {
             Error::new("PublishChecked requires an acquired release lease".to_string())
@@ -9610,6 +9637,22 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     // the private repo. Both proofs happen while the release is still a draft:
     // a channel head is never allowed to become visible unproven.
     prove_mirror_draft_assets(ctx, &slug, release_id)?;
+
+    // THE LAST LOOK BEFORE THE FLEET CAN SEE IT. Every earlier ratchet (lock,
+    // selfcheck, preflip, flip) ran against the ORIGIN, and a resume can reach this
+    // step alone, days later. A roster join is not lease-gated — it re-dresses the
+    // public head with a newer generation through a separate tool — so it can land
+    // between the origin flip and this one; flipping the mirror under the older
+    // generation then strands every client that ratcheted (RosterReject::Rollback,
+    // no fallback release). Read the public head's roster asset NOW and refuse.
+    let fleet_floor = machines::channel_roster_seq(&slug).map_err(|e| {
+        Error::new(format!(
+            "cannot read the machine roster on the public channel {slug}'s current head \
+             ({e}) immediately before the public flip; refusing to flip under an unknown \
+             fleet floor"
+        ))
+    })?;
+    roster_floor_covered(cut_roster_seq(ctx)?, fleet_floor)?;
 
     let endpoint = format!("repos/{slug}/releases/{release_id}");
     gh_retry_guarded(

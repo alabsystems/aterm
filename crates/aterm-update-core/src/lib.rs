@@ -47,7 +47,7 @@ mod sys;
 pub use hash::sha256_file;
 pub use http::{
     HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get, api_get_classified, download_bytes,
-    download_to,
+    download_error_is_rate_limit, download_to,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;
