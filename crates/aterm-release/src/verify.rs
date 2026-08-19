@@ -1734,6 +1734,203 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     }
 }
 
+/// THE SUPPORTED EXIT FOR A FLIPPED-BUT-UNMIRRORED CUT THE FLEET HAS MOVED PAST.
+///
+/// A cut that flipped on the origin and then stopped before `mirror` (probe
+/// timeout, GitHub 5xx, Ctrl-C) is resumable — but a roster join is not
+/// lease-gated, and one landing before the resume re-dresses the public head under
+/// a newer generation. `step_mirror` then refuses, correctly: mirroring this cut's
+/// older-generation roster would strand every ratcheted client. Before this verb
+/// that refusal had no terminal move — `--resume`/`recover` re-enter the same
+/// refusal, `--abandon` refuses a published release, `yank` refuses an unfinished
+/// journal, and the held lease blocks every fresh cut — so the operator was left
+/// with the ref surgery the docs forbid (2026-08-19 review).
+///
+/// What it does: proves the journal is this version's, published on the origin,
+/// stopped at or before `mirror`, and that the public channel's roster generation
+/// is strictly AHEAD of the generation this cut carries (the one condition under
+/// which the mirror can never legitimately proceed); then, as the journal's owner,
+/// releases the lease + publisher fence and deletes the journal. The origin
+/// release stays exactly as it is (it is live privately and tells the truth), the
+/// claim commit stays (the number is burned, as always), and the public channel —
+/// which never saw this cut — is superseded by the next cut, attributed under the
+/// current generation. Nothing older is ever mirrored.
+pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
+    let slug = slug_of(repo)?;
+    let tag = format!("v{version}");
+    println!("aterm-release · retire-unmirrored {tag} ({slug})");
+    let journal_path = repo.join("dist/cut-state.toml");
+    let journal = publish::Journal::load(&journal_path)?.ok_or_else(|| {
+        Error::new(format!(
+            "there is no v{version} journal on this machine; retire-unmirrored acts only for the \
+             cut's own publisher. A lost publisher is `cargo ship recover …`'s case"
+        ))
+    })?;
+    if journal.version != version {
+        return Err(Error::new(format!(
+            "local journal is v{}, not requested v{version}",
+            journal.version
+        )));
+    }
+    journal.ensure_resumable()?;
+    match journal.first_incomplete() {
+        Some("mirror") => {}
+        Some("unlock") => {
+            return Err(Error::new(format!(
+                "v{version} already flipped on the public channel (only `unlock` is pending); \
+                 there is nothing unmirrored to retire — finish it with `cargo ship cut --resume`"
+            )));
+        }
+        Some(step) => {
+            return Err(Error::new(format!(
+                "v{version} stopped at step {step:?}, before the origin flip; that is \
+                 `--resume`'s or `--abandon`'s case, not a retire"
+            )));
+        }
+        None => {
+            return Err(Error::new(format!(
+                "release journal v{version} is already complete; nothing to retire"
+            )));
+        }
+    }
+    let git = ledger::GitCli::new(repo);
+    publish::assert_origin_repo_binding(&git, &slug)?;
+    // The journal is never authority on its own: prove its claim commit is a real
+    // claim on origin/main whose ledger tail names this version/build, exactly as
+    // `--abandon` does before it acts on anything.
+    publish::ordinary_resume_claim_preflight(repo, &git, &journal)?;
+    if release_state(&slug, &tag)? != ReleaseState::Published {
+        return Err(Error::new(format!(
+            "{tag} is not published on the origin; a draft is `--abandon`'s case"
+        )));
+    }
+    // The ONE condition: the public channel's roster generation is strictly ahead of
+    // the generation this cut carries, so the mirror can never proceed.
+    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
+    let mirror_slug = crate::mirror::update_channel_slug(&cargo_text)?.ok_or_else(|| {
+        Error::new("no public update channel is configured; there is no mirror to retire from")
+    })?;
+    let carried = {
+        let manifest_path = repo.join("dist").join("aterm-appcast.toml");
+        let text = fs::read_to_string(&manifest_path).map_err(|e| {
+            Error::new(format!(
+                "read {} to learn which roster generation v{version} carries: {e}",
+                manifest_path.display()
+            ))
+        })?;
+        aterm_update_core::Manifest::parse(&text)
+            .map_err(|e| Error::new(format!("staged manifest re-parse failed: {e}")))?
+            .roster_seq
+    };
+    let fleet = crate::machines::channel_roster_document(&mirror_slug).map_err(|e| {
+        Error::new(format!(
+            "cannot read the public channel {mirror_slug}'s roster ({e}); refusing to retire a \
+             cut whose mirror might still be able to proceed"
+        ))
+    })?;
+    // The two refusals `step_mirror` can issue for good, and only those: the fleet's
+    // generation is strictly AHEAD of this cut's, or EQUAL with a different document
+    // (a lineage fork). Anything else is `--resume`'s case.
+    let local_roster = fs::read(repo.join("dist").join(aterm_update_core::roster::ROSTER_ASSET))
+        .map_err(|e| Error::new(format!("read this cut's roster asset from dist/: {e}")))?;
+    match (carried, fleet.as_ref()) {
+        (Some(carried), Some((fleet, _))) if *fleet > carried => step(
+            "retire",
+            &format!(
+                "v{version} carries roster generation {carried}; the public channel's head is at \
+                 {fleet} — the mirror can never proceed, so this cut retires unmirrored"
+            ),
+        ),
+        (Some(carried), Some((fleet, bytes))) if *fleet == carried && local_roster != *bytes => {
+            step(
+                "retire",
+                &format!(
+                    "v{version} and the public channel's head both carry roster generation \
+                     {carried} with DIFFERENT documents (a lineage fork) — the mirror can never \
+                     proceed, so this cut retires unmirrored; re-join from the machine holding \
+                     the channel's document before the next cut"
+                ),
+            );
+        }
+        (carried, fleet) => {
+            return Err(Error::new(format!(
+                "v{version} carries roster generation {carried:?} and the public channel's head \
+                 is at {:?}: the mirror is not refused by the fleet's floor or a lineage fork, \
+                 so finish it with `cargo ship cut --resume` instead of retiring",
+                fleet.map(|(seq, _)| *seq)
+            )));
+        }
+    }
+    let owner = journal.commit.clone();
+    let lease = publish::acquire_release_lease(&git, &owner)?;
+    let fence = publish::acquire_publisher_fence(&git, &owner)?;
+    let action = (|| -> Result<()> {
+        publish::assert_publisher_session(&git, &lease, &fence)?;
+        // A public DRAFT this cut already created (assets uploaded, refused at the
+        // pre-flip ratchet) must not stay behind as an unlisted release carrying the
+        // older-generation roster with no journal pointing at it. Delete it by its
+        // immutable ID, only if it is still a draft under our tag.
+        if let Some(id) = journal.mirror_release_id {
+            match publish::release_object_by_id(&mirror_slug, id)? {
+                Some(draft) if draft.draft && draft.tag == tag => {
+                    let endpoint = format!("repos/{mirror_slug}/releases/{id}");
+                    let out = publish::gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+                    if publish::release_object_by_id(&mirror_slug, id)?.is_some() {
+                        return Err(Error::new(format!(
+                            "could not delete the orphaned public draft {tag} (ID {id}) on \
+                             {mirror_slug}: {}",
+                            out.stderr_utf8().trim()
+                        )));
+                    }
+                    step("retire", &format!("orphaned public draft {tag} (ID {id}) deleted"));
+                }
+                Some(other) => {
+                    return Err(Error::new(format!(
+                        "the public release ID {id} on {mirror_slug} is {} under tag {:?}; \
+                         refusing to touch it",
+                        if other.draft { "a draft" } else { "LIVE" },
+                        other.tag
+                    )));
+                }
+                None => {}
+            }
+        }
+        let released = publish::release_completed_publisher_session(&git, &owner, &fence)?;
+        if released == publish::LeaseRelease::AlreadySuperseded {
+            return Err(Error::new(
+                "retire was fenced out before final unlock; journal retained for the winner",
+            ));
+        }
+        fs::remove_file(&journal_path)
+            .map_err(|e| Error::new(format!("delete {}: {e}", journal_path.display())))?;
+        step(
+            "",
+            "owner + unique publisher fence atomically released; local journal deleted",
+        );
+        step(
+            "",
+            &format!(
+                "{tag} stays live on the origin exactly as it is; the public channel never saw it \
+                 and the next cut (attributed under the current roster generation) supersedes \
+                 it. The claim commit stays (append-only ledger; the burned number is normal)."
+            ),
+        );
+        Ok(())
+    })();
+    let cleanup = publish::release_publisher_fence(&git, &fence).map(|_| ());
+    match (action, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(Error::new(format!(
+            "retire completed but exact fence cleanup failed: {cleanup}"
+        ))),
+        (Err(error), Err(cleanup)) => Err(Error::new(format!(
+            "{error}; exact fence cleanup also failed: {cleanup}"
+        ))),
+    }
+}
+
 /// "owner/repo" from the workspace manifest — the single source the client's
 /// compiled-in default also uses.
 fn slug_of(repo: &Path) -> Result<String> {

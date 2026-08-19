@@ -36,13 +36,36 @@
 //! socket for free, and the nonce makes the path unguessable and unique per
 //! attempt so a bind can never collide with a concurrent one.
 //!
-//! Darwin's `MAX_SUN_PATH` is 103 and that name is 87 bytes before `$HOME`,
-//! which leaves 16. `/Users//example` fits with three to spare; `/Users//andrewyates`
-//! does not. So the composed path is checked with `control_auth::sun_path_ok`
-//! BEFORE the bind, and a refusal falls back to the fork lane rather than
-//! proceeding — [`Rendezvous::bind`] answers [`RendezvousError::PathTooLong`],
-//! and [`rendezvous_path_fits`] lets the lane choice ask the same question
-//! before any nonce exists.
+//! Darwin's `MAX_SUN_PATH` is 103 and that name is 87 bytes before its
+//! directory. Under the per-user control directory (`$HOME/Library/Application
+//! Support/aterm`) that left 16 bytes for `$HOME`: `/Users//example` fit with three
+//! to spare and `/Users//andrewyates` — i.e. macOS's default short name for most
+//! people — did not, so most Macs silently took the fork lane the whole lane was
+//! built to replace (2026-08-19 review). The socket therefore lives in a SHORT
+//! per-uid private directory, [`rendezvous_dir`]: `$TMPDIR/aterm`, where `$TMPDIR`
+//! is the per-user temporary directory launchd hands every process
+//! (`/var/folders/…/T/`, owned by this uid, mode 0700 — a place no OTHER uid can
+//! plant an entry in, unlike sticky `/tmp`, which is exactly why `/tmp` is never
+//! used: a foreign uid could pre-create `/tmp/aterm-<uid>` as a symlink and either
+//! capture our chmod or redirect the bind into a directory it can read). The base
+//! is admitted only if `lstat` says it is a real directory owned by this uid and
+//! not group/other-writable and it is not `/tmp`-rooted; the `aterm` child is
+//! established with the lstat-hardened `aterm_update_core::ensure_private_dir`;
+//! after the bind the node is re-proved to be our socket inside our directory; and
+//! the DIALER proves the listener is same-uid (`getpeereid`) before it writes the
+//! claim secret. The control directory remains the fallback if `$TMPDIR` cannot be
+//! admitted, so the short-`$HOME` machines that always worked keep working. The
+//! name carries 16 hex of the attempt nonce (unique, unguessable; the CLAIM secret
+//! is separate and never on disk) so `<TMPDIR>/aterm/seamless-<pid>-<16 hex>.sock`
+//! fits `sun_path` with room to spare. The composed path is still checked with
+//! `control_auth::sun_path_ok` BEFORE the bind, and a refusal falls back to the
+//! fork lane rather than proceeding — [`Rendezvous::bind`] answers
+//! [`RendezvousError::PathTooLong`], and [`rendezvous_path_fits`] lets the lane
+//! choice ask the same question before any nonce exists (without creating
+//! anything). The prefix sweep in `seamless::discard_outgoing` runs over the
+//! control directory, not this one, so [`Rendezvous::bind`] sweeps this
+//! directory's leftovers itself: a socket whose embedded pid is dead is an attempt
+//! that can never be claimed.
 //!
 //! # What "single-use" means here
 //!
@@ -422,10 +445,138 @@ pub(crate) fn proof_identities_in_device_terms(
 
 /// The rendezvous path one attempt binds, composed from the SAME pieces
 /// `seamless::write_outgoing` names its manifest with — this process's pid and
-/// the attempt nonce — so `seamless::discard_outgoing`'s prefix sweep retires it
-/// without knowing it exists.
+/// the attempt nonce (its first 16 hex: unique and unguessable; the claim secret
+/// is the authority and never touches the filesystem) — so the name is unique per
+/// attempt and names its owner.
 fn rendezvous_path(dir: &Path, nonce: &str) -> PathBuf {
-    dir.join(format!("seamless-{}-{nonce}.sock", std::process::id()))
+    let short = &nonce[..nonce.len().min(RENDEZVOUS_NONCE_HEX)];
+    dir.join(format!("seamless-{}-{short}.sock", std::process::id()))
+}
+
+/// How much of the attempt nonce the socket name carries.
+const RENDEZVOUS_NONCE_HEX: usize = 16;
+
+/// The per-user temporary base the rendezvous directory hangs off, ADMITTED only
+/// when it is a place no other uid can plant an entry in: `lstat` says a real
+/// directory (not a symlink), owned by this uid, not group/other-writable, and not
+/// `/tmp`-rooted (sticky, world-writable — the one base that must never be used).
+/// `std::env::temp_dir` is `$TMPDIR` with a `/tmp` fallback; launchd sets `$TMPDIR`
+/// to the per-user `/var/folders/…/T/` for everything it starts, and anyone who can
+/// set this process's environment is already inside its trust boundary. (Not
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`: see `aterm_pty::unix` for why that call is
+/// unsafe in a process that forks.)
+#[cfg(unix)]
+fn admitted_temp_base() -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let base = std::env::temp_dir();
+    let canonical_tmp = |p: &Path| p == Path::new("/tmp") || p == Path::new("/private/tmp");
+    if canonical_tmp(&base) || base.starts_with("/tmp") || base.starts_with("/private/tmp") {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(&base).ok()?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !meta.file_type().is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o022 != 0 {
+        return None;
+    }
+    Some(base)
+}
+
+/// The directory the rendezvous socket lives in, WITHOUT creating anything — the
+/// lane-choice probe asks this every check and must not mutate the filesystem.
+/// `None` means the control directory (the fallback).
+#[must_use]
+fn rendezvous_dir_candidate() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        admitted_temp_base().map(|base| base.join("aterm"))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// The SHORT per-uid private directory the rendezvous socket lives in, established
+/// (lstat-hardened: a symlink at the target is refused before anything touches it,
+/// the final component must be a real directory owned by this uid and not
+/// group/other-writable). Falls back to the control directory when `$TMPDIR`
+/// cannot be admitted or the child cannot be established, so the short-`$HOME`
+/// machines that always worked keep working.
+#[must_use]
+pub(crate) fn rendezvous_dir() -> Option<PathBuf> {
+    if let Some(dir) = rendezvous_dir_candidate()
+        && aterm_update_core::ensure_private_dir(&dir).is_ok()
+    {
+        return Some(dir);
+    }
+    crate::control_auth::socket_dir()
+}
+
+/// After the bind: prove the node really is OUR socket inside OUR real directory —
+/// the directory opened with `O_NOFOLLOW` (a symlink swapped in between the check
+/// and the bind fails here), owned by this uid and not group/other-writable, and
+/// the entry a socket owned by this uid. Cheap, and it is what turns the pre-bind
+/// check from a race into a proof.
+#[cfg(unix)]
+fn prove_bound_socket_is_ours(dir: &Path, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{
+        FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let dir_handle = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+        .map_err(|e| format!("rendezvous directory is not a real directory of ours: {e}"))?;
+    let dmeta = dir_handle
+        .metadata()
+        .map_err(|e| format!("rendezvous directory fstat: {e}"))?;
+    if !dmeta.file_type().is_dir() || dmeta.uid() != uid || dmeta.permissions().mode() & 0o022 != 0 {
+        return Err("rendezvous directory is not owned by this uid or is shared".to_string());
+    }
+    let smeta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("rendezvous socket lstat: {e}"))?;
+    if !smeta.file_type().is_socket() || smeta.uid() != uid {
+        return Err("rendezvous node is not a socket owned by this uid".to_string());
+    }
+    Ok(())
+}
+
+/// Unlink leftover rendezvous sockets in `dir` whose embedded owner pid is no
+/// longer alive: an attempt that ended without its destructor (the success path
+/// `_exit`s; a crashed successor never unlinked). Best-effort, bounded to names
+/// of exactly this shape, and never touches an entry whose owner still runs.
+#[cfg(unix)]
+fn sweep_dead_rendezvous(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(rest) = name.strip_prefix("seamless-") else {
+            continue;
+        };
+        if !name.ends_with(".sock") {
+            continue;
+        }
+        let Some((pid, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<i32>() else {
+            continue;
+        };
+        if pid == std::process::id() as i32 {
+            continue;
+        }
+        // SAFETY: kill(pid, 0) probes existence only; ESRCH means gone.
+        let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if !alive {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Whether a rendezvous path composed for THIS process fits `sun_path`, without
@@ -438,7 +589,7 @@ fn rendezvous_path(dir: &Path, nonce: &str) -> PathBuf {
 /// same length.
 #[must_use]
 pub(crate) fn rendezvous_path_fits() -> bool {
-    let Some(dir) = crate::control_auth::socket_dir() else {
+    let Some(dir) = rendezvous_dir_candidate().or_else(crate::control_auth::socket_dir) else {
         return false;
     };
     rendezvous_path(&dir, &"0".repeat(32))
@@ -474,7 +625,9 @@ impl Rendezvous {
     pub(crate) fn bind(nonce: &str) -> Result<Self, RendezvousError> {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = crate::control_auth::socket_dir().ok_or(RendezvousError::NoControlDir)?;
+        let dir = rendezvous_dir().ok_or(RendezvousError::NoControlDir)?;
+        #[cfg(unix)]
+        sweep_dead_rendezvous(&dir);
         let path = rendezvous_path(&dir, nonce);
         let text = path
             .to_str()
@@ -495,6 +648,8 @@ impl Rendezvous {
             listener,
             claim,
         };
+        #[cfg(unix)]
+        prove_bound_socket_is_ours(&dir, &bound.path).map_err(RendezvousError::Bind)?;
         // The 0700 directory is already the access boundary; 0600 on the node
         // itself is the same defence in depth the control socket takes, and it
         // buys a refusal here rather than a surprise at connect time. From this
@@ -1067,6 +1222,20 @@ fn dial_and_claim(
 ) -> Result<ClaimedHandoff, RendezvousError> {
     let stream =
         CtlStream::connect(path).map_err(|error| RendezvousError::Dial(error.to_string()))?;
+    // THE LISTENER MUST BE US (same uid) before the claim secret leaves this process:
+    // the environment named a path, and a path is not an identity. A listener of any
+    // other uid — whatever put it there — gets nothing.
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        if crate::control_auth::peer_uid(&stream) != Some(uid) {
+            return Err(RendezvousError::Dial(
+                "rendezvous listener is not owned by this uid; refusing to present the claim"
+                    .to_string(),
+            ));
+        }
+    }
     let remaining = remaining_io_budget(deadline)?;
     stream
         .set_read_timeout(Some(remaining))

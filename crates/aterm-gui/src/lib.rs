@@ -8148,6 +8148,10 @@ struct App {
     native_update_reconcile_worker: Option<app_native::NativeUpdateReconcileSender>,
     next_native_update_reconcile_sequence: u64,
     last_native_update_reconcile_sequence: u64,
+    /// When this process last imported a stage from its own check — the floor
+    /// below which a disk observation predates that stage and must not retire it
+    /// (`app_native::reconcile_native_update_facts`).
+    native_stage_imported_at: Option<Instant>,
     deferred_native_update_reconcile: Option<(
         app_native::NativeUpdateReconcilePurpose,
         app_native::NativeUpdateReconcileFacts,
@@ -10355,6 +10359,7 @@ impl App {
             native_update_reconcile_worker: None,
             next_native_update_reconcile_sequence: 1,
             last_native_update_reconcile_sequence: 0,
+            native_stage_imported_at: None,
             deferred_native_update_reconcile: None,
             pending_native_update_reconcile_purpose: None,
             native_config_inflight: false,
@@ -16602,6 +16607,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         native_update_reconcile_worker,
         next_native_update_reconcile_sequence: 1,
         last_native_update_reconcile_sequence: 0,
+        native_stage_imported_at: None,
         deferred_native_update_reconcile: None,
         pending_native_update_reconcile_purpose: None,
         native_config_inflight: false,

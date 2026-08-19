@@ -2629,7 +2629,7 @@ fn cli_parses_the_whole_spec_5_surface() {
         "{yank_flag_error}"
     );
 
-    let cli::Cmd::Cut { opts, abandon } = parse(&[
+    let cli::Cmd::Cut { opts, abandon, .. } = parse(&[
         "cut",
         "--dry-run",
         "--set-version",

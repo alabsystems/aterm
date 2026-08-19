@@ -277,7 +277,15 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 /// paper master, so an unsigned or forged asset cannot ratchet the producer. Errors are
 /// transport or verification failures, returned as such — the caller decides whether
 /// "cannot tell" fails the gate (it does: a wrong answer here burns a build number).
-pub(crate) fn channel_roster_seq(slug: &str) -> std::result::Result<Option<u64>, String> {
+/// The master-admitted roster on the public channel's latest release: its generation
+/// AND its verified bytes. The bytes matter at EQUAL generation: two machines that
+/// each seeded from the same channel pair and each minted generation N+1 (both
+/// master-signed, each listing only itself) agree on the number and disagree on the
+/// document — a LINEAGE FORK that the number alone admits (2026-08-19 round-2 audit).
+/// [`roster_lineage_agrees`] compares the documents where the generations tie.
+pub(crate) fn channel_roster_document(
+    slug: &str,
+) -> std::result::Result<Option<(u64, Vec<u8>)>, String> {
     let url = |asset: &str| format!("https://github.com/{slug}/releases/latest/download/{asset}");
     let bytes = match anonymous_fetch(&url(aterm_update_core::roster::ROSTER_ASSET), 65_536) {
         Ok(b) => b,
@@ -291,7 +299,31 @@ pub(crate) fn channel_roster_seq(slug: &str) -> std::result::Result<Option<u64>,
         .map_err(|e| format!("the channel roster did not verify under the committed paper master ({e:?})"))?;
     let parsed = Roster::parse(&verified)
         .map_err(|e| format!("the channel roster verified but did not parse ({e:?})"))?;
-    Ok(Some(parsed.roster_seq))
+    Ok(Some((parsed.roster_seq, verified.as_slice().to_vec())))
+}
+
+/// At EQUAL generation the cut's roster (the pair in `dist/`) and the channel's must be
+/// the same document; otherwise two lineages exist at one number and whichever flips
+/// later strands every client that ratcheted on the other (and `provision` on either
+/// machine later hard-stops on the fork). `None` channel ⇒ nothing to disagree with.
+pub(crate) fn roster_lineage_agrees(
+    local_roster: &[u8],
+    carried_seq: Option<u64>,
+    channel: Option<&(u64, Vec<u8>)>,
+) -> std::result::Result<(), String> {
+    match (carried_seq, channel) {
+        (Some(carried), Some((observed, bytes))) if carried == *observed && local_roster != bytes.as_slice() => {
+            Err(format!(
+                "LINEAGE FORK: this cut carries machine-roster generation {carried} and the public \
+                 channel's head carries generation {observed} too, but the two documents differ \
+                 — two machines minted the same generation from the same seed. Publishing \
+                 either over the other strands every client that ratcheted on the first. Stop; \
+                 re-join from the machine holding the channel's document (never start a second \
+                 roster)"
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// One bounded anonymous download (the client's own roster limits: 64 KiB body, 4 KiB
@@ -645,6 +677,22 @@ mod tests {
         assert!(authorize_cut(&[&master], bytes, &sig, &pk(&M3), just_short).is_err());
         let (bytes, sig, master) = roster(&[]);
         assert!(authorize_cut(&[&master], bytes, &sig, &pk(&M3), just_short - 1).is_ok());
+    }
+
+    /// Two master-signed documents at the SAME generation are a lineage fork; the
+    /// number admits it, so the bytes decide. Different generations, or no channel
+    /// roster at all, are not a fork (they are what the ratchet judges).
+    #[test]
+    fn an_equal_generation_with_a_different_document_is_a_lineage_fork() {
+        let ours = b"roster_seq = 4\n[[machine]]\nid = \"m3\"\n".to_vec();
+        let theirs = b"roster_seq = 4\n[[machine]]\nid = \"m19\"\n".to_vec();
+        assert!(roster_lineage_agrees(&ours, Some(4), Some(&(4, ours.clone()))).is_ok());
+        let err = roster_lineage_agrees(&ours, Some(4), Some(&(4, theirs.clone()))).unwrap_err();
+        assert!(err.contains("LINEAGE FORK"), "{err}");
+        assert!(roster_lineage_agrees(&ours, Some(4), Some(&(3, theirs.clone()))).is_ok());
+        assert!(roster_lineage_agrees(&ours, Some(3), Some(&(4, theirs))).is_ok());
+        assert!(roster_lineage_agrees(&ours, Some(4), None).is_ok());
+        assert!(roster_lineage_agrees(&ours, None, Some(&(4, ours.clone()))).is_ok());
     }
 
     /// A RECOVERED roster must be the one the published manifest names — and nothing about

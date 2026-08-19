@@ -14048,6 +14048,10 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         "Checking…"
     } else if update.staged.is_some() {
         "Ready"
+    } else if update.failing_persistent {
+        // Beside the Danger "Failing" headline; "None staged" there read as a
+        // second, contradicting verdict (2026-08-19 audit).
+        "Checks failing"
     } else if update.enabled {
         "None staged"
     } else {
@@ -14336,6 +14340,14 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
     }
     vec![if update.checking {
         "Checking the update service for a newer build\u{2026}".to_string()
+    } else if let Some((build, version)) = update.staged.as_ref() {
+        // A staged build without notes (an ACTIVATION of a bundle already on disk,
+        // or a manifest that omits a changelog) is still a staged build — saying
+        // "is the latest build" under "Update ready" was a lie (2026-08-19 audit).
+        format!(
+            "Version {version} (build {build}) is staged; its release notes are not available \
+             here."
+        )
     } else if update.enabled {
         format!(
             "aterm {} is the latest build. Notes for a newer version appear here as soon as one is staged.",

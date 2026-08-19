@@ -710,6 +710,27 @@ fn update_is_owner_only_subcmd(rest: &str) -> bool {
     matches!(rest.trim(), "check" | "apply")
 }
 
+/// `aterm_update::installed_update_facts()` for the control verb, cached for
+/// [`INSTALLED_FACTS_TTL`]: the probe spawns codesign/spctl/PlistBuddy, and the
+/// status verb is AnyScopeMeta and polled — uncached it would spawn a helper
+/// chain per poll and could pin every control lane behind a slow Gatekeeper
+/// lookup. The cache is a pure observation (no authority rides on it).
+fn cached_installed_update_facts() -> Option<aterm_update::InstalledUpdateFacts> {
+    const INSTALLED_FACTS_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+    static CACHE: std::sync::Mutex<
+        Option<(std::time::Instant, Option<aterm_update::InstalledUpdateFacts>)>,
+    > = std::sync::Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, facts)) = guard.as_ref()
+        && at.elapsed() < INSTALLED_FACTS_TTL
+    {
+        return facts.clone();
+    }
+    let facts = aterm_update::installed_update_facts();
+    *guard = Some((std::time::Instant::now(), facts.clone()));
+    facts
+}
+
 fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String {
     let build = crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0);
     // `update` is AnyScopeMeta so `""`/`status` (a pure read of updater state) answers
@@ -752,9 +773,39 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
             return format!("ERR usage: update [status|check|apply] (got {other:?})\n");
         }
     };
-    let Some(st) = st else {
+    let Some(mut st) = st else {
         return "OK enabled=false outcome=\"no updater on this platform\"\n".to_string();
     };
+    // THE ACTIVATION LANE, AS THE LEDGER CANNOT SEE IT. A bundle newer than this
+    // process under its own executable is staged IN MEMORY by the GUI reducer (it
+    // writes no `ready.toml`), so a status read from disk alone answered
+    // `staged_build=- … "up to date"` while Settings said "Update ready" and
+    // `update apply` would act on it (2026-08-19 round-2 audit). Derive the same
+    // fact from the same source the reducer uses — the verified installed bundle —
+    // so the line says what the process is about to do.
+    // The reducer's rule, exactly: an installed bundle newer than the process with a
+    // usable sealed commit is the activation and it OUTRANKS any download on disk
+    // (the reducer retires the download for it). The probe runs codesign, so it is
+    // cached for a short while — a controller polling every second must not spawn
+    // helpers every second.
+    if st.enabled
+        && let Some(installed) = cached_installed_update_facts()
+        && installed.build_number > st.current_build
+        && crate::native_updater_service::usable_commit_identity(&installed.git_commit)
+    {
+        st.staged_build = Some(installed.build_number);
+        st.staged_version = installed
+            .version
+            .clone()
+            .or_else(|| Some(format!("build {}", installed.build_number)));
+        st.staged_commit = Some(installed.git_commit.clone());
+        st.staged_dmg_sha256 = None;
+        st.changelog = None;
+        st.outcome = format!(
+            "build {} is already installed on disk; activating it in place (ledger: {})",
+            installed.build_number, st.outcome
+        );
+    }
     let staged_build = st
         .staged_build
         .map(|b| b.to_string())

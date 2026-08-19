@@ -7230,9 +7230,9 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // ratchet reads BOTH and takes the greater. Only a real cut has a public channel to
     // ask; a rehearsal/dry run keeps the manifest-only floor.
     let manifest_roster_seq = published_roster_seq(newest_channel)?;
-    let observed_roster_seq = match (&mirror_slug, kind) {
+    let observed_roster = match (&mirror_slug, kind) {
         (Some(slug), CutKind::Real) if *slug != origin_slug => {
-            machines::channel_roster_seq(slug).map_err(|e| {
+            machines::channel_roster_document(slug).map_err(|e| {
                 Error::new(format!(
                     "cannot read the machine roster on the public channel {slug}'s latest \
                      release ({e}); refusing to reason about the fleet's roster floor — a \
@@ -7242,6 +7242,21 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         }
         _ => None,
     };
+    let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
+    // EQUAL generation, DIFFERENT document = a lineage fork; the number admits it, only
+    // the bytes can refuse it. Compared before the claim for the same reason as the
+    // ratchet: after it, the number is burned.
+    // The bytes that AUTHORIZED this cut and will ship as its assets — not whatever
+    // dist/ happens to hold (a stale leftover pair would be a false fork; an absent
+    // one would skip the check until after the claim).
+    if let Some(document) = signature_verdict.roster.as_ref() {
+        machines::roster_lineage_agrees(
+            &document.bytes,
+            signature_verdict.attribution.as_ref().map(|who| who.roster_seq),
+            observed_roster.as_ref(),
+        )
+        .map_err(Error::new)?;
+    }
     let newest_roster_seq = match (manifest_roster_seq, observed_roster_seq) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -8616,9 +8631,9 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     // audit). A public channel that cannot be read fails closed: a wrong answer here
     // burns a build number and strands the fleet.
     let manifest_roster_seq = published_roster_seq(best)?;
-    let observed_roster_seq = match (&ctx.mirror_slug, ctx.kind) {
+    let observed_roster = match (&ctx.mirror_slug, ctx.kind) {
         (Some(slug), CutKind::Real) if *slug != ctx.slug => {
-            machines::channel_roster_seq(slug).map_err(|e| {
+            machines::channel_roster_document(slug).map_err(|e| {
                 Error::new(format!(
                     "cannot read the machine roster on the public channel {slug}'s latest \
                      release ({e}); refusing to reason about the fleet's roster floor"
@@ -8627,11 +8642,17 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
         }
         _ => None,
     };
+    let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
+    let carried = cut_roster_seq(ctx)?;
+    if let Ok(local_roster) = fs::read(ctx.dist.join(roster::ROSTER_ASSET)) {
+        machines::roster_lineage_agrees(&local_roster, carried, observed_roster.as_ref())
+            .map_err(Error::new)?;
+    }
     let newest_roster_seq = match (manifest_roster_seq, observed_roster_seq) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
-    roster_floor_covered(cut_roster_seq(ctx)?, newest_roster_seq)?;
+    roster_floor_covered(carried, newest_roster_seq)?;
     if ctx.kind == CutKind::Real {
         let guard = ctx.lease.as_ref().ok_or_else(|| {
             Error::new("PublishChecked requires an acquired release lease".to_string())
@@ -9645,14 +9666,19 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
     // between the origin flip and this one; flipping the mirror under the older
     // generation then strands every client that ratcheted (RosterReject::Rollback,
     // no fallback release). Read the public head's roster asset NOW and refuse.
-    let fleet_floor = machines::channel_roster_seq(&slug).map_err(|e| {
+    let fleet_roster = machines::channel_roster_document(&slug).map_err(|e| {
         Error::new(format!(
             "cannot read the machine roster on the public channel {slug}'s current head \
              ({e}) immediately before the public flip; refusing to flip under an unknown \
              fleet floor"
         ))
     })?;
-    roster_floor_covered(cut_roster_seq(ctx)?, fleet_floor)?;
+    let carried = cut_roster_seq(ctx)?;
+    if let Ok(local_roster) = fs::read(ctx.dist.join(roster::ROSTER_ASSET)) {
+        machines::roster_lineage_agrees(&local_roster, carried, fleet_roster.as_ref())
+            .map_err(Error::new)?;
+    }
+    roster_floor_covered(carried, fleet_roster.as_ref().map(|(seq, _)| *seq))?;
 
     let endpoint = format!("repos/{slug}/releases/{release_id}");
     gh_retry_guarded(

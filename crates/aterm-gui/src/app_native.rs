@@ -168,6 +168,12 @@ pub(crate) struct NativeUpdateReconcileFacts {
     /// Assigned by the sole facts worker immediately before the read. This, not
     /// request dispatch order, is the freshness authority.
     pub(crate) observation_sequence: u64,
+    /// When the worker BEGAN reading the disk. The sequence orders observations
+    /// against each other; this orders them against the reducer's own stage
+    /// IMPORTS: a read that began before a check staged its build describes a disk
+    /// without that stage, however late its wake lands (the read spans a
+    /// codesign), and must not retire what the check imported.
+    pub(crate) observed_at: std::time::Instant,
     pub(crate) durable: Option<DurableUpdateStatus>,
     pub(crate) installed: Option<InstalledUpdate>,
 }
@@ -252,11 +258,13 @@ fn read_native_update_reconcile_facts_with(
     // the bundle first and removes ready afterward, so this observes ready+old,
     // ready+new, or missing+new; exact installed proof safely dominates either
     // surviving-marker case.
+    let observed_at = std::time::Instant::now();
     let durable = read_durable();
     let installed = read_installed();
     NativeUpdateReconcileFacts {
         _ticket: ticket,
         observation_sequence,
+        observed_at,
         durable,
         installed,
     }
@@ -4583,13 +4591,48 @@ impl App {
             // deferred observation. Reducer-inert means presentation-inert too.
             return;
         }
+        if self.native_updater_service.snapshot().staged.is_some() {
+            // The floor for disk observations: anything read before this instant
+            // predates the stage this check imported (see
+            // `reconcile_native_update_facts`).
+            self.native_stage_imported_at = Some(std::time::Instant::now());
+        }
         self.publish_native_update_state();
         #[cfg(test)]
         self.update_screen_refresh();
 
-        // A later durable observation outranks the just-finished check. Reduce it
-        // before arming/applying anything derived from this completion.
-        self.finish_deferred_native_update_reconcile();
+        // Facts parked while THIS check was active were observed BEFORE it staged
+        // anything: replaying them now would compare the stage the check just
+        // imported against a durable marker that did not yet exist and RETIRE it
+        // ("stale in-memory stage retired after durable marker changed"), leaving a
+        // verified stage on disk that nothing arms until the next background cycle
+        // (2026-08-19 round-2 audit — a "Check for Updates…" click parks a Refresh
+        // behind its own check). Keep the PURPOSE (a control apply must not be
+        // lost) and re-observe the disk fresh, with the stage now present.
+        if let Some((purpose, _stale)) = self.deferred_native_update_reconcile.take()
+            && !self.request_native_update_reconcile(purpose)
+        {
+            if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                // A control apply never vanishes silently: the same refusal the control
+                // entry path surfaces when facts cannot be collected.
+                let reason = "Updater facts could not be collected safely";
+                aterm_update::record_apply_refusal(
+                    self.native_updater_service.snapshot().current_build,
+                    reason,
+                );
+                self.surface_update_apply_outcome(
+                    "control request",
+                    UpdateOutcome::Blocked {
+                        reasons: vec![reason.to_string()],
+                    },
+                    false,
+                );
+            } else {
+                aterm_log::debug!(
+                    "update check: could not re-request the reconcile a parked {purpose:?} asked for"
+                );
+            }
+        }
         if self.native_updater_service.snapshot().phase == UpdaterPhase::Applying {
             return;
         }
@@ -5303,10 +5346,30 @@ impl App {
         {
             return NativeUpdateFactsResult::Deferred(facts);
         }
+        // A READ THAT BEGAN BEFORE THIS PROCESS'S OWN STAGE IMPORT describes a disk
+        // without that stage (the read spans a codesign; the check's wake can land
+        // first). Reducing it would RETIRE the stage the check just imported and
+        // leave a verified update on disk armed by nothing until the next cycle
+        // (2026-08-19 round-2 audit). It is stale by construction — ignored, not
+        // reduced; the next observation sees the stage.
+        if let Some(imported_at) = self.native_stage_imported_at
+            && facts.observed_at < imported_at
+            && facts
+                .durable
+                .as_ref()
+                .is_none_or(|durable| durable.staged_build.is_none())
+            && self.native_updater_service.snapshot().staged.is_some()
+        {
+            aterm_log::debug!(
+                "update sync: ignoring facts observed before this process staged its update"
+            );
+            return NativeUpdateFactsResult::IgnoredStale;
+        }
         self.last_native_update_reconcile_sequence = facts.observation_sequence;
         let NativeUpdateReconcileFacts {
             _ticket: _,
             observation_sequence: _,
+            observed_at: _,
             durable,
             installed,
         } = facts;
@@ -7268,6 +7331,7 @@ mod tests {
                 |ticket, observation_sequence, _| NativeUpdateReconcileFacts {
                     _ticket: ticket,
                     observation_sequence,
+                    observed_at: std::time::Instant::now(),
                     durable: None,
                     installed: None,
                 },
@@ -7995,6 +8059,7 @@ mod tests {
         NativeUpdateReconcileFacts {
             _ticket: NativeUpdateReconcileTicket { request_sequence },
             observation_sequence,
+            observed_at: std::time::Instant::now(),
             durable,
             installed,
         }
@@ -8379,6 +8444,84 @@ mod tests {
                 "purpose merge and newest-facts selection are independent"
             );
         }
+    }
+
+    /// "Check for Updates…" parks a Refresh behind its own check (the route opens,
+    /// queues a reconcile, and the check starts in the same turn). When the check
+    /// then STAGES, replaying those pre-stage facts retired the fresh stage and
+    /// left a verified update on disk armed by nothing. The parked facts are now
+    /// dropped in favour of a fresh observation, and the stage survives.
+    #[test]
+    fn facts_parked_behind_a_check_cannot_retire_the_stage_that_check_imports() {
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        let build = running + 1;
+        let ticket = start(&mut app.native_updater_service);
+        // Observed BEFORE the check staged anything: nothing staged, bundle == running.
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::Refresh,
+            reconcile_facts_with_installed(
+                1,
+                3,
+                Some(status(None, 0)),
+                Some(installed_update(running)),
+            ),
+        );
+        assert!(app.deferred_native_update_reconcile.is_some(), "PRECONDITION: parked");
+        // The check completes WITH a stage.
+        app.finish_native_update_check(ticket, status(Some(build), 0));
+        assert_eq!(
+            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            Some(build),
+            "the stage the check imported survives the parked pre-stage facts"
+        );
+        assert!(
+            app.deferred_native_update_reconcile.is_none(),
+            "the stale parked facts are gone (re-observed fresh, not replayed)"
+        );
+    }
+
+    /// The IN-FLIGHT variant of the same defect: a read that BEGAN before the check
+    /// staged (its wake lands after, so it is not parked — the reducer is free) must
+    /// not retire the stage either. `observed_at` is the floor.
+    #[test]
+    fn facts_read_before_the_stage_import_cannot_retire_it_however_late_they_land() {
+        let mut app = App::headless_for_test();
+        let running = app.native_updater_service.snapshot().current_build;
+        let build = running + 1;
+        // Read began BEFORE the import…
+        let mut early = reconcile_facts_with_installed(
+            1,
+            3,
+            Some(status(None, 0)),
+            Some(installed_update(running)),
+        );
+        early.observed_at = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let ticket = start(&mut app.native_updater_service);
+        app.finish_native_update_check(ticket, status(Some(build), 0));
+        assert!(app.native_stage_imported_at.is_some(), "PRECONDITION: the import is floored");
+        // …and its wake lands after the check completed (reducer free, not parked).
+        app.finish_native_update_reconcile(NativeUpdateReconcilePurpose::Refresh, early);
+        assert_eq!(
+            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            Some(build),
+            "a pre-import observation is stale by construction and retires nothing"
+        );
+        // A read that began AFTER the import and sees the stage on disk is reduced
+        // normally and keeps it.
+        app.finish_native_update_reconcile(
+            NativeUpdateReconcilePurpose::Refresh,
+            reconcile_facts_with_installed(
+                2,
+                4,
+                Some(status(Some(build), 0)),
+                Some(installed_update(running)),
+            ),
+        );
+        assert_eq!(
+            app.native_updater_service.snapshot().staged.as_ref().map(|s| s.build),
+            Some(build)
+        );
     }
 
     /// The SHIPPING returned-apply lane: a control apply parked while the reducer

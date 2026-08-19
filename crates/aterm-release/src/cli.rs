@@ -31,6 +31,14 @@ USAGE
                            its first incomplete step
         --abandon vX.Y.Z   delete that version's draft release + the local
                            journal (the claim commit stays; a later cut recuts)
+        --retire-unmirrored vX.Y.Z
+                           the supported exit for a cut that flipped on the
+                           origin but whose mirror step the fleet's roster
+                           floor now refuses (a roster join landed between the
+                           origin flip and the public flip): release the lease,
+                           retire the journal, leave the origin release as it is
+                           — the public channel never saw it and the next cut,
+                           attributed under the current generation, supersedes it
         --set-version X.Y.Z
                            override the version derived from
                            [workspace.package] version (DEV → 0)
@@ -98,6 +106,7 @@ pub enum Cmd {
     Cut {
         opts: publish::CutOptions,
         abandon: Option<String>,
+        retire_unmirrored: Option<String>,
     },
     Provision {
         id: String,
@@ -296,8 +305,13 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
 fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<Cmd, String> {
     let mut opts = publish::CutOptions::default();
     let mut abandon: Option<String> = None;
+    let mut retire_unmirrored: Option<String> = None;
     while let Some(flag) = it.next() {
         match flag {
+            "--retire-unmirrored" => {
+                let v = it.next().ok_or("--retire-unmirrored needs a version (vX.Y.Z)")?;
+                retire_unmirrored = Some(normalize_version(v)?);
+            }
             "--dry-run" => opts.dry_run = true,
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
@@ -380,7 +394,11 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     if opts.dry_run && opts.rehearse.is_some() {
         return Err("--dry-run and --rehearse are mutually exclusive".to_string());
     }
-    Ok(Cmd::Cut { opts, abandon })
+    Ok(Cmd::Cut {
+        opts,
+        abandon,
+        retire_unmirrored,
+    })
 }
 
 /// Accept "0.2.0" or "v0.2.0"; store the bare canonical MAJOR.MINOR.PATCH
@@ -400,6 +418,10 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
+        Cmd::Cut {
+            retire_unmirrored: Some(v),
+            ..
+        } => verify::run_retire_unmirrored(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
         Cmd::Provision { id, check } => crate::provision::run_provision(&repo_root()?, &id, check),
         Cmd::Status => verify::run_status(&repo_root()?),

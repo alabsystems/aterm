@@ -74,16 +74,26 @@ static RATE_LIMITED: AtomicBool = AtomicBool::new(false);
 /// successful asset fetch. Process-local on purpose: it bounds a misdiagnosis, it is
 /// not a ledger.
 static ASSET_RATE_LIMIT_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The CONTAINER download's own streak (zip/DMG via `download_to`), kept apart from
+/// the small-asset streak: the two legs fail independently (a filtering proxy may
+/// pass a 4 KB manifest and refuse a 30 MB object), and a single counter reset by
+/// one leg's success could never bound the other's (2026-08-19 round-2 audit: the
+/// reset sat before the container fetch, so the container leg was unbounded).
+static CONTAINER_RATE_LIMIT_STREAK: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
 /// How many consecutive asset-lane 429/403 checks are trusted as "rate limit" before
 /// they are booked as a broken download path. Three checks at the anonymous cadence
 /// spans ~45 min, well past a shared IP's hourly budget renewing.
 const ASSET_RATE_LIMIT_DEFERRALS: u32 = 3;
 
-/// Whether an asset-lane rate-limit shaped failure should still be treated as a
-/// deferral (true) or has persisted long enough to be a broken download path (false).
-fn asset_rate_limit_still_deferrable() -> bool {
-    let streak = ASSET_RATE_LIMIT_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
-    streak <= ASSET_RATE_LIMIT_DEFERRALS
+/// Whether a rate-limit shaped failure on `streak`'s leg should still be treated as
+/// a deferral (true) or has persisted long enough to be a broken download path
+/// (false). Each leg resets its own streak when that leg succeeds — the small assets
+/// when the authoritative release's manifest/roster/signature fetched without a rate
+/// limit (every check, including "up to date" ones), the container when it arrives.
+fn rate_limit_still_deferrable(streak: &std::sync::atomic::AtomicU32) -> bool {
+    let consecutive = streak.fetch_add(1, Ordering::Relaxed) + 1;
+    consecutive <= ASSET_RATE_LIMIT_DEFERRALS
 }
 
 /// Whether this process has already logged that it is updating without a token. Once
@@ -1454,6 +1464,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Ok(None);
     }
     let staging = Staging::resolve().ok_or("could not resolve Updates dir")?;
+    crate::status::clear_check_note();
     // A surviving apply streak recorded by a DIFFERENT build is proven stale
     // — the machine moved by SOME means (channel, manual install, boot swap)
     // — so every check heals it here rather than letting `update status`
@@ -1561,6 +1572,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     }
     let appcast_fetch_error = fetched.appcast_fetch_error;
     let asset_fetch_rate_limited = fetched.asset_fetch_rate_limited;
+    if !asset_fetch_rate_limited {
+        // The small assets fetched without a rate limit (or were not needed): the
+        // small-asset streak is over — on EVERY check, including the common "up to
+        // date" one, not only the path that goes on to download a container.
+        ASSET_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
+    }
     let manifest_rejected = fetched.manifest_rejected;
     let observed_roster_seq = fetched.observed_roster_seq;
     let best = fetched.selected;
@@ -1630,15 +1647,16 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                         observed_roster_seq.unwrap_or(0)
                     ));
                     staging.retire_published();
-                    crate::status::record(
-                        &staging,
-                        current_build,
-                        &format!(
-                            "held: staged build {} was signed by machine {machine}, which \
-                             the machine roster has revoked",
-                            staged.build_number
-                        ),
+                    let note = format!(
+                        "held: staged build {} was signed by machine {machine}, which the \
+                         machine roster has revoked",
+                        staged.build_number
                     );
+                    // Carried onto every later record of THIS check (status.toml is one
+                    // overwritten line): the sentence survives the check's own terminal
+                    // outcome, and `aterm ctl update status` really does say so.
+                    crate::status::set_check_note(note.clone());
+                    crate::status::record(&staging, current_build, &note);
                 }
             }
             Err(error) => crate::warn(&format!(
@@ -1651,7 +1669,10 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
-        if appcast_fetch_error && asset_fetch_rate_limited && asset_rate_limit_still_deferrable() {
+        if appcast_fetch_error
+            && asset_fetch_rate_limited
+            && rate_limit_still_deferrable(&ASSET_RATE_LIMIT_STREAK)
+        {
             // The manifest/roster/signature GET met GitHub's rate limit — the same
             // verdict `ListDecision::RateLimited` gets one request earlier, and for
             // the same reason no `record_failure`: three saturated checks in a row
@@ -1883,9 +1904,6 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Ok(None);
     }
 
-    // Every asset of the authoritative release fetched: whatever the asset lane's
-    // 4xx streak was, it is over.
-    ASSET_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
     // Download the exact unique same-release container identity already proven
     // while accepting the authoritative manifest — the zip when the release
     // carries one, else the DMG. No order-dependent asset lookup is permitted
@@ -1908,7 +1926,8 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         // The container's own 429/403 is the same weather as the manifest's, one
         // request later in the check: deferred (bounded by the streak), not a
         // pipeline failure.
-        if aterm_update_core::download_error_is_rate_limit(&e) && asset_rate_limit_still_deferrable()
+        if aterm_update_core::download_error_is_rate_limit(&e)
+            && rate_limit_still_deferrable(&CONTAINER_RATE_LIMIT_STREAK)
         {
             RATE_LIMITED.store(true, Ordering::Relaxed);
             crate::status::record(
@@ -1929,6 +1948,8 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         return Err(format!("{container} download failed: {e}"));
     }
 
+    // The container arrived: its streak is over.
+    CONTAINER_RATE_LIMIT_STREAK.store(0, Ordering::Relaxed);
     // Size sanity (when the API reported one), then atomically name it final. From
     // here failures are `stage`-class in the health ledger: the bytes ARRIVED; the
     // artifact (or local disk) is the problem, not the download pipeline.
@@ -2064,6 +2085,20 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
 
 #[cfg(test)]
 mod tests {
+    /// Each asset leg's rate-limit deferral is bounded by ITS OWN consecutive
+    /// streak and reset by ITS OWN success — three deferrals, then the failure is
+    /// booked; a success starts the count over.
+    #[test]
+    fn a_rate_limit_deferral_is_bounded_per_leg_and_reset_by_that_legs_success() {
+        let streak = std::sync::atomic::AtomicU32::new(0);
+        for _ in 0..super::ASSET_RATE_LIMIT_DEFERRALS {
+            assert!(super::rate_limit_still_deferrable(&streak));
+        }
+        assert!(!super::rate_limit_still_deferrable(&streak), "the fourth is booked");
+        streak.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(super::rate_limit_still_deferrable(&streak), "a success starts over");
+    }
+
     use super::*;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;

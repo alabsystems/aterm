@@ -323,8 +323,14 @@ fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
             // An install that is GONE (moved or deleted mid-trial) owns nothing: if
             // only its ghost could count, confirm or budget the sentinel, every
             // launch of this build from anywhere else would defer forever. Whoever
-            // runs this build now inherits the trial and its escapes.
-            !recorded.exists() || same_install_root(recorded, app_root)
+            // runs this build now inherits the trial and its escapes. GONE means
+            // `NotFound` precisely — an unmounted volume or a TCC-protected folder
+            // answers another error and still owns its trial (fail-safe).
+            match std::fs::symlink_metadata(recorded) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+                Ok(_) => same_install_root(recorded, app_root),
+            }
         }
     }
 }
@@ -2261,8 +2267,12 @@ fn apply_staged_if_ready_inner(
         // A sentinel armed for a build that is not the running one can never be
         // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
         // future apply forever. Budget it — with its own counter, never the
-        // trial's.
-        if armed_build != 0 && armed_build != current_build {
+        // trial's. The SAME-build case that another install owns is the same
+        // wedge for THIS process (`check_boot_health` rightly does not count us,
+        // and the owner may never run again), so it takes the same budget.
+        if armed_build != 0
+            && (armed_build != current_build || !trial_owned_by(&staging, &b.app_root))
+        {
             escape_wedged_foreign_trial(&staging, current_build, armed_build);
         }
         return ApplyOutcome::Deferred(format!(

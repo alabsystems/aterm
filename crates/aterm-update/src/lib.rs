@@ -678,6 +678,19 @@ pub fn preverify_installed_for_handoff(
     let installed =
         bundle::resolve_layout().ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
     let (build, commit) = install::verified_bundle_identity_at(&installed.app_root)?;
+    // The operator apply floor (a yank) gates an ACTIVATION exactly as it gates a
+    // staged swap (`install.rs`): a yanked build found under our own path is still a
+    // yanked build (2026-08-19 review).
+    if let Some(staging) = paths::Staging::resolve() {
+        let floor = manifest::Floor::read(&staging.floor());
+        if build < floor.min_build {
+            return Err(format!(
+                "installed bundle build {build} is below the operator apply floor {} (yanked); \
+                 not activating it",
+                floor.min_build
+            ));
+        }
+    }
     if build != expected_build {
         return Err(format!(
             "installed bundle is build {build}, not the authorized build {expected_build}"
@@ -905,6 +918,12 @@ pub fn spawn_background_check(
                     && let Some(installed) = bundle::resolve()
                     && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
                     && installed_build > current_build
+                    // A build below the operator apply floor (a yank) is not an update
+                    // wherever it sits; announcing it would stage something every
+                    // handoff then refuses.
+                    && paths::Staging::resolve().is_none_or(|s| {
+                        installed_build >= manifest::Floor::read(&s.floor()).min_build
+                    })
                     && announced_installed != Some(installed_build)
                 {
                     // ANNOUNCE ONLY WHAT THE GUI CAN IMPORT. The plist is written

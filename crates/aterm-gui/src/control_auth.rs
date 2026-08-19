@@ -62,10 +62,12 @@ pub use imp::our_uid;
 pub use imp::{
     ensure_private_dir, lock_socket_file, peer_check, provision_token, publish_latest_link,
 };
-// Test-only import: `peer_uid`'s production caller (`peer_check`) lives inside
-// the unix `imp` module; only the socketpair unit test below calls it directly.
-#[cfg(all(unix, test))]
-use imp::peer_uid;
+// `peer_uid`'s production callers are `peer_check` (inside the unix `imp`
+// module) and the handoff rendezvous DIALER (`handoff_rendezvous::dial_and_claim`
+// proves the listener is same-uid before it writes the claim secret); the
+// socketpair unit test below calls it directly.
+#[cfg(unix)]
+pub(crate) use imp::peer_uid;
 // Test-only import: `random_token_hex`'s production callers live inside the
 // per-platform `imp` modules (`provision_token`); only the unit tests below
 // draw a token directly.

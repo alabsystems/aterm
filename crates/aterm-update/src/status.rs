@@ -57,10 +57,40 @@ fn temp_path(staging: &Staging) -> PathBuf {
         .join(format!("status.toml.{}.{sequence}.tmp", std::process::id()))
 }
 
+/// A note a check wants carried onto EVERY status record it writes after a
+/// notable event — a revocation retiring a staged build — because `status.toml` is
+/// a single overwritten line and the check goes on to record its terminal outcome
+/// moments later, which used to erase the one sentence that explained where the
+/// stage went (2026-08-19 round-2 audit). Set by the event, cleared at the start of
+/// the next check.
+static CHECK_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Attach `note` to every status record until [`clear_check_note`].
+pub(crate) fn set_check_note(note: String) {
+    *CHECK_NOTE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(note);
+}
+
+/// Forget the current check note (the next check starts clean).
+pub(crate) fn clear_check_note() {
+    *CHECK_NOTE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// Atomically write the status record (temp + rename). Best-effort: failures are
 /// silent — status is diagnostics, never load-bearing.
 pub fn record(staging: &Staging, current_build: u64, outcome: &str) {
     let ready = crate::manifest::Ready::read_publishable(staging);
+    let noted;
+    let outcome = match CHECK_NOTE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_deref()
+    {
+        Some(note) if !outcome.contains(note) => {
+            noted = format!("{outcome} · {note}");
+            noted.as_str()
+        }
+        _ => outcome,
+    };
     let status = Status {
         schema: 1,
         updated_at: crate::install::now_rfc3339(),
