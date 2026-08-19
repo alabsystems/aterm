@@ -61,16 +61,25 @@
 #         (~/.local/lib/aterm/bin, override ATERM_STORE_DIR) with the one
 #         `aterm` symlink in ~/.local/bin — non-macOS, older bundles, or no
 #         installed app. A PATH hint prints if ~/.local/bin isn't on PATH.
-#   token — the per-machine GitHub token the IN-APP UPDATER needs, written to
+#   token — a per-machine GitHub token for the IN-APP UPDATER, written to
 #         "~/Library/Application Support/aterm/update-token" (0600, in a 0700
 #         dir). Sourced from $ATERM_UPDATE_TOKEN if set, else `gh auth token`.
-#         Without it the app can never read the private release repo and the
-#         machine silently stays on whatever build it was installed with —
-#         which is precisely what happened before this half existed. macOS
-#         only (the updater is macOS-only); idempotent; the token is never
-#         printed; --no-token skips it. Re-running the script refreshes a
-#         rotated token. Any failure here is a loud WARNING, not an abort:
-#         the app is already installed and usable.
+#         NOT needed for the default channel: the compiled-in update source is
+#         the PUBLIC repo, which the updater reads anonymously, and for it the
+#         token chain consults only an explicit $ATERM_UPDATE_TOKEN — never the
+#         keychain and never this file (crates/aterm-update-core/src/token.rs,
+#         `needs_ambient_credential`). The file matters when a machine points
+#         the updater somewhere else with $ATERM_UPDATE_OWNER/_REPO: only then
+#         does the chain read it, and only then can the source be a repo that
+#         requires authentication. Provisioning it here keeps that case working
+#         without `gh` on PATH (a Finder-launched .app has a minimal PATH).
+#         On the public channel a token only buys the faster check cadence
+#         (~75s vs ~15min), and ONLY via an exported $ATERM_UPDATE_TOKEN — this
+#         file cannot supply it there.
+#         macOS only (the updater is macOS-only); idempotent; the token is
+#         never printed; --no-token skips it. Re-running refreshes a rotated
+#         token, and no failure here is fatal: the app is installed and, on the
+#         public channel, updating regardless.
 #
 # FAILSAFE POLICY: each half is pre-flighted BEFORE any install work; a half
 # that is impossible in this environment (piped script with no checkout,
@@ -87,9 +96,9 @@
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
 #   tools/install.sh --no-token                       # don't provision the update token
-#   tools/install.sh --no-app --no-cli                # ONLY provision the token — the
-#                                                     # one-command repair for an already-
-#                                                     # installed Mac that never updates
+#   tools/install.sh --no-app --no-cli                # ONLY provision the token — for a
+#                                                     # machine that points the updater at
+#                                                     # a private repo (see `token` above)
 #   tools/install.sh --version 0.5.0                  # pin the app release
 #   tools/install.sh --uninstall                      # reverse everything it installed
 #   tools/install.sh --uninstall --dry-run            # ...show what that would remove
@@ -429,7 +438,18 @@ release_asset_records() {
 	case "$name" in
 	aterm-appcast.toml | aterm-appcast.toml.sig) ;;
 	*)
-		[[ "$name" =~ ^aterm-[0-9]+(\.[0-9]+)+\.dmg$ ]] || {
+		# Two canonical container names, both anchored and version-shaped. The zip
+		# is admitted because Intel Macs install FROM it: no ALab artifact is
+		# published for x86_64, so those machines take the lean container instead
+		# of ~600 MB of aarch64 payload they cannot use. Without this arm the whole
+		# lean lane was dead on arrival — every Intel install aborted here with
+		# "noncanonical name" before downloading a byte.
+		#
+		# Kept as an explicit allowlist rather than a loosened pattern: the point of
+		# this gate is that a manifest cannot name an arbitrary asset in the
+		# release, and `-mac.zip` is exactly as constrained as `.dmg`.
+		[[ "$name" =~ ^aterm-[0-9]+(\.[0-9]+)+\.dmg$ ||
+			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-mac\.zip$ ]] || {
 			echo "install.sh: refusing asset lookup for noncanonical name $name" >&2
 			return 2
 		}
@@ -909,7 +929,11 @@ install_app() {
 	cleanup() {
 		# Best-effort only, and never let a cleanup failure rewrite the exit status.
 		set +e
-		if [[ -d "$MNT" ]]; then
+		# Only a DMG is MOUNTED. The lean zip is expanded into this same path, and
+		# calling hdiutil on a plain directory costs a pointless `sleep 2` plus a
+		# second failed force-detach on every lean install — `rm -rf "$TMP"` below
+		# is all that one needs.
+		if [[ "${CONTAINER_KIND:-dmg}" == dmg && -d "$MNT" ]]; then
 			hdiutil detach "$MNT" -quiet >/dev/null 2>&1 ||
 				{ sleep 2; hdiutil detach "$MNT" -force -quiet >/dev/null 2>&1; }
 		fi
@@ -938,6 +962,64 @@ install_app() {
 	fi
 	validate_manifest_identity "$TAG" "$VERSION" "$DMG_NAME" "$SHA_WANT" || exit 1
 	TEAM_WANT="${ATERM_TEAM_ID:-$TEAM_MANIFEST}"
+
+	# --- pick the container: fat DMG, or the LEAN zip -------------------------
+	# The DMG carries the batteries-included toolchain seal (~600 MB of signed
+	# tarballs) so a first launch provisions the whole ALab toolset with no
+	# network. The zip is the SAME signed, notarized bundle with that payload
+	# stripped (~1/15 the bytes) — it already exists, is already published every
+	# cut, and is what self-updates download.
+	#
+	# The ONE case that takes the lean container is ARCHITECTURE, and it is not a
+	# preference — it is correctness. Every published ALab artifact is
+	# aarch64-apple-darwin, so on an x86_64 Mac the seal can install exactly
+	# nothing: the fat DMG would ship ~600 MB of provably unusable bytes that the
+	# first launch then deletes. Not sending them is not "opting out of
+	# batteries"; there are no batteries for that machine to receive.
+	#
+	# Deliberately NO user-facing knob here. Batteries are the product default,
+	# and a flag to decline them would contradict that for a case nobody has
+	# asked for — someone who truly wants the small container can install the
+	# published zip directly, and someone who wants the toolchain gone after the
+	# fact has `atpkg uninstall --all`.
+	ZIP_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" zip 0)" || ZIP_NAME=""
+	ZIP_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" zip_sha256 0)" || ZIP_SHA=""
+	CONTAINER_KIND=dmg
+	ASSET_NAME="$DMG_NAME"
+	ASSET_SHA="$SHA_WANT"
+	# HARDWARE, not the reporting process. `uname -m` answers for the running
+	# process: `#!/usr/bin/env bash` takes whatever bash is first on PATH, so an
+	# Intel-Homebrew /usr/local/bin/bash — or `arch -x86_64 bash`, or any
+	# Rosetta-translated shell — reports x86_64 on an M-series Mac. Deciding
+	# batteries from that would hand a real Apple Silicon machine the container
+	# with no toolchain in it, which is the exact opposite of the intent, and the
+	# user would never know why. `hw.optional.arm64` answers for the CPU.
+	IS_APPLE_SILICON=0
+	[[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == 1 ]] && IS_APPLE_SILICON=1
+	if [[ -n "$ZIP_NAME" && -n "$ZIP_SHA" && "$IS_APPLE_SILICON" == 0 ]]; then
+		# The SAME identity binds the DMG lane enforces, applied to the zip. Skipping
+		# them here would have made the lean container the one download whose name
+		# and digest shape nobody checked — a filename from the manifest joined
+		# straight onto a temp path, and a digest compared without ever proving it
+		# is a digest. The canonical-name bind is what stops a manifest naming some
+		# other asset in the release; the 64-hex bind is what stops an empty or
+		# malformed field from turning the later comparison into a no-op.
+		if [[ "$ZIP_NAME" != "aterm-$VERSION-mac.zip" ]]; then
+			echo "install.sh: manifest zip $ZIP_NAME is not canonical aterm-$VERSION-mac.zip" >&2
+			exit 1
+		fi
+		if [[ ! "$ZIP_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+			echo "install.sh: manifest zip_sha256 is not exactly 64 hexadecimal digits" >&2
+			exit 1
+		fi
+		CONTAINER_KIND=zip
+		ASSET_NAME="$ZIP_NAME"
+		ASSET_SHA="$ZIP_SHA"
+		echo "install.sh: Intel Mac — using the lean container ($ASSET_NAME)."
+		echo "install.sh:   Identical signed app. The bundled toolchain is omitted because"
+		echo "install.sh:   no ALab build is published for x86_64; atpkg installs it from"
+		echo "install.sh:   the network as soon as one is."
+	fi
 
 	# Signing is OPTIONAL (Tier REPO): unsigned releases carry no
 	# aterm-appcast.toml.sig at all and that absence is expected and tolerated.
@@ -976,20 +1058,44 @@ install_app() {
 
 	# Identity validation above makes this the canonical basename before it is
 	# joined to TMP. Resolve exactly one matching API asset and download that ID.
-	DMG_RECORD="$(release_unique_asset_record "$TAG" "$DMG_NAME" 1 2147483648)" || exit 1
-	IFS=$'\t' read -r DMG_ID DMG_SIZE <<<"$DMG_RECORD"
-	download_release_asset_id "$DMG_ID" "$DMG_SIZE" "$TMP/$DMG_NAME"
-	SHA_GOT="$(shasum -a 256 "$TMP/$DMG_NAME" | awk '{print $1}')"
-	if [[ "$SHA_GOT" != "$SHA_WANT" ]]; then
-		echo "install.sh: SHA-256 MISMATCH for $DMG_NAME — refusing to install" >&2
-		echo "  manifest: $SHA_WANT" >&2
+	ASSET_RECORD="$(release_unique_asset_record "$TAG" "$ASSET_NAME" 1 2147483648)" || exit 1
+	IFS=$'\t' read -r ASSET_ID ASSET_SIZE <<<"$ASSET_RECORD"
+	# SAY WHAT IS ABOUT TO HAPPEN. This download went from ~51 MB to ~650 MB when the
+	# toolchain moved into the DMG, and the script's output did not change by one
+	# character: between "installing <slug> <tag>" and "sha256 verified" it prints
+	# nothing, on a transport that is deliberately quiet (`curl -fsS`, `gh api` with
+	# no meter). On a slow line that is many minutes of a `curl | bash` pipeline that
+	# looks hung — the classic reason someone ^Cs an install half-written.
+	if [[ "$CONTAINER_KIND" == dmg ]]; then
+		echo "install.sh: downloading $ASSET_NAME ($((ASSET_SIZE / 1000000)) MB — includes the bundled ALab toolchain, so the first launch needs no network)"
+	else
+		echo "install.sh: downloading $ASSET_NAME ($((ASSET_SIZE / 1000000)) MB)"
+	fi
+	download_release_asset_id "$ASSET_ID" "$ASSET_SIZE" "$TMP/$ASSET_NAME"
+	SHA_GOT="$(shasum -a 256 "$TMP/$ASSET_NAME" | awk '{print $1}')"
+	if [[ "$SHA_GOT" != "$ASSET_SHA" ]]; then
+		echo "install.sh: SHA-256 MISMATCH for $ASSET_NAME — refusing to install" >&2
+		echo "  manifest: $ASSET_SHA" >&2
 		echo "  download: $SHA_GOT" >&2
 		exit 1
 	fi
 	echo "install.sh: sha256 verified (${SHA_GOT:0:12}…)"
 
-	hdiutil attach "$TMP/$DMG_NAME" -nobrowse -readonly -mountpoint "$MNT" -quiet
-	[[ -d "$MNT/aterm.app" ]] || { echo "install.sh: no aterm.app inside $DMG_NAME" >&2; exit 1; }
+	# Both containers land the bundle at "$MNT/aterm.app", so every check below —
+	# codesign, the Team-ID designated requirement, Gatekeeper, the staged swap —
+	# is identical for either. A stripped bundle verifies exactly like the fat one
+	# (the payload sits in a `.lproj` directory sealed `optional = true`), which is
+	# the property the whole lean lane rests on.
+	if [[ "$CONTAINER_KIND" == zip ]]; then
+		mkdir -p "$MNT"
+		ditto -x -k "$TMP/$ASSET_NAME" "$MNT" || {
+			echo "install.sh: could not expand $ASSET_NAME" >&2
+			exit 1
+		}
+	else
+		hdiutil attach "$TMP/$ASSET_NAME" -nobrowse -readonly -mountpoint "$MNT" -quiet
+	fi
+	[[ -d "$MNT/aterm.app" ]] || { echo "install.sh: no aterm.app inside $ASSET_NAME" >&2; exit 1; }
 
 	codesign --verify --deep --strict "$MNT/aterm.app" || {
 		echo "install.sh: code-signature verification FAILED — refusing to install" >&2
@@ -1256,24 +1362,28 @@ install_cli_completions() {
 	return 0
 }
 
-# --- update token: the step that decides whether this Mac EVER updates --------
+# --- update token: the credential for a REPOINTED update source ---------------
 #
-# The in-app updater reads the private release repo, so it needs a token. Its
-# resolution chain (crates/aterm-update-core/src/token.rs) ends at `gh auth
-# token`, which is why an install done on a `gh`-authenticated developer Mac
-# "just worked" and every other machine silently never updated: nothing ever
-# provisioned a token, and there was no installer step to do it.
+# History: the update channel used to be a private repo, so the updater needed a
+# token to read it at all, and an install on a `gh`-authenticated developer Mac
+# "just worked" while every other machine silently never updated. That is no
+# longer the shape. The compiled-in channel is the PUBLIC repo and the updater
+# reads it with no credential; a token only raises the anonymous API cadence.
 #
-# This installs the durable source (3) — the 0600 file under Application
-# Support — from the same credential this script already used to download the
-# app. That makes the machine independent of `gh` afterwards: the app keeps
-# updating from a Finder launch (minimal PATH, no `gh` in it) and after a
-# `brew uninstall gh`.
+# So this half is NOT what decides whether a Mac updates. Per
+# crates/aterm-update-core/src/token.rs (`needs_ambient_credential` + `walk`):
+# for the compiled-in channel the chain consults ONLY an explicit
+# $ATERM_UPDATE_TOKEN and never touches the keychain or the file written below.
+# The ambient chain — keychain, this 0600 file, $GITHUB_TOKEN, $GH_TOKEN, `gh
+# auth token` — runs only when $ATERM_UPDATE_OWNER/_REPO repoint the source,
+# which is the one way to reach a repo that can require authentication.
+#
+# Provisioning it anyway is cheap and keeps that repointed case working without
+# `gh` on PATH (a Finder-launched .app has a minimal one) — but a machine
+# without it is fine, and nothing here may claim otherwise.
 #
 # It is idempotent (a matching token is left alone), it NEVER prints the token,
-# and it is skippable with --no-token. Failure is non-fatal to the install but
-# LOUD, because a machine that installs fine and never updates is exactly the
-# state this whole exercise exists to end.
+# and it is skippable with --no-token. No failure here is fatal.
 UPDATE_TOKEN_DIR="$HOME/Library/Application Support/aterm"
 UPDATE_TOKEN_FILE="$UPDATE_TOKEN_DIR/update-token"
 
@@ -1314,21 +1424,30 @@ provision_update_token() {
 			echo "install.sh: update token already provisioned (existing file or keychain item) — left alone"
 			return 0
 		fi
-		echo "install.sh: WARNING: no GitHub token available, so THIS MAC WILL NEVER AUTO-UPDATE." >&2
-		echo "install.sh:   aterm reads its releases from a PRIVATE repo and needs a token to do it." >&2
-		echo "install.sh:   Fix it with two commands:" >&2
-		echo "install.sh:     gh auth login" >&2
+		# NOT a warning: the compiled-in channel is public and updates
+		# anonymously. Only a machine that repoints the updater at a private
+		# repo needs this file, and it can add it later.
+		# NOT a warning: the compiled-in channel is public, so this Mac updates
+		# without any credential — just on the slower anonymous interval.
+		echo "install.sh: no GitHub token available — the update channel is public, so this Mac"
+		echo "install.sh:   still auto-updates. Unauthenticated checks share ~60 GitHub requests per"
+		echo "install.sh:   hour per IP, so it checks about every 15 minutes instead of every 75s."
+		echo "install.sh:   To get the faster cadence, export ATERM_UPDATE_TOKEN for the app — on the"
+		echo "install.sh:   public channel that is the ONLY token source the updater consults."
 		# NOT "$0": piped as `… | bash` that is literally "bash". Name the
 		# documented invocation instead, which is correct however this ran.
-		echo "install.sh:     tools/install.sh --no-app --no-cli   # provisions the token, installs nothing else" >&2
-		echo "install.sh:   Verify with:  aterm ctl update status   (look at outcome=)" >&2
+		echo "install.sh:   The file this step writes is read only when ATERM_UPDATE_OWNER/_REPO point"
+		echo "install.sh:   the updater at another repo; add it later with:"
+		echo "install.sh:     gh auth login && tools/install.sh --no-app --no-cli"
+		echo "install.sh:   Check update health any time with:  aterm ctl update status"
 		return 0
 	fi
 
 	if ! well_formed_token "$tok"; then
 		echo "install.sh: WARNING: the available GitHub token is malformed, so it was NOT provisioned" >&2
-		echo "install.sh:   (expected [A-Za-z0-9_-]; got ${#tok} characters). THIS MAC WILL NOT AUTO-UPDATE." >&2
-		echo "install.sh:   Re-authenticate with: gh auth login" >&2
+		echo "install.sh:   (expected [A-Za-z0-9_-]; got ${#tok} characters). Updates from the public" >&2
+		echo "install.sh:   channel are unaffected; re-authenticate with \`gh auth login\` if you need a" >&2
+		echo "install.sh:   token for a repointed, private update source." >&2
 		return 0
 	fi
 
@@ -1342,7 +1461,7 @@ provision_update_token() {
 	fi
 
 	if ! mkdir -p "$UPDATE_TOKEN_DIR" 2>/dev/null; then
-		echo "install.sh: WARNING: could not create $UPDATE_TOKEN_DIR — auto-update is NOT provisioned" >&2
+		echo "install.sh: WARNING: could not create $UPDATE_TOKEN_DIR — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
 		return 0
 	fi
 	chmod 700 "$UPDATE_TOKEN_DIR" 2>/dev/null || true
@@ -1355,17 +1474,17 @@ provision_update_token() {
 		printf '%s' "$tok" >"$tmp"
 	) 2>/dev/null; then
 		rm -f "$tmp" 2>/dev/null
-		echo "install.sh: WARNING: could not write $UPDATE_TOKEN_FILE — auto-update is NOT provisioned" >&2
+		echo "install.sh: WARNING: could not write $UPDATE_TOKEN_FILE — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
 		return 0
 	fi
 	chmod 600 "$tmp" 2>/dev/null || true
 	if ! mv -f "$tmp" "$UPDATE_TOKEN_FILE" 2>/dev/null; then
 		rm -f "$tmp" 2>/dev/null
-		echo "install.sh: WARNING: could not install $UPDATE_TOKEN_FILE — auto-update is NOT provisioned" >&2
+		echo "install.sh: WARNING: could not install $UPDATE_TOKEN_FILE — the update token was NOT provisioned (public-channel updates are unaffected)" >&2
 		return 0
 	fi
 	INSTALLED_ANY=1
-	echo "install.sh: provisioned the update token (0600) -> $UPDATE_TOKEN_FILE — this Mac will auto-update"
+	echo "install.sh: provisioned the update token (0600) -> $UPDATE_TOKEN_FILE (used only if you repoint the updater at a private repo)"
 }
 
 cli_path_hint() {
