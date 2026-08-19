@@ -704,6 +704,7 @@ mod tests {
                     failing_checks: 0,
                     failing_persistent: false,
                     failing_kind: String::new(),
+                    failing_applies: 0,
                 },
             ),
             crate::native_updater_service::CheckCompletion::Reduced,

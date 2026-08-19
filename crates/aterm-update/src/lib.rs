@@ -733,6 +733,72 @@ pub fn forgive_trial_launch(target_build: u64) {
     install::forgive_trial_launch(target_build);
 }
 
+/// THIS PROCESS IS A HANDOFF CANDIDATE THAT HAS NOT TAKEN OVER YET. Set by the GUI
+/// at boot when the launch carries an overlap handoff, cleared when the outgoing
+/// process commits it (or never, if the candidate is rejected and exits).
+///
+/// It gates exactly one thing: [`health::Health::expire_stale_apply_streak`]. A
+/// candidate spawns its own background check within milliseconds of booting, and
+/// that check was expiring the apply streak its OWN attempt was about to add to —
+/// so `failing_applies` could never pass 1 and an update that downloads and
+/// verifies but will not start never reached the persistent verdict (2026-08-19
+/// round-4 audit). Scoped to the candidate rather than to "has reached a health
+/// checkpoint" so an ordinary launch — including a headless one, a `--version`
+/// run, or a session that never presents a frame — still heals a stale streak on
+/// its first check, exactly as before.
+static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process an uncommitted handoff candidate (`true` at boot when the
+/// launch carries a handoff; `false` once it is committed).
+pub fn set_uncommitted_handoff_candidate(uncommitted: bool) {
+    UNCOMMITTED_CANDIDATE.store(uncommitted, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether this process is a handoff candidate that has not been committed.
+#[must_use]
+pub fn is_uncommitted_handoff_candidate() -> bool {
+    UNCOMMITTED_CANDIDATE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Launches the boot sentinel has counted for `build` right now — the snapshot a
+/// parent takes before launching a candidate.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn trial_launch_count(build: u64) -> u32 {
+    install::trial_launch_count(build)
+}
+
+/// Non-macOS: no sentinel, nothing counted.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn trial_launch_count(_build: u64) -> u32 {
+    0
+}
+
+/// [`forgive_trial_launch`], but ONLY if this candidate actually observed a launch:
+/// the counter must have MOVED since `before` and stand above zero. A candidate
+/// killed in its first milliseconds — before `check_boot_health` runs — counted
+/// nothing, and forgiving then erases a launch some EARLIER, genuinely crashed
+/// candidate observed, which is the crash signal the sentinel exists to keep
+/// (2026-08-19 round-4 audit).
+///
+/// "MOVED", not "advanced": a candidate that swaps re-arms the trial
+/// (`prepare_trial` resets the count to 0) and then counts 1, so a stale-high
+/// snapshot from an earlier trial of the same build would suppress a legitimate
+/// forgive if this compared only `>` (round-4 skeptics).
+#[cfg(target_os = "macos")]
+pub fn forgive_trial_launch_if_advanced(target_build: u64, before: u32) {
+    let now = install::trial_launch_count(target_build);
+    if now > 0 && now != before {
+        install::forgive_trial_launch(target_build);
+    }
+}
+
+/// Non-macOS: nothing to forgive.
+#[cfg(not(target_os = "macos"))]
+pub fn forgive_trial_launch_if_advanced(_target_build: u64, _before: u32) {}
+
 /// Non-macOS: no boot sentinel is ever armed by a swap.
 #[cfg(not(target_os = "macos"))]
 pub fn forgive_trial_launch(_target_build: u64) {}

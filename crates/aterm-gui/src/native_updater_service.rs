@@ -74,8 +74,14 @@ pub(crate) struct DurableUpdateStatus {
     /// while the update screen said "You're up to date."
     pub(crate) failing_persistent: bool,
     /// The failing class the ledger recorded (`network` / `pipeline` / `manifest` /
-    /// `stage` / `apply`), empty when not failing.
+    /// `stage` / `apply`), empty when not failing. This is the MOST RECENT class,
+    /// not necessarily the one that escalated — see [`Self::failing_applies`].
     pub(crate) failing_kind: String,
+    /// Consecutive APPLY failures. The exact signal for "the staged build will not
+    /// start", which `failing_kind` cannot give: a machine whose apply lane
+    /// escalated but whose last failure was a network blip records `network`
+    /// (2026-08-19 round-4 skeptics).
+    pub(crate) failing_applies: u32,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -265,6 +271,9 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) failing_persistent: bool,
     /// The failing class behind `failing_persistent` (empty otherwise).
     pub(crate) failing_kind: String,
+    /// Consecutive APPLY failures from the ledger — the exact "the staged build
+    /// will not start" signal (`failing_kind` is only the most recent class).
+    pub(crate) failing_applies: u32,
 }
 
 impl UpdaterSnapshot {
@@ -651,6 +660,7 @@ impl NativeUpdaterService {
                 reexec_count: 0,
                 failing_persistent: false,
                 failing_kind: String::new(),
+                failing_applies: 0,
             },
             next_operation: 1,
             work_generation: 0,
@@ -800,12 +810,16 @@ impl NativeUpdaterService {
         } else {
             String::new()
         };
-        if self.snapshot.failing_persistent == now_persistent && self.snapshot.failing_kind == kind {
+        if self.snapshot.failing_persistent == now_persistent
+            && self.snapshot.failing_kind == kind
+            && self.snapshot.failing_applies == status.failing_applies
+        {
             return false;
         }
         let was_persistent = self.snapshot.failing_persistent;
         self.snapshot.failing_persistent = now_persistent;
         self.snapshot.failing_kind = kind;
+        self.snapshot.failing_applies = status.failing_applies;
         self.publish();
         if now_persistent && !was_persistent {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
@@ -837,6 +851,7 @@ impl NativeUpdaterService {
         } else {
             String::new()
         };
+        self.snapshot.failing_applies = status.failing_applies;
         if !status.enabled {
             let before = self.model_state();
             self.snapshot.active = None;
@@ -1501,6 +1516,7 @@ mod tests {
             failing_checks: 0,
             failing_persistent: false,
             failing_kind: String::new(),
+            failing_applies: 0,
         }
     }
 
@@ -1790,6 +1806,7 @@ mod tests {
             failing_checks: 0,
             failing_persistent: false,
             failing_kind: String::new(),
+            failing_applies: 0,
         };
         assert!(staged_from_status(11, 0, &download).is_none());
         download.staged_commit = Some("0".repeat(40));
@@ -1820,6 +1837,7 @@ mod tests {
             failing_checks: 0,
             failing_persistent: false,
             failing_kind: String::new(),
+            failing_applies: 0,
         };
         let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
         assert_eq!(imported.commit, stage.commit);

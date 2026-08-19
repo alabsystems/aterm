@@ -52,6 +52,12 @@ token for the updater's private-repo lane (`--no-token` skips this; the public
 channel needs no token). Run it again with `--uninstall` to reverse everything
 it installed.
 
+Installing by hand does the same checks manually: compare the DMG's SHA-256
+with the digest in that release's `aterm-appcast.toml`, then, with the app in
+place, run `codesign --verify --strict --verbose=2 /Applications/aterm.app` and
+`spctl -a -t exec -vv /Applications/aterm.app` — the second must report
+`source=Notarized Developer ID`.
+
 ### Staying current
 
 Installed copies keep themselves current: the app checks the release channel
@@ -77,8 +83,8 @@ cargo build --locked -p aterm
 ./target/debug/aterm --window
 ```
 
-`./target/debug/aterm --version` should agree with the `version` in the root
-`Cargo.toml`. Build from the workspace: aterm's crates are not on crates.io,
+`./target/debug/aterm --version` should agree with `[workspace.package]
+version` in the root `Cargo.toml`. Build from the workspace: aterm's crates are not on crates.io,
 and the crates.io package named `aterm` is an unrelated project, so do not
 `cargo install aterm`. Linux and Windows build from source too and have
 in-tree build lanes and tests, but only macOS has released binaries, an
@@ -350,6 +356,10 @@ aterm trustc --help
 aterm pkg list
 ```
 
+The app itself is universal, but the public package index currently carries
+Apple-silicon macOS builds on one channel, so `aterm pkg` has nothing to
+install on an Intel Mac yet.
+
 `aterm <tool>` resolves against the managed store — never `$PATH` — so aterm's
 own verbs cannot be shadowed. Settings ▸ Packages ▸ Install ALab Toolset (or
 `aterm pkg install --default-set`) fetches the whole set at once, and the
@@ -358,9 +368,7 @@ windowed app keeps installed packages current on a six-hour loop.
 Packages ride the same trust chain as the app updater (see
 [Security model](#security-model)): every download is verified before it is
 parsed, the tree hash of the extracted files must match the signed manifest, and
-installs swap in atomically with rollback. Today the public index carries one
-channel (`stable`) and Apple-silicon macOS packages; `aterm help` lists the
-tools.
+installs swap in atomically with rollback. `aterm help` lists the tools.
 
 ## Use aterm in your own project
 
@@ -378,8 +386,7 @@ terminal engine. From Rust, the `aterm-agent` crate wraps the same protocol as
 ### 2. Embed the engine
 
 Use the engine surfaces when your application owns the terminal grid and
-renderer. The crates are not on crates.io; point your workspace at the
-checked-out source:
+renderer. Point your workspace at the checked-out source:
 
 ```toml
 [dependencies]
@@ -476,8 +483,9 @@ executable interpreter. An embedded exhaustive checker verifies their
 invariants, deadlock-freedom, and transitions on every `cargo test` (a handful
 of function-valued models can only be checked by `ty`, and say so). Where the
 Trust model checker `ty` is installed the same obligations get a second,
-independent check, and `ay` re-checks the repository's hand-encoded SMT
-certificate bundles; a missing tool is reported, never counted as a pass.
+independent check, and `ay` re-checks the development line's hand-encoded SMT
+certificate bundles. A missing tool prints a prominent "did not run" notice
+rather than passing silently, and a few certificate gates fail outright instead.
 Conformance tests project real subsystem state back onto the models so the
 specs stay tied to shipping code; a model with no such tie only proves
 something about itself, and the repository labels those.
@@ -490,8 +498,8 @@ In-compilation verification is not yet enabled for the workspace as a whole,
 so "compiled by a verifying compiler" is not "verified": that campaign is
 ratcheting crate by crate. The public snapshot builds on stock Rust and carries
 the embedded exhaustive checker, the conformance, property, and fuzz tests, the CPU/GPU parity
-suites, and the differential oracle against `alacritty_terminal` (the
-hand-encoded `ay` certificate bundles stay internal). These prove or test named,
+suites, and the differential oracle against `alacritty_terminal` (those `ay`
+bundles stay internal). These prove or test named,
 bounded contracts — not the whole emulator, renderer, or OS.
 
 Run `cargo run -q -p xtask -- gate counts` for the live inventory of bounded
@@ -542,8 +550,9 @@ network calls.
 
 ## Community and license
 
-Source contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for
-the build and review boundary and [SECURITY.md](SECURITY.md) for private
+Focused fixes and well-scoped improvements are welcome — it is a best-effort
+project. See [CONTRIBUTING.md](CONTRIBUTING.md) for the build and review
+boundary and [SECURITY.md](SECURITY.md) for private
 vulnerability reporting. Release notes live on the
 [Releases](https://github.com/alabsystems/aterm/releases) page and inside the
 app under Settings ▸ Software Update.

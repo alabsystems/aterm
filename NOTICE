@@ -56,4 +56,6 @@ UNICODE-LICENSE.txt.
 
 The public source snapshot deliberately excludes private operational notes,
 release credentials, internal proof packets, and unused traced art inputs. It
-includes no executable binary, installer, or managed ALab tool package.
+includes no executable binary, no updater payload, and no managed ALab tool
+package; the installer script it does carry downloads and verifies the released
+application rather than containing it. See PUBLICATION.md for that boundary.

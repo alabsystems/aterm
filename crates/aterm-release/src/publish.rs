@@ -9564,10 +9564,56 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
         return Ok(());
     }
     ensure_ctx_release_lease(ctx)?;
+    // THE MIRROR IS A COPY OF THE ORIGIN RELEASE, NOT OF dist/. The roster pair in
+    // dist/ is the one file a separate, un-lease-gated ceremony (`atpkg-keys join`,
+    // `cargo ship provision`) rewrites between an origin flip and a resumed mirror —
+    // and this step then uploaded THOSE bytes beside a manifest signed under the
+    // roster the cut actually shipped, and judged the lineage fork from them too (a
+    // spurious fork no supported command could clear; and, at an equal generation, a
+    // genuinely forked document published as the channel head). Bind dist/'s roster
+    // to what the origin release carries before either use.
+    //
+    // READ BEFORE THE CHANNEL CREDENTIAL IS ENTERED: this fetch targets the PRIVATE
+    // origin repo, which the release-org channel token cannot read (2026-08-19
+    // round-4 skeptics — inside the scope every roster cut would have died here).
+    let shipped_roster = ctx
+        .attaches_roster()
+        .then(|| {
+            let origin_release_id = ctx.release_id.ok_or_else(|| {
+                Error::new("mirror step reached with no bound origin release ID".to_string())
+            })?;
+            download_release_asset_for_release_id(
+                &ctx.slug,
+                origin_release_id,
+                roster::ROSTER_ASSET,
+            )
+        })
+        .transpose()?;
+    if let Some(shipped) = shipped_roster.as_ref() {
+        let local = fs::read(ctx.dist.join(roster::ROSTER_ASSET)).map_err(|e| {
+            Error::new(format!(
+                "read this cut's roster asset from dist/ before mirroring it: {e}"
+            ))
+        })?;
+        if local != *shipped {
+            return Err(Error::new(format!(
+                "dist/{} is NOT the roster this cut published on its origin release — a join or \
+                 provision rewrote it after the flip. Mirroring it would publish a roster the \
+                 signed manifest does not name. Restore the pair this cut shipped (download \
+                 {} and its .sig from the {} release into dist/), then `cargo ship cut \
+                 --resume`; or retire this cut with `cargo ship cut --retire-unmirrored {}`",
+                roster::ROSTER_ASSET,
+                roster::ROSTER_ASSET,
+                ctx.tag,
+                ctx.tag,
+            )));
+        }
+    }
     // EVERYTHING below this line talks to the public channel and nothing else: the
-    // asset bytes come from local `dist/` files, and the two `ctx.slug` uses above are
-    // a message and the equality guard. So the release-org credential is safe to hold
-    // for the whole step, and it drops on every exit path including `?`.
+    // asset bytes come from local `dist/` files (proved identical to the origin's
+    // above), and the two `ctx.slug` uses above are a message and the equality guard.
+    // So the release-org credential is safe to hold for the whole step, and it drops
+    // on every exit path including `?`.
     let _cred = ChannelCred::enter();
     preflight_mirror_target(&slug)?;
 
@@ -9685,8 +9731,10 @@ fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
         ))
     })?;
     let carried = cut_roster_seq(ctx)?;
-    if let Ok(local_roster) = fs::read(ctx.dist.join(roster::ROSTER_ASSET)) {
-        machines::roster_lineage_agrees(&local_roster, carried, fleet_roster.as_ref())
+    // Judged from the roster this cut SHIPPED (proved byte-identical to dist/ above),
+    // never from dist/ alone.
+    if let Some(shipped) = shipped_roster.as_ref() {
+        machines::roster_lineage_agrees(shipped, carried, fleet_roster.as_ref())
             .map_err(Error::new)?;
     }
     roster_floor_covered(carried, fleet_roster.as_ref().map(|(seq, _)| *seq))?;

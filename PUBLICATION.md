@@ -3,36 +3,67 @@
 
 # Public source snapshot
 
-aterm's public version series began at `v0.1.0`; this snapshot is `v0.7.0`. Each
-one is produced as an immutable, single-commit source snapshot from the private
-development repository. aterm carries a single `MAJOR.MINOR.0` version (see
-`VERSIONING.md`): the patch slot is always `0` and `MINOR` is the knob that
-moves, and the macOS application, its release tag, and this source snapshot all report
-it. Historical private labels are not public releases.
+This repository is the public source snapshot of aterm, and it carries two
+different things:
+
+- **The source snapshot** — the tree you are reading. Each release adds one
+  commit here: a squashed export of the private development repository, cut at
+  release time. Every public release has a source snapshot beside it, and the
+  release cutter refuses to cut until this tree already carries the release's
+  version. It contains source, not prebuilt binaries.
+- **The releases** — the macOS application, published on this repository's
+  [Releases](https://github.com/alabsystems/aterm/releases) page as a signed,
+  notarized DMG, together with the signed update manifest and machine roster
+  that installed copies verify. The same page also hosts the signed
+  `atpkg-index-N` package index that `aterm pkg` reads.
+
+Both report the same version: a single `MAJOR.MINOR.0` whose patch slot is
+always `0` and whose `MINOR` is the knob that moves, described in
+[VERSIONING.md](VERSIONING.md). The authoritative value is the root Cargo
+workspace version, which `aterm --version` prints and which the staging gate
+checks by building a fresh, credential-free clone. Historical private labels
+are not public releases.
+
+## What the transform changes
 
 The publication transform makes only reviewable boundary changes:
 
-- sets the public Cargo workspace and first-party lockfile records to the public
-  `X.Y.0` — `0.7.0` for this snapshot;
-- pins the public build to stock Rust `1.97.1` and omits private Trust-only
-  Cargo configuration;
+- sets the public Cargo workspace and first-party lockfile records to the
+  public `X.Y.0`;
+- pins the public build to a stock Rust release — `rust-toolchain.toml` names
+  it — and omits the private Trust-only Cargo configuration;
 - points repository and update defaults at the public `alabsystems` namespace;
 - normalizes local-machine path and credential-shaped test fixtures without
   changing the behavior they test; and
-- excludes operational notes, internal proof write-ups, generated tool caches,
-  and unused traced art inputs.
+- excludes everything outside the export allowlist — operational notes, the
+  changelog and release ledger, man pages, the release and publication
+  machinery, internal proof packets, generated tool caches, and unused traced
+  art inputs whose source rights were not established.
 
-The exported source contains the full Rust workspace—including developer and
-release-helper source for Cargo lockfile closure—modified vendored crates,
-public media, and the license material needed for that boundary. It contains
-no release credentials, prebuilt executable, installer, public updater payload,
-or managed ALab tool package.
+## What the export contains
 
-Some compatibility and regression tests retain historical strings such as
-`v0.56` from the retired two-component update-channel scheme. Those strings are
-fixtures, not public version claims. The authoritative public package version is
-the root Cargo workspace version and `aterm --version`, both checked as `0.7.0`
-during staging.
+The export is an allowlist, not a denylist: only listed paths ship. What ships
+is the full Rust workspace — including developer and release-helper source, so
+the reviewed `Cargo.lock` needs no regeneration — plus modified vendored
+crates, the public README media, the installer script `tools/install.sh`, and
+the license material needed for that boundary.
+
+A few test targets in that workspace read internal proof packets and the
+changelog, which the export omits; those tests fail here and are not part of
+the contributor gate. [CONTRIBUTING.md](CONTRIBUTING.md) names them.
+
+It contains no release credentials, no prebuilt executable, no updater payload,
+and no managed ALab tool package. Those are distributed, not exported: the
+application arrives as a release artifact and the toolchain through
+`aterm pkg`, each verified against the signing chain described in
+[README ▸ Security model](README.md#security-model). That chain's trust anchor
+is a committed public-key constant in this source tree — reviewable here, never
+supplied by an environment variable.
+
+Some compatibility and regression tests retain historical strings from the
+retired two-component update-channel scheme, whose archive lives only in the
+private origin. Those strings are fixtures, not public version claims, and the
+updater never selects such a tag.
 
 See [NOTICE](NOTICE) for third-party attribution and [SECURITY.md](SECURITY.md)
 for private vulnerability reporting.

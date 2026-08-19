@@ -48,6 +48,7 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         failing_checks,
         failing_persistent: false,
         failing_kind: String::new(),
+        failing_applies: 0,
     }
 }
 

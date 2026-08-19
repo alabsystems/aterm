@@ -1421,10 +1421,12 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
     std::fs::rename(incoming, &staging.staged_app)
         .map_err(|error| format!("publish staged bundle: {error}"))?;
 
-    // The marker remains the commit point and is written last.
-    let tmp = staging.root.join("ready.toml.tmp");
-    std::fs::write(&tmp, marker).map_err(|error| format!("write ready marker: {error}"))?;
-    std::fs::rename(&tmp, &staging.ready).map_err(|error| format!("commit ready marker: {error}"))
+    // The marker remains the commit point and is written last — DURABLY: it is the
+    // fallback link of the same recovery-proof chain as the trial identity and the
+    // installed receipt (`ensure_current_trial_receipt` falls back to it when the
+    // receipt is absent), so a zero-length one after a kernel panic would strand the
+    // very repair those two were made durable for (2026-08-19 round-4 skeptics).
+    crate::manifest::write_durable(&staging.ready, &marker, "ready marker")
 }
 
 /// Stage a verified copy of the bundle from a downloaded (sha256-checked) DMG:
@@ -2709,12 +2711,40 @@ fn check_boot_health(
                         "trial recovery proof: {error}"
                     )));
                 }
-                // Budget exhausted AND the rollback is unprovable, so reverting is
-                // not available either. Staying armed is the strictly worse option:
-                // this build demonstrably BOOTS — we are executing its code, this
-                // many times in a row — and remaining armed only guarantees that no
-                // future update can ever apply. Disarm, keep running, and make the
-                // reason loud and durable instead of silently bricking the updater.
+                // BUDGET EXHAUSTED. Reverting is the right answer whenever it is
+                // AVAILABLE — a verified predecessor sitting at the fixed rollback
+                // path — because this trial can no longer be confirmed and the build
+                // is, by the sentinel's own count, failing to reach its checkpoint.
+                // The proof that just failed is a CONJUNCTION (rollback ∧ sealed
+                // identity ∧ trial marker ∧ receipt), and only its first term speaks
+                // to whether a revert can be performed; treating any failure of the
+                // later terms as "the rollback is unprovable" left a crash-looping
+                // build installed beside a perfectly good predecessor, which is the
+                // outcome the whole sentinel exists to prevent (2026-08-19 round-4
+                // skeptics). Re-derive that first term alone and revert on it.
+                if let Ok(rollback) = ensure_fixed_rollback(&b.app_root, current_build) {
+                    crate::warn(&format!(
+                        "trial recovery proof failed {MAX_BOOT_ATTEMPTS} launches in a row \
+                         ({error}), but the retained predecessor at {} verifies — reverting \
+                         to it rather than leaving an unconfirmable build installed",
+                        rollback.path.display()
+                    ));
+                    return Some(revert_to_rollback(
+                        &b,
+                        staging,
+                        &sentinel,
+                        current_build,
+                        rollback.path,
+                        handoff_fds,
+                        apply_lock,
+                    ));
+                }
+                // No verified predecessor: reverting is genuinely unavailable.
+                // Staying armed is the strictly worse option: this build demonstrably
+                // BOOTS — we are executing its code, this many times in a row — and
+                // remaining armed only guarantees that no future update can ever
+                // apply. Disarm, keep running, and make the reason loud and durable
+                // instead of silently bricking the updater.
                 let disarm = sentinel.confirm();
                 crate::health::Health::record_apply_failure(
                     &staging.health(),
@@ -2934,6 +2964,22 @@ fn confirm_health_under_apply_lock(
 
 /// See [`crate::forgive_trial_launch`]. Under the apply lock so it cannot interleave
 /// with a `check_boot_health` observation or a `confirm_boot_health` disarm.
+/// How many launches the boot sentinel has counted for `build` (0 when it is armed
+/// for another build, or not armed at all). The parent snapshots this before it
+/// launches a candidate so it can tell whether that candidate actually observed a
+/// launch before it was killed — see [`crate::forgive_trial_launch_if_advanced`].
+///
+/// A LOCK-FREE READ, unlike the forgiveness it feeds: it is a hint compared against
+/// a later read, and both a stale and a fresh answer are handled by the "moved and
+/// non-zero" rule.
+#[must_use]
+pub(crate) fn trial_launch_count(build: u64) -> u32 {
+    Staging::resolve()
+        .and_then(|staging| boot_sentinel(&staging).read_state())
+        .filter(|(armed, _)| *armed == build)
+        .map_or(0, |(_, attempts)| attempts)
+}
+
 pub(crate) fn forgive_trial_launch(target_build: u64) {
     let Some(staging) = Staging::resolve() else {
         return;

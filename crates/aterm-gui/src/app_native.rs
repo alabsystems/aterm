@@ -836,6 +836,7 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         failing_checks: status.failing_checks,
         failing_persistent: status.failing_persistent,
         failing_kind: status.failing_kind,
+        failing_applies: status.failing_applies,
     }
 }
 
@@ -852,6 +853,7 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         failing_checks: 1,
         failing_persistent: false,
         failing_kind: String::new(),
+        failing_applies: 0,
     }
 }
 
@@ -8094,6 +8096,7 @@ mod tests {
             failing_checks,
             failing_persistent: false,
             failing_kind: String::new(),
+            failing_applies: 0,
         }
     }
 
@@ -8221,6 +8224,7 @@ mod tests {
                 failing_checks: 0,
                 failing_persistent: false,
                 failing_kind: String::new(),
+                failing_applies: 0,
             }),
             Some(InstalledUpdate {
                 build,
@@ -8271,6 +8275,7 @@ mod tests {
                     failing_checks: 0,
                     failing_persistent: false,
                     failing_kind: String::new(),
+                    failing_applies: 0,
                 }),
                 Some(installed_update(running)),
             )
@@ -9493,6 +9498,7 @@ mod tests {
                     failing_checks: 0,
                     failing_persistent: false,
                     failing_kind: String::new(),
+                    failing_applies: 0,
                 },
             ),
             CheckCompletion::Reduced,
@@ -9559,6 +9565,7 @@ mod tests {
                         failing_checks: 0,
                         failing_persistent: false,
                         failing_kind: String::new(),
+                        failing_applies: 0,
                     }),
                     Some(InstalledUpdate {
                         build,
@@ -10362,6 +10369,7 @@ mod tests {
                 failing_checks: 0,
                 failing_persistent: false,
                 failing_kind: String::new(),
+                failing_applies: 0,
             }),
             Some(InstalledUpdate {
                 build,

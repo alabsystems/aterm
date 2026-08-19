@@ -83,6 +83,11 @@ struct HandoffWorkerJob {
     /// one lane and carries no field for it.
     #[cfg(target_os = "macos")]
     lane: HandoffLane,
+    /// Boot-trial launches the sentinel had counted for `target_build` BEFORE this
+    /// candidate was launched. Forgiveness compares against it, so a candidate
+    /// killed before it ever reached `check_boot_health` cannot give back a launch
+    /// some earlier, genuinely crashed candidate observed.
+    trial_launches_before: u32,
     /// The `.app` ROOT to hand LaunchServices on the out-of-band lane. `None`
     /// whenever this process is not running from a bundle, which is one of the
     /// reasons that lane is refused.
@@ -1297,7 +1302,12 @@ fn worker_reject_and_reap_handoff_child(
     // build that never failed. `ChildDied` is the one outcome that IS the crash
     // signal and keeps its count. Real apply only: the QA seam has no target.
     if outcome != crate::UpdateHandoffOutcome::ChildDied && job.target_build > job.current_build {
-        aterm_update::forgive_trial_launch(job.target_build);
+        // …and only a launch THIS candidate observed: the count must have advanced
+        // past the snapshot taken before it was launched. A candidate killed in its
+        // first milliseconds (a revoking event lands while it is still exec'ing)
+        // counted nothing, and forgiving then would erase an earlier candidate's
+        // genuine crash observation.
+        aterm_update::forgive_trial_launch_if_advanced(job.target_build, job.trial_launches_before);
     }
     send_warranted_handoff_failure(
         warrant,
@@ -1436,6 +1446,12 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     if handoff_preparation_cancelled(&job, &proxy, None) {
         return;
     }
+    // SNAPSHOT THE TRIAL COUNTER HERE, on the WORKER, after the (slow) codesign
+    // pre-verification and as late as the lane allows: taken on the main thread at
+    // job construction it both froze the terminal for a `Staging::resolve` (which
+    // chmods) and could attribute a THIRD party's launch — counted during our own
+    // pre-verification — to this candidate (2026-08-19 round-4 skeptics).
+    job.trial_launches_before = aterm_update::trial_launch_count(job.target_build);
 
     let layout_roundtrip = job
         .layout
@@ -3209,6 +3225,9 @@ impl App {
             proof_identities,
             #[cfg(target_os = "macos")]
             lane,
+            // Set by the WORKER immediately before the candidate is launched; the
+            // main thread must not touch the staging directory here.
+            trial_launches_before: 0,
             #[cfg(target_os = "macos")]
             bundle,
             cleanup,
@@ -5291,6 +5310,7 @@ mod returned_handoff_completion_lane_tests {
                     failing_checks: 0,
                     failing_persistent: false,
                     failing_kind: String::new(),
+                    failing_applies: 0,
                 },
             ),
             CheckCompletion::Reduced,

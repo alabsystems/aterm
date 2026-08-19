@@ -1470,7 +1470,15 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // — so every check heals it here rather than letting `update status`
     // present `persistent=true` on an up-to-date install forever (see
     // [`crate::health::Health::expire_stale_apply_streak`]).
-    crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);
+    // …unless this process is an UNCOMMITTED HANDOFF CANDIDATE. A candidate spawns
+    // its own background check before it has taken over, and expiring the streak
+    // from there erased the very failures its own attempt was about to add —
+    // `failing_applies` could never pass 1, so an update that downloads and verifies
+    // but never starts stayed invisible (round-4 audit). Every other launch heals on
+    // its first check, exactly as before.
+    if !crate::is_uncommitted_handoff_candidate() {
+        crate::health::Health::expire_stale_apply_streak(&staging.health(), current_build);
+    }
     // The Application Support dir is the Updates dir's parent.
     let support = staging.root.parent().ok_or("no support dir")?.to_path_buf();
     // ONE walk of the token chain: the token, or the diagnosis explaining why there
@@ -1756,6 +1764,14 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
 
     // Downgrade gate: never stage an older-or-equal build. A terminal healthy
     // outcome — the whole pipeline this check exercised worked.
+    //
+    // DELIBERATELY NOT GATED ON THE BUNDLE AT THIS PATH. Suppressing the download
+    // when the installed bundle already carries this build would save one redundant
+    // fetch on a publisher's own machine — and would strand every machine whose
+    // newer bundle cannot be VERIFIED (mid-notarization, a broken seal, a yanked
+    // build), because the activation lane refuses it while the check lane would no
+    // longer acquire the release it could actually install. An unverified plist is
+    // not an input to an acquisition decision (2026-08-19 round-4 skeptics).
     if manifest.build_number <= current_build {
         crate::health::Health::record_success(&staging.health());
         crate::status::record(

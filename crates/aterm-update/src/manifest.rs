@@ -11,6 +11,61 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// Write `text` to `path` atomically AND DURABLY: temp file, `sync_all`, rename,
+/// best-effort directory sync — the shape `aterm_update_core::sentinel` already
+/// uses for the boot sentinel.
+///
+/// WHY THESE TWO FILES NEED IT (2026-08-19 round-4 audit). The sentinel is the
+/// commit marker for a swap and is `F_FULLFSYNC`'d; `trial.toml` (the trialed
+/// artifact's identity) and `installed-receipt.toml` (the proof the installed
+/// bundle is the artifact a ticket authorized) were written with a plain
+/// `write` + `rename`. APFS commits the rename in a metadata transaction that a
+/// later fsync can force, while the file's DATA pages stay dirty for up to ~30 s —
+/// so a KERNEL panic or power loss in the trial window could leave the sentinel
+/// armed beside a ZERO-LENGTH trial marker. (A userspace panic cannot: `write` and
+/// `rename` are complete syscalls and the page cache is coherent for every later
+/// reader. The dangerous window is the one the hardware can interrupt.) Every launch then counts, fails
+/// `ensure_current_trial_receipt` (no identity to prove), and on the third one the
+/// updater takes the "budget exhausted AND the rollback is unprovable" branch:
+/// it DISARMS instead of reverting, so a crash-looping build stays installed with
+/// its verified rollback sitting unused beside it. The two records must be as
+/// durable as the marker that points at them.
+///
+/// An "unsupported" sync (network home, some FUSE volumes — Apple's `sync_all` is
+/// a bare `F_FULLFSYNC` with no fallback) degrades to the previous non-durable
+/// behaviour rather than failing the apply; a real I/O error still aborts.
+pub(crate) fn write_durable(path: &Path, text: &str, what: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        match file.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    })();
+    if let Err(error) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write {what}: {error}"));
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("commit {what}: {error}"));
+    }
+    let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    Ok(())
+}
+
 /// The client's view of the release manifest attached to a GitHub Release as
 /// `aterm-appcast.toml`: just the fields the updater consumes, filled by
 /// [`Manifest::parse`] from the shared `aterm_update_core::manifest::Manifest`
@@ -302,15 +357,7 @@ impl InstalledReceipt {
             .ok_or_else(|| "installed receipt identity is malformed".to_string())?;
         let text = toml::to_string(&receipt)
             .map_err(|error| format!("serialize installed receipt: {error}"))?;
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if let Err(error) = std::fs::write(&tmp, text) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("write installed receipt: {error}"));
-        }
-        std::fs::rename(&tmp, path).map_err(|error| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("commit installed receipt: {error}")
-        })
+        write_durable(path, &text, "installed receipt")
     }
 
     /// Re-record a previously parsed receipt verbatim. Used when an exec-failure
@@ -573,8 +620,15 @@ pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60
 
 impl FailedMark {
     /// Read the memo, or `None` if absent/unparseable.
+    /// A marker that parses to ALL DEFAULTS is not a marker: every field carries
+    /// `#[serde(default)]`, so a zero-length file — a rename committed over data
+    /// extents a kernel panic never wrote — deserialized into `build_number: 0` and
+    /// answered "not this artifact" instead of failing closed, which would let a
+    /// just-quarantined build be re-downloaded and re-applied (2026-08-19 round-4
+    /// skeptics). Treated as ABSENT.
     pub fn read(path: &Path) -> Option<Self> {
-        toml::from_str(&crate::read_ledger_text(path)?).ok()
+        let parsed: Self = toml::from_str(&crate::read_ledger_text(path)?).ok()?;
+        (parsed.build_number != 0 || !parsed.sha256.is_empty()).then_some(parsed)
     }
 
     /// Whether this memo matches the given candidate (same build AND same DMG hash).
@@ -665,6 +719,11 @@ impl FailedMark {
     /// the very next check re-downloaded and re-applied the build that had just
     /// crash-looped, straight back into the crash/revert loop the poison existed to
     /// break.
+    /// DURABLE, like the trial identity it supersedes: this memo is the only thing
+    /// standing between a build that just crash-looped and the next check
+    /// re-downloading and re-applying it, and every other record that could
+    /// re-derive the verdict (trial, rollback, stage) is deleted moments later
+    /// (2026-08-19 round-4 skeptics).
     pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str) {
         let m = FailedMark {
             build_number,
@@ -708,12 +767,7 @@ impl FailedMark {
         let Ok(text) = toml::to_string(&m) else {
             return;
         };
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        } else {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = write_durable(path, &text, "artifact quarantine");
     }
 
     /// Atomically record `(build_number, sha256)`, reporting persistence failure.
@@ -736,15 +790,7 @@ impl FailedMark {
         };
         let text =
             toml::to_string(&m).map_err(|error| format!("serialize artifact marker: {error}"))?;
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if let Err(error) = std::fs::write(&tmp, text) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(format!("write artifact marker: {error}"));
-        }
-        std::fs::rename(&tmp, path).map_err(|error| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("commit artifact marker: {error}")
-        })
+        write_durable(path, &text, "artifact marker")
     }
 
     /// Clear the memo (called once a stage finally succeeds).
@@ -756,6 +802,28 @@ impl FailedMark {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zero-length marker — a rename committed over data extents a kernel panic
+    /// never wrote — must read as ABSENT, not as an all-defaults memo that answers
+    /// "not this artifact" and lets a just-quarantined build be re-applied.
+    #[test]
+    fn a_vacuous_marker_reads_as_absent_not_as_an_empty_memo() {
+        let dir = std::env::temp_dir().join(format!("aterm-vacuous-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("failed.toml");
+
+        std::fs::write(&path, "").unwrap();
+        assert!(FailedMark::read(&path).is_none(), "zero length is absent");
+        std::fs::write(&path, "build_number = 0\nsha256 = \"\"\n").unwrap();
+        assert!(FailedMark::read(&path).is_none(), "all-defaults is absent");
+
+        FailedMark::record_quarantine(&path, 42, &"ab".repeat(32));
+        let read = FailedMark::read(&path).expect("a real memo reads back");
+        assert_eq!(read.build_number, 42);
+        assert!(read.quarantined, "and keeps its verdict");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The regression this budget exists for: a stage failure must SUPPRESS the
     /// candidate for a while, then let it through again. The old marker had no

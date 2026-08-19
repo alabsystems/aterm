@@ -8152,6 +8152,9 @@ struct App {
     /// below which a disk observation predates that stage and must not retire it
     /// (`app_native::reconcile_native_update_facts`).
     native_stage_imported_at: Option<Instant>,
+    /// Last observed state of the automatic-apply switch, so the OFF→ON edge can
+    /// re-arm an intent the OFF cleared.
+    auto_apply_was_on: bool,
     /// How many times in a row a control apply's facts came back stale and were
     /// re-requested; bounded so a wedged facts worker (sequences restarted below
     /// the last reduced one) cannot turn one `update apply` into a hot loop.
@@ -10364,6 +10367,7 @@ impl App {
             next_native_update_reconcile_sequence: 1,
             last_native_update_reconcile_sequence: 0,
             native_stage_imported_at: None,
+            auto_apply_was_on: true,
             control_apply_stale_retries: 0,
             deferred_native_update_reconcile: None,
             pending_native_update_reconcile_purpose: None,
@@ -12490,6 +12494,22 @@ impl ApplicationHandler<Wake> for App {
         if self.lapse_expired_auto_apply_manual_only() {
             self.rearm_native_auto_apply_after_lapse();
         }
+        // AUTOMATIC APPLY TURNED BACK ON. Switching it off clears the armed intent
+        // (`poll` answers `Clear`), and nothing re-armed it when the switch came back:
+        // a verified stage then sat unapplied until the user reopened Settings, ran
+        // `aterm ctl update apply`, or relaunched — while the panel said "aterm
+        // installs new builds on its own" (2026-08-19 round-4 audit). Re-arm on the
+        // OFF→ON edge; `arm_native_auto_apply` is idempotent and refuses on its own
+        // when nothing is staged or a latch stands.
+        let auto_apply_on = app_config::update_auto_apply(&self.config);
+        if auto_apply_on
+            && !self.auto_apply_was_on
+            && self.auto_apply_intent.is_none()
+            && self.native_updater_service.snapshot().staged.is_some()
+        {
+            self.rearm_native_auto_apply_after_lapse();
+        }
+        self.auto_apply_was_on = auto_apply_on;
         if self
             .auto_apply_intent
             .is_some_and(|intent| Instant::now() >= intent.retry_at)
@@ -14296,6 +14316,11 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
+                // TAKEN OVER. Until this instant the updater treats this process as a
+                // candidate that may still be rejected, and refuses to expire another
+                // build's apply streak from here (see
+                // `aterm_update::set_uncommitted_handoff_candidate`).
+                aterm_update::set_uncommitted_handoff_candidate(false);
                 self.handoff_reader_gate.take();
                 let mut current: Vec<(u64, i32, i32)> = self
                     .pool
@@ -15507,6 +15532,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // second private channel carries the parent's irreversible Commit; readers
     // remain disabled between proof and Commit. Missing either half disables the
     // protocol so a partial/spoofed wire can never authorize PTY consumption.
+    // A LAUNCH THAT CARRIES A HANDOFF IS A CANDIDATE UNTIL IT IS COMMITTED. Declared
+    // before any thread (the background check reads it), cleared by
+    // `Wake::ActivateCommittedHandoff`.
+    aterm_update::set_uncommitted_handoff_candidate(
+        std::env::var_os("ATERM_HANDOFF_READY_FD").is_some()
+            || std::env::var_os("ATERM_HANDOFF_COMMIT_FD").is_some(),
+    );
     let ready_env_present = std::env::var_os("ATERM_HANDOFF_READY_FD").is_some();
     let commit_env_present = std::env::var_os("ATERM_HANDOFF_COMMIT_FD").is_some();
     let overlap_channels_present = ready_env_present || commit_env_present;
@@ -16632,6 +16664,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         next_native_update_reconcile_sequence: 1,
         last_native_update_reconcile_sequence: 0,
         native_stage_imported_at: None,
+        auto_apply_was_on: true,
         control_apply_stale_retries: 0,
         deferred_native_update_reconcile: None,
         pending_native_update_reconcile_purpose: None,

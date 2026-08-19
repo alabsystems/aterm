@@ -469,6 +469,14 @@ const RENDEZVOUS_NONCE_HEX: usize = 16;
 fn admitted_temp_base() -> Option<PathBuf> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let base = std::env::temp_dir();
+    // ABSOLUTE ONLY. `$TMPDIR` is whatever the environment says; a relative value
+    // (`TMPDIR=tmp`) composes a relative socket path that binds fine against THIS
+    // process's cwd and then cannot be dialed by a LaunchServices successor, whose
+    // cwd is `/` — the parent parks its terminal for the full readiness deadline and
+    // the fork fallback is never taken, on every attempt (2026-08-19 round-4 audit).
+    if !base.is_absolute() {
+        return None;
+    }
     let canonical_tmp = |p: &Path| p == Path::new("/tmp") || p == Path::new("/private/tmp");
     if canonical_tmp(&base) || base.starts_with("/tmp") || base.starts_with("/private/tmp") {
         return None;
@@ -510,7 +518,9 @@ pub(crate) fn rendezvous_dir() -> Option<PathBuf> {
     {
         return Some(dir);
     }
-    crate::control_auth::socket_dir()
+    // The fallback carries the same requirement: a relative path binds against THIS
+    // process's cwd and cannot be dialed by a LaunchServices successor (cwd `/`).
+    crate::control_auth::socket_dir().filter(|dir| dir.is_absolute())
 }
 
 /// After the bind: prove the node really is OUR socket inside OUR real directory —
@@ -589,7 +599,10 @@ fn sweep_dead_rendezvous(dir: &Path) {
 /// same length.
 #[must_use]
 pub(crate) fn rendezvous_path_fits() -> bool {
-    let Some(dir) = rendezvous_dir_candidate().or_else(crate::control_auth::socket_dir) else {
+    let Some(dir) = rendezvous_dir_candidate()
+        .or_else(crate::control_auth::socket_dir)
+        .filter(|dir| dir.is_absolute())
+    else {
         return false;
     };
     rendezvous_path(&dir, &"0".repeat(32))
