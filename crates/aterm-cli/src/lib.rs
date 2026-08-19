@@ -116,7 +116,7 @@ const HELP: &str = concat!(
     "\n",
     "TOOLCHAIN (use aterm to run all our programs; see docs/ATERM-DISTRIBUTION-WEDGE.md):\n",
     "    aterm <tool> [args]       Run a pinned, installed tool, e.g. `aterm ay`, `aterm ty`,\n",
-    "                              `aterm trust`. Resolved from the managed store (never $PATH);\n",
+    "                              `aterm trustc`. Resolved from the managed store (never $PATH);\n",
     "                              `aterm pkg install <tool>` adds one. (Installing a program\n",
     "                              standalone the normal way still works too.)\n",
     "\n",

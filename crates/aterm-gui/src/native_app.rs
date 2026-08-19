@@ -2020,6 +2020,16 @@ pub(crate) enum PackagesRequest {
     CheckUpdate,
     /// `atpkg install --default-set` — the explicit ALab-toolset consent click.
     InstallDefaultSet,
+    /// `atpkg uninstall --all` — remove the whole managed toolset and reclaim its
+    /// disk (multiple GB).
+    ///
+    /// The way IN is zero clicks and no prompt (§9.1: the bytes ship inside the app,
+    /// so installing the app is the consent). A way OUT that exists only as a CLI verb
+    /// the user must first learn about is not a matching exit, and the asymmetry is
+    /// what makes an unprompted multi-GB install feel like something done TO someone.
+    /// Trashing aterm.app does not reclaim the store either — it orphans it under
+    /// Application Support.
+    UninstallAll,
 }
 
 /// Synchronous admission outcome for a [`PackagesRequest`] (the worker's real

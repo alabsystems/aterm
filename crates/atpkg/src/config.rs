@@ -44,10 +44,26 @@ pub struct PackagesConfig {
     /// default on any violation. So a hostile config can redirect the store only to a
     /// place that is already at least as safe as the default.
     ///
-    /// The reason to set it is the VERIFIED lane: Trust's verified launcher refuses a
-    /// user-owned toolchain path, so a toolchain installed under `$HOME` can only ever
-    /// be used unverified. Pointing this at a root-owned prefix (and installing as
-    /// root) is what makes `targo trust` usable on an atpkg-delivered toolchain.
+    /// CORRECTION 2026-08-18: this doc used to say a root-owned prefix was REQUIRED for
+    /// the verified lane — that "Trust's verified launcher refuses a user-owned toolchain
+    /// path", so `targo trust` could not run on anything atpkg installed under `$HOME`.
+    /// That was true of an older Trust and is now false, and it is worth stating loudly
+    /// because it nearly bought this project a `.pkg` installer, an admin prompt and a
+    /// privileged updater daemon it does not need.
+    ///
+    /// Trust's default authority mode is `CallerOwned`
+    /// (`targo/src/cargo/util/process_authority.rs`): a path component may be owned by
+    /// root **or by the invoking identity**, and must not be group/world-writable. The
+    /// DEFAULT `$HOME` prefix (0700, ours) satisfies it, so proving works with no
+    /// privilege at all — Trust's own comment cites rustup's `~/.rustup` as the case that
+    /// demanding root would break. Root is in fact REFUSED: targo bails when
+    /// `effective_uid == 0`, because root-launched build scripts retain write authority
+    /// over the execution objects.
+    ///
+    /// So the reason to set this is NOT the verified lane. It is a genuine system-wide
+    /// install (one store shared by several users), or opting in to
+    /// `TRUST_REQUIRE_SEALED_LAUNCHER=1`, whose sealed-release predicate Trust itself
+    /// documents as still unimplementable. See `docs/GOLDEN-INSTALL-PATH.md` §2.
     pub prefix: Option<String>,
     /// Master for the background tools loop (the GUI's `spawn_pkg_update_check`).
     /// Default TRUE (today's behavior). Read by the GUI, not by atpkg's own
@@ -56,10 +72,25 @@ pub struct PackagesConfig {
     /// Run `atpkg update` on the background cadence. Default TRUE (today's
     /// behavior). Read by the GUI loop gate.
     pub auto_update: Option<bool>,
-    /// ALSO install missing index default-set members on the `update` pass
-    /// (§11 batteries-included bootstrap). Default FALSE — multi-GB toolchains
-    /// need explicit consent; the Settings switch is the consent click.
+    /// Bootstrap the index default set over the NETWORK on a machine that has
+    /// not adopted the toolset (§11). Default FALSE — pulling a multi-GB
+    /// toolchain onto a machine that has never had one needs explicit consent,
+    /// and the Settings switch is that click.
+    ///
+    /// This is NOT the switch that keeps an existing toolset complete. Once a
+    /// machine has ADOPTED the set — the batteries-included seed bootstrap, or
+    /// an explicit `install --default-set` — newly published members arrive on
+    /// the ordinary update pass regardless of this bit
+    /// ([`crate::store::Layout::adopted`]). Conflating the two made a user's
+    /// toolchain decay into "whatever was published on install day".
     pub auto_install: Option<bool>,
+    /// Install the BUNDLED seed registry on the first-run `atpkg seed` pass
+    /// (§9.1 batteries-included). Default TRUE — the seed's bytes are already
+    /// on disk, sealed under the app's own code signature, so installing the
+    /// app is the consent for laying them down; the download-consent switch
+    /// (`auto_install`) keeps gating the NETWORK bootstrap unchanged. `false`
+    /// turns the first run back into an announced offer (Settings ▸ Packages).
+    pub seed_install: Option<bool>,
     /// Index owner override (e.g. `"alabsystems"`). Default = the compiled
     /// owner; `ATPKG_ACCOUNT` env beats this ([`crate::discovery::resolve_account`]).
     /// Slug-validated downstream — a malformed value can never redirect fetches.
@@ -105,6 +136,14 @@ impl PackagesConfig {
     #[must_use]
     pub fn auto_install(&self) -> bool {
         self.auto_install.unwrap_or(false)
+    }
+
+    /// Whether the first-run `seed` pass INSTALLS the bundled registry rather
+    /// than announcing it. Default TRUE (§9.1 — local bytes under the app's
+    /// own signature; installing the app is the consent).
+    #[must_use]
+    pub fn seed_install(&self) -> bool {
+        self.seed_install.unwrap_or(true)
     }
 
     /// The narrowing-only include filter (empty ⇒ the whole index default set).
@@ -295,6 +334,11 @@ mod tests {
             !cfg.auto_install(),
             "auto_install must default OFF (consent)"
         );
+        assert!(
+            cfg.seed_install(),
+            "seed_install must default ON (§9.1 — the bundled bytes are local and sealed; \
+             installing the app is the consent)"
+        );
         assert!(cfg.include().is_empty());
         assert!(cfg.exclude().is_empty());
         assert!(cfg.links.is_empty());
@@ -307,6 +351,7 @@ mod tests {
     fn full_table_parses_every_key() {
         let cfg = parse_packages(
             "[packages]\nenabled = true\nauto_update = false\nauto_install = true\n\
+             seed_install = false\n\
              account = \"alabsystems\"\nchannel = \"nightly\"\n\
              include = [\"ay\", \"trust\"]\nexclude = [\"trust\"]\n\
              [packages.links]\nay = \"~/ay\"\norc = \"alabsystems/orc\"\n",
@@ -314,6 +359,7 @@ mod tests {
         assert_eq!(cfg.enabled, Some(true));
         assert_eq!(cfg.auto_update, Some(false));
         assert!(cfg.auto_install());
+        assert!(!cfg.seed_install());
         assert_eq!(cfg.account(), Some("alabsystems"));
         assert_eq!(cfg.channel(), "nightly");
         assert_eq!(cfg.include(), ["ay".to_string(), "trust".to_string()]);

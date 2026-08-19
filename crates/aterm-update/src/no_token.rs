@@ -155,7 +155,7 @@ pub(crate) fn announce_unreadable(staging: &Staging, current_build: u64, explana
 /// ~60/hour per-IP anonymous one. Throttled like the stranded warning; silent when
 /// nothing was rejected (an absent source is just "not configured", which on a public
 /// channel is a perfectly normal state and must stay quiet).
-pub(crate) fn note_unusable_token(diagnosis: &Diagnosis) {
+pub(crate) fn note_unusable_token(source: &crate::Source, diagnosis: &Diagnosis) {
     let rejections = diagnosis.rejections();
     if rejections.is_empty() {
         return;
@@ -167,7 +167,12 @@ pub(crate) fn note_unusable_token(diagnosis: &Diagnosis) {
              public channel, but this machine shares the anonymous ~60 requests/hour per IP \
              budget instead of its own 5000/hour. Fix it with: {}",
             rejections.join("; "),
-            aterm_update_core::token::PROVISION_COMMAND
+            // THE RUNG THIS SOURCE ACTUALLY CONSULTS. This path is public-channel by
+            // construction (its own doc: "a check that nonetheless succeeded"), and
+            // there the chain reads only `$ATERM_UPDATE_TOKEN` — so naming the 0600
+            // file sent the operator to fix something that is never read
+            // (2026-08-19, third instance of the class).
+            aterm_update_core::token::provision_remedy(&source.owner, &source.repo)
         ),
     );
 }
@@ -197,14 +202,19 @@ pub(crate) fn notification() -> (String, String) {
         .unwrap_or_else(|e| e.into_inner())
         .clone()
         .unwrap_or_else(|| {
-            format!(
-                "aterm cannot read its release repository. If the channel is private, \
-                 provision a token by running: {}",
-                aterm_update_core::token::PROVISION_COMMAND
-            )
+            // The fallback fires only when no explanation was recorded, so it has no
+            // source in hand and must not name a rung: `aterm-ctl update status`
+            // prints the chain that actually ran for THIS machine.
+            "aterm cannot read its release repository. Run `aterm-ctl update status` \
+             for the exact cause and the token chain this machine consulted."
+                .to_string()
         });
     (
-        "aterm will never auto-update on this Mac".to_string(),
+        // NOT "will never": `clear()` drops the stranded latch on ANY successful
+        // releases list, so the honest claim is the one the body already makes —
+        // this Mac stays put UNTIL the cause is fixed. (Same false absolute the
+        // installer's warning carried, removed in f8279ac5.)
+        "aterm is not updating on this Mac".to_string(),
         format!(
             "{why}\n\nThis Mac will stay on its current build until you fix it. Then run \
              `aterm-ctl update check`."
@@ -232,17 +242,32 @@ mod tests {
     #[test]
     fn the_notification_names_the_consequence_and_the_exact_fix() {
         let (title, body) = notification();
+        // THE CONSEQUENCE, NOT AN ABSOLUTE. "will never auto-update" is a claim the
+        // code does not enforce: `clear()` drops the latch on ANY successful releases
+        // list, so the machine resumes the moment the cause is fixed — which is
+        // exactly what the body says. The title must not outrun it (2026-08-19).
         assert!(
-            title.contains("never auto-update"),
-            "the title must state the consequence, not the mechanism: {title}"
+            title.contains("not updating"),
+            "the title must state the consequence: {title}"
         );
         assert!(
-            body.contains(aterm_update_core::token::PROVISION_COMMAND),
-            "the body must carry the copy-pasteable remedy: {body}"
+            !title.contains("never"),
+            "…without claiming a permanence the code does not enforce: {title}"
         );
         assert!(
             body.contains("stay on its current build"),
             "the body must say what happens if it is ignored: {body}"
+        );
+        // The FALLBACK body (no explanation recorded) has no source in hand, so it
+        // must point at the diagnostic that prints this machine's real token chain
+        // rather than name a rung the configured channel may never consult.
+        assert!(
+            body.contains("aterm-ctl update status"),
+            "the body must carry an actionable next step: {body}"
+        );
+        assert!(
+            !body.contains(aterm_update_core::token::PROVISION_COMMAND),
+            "…and must not print a remedy the public channel would ignore: {body}"
         );
     }
 
@@ -312,20 +337,27 @@ mod tests {
         // Asserted as a DELTA rather than an absolute, so this stays correct beside
         // the sibling tests that legitimately arm the latch in the same process.
         let before = is_stranded();
-        note_unusable_token(&unprovisioned());
+        let public = crate::Source {
+            owner: "alabsystems".to_string(),
+            repo: "aterm".to_string(),
+        };
+        note_unusable_token(&public, &unprovisioned());
         assert_eq!(
             is_stranded(),
             before,
             "an ABSENT token source is the normal public-channel state and must not \
              touch the latch"
         );
-        note_unusable_token(&Diagnosis {
-            resolved: None,
-            probes: vec![SourceProbe {
-                source: "0600 update-token file",
-                outcome: ProbeOutcome::Rejected("chmod 600 it"),
-            }],
-        });
+        note_unusable_token(
+            &public,
+            &Diagnosis {
+                resolved: None,
+                probes: vec![SourceProbe {
+                    source: "0600 update-token file",
+                    outcome: ProbeOutcome::Rejected("chmod 600 it"),
+                }],
+            },
+        );
         assert_eq!(
             is_stranded(),
             before,

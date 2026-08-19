@@ -48,9 +48,10 @@ the reviewed `Cargo.lock` needs no regeneration — plus modified vendored
 crates, the public README media, the installer script `tools/install.sh`, and
 the license material needed for that boundary.
 
-A few test targets in that workspace read internal proof packets and the
-changelog, which the export omits; those tests fail here and are not part of
-the contributor gate. [CONTRIBUTING.md](CONTRIBUTING.md) names them.
+Where a test's only fixture is something the export omits — the internal `ay`
+proof bundles, the changelog — that test is left out too, so a fresh clone of
+this tree tests clean. Those obligations still run on the development line,
+where their inputs exist.
 
 It contains no release credentials, no prebuilt executable, no updater payload,
 and no managed ALab tool package. Those are distributed, not exported: the

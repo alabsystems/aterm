@@ -6925,6 +6925,18 @@ fn recover_published_cut(
 /// ledger, which supplies only the build number. Cutting twice without
 /// bumping Cargo.toml therefore lands on the already-published guard in
 /// [`verify::derive_cut_mode`], which names the bump.
+/// Whether this cut deliberately ships WITHOUT the batteries-included toolchain
+/// seed (§9.1). The one spelling of the escape hatch, read by both the
+/// pre-claim gate and the journaled `step_build`, so the two can never disagree
+/// about what this cut is.
+///
+/// Exactly `1` — not "any value set". A `ATERM_SEEDLESS=0` that silently meant
+/// "seedless" would be the worst possible reading of an operator's intent, and
+/// the same strict-`1` rule already governs the other env switches here.
+fn seedless_cut() -> bool {
+    std::env::var("ATERM_SEEDLESS").is_ok_and(|v| v.trim() == "1")
+}
+
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // Resolved ONCE, here — the explicit flag when given, else this machine's
     // provisioned identity (`~/.aterm/machine.key`, the same file every atpkg
@@ -7109,6 +7121,47 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             gr.head_short
         ),
     );
+
+    // Batteries-included seed, PRE-CLAIM (§9.1 + the ordering rule above):
+    // everything that can fail must fail before the ledger claim burns a build
+    // number, and a missing or drifted seed certainly fails step_build. Cheap —
+    // signature checks over a few MB of manifests plus stat calls; artifact
+    // bytes are never read. step_build revalidates the same dir (the authority
+    // for what actually seals); this gate only makes the refusal free.
+    // `ATERM_SEEDLESS=1` is checked BEFORE `resolve`, never as a `None` arm: it
+    // means "this cut ships no seed", which must hold whatever is lying in
+    // `dist/`. Testing it only when no dir exists made the documented escape
+    // hatch unreachable in the one case an operator actually needs it — a stale
+    // or half-staged `dist/toolchain-seed` would fail validation and there was
+    // no way to proceed except deleting the directory.
+    if seedless_cut() {
+        step("seed", "NONE — deliberately seedless (ATERM_SEEDLESS=1)");
+    } else {
+        let dist = repo.join("dist");
+        match crate::seedpack::resolve(&dist) {
+            Some(dir) => {
+                let stat = crate::seedpack::validate(&dir)
+                    .map_err(|e| Error::new(format!("toolchain seed gate (pre-claim): {e}")))?;
+                step(
+                    "seed",
+                    &format!(
+                        "{} program(s) staged, index_build {}, valid_until {}",
+                        stat.programs.len(),
+                        stat.index_build,
+                        stat.valid_until
+                    ),
+                );
+            }
+            None => {
+                return Err(Error::new(
+                    "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
+                     a batteries-included cut seals every published binary into the app. Stage \
+                     one with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
+                     deliberately seedless with ATERM_SEEDLESS=1. No ledger claim was made.",
+                ));
+            }
+        }
+    }
     step(
         "",
         &format!(
@@ -7920,7 +7973,13 @@ fn run_gate_script(repo: &Path) -> Result<()> {
 /// one-line delegations, so nothing about how a DMG is actually built moved.
 pub trait Packager {
     fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
-    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged>;
+    /// `notarized` says whether the bundle really carries a Developer-ID signature and
+    /// a stapled ticket. It decides whether the stripped-bundle Gatekeeper check is
+    /// advisory (ad-hoc tier: spctl rejects everything, so a failure proves nothing) or
+    /// FATAL (notarized tier: a rejection means the lean updater zip would fail on every
+    /// client).
+    fn zip(&self, app: &Path, dist: &Path, version: &str, notarized: bool)
+    -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
 }
@@ -7932,8 +7991,14 @@ impl Packager for RealPackager {
     fn dmg(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
         dmg::create(app, dist, version).map_err(Error::new)
     }
-    fn zip(&self, app: &Path, dist: &Path, version: &str) -> Result<dmg::Packaged> {
-        dmg::create_zip(app, dist, version).map_err(Error::new)
+    fn zip(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        notarized: bool,
+    ) -> Result<dmg::Packaged> {
+        dmg::create_zip(app, dist, version, notarized).map_err(Error::new)
     }
     fn sha256(&self, path: &Path) -> Result<String> {
         dmg::sha256_file(path).map_err(Error::new)
@@ -7988,7 +8053,8 @@ pub fn notarize_and_package(
     pack: &dyn Packager,
 ) -> Result<PackagedCut> {
     // THE BUNDLE IS NOTARIZED FIRST, before either container exists.
-    if sign::notarize_app(app, tier, tools).map_err(Error::new)? {
+    let notarized_app = sign::notarize_app(app, tier, tools).map_err(Error::new)?;
+    if notarized_app {
         step(
             "notarize",
             &format!(
@@ -8024,7 +8090,11 @@ pub fn notarize_and_package(
     // DMG because `ditto` must archive the bundle directly to preserve its seal,
     // and `create_zip` hashes what it writes, so its digest already covers the
     // ticket without a second pass.
-    let zip = pack.zip(app, dist, version)?;
+    // `notarize_app` reported whether this bundle actually got a Developer-ID
+    // signature and a stapled ticket; pass it through so the stripped-bundle
+    // Gatekeeper check knows whether an spctl rejection is meaningless (ad-hoc) or
+    // fleet-fatal (notarized).
+    let zip = pack.zip(app, dist, version, notarized_app)?;
     Ok(PackagedCut {
         dmg: dmg_out,
         dmg_sha256,
@@ -8090,6 +8160,38 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         ),
     );
 
+    // Batteries-included seed (§9.1, reinstated 2026-08-17): validate BEFORE
+    // assemble so a cut never seals a seed its own client would refuse — the
+    // gate IS the client's chain (`seedpack::validate` runs atpkg's DirFetcher
+    // + roster + index selection under the compiled paper master). A cut with
+    // NO seed dir is refused too: "installs with all the binaries" is the
+    // product default, so shipping seedless takes the explicit
+    // `ATERM_SEEDLESS=1` (stamped `seed=no` in the provenance record).
+    //
+    // The pre-claim gate in `run_cut` already made this exact decision, but it
+    // is re-derived rather than threaded: `step_build` is a JOURNALED step and a
+    // `--resume` can enter here in a fresh shell that never ran the pre-claim
+    // gate. Re-reading the env keeps the two answers identical on a normal cut,
+    // and the refusal below names the variable so a resumed seedless cut is told
+    // exactly what to re-export instead of failing with a puzzle.
+    let seed = if seedless_cut() {
+        None
+    } else {
+        match crate::seedpack::resolve(&ctx.dist) {
+            Some(dir) => Some(crate::seedpack::validate(&dir).map_err(Error::new)?),
+            None => {
+                return Err(Error::new(
+                    "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
+                     a batteries-included cut seals every published binary into the app. Stage \
+                     one with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
+                     deliberately seedless with ATERM_SEEDLESS=1. If this is a --resume of a \
+                     cut that was already running seedless, re-export ATERM_SEEDLESS=1 in this \
+                     shell: the flag is read from the environment, not from the journal.",
+                ));
+            }
+        }
+    };
+
     let spec = bundle::BundleSpec {
         repo_root: ctx.repo.clone(),
         out_dir: ctx.dist.clone(),
@@ -8098,13 +8200,23 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         bundle_id: "com.aterm.aterm".to_string(),
         git_commit: stamp.clone(),
         aterm_bin: bout.aterm,
+        seed,
     };
     let app = bundle::assemble(&spec)?;
     step(
         "bundle",
         &format!(
-            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}",
-            ctx.version, ctx.build,
+            "aterm.app: Short={}  CFBundleVersion={}  ATermGitCommit={stamp}  seed={}",
+            ctx.version,
+            ctx.build,
+            match &spec.seed {
+                Some(s) => format!(
+                    "{} program(s), index_build {}",
+                    s.programs.len(),
+                    s.index_build
+                ),
+                None => "none (ATERM_SEEDLESS=1)".to_string(),
+            }
         ),
     );
 
@@ -9800,9 +9912,41 @@ const ANON_PROBE_DELAY: Duration = Duration::from_secs(6);
 
 /// Run one anonymous `curl` probe, retrying while it fails.
 ///
+/// The retry budget is deliberately short (about a minute): it exists to outlast
+/// GitHub's own eventual consistency after a flip, not a rate-limit window, which
+/// is an hour and is reported as such — see [`anon_probe_rate_limited`].
+///
 /// Credentials are stripped from the child on every attempt: the whole point is to
 /// see the channel exactly as an install with no token sees it. See
 /// [`ANON_PROBE_ATTEMPTS`] for why retrying is sound.
+/// Whether an anonymous probe's failure is GitHub's unauthenticated RATE LIMIT
+/// (60 requests/hour per IP) rather than a statement about the channel. `curl -f`
+/// collapses every 4xx into exit 22 with the status in its message, so the code is
+/// read out of the text — the same shape the client's `download_bytes` uses.
+///
+/// MEASURED 2026-08-19: a cut from a machine that had spent the hour's anonymous
+/// budget failed at the post-flip probe with "the public channel … is NOT readable
+/// without a credential" and told the operator to make an already-public repo
+/// public. The mirror step is the LAST step of a cut, so the release was live on
+/// the origin, the draft was on the channel, and the wrong remedy was the only
+/// thing on screen.
+#[must_use]
+fn anon_probe_rate_limited(out: &std::process::Output) -> bool {
+    anon_probe_stderr_is_rate_limit(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// The text half of [`anon_probe_rate_limited`], split out so it is testable
+/// without a process.
+#[must_use]
+pub fn anon_probe_stderr_is_rate_limit(stderr: &str) -> bool {
+    let Some(idx) = stderr.find("returned error: ") else {
+        return false;
+    };
+    let rest = &stderr[idx + "returned error: ".len()..];
+    let code: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    matches!(code.as_str(), "403" | "429")
+}
+
 fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
     let mut last = None;
     for attempt in 1..=ANON_PROBE_ATTEMPTS {
@@ -9842,6 +9986,23 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         &url,
     ])?;
     if !out.status.success() {
+        // A RATE LIMIT IS NOT A VERDICT ABOUT THE CHANNEL. Every probe here is
+        // deliberately anonymous, and GitHub's unauthenticated budget is 60 requests
+        // per hour PER IP — a machine that has been checking for updates all day
+        // (or a NAT) can exhaust it. Say that, with the remedy that actually works.
+        if anon_probe_rate_limited(&out) {
+            return Err(Error::new(format!(
+                "the anonymous readability probe of {url} was RATE LIMITED by GitHub \
+                 ({}). This says nothing about whether {slug} is public — the \
+                 unauthenticated budget is 60 requests/hour per IP and this machine has \
+                 spent it. The release is live on the origin and its channel draft is \
+                 uploaded; wait for the hour to roll over (`curl -s \
+                 https://api.github.com/rate_limit` shows the reset) and run \
+                 `cargo ship cut --resume`, which converges without re-uploading \
+                 anything.",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
+        }
         return Err(Error::new(format!(
             "the public channel {slug} is NOT readable without a credential: an \
              unauthenticated GET of {url} failed ({}). Every authenticated check \

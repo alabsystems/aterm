@@ -458,10 +458,13 @@ fn a_change_scoped_run_that_selected_nothing_compiles_nothing() {
     repo.with_stage2("echo \"argv: $*\"\nexit 0");
     let (ladder, _) = repo.run(Mode::Fast, Scope::changed("main", vec![], true), false);
 
+    // No "(trustdoc)" on the skipped test/doctest lines: a run that compiled
+    // nothing never chose a doc driver, so the skip names no tool it never
+    // bound — the empty selection outranks the doc-driver verdict.
     for named in [
         "targo build <no crates selected> (change-scoped run selected no crates)",
-        "targo test <no crates selected> (trustdoc) (change-scoped run selected no crates)",
-        "targo test --doc <no crates selected> (trustdoc) (change-scoped run selected no crates)",
+        "targo test <no crates selected> (change-scoped run selected no crates)",
+        "targo test --doc <no crates selected> (change-scoped run selected no crates)",
     ] {
         assert!(
             labels_with(&ladder, "skip").iter().any(|l| l == named),

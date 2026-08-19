@@ -82,6 +82,11 @@ pub(crate) struct DurableUpdateStatus {
     /// escalated but whose last failure was a network blip records `network`
     /// (2026-08-19 round-4 skeptics).
     pub(crate) failing_applies: u32,
+    /// This launch has a bundle the updater could REPLACE. `false` for a run from
+    /// the mounted DMG, a Gatekeeper-translocated copy, or a dev-marked install —
+    /// states in which no check thread ever starts, so every ledger field is the
+    /// pristine default of a machine that structurally cannot update.
+    pub(crate) installable: bool,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -274,6 +279,8 @@ pub(crate) struct UpdaterSnapshot {
     /// Consecutive APPLY failures from the ledger — the exact "the staged build
     /// will not start" signal (`failing_kind` is only the most recent class).
     pub(crate) failing_applies: u32,
+    /// See [`DurableUpdateStatus::installable`].
+    pub(crate) installable: bool,
 }
 
 impl UpdaterSnapshot {
@@ -661,6 +668,7 @@ impl NativeUpdaterService {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                installable: true,
             },
             next_operation: 1,
             work_generation: 0,
@@ -852,6 +860,7 @@ impl NativeUpdaterService {
             String::new()
         };
         self.snapshot.failing_applies = status.failing_applies;
+        self.snapshot.installable = status.installable;
         if !status.enabled {
             let before = self.model_state();
             self.snapshot.active = None;
@@ -1276,11 +1285,22 @@ impl NativeUpdaterService {
         // again (a newer one lands, or it is rolled back under us) the stage retires
         // and the next observation imports whatever is there now.
         if staged.is_installed_activation() {
+            // ABSENCE OF EVIDENCE IS NOT EVIDENCE THE BUNDLE CHANGED. `installed`
+            // is `None` whenever the facts worker could not PROVE the bundle this
+            // pass — `installed_update_facts` fails closed, and its `spctl` probe
+            // rides a 30 s ceiling that a captive portal or half-open network
+            // reaches routinely. Retiring on that observation threw away a
+            // perfectly good activation, and nothing re-announced it: the check
+            // thread's watch latches one announcement per build and the download
+            // lane is silent while a stage covers the release, so the update sat
+            // lost until the next relaunch (2026-08-19 round-5 audit). Keep the
+            // stage; retire only when the bundle is OBSERVED and no longer backs it.
+            let Some(installed) = installed else {
+                return DurableStageDisposition::Unchanged;
+            };
             let backed = self.snapshot.enabled
-                && installed.is_some_and(|installed| {
-                    staged.commit.as_deref().is_some_and(|commit| {
-                        installed.backs_activation(self.snapshot.current_build, staged.build, commit)
-                    })
+                && staged.commit.as_deref().is_some_and(|commit| {
+                    installed.backs_activation(self.snapshot.current_build, staged.build, commit)
                 });
             if backed {
                 return DurableStageDisposition::Unchanged;
@@ -1517,6 +1537,7 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
         }
     }
 
@@ -1807,6 +1828,7 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
         };
         assert!(staged_from_status(11, 0, &download).is_none());
         download.staged_commit = Some("0".repeat(40));
@@ -1838,6 +1860,7 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
         };
         let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
         assert_eq!(imported.commit, stage.commit);
@@ -1930,10 +1953,23 @@ mod tests {
             service.reconcile_durable_stage(true, None, None, None, Some(&rolled_back)),
             DurableStageDisposition::Retired
         );
-        // And with no installed observation at all: nothing backs it — retire.
+        // NO OBSERVATION AT ALL is not "the bundle changed": the facts worker fails
+        // closed (its `spctl` probe rides a 30 s ceiling a captive portal reaches),
+        // and retiring on that lost a good activation that nothing re-announced
+        // (2026-08-19 round-5 audit). The stage is KEPT and re-judged next pass.
         stage_activation(&mut service, 11);
         assert_eq!(
             service.reconcile_durable_stage(true, None, None, None, None),
+            DurableStageDisposition::Unchanged
+        );
+        assert!(
+            service.snapshot().staged.is_some(),
+            "an unobservable bundle must not throw the activation away"
+        );
+        // …and once the bundle IS observed and no longer backs it, it retires.
+        let moved_on = installed(12, TEST_COMMIT, None, None);
+        assert_eq!(
+            service.reconcile_durable_stage(true, None, None, None, Some(&moved_on)),
             DurableStageDisposition::Retired
         );
     }

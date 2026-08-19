@@ -2511,6 +2511,23 @@ fn apply_staged_if_ready_inner(
     // state and must not be resurrected after an inverse swap.
     let previous_receipt = previous_receipt_for_sealed_old(&staging, old_build, &old_commit);
 
+    // 7b. THE CANDIDATE MUST BE ABLE TO START. Every check so far is cryptographic;
+    // none of them proves the binary LOADS. The crash-loop sentinel cannot cover that
+    // case — it runs inside the new build's own `main` — so a bundle that dyld or
+    // Gatekeeper rejects before `main` would be swapped in and never reverted, leaving
+    // a bricked app beside the verified predecessor it should have rolled back to.
+    // Start it once, here, while OLD is still installed and backing out is free.
+    if let Err(error) = crate::verify::probe_bundle_starts(&prepared.fixed, ready.build_number) {
+        recover_prepared_candidate(&prepared, &staging);
+        crate::manifest::FailedMark::record_stage_failure(
+            &staging.failed(),
+            ready.build_number,
+            &ready.dmg_sha256,
+            unix_now_secs(),
+        );
+        return ApplyOutcome::Deferred(format!("staged candidate cannot start: {error}"));
+    }
+
     // 8. Arm exact crash-loop authority only after fixed NEW is fully verified and
     // immediately before the atomic swap. A crash after this boundary has one
     // deterministic pre-swap shape: installed=OLD, fixed=NEW, ready+trial exact.

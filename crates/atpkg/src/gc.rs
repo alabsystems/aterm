@@ -372,10 +372,38 @@ pub fn live_builds(layout: &Layout) -> LiveSet {
 /// from a `read_dir` fold.
 #[must_use]
 pub fn reclaimable(installed: &[u64], live: &LiveBuild) -> Vec<u64> {
+    reclaimable_with_provisional(installed, live, &BTreeSet::new())
+}
+
+/// [`reclaimable`], plus the builds that must NOT be kept as a rollback target because
+/// they were never really in service.
+///
+/// A build laid down by the batteries-included seed and superseded by the very next
+/// `update` pass is the case this exists for. The seal is a snapshot of the channel at
+/// CUT time; a machine installing weeks later runs the seed, then the 6h loop's first
+/// pass immediately upgrades whatever the published index has moved. Under the plain
+/// rule that seed build becomes the retained rollback — so `trust` alone occupies
+/// ~3.2 GB live plus ~3.2 GB rollback, to preserve the ability to return to a state the
+/// user occupied for about thirty seconds and never used.
+///
+/// Rollback safety is not really surrendered: these builds are published, so
+/// `atpkg install <program>` can fetch one back. What is surrendered is doing it
+/// instantly, and that is a poor trade against doubling the largest thing on disk.
+pub fn reclaimable_with_provisional(
+    installed: &[u64],
+    live: &LiveBuild,
+    provisional: &BTreeSet<u64>,
+) -> Vec<u64> {
     let mut keep: BTreeSet<u64> = BTreeSet::new();
     keep.insert(live.build);
-    // The rollback target is the most-recent build the live one superseded.
-    if let Some(rollback) = installed.iter().copied().filter(|&b| b < live.build).max() {
+    // The rollback target is the most-recent build the live one superseded — unless
+    // that build is provisional, in which case there is nothing worth keeping it for.
+    if let Some(rollback) = installed
+        .iter()
+        .copied()
+        .filter(|&b| b < live.build && !provisional.contains(&b))
+        .max()
+    {
         keep.insert(rollback);
     }
     let mut out: Vec<u64> = installed
@@ -561,6 +589,17 @@ pub struct GcReport {
     /// GC never resolves a disagreement by deleting something; `atpkg doctor` prints these,
     /// so a divergence surfaces as a diagnostic instead of as unexplained disk growth.
     pub diverged: Vec<Divergence>,
+    /// `(program, staged file names ascending)` for compressed archives a killed
+    /// download left in `staging/`.
+    ///
+    /// Its own category because it is its own leak: `swept_partial`/`swept_scratch`
+    /// are extracted trees under `store/`, while this is the multi-hundred-MB
+    /// `.tar.zst` that sits in `staging/<program>/` for the whole
+    /// download+verify+extract window. Nothing swept it — gc walked `store/` only —
+    /// so a SIGKILL mid-install stranded the archive permanently while `atpkg gc`
+    /// reported "nothing to reclaim". The batteries-included seed made that routine
+    /// rather than rare: every first run parks an archive there for minutes by design.
+    pub swept_staging: Vec<(String, Vec<String>)>,
 }
 
 /// Reclaim superseded builds per program: the live build + one rollback are kept, the rest
@@ -597,17 +636,22 @@ pub fn run(layout: &Layout) -> GcReport {
         by_prog.entry(p).or_default().push(b);
     }
     let mut reclaimed = Vec::new();
+    // Whatever this sweep reclaims, the provisional record must not outlive: prune
+    // after the loop so it lists only builds that still exist.
+    let mut reclaimed_any = false;
     for (program, installed) in by_prog {
         let Some(witness) = live.get(&program) else {
             continue;
         };
         let mut gone = Vec::new();
-        for b in reclaimable(&installed, witness) {
+        let provisional = crate::provisional::builds_for(layout, &program);
+        for b in reclaimable_with_provisional(&installed, witness, &provisional) {
             // `Retained::IsLive` cannot fire here — `reclaimable` never yields the witness's
             // own build — but it is honoured rather than unwrapped so that a future change to
             // the retention rule loses a reclaim, not the user's toolchain.
             if discard_superseded(layout, witness, b).is_ok() {
                 gone.push(b);
+                reclaimed_any = true;
             }
         }
         if !gone.is_empty() {
@@ -644,7 +688,48 @@ pub fn run(layout: &Layout) -> GcReport {
         }
     }
 
+    // Sweep `staging/`. Safe by the same argument the scratch sweep uses: this runs
+    // under the store-wide writer lock, so any archive still sitting here is owned by
+    // a process that no longer exists — a live install holds the lock and would not
+    // let us in. Removing a file the CURRENT pass is about to write is impossible for
+    // the same reason.
+    let mut swept_staging: Vec<(String, Vec<String>)> = Vec::new();
+    if let Ok(programs) = std::fs::read_dir(layout.prefix.join("staging")) {
+        for program in programs.filter_map(Result::ok) {
+            let Ok(name) = program.file_name().into_string() else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(program.path()) else {
+                continue;
+            };
+            let mut gone: Vec<String> = Vec::new();
+            for e in entries.filter_map(Result::ok) {
+                // Regular files only: never follow a symlink out of the prefix, and
+                // never recurse into something that is not ours to interpret.
+                if e.file_type().is_ok_and(|t| t.is_file())
+                    && std::fs::remove_file(e.path()).is_ok()
+                    && let Ok(n) = e.file_name().into_string()
+                {
+                    gone.push(n);
+                }
+            }
+            if !gone.is_empty() {
+                gone.sort();
+                swept_staging.push((name, gone));
+            }
+        }
+        swept_staging.sort();
+    }
+
+    // The provisional record is a disk-retention hint, not state anything reads for
+    // correctness — but a stale entry could suppress a legitimate rollback slot for a
+    // build number later reused, so it is trimmed to what is actually installed.
+    if reclaimed_any {
+        crate::provisional::prune(layout);
+    }
+
     GcReport {
+        swept_staging,
         reclaimed,
         swept_partial: swept_partial.into_iter().collect(),
         swept_scratch: swept_scratch.into_iter().collect(),
@@ -686,6 +771,35 @@ mod tests {
         // live is the lowest installed ⇒ no rollback target ⇒ the higher ones (staged but
         // never activated) are reclaimable; the live build stays.
         assert_eq!(reclaimable(&[19, 20, 21], &live("ay", 19)), vec![20, 21]);
+    }
+
+    /// A PROVISIONAL build — one the batteries-included seed laid down and the very
+    /// next update pass superseded — is not worth a rollback slot. Under the plain
+    /// rule it would occupy a second copy of the largest thing aterm installs
+    /// (~3.2 GB for `trust`) to preserve a state the user held for seconds and never
+    /// ran. See `crate::provisional`.
+    #[test]
+    fn a_provisional_build_is_not_retained_as_the_rollback_target() {
+        let installed = [5520, 5600];
+        let witness = live("trust", 5600);
+        // Plain rule: the superseded build is KEPT as the rollback target.
+        assert!(
+            reclaimable(&installed, &witness).is_empty(),
+            "the plain rule keeps one rollback"
+        );
+        // Provisional: reclaimed instead of doubling the toolchain on disk.
+        let prov: BTreeSet<u64> = [5520].into_iter().collect();
+        assert_eq!(
+            reclaimable_with_provisional(&installed, &witness, &prov),
+            vec![5520]
+        );
+        // The LIVE build is retained no matter what the record says.
+        let prov_live: BTreeSet<u64> = [5520, 5600].into_iter().collect();
+        assert_eq!(
+            reclaimable_with_provisional(&installed, &witness, &prov_live),
+            vec![5520],
+            "the live build is never reclaimable"
+        );
     }
 
     #[test]

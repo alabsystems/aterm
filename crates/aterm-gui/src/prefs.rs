@@ -365,6 +365,12 @@ pub(crate) const EDIT_PACKAGES_ENABLED: &str = "packages.enabled";
 pub(crate) const EDIT_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
 /// See [`EDIT_PACKAGES_AUTO_UPDATE`]; default OFF (consent-gated).
 pub(crate) const EDIT_PACKAGES_AUTO_INSTALL: &str = "packages.auto_install";
+/// `[packages] seed_install` — lay the BUNDLED toolchain down on first launch.
+/// Default ON: those bytes already shipped inside the app, so installing the app is
+/// the consent and the remaining cost is extraction, not download. Off turns the
+/// first run into an announced offer instead. Distinct from
+/// [`EDIT_PACKAGES_AUTO_INSTALL`], which governs NETWORK installs.
+pub(crate) const EDIT_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
 
 /// The security opt-in toggles — ALL fail-closed (default OFF). Grouped so `edit_kind`
 /// and the schema rows agree they are booleans, and so the Settings UI can label them
@@ -1423,6 +1429,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_PACKAGES_ENABLED
         | EDIT_PACKAGES_AUTO_UPDATE
         | EDIT_PACKAGES_AUTO_INSTALL
+        | EDIT_PACKAGES_SEED_INSTALL
         | EDIT_WALLPAPER_TEXT_TINT => EditKind::Bool,
         EDIT_CURSOR_TRAIL_STYLE => EditKind::Enum {
             options: CURSOR_TRAIL_STYLES,
@@ -2313,9 +2320,10 @@ pub(crate) fn section_of(key: &str) -> Section {
         // The [packages] maintenance switches live on the special Packages page;
         // this section keeps them findable (Search/Modified) without also
         // duplicating them onto an ordinary registry page.
-        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => {
-            Section::Packages
-        }
+        EDIT_PACKAGES_ENABLED
+        | EDIT_PACKAGES_AUTO_UPDATE
+        | EDIT_PACKAGES_AUTO_INSTALL
+        | EDIT_PACKAGES_SEED_INSTALL => Section::Packages,
         EDIT_CURSOR_STYLE
         | EDIT_CURSOR_BLINK
         | EDIT_CURSOR_TRAIL
@@ -2515,10 +2523,15 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_OPTION_AS_META | EDIT_PREDICTIVE_ECHO => ("Keyboard", 1),
         // Performance › focus-linked QoS, launch-time renderer choice, and replay.
         EDIT_FOCUS_BOOST | EDIT_GPU | EDIT_TEMPORAL_RECORDING => ("System", 1),
-        // Packages › the three toolchain-manager maintenance switches ride together.
-        EDIT_PACKAGES_ENABLED | EDIT_PACKAGES_AUTO_UPDATE | EDIT_PACKAGES_AUTO_INSTALL => {
-            ("Toolchain Packages", 0)
-        }
+        // Packages › the toolchain-manager maintenance switches ride together.
+        // `seed_install` groups here too even though the Packages page does not
+        // render a fourth switch row (a fourth row overruns the compact card's
+        // height budget); Search and `settings set` still reach it, and a key with
+        // no group at all fails the grouping-table coherence test.
+        EDIT_PACKAGES_ENABLED
+        | EDIT_PACKAGES_AUTO_UPDATE
+        | EDIT_PACKAGES_AUTO_INSTALL
+        | EDIT_PACKAGES_SEED_INSTALL => ("Toolchain Packages", 0),
         EDIT_SCROLLBACK | EDIT_SEARCH_HISTORY_LINES => ("Scrollback", 0),
         EDIT_BIDI | EDIT_AMBIGUOUS_WIDTH => ("Text direction & width", 1),
         // Terminal › which program runs in the pane.
@@ -2623,7 +2636,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
         }
         "Toolchain Packages" => {
-            "Maintenance controls the background service. It and auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB."
+            "Maintenance controls the background service. It and auto-update apply next launch. Auto-install runs next package operation and may fetch multiple GB. A batteries-included install lays down the bundled toolchain on first launch (the bytes ship inside the app); [packages] seed_install = false in aterm.toml turns that into an offer."
         }
         "Smart Titles" => {
             "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
@@ -2659,6 +2672,7 @@ pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
         EDIT_HDR_GLOW => Some("Disabling applies now; enabling may require a new window"),
         EDIT_RESTORE_SESSION => Some("Applies when closing or next launch"),
         EDIT_PACKAGES_AUTO_INSTALL
+        | EDIT_PACKAGES_SEED_INSTALL
         | "packages.account"
         | "packages.channel"
         | "packages.include"
@@ -3032,6 +3046,17 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "master",
         ],
         EDIT_PACKAGES_AUTO_UPDATE => &["packages", "toolchain", "atpkg", "tools", "alab"],
+        EDIT_PACKAGES_SEED_INSTALL => &[
+            "packages",
+            "toolchain",
+            "atpkg",
+            "seed",
+            "bundled",
+            "batteries",
+            "offline",
+            "first run",
+            "alab",
+        ],
         EDIT_PACKAGES_AUTO_INSTALL => &[
             "packages",
             "toolchain",
@@ -4302,6 +4327,19 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_PACKAGES_AUTO_INSTALL,
             kind: EditKind::Bool,
             seed: Some(cfg.packages_auto_install().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // `[packages] seed_install` (dotted key): lay down the toolchain
+            // sealed INSIDE the app on first launch. Default ON — those bytes
+            // already shipped, so the cost is extraction rather than download.
+            // It is here, and not only in aterm.toml, because the documented way
+            // to decline used to require editing a config file that does not
+            // exist until the app has already run once and installed everything.
+            label: "Install bundled ALab toolset on first launch",
+            key: EDIT_PACKAGES_SEED_INSTALL,
+            kind: EditKind::Bool,
+            seed: Some(cfg.packages_seed_install().to_string()),
             placeholder: String::new(),
         },
     ];

@@ -98,13 +98,29 @@ const RELEASES_PER_PAGE: usize = 100;
 const MAX_RELEASE_PAGES: u64 = 10;
 
 /// How many index-carrying releases [`GithubFetcher::index_candidates`] downloads the
-/// signed pair for, NEWEST FIRST. Bounds what a deep index history costs (two asset
-/// downloads per carrying release, now that the listing spans up to 1000 releases) while
-/// staying BELOW the §14 cache's own candidate cap (`cache::MAX_CACHE_CANDIDATES` = 24),
-/// so a full candidate set is never refused by the cache write. Selection only ever wants
-/// the HIGHEST signed `index_build`, which rides the newest carrying release under the
-/// monotonic publish counter; the floor gate downstream refuses anything older anyway.
-const INDEX_CANDIDATE_CAP: usize = 20;
+/// signed quad for, NEWEST FIRST.
+///
+/// # This number is the anonymous user's delivery budget
+///
+/// Each candidate costs FOUR asset downloads (`index.toml`, its `.sig`, the roster,
+/// its `.sig`), so this constant multiplies by four into GitHub's **60 requests per
+/// hour per IP** anonymous limit — the only budget a user has when they run the
+/// advertised `curl … | bash` without `gh` installed. At 20 that was up to 80 requests
+/// for candidate gathering alone, before a single package manifest or artifact:
+/// roughly 90 against a ceiling of 60, i.e. a DETERMINISTIC failure, and worse on a
+/// shared corporate NAT where the whole office draws on one budget.
+///
+/// Four is chosen because the extra candidates were nearly always dead weight.
+/// Selection takes the HIGHEST signed `index_build` within the newest admitted roster
+/// generation, releases are listed newest-first, and the publish counter is monotonic
+/// — so the winner is the FIRST carrying release essentially always. The remaining
+/// three are the genuine fallbacks (a newest release whose index fails verification,
+/// sits below the durable floor, or carries a superseded generation), and paying 12
+/// requests for those beats paying 64 for sixteen that never win.
+///
+/// Still below the §14 cache's own candidate cap (`cache::MAX_CACHE_CANDIDATES` = 24),
+/// so a full candidate set is never refused by the cache write.
+const INDEX_CANDIDATE_CAP: usize = 4;
 
 /// Walk the release listing page by page via `fetch_page(page)` (1-based) until a short
 /// page (the listing is exhausted) or [`MAX_RELEASE_PAGES`]. A mid-walk error fails the
@@ -565,6 +581,25 @@ impl crate::flow::Fetcher for DirFetcher {
             return Err(format!("unsafe asset name {asset:?}"));
         }
         let src = self.dir.join(asset);
+        // UNLINK FIRST — this line prevents data destruction inside a signed app
+        // bundle, and it is not optional.
+        //
+        // Without it: `hard_link` fails EEXIST when a previous run left a staging
+        // link behind (nothing sweeps `staging/`, and an interrupted first run is
+        // exactly what the resumable seed lane expects), so the fallback runs
+        // `fs::copy(src, dest)` where — because they are the SAME hardlinked inode
+        // — dest IS src. Rust's macOS copy opens the destination `O_TRUNC`,
+        // truncating the shared inode, then copies the now-empty source and
+        // returns `Ok(0)`. Measured on macOS 26.5: `src=0 dst=0`, success reported.
+        //
+        // For a `dir:` registry that source lives in
+        // `aterm.app/Contents/Resources/toolchain-seed.lproj/`, so the victim is a
+        // file inside the user's installed, notarized bundle. Zeroing it kills that
+        // seed asset permanently (sha256 can never match again) AND invalidates the
+        // code signature — the `.lproj` optional seal tolerates ABSENCE but not
+        // MODIFICATION. An ordinary power-off during the first-run extraction was
+        // enough to trigger it.
+        let _ = std::fs::remove_file(dest);
         // Hardlink to avoid duplicating a multi-GB toolchain; a later remove_file(dl) drops
         // only the link, never the registry file. Cross-filesystem hardlink fails ⇒ copy.
         if std::fs::hard_link(&src, dest).is_ok() {
@@ -582,10 +617,16 @@ impl crate::flow::Fetcher for DirFetcher {
 
 /// Two fetchers, one flow (§9.1 bundled seed): candidates from BOTH sources
 /// feed the ONE index selection (highest signature-valid `index_build` ≥ floor
-/// wins, [`crate::select_index`]), and per-asset reads try `primary` then fall
-/// back to `secondary`. This is how a network registry and the app-bundle seed
-/// coexist without a second trust path: a fresher published index outranks the
-/// sealed seed by the ordinary monotonic gate, an offline machine still
+/// wins, [`crate::select_index`]) with the `primary` (network) leg as the
+/// AUTHORITY — its candidates come first, so on an equal `index_build` tie it
+/// wins, and only it feeds the §14 cache. Per-asset reads run the OTHER way:
+/// `secondary` (the co-located seed — local bytes) first, falling back to
+/// `primary` — the whole point of a batteries-included cut is that a first
+/// run does not re-download the gigabytes the app already carries, and an
+/// asset the seed never sealed (a fresher network pin) simply misses by name
+/// and falls through. This is how a network registry and the app-bundle seed
+/// coexist without a second trust path: a fresher published index outranks
+/// the sealed seed by the ordinary monotonic gate, an offline machine still
 /// resolves the seed's index, and every byte from EITHER source passes the
 /// identical verify-before-parse + floor + freshness + sha256 + `tree_root`
 /// gates. The chain is composition, never authenticity: neither side is
@@ -603,7 +644,8 @@ pub struct ChainFetcher {
 }
 
 impl ChainFetcher {
-    /// Chain `primary` (tried first for every asset) over `secondary`.
+    /// Chain `primary` (the index/cache authority) over `secondary` (the
+    /// local-bytes leg, tried first for every asset).
     #[must_use]
     pub fn new(
         primary: Box<dyn crate::flow::Fetcher>,
@@ -651,20 +693,23 @@ impl crate::flow::Fetcher for ChainFetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.primary
+        // Local (seed) bytes first — manifest names are build-qualified, so a
+        // pin the seed never sealed misses by name and falls to the network;
+        // either side's bytes verify identically downstream.
+        self.secondary
             .pkg_manifest(repo, program, build)
             .or_else(|e1| {
-                self.secondary
+                self.primary
                     .pkg_manifest(repo, program, build)
-                    .map_err(|e2| chain_err(&e1, &e2))
+                    .map_err(|e2| chain_err(&e2, &e1))
             })
     }
 
     fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
-        self.primary.download(repo, asset, dest).or_else(|e1| {
-            self.secondary
+        self.secondary.download(repo, asset, dest).or_else(|e1| {
+            self.primary
                 .download(repo, asset, dest)
-                .map_err(|e2| chain_err(&e1, &e2))
+                .map_err(|e2| chain_err(&e2, &e1))
         })
     }
 
@@ -676,13 +721,14 @@ impl crate::flow::Fetcher for ChainFetcher {
         dest: &Path,
     ) -> Result<(), String> {
         // Route through both sides' OWN `download_for` so the primary's
-        // per-program `[packages.links]` fetch override still applies.
-        self.primary
+        // per-program `[packages.links]` fetch override still applies on the
+        // fallback leg.
+        self.secondary
             .download_for(program, repo, asset, dest)
             .or_else(|e1| {
-                self.secondary
+                self.primary
                     .download_for(program, repo, asset, dest)
-                    .map_err(|e2| chain_err(&e1, &e2))
+                    .map_err(|e2| chain_err(&e2, &e1))
             })
     }
 
@@ -716,8 +762,9 @@ impl crate::flow::Fetcher for ChainFetcher {
     }
 }
 
-/// Both legs failed; keep both reasons (the second is usually the seed dir,
-/// whose "no such file" alone would mislead when the real story is offline).
+/// Both legs failed; keep both reasons, the network (primary) story FIRST
+/// regardless of which leg was tried first — the seed dir's "no such file"
+/// alone would mislead when the real story is offline.
 fn chain_err(primary: &str, secondary: &str) -> String {
     format!("{primary}; fallback: {secondary}")
 }
@@ -1013,6 +1060,74 @@ mod tests {
     /// Two registry dirs, one flow: the chain unions index candidates from
     /// both legs, serves per-asset reads from the first leg that has the
     /// bytes, and only errors when BOTH legs fail (with both reasons kept).
+    /// THE INODE-TRUNCATION REGRESSION. `DirFetcher`'s source for a bundled seed is a
+    /// file inside the user's signed `aterm.app`, and it hardlinks that file into
+    /// staging. Nothing sweeps staging, so a killed run leaves the link behind; the
+    /// next attempt then found `hard_link` EEXIST and fell back to
+    /// `fs::copy(src, dest)` where dest IS src — which on macOS opens the shared
+    /// inode `O_TRUNC` and reports `Ok(0)`, zeroing a file inside a notarized bundle.
+    /// That kills the asset forever (sha256 can never match) and invalidates the code
+    /// signature, because the `.lproj` seal tolerates absence but not modification.
+    ///
+    /// The fix is one `remove_file(dest)`; this proves the registry survives a retry.
+    /// THE ANONYMOUS DELIVERY BUDGET. Candidate gathering costs four asset downloads
+    /// each and is the dominant term in a first bootstrap's GitHub API usage. The
+    /// advertised `curl … | bash` install has no token, so it draws on the anonymous
+    /// 60-requests-per-hour-per-IP limit — and at the old cap of 20 this ALONE cost up
+    /// to 80, a deterministic failure before any package was fetched. Pinned as a
+    /// number rather than a comment because it is a product guarantee, not a tuning
+    /// preference: raising it silently re-breaks delivery for every tokenless user,
+    /// and on a shared corporate NAT for everyone behind it.
+    #[test]
+    fn candidate_gathering_fits_the_anonymous_api_budget() {
+        const ANONYMOUS_HOURLY_LIMIT: usize = 60;
+        const DOWNLOADS_PER_CANDIDATE: usize = 4; // index, index.sig, roster, roster.sig
+        let gathering = INDEX_CANDIDATE_CAP * DOWNLOADS_PER_CANDIDATE;
+        let listing = MAX_RELEASE_PAGES as usize;
+        assert!(
+            gathering + listing <= ANONYMOUS_HOURLY_LIMIT / 2,
+            "candidate gathering costs {gathering} requests (+{listing} for the listing),              which leaves too little of the {ANONYMOUS_HOURLY_LIMIT}/hour anonymous budget              for the package manifests and artifacts that actually deliver the toolchain"
+        );
+        // And still under the §14 cache's candidate ceiling, or a full set could never
+        // be persisted for the offline fallback. A `const` block rather than a runtime
+        // assertion: both operands are compile-time constants, so this is a ceiling on
+        // the SOURCE, and it should fail the build that raises the cap rather than wait
+        // for someone to run this test.
+        const { assert!(INDEX_CANDIDATE_CAP <= 24, "INDEX_CANDIDATE_CAP exceeds the §14 cache's candidate ceiling: a full candidate set could no longer be persisted for the offline fallback") };
+    }
+
+    #[test]
+    fn a_stale_staging_hardlink_never_truncates_the_registry_file() {
+        use crate::flow::Fetcher as _;
+        let dir = std::env::temp_dir().join(format!("atpkg-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("reg")).unwrap();
+        std::fs::create_dir_all(dir.join("staging")).unwrap();
+        let payload = b"the sealed registry bytes that must survive";
+        let src = dir.join("reg/ay-18.tar.zst");
+        std::fs::write(&src, payload).unwrap();
+        let dest = dir.join("staging/ay-18.tar.zst");
+
+        let f = DirFetcher::new(dir.join("reg"));
+        // First fetch: hardlinks into staging (the multi-minute window a kill lands in).
+        f.download("r", "ay-18.tar.zst", &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), payload);
+        // The process is killed here — the link survives, nothing sweeps it.
+        // Second fetch (the resumable lane's retry) must NOT destroy the source.
+        f.download("r", "ay-18.tar.zst", &dest).unwrap();
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            payload,
+            "the registry file inside the app bundle must be byte-intact after a retry"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            payload,
+            "and the staged copy must hold the real bytes, not an empty file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn chain_unions_candidates_and_falls_back_per_asset() {
         use crate::flow::Fetcher as _;
@@ -1060,9 +1175,23 @@ mod tests {
             "primary first"
         );
         assert_eq!(candidates[1].index_bytes, b"schema = 2 # b");
-        // Primary serves what it has; the fallback serves what primary lacks.
+        // Either leg serves what only it holds — a miss falls through by name.
         assert_eq!(chain.pkg_manifest("r", "ay", 1).unwrap().0, b"pkg a");
         assert_eq!(chain.pkg_manifest("r", "ny", 2).unwrap().0, b"pkg b");
+        // An asset BOTH legs hold is served from the SECONDARY (local seed)
+        // leg — load-bearing for the batteries-included cut: a networked first
+        // run must not re-download bytes the app bundle already carries. (Real
+        // asset names are build-qualified, so same-name means same signed
+        // bytes; the identical sha256/tree_root gates run either way.)
+        std::fs::write(a.join("pkg-both-3.toml"), b"from net").unwrap();
+        std::fs::write(a.join("pkg-both-3.toml.sig"), [5u8; 64]).unwrap();
+        std::fs::write(b.join("pkg-both-3.toml"), b"from seed").unwrap();
+        std::fs::write(b.join("pkg-both-3.toml.sig"), [6u8; 64]).unwrap();
+        assert_eq!(
+            chain.pkg_manifest("r", "both", 3).unwrap().0,
+            b"from seed",
+            "local seed leg preferred per asset"
+        );
         // Both legs missing ⇒ an error carrying both stories.
         let err = chain.pkg_manifest("r", "absent", 9).unwrap_err();
         assert!(err.contains("fallback:"), "both reasons kept: {err}");

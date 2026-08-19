@@ -54,6 +54,11 @@ pub fn dir_meta_is_private(_meta: &Metadata) -> bool {
     true
 }
 
+/// Backup exclusion is a macOS convention (`com_apple_backup_excludeItem`); Windows
+/// backup tooling has no equivalent per-directory opt-out to honour, so this is a
+/// no-op that exists to keep `store::ensure_dir` one shape across platforms.
+pub fn exclude_from_backup(_dir: &Path) {}
+
 /// Shared-directory creation. On Windows POSIX modes do not apply, so this is just
 /// `create_dir_all`; the per-directory ACL governs access, exactly as it does for
 /// `ensure_private_dir`.

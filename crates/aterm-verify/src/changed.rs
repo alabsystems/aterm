@@ -526,6 +526,25 @@ pub fn declares_lib_target(manifest: &str) -> bool {
     manifest.lines().any(|l| l.starts_with("[lib]"))
 }
 
+/// Does the member at `crates/<name>` have a library target — for the ONE
+/// scope shape (`--scope <crate>`) that never resolved the graph and so has no
+/// `Members` table to ask. Both halves of cargo's rule: the explicit `[lib]`
+/// table ([`declares_lib_target`]) and the autodiscovered `src/lib.rs` on
+/// disk. The `crates/<name>` convention is this workspace's layout; a member
+/// living elsewhere makes the manifest unreadable, and an unanswerable
+/// question answers YES — the same fail-closed direction as
+/// [`Members::any_has_lib`], here meaning the doc-driver diagnosis fires
+/// rather than a bare run that would die raw at rustdoc exec if the answer
+/// was really yes.
+#[must_use]
+pub fn crate_dir_has_lib(root: &std::path::Path, name: &str) -> bool {
+    let dir = root.join("crates").join(name);
+    match std::fs::read_to_string(dir.join("Cargo.toml")) {
+        Ok(manifest) => declares_lib_target(&manifest) || dir.join("src/lib.rs").is_file(),
+        Err(_) => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -905,6 +924,32 @@ mod tests {
     }
 
     // -- the doctest lib-target question -----------------------------------
+
+    #[test]
+    fn a_scoped_crate_answers_the_lib_question_from_its_own_manifest_or_yes() {
+        let tmp = std::env::temp_dir().join(format!("atv-scoped-lib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Bin-only: a manifest with no [lib] and no src/lib.rs answers NO.
+        let bin_only = tmp.join("crates/binonly");
+        std::fs::create_dir_all(bin_only.join("src")).unwrap();
+        std::fs::write(bin_only.join("Cargo.toml"), "[package]\nname = \"binonly\"\n").unwrap();
+        assert!(!crate_dir_has_lib(&tmp, "binonly"));
+        // The autodiscovered src/lib.rs half of cargo's rule.
+        std::fs::write(bin_only.join("src/lib.rs"), "").unwrap();
+        assert!(crate_dir_has_lib(&tmp, "binonly"));
+        // The explicit [lib] table half.
+        let declared = tmp.join("crates/declared");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::write(
+            declared.join("Cargo.toml"),
+            "[package]\nname = \"declared\"\n[lib]\npath = \"other.rs\"\n",
+        )
+        .unwrap();
+        assert!(crate_dir_has_lib(&tmp, "declared"));
+        // Unanswerable answers YES — the Members::any_has_lib direction.
+        assert!(crate_dir_has_lib(&tmp, "no-such-member"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn an_all_binary_selection_reports_that_it_has_no_library_target() {

@@ -837,6 +837,7 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         failing_persistent: status.failing_persistent,
         failing_kind: status.failing_kind,
         failing_applies: status.failing_applies,
+        installable: status.installable,
     }
 }
 
@@ -854,6 +855,9 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         failing_persistent: false,
         failing_kind: String::new(),
         failing_applies: 0,
+        // A worker failure says nothing about the bundle; the installable claim is
+        // only ever made by a real observation.
+        installable: true,
     }
 }
 
@@ -4286,6 +4290,7 @@ impl App {
         let verb: &[&str] = match request {
             PackagesRequest::CheckUpdate => &["update"],
             PackagesRequest::InstallDefaultSet => &["install", "--default-set"],
+            PackagesRequest::UninstallAll => &["uninstall", "--all"],
         };
         let Some(atpkg) = atpkg else {
             return PackagesOutcome::Failed {
@@ -4308,6 +4313,7 @@ impl App {
         let busy = match request {
             PackagesRequest::CheckUpdate => PackagesBusy::Check,
             PackagesRequest::InstallDefaultSet => PackagesBusy::Install,
+            PackagesRequest::UninstallAll => PackagesBusy::Uninstall,
         };
         let Some(proxy) = self.proxy.clone() else {
             return PackagesOutcome::Failed {
@@ -4341,6 +4347,20 @@ impl App {
                     Ok(status) if status.success() => {
                         PackagesCommandOutcome::Succeeded { operation: busy }
                     }
+                    // EXIT 2 = "ran fine, installed nothing, and never will here"
+                    // (atpkg `cmd_install_default_set`: the signed index pins no
+                    // build for this machine's architecture). It is neither a
+                    // success nor a retryable failure, and reporting it as either
+                    // lies to the user — "install completed" over an empty store,
+                    // or a red error they will keep re-clicking. Give it its own
+                    // words.
+                    Ok(status) if status.code() == Some(2) => PackagesCommandOutcome::Failed {
+                        operation: busy,
+                        message: "No ALab build is published for this Mac's architecture yet, \
+                                  so nothing was installed. This is not a temporary error — \
+                                  retrying will not change it."
+                            .to_string(),
+                    },
                     Ok(status) => PackagesCommandOutcome::Failed {
                         operation: busy,
                         message: format!("atpkg {} exited with {status}", verb.join(" ")),
@@ -8097,6 +8117,7 @@ mod tests {
             failing_persistent: false,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
         }
     }
 
@@ -8225,6 +8246,7 @@ mod tests {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                installable: true,
             }),
             Some(InstalledUpdate {
                 build,
@@ -8276,6 +8298,7 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    installable: true,
                 }),
                 Some(installed_update(running)),
             )
@@ -9499,6 +9522,7 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    installable: true,
                 },
             ),
             CheckCompletion::Reduced,
@@ -9566,6 +9590,7 @@ mod tests {
                         failing_persistent: false,
                         failing_kind: String::new(),
                         failing_applies: 0,
+                        installable: true,
                     }),
                     Some(InstalledUpdate {
                         build,
@@ -10370,6 +10395,7 @@ mod tests {
                 failing_persistent: false,
                 failing_kind: String::new(),
                 failing_applies: 0,
+                installable: true,
             }),
             Some(InstalledUpdate {
                 build,

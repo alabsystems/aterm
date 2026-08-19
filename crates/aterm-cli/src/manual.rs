@@ -169,9 +169,21 @@ WHAT IT IS
 KEY USAGE
   atpkg list                 installed (program, build) pairs — local, no network
   atpkg install <program>    verify the signed index, then install/upgrade the pinned build
+  atpkg seed                 first-run batteries bootstrap: fill an EMPTY store from the
+                             signed registry sealed inside the app bundle. Zero network by
+                             construction (a local DirFetcher, never the network chain), so
+                             it installs only what the seal carries; anything newer is the
+                             consented `update` pass's job. The GUI runs it once per launch;
+                             [packages].seed_install (default true) turns it from install
+                             into announce-only when false
   atpkg update [program]     upgrade all (or one) to the channel pin;
                              coherence groups apply all-or-nothing (the rustc-locked
                              tuple moves together)
+  atpkg uninstall <program> | --all
+                             remove one program, or the WHOLE managed toolset and its
+                             disk (~3.2 GB) in one step — the way out is as single-step
+                             as the way in. Either form stops atpkg auto-completing the
+                             set; [packages].exclude drops one program while keeping it
   atpkg which <tool>         print the store path a tool resolves to (never $PATH)
   atpkg run <tool> [-- args] exec the store binary — what `aterm <tool>` dispatches to
   atpkg doctor | verify      health surface / re-attest the store against the signed root

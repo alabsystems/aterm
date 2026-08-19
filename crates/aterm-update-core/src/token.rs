@@ -257,6 +257,26 @@ fn needs_ambient_credential(owner: &str, repo: &str) -> bool {
     owner != crate::source::DEFAULT_OWNER || repo != crate::source::DEFAULT_REPO
 }
 
+/// The remedy that ACTUALLY provisions a token for this source — the one thing a
+/// user is told to run when the channel cannot be read, or when their token was
+/// rejected.
+///
+/// On the compiled-in public channel [`walk`] consults ONE rung, `$ATERM_UPDATE_TOKEN`,
+/// and deliberately never goes looking for an ambient credential (it would surface a
+/// broad developer PAT to read a public repo). So [`PROVISION_COMMAND`] — which writes
+/// the 0600 file — is a no-op there: the file is never read, and a user who followed
+/// that instruction would watch nothing change and have no way to tell why
+/// (2026-08-19). Name the rung this source will really consult.
+#[must_use]
+pub fn provision_remedy(owner: &str, repo: &str) -> &'static str {
+    if needs_ambient_credential(owner, repo) {
+        PROVISION_COMMAND
+    } else {
+        "export ATERM_UPDATE_TOKEN=$(gh auth token)   # the default channel is public: \
+         aterm reads ONLY this rung for it, and never an ambient credential"
+    }
+}
+
 /// Resolve the token, or `None` when none is provisioned (the updater then stays
 /// idle rather than hammering the API unauthenticated against a private repo).
 /// `support_dir` is `…/Library/Application Support/aterm` (the `Updates` parent).

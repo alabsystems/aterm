@@ -2214,6 +2214,56 @@ enum Wake {
         close: bool,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// The batteries-included TOOLCHAIN SEED reported. The lane is RESUMABLE: it acts
+    /// whenever the sealed registry still holds channel-pinned members this store
+    /// lacks, so an interrupted first launch finishes on a later one. (It was once
+    /// gated on an EMPTY store, which made it single-shot and stranded every member a
+    /// killed first run had not reached.) It remains a bootstrap source rather than an
+    /// update source: the seal is outranked by any newer network index, and programs
+    /// the user removed on purpose are excluded.
+    /// Constructed ONLY by the `atpkg-update` thread
+    /// (`spawn_pkg_update_check`), ONCE per process at most: the launch-time `atpkg seed`
+    /// child's captured stdout carried one of the two STABLE marker lines
+    /// (`atpkg: seed-installed: …` / `atpkg: seed-pending: …` — see
+    /// [`parse_seed_markers`]); a quiet seed posts nothing. `installed` is the bundled
+    /// programs the pass just installed (may be empty when only the consent-pending
+    /// marker matched); `pending` is the human tail of the pending line — present when a
+    /// seed is available but `[packages].seed_install = false` turned the first run back
+    /// into an offer. Fire-and-forget and safe by construction: the main thread only
+    /// raises the NON-clickable transient status pill (details stay in
+    /// Settings ▸ Packages, the same truth atpkg records in its own `status.toml`) — no
+    /// install authority crosses this event.
+    PkgSeed {
+        installed: Vec<String>,
+        pending: Option<String>,
+    },
+    /// The batteries-included seed pass has STARTED laying the toolset down — raised
+    /// from the streamed `seed-starting:` marker before the multi-GB extraction, so the
+    /// user is told what is happening while it happens rather than after. Non-clickable
+    /// transient pill only, same as [`Wake::PkgSeed`]; no authority crosses it.
+    PkgSeedStarted {
+        detail: String,
+    },
+    /// The bundled toolchain has no build this machine can run — raised from the
+    /// streamed `seed-unusable:` marker. It exists so the "Installing…" notice
+    /// [`Wake::PkgSeedStarted`] raised is always ANSWERED: an announced install that
+    /// silently delivers nothing is worse than one that never announced itself.
+    PkgSeedUnusable {
+        detail: String,
+    },
+    /// The seed pass ran and every member failed to install — raised from the streamed
+    /// `seed-failed:` marker so the "Installing…" notice is retired with the truth
+    /// rather than left standing forever. Retryable, unlike [`Wake::PkgSeedUnusable`].
+    PkgSeedFailed {
+        detail: String,
+    },
+    /// Some members installed and some did not — raised from `seed-partial:`. Its own
+    /// variant because the two obvious renderings are both lies: the success pill
+    /// claims a toolchain the machine does not have, and the failure pill hides the
+    /// programs that did arrive.
+    PkgSeedPartial {
+        detail: String,
+    },
 }
 
 /// MEM-ACCT-3(b) shed policy: the low scrollback watermark (bytes) to evict down to when
@@ -8155,6 +8205,10 @@ struct App {
     /// Last observed state of the automatic-apply switch, so the OFF→ON edge can
     /// re-arm an intent the OFF cleared.
     auto_apply_was_on: bool,
+    /// Keyboard events that arrived at the successor's already-revealed window
+    /// between first paint and Commit. Replayed in order once the handoff commits;
+    /// see the deferral in `window_event`.
+    handoff_deferred_input: Vec<(WinitWindowId, WindowEvent)>,
     /// How many times in a row a control apply's facts came back stale and were
     /// re-requested; bounded so a wedged facts worker (sequences restarted below
     /// the last reduced one) cannot turn one `update apply` into a hot loop.
@@ -10368,6 +10422,7 @@ impl App {
             last_native_update_reconcile_sequence: 0,
             native_stage_imported_at: None,
             auto_apply_was_on: true,
+            handoff_deferred_input: Vec::new(),
             control_apply_stale_retries: 0,
             deferred_native_update_reconcile: None,
             pending_native_update_reconcile_purpose: None,
@@ -14316,6 +14371,10 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ActivateCommittedHandoff { mut expected } => {
                 self.incoming_handoff_pending = false;
+                // Everything typed into the revealed window while we waited for Commit
+                // now runs through the ordinary path, in order. Taken BEFORE the replay
+                // so a re-entrant deferral cannot loop.
+                let replay = std::mem::take(&mut self.handoff_deferred_input);
                 // TAKEN OVER. Until this instant the updater treats this process as a
                 // candidate that may still be rejected, and refuses to expire another
                 // build's apply streak from here (see
@@ -14341,6 +14400,19 @@ impl ApplicationHandler<Wake> for App {
                     aterm_log::warn!(
                         "overlap handoff: adopted pool changed after proof; activating surviving committed readers"
                     );
+                }
+                // Replay what the user typed into the revealed window while the
+                // handoff was still uncommitted, in arrival order, through the very
+                // path a live keystroke takes. `incoming_handoff_pending` is already
+                // false, so nothing re-defers.
+                if !replay.is_empty() {
+                    aterm_log::info!(
+                        "overlap handoff: replaying {} input event(s) typed before Commit",
+                        replay.len()
+                    );
+                    for (winit_id, deferred) in replay {
+                        self.window_event(el, winit_id, deferred);
+                    }
                 }
             }
             Wake::NativeDocumentSaved {
@@ -14509,6 +14581,59 @@ impl ApplicationHandler<Wake> for App {
                 ) {
                     aterm_log::warn!(
                         "update staged wake could not dispatch ordered fact collection"
+                    );
+                }
+            }
+            // Batteries-included toolchain seed: the atpkg-update thread's one-shot
+            // launch-time `atpkg seed` pass matched a stable stdout marker. Raise the
+            // NON-clickable transient status pill only — details stay in
+            // Settings ▸ Packages (App ▸ Packages… jumps straight there).
+            // The seed pass has begun. Say so NOW — the extraction that follows is
+            // minutes long and gigabytes wide, and an app that does that silently on
+            // first launch is indistinguishable from one that is misbehaving.
+            Wake::PkgSeedStarted { detail } => {
+                aterm_log::info!("atpkg seed starting: {detail}");
+                // Carry the SIZE to the screen. atpkg computes it from the signed
+                // manifests precisely so the user sees what they are committing;
+                // logging it and rendering a fixed caption threw that away.
+                let size = detail
+                    .rsplit_once('(')
+                    .and_then(|(_, t)| t.strip_suffix(')'))
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or_default();
+                self.surface_nonmodal_update_status(&format!(
+                    "⇣ Installing the ALab toolchain{size}…"
+                ));
+            }
+            // Answer the "Installing…" notice honestly rather than leaving it as the
+            // last thing the user saw.
+            Wake::PkgSeedPartial { detail } => {
+                aterm_log::warn!("atpkg seed partial: {detail}");
+                self.surface_nonmodal_update_status(
+                    "⚠ ALab toolchain partly installed — see Settings ▸ Packages",
+                );
+            }
+            Wake::PkgSeedFailed { detail } => {
+                aterm_log::warn!("atpkg seed failed: {detail}");
+                self.surface_nonmodal_update_status(
+                    "⚠ ALab toolchain install failed — see Settings ▸ Packages",
+                );
+            }
+            Wake::PkgSeedUnusable { detail } => {
+                aterm_log::info!("atpkg seed unusable: {detail}");
+                self.surface_nonmodal_update_status(
+                    "⚠ No ALab toolchain for this Mac's architecture",
+                );
+            }
+            Wake::PkgSeed { installed, pending } => {
+                if !installed.is_empty() {
+                    self.surface_nonmodal_update_status(&seed_pill_text(&installed));
+                } else if let Some(tail) = pending {
+                    // `[packages].seed_install = false`: offer, don't act. The full
+                    // roster stays in the log; the pill points at the switch.
+                    aterm_log::info!("atpkg seed pending: {tail}");
+                    self.surface_nonmodal_update_status(
+                        "⇣ ALab toolchain available — install via Settings ▸ Packages",
                     );
                 }
             }
@@ -14723,6 +14848,23 @@ impl ApplicationHandler<Wake> for App {
                     | WindowEvent::Occluded(_)
             )
         {
+            // TYPING IS DEFERRED HERE, NOT DISCARDED. This window is already VISIBLE
+            // and already the key window — it was revealed at its first painted frame,
+            // which the adoption proof requires, and the outgoing process was
+            // deactivated by our own launch, so it receives no keyboard events either.
+            // Bytes typed into what looks like a live terminal reached NEITHER process
+            // and were simply lost, and the act of typing lengthens the window that
+            // loses it (the parent's pre-Commit drain waits for input to go quiet).
+            // Queue them and replay after Commit, bounded so a held key cannot grow
+            // this without limit (2026-08-19 round-5 audit).
+            const MAX_DEFERRED_HANDOFF_INPUT: usize = 512;
+            if matches!(
+                &event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::ModifiersChanged(_)
+            ) && self.handoff_deferred_input.len() < MAX_DEFERRED_HANDOFF_INPUT
+            {
+                self.handoff_deferred_input.push((id, event));
+            }
             return;
         }
         // Resolve the winit id to our logical WindowId. An event for an unknown
@@ -15204,15 +15346,33 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
 /// `atpkg` verifies its own signed channel and is itself inert on a build with no pinned
 /// root key, so this is safe to always spawn for a real `.app`. Interval is
 /// `ATPKG_UPDATE_INTERVAL_SECS` (default 6h; 0 = once — the env override survives the
-/// config gate on purpose: it tunes cadence, never consent). The loop's output is
-/// discarded entirely — atpkg records its own `status.toml` (§9), which is the single
-/// truth Settings ▸ Packages reads, so there is nothing for this thread to report back
-/// to the UI. The gate reads launch-time config only: flipping the switch takes effect
-/// at the next launch (documented; the loop itself is stateless between passes).
-fn spawn_pkg_update_check(config: &Config) -> bool {
-    if !config.packages_update_loop_enabled() {
+/// config gate on purpose: it tunes cadence, never consent). The `update` loop's output
+/// is discarded — atpkg records its own `status.toml` (§9), the single truth
+/// Settings ▸ Packages reads; the ONE-SHOT `atpkg seed` pass that runs first is the
+/// exception: its stdout is captured and scanned for the two stable marker lines
+/// ([`parse_seed_markers`]), and a match posts [`Wake::PkgSeed`] through `proxy` so the
+/// first launch can SAY what the batteries-included seed did (or is offering). The gate
+/// reads launch-time config only: flipping the switch takes effect at the next launch
+/// (documented; the loop itself is stateless between passes) — and it gates the seed
+/// pass too: `[packages].auto_update = false` also forgoes the launch-time seed, since
+/// the seed rides this one thread.
+fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool {
+    // The MASTER switch (`[packages].enabled`) gates everything this thread
+    // does. `auto_update` gates only the recurring pass — NOT the one-shot
+    // seed, which is why the two are read separately here.
+    //
+    // They were briefly the same gate, and that made a cadence preference
+    // silently cancel the product's headline promise: a user who set
+    // `auto_update = false` (meaning "do not go to the network on a timer")
+    // also lost the batteries sealed inside their own app bundle, while every
+    // string in Settings and every line of §9.1 still told them a first launch
+    // installs the toolchain. The seed pass is not an update and touches no
+    // network (`cmd_seed` runs a local DirFetcher) — there is nothing in it for
+    // `auto_update` to be about.
+    if !config.packages_enabled() {
         return false;
     }
+    let run_update_loop = config.packages_update_loop_enabled();
     let Some(atpkg) = co_located_atpkg() else {
         return false;
     };
@@ -15223,12 +15383,88 @@ fn spawn_pkg_update_check(config: &Config) -> bool {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(6 * 60 * 60);
+            // First-run batteries-included SEED (§9.1): if the release cut sealed a
+            // signed toolchain registry into the app bundle, this one-shot fills an
+            // EMPTY store from it (`crates/atpkg/src/cli.rs` `cmd_seed` — bootstrap-
+            // only, network-index-outranked, the full verify chain unchanged). On a
+            // seedless or already-provisioned install it prints and does nothing.
+            // Store mutation is serialized by atpkg's own store-wide lock. Runs once
+            // BEFORE the loop, off the event loop. Stdout is captured for the stable
+            // seed markers (stderr stays discarded — atpkg records its own
+            // status.toml); a marker match posts the one-shot `Wake::PkgSeed`, a
+            // quiet seed posts nothing.
+            // Stdout is STREAMED, not collected with `.output()`. Laying down the
+            // toolset is minutes of work and gigabytes of disk, and `.output()`
+            // blocks until the child exits — so every notice arrived only after
+            // the thing it described had already finished. Reading line by line
+            // is what lets the `seed-starting:` marker put a notice on screen
+            // WHILE the extraction runs; a user watching gigabytes appear in
+            // Activity Monitor with a silent app is the complaint this avoids.
+            // (stderr stays discarded — atpkg records its own status.toml.)
+            // Whether the seed pass actually laid anything down — the first update
+            // tick is skipped when it did, so the toolchain is not re-fetched
+            // seconds after being installed.
+            let mut seed_installed_something = false;
+            if let Ok(mut child) = std::process::Command::new(&atpkg)
+                .arg("seed")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                if let Some(out) = child.stdout.take() {
+                    use std::io::BufRead as _;
+                    for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                        if let Some(event) = parse_seed_line(&line) {
+                            if matches!(event, Wake::PkgSeed { .. } | Wake::PkgSeedPartial { .. }) {
+                                seed_installed_something = true;
+                            }
+                            let _ = proxy.send_event(event);
+                        }
+                    }
+                }
+                let _ = child.wait();
+            }
+            if !run_update_loop {
+                // `auto_update = false`: the batteries went in above, and that
+                // is all this thread was asked to do.
+                return;
+            }
+            // DO NOT re-fetch what the seed just installed. The loop body runs with
+            // no initial delay, so a successful seed pass was immediately followed by
+            // an `atpkg update` that re-downloaded every program whose published pin
+            // had moved since the cut — and the cut gate REQUIRES >=30 days of
+            // remaining shelf life, so a DMG a few weeks old is stale by
+            // construction. (This flag was previously set and never read: the skip
+            // was dead code and the double-fetch happened on every install.)
+            if seed_installed_something && interval > 0 {
+                std::thread::sleep(Duration::from_secs(interval));
+            }
             loop {
-                let _ = std::process::Command::new(&atpkg)
+                // STREAM this child too. It was spawned with stdout discarded, which
+                // meant the NETWORK provisioning lane reached the user through no
+                // channel whatsoever: a multi-GB install could run with nothing on
+                // screen, and a failure was equally invisible. That lane is not
+                // exotic — it is the whole delivery path for an Intel Mac the day
+                // x86_64 publishes, for a seedless cut, for a seal past its horizon,
+                // and for any machine that updated the app before provisioning. The
+                // markers atpkg already prints (`net-installed:`, and the
+                // seed-unusable class) were being written to /dev/null.
+                if let Ok(mut child) = std::process::Command::new(&atpkg)
                     .arg("update")
-                    .stdout(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
-                    .status();
+                    .spawn()
+                {
+                    if let Some(out) = child.stdout.take() {
+                        use std::io::BufRead as _;
+                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                            if let Some(event) = parse_seed_line(&line) {
+                                let _ = proxy.send_event(event);
+                            }
+                        }
+                    }
+                    let _ = child.wait();
+                }
                 if interval == 0 {
                     break;
                 }
@@ -15236,6 +15472,252 @@ fn spawn_pkg_update_check(config: &Config) -> bool {
             }
         })
         .is_ok()
+}
+
+/// Scan an `atpkg seed` child's stdout for the two STABLE marker lines the
+/// batteries-included lane prints (crates/atpkg/src/cli.rs `cmd_seed` — the
+/// markers are a cross-crate contract; changing either side blinds the other):
+///
+///   `atpkg: seed-installed: <name>, <name>, …`
+///   `atpkg: seed-pending: <human tail>`
+///
+/// Returns `None` when neither matched (the quiet-seed common case), else
+/// `(installed_names, pending_tail)`. Pure so the contract is unit-testable
+/// without spawning a child.
+fn parse_seed_markers(stdout: &str) -> Option<(Vec<String>, Option<String>)> {
+    let mut installed: Vec<String> = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("atpkg: seed-installed: ") {
+            installed.extend(
+                rest.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        } else if let Some(rest) = line.strip_prefix("atpkg: seed-pending: ") {
+            let tail = rest.trim();
+            if !tail.is_empty() {
+                pending = Some(tail.to_string());
+            }
+        }
+    }
+    (!installed.is_empty() || pending.is_some()).then_some((installed, pending))
+}
+
+/// One STREAMED line of `atpkg seed` stdout → the `Wake` it should raise, if any.
+///
+/// The line-at-a-time twin of [`parse_seed_markers`] (which stays as the whole-output
+/// parser its contract tests exercise). Three stable markers, and the ORDER they arrive
+/// in is the point: `seed-starting:` fires before the multi-GB extraction so the notice
+/// is on screen while it runs, and `seed-installed:`/`seed-pending:` land when it is
+/// done. Anything else the child prints is diagnostics for `status.toml`, not UI.
+fn parse_seed_line(line: &str) -> Option<Wake> {
+    // The prefixes come from atpkg itself, so a rename is a COMPILE error on both
+    // sides. They used to be literals duplicated here, which made this contract's
+    // failure mode silent: reword one side and the notice simply never appears
+    // again, with nothing red anywhere. That has already happened once.
+    let marked = |m: &str| -> Option<String> {
+        line.strip_prefix("atpkg: ")
+            .and_then(|r| r.strip_prefix(m))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    };
+    if let Some(detail) = marked(atpkg::cli::SEED_STARTING_MARKER) {
+        return Some(Wake::PkgSeedStarted { detail });
+    }
+    if let Some(detail) = marked(atpkg::cli::SEED_PARTIAL_MARKER) {
+        return Some(Wake::PkgSeedPartial { detail });
+    }
+    if let Some(detail) = marked(atpkg::cli::SEED_FAILED_MARKER) {
+        return Some(Wake::PkgSeedFailed { detail });
+    }
+    if let Some(detail) = marked(atpkg::cli::SEED_UNUSABLE_MARKER) {
+        return Some(Wake::PkgSeedUnusable { detail });
+    }
+    // The NETWORK completion lane's arrival — same pill as a local install, because
+    // to the user it is the same event: the toolchain is now here.
+    if let Some(detail) = marked(atpkg::cli::NET_INSTALLED_MARKER) {
+        return Some(Wake::PkgSeed {
+            installed: detail
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            pending: None,
+        });
+    }
+    let (installed, pending) = parse_seed_markers(line)?;
+    Some(Wake::PkgSeed { installed, pending })
+}
+
+/// The installed-roster pill caption. Extracted from the `Wake::PkgSeed` arm so
+/// the cap and the marker glyph are unit-testable (the arm itself runs only on
+/// the UI thread). The leading "✓" is deliberate: the notice renderer tints the
+/// FIRST character with the accent colour, so without a marker the "A" of
+/// "ALab" would be tinted alone and the word would read as "A Lab".
+fn seed_pill_text(installed: &[String]) -> String {
+    // Cap the roster so the pill stays a pill: ≤5 names, then an ellipsis
+    // standing in for the rest.
+    let mut names = installed
+        .iter()
+        .take(5)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if installed.len() > 5 {
+        names.push('…');
+    }
+    // "…open a new tab" is not padding. `hooks::refresh` writes ~/.aterm/shell.d
+    // AFTER this install, but aterm's shell integration sources that directory once
+    // at shell startup — which happened at app launch, minutes earlier. So the shell
+    // the user is staring at, in the window that just announced the toolchain, does
+    // NOT have <prefix>/bin on PATH: typing `ay` gives "command not found". Claiming
+    // "installed" and delivering that is the product's worst possible first
+    // impression, and one clause converts it into a correct one.
+    format!("✓ ALab toolchain installed: {names} — open a new tab to use them")
+}
+
+/// The seed-marker contract with atpkg (`cmd_seed`'s two stable stdout lines):
+/// pinned here so a wording drift on either side goes red instead of silently
+/// blinding the first-run notice.
+#[cfg(test)]
+mod seed_marker_tests {
+    use super::{Wake, parse_seed_line, parse_seed_markers, seed_pill_text};
+
+    /// The STREAMING contract: `seed-starting:` must raise its event from a single
+    /// line, because that is the whole point — it arrives before the multi-GB
+    /// extraction, not bundled with the output after it. A quiet line raises nothing.
+    #[test]
+    fn a_streamed_start_marker_raises_the_started_wake() {
+        let started = parse_seed_line(
+            "atpkg: seed-starting: installing the ALab toolset from the bundled registry \
+             (about 3 GB on disk when finished)",
+        );
+        match started {
+            Some(Wake::PkgSeedStarted { detail }) => {
+                assert!(detail.starts_with("installing the ALab toolset"), "{detail}");
+                assert!(
+                    !detail.contains("seed-starting"),
+                    "the marker prefix is stripped, not echoed: {detail}"
+                );
+            }
+            other => panic!("expected PkgSeedStarted, got {other:?}"),
+        }
+        // The completion markers still resolve line-at-a-time…
+        match parse_seed_line("atpkg: seed-installed: ay, trust") {
+            Some(Wake::PkgSeed { installed, pending }) => {
+                assert_eq!(installed, ["ay", "trust"]);
+                assert_eq!(pending, None);
+            }
+            other => panic!("expected PkgSeed, got {other:?}"),
+        }
+        // …and ordinary chatter raises nothing at all.
+        assert!(parse_seed_line("atpkg: no bundled seed — bootstrap is network-only").is_none());
+        assert!(parse_seed_line("atpkg: seed-starting: ").is_none(), "empty tail");
+    }
+
+    #[test]
+    fn pill_caps_the_roster_and_keeps_its_marker_glyph() {
+        let names = |n: usize| -> Vec<String> {
+            ["ay", "clean", "ny", "trust", "ty", "nn"][..n]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        };
+        // ≤5: every name, no ellipsis.
+        assert_eq!(
+            seed_pill_text(&names(3)),
+            "✓ ALab toolchain installed: ay, clean, ny — open a new tab to use them"
+        );
+        assert_eq!(
+            seed_pill_text(&names(5)),
+            "✓ ALab toolchain installed: ay, clean, ny, trust, ty — open a new tab to use them"
+        );
+        // >5: exactly five, then the ellipsis.
+        assert_eq!(
+            seed_pill_text(&names(6)),
+            "✓ ALab toolchain installed: ay, clean, ny, trust, ty… — open a new tab to use them"
+        );
+        // The PATH caveat is load-bearing, not decoration: shell.d is written after
+        // this install, but aterm's integration sourced it at shell startup, so the
+        // window showing this pill cannot run the tools yet.
+        assert!(
+            seed_pill_text(&names(1)).contains("open a new tab"),
+            "the pill must not claim tools the current shell cannot run"
+        );
+        // The marker glyph must lead — the renderer tints the FIRST char, so
+        // losing it makes "ALab" render as "A Lab".
+        assert!(seed_pill_text(&names(1)).starts_with("✓ "));
+    }
+
+    /// The contract is now TYPE-CHECKED, not string-matched: these prefixes are
+    /// atpkg's own constants, so a rename cannot silently desynchronise the two
+    /// crates. Pinned here so the wiring itself is exercised — including the
+    /// NETWORK lane, whose arrival used to reach the user through no channel at all.
+    #[test]
+    fn every_atpkg_marker_constant_has_a_wake_arm() {
+        use super::parse_seed_line;
+        let cases: [(&str, &str); 6] = [
+            (atpkg::cli::SEED_STARTING_MARKER, "installing 8 ALab program(s)"),
+            (atpkg::cli::SEED_PARTIAL_MARKER, "3 installed, 5 failed"),
+            (atpkg::cli::SEED_FAILED_MARKER, "nothing could be installed"),
+            (atpkg::cli::SEED_UNUSABLE_MARKER, "no build for this architecture"),
+            (atpkg::cli::NET_INSTALLED_MARKER, "ay, clean"),
+            (atpkg::cli::SEED_INSTALLED_MARKER, "ay, trust"),
+        ];
+        for (marker, tail) in cases {
+            let line = format!("atpkg: {marker}{tail}");
+            assert!(
+                parse_seed_line(&line).is_some(),
+                "marker {marker:?} reaches the user through no Wake — an announcement \
+                 with no answer leaves its notice on screen forever"
+            );
+        }
+        // The network lane's arrival renders as an install, because to the user that
+        // is exactly what it is.
+        match parse_seed_line(&format!("atpkg: {}ay, clean", atpkg::cli::NET_INSTALLED_MARKER)) {
+            Some(Wake::PkgSeed { installed, .. }) => assert_eq!(installed, ["ay", "clean"]),
+            other => panic!("expected PkgSeed for the network lane, got {other:?}"),
+        }
+        // An empty tail is not an event.
+        assert!(parse_seed_line(&format!("atpkg: {}", atpkg::cli::SEED_FAILED_MARKER)).is_none());
+    }
+
+    #[test]
+    fn quiet_seed_posts_nothing() {
+        assert_eq!(parse_seed_markers(""), None);
+        assert_eq!(
+            parse_seed_markers("atpkg: no bundled seed — bootstrap is network-only\n"),
+            None
+        );
+        assert_eq!(
+            parse_seed_markers(
+                "atpkg: store already provisioned — the bundled seed is a bootstrap-only source\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn installed_marker_yields_the_name_roster() {
+        let out = "atpkg: default set complete\n\
+                   atpkg: seed-installed: ay, trust, ty\n";
+        let (installed, pending) = parse_seed_markers(out).unwrap();
+        assert_eq!(installed, ["ay", "trust", "ty"]);
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn pending_marker_yields_the_human_tail() {
+        let out = "atpkg: seed-pending: 3 program(s) ready to install from the bundled seed: \
+                   ay, trust, ty (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg \
+                   install --default-set`)\n";
+        let (installed, pending) = parse_seed_markers(out).unwrap();
+        assert!(installed.is_empty());
+        assert!(pending.unwrap().starts_with("3 program(s) ready"));
+    }
 }
 
 /// Set ONCE in `main` (single-threaded launcher) from `$ATERM_UPDATED_FROM`: `true` when
@@ -16200,7 +16682,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // its own signed channel and is inert on a build with no pinned root key. A no-op for
     // dev/`cargo run` (no co-located `atpkg`), skipped headless (no background network),
     // and gated on the `[packages]` loop flags (enabled + auto_update, default on).
-    let package_update_loop_running = !headless && spawn_pkg_update_check(&config);
+    let package_update_loop_running = !headless && spawn_pkg_update_check(&config, proxy.clone());
 
     // Latency self-introspection state (see App::trace_latency). The epoch is a
     // shared monotonic origin so each tab's reader thread and the UI thread
@@ -16665,6 +17147,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         last_native_update_reconcile_sequence: 0,
         native_stage_imported_at: None,
         auto_apply_was_on: true,
+        handoff_deferred_input: Vec::new(),
         control_apply_stale_retries: 0,
         deferred_native_update_reconcile: None,
         pending_native_update_reconcile_purpose: None,

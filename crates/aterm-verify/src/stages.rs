@@ -8,8 +8,10 @@
 //! small pure function below, so the port is checked by unit tests rather than by
 //! a reviewer diffing two languages — including the details that are easy to lose
 //! and expensive to lose: tippy's separate `CARGO_TARGET_DIR` and
-//! `TRUST_NO_MIGRATE_WARN`, `RUSTDOC=<stage2>/trustdoc` on the doc-running
-//! stages, `ATERM_SEARCH_REGEX_LANE=1` on the regex lane, and `--unverified` on
+//! `TRUST_NO_MIGRATE_WARN`, the doc-driver rule on the doc-running stages
+//! ([`DocDriver`]: `RUSTDOC=<stage2>/trustdoc` when the stage2 carries it,
+//! the caller's own export or the PATH farm link otherwise, a diagnosis when
+//! nothing exists), `ATERM_SEARCH_REGEX_LANE=1` on the regex lane, and `--unverified` on
 //! every driver invocation (naming the lane is the point: `targo` REFUSES a bare
 //! verb precisely so a gate cannot be quietly unverified).
 
@@ -242,6 +244,72 @@ fn with_trustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
     cmd.env("RUSTDOC", ctx.tools.trustdoc.as_os_str())
 }
 
+/// Which doc driver a doc-running stage gets. `Stage2` is the pinned driver,
+/// bound through `RUSTDOC` (a `Command::env` that overrides anything the
+/// caller exported — the gate pins its own driver whenever it has one).
+/// `Ambient` is a caller-exported `RUSTDOC`/`CARGO_BUILD_RUSTDOC`: cargo
+/// prefers either over the config's `[build] rustdoc`, so the child runs under
+/// the operator's own binding and the ladder says so. `BarePath` leaves
+/// cargo's discovery to resolve the config's bare `trustdoc` from the
+/// children's PATH (the `~/.local/bin` farm link) — fail-closed, real doctest
+/// verdicts. `Absent` means a doctest-compiling run would die at exec with a
+/// raw OS error naming no remedy, so the stage diagnoses instead — unless the
+/// run compiles no lib target (rustdoc is never spawned) or `--selftest`
+/// executes nothing anyway; the stage arms below hold those qualifiers.
+#[derive(Debug, PartialEq, Eq)]
+enum DocDriver {
+    Stage2,
+    Ambient,
+    BarePath,
+    Absent,
+}
+
+fn doc_driver(ctx: &Ctx) -> DocDriver {
+    doc_driver_from(
+        ctx.tools.have_trustdoc(),
+        ctx.env.rustdoc_override.is_some(),
+        crate::have_on_path("trustdoc", &ctx.path_env),
+    )
+}
+
+/// Would this scope's `targo test` compile any doctests? Cargo spawns rustdoc
+/// only for lib targets, so a scope with none runs green without any doc
+/// driver — the Absent diagnosis must not fire there. `--changed` answers from
+/// its resolved `Members` table; `--scope <crate>` never resolved the graph,
+/// so it asks the member's own manifest (`crates/<name>` layout, both halves
+/// of cargo's rule); the workspace always holds libs. Unanswerable answers
+/// YES, the same fail-closed direction as `Members::any_has_lib` — here the
+/// diagnosis rather than a bare run that would die raw if the answer was
+/// really yes.
+fn scope_compiles_doctests(ctx: &Ctx) -> bool {
+    match &ctx.scope {
+        Scope::Crate(c) => crate::changed::crate_dir_has_lib(&ctx.root, c),
+        s => s.has_lib_target(),
+    }
+}
+
+/// The rule as a truth table — pure, so it is a test and not a promise. The
+/// stage2's own copy outranks everything: the gate runs THE toolchain's
+/// drivers, and its `RUSTDOC` binding overrides even a caller's export. The
+/// caller's export outranks the bare PATH walk because cargo gives it exactly
+/// that precedence over the config key. The farm link is the fallback for
+/// machines whose stage2 predates trustdoc, never a preference.
+const fn doc_driver_from(
+    stage2_has_trustdoc: bool,
+    ambient_override: bool,
+    bare_on_path: bool,
+) -> DocDriver {
+    if stage2_has_trustdoc {
+        DocDriver::Stage2
+    } else if ambient_override {
+        DocDriver::Ambient
+    } else if bare_on_path {
+        DocDriver::BarePath
+    } else {
+        DocDriver::Absent
+    }
+}
+
 /// A helper script under `tools/` (or anywhere), run as `<script> <root>`.
 fn script_cmd(path: &std::path::Path, root: &std::path::Path) -> Cmd {
     Cmd::new(path).arg(root)
@@ -268,7 +336,9 @@ fn build(ctx: &Ctx, r: &mut Report) {
 
 // ---------------------------------------------------------------------------
 // 2) TEST — `targo test` runs crate doctests after the unit/integration targets,
-//    so trustdoc is bound here as well as in the explicit doc-only stage.
+//    so trustdoc is bound here as well as in the explicit doc-only stage — and a
+//    machine with NO doc driver anywhere is diagnosed here (COULD-NOT-RUN with
+//    the remedy), not left to die at exec mid-stage after the unit tests passed.
 // ---------------------------------------------------------------------------
 fn test(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
@@ -276,16 +346,34 @@ fn test(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let label = format!("targo test {}", ctx.scope.label());
+    // The empty change-selection outranks the doc-driver verdict: a run that
+    // compiles NOTHING needs no doc driver, and must keep saying why it ran
+    // nothing rather than blaming a tool it never needed.
+    if ctx.scope.selects_nothing() {
+        r.skip(format!("{label} (change-scoped run selected no crates)"));
+        return;
+    }
     let cmd = targo(ctx, test_args(&ctx.scope));
-    if ctx.tools.have_trustdoc() {
-        run_scoped(
+    match doc_driver(ctx) {
+        DocDriver::Stage2 => run_labeled(
             ctx,
             r,
             &format!("{label} (trustdoc)"),
             &with_trustdoc(ctx, cmd),
-        );
-    } else {
-        run_scoped(ctx, r, &label, &cmd);
+        ),
+        DocDriver::Ambient => {
+            run_labeled(ctx, r, &format!("{label} (caller's RUSTDOC)"), &cmd);
+        }
+        DocDriver::BarePath => run_labeled(ctx, r, &label, &cmd),
+        // Diagnose only a run that would really spawn rustdoc: `--selftest`
+        // executes nothing (run_labeled prints its skip), and a scope that
+        // compiles no lib target compiles no doctests, so the child runs
+        // green without a doc driver — declaring the machine broken there
+        // would blame a tool the run never needed.
+        DocDriver::Absent if ctx.selftest || !scope_compiles_doctests(ctx) => {
+            run_labeled(ctx, r, &label, &cmd);
+        }
+        DocDriver::Absent => r.cannot_run(ctx.tools.missing_trustdoc_label()),
     }
 }
 
@@ -298,14 +386,22 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let label = format!("targo test --doc {}", ctx.scope.label());
+    // The empty change-selection outranks every other verdict, same as the test
+    // stage directly above.
+    if ctx.scope.selects_nothing() {
+        r.skip(format!("{label} (change-scoped run selected no crates)"));
+        return;
+    }
     // `cargo test --doc -p …` is a hard ERROR — "no library targets found in
     // package `X`" — when NONE of the selected packages has a lib, and an
-    // all-binary selection is an ordinary outcome under `--changed`: `xtask` is
-    // bin-only, so a branch that edits only crates/xtask selects exactly {xtask}
-    // and this stage would go RED on a completely healthy tree. A tier that
-    // cries wolf is worse than no tier, so ask first and skip honestly — a skip
-    // is counted, and the verdict narrows accordingly.
-    if !ctx.scope.selects_nothing() && !ctx.scope.has_lib_target() {
+    // all-binary selection is an ordinary outcome under `--changed` (`xtask` is
+    // bin-only, so a branch that edits only crates/xtask selects exactly
+    // {xtask}) and under `--scope xtask` alike: this stage would go RED on a
+    // completely healthy tree. A tier that cries wolf is worse than no tier,
+    // so ask first — `scope_compiles_doctests`, the same answer the test
+    // stage's diagnosis consults — and skip honestly: a skip is counted, and
+    // the verdict narrows accordingly.
+    if !scope_compiles_doctests(ctx) {
         r.skip(format!(
             "targo test --doc (no package in scope has a library target: {})",
             ctx.scope.label()
@@ -313,15 +409,25 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let cmd = targo(ctx, doctest_args(&ctx.scope));
-    if ctx.tools.have_trustdoc() {
-        run_scoped(
+    match doc_driver(ctx) {
+        DocDriver::Stage2 => run_labeled(
             ctx,
             r,
             &format!("{label} (trustdoc)"),
             &with_trustdoc(ctx, cmd),
-        );
-    } else {
-        run_scoped(ctx, r, &label, &cmd);
+        ),
+        DocDriver::Ambient => {
+            run_labeled(ctx, r, &format!("{label} (caller's RUSTDOC)"), &cmd);
+        }
+        DocDriver::BarePath => run_labeled(ctx, r, &label, &cmd),
+        // Selftest executes nothing — run_labeled prints its uniform skip.
+        DocDriver::Absent if ctx.selftest => run_labeled(ctx, r, &label, &cmd),
+        // The test stage directly above already declared the COULD-NOT-RUN with
+        // the full remedy — same pattern as the no-targo ladder, where build
+        // declares once and the later stages skip pointing at it. (Whenever
+        // this stage survives its lib-target guard, that scope made the test
+        // stage's Absent arm a real cannot_run, so the pointer never dangles.)
+        DocDriver::Absent => r.skip("targo test --doc (no doc driver — see the test line)"),
     }
 }
 
@@ -348,15 +454,26 @@ fn regex_lane(ctx: &Ctx, r: &mut Report) {
     }
     let label = "targo test -p aterm-search --features regex";
     let cmd = regex_lane_cmd(ctx);
-    if ctx.tools.have_trustdoc() {
-        run_labeled(
+    // This lane compiles aterm-search's doctests too, so it takes the same
+    // doc-driver rule as the test/doctest stages — left on the old two-way
+    // binding it would be the one stage still dying raw at rustdoc exec on a
+    // machine with no doc driver, and worse, dying as a GateFailed that
+    // outranks the test stage's honest COULD-NOT-RUN in the verdict.
+    match doc_driver(ctx) {
+        DocDriver::Stage2 => run_labeled(
             ctx,
             r,
             &format!("{label} (trustdoc)"),
             &with_trustdoc(ctx, cmd),
-        );
-    } else {
-        run_labeled(ctx, r, label, &cmd);
+        ),
+        DocDriver::Ambient => {
+            run_labeled(ctx, r, &format!("{label} (caller's RUSTDOC)"), &cmd);
+        }
+        DocDriver::BarePath => run_labeled(ctx, r, label, &cmd),
+        DocDriver::Absent if ctx.selftest => run_labeled(ctx, r, label, &cmd),
+        // Planned only when aterm-search (a lib crate) is in scope, so the test
+        // stage's Absent arm was a real cannot_run — the pointer never dangles.
+        DocDriver::Absent => r.skip(format!("{label} (no doc driver — see the test line)")),
     }
 }
 
@@ -793,6 +910,140 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_machine_with_no_doc_driver_anywhere_is_diagnosed_not_left_to_die_at_exec() {
+        // targo exists, trustdoc does not, and nothing on the children's PATH
+        // answers to the bare name: the test stage must say COULD-NOT-RUN with
+        // the remedy BEFORE spawning anything (the old behavior ran the child
+        // and let cargo die at exec mid-stage, after the unit tests passed),
+        // and the doctest stage points at that line rather than re-declaring.
+        let mut cc = ctx(Scope::workspace());
+        cc.tools.targo = PathBuf::from("/bin/sh");
+        cc.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
+        cc.path_env = "/nonexistent-dir".into();
+        let spec = |id| StageSpec {
+            id,
+            title: "t".into(),
+            lane: crate::plan::Lane::MainTarget,
+            exclusive: false,
+        };
+
+        let r = run_stage(&cc, &spec(StageId::Test));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes.len(), 1, "test decided once");
+        assert_eq!(outcomes[0].0, Outcome::Fail(Severity::CouldNotRun));
+        assert!(
+            outcomes[0].1.contains("~/.local/bin/trustdoc"),
+            "the diagnosis names the remedy: {}",
+            outcomes[0].1
+        );
+
+        let r = run_stage(&cc, &spec(StageId::Doctests));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes.len(), 1, "doctests decided once");
+        assert_eq!(outcomes[0].0, Outcome::Skip);
+        assert!(
+            outcomes[0].1.contains("see the test line"),
+            "{}",
+            outcomes[0].1
+        );
+
+        // The regex lane compiles aterm-search doctests, so it takes the same
+        // rule — a skip pointing at the test line, never a raw exec death that
+        // would land as GateFailed and outrank the honest COULD-NOT-RUN.
+        let r = run_stage(&cc, &spec(StageId::RegexLane));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes.len(), 1, "regex lane decided once");
+        assert_eq!(outcomes[0].0, Outcome::Skip);
+        assert!(
+            outcomes[0].1.contains("see the test line"),
+            "{}",
+            outcomes[0].1
+        );
+
+        // `--selftest` executes nothing, so there is no machine to diagnose:
+        // the ladder keeps its uniform selftest skips and the run stays green.
+        let mut cs = ctx(Scope::workspace());
+        cs.tools.targo = PathBuf::from("/bin/sh");
+        cs.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
+        cs.path_env = "/nonexistent-dir".into();
+        cs.selftest = true;
+        let r = run_stage(&cs, &spec(StageId::Test));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes.len(), 1, "selftest test decided once");
+        assert_eq!(outcomes[0].0, Outcome::Skip);
+        assert!(
+            outcomes[0].1.contains("(selftest: not executed)"),
+            "{}",
+            outcomes[0].1
+        );
+
+        // A cone with no lib target compiles no doctests — rustdoc is never
+        // spawned, so the run proceeds instead of blaming a tool it never
+        // needed. `/usr/bin/true` stands in for targo: an Ok outcome proves
+        // the stage RAN the child rather than declaring COULD-NOT-RUN.
+        let mut cb = ctx(Scope::changed("main", vec!["xtask".into()], false));
+        cb.tools.targo = PathBuf::from("/usr/bin/true");
+        cb.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
+        cb.path_env = "/nonexistent-dir".into();
+        // The ctx() helper's `/repo` root is fine for stages that never spawn;
+        // this case must actually exec, so the child needs a real cwd.
+        cb.root = std::env::temp_dir();
+        cb.scratch = std::env::temp_dir();
+        let r = run_stage(&cb, &spec(StageId::Test));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes.len(), 1, "bin-only test decided once");
+        assert_eq!(outcomes[0].0, Outcome::Ok, "{}", outcomes[0].1);
+
+        // `--scope <crate>` answers the lib question from the member's own
+        // manifest: a bin-only scope runs (rustdoc never spawns), and the
+        // same scope with a lib is a real diagnosis.
+        let tmp = crate::mktemp_dir("atv-doc-scope").expect("mktemp");
+        let bin_only = tmp.join("crates/binonly");
+        std::fs::create_dir_all(bin_only.join("src")).unwrap();
+        std::fs::write(
+            bin_only.join("Cargo.toml"),
+            "[package]\nname = \"binonly\"\n",
+        )
+        .unwrap();
+        let mut cx = ctx(Scope::Crate("binonly".into()));
+        cx.tools.targo = PathBuf::from("/usr/bin/true");
+        cx.tools.trustdoc = PathBuf::from("/nonexistent/trustdoc");
+        cx.path_env = "/nonexistent-dir".into();
+        cx.root = tmp.clone();
+        cx.scratch = std::env::temp_dir();
+        let r = run_stage(&cx, &spec(StageId::Test));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(outcomes[0].0, Outcome::Ok, "{}", outcomes[0].1);
+
+        std::fs::write(bin_only.join("src/lib.rs"), "").unwrap();
+        let r = run_stage(&cx, &spec(StageId::Test));
+        let outcomes: Vec<_> = r.outcomes().collect();
+        assert_eq!(
+            outcomes[0].0,
+            Outcome::Fail(Severity::CouldNotRun),
+            "{}",
+            outcomes[0].1
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_doc_driver_rule_pins_stage2_first_and_diagnoses_absence() {
+        // The pinned driver always wins (the gate runs THE toolchain's
+        // drivers, and its RUSTDOC binding overrides even a caller's export);
+        // the caller's export outranks the PATH walk exactly as cargo ranks
+        // env over config; a farm link keeps an older stage2 running
+        // fail-closed; and nothing-anywhere is a diagnosis, never a raw exec
+        // death after the unit tests already passed.
+        assert_eq!(doc_driver_from(true, true, true), DocDriver::Stage2);
+        assert_eq!(doc_driver_from(true, false, false), DocDriver::Stage2);
+        assert_eq!(doc_driver_from(false, true, true), DocDriver::Ambient);
+        assert_eq!(doc_driver_from(false, true, false), DocDriver::Ambient);
+        assert_eq!(doc_driver_from(false, false, true), DocDriver::BarePath);
+        assert_eq!(doc_driver_from(false, false, false), DocDriver::Absent);
     }
 
     #[test]

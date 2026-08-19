@@ -7,10 +7,12 @@
 //! "Publishing" is the load-bearing word: a machine on the roster builds what it signs,
 //! so the audit proves the whole stack — the self-hosted Trust stage2 toolchain (a real
 //! smoke-compile under the native-lane rustflags, via the same `gates` probes the cut
-//! runs), the trust-named gate drivers (`targo`/`tippy`/`ty`/`trustdoc`), the rustup
-//! front door (`cargo` in this repo dispatches into the linked `trust` toolchain — the
-//! link is a provisioned artifact, not an accident), the stable `x86_64-apple-darwin`
-//! slice of the universal binary, Apple's packaging tools, the Developer ID identity, a
+//! runs), the trust-named gate drivers (`targo`/`tippy`/`ty`/`trustdoc`), the doc-tool
+//! farm link (`~/.local/bin/trustdoc`, repaired in place when safely mechanical —
+//! [`doc_tool_check`]), the rustup front door (`cargo` in this repo dispatches into the
+//! linked `trust` toolchain — the link is a provisioned artifact, not an accident), the
+//! stable `x86_64-apple-darwin` slice of the universal binary, Apple's packaging tools,
+//! the Developer ID identity, a
 //! LIVE-tested notarytool credential, the credentials profile, `gh` auth and the
 //! channel token. On a machine with none of that, the front door is
 //! `tools/bootstrap-publisher.sh`, which acquires the toolchain and hands off here.
@@ -98,6 +100,16 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
 
     // ---- 1. the roster pair: newest verified generation into dist/ ----------------
     let home = std::env::var("HOME").map_err(|_| Error::new("HOME is not set"))?;
+    // Set-but-empty (or relative) survives the var read and would silently derive
+    // RELATIVE kept-roster/key/identity/farm paths — writes landing in the process cwd
+    // instead of the home directory. The kept pair below is the first of those writes,
+    // and it is the one whose loss has no remedy, so refuse before it.
+    if !Path::new(&home).is_absolute() {
+        return Err(Error::new(format!(
+            "HOME is not an absolute path ({home:?}) — refusing to derive the kept roster \
+             pair, machine key, identity, and farm-link paths from it"
+        )));
+    }
     let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
     let kept_path = kept_roster_path(&home);
     // dist/ is gitignored and `git clean -xdf` sweeps it — but the generation a mint
@@ -175,6 +187,8 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // `authority` line, which proves the same key through the cut's own gate. On an
     // unprovisioned machine, the case the verb exists for, the section was a numbered
     // header with nothing under it.
+    //
+    // `home` is bound (and proven absolute) in the roster phase above.
     let key_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_KEY_REL);
     let identity_path = Path::new(&home).join(atpkg_keys::provision::MACHINE_PUB_REL);
 
@@ -269,6 +283,11 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
         record("verifiers", verifiers_check(bin), &mut checks);
         record("front door", front_door_check(bin), &mut checks);
     }
+    // NOT gated on a proven stage2, unlike the two above: this one reads the farm link
+    // and PATH, which exist (and can be wrong) whether or not a stage2 resolves — so it
+    // always has something to look at, and a machine whose toolchain needs replacing
+    // still gets told its doc driver is missing in the same pass.
+    record("doc tool", doc_tool_check(&home, check_only), &mut checks);
     record("x86 slice", x86_slice_check(), &mut checks);
     record("apple sdk", apple_clt_check(), &mut checks);
 
@@ -295,6 +314,21 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // and reported once, after the mint, where its verdict is already true.
     let blocking = blockers(&checks);
     let host_cannot_cut = checks.iter().any(|(_, c)| matches!(c, Check::Skip(_)));
+
+    // The batteries-included seed (§9.1) is audited but deliberately NOT part of
+    // `blocking`, and the distinction is load-bearing. Everything in `checks` above
+    // is a MACHINE CAPABILITY — a compiler, a credential, a signing identity —
+    // and `blocking > 0` defers the mint because consuming an irreversible roster id
+    // on a machine that cannot build or publish is unrecoverable. A seed is not a
+    // capability: it is a per-CUT build input that any provisioned machine can
+    // stage in one command, so letting its absence block the MINT would gate this
+    // machine's permanent identity on a 600 MB download it does not need to
+    // possess an identity. It does gate READY TO CUT, because the cut's own
+    // pre-claim gate refuses without it — so it is reported here, counted
+    // separately, and folded into the verdict below.
+    let seed = seed_source_check(repo);
+    print_check("seed source", &seed);
+    let seed_blocks_cut = matches!(seed, Check::Fail { .. });
 
     // ---- 3. mint LAST -------------------------------------------------------------
     // A roster id is irreversible, so it is never consumed on a machine the audit just
@@ -432,6 +466,16 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
         println!(
             "ROSTERED — but cuts run on macOS (Tier APPLE): this machine can sign the \
              atpkg index, and can never say READY TO CUT"
+        );
+    } else if seed_blocks_cut {
+        // Every CAPABILITY passed — this machine is provisioned and minted — but
+        // `cargo ship cut` refuses pre-claim without a validated seed, so saying
+        // "READY TO CUT: yes" here would be the label out-running the proof.
+        println!(
+            "READY TO CUT: not yet — this machine is fully provisioned, but the \
+             batteries-included seed is not staged (see the seed source line above). \
+             Stage it with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
+             deliberately seedless with ATERM_SEEDLESS=1"
         );
     } else {
         // One line, and the command as printed RUNS: the old text spelled the profile
@@ -905,6 +949,220 @@ fn verifiers_check(bin: &Path) -> Check {
                   + ty"
                 .into(),
         }
+    }
+}
+
+/// The doc-tool FARM LINK. `.cargo/config.toml` names the workspace's doc driver
+/// by BARE NAME (`[build] rustdoc = "trustdoc"`, resolved from PATH), so a plain
+/// `cargo test` on this machine runs its doctest lane only where `trustdoc`
+/// resolves — the verify gate binds `RUSTDOC` to the stage2's copy when the
+/// stage2 carries one (and diagnoses when nothing exists anywhere), but a
+/// direct cargo invocation has only PATH, and without the link it dies at exec
+/// with a raw OS error that names no remedy. The convention that config
+/// comment describes — `~/.local/bin/trustdoc` symlinked at the live stage2 —
+/// is a provisioned artifact, audited like the rustup link. UNLIKE that link the
+/// whole remedy is one mechanical symlink, so a full run REPAIRS it in place: a
+/// missing entry or a DANGLING symlink (a swept stage2, say) is linked to the
+/// stage2's trustdoc; anything else at that path is somebody's arrangement and
+/// is never replaced. `--check` reports the remedy without writing, like every
+/// other no-writes path.
+#[cfg(unix)]
+fn doc_tool_check(home: &str, check_only: bool) -> Check {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(found) = resolve_on_path("trustdoc", &path_var) {
+        return Check::Pass(format!("trustdoc resolves on PATH ({})", found.display()));
+    }
+    // A LIVE, working farm entry that PATH simply cannot see is the one state
+    // where every other remedy is a dead end: link_farm rightly refuses to
+    // replace it, `ln -sf` would recreate the identical link, and only the
+    // PATH itself is wrong. Diagnose it FIRST, so the audit cannot loop
+    // forever handing out fixes that change nothing.
+    let farm = Path::new(home).join(".local/bin/trustdoc");
+    if executable(&farm) {
+        return Check::Fail {
+            what: format!(
+                "{} is a working doc driver, but its directory is not on PATH",
+                farm.display()
+            ),
+            fix: format!(
+                "add {} to PATH",
+                farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
+            ),
+        };
+    }
+    let stage2 = match gates::trust_stage2_bin() {
+        Ok(b) => b,
+        Err(_) => return Check::Skip("no stage2 toolchain — see the toolchain line".into()),
+    };
+    let target = stage2.join("trustdoc");
+    if !target.is_file() {
+        return Check::Skip("the stage2 lacks trustdoc — see the verifiers line".into());
+    }
+    if !executable(&target) {
+        // A farm link at a driver that cannot exec would turn this audit's
+        // Pass into cargo's raw exec error — the defect is the stage2's, and
+        // linking it would only relocate the death.
+        return Check::Fail {
+            what: format!("{} exists but is not executable", target.display()),
+            fix: "an incomplete stage2 — rebuild it (`python3 x.py build --stage 2` in \
+                  $HOME/trust) or reinstall via `atpkg install trust`"
+                .into(),
+        };
+    }
+    // `-sf` so the remedy is runnable over the dangling link this check
+    // repairs; on anything LIVE at that path the operator is choosing to
+    // replace it, which is exactly what typing the command states.
+    let fix = format!(
+        "ln -sf {} {} — the farm link `[build] rustdoc = \"trustdoc\"` \
+         (.cargo/config.toml) resolves; a full `cargo ship provision` run repairs it",
+        target.display(),
+        farm.display(),
+    );
+    if check_only {
+        return Check::Fail {
+            what: "no `trustdoc` resolves on PATH — a plain `cargo test`'s doctest lane \
+                   dies at exec"
+                .into(),
+            fix,
+        };
+    }
+    if let Err(why) = link_farm(&farm, &target) {
+        return Check::Fail { what: why, fix };
+    }
+    if resolve_on_path("trustdoc", &path_var).is_some() {
+        Check::Pass(format!("linked {} → {}", farm.display(), target.display()))
+    } else {
+        Check::Fail {
+            what: format!(
+                "linked {} → {}, but its directory is not on PATH",
+                farm.display(),
+                target.display()
+            ),
+            fix: format!(
+                "add {} to PATH",
+                farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
+            ),
+        }
+    }
+}
+
+/// First executable `name` on `path` — the same PATH walk cargo's bare-name
+/// `[build] rustdoc` key resolves through. Pure over the PATH value, so it is
+/// testable with a scratch dir. The mode test is the any-exec-bit heuristic,
+/// not `access(2)`'s uid/gid arithmetic: a candidate the invoking user cannot
+/// actually exec (a root-only 0700, say) is accepted here and still fails at
+/// spawn — the audit prefers a nameable near-miss over a permission model it
+/// would get subtly wrong.
+#[cfg(unix)]
+fn resolve_on_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .map(|d| d.join(name))
+        .find(|p| executable(p))
+}
+
+/// A regular file with any exec bit set (following symlinks, as spawn does).
+#[cfg(unix)]
+fn executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(p)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Create `farm` → `target`, repairing only what is safely mechanical: nothing
+/// there, or a symlink that resolves to NOTHING FOUND. An existing regular
+/// file, directory, or LIVE symlink is never replaced — it is somebody's
+/// arrangement, and silently overwriting it is how a provisioning verb becomes
+/// a footgun. "Dangling" is judged on `NotFound` ALONE: a follow that fails
+/// for any other reason (an unreadable directory on the link's path, a
+/// symlink loop) proves nothing about the target's existence, so those refuse
+/// too rather than destroy a link that may be live.
+///
+/// The write is stage-and-promote (the `install_pair` discipline): the new
+/// symlink is born complete under a staged name and RENAMED into place, so the
+/// farm entry is never half-made and a dangling link is replaced in one atomic
+/// step rather than a delete-then-create window. The classify→promote gap is
+/// the residual a single-operator `~/.local/bin` accepts — an entry someone
+/// races into that gap is either replaced by the promote or fails it (a
+/// raced-in directory makes the rename error), never half-made; the same
+/// residual `install_pair` documents for `dist/`.
+#[cfg(unix)]
+fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
+    match std::fs::symlink_metadata(farm) {
+        // Nothing there — the ordinary case. NotFound ONLY: a stat that fails
+        // any other way (an unreadable ancestor, say) may be hiding a live
+        // entry, so it refuses below rather than write blind.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "cannot inspect {}: {e} — refusing to write what it cannot see",
+                farm.display()
+            ));
+        }
+        // Dangling: following the link finds nothing, so replacing it destroys
+        // nothing.
+        Ok(m) if m.file_type().is_symlink()
+            && matches!(&std::fs::metadata(farm),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound) => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} exists and is not a dangling symlink — refusing to replace it",
+                farm.display()
+            ));
+        }
+    }
+    let dir = farm
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", farm.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let mut staged = farm.as_os_str().to_owned();
+    staged.push(".provision.tmp");
+    let staged = PathBuf::from(staged);
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(target, &staged)
+        .map_err(|e| format!("stage {} → {}: {e}", staged.display(), target.display()))?;
+    std::fs::rename(&staged, farm).map_err(|e| {
+        // A failed promote must not strand its staged link (the next run's
+        // pre-clean would eat it, but nothing else ever reads the name).
+        let _ = std::fs::remove_file(&staged);
+        format!("rename {} into place: {e}", staged.display())
+    })
+}
+
+/// The batteries-included toolchain seed a cut seals into the app (§9.1,
+/// reinstated 2026-08-17): `cargo ship cut` refuses without a validated
+/// `dist/toolchain-seed` (or an explicit `ATERM_SEEDLESS=1`), so an unstaged or
+/// drifted seed is a provisioning gap on this machine like any other. Audit
+/// only — materializing one downloads the published artifacts (~600 MB), which
+/// is the named remedy's job, never a silent side effect of an audit.
+#[cfg(unix)]
+fn seed_source_check(repo: &Path) -> Check {
+    let dist = repo.join("dist");
+    match crate::seedpack::resolve(&dist) {
+        Some(dir) => match crate::seedpack::validate(&dir) {
+            Ok(stat) => Check::Pass(format!(
+                "{} program(s) staged at {} (index_build {}, valid_until {})",
+                stat.programs.len(),
+                dir.display(),
+                stat.index_build,
+                stat.valid_until
+            )),
+            Err(e) => Check::Fail {
+                what: format!("{} does not validate: {e}", dir.display()),
+                fix: "restage it: tools/atpkg-seed-from-published.sh (downloads + verifies \
+                      the published index and artifacts, lays them flat into \
+                      dist/toolchain-seed)"
+                    .into(),
+            },
+        },
+        None => Check::Fail {
+            what: "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
+                   `cargo ship cut` will refuse"
+                .into(),
+            fix: "stage one: tools/atpkg-seed-from-published.sh, or cut deliberately seedless \
+                  with ATERM_SEEDLESS=1"
+                .into(),
+        },
     }
 }
 
@@ -1783,6 +2041,100 @@ mod tests {
             release_asset_url("alabsystems/aterm", "aterm-machines.toml"),
             "https://github.com/alabsystems/aterm/releases/latest/download/aterm-machines.toml"
         );
+    }
+
+    #[test]
+    fn path_resolution_finds_only_a_real_executable_and_in_path_order() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("provision-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let joined = std::env::join_paths([&a, &b]).unwrap();
+
+        // Nothing anywhere.
+        assert_eq!(resolve_on_path("trustdoc", &joined), None);
+
+        // A non-executable file is not a doc driver — exec would still fail.
+        std::fs::write(b.join("trustdoc"), b"").unwrap();
+        assert_eq!(resolve_on_path("trustdoc", &joined), None);
+
+        // Executable in the later dir resolves…
+        std::fs::set_permissions(b.join("trustdoc"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(resolve_on_path("trustdoc", &joined), Some(b.join("trustdoc")));
+
+        // …and the earlier dir wins once it has one, exactly like exec.
+        std::fs::write(a.join("trustdoc"), b"").unwrap();
+        std::fs::set_permissions(a.join("trustdoc"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(resolve_on_path("trustdoc", &joined), Some(a.join("trustdoc")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_farm_link_is_created_repairs_a_dangling_link_and_replaces_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("provision-farm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("stage2-trustdoc");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        let farm = dir.join("farm/bin/trustdoc");
+
+        // Fresh: parent dirs and the link are created, no staged residue left.
+        link_farm(&farm, &target).expect("create");
+        assert_eq!(std::fs::read_link(&farm).unwrap(), target);
+        let staged = {
+            let mut s = farm.as_os_str().to_owned();
+            s.push(".provision.tmp");
+            std::path::PathBuf::from(s)
+        };
+        assert!(
+            std::fs::symlink_metadata(&staged).is_err(),
+            "the staged name never survives a promote"
+        );
+
+        // Dangling (a swept stage2): repaired in place.
+        std::fs::remove_file(&farm).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), &farm).unwrap();
+        link_farm(&farm, &target).expect("repair dangling");
+        assert_eq!(std::fs::read_link(&farm).unwrap(), target);
+
+        // A link whose follow fails for a NON-NotFound reason (an unreadable
+        // directory on its path) proves NOTHING about its target — refused,
+        // never treated as dangling. (Under root the follow succeeds instead
+        // and the link is simply live — refused by the same arm.)
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::remove_file(&farm).unwrap();
+            let sealed = dir.join("sealed");
+            std::fs::create_dir_all(&sealed).unwrap();
+            std::fs::write(sealed.join("trustdoc"), b"#!/bin/sh\n").unwrap();
+            std::os::unix::fs::symlink(sealed.join("trustdoc"), &farm).unwrap();
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let refused = link_farm(&farm, &target);
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = refused.unwrap_err();
+            assert!(err.contains("refusing to replace"), "{err}");
+        }
+
+        // A LIVE symlink is somebody's arrangement — refused, and untouched.
+        std::fs::remove_file(&farm).unwrap();
+        std::os::unix::fs::symlink(&target, &farm).unwrap();
+        let other = dir.join("other-trustdoc");
+        std::fs::write(&other, b"#!/bin/sh\n").unwrap();
+        let err = link_farm(&farm, &other).unwrap_err();
+        assert!(err.contains("refusing to replace"), "{err}");
+        assert_eq!(std::fs::read_link(&farm).unwrap(), target);
+
+        // A regular file too.
+        std::fs::remove_file(&farm).unwrap();
+        std::fs::write(&farm, b"not a link").unwrap();
+        let err = link_farm(&farm, &target).unwrap_err();
+        assert!(err.contains("refusing to replace"), "{err}");
+        assert_eq!(std::fs::read_to_string(&farm).unwrap(), "not a link");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

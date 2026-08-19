@@ -184,17 +184,14 @@ fn main() {
         "cargo:rustc-env=ATERM_BUILD_PROFILE={}",
         std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into())
     );
-    // "on" iff this build compiled with `--cfg trust_verify` (cargo exposes active
-    // cfgs to build scripts as CARGO_CFG_*), so About/ctl can say whether the
-    // Trust-verify hardening was in the compile.
+    // Whether the Trust verification pipeline was really in this compile, for
+    // About and `aterm ctl version`. See `trust_verify_state` — the `--print cfg`
+    // probe alone answers this WRONG on a Trust toolchain.
     println!(
         "cargo:rustc-env=ATERM_TRUST_VERIFY={}",
-        if std::env::var_os("CARGO_CFG_TRUST_VERIFY").is_some() {
-            "on"
-        } else {
-            "off"
-        }
+        trust_verify_state()
     );
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=ATERM_COMPILER_FLAVOR");
@@ -222,5 +219,80 @@ fn main() {
         {
             println!("cargo:warning=aterm-gui: window icon not embedded: {e}");
         }
+    }
+}
+
+
+/// `"on"` iff this compile really runs the Trust verification pipeline.
+///
+/// `CARGO_CFG_TRUST_VERIFY` alone is NOT the answer, and trusting it shipped a
+/// false provenance line for months. Cargo derives every `CARGO_CFG_*` from a
+/// `rustc --print cfg` probe, and targo deliberately strips the `-Ztrust-verify`
+/// family from that probe — so on a Trust toolchain the cfg reports the
+/// compiler's DEFAULT (verification on) while every real unit is compiled with
+/// `-Ztrust-verify=off` from `.cargo/config.toml`. Printing that as "on" claims
+/// a hardening the binary does not carry, which is exactly what the honesty
+/// ratchet forbids.
+///
+/// So the rustflags cargo will actually pass to rustc win over the probe, and
+/// the probe is only the fallback for the case it does answer correctly: no
+/// explicit flag at all (a stock-Rust build, where the cfg is simply unset).
+///
+/// Both spellings of the off-switch are recognised — `-Ztrust-verify=off` is
+/// current, `-Zno-trust-verify=yes` is the retired one — and both the joined
+/// (`-Ztrust-verify=off`) and split (`-Z` `trust-verify=off`) argument forms,
+/// since a rustflags list may carry either.
+fn trust_verify_state() -> &'static str {
+    fn from_value(flag: &str) -> Option<&'static str> {
+        if let Some(v) = flag.strip_prefix("trust-verify=") {
+            return Some(if v.eq_ignore_ascii_case("off") {
+                "off"
+            } else {
+                "on"
+            });
+        }
+        if let Some(v) = flag.strip_prefix("no-trust-verify=") {
+            return Some(if v.eq_ignore_ascii_case("yes") {
+                "off"
+            } else {
+                "on"
+            });
+        }
+        None
+    }
+
+    if let Some(encoded) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+        let encoded = encoded.to_string_lossy().into_owned();
+        // CARGO_ENCODED_RUSTFLAGS is 0x1f-separated (cargo's documented encoding).
+        let flags: Vec<&str> = encoded
+            .split('\u{1f}')
+            .filter(|flag| !flag.is_empty())
+            .collect();
+        let mut expect_z_value = false;
+        for flag in flags {
+            if expect_z_value {
+                expect_z_value = false;
+                if let Some(state) = from_value(flag) {
+                    return state;
+                }
+                continue;
+            }
+            if flag == "-Z" {
+                expect_z_value = true;
+                continue;
+            }
+            if let Some(rest) = flag.strip_prefix("-Z")
+                && let Some(state) = from_value(rest)
+            {
+                return state;
+            }
+        }
+    }
+
+    // No explicit flag: the cfg probe is authoritative (and on stock Rust, unset).
+    if std::env::var_os("CARGO_CFG_TRUST_VERIFY").is_some() {
+        "on"
+    } else {
+        "off"
     }
 }

@@ -161,6 +161,17 @@ pub enum DepResult {
 pub enum FlowError {
     /// No signature-valid index at/above the floor was found.
     NoIndex,
+    /// The index SOURCE could not be reached at all — offline, DNS failure, a proxy,
+    /// a 403 rate-limit — and no §14 cached index was available to stand in.
+    ///
+    /// Distinct from [`FlowError::NoIndex`] because the two need opposite reactions
+    /// and used to be indistinguishable: a transport failure fell into the `_` arm of
+    /// `resolve_candidates`, which discarded the reason and reported "no
+    /// signature-valid index at/above the floor". That is a TRUST verdict, and it is
+    /// the first thing an offline machine showed its owner — sending someone to key
+    /// management when the fix is "connect to the internet", and quietly implying the
+    /// publisher's signatures are bad.
+    Unreachable(String),
     /// The program is not named in the verified index (unreachable, §5).
     NotReachable(String),
     /// The requested channel does not exist in the index.
@@ -213,6 +224,12 @@ impl std::fmt::Display for FlowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FlowError::NoIndex => f.write_str("no signature-valid index at/above the floor"),
+            FlowError::Unreachable(why) => {
+                f.write_str("could not reach the toolchain index (")?;
+                f.write_str(why)?;
+                f.write_str(") — this is a network problem, not a signature problem; \
+                             the toolchain retries automatically")
+            }
             FlowError::NotReachable(p) => {
                 f.write_str(p)?;
                 f.write_str(" is not named in the signed index")
@@ -510,6 +527,12 @@ fn install_inner(
     if let Some(parent) = dl.parent() {
         std::fs::create_dir_all(parent).map_err(|e| FlowError::Download(e.to_string()))?;
     }
+    // Clear any stale staging file BEFORE fetching. A leftover from a killed run is
+    // not merely junk: for a `dir:` registry it is a HARDLINK to the source, and
+    // writing "into" it writes into the registry — `curl -o` truncates it, and
+    // `fs::copy` truncates the shared inode. Both destroy a file inside the user's
+    // signed app bundle. See `DirFetcher::download`.
+    let _ = std::fs::remove_file(&dl);
     if let Err(e) = fetcher.download_for(program, &repo, &artifact.asset, &dl) {
         // An aborted transfer leaves BYTES here: the production fetcher hands curl `-o <dl>`
         // with no `--remove-on-error` and no `.part`+rename, so a timed-out multi-GB body is
@@ -1220,8 +1243,12 @@ pub(crate) fn observe_roster_generation(layout: &Layout, seq: u64) {
 
 /// The §8 gate-2 freshness predicate over a verified index: whether its signed
 /// `valid_until` window is still open at `now_unix`. A `valid_until` we cannot parse
-/// is lapsed (fail closed). Shared by [`verify_select_fresh`] and the CLI's
-/// seed-as-update-source admission, so the two can never drift on what "fresh" means.
+/// is lapsed (fail closed).
+///
+/// (This used to say it was shared with "the CLI's seed-as-update-source
+/// admission". No such admission has ever existed: the seed is a BOOTSTRAP
+/// source only — `seed_bootstrap_leg` joins it to the chain solely on an empty
+/// store — and it was not restored as one when the lane came back in 2026-08-17.)
 pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
     matches!(
         rfc3339_to_unix(&index.valid_until),
@@ -1245,14 +1272,53 @@ fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Cand
     let src = fetcher.cache_source_id();
     match fetcher.index_candidates() {
         Ok(c) if !c.is_empty() => {
-            if let Some(cacheable) = fetcher.cacheable_candidates(&c) {
+            match fetcher.cacheable_candidates(&c) {
                 // `store` itself refuses an empty set, so a network leg that succeeded
                 // with nothing keeps the older good cache rather than clobbering it.
-                cache.store(&src, &cacheable);
+                // An EMPTY cacheable set takes the union arm below for the same reason
+                // `None` does: "the network found no index" and "the network could not
+                // be reached" both mean the authoritative leg said nothing this pass.
+                Some(cacheable) if !cacheable.is_empty() => {
+                    cache.store(&src, &cacheable);
+                    Ok(c)
+                }
+                // The CACHEABLE (network) leg contributed NOTHING, yet the fetch as a
+                // whole succeeded — only a chained fetcher can be in this state, and it
+                // means the seed leg alone answered. Closing the cache-masking tooth on
+                // the WRITE side is not enough here: leaving this as a plain `Ok` also
+                // masks the cache READ, because the fallback below is the only place the
+                // cache is consulted. That is the same defect the 2026-07-30 review
+                // named, one arm over.
+                //
+                // It is not theoretical. On an EMPTY store the durable `index_build`
+                // floor cannot rise (`advance_floors` runs only after a completed
+                // install), and the empty store is exactly when the seed leg is chained
+                // in — so an offline launch could resolve the SEALED index while a
+                // strictly newer, already-verified network index sat in the cache, and
+                // reinstate pins that index had yanked or floored out.
+                //
+                // So: UNION the last-good network candidates in and let the ordinary
+                // monotonic selection decide. The cache is not trusted here any more
+                // than anywhere else — these are raw bytes that still face
+                // verify-then-select, freshness, and the floor.
+                _ => {
+                    // Cached candidates FIRST: `select_index` replaces only on a
+                    // STRICTLY greater index_build, so on a tie the last-good network
+                    // index outranks an equal-build seal — the same authority ordering
+                    // the live chain uses.
+                    let mut merged = cache.load(&src).unwrap_or_default();
+                    merged.extend(c);
+                    Ok(merged)
+                }
             }
-            Ok(c)
         }
-        _ => cache.load(&src).ok_or(FlowError::NoIndex),
+        // Reached the source, and it genuinely carried no index — a repo with no
+        // index release, or a tag pushed off the listing. A trust-shaped answer is
+        // the right one here.
+        Ok(_) => cache.load(&src).ok_or(FlowError::NoIndex),
+        // Could NOT reach it. Keep the reason: telling an offline user their
+        // signatures failed sends them to the wrong problem entirely.
+        Err(why) => cache.load(&src).ok_or(FlowError::Unreachable(why)),
     }
 }
 
@@ -1479,7 +1545,12 @@ pub struct UpdatePlan {
 /// Returns `(pinned build, repo, manifest)`; `None` on a missing pin/program or any
 /// fetch/verify/parse failure. A caller that must bind the signed `program`/`build_number`
 /// to its request (anti-replay) checks that on the returned manifest.
-fn verified_pkg(
+///
+/// `pub(crate)` for the CLI's pre-install disclosure: the size a user is told before
+/// committing gigabytes of disk is summed from these signed manifests'
+/// `[cost].disk_installed` (`cli::seed_install_bytes`), so the number on screen comes
+/// from the same verified bytes as the install itself rather than a separate estimate.
+pub(crate) fn verified_pkg(
     fetcher: &dyn Fetcher,
     index: &TrustedIndex,
     ch: &Channel,
@@ -1522,6 +1593,9 @@ fn stage_member(
     };
     let dl = layout.staging_dir(program).join(&artifact.asset);
     std::fs::create_dir_all(dl.parent()?).ok()?;
+    // Same reason as the singleton path: a stale staging entry can be a hardlink
+    // into the sealed registry, and fetching over it corrupts the app bundle.
+    let _ = std::fs::remove_file(&dl);
     if fetcher
         .download_for(program, &repo, &artifact.asset, &dl)
         .is_err()
@@ -3655,13 +3729,23 @@ mod tests {
         // 2. Fetch now fails, SAME source → the install is served from the cache.
         f.fail.set(true);
         install(&f, &layout, &anchor(), &req, fl(0), 0).expect("cache fallback serves the index");
-        // 3. A DIFFERENT source with a failing fetch has no cache → NoIndex.
+        // 3. A DIFFERENT source with a failing fetch has no cache to fall back on.
+        //    The error must name TRANSPORT, not trust: this is the state an offline,
+        //    proxied or rate-limited machine reaches, and reporting it as
+        //    "no signature-valid index" sent those users to key management when the
+        //    fix was to connect to the network.
         let f2 = FlakyFake::new(fixture(&dir), "src:B");
         f2.fail.set(true);
         let err = install(&f2, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
         assert!(
-            matches!(err, FlowError::NoIndex),
-            "a dir: cache never satisfies a github: fetch"
+            matches!(err, FlowError::Unreachable(_)),
+            "a dir: cache never satisfies a github: fetch, and an unreachable source \
+             must not be reported as a signature failure — got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("network problem") && !rendered.contains("signature-valid"),
+            "the message must point at the network: {rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3770,6 +3854,42 @@ mod tests {
         plain.fail.set(true);
         install(&plain, &layout, &anchor(), &req, fl(0), 0)
             .expect("the §14 fallback serves the plain-network path from the chain-written cache");
+
+        // 4. THE READ HALF of the cache-masking tooth. With the network leg DOWN and
+        //    the seed leg answering, the resolve must still CONSULT the last-good
+        //    network cache — not silently accept the seal as the only word.
+        //
+        //    Guarding only the cache WRITE (steps 1-3) left this open: a seed-leg
+        //    success turned the network failure into `Ok`, and the cache was read
+        //    exclusively in the failure arm, so the cached index was never even
+        //    looked at. On an empty store — the only state the seed leg is chained
+        //    in — the durable index_build floor cannot rise, so nothing else would
+        //    have caught a seal that reinstated pins a newer cached index had
+        //    yanked or floored out.
+        let down_again = FlakyFake::new(fixture(&dir), "github:t/aterm");
+        down_again.fail.set(true);
+        let chain_down = crate::net::ChainFetcher::new(
+            Box::new(down_again),
+            Box::new(crate::net::DirFetcher::new(reg.clone())),
+        );
+        let resolved = resolve_candidates(&chain_down, &layout)
+            .expect("the seed leg still answers when the network is down");
+        let labels: Vec<&str> = resolved.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            labels.contains(&"v0"),
+            "the last-good NETWORK candidate must be unioned in, not masked by the \
+             seed-leg success — got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"dir"),
+            "the seed's own candidate must still be offered — got {labels:?}"
+        );
+        assert_eq!(
+            labels[0], "v0",
+            "cached network candidates come FIRST: select_index replaces only on a \
+             strictly greater index_build, so a tie must go to the network's last-good \
+             index rather than the seal — got {labels:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -20,14 +20,24 @@
 //!   2. **SYSTEM prefix** — anywhere outside `$HOME`, with **every existing directory
 //!      from `/` down** owned by ROOT, not group/other-writable, and not a symlink.
 //!
-//!   The system shape exists because a user-owned prefix cannot carry PATHNAME
-//!   EXECUTION AUTHORITY: Trust's verified launcher refuses a user-owned toolchain
-//!   component outright, so an atpkg that could only install under `$HOME` left the
-//!   verified lane permanently unreachable for every toolchain it delivers. It is not a
-//!   weakening — a root-owned chain answers the same "no attacker-writable ancestor"
-//!   question at least as strongly — and writing there requires root, which is checked
-//!   rather than assumed. Both shapes are AND-checks over the FULL chain: one
-//!   world-writable ancestor (`/private/tmp`, say) disqualifies the whole prefix.
+//!   The system shape exists for a genuine multi-user install (one store several
+//!   accounts share, which no `$HOME` prefix can be), and for anyone opting in to
+//!   `TRUST_REQUIRE_SEALED_LAUNCHER=1`. A root-owned chain answers the same
+//!   "no attacker-writable ancestor" question at least as strongly, and writing there
+//!   requires root, which is checked rather than assumed. Both shapes are AND-checks
+//!   over the FULL chain: one world-writable ancestor (`/private/tmp`, say)
+//!   disqualifies the whole prefix.
+//!
+//!   CORRECTION 2026-08-18: this used to claim the system shape was REQUIRED for the
+//!   verified lane — that a user-owned prefix "cannot carry pathname execution
+//!   authority" and left `targo trust` unreachable for everything atpkg installs. That
+//!   described an older Trust. Trust's default mode is now `CallerOwned`: a component
+//!   owned by root **or by the invoking identity**, not group/world-writable, is
+//!   authoritative — Trust's own source cites rustup's `~/.rustup` as the installation
+//!   shape that demanding root would refuse. The DEFAULT `$HOME` prefix therefore
+//!   proves fine, and running targo as root is REFUSED outright. Believing the old
+//!   claim nearly cost this project an admin prompt and a privileged daemon;
+//!   see `docs/GOLDEN-INSTALL-PATH.md` §2.
 //! * **Shim names that collide with sensitive commands are refused** ([`shim_allowed`]).
 //!   `bin/` is appended to the child `PATH` (never prepended, so a managed tool can't
 //!   shadow a system one), but a tool honestly or maliciously named `sudo`/`ssh`/`git`/…
@@ -74,11 +84,27 @@ impl Layout {
     /// The write itself is still guarded by the prefix chain check: this only decides
     /// who may READ and TRAVERSE, never who may write.
     pub fn ensure_dir(&self, dir: &Path) -> std::io::Result<()> {
-        if self.is_system_prefix() {
+        let created = if self.is_system_prefix() {
             crate::platform::ensure_shared_dir(dir)
         } else {
             crate::platform::ensure_private_dir(dir)
+        };
+        // KEEP THE TOOLCHAIN OUT OF BACKUPS. The store holds multiple GB of
+        // extracted compiler and prover binaries that are, by construction,
+        // re-downloadable and signature-verifiable from the signed index — Apple's
+        // own guidance is that exactly this content should be excluded. It lives
+        // under Application Support rather than Caches (it must survive a purge, and
+        // the verified lane needs a stable path), so nothing excludes it by default:
+        // without this, every Time Machine / Backblaze / Arq run copies ~3.2 GB of
+        // re-creatable bytes, and churns them again on every update pass.
+        //
+        // Applied to the PREFIX only, once, and best-effort: this is a storage
+        // courtesy, never a correctness property, so a filesystem that will not take
+        // the attribute changes nothing about the install.
+        if dir == self.prefix {
+            crate::platform::exclude_from_backup(dir);
         }
+        created
     }
 
     /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
@@ -204,6 +230,76 @@ impl Layout {
     #[must_use]
     pub fn status(&self) -> PathBuf {
         self.prefix.join("status.toml")
+    }
+
+    /// `adopted` — the durable marker that this machine RUNS THE ALAB TOOLSET, as a set
+    /// rather than as a handful of individually-chosen programs (§11).
+    ///
+    /// Written when the whole default set is laid down deliberately: the batteries-included
+    /// first-run seed bootstrap, or an explicit `install --default-set` (the Settings
+    /// "Install ALab toolset" button). NOT written by `install <program>` — asking for one
+    /// tool is not adopting the suite.
+    ///
+    /// It exists because one config bit was doing two unrelated jobs. `[packages].auto_install`
+    /// answers "may atpkg pull a multi-GB toolchain onto a machine that has never had one?",
+    /// which is a genuine consent question and rightly defaults FALSE. But the update pass
+    /// was ALSO reading it to answer "should a machine that already runs this toolset keep
+    /// that set complete?" — and with the default answer being no, a program published to
+    /// the index AFTER a user installed simply never arrived. Their toolchain quietly stopped
+    /// being the whole toolchain as the suite grew, which is the opposite of what a
+    /// distribution channel is for. Adoption separates the two: consent is asked once, and
+    /// alignment thereafter is not a new consent event.
+    ///
+    /// CLEARED by `uninstall` (see `crate::ops::uninstall`'s caller): removing a managed
+    /// program is an explicit act, and set-completion must never fight it by reinstalling on
+    /// the next pass. The durable way to drop ONE program while staying adopted is
+    /// `[packages].exclude`, which the default-set planner already honours.
+    #[must_use]
+    pub fn adopted(&self) -> PathBuf {
+        self.prefix.join("adopted")
+    }
+
+    /// `provisional` — build numbers the batteries-included seed laid down that GC
+    /// must not retain as a rollback target once superseded
+    /// ([`crate::provisional`]). Absent means "nothing provisional", which is the
+    /// pre-existing retention behaviour.
+    #[must_use]
+    pub fn provisional(&self) -> PathBuf {
+        self.prefix.join("provisional")
+    }
+
+    /// `removed` — programs the user uninstalled INDIVIDUALLY, one name per line.
+    ///
+    /// The whole-set `declined` marker cannot express this, and without it the
+    /// resumable seed lane silently undoes a targeted removal: the lane installs
+    /// whatever the store LACKS (that is what lets an interrupted first run finish),
+    /// so `atpkg uninstall ny` came back on the next launch. A package manager that
+    /// reinstalls what you just removed is worse than one that never had the package.
+    ///
+    /// An explicit `install <program>` or `install --default-set` clears the relevant
+    /// entries — asking for it back is unambiguous.
+    #[must_use]
+    pub fn removed(&self) -> PathBuf {
+        self.prefix.join("removed")
+    }
+
+    /// `declined` — the durable "this machine does not want the bundled toolset"
+    /// marker, written by `uninstall --all`.
+    ///
+    /// Without it the removal does not stick. The seed lane fires on every launch and
+    /// installs whatever channel-pinned members the store LACKS (that resumability is
+    /// what lets an interrupted first run finish), so a user who removed the toolset
+    /// would find the whole 3.2 GB back after the next launch — the manager undoing a
+    /// deliberate act, which is the single most infuriating thing a package manager
+    /// can do. `adopted` cannot carry this: its absence means "never adopted", which
+    /// is exactly the state a first run must install from.
+    ///
+    /// Cleared by any explicit install (`install --default-set`, `install <program>`):
+    /// asking for the toolset is unambiguous, and it must not be necessary to find and
+    /// delete a marker file to undo a decline.
+    #[must_use]
+    pub fn declined(&self) -> PathBuf {
+        self.prefix.join("declined")
     }
 
     /// `links/` — the per-program dev-link markers directory (§13). One `0600` marker per
@@ -525,11 +621,11 @@ pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     // SYSTEM PREFIX — the second trusted shape. A prefix OUTSIDE $HOME is admissible
     // only when every existing component from `/` down is root-owned and not
     // group/other-writable. That answers the same question the $HOME chain answers
-    // (no attacker-writable ancestor can swap a component) at least as strongly, and
-    // it is the ONLY shape a verified Trust toolchain can execute from: the verified
-    // launcher refuses a user-owned path component outright, so a home prefix leaves
-    // the verified lane permanently unreachable. Installing here needs root; that is
-    // the point, and it is checked rather than assumed.
+    // (no attacker-writable ancestor can swap a component) at least as strongly.
+    // Installing here needs root; that is the point, and it is checked rather than
+    // assumed. It is for a genuinely shared multi-user store, NOT a precondition of
+    // the verified lane — Trust's default `CallerOwned` mode admits a component owned
+    // by the invoking identity, so the $HOME shape proves fine (see the module docs).
     if !under_home(p, home) {
         return if system_chain_trusted(p) {
             p.to_path_buf()

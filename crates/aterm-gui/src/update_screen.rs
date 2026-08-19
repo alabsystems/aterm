@@ -49,6 +49,8 @@ pub(crate) struct UpdateState {
     /// "the staged build will not start", independent of which class happened to
     /// fail last (2026-08-19 round-4 skeptics).
     failing_applies: u32,
+    /// This launch has a bundle the updater could replace at all.
+    installable: bool,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
 }
@@ -117,6 +119,7 @@ impl UpdateState {
             failing_persistent: snapshot.failing_persistent,
             failing_kind: snapshot.failing_kind.clone(),
             failing_applies: snapshot.failing_applies,
+            installable: snapshot.installable,
             checking,
         }
     }
@@ -164,6 +167,7 @@ impl UpdateState {
             failing_persistent: status.is_some_and(|s| s.enabled && s.is_failing_persistently()),
             failing_kind: status.map(|s| s.failing_kind.clone()).unwrap_or_default(),
             failing_applies: status.map_or(0, |s| s.failing_applies),
+            installable: status.is_none_or(|s| s.installable),
             checking,
         }
     }
@@ -249,6 +253,13 @@ impl UpdateState {
             "Update ready, but it keeps failing to apply.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
+        } else if !self.installable {
+            // NOT "You're up to date": this copy cannot be replaced at all — it is
+            // running from the mounted disk image, from a Gatekeeper-translocated
+            // location, or from a dev-marked install, so no check thread ever starts
+            // and every ledger field below is the pristine default of a machine that
+            // structurally cannot update (2026-08-19 round-5 audit).
+            "This copy of aterm can\u{2019}t update itself.".to_string()
         } else if !self.enabled {
             "Automatic updates are off.".to_string()
         } else if self.failing_persistent {
@@ -265,6 +276,14 @@ impl UpdateState {
     /// The secondary detail line under the headline: the staged build's version + number
     /// (`Some` only when a build is ready), rendered small under the accent headline.
     fn detail(&self) -> Option<String> {
+        if !self.installable {
+            return Some(
+                "Move aterm.app to your Applications folder and open it from there. \
+                 A copy running from a disk image, a quarantined download, or a local \
+                 build is never replaced in place."
+                    .to_string(),
+            );
+        }
         if let Some((b, v)) = self.staged.as_ref() {
             // Not the ledger `outcome`: the check lane rewrites that every cycle with
             // the healthy "staged … ready to apply" sentence while a stage is held.
@@ -276,10 +295,18 @@ impl UpdateState {
                 ));
             }
             if self.enabled && self.failing_persistent {
+                // The class is named only when it is the one that ESCALATED. A single
+                // apply failure under an escalated `pipeline` streak leaves
+                // `failing_kind = "apply"` — naming it there told the user their
+                // staged build would not start when nothing of the kind had been
+                // established (2026-08-19 round-5 audit).
+                let named = match self.failing_kind.as_str() {
+                    "apply" | "" => String::new(),
+                    kind => format!(" ({kind})"),
+                };
                 return Some(format!(
                     "Version {v} \u{00b7} build {b} \u{00b7} ready to install; but update \
-                     CHECKS are failing ({}), so newer builds may not arrive — see aterm.log",
-                    self.failing_kind
+                     CHECKS are failing{named}, so newer builds may not arrive — see aterm.log"
                 ));
             }
             return Some(format!("Version {v} \u{00b7} build {b}"));
@@ -908,6 +935,7 @@ mod tests {
             failing_checks: 0,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,
@@ -927,6 +955,30 @@ mod tests {
     /// A staged build whose apply keeps failing persistently is not "Update ready":
     /// the headline says so and the detail names the failing class, not the
     /// churned ledger outcome.
+    /// A copy that structurally CANNOT be replaced — run from the mounted DMG, a
+    /// Gatekeeper-translocated download, or a dev-marked install — must say so. No
+    /// check thread ever starts in that state, so every ledger field is the pristine
+    /// default and the panel otherwise reported the confident "You're up to date" of
+    /// a machine that will never update (2026-08-19 round-5 audit).
+    #[test]
+    fn a_copy_that_cannot_replace_itself_says_so_instead_of_up_to_date() {
+        let mut st = staged_status();
+        st.staged_build = None;
+        st.staged_version = None;
+        st.staged_dmg_sha256 = None;
+        st.changelog = None;
+        st.installable = false;
+        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
+        let p = s.projection();
+        assert_eq!(p.headline, "This copy of aterm can\u{2019}t update itself.");
+        let detail = p.detail.expect("detail");
+        assert!(detail.contains("Applications"), "…and how to fix it: {detail}");
+        // The same state WITH a replaceable bundle is the ordinary healthy line.
+        st.installable = true;
+        let ok = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+        assert_eq!(ok.headline, "You\u{2019}re up to date.");
+    }
+
     #[test]
     fn a_staged_build_that_keeps_failing_to_apply_says_so() {
         let mut st = staged_status();

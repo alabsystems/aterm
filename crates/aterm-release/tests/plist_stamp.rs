@@ -14,6 +14,9 @@
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)] // the test mount exercises the pure stamp/commit helpers only
 mod bundle;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 
 /// The COMMITTED template (apps/aterm-mac/Info.plist) — stamping goldens run
 /// against the real thing so template drift breaks the test, not the release.

@@ -61,8 +61,10 @@
 //!  * Fail-closed everywhere: no missing tool may produce a pass.
 //!  * Every stage that shells out shells out to the SAME command with the same
 //!    arguments and environment — tippy keeps its separate `CARGO_TARGET_DIR` and
-//!    `TRUST_NO_MIGRATE_WARN`, doctests keep `RUSTDOC=<stage2>/trustdoc`, and
-//!    every driver invocation still names its lane with `--unverified`.
+//!    `TRUST_NO_MIGRATE_WARN`, the doc-running stages bind
+//!    `RUSTDOC=<stage2>/trustdoc` whenever the stage2 carries an executable one
+//!    (the full rule is `stages::doc_driver`), and every driver invocation
+//!    still names its lane with `--unverified`.
 //!
 //! WHAT CHANGED ON PURPOSE
 //!  * Independent stages run CONCURRENTLY ([`sched`]) while the OUTPUT stays in
@@ -143,6 +145,13 @@ pub struct EnvSnapshot {
     pub skip_gui_smoke: Option<String>,
     /// `ATERM_VERIFY_BASE` — the default `--base` for `--changed`.
     pub verify_base: Option<String>,
+    /// `RUSTDOC` or `CARGO_BUILD_RUSTDOC` — a caller-supplied doc-driver
+    /// binding. Cargo prefers either over the config's `[build] rustdoc`, so
+    /// the children inherit it and the doc-driver rule must account for it:
+    /// an explicit export is the operator's own per-invocation override (the
+    /// same escape hatch verify.sh's header sanctions for flag-spelling skew),
+    /// never grounds for a COULD-NOT-RUN.
+    pub rustdoc_override: Option<OsString>,
 }
 
 impl EnvSnapshot {
@@ -162,6 +171,14 @@ impl EnvSnapshot {
             verify_base: std::env::var("ATERM_VERIFY_BASE")
                 .ok()
                 .filter(|s| !s.is_empty()),
+            // NO empty-filter, deliberately: cargo has no treat-empty-as-unset
+            // rule for these (only RUSTC_WRAPPER gets one), so a set-but-empty
+            // RUSTDOC still masks CARGO_BUILD_RUSTDOC and still reaches the
+            // child — the snapshot mirrors that precedence exactly, and a
+            // broken export fails under the "(caller's RUSTDOC)" label that
+            // names whose binding it was.
+            rustdoc_override: std::env::var_os("RUSTDOC")
+                .or_else(|| std::env::var_os("CARGO_BUILD_RUSTDOC")),
         }
     }
 }

@@ -16,6 +16,9 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -1077,4 +1080,19 @@ fn archive_executor_refines_identity_preserving_single_head_transitions() {
         error.contains("vanished instead of being metadata-renamed"),
         "delete+recreate mutant escaped identity proof: {error}"
     );
+}
+
+/// A rate-limited anonymous probe is NOT a statement that the channel is private.
+/// Measured 2026-08-19: a cut whose machine had spent the hour's unauthenticated
+/// budget (60/hour/IP) failed the post-flip probe and told the operator to make an
+/// already-public repo public, with the release live on the origin and its channel
+/// draft uploaded.
+#[test]
+fn a_rate_limited_anonymous_probe_is_classified_as_such() {
+    use publish::anon_probe_stderr_is_rate_limit as is_rate_limit;
+    assert!(is_rate_limit("curl: (22) The requested URL returned error: 403"));
+    assert!(is_rate_limit("curl: (22) The requested URL returned error: 429"));
+    assert!(!is_rate_limit("curl: (22) The requested URL returned error: 404"));
+    assert!(!is_rate_limit("curl: (56) Recv failure: Connection reset by peer"));
+    assert!(!is_rate_limit(""));
 }

@@ -736,12 +736,7 @@ impl FailedMark {
         let Ok(text) = toml::to_string(&m) else {
             return;
         };
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        } else {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = write_durable(path, &text, "artifact quarantine");
     }
 
     /// Record a download/stage failure of `(build_number, sha256)`, widening the
@@ -767,7 +762,17 @@ impl FailedMark {
         let Ok(text) = toml::to_string(&m) else {
             return;
         };
-        let _ = write_durable(path, &text, "artifact quarantine");
+        // NOT durable, deliberately: losing a backoff memo costs one redundant
+        // download, never correctness. (Round 4 put the durable write HERE by a
+        // mis-anchored edit and left the quarantine — the record that actually has
+        // to survive a power loss — on the plain path, while the release note said
+        // otherwise. All four round-5 reviewers blocked on it.)
+        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 
     /// Atomically record `(build_number, sha256)`, reporting persistence failure.
@@ -822,6 +827,16 @@ mod tests {
         let read = FailedMark::read(&path).expect("a real memo reads back");
         assert_eq!(read.build_number, 42);
         assert!(read.quarantined, "and keeps its verdict");
+        // …and it went through the DURABLE writer, which leaves no temp behind.
+        // (Round 4 wired that call into the stage-backoff memo instead — a
+        // mis-anchored edit that all four round-5 reviewers caught.)
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "durable write leaves no scratch: {strays:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

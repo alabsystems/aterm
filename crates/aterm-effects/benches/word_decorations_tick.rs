@@ -107,6 +107,16 @@
 //!   nova_coupled_peak          128     128  1 call, walk 128   1 call, w 128  emit_nova_axis x128
 //!   split_4_panes_settled     32/pn  32/pn  4 calls, walk 128  4 calls, w 128 ParkedPane::swap x8,
 //!                                                                            burst_summary walk 128
+//!   supernova_peak_light         1       1  1 call, walk 1     1 call, w 1    176 Shade stamps ->
+//!                                                                            bound_shade_opacity
+//!                                                                            scan over 176 x 176
+//!   nova_coupled_light         128     128  1 call, walk 128   1 call, w 128  emit_nova_axis x128,
+//!                                                                            light ink chain, 0 Shade
+//!
+//! (The two `_light` rows' occ/persist columns are by construction — the same
+//! screens as their dark siblings, and `seed_of` never sees the background —
+//! and their Shade counts are measured off the EMITTED stream, which is
+//! exactly the population in question, so no in-engine counter was needed.)
 //!
 //! Three of those rows are the findings, sized: `idle_settled_persist_512` walks
 //! 512 + 512 entries per frame to emit nothing (vs 128 + 128 for the identical
@@ -115,17 +125,39 @@
 //! `ParkedPane::swap` re-derivations over 128 episodes per frame — one park and
 //! one unpark per pane — purely to maintain a summary that exists to make a
 //! read cheap.
+//!
+//! THE LIGHT LANE (audit CF-3). `bound_shade_opacity` (supernova.rs:902)
+//! re-walks its whole deco slice inside a filter over the same slice — O(n²)
+//! per frame — but only while Over-blend `Shade` stamps exist, and Shade is
+//! stamped by exactly one producer in the crate: the supernova's light-theme
+//! eclipse. `emit_super_axis` resolves the theme PER OCCURRENCE from
+//! `relative_luminance(occ.ink_bg) > 0.5` (word_decorations.rs:7758), and the
+//! headless `Terminal` default background is black, so every dark workload
+//! above runs the quadratic over an EMPTY stream: the finding had never been
+//! reached by any bench until the `_light` pair. `supernova_peak_light`
+//! drives the burst word's cells white via SGR 48;2, sweeps for the frame
+//! with the MOST Shade stamps (a total-volume sweep parks on a debris frame
+//! with zero — see `peak_shade_offset_ms`), and pins the population from both
+//! sides: 176 stamps at the timed frame, with the post-bound per-cell peak
+//! squeezed to 63 (the `MAX_VIEWPORT_OVERLAY` = 64 cap minus per-stamp
+//! truncation) — the raw veil center is ~200 alpha, so that squeeze is the
+//! emitted-bytes proof that BOTH of the function's passes ran.
+//! `nova_coupled_light` prices the rest of the light-theme frame (the §3.1
+//! deep-candy ink chain, whose bytes are proven to diverge from a dark twin
+//! over the identical frame history) and pins `shade == 0`: the classic nova
+//! must never grow a Shade population without this file noticing.
 
 use std::time::Duration;
 
 use aterm_core::render::{FreeSprite, RenderInput};
 use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
+use aterm_effects::color_math::relative_luminance;
 use aterm_effects::word_decorations::{
     DecoConfig, EffectGeom, ProfanityStyle, SelView, WordDecorations,
 };
 use aterm_lexicon::{Class, Lexicon};
-use aterm_render::{GlowQuad, InkCell, WordDecoration};
+use aterm_render::{DecoBlend, DecoGlyph, GlowQuad, InkCell, WordDecoration};
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use web_time::Instant;
 
@@ -184,6 +216,33 @@ const PERSIST_CAP: usize = 512;
 /// How far the burst workloads sweep looking for their busiest frame.
 /// `SUPER_TOTAL_MS` = 2400 plus the ignition limiter's queueing slack.
 const SUPER_SEARCH_MS: u64 = 5_000;
+
+/// `supernova::MAX_VEIL_CELLS` (200) plus the 8-axis x 3-segment dark crown:
+/// the hard ceiling on Over-blend `Shade` stamps one supernova frame can carry,
+/// and therefore the hi side of every shade bound in this file.
+const MAX_SHADE_STAMPS: usize = 224;
+
+/// `supernova::MAX_VIEWPORT_OVERLAY`: the per-cell aggregate opacity cap
+/// `bound_shade_opacity` (supernova.rs:902, audit CF-3) exists to enforce.
+/// Mirrored here because the SCALED output is that function's only external
+/// signature — the verification below reads it off the emitted stream.
+const MAX_VIEWPORT_OVERLAY: u32 = 64;
+
+/// Floor on the post-bound peak per-cell Shade alpha sum at the eclipse's
+/// busiest frame. The raw center-of-veil stamp alone is ~235 x `rise_fall(e)`
+/// x `intensity` (= ~200 at the peak with the default 0.85), far above the
+/// 64 cap, so on any frame this file parks on the scale arm MUST have run and
+/// left the peak at ~64 (a hair under: each stamp's `alpha * 64 / peak`
+/// truncates individually). Well below 64 means the bound never bit — the
+/// workload found some other, dimmer Shade population than the veil.
+const SHADE_PEAK_FLOOR: u32 = 32;
+
+/// The light-theme background driven under the burst words via SGR 48;2.
+/// White is the strongest possible witness for the engine's theme predicate
+/// (`relative_luminance(occ.ink_bg) > 0.5`, word_decorations.rs:7758):
+/// relative luminance exactly 1.0. It is also what the in-crate eclipse tests
+/// drive, so the bench and the tests agree on what "light" means.
+const LIGHT_BG: [u8; 3] = [255, 255, 255];
 
 /// Ticks allowed for a workload to reach its fixed point. Generous: the
 /// settled feline screen needs ~16 (MAX_CATS = 8 slots freeing 8 at a time
@@ -283,6 +342,44 @@ impl Emitted {
         self.ink.clear();
         self.free.clear();
         self.nova.clear();
+    }
+
+    /// Over-blend `Shade` stamps in the deco stream — the EXACT population
+    /// `bound_shade_opacity` (supernova.rs:902) scans quadratically (audit
+    /// CF-3), and nothing else: the predicate mirrors that function's
+    /// `is_shade` (blend AND glyph, because the light-theme charge motes and
+    /// debris ride `Over` too and must not be counted). Only the light-theme
+    /// supernova eclipse emits these, which is why every pre-light workload
+    /// counts exactly zero and the quadratic had never run under a bench.
+    fn shade(&self) -> usize {
+        self.deco
+            .iter()
+            .filter(|d| matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade))
+            .count()
+    }
+
+    /// The worst per-`(row, col)` aggregate Shade alpha — the quantity
+    /// `bound_shade_opacity` computes and caps at `MAX_VIEWPORT_OVERLAY`.
+    /// Deliberately the same O(n²) shape as the engine's own scan (n <= 224,
+    /// verification-only, never timed) so the two can not diverge on overlap
+    /// semantics: `(row, col)` is the exact overlap class, every supernova
+    /// Shade has zero `(dx, dy)` jitter.
+    fn shade_peak_cell_sum(&self) -> u32 {
+        let is_shade = |d: &WordDecoration| {
+            matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
+        };
+        self.deco
+            .iter()
+            .filter(|d| is_shade(d))
+            .map(|d| {
+                self.deco
+                    .iter()
+                    .filter(|o| is_shade(o) && o.row == d.row && o.col == d.col)
+                    .map(|o| u32::from(o.alpha))
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -533,6 +630,33 @@ impl Bed {
         }
         best.1
     }
+
+    /// `busiest_offset_ms`, scored by Over+`Shade` stamp COUNT instead of
+    /// total volume, returning `(peak count, offset)`.
+    ///
+    /// The distinction is load-bearing, not cosmetic: the eclipse veil exists
+    /// for only the ~300 ms `CHARGE_END_MS..DETONATION_END_MS` slice of the
+    /// ~2.4 s supernova window (whose ignition instant the flash limiter owns
+    /// and the bench cannot predict), while the debris phase that follows
+    /// emits MORE total items with ZERO Shade stamps. A total-volume sweep
+    /// therefore parks the light workload on a debris frame where the CF-3
+    /// quadratic never runs — the exact miss this file's light lane exists to
+    /// prevent. Scoring by the population `bound_shade_opacity` iterates is
+    /// the only sweep that cannot make it.
+    fn peak_shade_offset_ms(&mut self, span_ms: u64) -> (usize, u64) {
+        let mut cap = Emitted::default();
+        let mut best = (0usize, 0u64);
+        let mut ms = 0;
+        while ms <= span_ms {
+            self.at(ms);
+            self.frame_capturing(&mut cap);
+            if cap.shade() > best.0 {
+                best = (cap.shade(), ms);
+            }
+            ms += FRAME_MS;
+        }
+        best
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +707,57 @@ fn plain_grid(rows: usize) -> Vec<u8> {
         );
     }
     out.into_bytes()
+}
+
+/// SGR 48;2 truecolor background prefix. Emitted ONCE at the head of a byte
+/// stream: SGR state persists across CUP moves, so every cell written after it
+/// carries `bg` — which is exactly the value `rescan` captures into
+/// `occ.ink_bg` from the word's first lead cell, the one byte the theme branch
+/// reads.
+fn sgr_bg(bg: [u8; 3]) -> String {
+    format!("\x1b[48;2;{};{};{}m", bg[0], bg[1], bg[2])
+}
+
+/// `word_grid` on a LIGHT background: identical layout, every written cell's
+/// bg driven to `LIGHT_BG`. The layout being byte-identical (same rows, same
+/// columns, same words) matters: `seed_of(start_col, class, form_hash)` does
+/// not see the background, so the light sibling of a dark workload carries the
+/// SAME genomes, phases and grants — the theme branch is the only difference.
+fn word_grid_light(word: &str, rows: usize) -> Vec<u8> {
+    let mut out = sgr_bg(LIGHT_BG).into_bytes();
+    out.extend_from_slice(&word_grid(word, rows));
+    out
+}
+
+/// Prove a light-workload screen crosses the engine's theme predicate BEFORE
+/// the engine ever sees it: every glyph-bearing cell must satisfy the EXACT
+/// test `emit_super_axis` applies to `occ.ink_bg`
+/// (`relative_luminance(bg) > 0.5`, word_decorations.rs:7758) — checked with
+/// the same public `relative_luminance` the engine calls, not a re-derived
+/// formula that could drift. Every dark workload fails this for every cell
+/// (the headless `Terminal` default bg is black, luminance 0.0), which is
+/// precisely why the CF-3 quadratic had never executed under a bench.
+fn verify_light_screen(screen: &RenderInput) {
+    let mut checked = 0usize;
+    for row in &screen.cells {
+        for c in row.iter().filter(|c| !c.wide && c.ch != ' ') {
+            let bg = (u32::from(c.bg[0]) << 16) | (u32::from(c.bg[1]) << 8) | u32::from(c.bg[2]);
+            assert!(
+                relative_luminance(bg) > 0.5,
+                "glyph cell {:?} at bg {:?} resolves DARK under the engine's \
+                 theme predicate — the eclipse would never stamp and the light \
+                 workload would silently price the dark path",
+                c.ch,
+                c.bg
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "light screen holds no glyph cells at all — nothing for the theme \
+         predicate to resolve"
+    );
 }
 
 /// One simple selection over `[c0, c1]` of `row`.
@@ -885,6 +1060,142 @@ fn build_nova_coupled() -> Bed {
     bed
 }
 
+/// `supernova_peak` on a LIGHT background, parked on the frame with the MOST
+/// Over-blend `Shade` stamps — the eclipse.
+///
+/// This is the CF-3 workload. `emit_super_axis` resolves the theme per
+/// occurrence from `occ.ink_bg` luminance (word_decorations.rs:7758); on dark
+/// backgrounds the detonation is additive light and `bound_shade_opacity`'s
+/// outer iterator is EMPTY, so `supernova_peak` — and every other workload in
+/// this file — has never once executed the quadratic scan it is supposed to
+/// price. Driving the word's cells white flips exactly that branch: the
+/// 300 ms `CHARGE_END_MS..DETONATION_END_MS` window stamps a <= 200-cell
+/// radial Shade veil plus a <= 24-stamp dark crown, and every one of those
+/// stamps is re-walked against every other, per frame, inside
+/// `bound_shade_opacity` (supernova.rs:902).
+///
+/// Same shape as `build_supernova` otherwise — same word row, same placement
+/// sweep (the tier is still a genome roll keyed on the COLUMN; the bg does not
+/// enter `seed_of`), same off-span selection (on-span defers the ignition
+/// outright; four rows above instead exercises the Over-drop filter, which on
+/// this workload walks the veil itself). The one deliberate difference: the
+/// sweep is scored by SHADE COUNT, not total volume — see
+/// `peak_shade_offset_ms` for why a total-volume sweep parks on a debris
+/// frame and misses the finding entirely.
+fn build_supernova_light() -> Bed {
+    let word_row = ROWS / 2;
+    let make = |col: usize| {
+        use std::fmt::Write as _;
+        let mut text = sgr_bg(LIGHT_BG);
+        let _ = write!(
+            text,
+            "\x1b[{};{}H{PROFANE_WORD}\x1b[0m",
+            word_row + 1,
+            col + 1
+        );
+        let bed = Bed::new(
+            cfg_supernova(),
+            snapshot(text.as_bytes(), ROWS, COLS),
+            ROWS,
+            COLS,
+        );
+        // The setup-side half of the reach proof: the word's cells really do
+        // cross the engine's own luminance threshold. (The emission-side half
+        // is the two-sided shade bound in `verify_reaches_target`.)
+        verify_light_screen(&bed.screen);
+        let mut bed = bed;
+        bed.sel = Some(select_row((word_row - 4) as i32, 0, (COLS - 1) as u16));
+        bed
+    };
+    let placements = [8usize, 18, 28, 38, 48, 58, 68];
+    let best = placements
+        .into_iter()
+        .map(|col| {
+            let mut probe = make(col);
+            let (shade, ms) = probe.peak_shade_offset_ms(SUPER_SEARCH_MS);
+            (shade, col, ms)
+        })
+        .max()
+        .expect("a non-empty placement sweep");
+    let (_, col, peak_ms) = best;
+    let mut bed = make(col);
+    // Re-drive frame by frame to the chosen instant, exactly as
+    // `build_supernova` does: the flash limiter grants the ignition off the
+    // frame history, so jumping straight there lands in a different state
+    // than the sweep measured.
+    let mut ms = 0;
+    while ms < peak_ms {
+        bed.at(ms);
+        bed.frame();
+        ms += FRAME_MS;
+    }
+    bed.at(peak_ms);
+    bed.witness = bed.fixed_point().volume();
+    bed
+}
+
+/// `nova_coupled_peak` on a LIGHT background: the classic nova's whole frame —
+/// `nova_prepass`'s per-nova sort, `ink_fx`, `emit_nova_axis`, and 128 words
+/// of `emit_rainbow_ink` — through the light-theme arm of the colour chain
+/// (§3.1 deep-candy s/v, and a legibility guard that PULLS on light bg where
+/// the dark leg's passes it immediately).
+///
+/// This sibling does NOT reach CF-3 — the classic nova never emits a `Shade`
+/// stamp; its darkening ring is the genome-gated `RingArc` — and its shade
+/// bound is pinned at exactly (0, 0) to say so: if a refactor ever routes
+/// nova frames through the Shade/`bound_shade_opacity` machinery, this
+/// workload's profile silently changes class, and the pin turns that into a
+/// loud failure instead. The light-branch reach is proven the only way it is
+/// externally visible: the emitted ink bytes DIVERGE from a dark twin driven
+/// through the identical frame history (same words, same columns, same
+/// genomes and grants — `seed_of` never sees the background).
+fn build_nova_coupled_light() -> Bed {
+    let text = word_grid_light(PROFANE_WORD, ROWS);
+    let make = || {
+        let bed = Bed::new(cfg_nova(), snapshot(&text, ROWS, COLS), ROWS, COLS);
+        verify_light_screen(&bed.screen);
+        bed
+    };
+    let peak_ms = make().busiest_offset_ms(SUPER_SEARCH_MS);
+    let mut bed = make();
+    let mut dark = Bed::new(
+        cfg_nova(),
+        snapshot(&word_grid(PROFANE_WORD, ROWS), ROWS, COLS),
+        ROWS,
+        COLS,
+    );
+    let mut ms = 0;
+    while ms < peak_ms {
+        bed.at(ms);
+        bed.frame();
+        dark.at(ms);
+        dark.frame();
+        ms += FRAME_MS;
+    }
+    bed.at(peak_ms);
+    dark.at(peak_ms);
+    let mut light_frame = Emitted::default();
+    let mut dark_frame = Emitted::default();
+    bed.frame_capturing(&mut light_frame);
+    dark.frame_capturing(&mut dark_frame);
+    assert!(
+        !light_frame.ink.is_empty() && !dark_frame.ink.is_empty(),
+        "both themes must emit ink at the peak (light {}, dark {}) or the \
+         divergence check below is vacuous",
+        light_frame.ink.len(),
+        dark_frame.ink.len()
+    );
+    assert_ne!(
+        light_frame.ink, dark_frame.ink,
+        "the light and dark twins emitted BYTE-IDENTICAL ink over identical \
+         frame histories — the theme branch did not take, and this workload \
+         would silently re-price the dark path `nova_coupled_peak` already \
+         covers"
+    );
+    bed.witness = bed.fixed_point().volume();
+    bed
+}
+
 /// Four panes, each with its own settled episode map, driven the way the
 /// composed host drives them: ONE `begin_host_frame` + `retain_panes`, then
 /// `bind_pane`/`tick` per pane.
@@ -979,6 +1290,16 @@ struct Expect {
     ink: Bound,
     free: Bound,
     nova: Bound,
+    /// Two-sided bound on Over-blend `DecoGlyph::Shade` stamps inside `deco` —
+    /// the exact population `bound_shade_opacity` (supernova.rs:902) scans
+    /// QUADRATICALLY (audit CF-3), emitted only by the light-theme supernova
+    /// eclipse. `None`: not asserted (the pre-light workloads, whose deco
+    /// bounds were calibrated before this count existed — all of them count
+    /// zero, because the headless `Terminal` default bg resolves dark).
+    /// `Some((0, 0))` is a REAL assertion, not a shrug: the workload proves
+    /// the quadratic population is absent, so a refactor that starts stamping
+    /// Shade outside the eclipse fails loudly here.
+    shade: Option<Bound>,
     /// `true` when `tick` must take an early-return (fingerprint exactly 0);
     /// `false` when the machine must have run (fingerprint non-zero).
     early_out: bool,
@@ -1008,6 +1329,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: true,
                 settled: Some(true),
                 witness_min: 1,
@@ -1021,6 +1343,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(true),
                 witness_min: 1,
@@ -1034,6 +1357,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(true),
                 witness_min: 1,
@@ -1055,6 +1379,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (1, 64),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(true),
                 witness_min: 1,
@@ -1068,6 +1393,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (1, MAX_INK_CELLS),
                 free: (4, 64),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(false),
                 witness_min: 4,
@@ -1081,6 +1407,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (MAX_INK_CELLS - 8, MAX_INK_CELLS),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(true),
                 witness_min: MAX_INK_CELLS - 8,
@@ -1094,6 +1421,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (MAX_INK_CELLS - 8, MAX_INK_CELLS),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: Some(false),
                 witness_min: MAX_INK_CELLS - 8,
@@ -1110,6 +1438,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (1, 64),
                 free: (0, 64),
                 nova: (32, 4_096),
+                shade: None,
                 early_out: false,
                 settled: Some(false),
                 witness_min: 32,
@@ -1123,6 +1452,7 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (1, MAX_INK_CELLS),
                 free: (0, 0),
                 nova: (32, 4_096),
+                shade: None,
                 early_out: false,
                 settled: Some(false),
                 witness_min: 32,
@@ -1136,9 +1466,60 @@ fn tick_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: None,
                 witness_min: 1,
+            },
+        },
+        Workload {
+            name: "supernova_peak_light",
+            build: build_supernova_light,
+            expect: Expect {
+                // `shade` is the load-bearing bound (CF-3): the lo side is
+                // what every dark workload silently fails — zero Shade stamps
+                // ⇒ `bound_shade_opacity`'s quadratic scan iterates an empty
+                // stream and the bench acquits a cost it never met. Measured:
+                // 176 stamps of the 224 ceiling (the radial falloff skips
+                // sub-threshold corner stamps; the off-span selection drops a
+                // few crown stamps). The lo of 128 keeps slack under that but
+                // stays far above anything a NON-eclipse frame can produce —
+                // the ring dark fringe peaks at 16 — so only the veil itself
+                // can satisfy it. deco is shade-dominated in this window; the
+                // debris motes that dominate `supernova_peak`'s deco stream
+                // have not started yet.
+                deco: (128, 512),
+                ink: (1, 64),
+                // The winning placement may roll the Nuke tier, whose cloud
+                // sprite is already airborne during the eclipse (measured: 1).
+                free: (0, 64),
+                // The additive channel is deliberately allowed to floor at 0:
+                // on light themes the charge motes and wash are Over decos
+                // (additive white over white is invisible) and the quad stream
+                // really is empty at the eclipse frame (measured: 0).
+                nova: (0, 4_096),
+                shade: Some((128, MAX_SHADE_STAMPS)),
+                early_out: false,
+                settled: Some(false),
+                witness_min: 128,
+            },
+        },
+        Workload {
+            name: "nova_coupled_light",
+            build: build_nova_coupled_light,
+            expect: Expect {
+                deco: (0, 4_096),
+                ink: (1, MAX_INK_CELLS),
+                free: (0, 0),
+                nova: (32, 4_096),
+                // A PIN, not a shrug (see `build_nova_coupled_light`): the
+                // classic nova must never carry the Shade population — its
+                // light-theme cost is the colour chain, and the divergence
+                // assert in the builder is what proves that branch took.
+                shade: Some((0, 0)),
+                early_out: false,
+                settled: Some(false),
+                witness_min: 32,
             },
         },
     ]
@@ -1154,6 +1535,7 @@ fn rescan_workloads() -> Vec<Workload> {
                 ink: (1, MAX_INK_CELLS),
                 free: (0, 64),
                 nova: (0, 0),
+                shade: None,
                 early_out: false,
                 settled: None,
                 witness_min: 1,
@@ -1167,6 +1549,7 @@ fn rescan_workloads() -> Vec<Workload> {
                 ink: (0, 0),
                 free: (0, 0),
                 nova: (0, 0),
+                shade: None,
                 early_out: true,
                 settled: None,
                 witness_min: 0,
@@ -1231,8 +1614,10 @@ fn verify_reaches_target(w: &Workload, bed: &mut Bed) -> Volume {
     // Printed BEFORE the assertions so a failing run still shows the numbers
     // that explain why.
     println!(
-        "reaches  {:<26} {vol}  fp {fp:#018x}  witness {}",
-        w.name, bed.witness
+        "reaches  {:<26} {vol}  shade {:>3}  fp {fp:#018x}  witness {}",
+        w.name,
+        steady.shade(),
+        bed.witness
     );
     assert_eq!(
         fp_vol, vol,
@@ -1268,6 +1653,41 @@ fn verify_reaches_target(w: &Workload, bed: &mut Bed) -> Volume {
         w.expect.free,
         w.expect.nova
     );
+
+    if let Some(bound) = w.expect.shade {
+        let shade = steady.shade();
+        assert!(
+            in_bound(shade, bound),
+            "{}: {shade} Over-blend Shade stamps, outside {bound:?}. The lo \
+             side is the whole point of the light lane: Shade stamps are the \
+             ONLY population `bound_shade_opacity`'s quadratic scan iterates \
+             (audit CF-3), every dark workload emits exactly zero of them, and \
+             a light workload that stops stamping has silently stopped \
+             reaching the finding it prices.",
+            w.name
+        );
+        if bound.0 > 0 {
+            // The emission-side signature that `bound_shade_opacity` itself
+            // RAN, both passes: the raw center-of-veil stamp is ~200 alpha
+            // (235 x rise_fall x 0.85 intensity), so an unbounded stream
+            // would carry a per-cell peak far above 64. Seeing the peak
+            // squeezed into [SHADE_PEAK_FLOOR, MAX_VIEWPORT_OVERLAY] on the
+            // emitted bytes proves the scan found the true peak AND the scale
+            // pass rewrote every stamp — the only external evidence the
+            // function leaves, and the exact invariant
+            // (`max_cell_shade_alpha <= 64`) any CF-3 rewrite must preserve.
+            let peak = steady.shade_peak_cell_sum();
+            assert!(
+                (SHADE_PEAK_FLOOR..=MAX_VIEWPORT_OVERLAY).contains(&peak),
+                "{}: post-bound per-cell Shade peak {peak}, outside \
+                 [{SHADE_PEAK_FLOOR}, {MAX_VIEWPORT_OVERLAY}]. Above 64 the \
+                 engine's cap is broken outright; well below it the bound \
+                 never bit, meaning this frame's veil is too dim to exercise \
+                 the scale pass a CF-3 rewrite must reproduce.",
+                w.name
+            );
+        }
+    }
 
     assert!(
         bed.witness.total() >= w.expect.witness_min,

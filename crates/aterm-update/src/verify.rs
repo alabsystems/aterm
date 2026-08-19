@@ -22,8 +22,23 @@ use std::time::{Duration, Instant};
 /// and finish in tens of milliseconds, but they share the ceiling because a hung
 /// child is a hung child.
 ///
-/// 30s is far above any healthy run (a 48 MB universal binary verifies in ~1-2s)
-/// and far below "the user thinks the app is broken".
+/// 30s is far above any healthy run and far below "the user thinks the app is
+/// broken".
+///
+/// The headroom survived the batteries-included seed (§9.1), which is worth
+/// recording because it looks like it should not have: the sealed
+/// `Contents/Resources/toolchain-seed` puts the bundle at ~650-850 MB, and
+/// `codesign --verify --deep --strict` really does hash every sealed resource.
+/// Measured on an 851 MB seeded bundle: 0.09 s wall (0.28 s CPU) — codesign
+/// hashes at roughly 3 GB/s and parallelizes across files, so the seed's
+/// marginal cost is ~0.06 s. `spctl` is 0.14-0.21 s there and *slower* on the
+/// small notarized app (~0.44 s), because certificate and ticket evaluation
+/// dominate it, not hashing. Even a pre-SHA-NI Intel Mac doing software SHA-256
+/// lands 1-2 s wall. Reaching 30 s would need sustained reads under ~27 MB/s
+/// across the whole payload — below any internal SSD and below a spinning disk —
+/// and in that regime the download and `ditto` extract dominate long before
+/// verification does. `spctl`'s network reach, not payload size, remains the
+/// reason this ceiling exists.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The CEILING on the child-exit poll interval (see [`HELPER_POLL_MIN`]).
@@ -51,6 +66,62 @@ const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 /// The output of these helpers is a few hundred bytes at most, so collecting it
 /// after the child exits cannot deadlock on a full pipe. Do not reuse this for a
 /// child that streams volume.
+/// PROVE THE CANDIDATE CAN ACTUALLY START, by starting it.
+///
+/// Everything else this module checks is CRYPTOGRAPHIC — the signature, the Team ID,
+/// the sealed identity, the Gatekeeper assessment. None of it establishes that the
+/// binary will LOAD: a wrong-architecture slice, a missing dylib, a Developer ID
+/// Apple revoked after we verified, anything the kernel or dyld rejects before
+/// `main`. That case is the one the crash-loop sentinel cannot cover, because the
+/// sentinel lives inside the new build's own `main` (`install::check_boot_health`):
+/// a build that never reaches `main` never counts a launch, never reaches
+/// `MAX_BOOT_ATTEMPTS`, and never reverts — leaving a bricked app beside a perfectly
+/// good predecessor at `aterm.app.rollback` (2026-08-19, named by an external
+/// reviewer of the product's public claim).
+///
+/// So: run the candidate's own executable with `--version` before the swap and
+/// require a clean exit that names the build we are about to install. `--version` is
+/// the cheapest total path through the binary — it loads every linked library, then
+/// prints and exits without touching config, sockets, PTYs or the updater.
+///
+/// Bounded like every other helper here, and FAIL-CLOSED: a probe that times out,
+/// crashes, or prints the wrong build refuses the apply. The machine keeps the build
+/// it has, which is always a safe outcome; a bricked app is not.
+#[cfg(target_os = "macos")]
+pub fn probe_bundle_starts(app: &Path, expected_build: u64) -> Result<(), String> {
+    let exe = app.join("Contents/MacOS/aterm");
+    if !exe.is_file() {
+        return Err(format!("no executable at {}", exe.display()));
+    }
+    let out = output_bounded(
+        Command::new(&exe).arg("--version").env("ATERM_NO_AUTO_UPDATE", "1"),
+        "candidate --version probe",
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "the staged bundle could not start ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // …and it must be the build we are installing. A probe that starts SOME binary
+    // proves nothing about this one.
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.contains(&expected_build.to_string()) && bundle_build_number(app).ok() != Some(expected_build) {
+        return Err(format!(
+            "the staged bundle started but does not report build {expected_build}: {}",
+            text.trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Non-macOS: there is no bundle to start.
+#[cfg(not(target_os = "macos"))]
+pub fn probe_bundle_starts(_app: &Path, _expected_build: u64) -> Result<(), String> {
+    Ok(())
+}
+
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     let mut child = cmd

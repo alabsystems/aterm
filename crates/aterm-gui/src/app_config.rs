@@ -2074,6 +2074,9 @@ pub(crate) struct MatrixRainConfig {
 /// # auto_update  = true    # run `atpkg update` on the 6h cadence (default true)
 /// # auto_install = false   # ALSO install missing default-set members (default
 /// #                        # FALSE — multi-GB toolchains need explicit consent)
+/// # seed_install = true    # install the BUNDLED seed registry on first launch
+/// #                        # (default TRUE — the bytes ship inside the app;
+/// #                        # false = announce an offer instead). atpkg-only key.
 /// # account      = "alabsystems"   # index owner override (default = compiled owner)
 /// # channel      = "stable"
 /// # include      = ["ay"]  # narrowing-only filters over the signed index set
@@ -2093,6 +2096,13 @@ pub(crate) struct PackagesConfig {
     /// Absent ⇒ OFF (consent-gated — the Settings switch is the consent click).
     /// Consumed by ATPKG (its own reader), not by the GUI loop gate.
     pub(crate) auto_install: Option<bool>,
+    /// `[packages].seed_install`: install the BUNDLED toolchain seal on first launch.
+    /// Default TRUE (the bytes ship inside the app, so installing the app is the
+    /// consent). Consumed by atpkg, mirrored here so Settings can offer the switch —
+    /// the docs pointed at this key while the only way to set it was hand-editing a
+    /// file a new user does not have yet, which made the documented opt-out
+    /// unreachable by exactly the person it exists for.
+    pub(crate) seed_install: Option<bool>,
     /// Index owner override — consumed by atpkg (`ATPKG_ACCOUNT` env beats it).
     pub(crate) account: Option<String>,
     /// Channel — consumed by atpkg (default "stable" there).
@@ -3647,6 +3657,14 @@ impl Config {
     /// toolchains need explicit consent; the Settings switch IS the consent
     /// click, `docs/TOOLCHAIN-PACKAGE-MANAGER.md` §11). Consumed by the
     /// co-located `atpkg` from the same table; the GUI only displays/edits it.
+    /// The `[packages]` `seed_install` RESOLVED bit (default TRUE).
+    pub(crate) fn packages_seed_install(&self) -> bool {
+        self.packages
+            .as_ref()
+            .and_then(|p| p.seed_install)
+            .unwrap_or(true)
+    }
+
     pub(crate) fn packages_auto_install(&self) -> bool {
         self.packages
             .as_ref()
@@ -3669,6 +3687,7 @@ impl Config {
         // as the parsed-but-inert matrix-rain v1.1 keys.
         let _ = (
             p.auto_install,
+            p.seed_install,
             p.account.as_deref(),
             p.channel.as_deref(),
             p.include.as_deref(),

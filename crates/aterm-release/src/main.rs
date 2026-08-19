@@ -36,6 +36,7 @@ mod mirror;
 // channel release, drive the atpkg-keys join in-process, audit the Apple/token stack.
 mod provision;
 mod publish;
+mod seedpack;
 mod sign;
 mod verify;
 

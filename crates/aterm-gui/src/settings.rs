@@ -7870,11 +7870,30 @@ mod tests {
         }
         let mask = s.visible_mask();
         assert_eq!(s.scroll, max_scroll(&s.fields, mask.as_deref(), body));
-        assert_eq!(
-            body_layout(&s.fields, s.scroll, body).len(),
-            body,
-            "the band is still full at max scroll"
+        // MAXIMALITY, which is the property that actually matters: you cannot
+        // scroll further without running off the end, and you could not have
+        // scrolled less without overflowing the band.
+        //
+        // This used to assert the band is EXACTLY full at max scroll. That is not
+        // an invariant — it is a fact about one particular field roster, and it
+        // broke the first time a setting was added. `body_layout` emits a section
+        // HEADER whenever the section changes, so a header falling on the boundary
+        // costs a row: the smallest scroll whose content fits can leave the last
+        // band one row short, and no scroll value yields exactly `body`. Under-
+        // filling by a row is cosmetic; over-scrolling into blank space is the bug,
+        // and that is what is checked here.
+        let rows = body_layout(&s.fields, s.scroll, body).len();
+        assert!(
+            rows == body || rows + 1 == body,
+            "max scroll fills the band, or falls one row short on a section \
+             boundary — got {rows} of {body}"
         );
+        if s.scroll > 0 {
+            assert!(
+                body_layout(&s.fields, s.scroll - 1, body + 1).len() > body,
+                "max scroll is MAXIMAL: one row less would overflow the band"
+            );
+        }
         assert_eq!(s.selected, sel, "wheel scrolling never moves the selection");
 
         // Menu scroll window: clamped to the overflow.

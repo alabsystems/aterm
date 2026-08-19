@@ -705,6 +705,7 @@ mod tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    installable: true,
                 },
             ),
             crate::native_updater_service::CheckCompletion::Reduced,

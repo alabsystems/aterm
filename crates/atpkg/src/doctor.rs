@@ -289,11 +289,61 @@ pub fn run_with(
         println!("doctor: warn — rustup not found (self-contained bundles are portable)");
     }
 
-    if fails == 0 {
+    // (10) THE QUESTION A USER ACTUALLY CAME HERE WITH: do I have the toolchain?
+    //
+    // Everything above audits the STRUCTURE of the store — shims, floors, PATH, disk.
+    // All of it passes vacuously on a machine that received nothing at all, so
+    // `doctor` cheerfully printed "healthy" to the one person most in need of an
+    // answer: someone whose toolchain never arrived, looking at the command the docs
+    // point them to. A diagnostic that reports health over an empty store closes off
+    // the only self-service path to understanding.
+    let installed = crate::ops::active_builds(layout);
+    let status = crate::status::read(layout);
+    let recorded_problem = status.as_ref().and_then(|s| {
+        s.programs
+            .iter()
+            .find(|(_, p)| {
+                p.state.starts_with("error:")
+                    || p.state.starts_with("unavailable:")
+                    || p.state.starts_with("blocked:")
+            })
+            .map(|(name, p)| format!("{name}: {}", p.state))
+    });
+    let mut toolset_problem = false;
+    if layout.declined().is_file() {
+        // Intended emptiness. Say so, so it does not read as a fault.
+        println!(
+            "doctor: the ALab toolset was removed on this machine (`aterm pkg install \
+             --default-set` reinstalls it)"
+        );
+    } else if installed.is_empty() {
+        toolset_problem = true;
+        match &recorded_problem {
+            Some(why) => println!("doctor: PROBLEM — no ALab programs are installed ({why})"),
+            None => println!(
+                "doctor: PROBLEM — no ALab programs are installed. Run \
+                 `aterm pkg install --default-set` to see why (it names the reason and \
+                 exits 2 when no build is published for this Mac)"
+            ),
+        }
+    } else if let Some(why) = &recorded_problem {
+        // Something IS installed, but the record carries a live failure — a partial
+        // first run, a blocked disk, a member with no build for this triple.
+        toolset_problem = true;
+        println!(
+            "doctor: PROBLEM — the toolset is incomplete ({why}); {} program(s) active",
+            installed.len()
+        );
+    } else {
+        println!("doctor: {} ALab program(s) active", installed.len());
+    }
+
+    if fails == 0 && !toolset_problem {
         println!("doctor: healthy");
         true
     } else {
-        println!("doctor: found {fails} problem(s)");
+        let total = fails + usize::from(toolset_problem);
+        println!("doctor: found {total} problem(s)");
         false
     }
 }
@@ -423,6 +473,41 @@ mod tests {
         assert!(
             run_with(&l, Some(&home), Some(&path), 0, None, None),
             "a clean install is healthy"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE QUESTION THE COMMAND EXISTS FOR. Every structural check passes vacuously
+    /// on a store that received nothing, so `doctor` used to print "healthy" to the
+    /// one user most in need of an answer — someone whose toolchain never arrived,
+    /// running the command the docs point them at. An empty store is not health.
+    #[test]
+    fn an_empty_store_is_not_healthy() {
+        let l = layout("empty-store");
+        let home = synthetic_home("empty-store");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        // Structurally spotless — and still not healthy, because there is no toolchain.
+        assert!(
+            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            "a store with no ALab programs must report a problem, not health"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// …unless the emptiness was ASKED FOR. A user who removed the toolset is not
+    /// broken, and telling them so would train them to ignore the diagnostic.
+    #[test]
+    fn a_declined_store_is_healthy_while_empty() {
+        let l = layout("declined-store");
+        let home = synthetic_home("declined-store");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        std::fs::create_dir_all(&l.prefix).unwrap();
+        std::fs::write(l.declined(), b"# removed on purpose\n").unwrap();
+        assert!(
+            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            "a deliberate removal is a healthy state, not a fault"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);

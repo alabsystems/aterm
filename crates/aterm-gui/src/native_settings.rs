@@ -2398,6 +2398,15 @@ impl SettingsApp {
                 );
                 EventResult::Handled
             }
+            "packages/uninstall-all" => {
+                self.reduce_packages_verb(
+                    view,
+                    cx,
+                    PackagesRequest::UninstallAll,
+                    "Removing the ALab toolset…",
+                );
+                EventResult::Handled
+            }
             "packages/install-default" => {
                 self.reduce_packages_verb(
                     view,
@@ -3272,7 +3281,8 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         prefs::EDIT_RESTORE_SESSION => Some(Effect::SessionRuntime),
         prefs::EDIT_PACKAGES_ENABLED
         | prefs::EDIT_PACKAGES_AUTO_UPDATE
-        | prefs::EDIT_PACKAGES_AUTO_INSTALL => Some(Effect::PackageRuntime),
+        | prefs::EDIT_PACKAGES_AUTO_INSTALL
+        | prefs::EDIT_PACKAGES_SEED_INSTALL => Some(Effect::PackageRuntime),
         _ => None,
     }
 }
@@ -3702,6 +3712,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         prefs::EDIT_PACKAGES_ENABLED => config.packages.as_ref().and_then(|p| p.enabled),
         prefs::EDIT_PACKAGES_AUTO_UPDATE => config.packages.as_ref().and_then(|p| p.auto_update),
         prefs::EDIT_PACKAGES_AUTO_INSTALL => config.packages.as_ref().and_then(|p| p.auto_install),
+        prefs::EDIT_PACKAGES_SEED_INSTALL => config.packages.as_ref().and_then(|p| p.seed_install),
         "sparkle_words.enabled" => sparkle.and_then(|s| s.enabled),
         // The DEPTH-2 `[sparkle_words.*]` Bool leaves (every Bool registered in
         // `prefs::NESTED_LEAVES` two tables down), same contract again: the
@@ -14358,6 +14369,13 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
             "Version {version} (build {build}) is staged; its release notes are not available \
              here."
         )
+    } else if update.failing_persistent {
+        // NEVER "is the latest build" on the same page whose headline says this Mac
+        // cannot update: with nothing staged this branch was unconditional, so the
+        // card contradicted the card above it every time (2026-08-19 round-5 audit).
+        "Release notes appear here once a newer build is staged. This Mac is not \
+         completing update checks — the cause is above."
+            .to_string()
     } else if update.enabled {
         format!(
             "aterm {} is the latest build. Notes for a newer version appear here as soon as one is staged.",
@@ -15027,9 +15045,15 @@ fn packages_has_service_line(packages: &PackagesProjection) -> bool {
 }
 
 fn packages_compact_sections(packages: &PackagesProjection) -> usize {
-    // Summary, two actions, optional manager provenance, three maintenance switches,
-    // live updater status, consent explanation, and every bounded managed-program row.
-    1 + 2
+    // Summary, THREE actions (check / install / remove), optional manager provenance,
+    // three maintenance switches, live updater status, consent explanation, and every
+    // bounded managed-program row.
+    //
+    // These counts mirror the two literal lists in `packages_page` — the action_button
+    // vec and the switch-key array. Adding to either without adding here silently
+    // over-runs the compact page's height budget, which does not fail loudly: the
+    // switches simply stop rendering.
+    1 + 3
         + usize::from(packages_has_service_line(packages))
         + 3
         + 1
@@ -15346,6 +15370,17 @@ fn packages_page(
             PackagesBusy::Install,
             false,
         ),
+        // The EXIT, sitting beside the entrance. A first launch installs multiple GB
+        // without a prompt (§9.1 — the bytes ship inside the app), and trashing
+        // aterm.app leaves every one of them orphaned under Application Support. An
+        // unprompted install whose only removal path is a CLI verb the user has to
+        // discover is the asymmetry that makes it feel like something done TO them.
+        action_button(
+            "packages/uninstall-all",
+            "Remove ALab Toolset",
+            PackagesBusy::Uninstall,
+            false,
+        ),
     ];
     let action_height = if stack_actions {
         actions.len() as f32 * action_control_height + actions.len().saturating_sub(1) as f32 * 8.0
@@ -15458,9 +15493,16 @@ fn packages_page(
     let switch_height = width.row_height();
     let consent_heading_height = 22.0_f32.max(16.0 * text_scale);
     let consent_note_height = 42.0_f32.max(36.0 * text_scale);
-    const PACKAGE_CONSENT_NOTE: &str = "Automatic maintenance controls the background service. Maintenance and auto-update apply on the next launch. Auto-install applies on the next package operation and may download multiple GB; enabling it is multi-GB consent. All three switches write [packages] in aterm.toml.";
+    // TELL THE TRUTH ABOUT THE DEFAULT. aterm installs and maintains the ALab
+    // toolset by default — that is what the app is for — so copy implying the
+    // toolchain only arrives if you enable Auto-install described a product that
+    // does not exist, while multi-GB installs happened anyway. `auto_install` now
+    // means only what its name says: may atpkg pull the set over the NETWORK onto a
+    // machine that has none. "Remove ALab Toolset" is the durable way out, and it is
+    // named here because a default this large must state its off switch.
+    const PACKAGE_CONSENT_NOTE: &str = "Automatic maintenance controls the background service. Maintenance and auto-update apply on the next launch. aterm keeps the ALab toolset installed and complete by default; Remove ALab Toolset undoes that. Auto-install applies on the next package operation and may download multiple GB; enabling it is multi-GB consent. All three switches write [packages] in aterm.toml.";
     const PACKAGE_CONSENT_LINES: [&str; 2] = [
-        "Maintenance and auto-update: next launch.",
+        "ALab toolset kept complete by default; Remove undoes it.",
         "Auto-install: next package operation; multi-GB consent.",
     ];
     let mut consent_children = vec![
@@ -15485,6 +15527,13 @@ fn packages_page(
         prefs::EDIT_PACKAGES_ENABLED,
         prefs::EDIT_PACKAGES_AUTO_UPDATE,
         prefs::EDIT_PACKAGES_AUTO_INSTALL,
+        // NOT `seed_install`. It is a real setting (the EditField roster, Search,
+        // `settings set`, and the manual all carry it), but a fourth row pushes the
+        // consent card past the compact page's height budget, at which point the
+        // page decomposes and NONE of the switches render — a worse outcome than
+        // reaching this one through Search. The visible way out of a toolset you
+        // do not want is the "Remove ALab Toolset" action beside these switches,
+        // which is durable (`atpkg uninstall --all` writes a `declined` marker).
     ] {
         if let Some(row) = packages_switch_row(state, key, width) {
             consent_children.push(row);
@@ -17843,6 +17892,7 @@ mod tests {
             failing_checks: 0,
             failing_kind: String::new(),
             failing_applies: 0,
+            installable: true,
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,

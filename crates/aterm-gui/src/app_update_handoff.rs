@@ -2412,7 +2412,14 @@ impl App {
     /// proven — `SessionHandoff` + `handoff_roundtrip_model`; the single-use nonce by
     /// `seamless_nonce_model`). Scope: the live process, visible rows, terminal modes/cursors,
     /// and output queued after reader park survive. Preexisting off-screen scrollback is
-    /// deliberately excluded to keep capture latency bounded. A cold relaunch is
+    /// carried only up to `seamless::MAX_HANDOFF_HISTORY_LINES` (256) per session, and
+    /// DROPPED ENTIRELY for a session when the time ladder or the aggregate cell budget
+    /// says so — the standing policy is "the failure mode is less scrollback, never the
+    /// update did not apply". A tab configured for the default 100,000-line ring
+    /// therefore keeps its processes, its visible screen and its queued output across an
+    /// in-session update, but not its history. (This sentence used to say scrollback was
+    /// "deliberately excluded", which stopped being true when the 256-line carry landed
+    /// and understated what survives; 2026-08-19.) A cold relaunch is
     /// permitted only when no foreground terminal job would be destroyed. Every path that
     /// leaves this process alive returns an actionable failure so the updater reducer can
     /// re-arm the verified stage instead of remaining stuck in `Applying`.
@@ -2991,6 +2998,17 @@ impl App {
             // approximate. The latch stops every later session paying the same
             // doomed probe once the budget is known to be tight.
             if per_grid.is_none() && history != 0 {
+                // SAY SO. Dropping a tab's history is invisible to the user until they
+                // scroll up and find it gone, on a machine configured for 100,000
+                // lines. The decision is deliberate and stays deliberate — but it is
+                // recorded where every other handoff decision is (2026-08-19, raised
+                // by an external reviewer of the product's public claim).
+                aterm_log::info!(
+                    "update apply: carrying no scrollback for this session — the \
+                     handoff's aggregate cell budget cannot fit {history} history \
+                     line(s) beside the visible {rows}x{cols} screen. Processes, the \
+                     visible screen and queued output still survive the update."
+                );
                 history = 0;
                 history_over_budget = true;
                 per_grid = crate::seamless::admit_checkpoint_dimensions(
@@ -5311,6 +5329,7 @@ mod returned_handoff_completion_lane_tests {
                     failing_persistent: false,
                     failing_kind: String::new(),
                     failing_applies: 0,
+                    installable: true,
                 },
             ),
             CheckCompletion::Reduced,

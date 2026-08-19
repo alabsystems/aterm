@@ -255,7 +255,10 @@ fn unreadable_explanation(
          aterm's config, or $ATERM_UPDATE_OWNER / $ATERM_UPDATE_REPO.",
         source.owner,
         source.repo,
-        token::PROVISION_COMMAND
+        // The rung THIS source actually consults: on the default public channel the
+        // 0600 file is never read, so telling the user to write one would send them
+        // to watch nothing happen.
+        token::provision_remedy(&source.owner, &source.repo)
     )
 }
 
@@ -1342,7 +1345,7 @@ fn fetch_release_catalog(
                     // paste) still costs this machine the 5000/hour budget even though
                     // the public channel works. Say so, throttled, once in a while.
                     if let Some(diagnosis) = diagnosis.as_ref() {
-                        crate::no_token::note_unusable_token(diagnosis);
+                        crate::no_token::note_unusable_token(source, diagnosis);
                     }
                     break body;
                 }
@@ -1368,7 +1371,7 @@ fn fetch_release_catalog(
                          while the channel is public, but rotate the token with: {}",
                         source.owner,
                         source.repo,
-                        token::PROVISION_COMMAND
+                        token::provision_remedy(&source.owner, &source.repo)
                     ));
                 }
                 ListDecision::Blocked(explanation) => {
@@ -2176,7 +2179,42 @@ mod tests {
                 text.contains("ATERM_UPDATE_OWNER"),
                 "cause 3 missing: {text}"
             );
-            // The copy-pasteable fix for cause 1.
+            // The copy-pasteable fix for cause 1 — and it must be the rung THIS
+            // source actually consults. On the compiled-in public channel the token
+            // chain reads only `$ATERM_UPDATE_TOKEN` (it will not go looking for an
+            // ambient credential to read a public repo), so telling the operator to
+            // write the 0600 file would send them to watch nothing change
+            // (2026-08-19).
+            assert!(
+                text.contains(token::provision_remedy(&source.owner, &source.repo)),
+                "{text}"
+            );
+            assert!(
+                text.contains("ATERM_UPDATE_TOKEN"),
+                "the default channel's only rung must be named: {text}"
+            );
+            assert!(
+                !text.contains(token::PROVISION_COMMAND),
+                "the 0600-file remedy is a no-op on the default channel: {text}"
+            );
+        }
+
+        // …and an OVERRIDDEN source does consult the ambient chain, so there the
+        // 0600-file remedy is the right one to print.
+        {
+            let overridden = Source {
+                owner: "someone-else".to_string(),
+                repo: "private-aterm".to_string(),
+            };
+            let ListDecision::Blocked(text) = classify_list_error(
+                &not_found(),
+                false,
+                false,
+                &overridden,
+                Some(&unprovisioned()),
+            ) else {
+                panic!("an unreadable overridden channel with no token must block");
+            };
             assert!(text.contains(token::PROVISION_COMMAND), "{text}");
         }
 

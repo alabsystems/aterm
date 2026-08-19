@@ -22,6 +22,8 @@ pub(crate) enum PackagesBusy {
     Check,
     /// `atpkg install --default-set` — bootstrap-install the signed default set.
     Install,
+    /// `atpkg uninstall --all` — remove the whole managed toolset, reclaiming its disk.
+    Uninstall,
 }
 
 impl PackagesBusy {
@@ -29,6 +31,7 @@ impl PackagesBusy {
         match self {
             Self::Check => "Package check completed",
             Self::Install => "ALab toolset install completed",
+            Self::Uninstall => "ALab toolset removed",
         }
     }
 
@@ -36,6 +39,7 @@ impl PackagesBusy {
         match self {
             Self::Check => "Package check failed",
             Self::Install => "ALab toolset install failed",
+            Self::Uninstall => "ALab toolset removal failed",
         }
     }
 }
@@ -369,6 +373,7 @@ impl PackagesService {
             (true, None) => 1,
             (true, Some(PackagesBusy::Check)) => 2,
             (true, Some(PackagesBusy::Install)) => 3,
+            (true, Some(PackagesBusy::Uninstall)) => 4,
         };
         let (last_operation, last_result) = match self.last_command.as_ref() {
             None => (0, 0),
@@ -376,6 +381,7 @@ impl PackagesService {
                 match operation {
                     PackagesBusy::Check => 2,
                     PackagesBusy::Install => 3,
+                    PackagesBusy::Uninstall => 4,
                 },
                 1,
             ),
@@ -383,6 +389,7 @@ impl PackagesService {
                 match operation {
                     PackagesBusy::Check => 2,
                     PackagesBusy::Install => 3,
+                    PackagesBusy::Uninstall => 4,
                 },
                 2,
             ),
@@ -559,6 +566,7 @@ impl PackagesState {
             match busy {
                 PackagesBusy::Check => "Checking toolchain packages…".to_string(),
                 PackagesBusy::Install => "Installing the ALab toolset…".to_string(),
+                PackagesBusy::Uninstall => "Removing the ALab toolset…".to_string(),
             }
         } else if let Some(command) = self.last_command.as_ref() {
             command.headline().to_string()

@@ -68,6 +68,7 @@
 pub mod activate;
 pub mod appgate;
 pub mod apply;
+pub mod bundled;
 pub mod cache;
 /// The `atpkg` CLI (all verbs), callable in-process by the ONE `aterm` binary.
 pub mod cli;
@@ -91,6 +92,7 @@ pub mod net;
 pub mod ops;
 pub mod pin;
 pub mod platform;
+pub mod provisional;
 pub mod relocate;
 pub mod select;
 pub mod sig;
@@ -103,6 +105,7 @@ pub mod verify;
 pub use activate::{activate_channel, atomic_symlink, install_shims};
 pub use appgate::{AppIndexGate, app_apply_allowed};
 pub use apply::{Group, TxnOutcome, plan_groups, transact};
+pub use bundled::{SEED_DIR_NAME, bundled_seed_dir};
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};
 pub use cost::{disk_ok, human_bytes, needs_consent};

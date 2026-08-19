@@ -48,8 +48,58 @@ pub fn our_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Create `dir` (and parents) as a SHARED, world-traversable directory: `0755`.
+/// Mark `dir` as excluded from Time Machine and every backup tool that honours the
+/// convention, by setting the `com.apple.metadata:com_apple_backup_excludeItem`
+/// extended attribute.
 ///
+/// The store is multiple GB of extracted toolchain that is re-downloadable and
+/// signature-verifiable from the signed index; backing it up copies bytes the machine
+/// can always reconstruct, and re-copies them on every update pass. It cannot simply
+/// live in `~/Library/Caches` instead — a purge there would silently break an
+/// installed toolchain, and the verified lane needs a stable path — so the exclusion
+/// is set explicitly.
+///
+/// Best-effort and deliberately infallible: a volume or filesystem that refuses
+/// extended attributes (a network home, an exFAT prefix) costs the user backup space
+/// and nothing else. Never let a storage courtesy fail an install.
+///
+/// The value is the documented `bplist00` byte sequence for a `true` boolean, written
+/// verbatim rather than via a plist encoder so this stays a dependency-free `setxattr`.
+pub fn exclude_from_backup(dir: &Path) {
+    use std::os::unix::ffi::OsStrExt as _;
+    const ATTR: &[u8] = b"com.apple.metadata:com_apple_backup_excludeItem\0";
+    // CFBoolean true, as a binary plist: header, the `true` marker (0x09), trailer.
+    const TRUE_BPLIST: &[u8] = &[
+        0x62, 0x70, 0x6c, 0x69, 0x73, 0x74, 0x30, 0x30, // "bplist00"
+        0x09, // kCFBinaryPlistMarkerTrue
+        0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x09,
+    ];
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return; // an interior NUL cannot name a real path
+    };
+    // SAFETY: `path` and `ATTR` are NUL-terminated C strings that outlive the call, the
+    // value pointer/length describe a `'static` slice, and the return value is ignored
+    // because failure is explicitly acceptable here.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            ATTR.as_ptr().cast::<libc::c_char>(),
+            TRUE_BPLIST.as_ptr().cast::<libc::c_void>(),
+            TRUE_BPLIST.len(),
+            0,
+            0,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Other Unixes have no Time Machine convention to honour.
+        let _ = (path, ATTR, TRUE_BPLIST);
+    }
+}
+
 /// The system-prefix counterpart of `ensure_private_dir`'s `0700`. A root-owned store
 /// exists precisely so every user can execute out of it, so it must be readable and
 /// traversable by all — while staying writable only by root, which is what the prefix
@@ -79,11 +129,15 @@ pub fn ensure_shared_dir(dir: &Path) -> std::io::Result<()> {
 /// The second trusted chain shape, and the one a verified toolchain requires. The
 /// `$HOME` chain check answers "no attacker-writable ancestor" by proving every
 /// component is ours; a root-owned chain answers the same question at least as
-/// strongly — nothing below root can swap a component — while additionally carrying
-/// PATHNAME EXECUTION AUTHORITY, which a user-owned path cannot. Trust's verified
-/// launcher rejects a user-owned toolchain outright ("user-owned toolchains cannot
-/// provide pathname execution authority"), so without this shape the verified lane is
-/// unreachable for anything atpkg installs.
+/// strongly — nothing below root can swap a component. This shape is for a genuinely
+/// shared multi-user store.
+///
+/// CORRECTION 2026-08-18: this used to say a root-owned chain additionally carried
+/// "PATHNAME EXECUTION AUTHORITY, which a user-owned path cannot", and that Trust's
+/// verified launcher rejects a user-owned toolchain outright. Not true of current
+/// Trust: its default `CallerOwned` mode admits a component owned by root OR by the
+/// invoking identity (`process_authority.rs` — and it REFUSES to authenticate at all
+/// when targo runs as root). A user-owned 0700 prefix proves fine.
 ///
 /// Deliberately NOT "root-owned OR ours": admitting our own uid here would let the
 /// system prefix fall back to exactly the property the verified lane refuses.
@@ -207,7 +261,24 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
 /// Install a bin shim at `shim` forwarding to `target`. On Unix a shim IS a symlink,
 /// so this is exactly [`atomic_symlink`].
 pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
-    atomic_symlink(target, shim)
+    // An EXEC STUB, not a symlink. See `platform::sh_shim_content` for why: Trust's
+    // `targo` refuses to authenticate when its own `current_exe` is a symlink or a
+    // non-canonical path, so a symlinked shim made the product's headline tool fail
+    // on 100% of successful installs. `exec` hands the process image to the real
+    // binary at its real path, which also keeps its sysroot siblings resolvable.
+    //
+    // Written temp+rename so the swap stays atomic exactly as `atomic_symlink` was:
+    // a shim on the user's PATH is never briefly absent or half-written.
+    let body = super::sh_shim_content(target);
+    let tmp = shim.with_extension("atpkg-new");
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut f = open_create_write(&tmp, 0o755)?;
+        use std::io::Write as _;
+        f.write_all(body.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, shim)
 }
 
 /// Wrap `s` in single quotes for safe embedding in a `/bin/sh` script, escaping any embedded
@@ -267,7 +338,18 @@ pub fn install_tombstone_shim(shim: &Path, message: &str) -> io::Result<()> {
 /// (a regular file, not a symlink) yields `None`.
 #[must_use]
 pub fn resolve_shim(shim: &Path) -> Option<PathBuf> {
-    fs::read_link(shim).ok()
+    // Parses the exec stub rather than reading a link. Every store answer is built on
+    // this — `active_builds`, `prune_stale_shims`, gc's retention — so it must return
+    // exactly what `read_link` used to. A TOMBSTONE (a failing notice script with no
+    // `exec` line) yields `None`, mirroring `read_link`'s `Err` for a non-symlink.
+    //
+    // A symlink left by an older atpkg still resolves, so an in-place upgrade keeps
+    // working until the next activation rewrites the shim as a stub.
+    if let Ok(target) = fs::read_link(shim) {
+        return Some(target);
+    }
+    let content = crate::metadata_io::read_bounded_regular_utf8(shim, super::MAX_SHIM_BYTES).ok()?;
+    super::parse_sh_shim_target(&content)
 }
 
 /// Replace the current process image with `command` (`execve`); returns only on failure.

@@ -1302,6 +1302,14 @@ pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 pub struct UpdateStatus {
     /// Whether the updater is configured to act on this build/machine.
     pub enabled: bool,
+    /// Whether this launch has a bundle the updater could actually REPLACE.
+    /// `false` for a run from the mounted DMG, a Gatekeeper-translocated copy, or
+    /// a dev-marked install (`bundle::resolve` returns `None`) — states in which
+    /// `spawn_background_check` never even starts a thread, so nothing is ever
+    /// written to the ledger and the panel would otherwise report the pristine
+    /// "You're up to date" of a machine that structurally cannot update
+    /// (2026-08-19 round-5 audit).
+    pub installable: bool,
     /// The running build number.
     pub current_build: u64,
     /// Build number staged for next-launch apply, if any.
@@ -1376,6 +1384,9 @@ impl UpdateStatus {
     fn empty(enabled: bool, current_build: u64, outcome: String) -> Self {
         Self {
             enabled,
+            // The fallback/stub path has no bundle to speak for; claiming one would
+            // be the very over-claim `installable` exists to prevent.
+            installable: false,
             current_build,
             staged_build: None,
             staged_version: None,
@@ -1621,6 +1632,7 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
     let h = health::Health::read(&staging.health());
     Some(UpdateStatus {
         enabled: enabled(),
+        installable: bundle::resolve().is_some(),
         current_build,
         staged_build: ready.as_ref().map(|r| r.build_number),
         staged_version: ready.as_ref().map(|r| r.version.clone()),

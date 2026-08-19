@@ -46,6 +46,9 @@ mod buildplan;
 #[path = "../src/bundle.rs"]
 #[allow(dead_code)]
 mod bundle;
+#[path = "../src/seedpack.rs"]
+#[allow(dead_code)] // mounted for bundle/publish, whose seed lane references it
+mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
@@ -275,8 +278,25 @@ impl publish::Packager for FakePackager {
             size_bytes: 1_000,
         })
     }
-    fn zip(&self, app: &Path, _dist: &Path, _version: &str) -> ledger::Result<dmg::Packaged> {
-        record(&self.log, "create_zip", app);
+    fn zip(
+        &self,
+        app: &Path,
+        _dist: &Path,
+        _version: &str,
+        notarized: bool,
+    ) -> ledger::Result<dmg::Packaged> {
+        // Recorded so the ORDERING contract stays observable: the zip is built from a
+        // bundle that has already been notarized and stapled, and the stripped-bundle
+        // Gatekeeper check is only decisive when that is true.
+        record(
+            &self.log,
+            if notarized {
+                "create_zip(notarized)"
+            } else {
+                "create_zip"
+            },
+            app,
+        );
         Ok(dmg::Packaged {
             path: PathBuf::from("/tmp/aterm-tier-fixture/aterm-mac.zip"),
             sha256: ZIP_SHA.into(),
@@ -868,7 +888,11 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             "rehash:aterm.dmg",
             "resize:aterm.dmg",
             // 5. and the zip archived from the ALREADY-STAPLED bundle last.
-            "create_zip:aterm.app",
+            //    `(notarized)` is the point, not noise: it proves the ACTIVE tier
+            //    tells the zip builder the bundle really is signed and stapled,
+            //    which is what makes the stripped-bundle Gatekeeper check FATAL
+            //    rather than advisory (dmg::verify_stripped_bundle).
+            "create_zip(notarized):aterm.app",
         ],
         "the bundle must be stapled before either container is built"
     );

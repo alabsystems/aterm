@@ -39,7 +39,8 @@
 
 use std::io;
 use std::path::Path;
-#[cfg(any(windows, test))]
+// Unconditional now: the Unix shim parser returns a `PathBuf` too, so this is no
+// longer a Windows/test-only need.
 use std::path::PathBuf;
 
 #[cfg(unix)]
@@ -172,8 +173,80 @@ pub(crate) fn parse_cmd_shim_target(content: &str) -> Option<PathBuf> {
     None
 }
 
+/// The Unix `bin/` shim body: a `/bin/sh` stub that EXECs the store binary.
+///
+/// # Why this is not a symlink any more
+///
+/// It was, and that silently broke the product's headline tool on every install.
+/// Trust's `targo` authenticates its own frontend before doing anything: it requires
+/// `current_exe` to be a plain regular file (`protected Targo frontends cannot be
+/// symlinks or reparse points`) and, in `validate_unprivileged_authority_path`, that
+/// the path already equal its own `canonicalize()`. A symlinked shim fails both.
+/// Reproduced directly: `targo --version` through a symlink gives
+/// "could not authenticate Cargo/Targo frontend identity", while the same binary at
+/// its real path prints its version.
+///
+/// `exec` is what makes the stub work where a hardlink cannot: the process IMAGE is
+/// replaced, so by the time targo authenticates, `current_exe` is the real binary at
+/// its real path — and, just as importantly, `frontend.parent()` is the true toolchain
+/// `bin/`, which is how targo finds its sysroot siblings. A hardlink would be a plain
+/// file but would sit in `<prefix>/bin`, where those siblings are not.
+///
+/// Keeping a shim at all (rather than putting the store's `bin/` on PATH) is what
+/// keeps the `exposes` allowlist meaningful — `shim_allowed` refuses a tool honestly
+/// or maliciously named `sudo`/`ssh`/`git`, and a raw directory on PATH would expose
+/// every binary in a build regardless.
+///
+/// `exec "<target>" "$@"` sets argv[0] to the target, which targo's brand detection
+/// reads: the stub is invisible to the tool it launches.
+pub(crate) fn sh_shim_content(target: &Path) -> String {
+    let mut s =
+        String::from("#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\nexec ");
+    s.push_str(&sh_shim_quote(target));
+    s.push_str(" \"$@\"\n");
+    s
+}
+
+/// Single-quote a path for the `sh` stub, escaping embedded quotes POSIX-style. A
+/// managed-store path never contains one; this is fail-closed defence in depth, the
+/// same posture the `.cmd` side takes.
+pub(crate) fn sh_shim_quote(target: &Path) -> String {
+    let mut out = String::from("'");
+    for c in target.to_string_lossy().chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The inverse of [`sh_shim_content`] — recover the target a shim execs.
+///
+/// `resolve_shim` used to be `read_link`, and the whole store's bookkeeping is built
+/// on it: `active_builds`, `prune_stale_shims` and gc all ask "which build does this
+/// shim point at". Parsing the stub keeps every one of those answers identical.
+/// A TOMBSTONE (a failing notice script with no `exec`) must parse as `None`, exactly
+/// as `read_link` returned `Err` for it.
+pub(crate) fn parse_sh_shim_target(content: &str) -> Option<PathBuf> {
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("exec '")
+            && let Some(end) = rest.rfind("' \"$@\"")
+        {
+            return Some(PathBuf::from(rest[..end].replace("'\\''", "'")));
+        }
+    }
+    None
+}
+
 #[cfg(any(windows, test))]
 const MAX_CMD_SHIM_BYTES: usize = 64 * 1024;
+
+/// Shared bound for reading a shim of either dialect before parsing it.
+pub(crate) const MAX_SHIM_BYTES: usize = 64 * 1024;
 
 /// Read the Windows `.cmd` shim through the package-metadata admission seam
 /// before parsing it. Compiled in Unix tests as a cross-platform regression for
@@ -277,5 +350,44 @@ mod tests {
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(read_cmd_shim_target(&path).is_none());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sh_shim_tests {
+    use super::*;
+
+    /// THE REGRESSION THAT BROKE THE PRODUCT. A symlinked shim made Trust's `targo`
+    /// refuse to run on every successful install — it authenticates its own
+    /// `current_exe` as a plain, already-canonical regular file. The stub must
+    /// therefore BE a regular file whose `exec` hands off to the real path.
+    #[test]
+    fn the_sh_shim_execs_the_real_path_and_round_trips() {
+        let target = Path::new("/prefix/store/trust/5520/bin/targo");
+        let body = sh_shim_content(target);
+        assert!(body.starts_with("#!/bin/sh\n"), "{body}");
+        assert!(
+            body.contains("exec '/prefix/store/trust/5520/bin/targo' \"$@\""),
+            "the stub must EXEC (replacing the process image) so the tool authenticates \
+             at its real path, and forward args verbatim: {body}"
+        );
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(target));
+    }
+
+    /// A tombstone has no `exec` line, so it must resolve to nothing — exactly as
+    /// `read_link` returned `Err` for it. `active_builds` and gc depend on this.
+    #[test]
+    fn a_tombstone_is_not_an_installed_shim() {
+        let notice = "#!/bin/sh\necho 'atpkg: ay was yanked' 1>&2\nexit 70\n";
+        assert_eq!(parse_sh_shim_target(notice), None);
+    }
+
+    /// Defence in depth: a path containing a quote cannot break out of the stub.
+    #[test]
+    fn an_embedded_quote_cannot_escape_the_stub() {
+        let nasty = Path::new("/prefix/store/o'ny/1/bin/x");
+        let body = sh_shim_content(nasty);
+        assert!(body.contains(r"'\''"), "quote is POSIX-escaped: {body}");
+        assert_eq!(parse_sh_shim_target(&body).as_deref(), Some(nasty));
     }
 }

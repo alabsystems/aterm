@@ -24,11 +24,12 @@ use crate::flow::now_unix;
 ///
 /// Kept as DATA, and checked against the `match` by
 /// [`tests::verb_hint_matches_dispatch`], because the hint has drifted from
-/// reality twice: `sync` (deleted in `a43193f4`) and `seed` (deleted in
-/// `ba832933`) were both still advertised here long after they stopped
-/// dispatching — so a user who followed the suggestion got the very error
-/// that printed it. A hand-maintained help string cannot be trusted to track
-/// a match arm; a test can.
+/// reality twice: `sync` (deleted in `a43193f4`) and the source-build-era
+/// `seed` (deleted in `ba832933`; the verb returned 2026-08-17 as the signed
+/// bundled-seed bootstrap only) were both still advertised here long after
+/// they stopped dispatching — so a user who followed the suggestion got the
+/// very error that printed it. A hand-maintained help string cannot be
+/// trusted to track a match arm; a test can.
 const VERBS: &[&str] = &[
     "doctor",
     "which",
@@ -38,6 +39,7 @@ const VERBS: &[&str] = &[
     "verify-index",
     "verify-pkg",
     "install",
+    "seed",
     "update",
     "rollback",
     "pin",
@@ -92,6 +94,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("verify-index") => return cmd_verify_index(args.get(1..).unwrap_or(&[])),
         Some("verify-pkg") => return cmd_verify_pkg(args.get(1..).unwrap_or(&[])),
         Some("install") => return cmd_install(args.get(1)),
+        Some("seed") => return cmd_seed(&args[1..]),
         Some("update") => return cmd_update(args.get(1)),
         Some("rollback") => return cmd_rollback(args.get(1)),
         Some("pin") => return cmd_pin(args.get(1), true),
@@ -126,9 +129,13 @@ fn cmd_help() -> ExitCode {
 /// The chain-validated `[packages].prefix` override, or `None` for the default.
 /// Threaded through `store::resolve` so the override is REACHABLE: both call sites
 /// previously passed a hardcoded `None`, which made `vet_prefix`'s whole
-/// configured-prefix branch dead code and pinned every install to `$HOME` — and
-/// therefore to the unverified lane, since a user-owned toolchain path cannot carry
-/// pathname execution authority.
+/// configured-prefix branch dead code and pinned every install to `$HOME`.
+///
+/// (That was a real bug, but NOT for the reason once recorded here: `$HOME` does not
+/// mean "the unverified lane". Trust's default `CallerOwned` authority mode admits a
+/// toolchain owned by the invoking identity, so the default prefix proves fine —
+/// see `docs/GOLDEN-INSTALL-PATH.md` §2. The override matters for a shared
+/// multi-user store.)
 fn configured_prefix() -> Option<std::path::PathBuf> {
     crate::config::load().prefix_path(aterm_types::dirs::home_dir().as_deref())
 }
@@ -147,7 +154,7 @@ fn layout() -> Option<crate::store::Layout> {
 /// Whether `verb` MUTATES the store and must therefore hold the store-wide
 /// single-writer lock ([`crate::lock`]) for its whole run. The mutators are every
 /// verb that stages/activates/discards builds or rewrites shims (`install` — incl.
-/// `--default-set` —, `update`, `rollback`, `uninstall`, `gc`), every
+/// `--default-set` —, `seed`, `update`, `rollback`, `uninstall`, `gc`), every
 /// link-mutating verb (`link`, `unlink`, `refresh` — which also covers the
 /// `[packages.links]` reconciliation the network verbs run), and `pin`/`unpin`:
 /// pins are LOCAL state files, but they gate the coherence-group transaction and
@@ -159,6 +166,7 @@ fn verb_mutates_store(verb: &str) -> bool {
     matches!(
         verb,
         "install"
+            | "seed"
             | "update"
             | "rollback"
             | "uninstall"
@@ -352,21 +360,118 @@ fn cmd_list() {
 /// `atpkg uninstall <program>` — remove its shims + store builds (fail-closed inside the prefix).
 fn cmd_uninstall(program: Option<&String>) -> ExitCode {
     let Some(program) = program else {
-        eprintln!("usage: atpkg uninstall <program>");
+        eprintln!("usage: atpkg uninstall <program> | --all");
         return ExitCode::from(2);
     };
+    if program == "--all" {
+        return cmd_uninstall_all();
+    }
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
     match crate::uninstall(&layout, program) {
         Ok(()) => {
             println!("atpkg: uninstalled {program}");
+            // Remember it, or the resumable seed lane reinstalls it on the next
+            // launch — the manager undoing a deliberate act.
+            record_removed(&layout, program);
+            // Removing a managed program is an EXPLICIT act, so this machine stops being
+            // one that keeps the whole set complete — otherwise the next unattended pass
+            // would reinstall what the user just removed, which is the manager fighting
+            // its owner. Adoption is re-established by the deliberate whole-set act
+            // (Settings ▸ Packages ▸ Install ALab toolset), and the way to drop ONE
+            // program while staying adopted is `[packages].exclude`.
+            if adopted(&layout) {
+                clear_adoption(&layout);
+                println!(
+                    "atpkg: this machine no longer auto-completes the ALab toolset (removing \
+                     a program opts out). Re-adopt with `aterm pkg install --default-set`, or \
+                     keep the set and drop just this one with [packages].exclude in aterm.toml"
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("atpkg: uninstall {program} failed: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// `atpkg uninstall --all` — remove the WHOLE managed toolset and reclaim its disk.
+///
+/// The batteries-included install lays down ~3.2 GB without asking (§9.1 — the bytes
+/// shipped inside the app, so installing the app is the consent). A user who decides
+/// they do not want it must have a way OUT that is as single-step as the way in;
+/// making them run `uninstall` eight times, once per program they never chose
+/// individually, is the kind of asymmetry that earns a product a reputation.
+///
+/// Composed from the tested per-program primitive plus a GC sweep rather than an
+/// `rm -rf` of the prefix: `[packages].prefix` is user-configurable and chain-vetted,
+/// and a recursive delete of a path from config is exactly the operation that must
+/// never exist. Adoption is cleared last, so the 6h pass does not put it all back.
+fn cmd_uninstall_all() -> ExitCode {
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let installed = crate::active_builds(&layout);
+    if installed.is_empty() {
+        // RECORD THE DECLINE ANYWAY. "Remove the ALab toolset" states an INTENT —
+        // "I do not want this on my machine" — and that intent is independent of
+        // whether anything happens to be installed at this instant. Returning early
+        // made the documented exit door a silent no-op in exactly the cases that
+        // need it most: an Intel/lean Mac (where the store is ALWAYS empty, so the
+        // button could never do anything), and a launch during which the seed pass
+        // has not run yet. The user saw "ALab toolset removed", and the next launch
+        // re-adopted the machine and installed the whole set.
+        clear_adoption(&layout);
+        record_decline(&layout);
+        println!(
+            "atpkg: nothing was installed — recorded that this machine does not want the \
+             ALab toolset, so no later pass installs it. \
+             `aterm pkg install --default-set` opts back in."
+        );
+        return ExitCode::SUCCESS;
+    }
+    let mut failures = 0u32;
+    let mut removed: Vec<String> = Vec::new();
+    for program in installed.keys() {
+        match crate::uninstall(&layout, program) {
+            Ok(()) => removed.push(program.clone()),
+            Err(e) => {
+                failures += 1;
+                eprintln!("atpkg: uninstall {program} failed: {e}");
+            }
+        }
+    }
+    // Reclaim the now-unreferenced build trees — this is where the gigabytes
+    // actually go back, and reporting it is the point of the verb.
+    let report = crate::gc::run(&layout);
+    print_gc_sweeps("uninstall --all", &report);
+    print_gc_abstentions("uninstall --all", &report);
+    crate::hooks::refresh(&layout);
+    // Last, and only after the removals: this machine no longer runs the set, so
+    // set-completion must not reinstate it on the next unattended pass — and the
+    // SEED lane must not either. The seed installs whatever the store lacks (that
+    // is what makes an interrupted first run resumable), so without a durable
+    // decline the next launch would cheerfully restore all 3.2 GB the user just
+    // removed.
+    clear_adoption(&layout);
+    record_decline(&layout);
+    if removed.is_empty() {
+        eprintln!("atpkg: removed nothing");
+        return ExitCode::from(1);
+    }
+    removed.sort();
+    println!("atpkg: removed {}", removed.join(", "));
+    println!(
+        "atpkg: the ALab toolset is no longer managed here. `aterm pkg install --default-set` \
+         puts it back; the app itself is untouched."
+    );
+    if failures == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -450,6 +555,15 @@ fn print_gc_sweeps(verb: &str, report: &crate::gc::GcReport) {
     }
     for (p, names) in &report.swept_scratch {
         println!("atpkg {verb}: swept {p} stage scratch {}", names.join(", "));
+    }
+    // Say it, because the whole point is that this space used to vanish silently:
+    // a killed download stranded a multi-hundred-MB archive in `staging/` that
+    // NOTHING swept, while `gc` reported "nothing to reclaim".
+    for (p, names) in &report.swept_staging {
+        println!(
+            "atpkg {verb}: swept {p} interrupted download(s) {} — a killed transfer left              the compressed archive behind",
+            names.join(", ")
+        );
     }
 }
 
@@ -720,10 +834,53 @@ fn resolve_fetcher(layout: &crate::store::Layout) -> Box<dyn crate::flow::Fetche
     //     `Ok`, so `flow::resolve_candidates`' §14 last-good-index cache
     //     fallback (its `Err` arm) could never fire, and the seed-only set
     //     then OVERWROTE that cache under the chain's source id.
-    // The signed network registry is the only source. A co-located bundled seed
-    // used to be chained in ahead of it for a first run on an empty store; that
-    // offline lane is gone, so there is one way to get bytes.
-    github
+    // Both teeth are closed structurally, which is why the lane could return
+    // (2026-08-17, resurrecting the shape deleted in `ba832933`):
+    //   * the chain joins ONLY on an EMPTY store — the first run, where there
+    //     is no floor to roll back and no installed build for a stale pin to
+    //     downgrade; every subsequent pass is network-only, so the seed can
+    //     never act as an update source;
+    //   * `ChainFetcher` caches under the PRIMARY leg's id and persists only
+    //     the primary's own candidates (`cache_source_id`,
+    //     `cacheable_candidates` — net.rs), so a seed-leg success can neither
+    //     satisfy nor overwrite the last-good NETWORK cache.
+    // The seed is the network registry's twin, not a second trust path: the
+    // DirFetcher's bytes pass the identical verify + floor + freshness gates.
+    let seeded_bootstrap = seed_bootstrap_leg(
+        crate::bundled_seed_dir(),
+        crate::active_builds(layout).is_empty(),
+    )
+    .map(|seed| Box::new(crate::DirFetcher::new(seed)) as Box<dyn crate::flow::Fetcher>);
+    match seeded_bootstrap {
+        Some(seed) => Box::new(crate::ChainFetcher::new(github, seed)),
+        None => github,
+    }
+}
+
+/// THE bootstrap-only rule, as a pure function: the co-located seed joins the
+/// fetcher chain **iff** it exists AND the store is empty.
+///
+/// Split out of [`resolve_fetcher`] because it is the entire safety argument
+/// for re-admitting the seed lane (§9.1), and the version of it that lived
+/// inline was untestable — it reached for `current_exe` and process env — so
+/// the one claim the 2026-07-30 adversarial review turned on had no test at
+/// all. Both teeth it closes are restated at the call site; what this function
+/// guarantees is the premise they rest on.
+///
+/// `store_is_empty` is the SHIM view (`active_builds`), not "no build dirs on
+/// disk", so a store whose every program has been TOMBSTONED by a yank reads
+/// empty here and re-arms the chain. That is safe, but for a reason OUTSIDE
+/// this function: the pass that tombstones also advances the durable
+/// `index_build` floor to the yanking index, and a yanking index is by
+/// construction published above the sealed one — so a seal that would
+/// reinstate yanked builds is refused by the floor, not by this predicate.
+/// Worth knowing before anyone "tightens" the emptiness test to count
+/// directories instead.
+fn seed_bootstrap_leg(
+    seed: Option<std::path::PathBuf>,
+    store_is_empty: bool,
+) -> Option<std::path::PathBuf> {
+    seed.filter(|_| store_is_empty)
 }
 
 /// The trust anchor the network verbs verify under: the committed paper-master keyset
@@ -790,6 +947,184 @@ fn advance_floors(layout: &crate::store::Layout, index_build: u64, roster_seq: u
 /// verify under AND the user has not opted out via `ATPKG_DISABLE`.
 fn manager_enabled() -> bool {
     crate::manager_enabled()
+}
+
+/// Whether this machine has ADOPTED the ALab toolset — see [`crate::store::Layout::adopted`]
+/// for what that means and why it is not the same question as `[packages].auto_install`.
+fn adopted(layout: &crate::store::Layout) -> bool {
+    layout.adopted().is_file()
+}
+
+/// Record adoption after a deliberate whole-set install. Idempotent, and best-effort in the
+/// same sense the floor writes are: a machine that adopted but could not persist the marker
+/// simply asks the consent question again next pass, which is the safe direction.
+fn record_adoption(layout: &crate::store::Layout) {
+    let path = layout.adopted();
+    if path.is_file() {
+        return;
+    }
+    // The payload is documentation for whoever finds the file, never something read back:
+    // adoption is the file's EXISTENCE, so a truncated or garbled write cannot be
+    // misinterpreted as a different answer.
+    match crate::platform::open_create_write(&path, 0o600) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "# This machine runs the ALab toolset as a SET.\n\
+                 # atpkg therefore keeps that set COMPLETE — a program published to the\n\
+                 # signed index later is installed on a later pass, not silently skipped.\n\
+                 # Written by the batteries-included seed bootstrap or `install --default-set`.\n\
+                 # Removed by `uninstall`. To drop one program while staying adopted, use\n\
+                 # [packages].exclude in aterm.toml."
+            );
+        }
+        Err(e) => eprintln!(
+            "atpkg: could not record toolset adoption at {}: {e} — the set will not be \
+             auto-completed until a later pass records it",
+            path.display()
+        ),
+    }
+}
+
+/// Forget adoption. Called by `uninstall`: removing a managed program is an explicit act,
+/// and set-completion must never undo it on the next unattended pass.
+fn clear_adoption(layout: &crate::store::Layout) {
+    let path = layout.adopted();
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The programs this user removed individually ([`crate::store::Layout::removed`]).
+fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(layout.removed())
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record that `program` was removed on purpose, so no unattended pass puts it back.
+fn record_removed(layout: &crate::store::Layout, program: &str) {
+    let mut all = removed_programs(layout);
+    if !all.insert(program.to_string()) {
+        return;
+    }
+    write_removed(layout, &all);
+}
+
+/// Forget removals for `programs` — an explicit install is an unambiguous change of mind.
+fn clear_removed(layout: &crate::store::Layout, programs: &[String]) {
+    let mut all = removed_programs(layout);
+    let before = all.len();
+    for p in programs {
+        all.remove(p);
+    }
+    if all.len() != before {
+        write_removed(layout, &all);
+    }
+}
+
+fn write_removed(layout: &crate::store::Layout, all: &std::collections::BTreeSet<String>) {
+    let path = layout.removed();
+    if all.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Ok(mut f) = crate::platform::open_create_write(&path, 0o600) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            f,
+            "# Programs removed on purpose. No unattended pass reinstalls these;\n\
+             # `aterm pkg install <program>` brings one back."
+        );
+        for p in all {
+            let _ = writeln!(f, "{p}");
+        }
+    }
+}
+
+/// The STABLE stdout markers the GUI parses (`crates/aterm-gui`, `parse_seed_line`).
+///
+/// Constants rather than inline literals because this is a CROSS-CRATE CONTRACT with a
+/// silent failure mode: a reworded prefix does not break a build or a test, it just
+/// means the notice never appears again — and this contract has already broken
+/// undetected once. `aterm-gui` imports these, so a rename is a compile error on both
+/// sides instead of a string that quietly stops matching.
+///
+/// Every marker is a TERMINAL answer to an announcement except `SEED_STARTING`, which
+/// opens one. An announcement with no answer leaves "Installing…" on screen forever.
+pub const SEED_STARTING_MARKER: &str = "seed-starting: ";
+pub const SEED_INSTALLED_MARKER: &str = "seed-installed: ";
+pub const SEED_PENDING_MARKER: &str = "seed-pending: ";
+pub const SEED_UNUSABLE_MARKER: &str = "seed-unusable: ";
+pub const SEED_FAILED_MARKER: &str = "seed-failed: ";
+pub const SEED_PARTIAL_MARKER: &str = "seed-partial: ";
+/// The NETWORK completion lane's answer — programs that arrived over the wire on an
+/// adopted machine, which used to happen with no user-visible trace at all.
+pub const NET_INSTALLED_MARKER: &str = "net-installed: ";
+
+/// WHETHER THE 6-HOUR PASS MAY COMPLETE THE SET — the whole consent policy, as one
+/// pure function so it can be tested.
+///
+/// Three inputs, and the precedence between them is the part that keeps going wrong:
+///
+/// * `declined` — the user removed the toolset on purpose. It outranks everything,
+///   including `auto_install`, because it is the later and more specific act. Checked
+///   HERE and not only in the seed lane: the network pass is what the loop runs, so a
+///   decline honoured locally while this pass reinstalled the set worked for exactly
+///   one launch.
+/// * `adopted` — this machine runs the toolset (installing aterm is wanting it), so
+///   newly published members should arrive without asking again.
+/// * `auto_install` — explicit consent to pull the set over the network onto a machine
+///   that has none.
+fn should_complete_set(auto_install: bool, adopted: bool, declined: bool) -> bool {
+    !declined && (auto_install || adopted)
+}
+
+/// Whether this machine has DECLINED the bundled toolset
+/// ([`crate::store::Layout::declined`]).
+fn declined(layout: &crate::store::Layout) -> bool {
+    layout.declined().is_file()
+}
+
+/// Record a decline, so the seed lane stops re-installing what the user removed.
+fn record_decline(layout: &crate::store::Layout) {
+    let path = layout.declined();
+    if path.is_file() {
+        return;
+    }
+    match crate::platform::open_create_write(&path, 0o600) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = writeln!(
+                f,
+                "# This machine declined the bundled ALab toolset.\n\
+                 # `atpkg seed` will not re-install it (without this, the next launch would\n\
+                 # simply put back everything `uninstall --all` just removed).\n\
+                 # Removed automatically by any explicit install."
+            );
+        }
+        Err(e) => eprintln!(
+            "atpkg: could not record the decline at {}: {e} — the bundled seed may reinstall \
+             on the next launch; set [packages].seed_install = false in aterm.toml to be sure",
+            path.display()
+        ),
+    }
+}
+
+/// Forget a decline — any EXPLICIT install is an unambiguous change of mind, and undoing
+/// one must never require finding a marker file.
+fn clear_decline(layout: &crate::store::Layout) {
+    let path = layout.declined();
+    if path.is_file() {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Record each freshly-installed `requires` dependency of `parent` into `status.toml`
@@ -932,6 +1267,10 @@ fn cmd_install(program: Option<&String>) -> ExitCode {
         return ExitCode::from(1);
     };
     let cfg = crate::config::cached();
+    // Asking for this program back lifts its removal record — otherwise the user
+    // would install it, and then have to know about a marker file to stop the next
+    // unattended pass treating it as "absent by request" again.
+    clear_removed(&layout, std::slice::from_ref(program));
     cmd_install_with(program, &layout, cfg, &*resolve_fetcher(&layout))
 }
 
@@ -1131,7 +1470,19 @@ fn cmd_update_all() -> ExitCode {
     // on disk — so `decide` never treats a staged-but-unactivated build as the running one
     // (which would silently skip a needed re-flip, #19).
     let installed: std::collections::BTreeMap<String, u64> = crate::active_builds(&layout);
-    if installed.is_empty() && !cfg.auto_install() {
+    // WHO gets set-completion: a machine that has ADOPTED the toolset (the seed bootstrap
+    // or an explicit "Install ALab toolset" already laid the whole set down), or one whose
+    // owner ticked `auto_install` to authorize a from-scratch network bootstrap. The two
+    // are different questions — see `store::Layout::adopted`. Reading only the config bit
+    // meant a program published AFTER a user installed never reached them, so their
+    // "entire ALab toolchain" quietly decayed into "whatever was published the day they
+    // installed".
+    // `declined` outranks BOTH. It is checked here and not only in the seed lane
+    // because this is the pass the 6-hour loop runs: honouring a removal on the
+    // local lane while the network lane quietly reinstalled the whole set on the
+    // next tick made the decline look like it worked for exactly one launch.
+    let complete_the_set = should_complete_set(cfg.auto_install(), adopted(&layout), declined(&layout));
+    if installed.is_empty() && !complete_the_set {
         println!("atpkg: nothing installed to update");
         return ExitCode::SUCCESS;
     }
@@ -1172,11 +1523,30 @@ fn cmd_update_all() -> ExitCode {
             println!("atpkg: {p} dev-linked — skipped");
         }
     }
-    // §11 batteries-included: with explicit config consent, ALSO install the index
-    // default-set members not yet installed (include/exclude-narrowed; linked/yanked
-    // members skip; per-program failures are loud but never block the rest).
-    if cfg.auto_install() {
+    // §11 batteries-included: install the index default-set members not yet installed
+    // (include/exclude-narrowed; linked/yanked members skip; per-program failures are loud
+    // but never block the rest). This is what keeps an ADOPTED machine's toolset COMPLETE
+    // as the suite grows, and what an `auto_install` machine uses to bootstrap from empty.
+    if complete_the_set {
+        // ANNOUNCE BEFORE ACTING, exactly as the local seed lane does. This pass can
+        // pull GIGABYTES over the network — an Intel Mac the day x86_64 publishes, a
+        // seedless cut, a seal past its horizon, an app updated before it ever
+        // provisioned — and it ran completely silently: the GUI spawns it with
+        // stdout discarded, so a user could watch multiple GB arrive with nothing on
+        // screen ever mentioning it. That is the same defect the seed lane's marker
+        // contract exists to prevent, on the lane that is MORE surprising because
+        // nothing local prompted it.
+        let before_net = crate::active_builds(&layout);
         failures += install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
+        let mut arrived: Vec<String> = crate::active_builds(&layout)
+            .keys()
+            .filter(|k| !before_net.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        if !arrived.is_empty() {
+            arrived.sort();
+            println!("atpkg: {NET_INSTALLED_MARKER}{}", arrived.join(", "));
+        }
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
     // done). Best-effort; never fails the update. This verb sweeps the WHOLE prefix, so an
@@ -1252,7 +1622,15 @@ fn install_default_set(
         return 1;
     };
     let installed = crate::active_builds(layout);
-    let wanted = index.installable(cfg.include(), cfg.exclude());
+    let mut wanted = index.installable(cfg.include(), cfg.exclude());
+    // Programs the user removed on purpose are not "missing" — they are absent by
+    // request. Filtering them ONLY in the seed lane's prescan was not enough: THIS
+    // function is what the 6-hour pass runs, so an adopted machine reinstalled an
+    // uninstalled program on the next tick regardless. Set-completion means keeping
+    // the set the user has, not overruling their removals.
+    for p in removed_programs(layout) {
+        wanted.remove(&p);
+    }
     let mut failures = 0u32;
     // Every channel-pinned program some group covers (grouped tuple or singleton);
     // wanted members left over are unpinned and fail loudly below.
@@ -1550,7 +1928,25 @@ fn cmd_install_default_set() -> ExitCode {
     let cfg = crate::config::cached();
     reconcile_links(&layout, cfg);
     let fetcher = resolve_fetcher(&layout);
+    let before = crate::active_builds(&layout);
     let failures = install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
+    let activated = crate::active_builds(&layout)
+        .keys()
+        .filter(|k| !before.contains_key(k.as_str()))
+        .count();
+    // The explicit "Install ALab toolset" act IS adoption — but only if it actually
+    // laid something down. Adoption grants unattended network set-completion later
+    // (`cmd_update_all`), so recording it after a pass that installed nothing would
+    // switch that on for a machine that received no toolset at all.
+    if activated > 0 {
+        record_adoption(&layout);
+    }
+    // Asking for the toolset is an unambiguous change of mind about any earlier
+    // removal; undoing a decline must never mean hunting for a marker file. The
+    // per-program removals go too — "install the whole set" plainly includes them.
+    clear_decline(&layout);
+    let all_removed: Vec<String> = removed_programs(&layout).into_iter().collect();
+    clear_removed(&layout, &all_removed);
     // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
     // its disclosure of what the pass abstained on, for the same reason: this verb walks the
     // whole prefix, so a skip here is not about a program the user never mentioned.
@@ -1558,12 +1954,801 @@ fn cmd_install_default_set() -> ExitCode {
     print_gc_sweeps("install-default-set", &report);
     print_gc_abstentions("install-default-set", &report);
     crate::hooks::refresh(&layout);
+    if failures > 0 {
+        return ExitCode::from(1);
+    }
+    // "Zero failures" is NOT "it worked". Every member can clean-skip — no artifact
+    // for this triple (§6), all dev-linked, all tombstoned — and that path used to
+    // print "default set complete" and exit 0, which the Packages page renders as
+    // "ALab toolset install completed" over an empty program list. Telling a user in
+    // green that a multi-GB toolchain installed when nothing happened is the exact
+    // silent-and-green shape this codebase keeps having to root out, so the
+    // no-op case gets its own words and its own exit code.
+    if activated == 0 {
+        let already = !before.is_empty();
+        if already {
+            println!("atpkg: default set already complete — nothing to install");
+            return ExitCode::SUCCESS;
+        }
+        println!(
+            "atpkg: nothing was installed — the signed index pins no program with a build \
+             for this machine ({}). This is not a failure to retry; there is no ALab build \
+             for this architecture yet.",
+            current_triple()
+        );
+        // Exit 2, not 0 and not 1: the GUI maps 0 to "Succeeded" (which would be the
+        // lie) and 1 to a retryable failure (which would be false hope).
+        return ExitCode::from(2);
+    }
+    // The `*seed*` offer, if one was ever announced, is now TAKEN. `record_status`
+    // MERGES the program map, so a row nobody removes lives forever and Settings ▸
+    // Packages keeps advertising an install the user already performed.
+    clear_seed_status(&layout);
+    println!("atpkg: default set complete ({activated} program(s) installed)");
+    ExitCode::SUCCESS
+}
+
+/// `atpkg seed` — the batteries-included first-run bootstrap (§9.1/§11),
+/// resurrected 2026-08-17 as the SIGNED lane only (the keyless source-build
+/// lane stays deleted, `ba832933`): if a release cut sealed a signed seed
+/// registry beside this executable, fill the EMPTY store from it — zero
+/// network required — through the UNCHANGED anchor + freshness + floor +
+/// sha256 + `tree_root` gates. The verb the GUI spawns once per launch.
+///
+/// The seed is a BOOTSTRAP source (see [`resolve_fetcher`]): once the store
+/// holds anything, updates belong to the network + cache path, so the lane is
+/// skipped entirely rather than resolving an index it will not use. Consent:
+/// `[packages].seed_install` (default TRUE — the bytes are already on disk,
+/// sealed under the app's own code signature, so installing the app is the
+/// consent; ~3.2 GB lands in the store on extraction). `false` announces the
+/// offer instead ([`announce_pending_seed`]) and Settings ▸ Packages carries
+/// the act. Store mutation is serialized by the store-wide lock held at the
+/// dispatch edge (`seed` is in [`verb_mutates_store`]). Every skip is loud
+/// and exit-0 — absence of a seed is a legal state, not a failure.
+///
+/// # This verb is LOCAL-ONLY, and that is a consent property, not an optimization
+///
+/// The fetcher here is a bare [`crate::DirFetcher`] over the sealed registry —
+/// **never** [`resolve_fetcher`]'s chain. `seed_install` defaults TRUE on
+/// exactly one argument: the bytes already shipped inside the app, so laying
+/// them down costs disk and no network. Handing this path the chain would make
+/// that argument false. The chain's network leg is the index AUTHORITY, so the
+/// moment the published index outranks the sealed one (the registry publishes
+/// independently of app cuts — §9.2), its pins name builds the seed never
+/// sealed, every asset misses by build-qualified name, and the "local bytes"
+/// bootstrap silently pulls gigabytes over a metered link with
+/// `auto_install = false` still set. `auto_install` is the switch that exists
+/// to stop precisely that, and it gates the NETWORK bootstrap
+/// ([`cmd_update_all`]) — which runs moments later on the same launch, and is
+/// where a machine that wants fresher-than-sealed bytes gets them, with
+/// consent. Staleness here is therefore correct and self-healing: the seed
+/// lays down what it carries, the consented network pass upgrades it.
+fn cmd_seed(rest: &[String]) -> ExitCode {
+    if !rest.is_empty() {
+        eprintln!("usage: atpkg seed");
+        return ExitCode::from(2);
+    }
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    if declined(&layout) {
+        // The user removed this toolset deliberately (`uninstall --all`). The seed
+        // lane installs whatever the store lacks, so without this check it would
+        // undo that on the very next launch.
+        println!(
+            "atpkg: the ALab toolset was removed on this machine — not re-installing it.              `aterm pkg install --default-set` brings it back."
+        );
+        return ExitCode::SUCCESS;
+    }
+    // INSTALLING ATERM IS WANTING THE TOOLSET. Adoption is recorded here — on the
+    // first run of this lane, before any question of whether a seal exists —
+    // because the sealed registry is an optimisation for HOW the toolchain
+    // arrives, never a condition on WHETHER it does.
+    //
+    // Recording it only after a successful seed install left a hole exactly where
+    // the product could least afford one: a machine that got the LEAN container
+    // (every Intel Mac today, and any deliberately seedless cut) has no seal, so it
+    // was never adopted, so `cmd_update_all` short-circuited on
+    // `installed.is_empty() && !complete_the_set` and printed "nothing installed to
+    // update" — forever. That user could never receive the ALab toolchain, not even
+    // once x86_64 artifacts were published, unless they hand-edited
+    // `[packages].auto_install = true` into a config file that does not exist until
+    // the app has already run. "Installing aterm installs the packages" has to be
+    // true on every Mac, not only the ones the seal happens to serve.
+    //
+    // `declined` is checked above, so a deliberate `uninstall --all` still wins —
+    // and so does `seed_install = false`, which is checked BEFORE this line for the
+    // same reason. Adopting first made that flag a lie: the machine became adopted,
+    // `cmd_update_all` then saw `complete_the_set` and installed the entire ~3.2 GB
+    // set over the NETWORK seconds later, bypassing `auto_install` — the exact
+    // unconsented multi-GB path the bare local `DirFetcher` exists to prevent. The
+    // one documented way to say "not on my disk" has to be honoured before anything
+    // records a wish for the toolset.
+    let cfg = crate::config::cached();
+    if !cfg.seed_install() {
+        // Declining the lay-down is not adoption. Announce what is on offer (if
+        // anything) and leave the store exactly as it was.
+        if let Some(seed_dir) = crate::bundled_seed_dir()
+            && manager_enabled()
+        {
+            let fetcher = crate::DirFetcher::new(seed_dir.clone());
+            announce_pending_seed(&layout, &fetcher, cfg, &seed_dir);
+        } else {
+            println!(
+                "atpkg: [packages].seed_install = false — not installing the ALab toolset"
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+    record_adoption(&layout);
+    let Some(seed_dir) = crate::bundled_seed_dir() else {
+        // DO NOT PROMISE WHAT THE INDEX CANNOT DELIVER. This used to assert the
+        // toolset would be "kept current and complete from here on" without asking
+        // whether the index publishes anything for THIS machine — false on every
+        // Intel Mac, which is the lean container's entire audience. (The sentence
+        // also carried a 14-space run from a lost line continuation.)
+        report_seedless_posture(&layout);
+        return ExitCode::SUCCESS;
+    };
+    if !manager_enabled() {
+        println!(
+            "atpkg: bundled seed present ({}) but the manager is disabled — lane skipped \
+             (fail-closed)",
+            seed_dir.display()
+        );
+        return ExitCode::SUCCESS;
+    }
+    // LOCAL-ONLY by construction (see the consent note above): the sealed
+    // registry, served through the identical verify + floor + freshness gates
+    // as any network source — a dir holds bytes, not trust.
+    let fetcher = crate::DirFetcher::new(seed_dir.clone());
+    // Resolve the sealed index FIRST, so an unusable seed is a loud SKIP rather
+    // than the hard failure `install_default_set` reports for an unresolvable
+    // index. Every reason a seed can be unusable here is a correct state the
+    // once-per-launch pass must not scream about: freshness lapsed (the DMG
+    // outlived its horizon), or the store's durable floor already sits above
+    // the sealed index_build (this machine has trusted something newer). In
+    // both cases the consented network lane is the answer, not an error.
+    let anchor = effective_anchor(&layout);
+    let index = match crate::resolve_verified_index(
+        &fetcher,
+        &layout,
+        &anchor,
+        build_floor(&layout),
+        now_unix(),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            println!(
+                "atpkg: bundled seed present ({}) but its index is not usable here: {e} \
+                 — leaving bootstrap to the network lane",
+                seed_dir.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+    // WHAT THIS SEAL CAN STILL DO FOR THIS MACHINE, decided before anything is
+    // announced or extracted. Two questions, and the old code answered neither:
+    //
+    //  * Is there work left? The gate used to be "the store is empty", which made
+    //    the lane single-shot: a first launch interrupted halfway (the extraction
+    //    is minutes long) left some members installed, and every later launch then
+    //    returned early and never touched the seal again — stranding the rest on a
+    //    network that, for the sealed builds, is a strictly worse source. Asking
+    //    instead for the members this store LACKS makes the lane resumable.
+    //    Bootstrap-only-ness is not weakened: it is enforced by the seed being a
+    //    bare local `DirFetcher` outranked by any newer network index, not by the
+    //    store happening to be empty.
+    //  * Can it serve THIS triple at all? On an Intel Mac against today's
+    //    aarch64-only registry the honest answer is no, and saying "installing…"
+    //    first and discovering that afterwards is how a user ends up watching a
+    //    progress notice that never resolves.
+    let wanted = seed_serviceable(&layout, &fetcher, &index, cfg);
+    if wanted.is_empty() {
+        return finish_unusable_seed(&layout, &seed_dir, &fetcher, &index, cfg);
+    }
+    // Parity with the other mutating network verbs: a config-declared dev-link
+    // must exist BEFORE the pass decides what it manages (linked members
+    // hard-skip, §13) — a dev box's first run must not pave over a checkout.
+    reconcile_links(&layout, cfg);
+    // WHOLE-SET DISK GATE, before a single byte is extracted. The per-member and
+    // per-group preflights inside `flow` each ask "does THIS member fit", which is
+    // the wrong question for a first run: on a laptop with a few GB free the small
+    // solvers install, the trust tuple then fails its own gate, and the machine is
+    // left permanently partial — provers but no compiler — with the cause recorded
+    // nowhere. Asking for the total first turns that into one honest refusal that
+    // names the number, and leaves the seal intact for a retry after the user frees
+    // space.
+    if let Some(need) = seed_install_bytes(&fetcher, &index, cfg, &wanted) {
+        let have = crate::freespace::available_bytes(&layout.prefix);
+        if !have.is_none_or(|a| crate::cost::disk_ok(need, a, crate::cost::FREE_FLOOR)) {
+            println!(
+                "atpkg: {SEED_FAILED_MARKER}the ALab toolset needs {:.1} GB free (plus a \
+                 {:.0} GB reserve) and this disk has {:.1} GB — nothing was installed, and \
+                 the bundled copy is kept for when space is available",
+                need as f64 / 1e9,
+                crate::cost::FREE_FLOOR as f64 / 1e9,
+                have.unwrap_or(0) as f64 / 1e9
+            );
+            record_status(
+                &layout,
+                "*toolset*",
+                crate::ProgramStatus {
+                    installed_build: None,
+                    state: String::from("blocked: insufficient disk space"),
+                    tree_root: String::new(),
+                },
+                format!("needs {:.1} GB free", need as f64 / 1e9),
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
+    // ANNOUNCE BEFORE ACTING, with the SIGNED size rather than a guess. Extracting
+    // the seal is minutes of work and gigabytes of disk, and until this marker the
+    // only honest description of a first launch was "the app silently starts
+    // consuming disk". The GUI streams this child's stdout, so the notice lands
+    // while it happens rather than after (crates/aterm-gui, `parse_seed_line`).
+    println!(
+        "atpkg: seed-starting: installing {} ALab program(s) from the bundled registry{}",
+        wanted.len(),
+        match seed_install_bytes(&fetcher, &index, cfg, &wanted) {
+            Some(b) => format!(" (~{:.1} GB on disk when finished)", b as f64 / 1e9),
+            None => String::new(),
+        }
+    );
+    let before = crate::active_builds(&layout);
+    let failures = install_default_set(&layout, &fetcher, &anchor, cfg, now_unix());
+    // New shims must reach interactive shells without a relaunch.
+    crate::hooks::refresh(&layout);
+    let after = crate::active_builds(&layout);
+    let mut new: Vec<String> = after
+        .keys()
+        .filter(|k| !before.contains_key(k.as_str()))
+        .cloned()
+        .collect();
+    if !new.is_empty() {
+        new.sort();
+        // Mark what the SEED laid down as PROVISIONAL. The seal is a cut-time
+        // snapshot; the update pass that runs seconds later replaces whatever the
+        // published index has moved, and under GC's ordinary live+1-rollback rule
+        // each replaced seed build would be retained — a second ~3.2 GB copy of
+        // `trust` preserving a state nobody ran. See `crate::provisional`.
+        let provisional: Vec<(String, u64)> = new
+            .iter()
+            .filter_map(|p| after.get(p.as_str()).map(|b| (p.clone(), *b)))
+            .collect();
+        crate::provisional::record(&layout, &provisional);
+        // The offer, if one was ever announced, is now TAKEN — retire the row
+        // before announcing the install, or Settings ▸ Packages keeps
+        // advertising a pending offer the user already has on disk
+        // (`record_status` MERGES, so nobody else ever removes it).
+        clear_seed_status(&layout);
+        // The stable marker the GUI parses — change it and the first-run
+        // notice goes blind (crates/aterm-gui, spawn_pkg_update_check).
+        println!("atpkg: seed-installed: {}", new.join(", "));
+    }
+    // RECLAIM only on a CLEAN pass. The payload is dead weight once extracted —
+    // ~600 MB on top of the gigabytes it expanded into — but "extracted" has to
+    // mean all of it. A partial pass (a disk that filled, one corrupt artifact)
+    // leaves members the seal still holds locally, and deleting it there would
+    // force the exact bytes that were on this disk a second ago to come back over
+    // the network. `failures == 0` is what separates "consumed" from "interrupted",
+    // and the lane is resumable now, so keeping it is what lets the next launch
+    // finish the job.
+    //
+    // Deleting is signature-SAFE only because of WHERE the payload lives: a
+    // `.lproj` directory, sealed `optional = true` by codesign's built-in rules,
+    // so the bundle still verifies with it entirely absent (measured — see
+    // `crate::bundled::SEED_DIR_NAME`). Doing this to a normally-sealed resource
+    // would break `codesign --verify` and, with it, the updater's verification of
+    // the installed bundle at the next apply.
     if failures == 0 {
-        println!("atpkg: default set complete");
+        reclaim_bundled_seed(&seed_dir);
+    } else {
+        println!(
+            "atpkg: keeping the bundled seed — {failures} member(s) did not install, and the \
+             seal still holds them locally for the next attempt"
+        );
+    }
+    // ALWAYS ANSWER THE ANNOUNCEMENT. `seed-starting:` already put "Installing the
+    // ALab toolchain…" on screen; if this pass then installs nothing and emits no
+    // terminal marker, that notice is the last word the user ever gets — an install
+    // that announced itself, delivered nothing, and never said why. `new` being
+    // empty here means every member failed (a clean skip cannot happen: the
+    // serviceable prescan ran before the announcement), so this is the failure
+    // marker the GUI needs to retire the notice honestly.
+    if new.is_empty() {
+        println!(
+            "atpkg: seed-failed: no ALab program could be installed from the bundled \
+             registry ({failures} failed) — the toolset will be retried on the next launch \
+             and can also come from the network"
+        );
+    } else if failures > 0 {
+        // PARTIAL. This is the likeliest real first-launch failure — a laptop
+        // without ~4 GB free installs the small tools and then the disk preflight
+        // refuses the trust tuple — and it used to print ONLY `seed-installed:`,
+        // so the user got "✓ ALab toolchain installed" with no compiler present.
+        // A green tick over a missing compiler is worse than an error, because
+        // nothing prompts the user to look. The marker carries the count so the
+        // notice can say what is actually true.
+        println!(
+            "atpkg: seed-partial: {} installed, {failures} could not be installed — the \
+             rest is retried on the next launch (Settings ▸ Packages shows which)",
+            new.len()
+        );
+    }
+    if failures == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
     }
+}
+
+/// The channel-pinned members this SEAL can still install on THIS machine: wanted by
+/// config, not already active, and carrying an artifact for this triple.
+///
+/// The triple test is the one that matters for honesty. Every published artifact today
+/// is `aarch64-apple-darwin`, so on an Intel Mac this returns empty and the caller can
+/// say so BEFORE announcing an install — rather than printing "installing…", clean-
+/// skipping every member inside `install_default_set`, and leaving a progress notice
+/// that never resolves.
+///
+/// Group granularity matches the installer's: a coherence tuple is all-or-nothing, so a
+/// tuple with any member lacking this triple contributes nothing (the same rule
+/// `announce_pending_seed` applies, and the same one `install_default_set` acts on).
+fn seed_serviceable(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::TrustedIndex,
+    cfg: &crate::config::PackagesConfig,
+) -> Vec<String> {
+    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+        return Vec::new();
+    };
+    let installed = crate::active_builds(layout);
+    let wanted = index.installable(cfg.include(), cfg.exclude());
+    // Programs the user removed on purpose are NOT missing — they are absent by
+    // request, and the lane's "install whatever the store lacks" rule would
+    // otherwise reinstate them on the next launch.
+    let removed = removed_programs(layout);
+    let triple = current_triple();
+    let mut out: Vec<String> = Vec::new();
+    for group in crate::plan_groups(index, ch) {
+        let missing: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| {
+                wanted.contains(m.as_str())
+                    && !installed.contains_key(m.as_str())
+                    && !removed.contains(m.as_str())
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() || group.members.iter().any(|m| crate::linkmode::is_linked(layout, m))
+        {
+            continue;
+        }
+        // A coherence tuple applies ALL-OR-NOTHING, and `bootstrap_group` refuses the
+        // whole group when any member is neither wanted nor installed — exactly what
+        // an `exclude` entry or a prior `uninstall <member>` produces. Announcing the
+        // remaining members anyway meant the lane advertised programs it would then
+        // silently refuse, reported zero failures, and walked out having installed
+        // nothing it promised. The prescan has to apply the installer's own rule.
+        if group.group.is_some()
+            && !group
+                .members
+                .iter()
+                .all(|m| wanted.contains(m.as_str()) || installed.contains_key(m.as_str()))
+        {
+            continue;
+        }
+        let probe: &[String] = match &group.group {
+            Some(_) => &group.members,
+            None => &missing,
+        };
+        if crate::flow::group_missing_triple(fetcher, index, cfg.channel(), triple, probe).is_none()
+        {
+            out.extend(missing);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The SIGNED installed size of `members` for this triple, summed from the pinned
+/// manifests' `[cost].disk_installed`.
+///
+/// The authoritative number, not a multiplier: the one disclosure a user gets before
+/// committing multiple GB of disk should come from the same signed bytes everything
+/// else in this lane is verified against. `None` when any member's cost is unavailable
+/// or zero — a partial sum would understate the commitment, and no number at all is
+/// more honest than a confidently wrong one.
+fn seed_install_bytes(
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::TrustedIndex,
+    cfg: &crate::config::PackagesConfig,
+    members: &[String],
+) -> Option<u64> {
+    let ch = index.channels.iter().find(|c| c.name == cfg.channel())?;
+    let triple = current_triple();
+    let mut total: u64 = 0;
+    for m in members {
+        let (_, _, pkg) = crate::flow::verified_pkg(fetcher, index, ch, m)?;
+        let art = pkg.artifact_for(triple)?;
+        if art.cost.disk_installed == 0 {
+            return None;
+        }
+        total = total.saturating_add(art.cost.disk_installed);
+    }
+    (total > 0).then_some(total)
+}
+
+/// The seal cannot serve this machine: say so honestly, reclaim it, and DO NOT claim
+/// the network will make up the difference.
+///
+/// That claim would usually be false. The seal is staged from the published index, so
+/// a triple the seal cannot serve is overwhelmingly a triple the registry does not
+/// publish at all — an Intel Mac today. Telling that user "the toolchain will come
+/// from the network instead" sends them to wait for something that is not coming.
+///
+/// Emits the `seed-unusable:` marker so the GUI can retire the in-progress notice with
+/// a real answer instead of leaving "Installing…" on screen forever.
+fn finish_unusable_seed(
+    layout: &crate::store::Layout,
+    seed_dir: &std::path::Path,
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::TrustedIndex,
+    cfg: &crate::config::PackagesConfig,
+) -> ExitCode {
+    // Distinguish "already done" from "can never be done here" — they deserve
+    // different words, and only one of them is a disappointment.
+    let complete = !crate::active_builds(layout).is_empty()
+        && index
+            .channels
+            .iter()
+            .find(|c| c.name == cfg.channel())
+            .is_some_and(|ch| {
+                let installed = crate::active_builds(layout);
+                crate::plan_groups(index, ch)
+                    .iter()
+                    .flat_map(|g| g.members.iter())
+                    .all(|m| installed.contains_key(m.as_str()))
+            });
+    clear_seed_status(layout);
+    // Does this verdict justify deleting the seal? Only `complete` and the
+    // architecture branch below say yes.
+    let mut permanent = complete;
+    if complete {
+        println!("atpkg: the bundled seed is fully installed — nothing left to lay down");
+    } else if crate::active_builds(layout).is_empty() {
+        // Nothing installed and nothing installable — but do NOT blame the
+        // architecture reflexively. An empty serviceable set has three causes, and
+        // saying "no build for your Mac" to someone who actually excluded every
+        // program, or whose whole toolset is dev-linked, is a confident wrong answer.
+        let _ = fetcher;
+        let removed = removed_programs(layout);
+        permanent = false;
+        if !removed.is_empty() {
+            println!(
+                "atpkg: seed-unusable: every program the bundled registry offers was \
+                 removed on this machine ({}) — nothing to install. \
+                 `aterm pkg install <program>` brings one back",
+                removed.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        } else if !index.channels.iter().any(|c| c.name == cfg.channel()) {
+            // A channel the seal does not carry. REVERSIBLE — one line of config —
+            // and it used to fall through to the architecture arm below, which set
+            // `permanent = true` and DELETED the seal while blaming the CPU. The
+            // comment on the reclaim names this exact case as one that must be kept;
+            // the ladder simply had no branch for it, so the code contradicted its
+            // own stated rule and destroyed ~600 MB over a typo.
+            println!(
+                "atpkg: seed-unusable: the bundled registry carries no '{}' channel \
+                 (it has: {}) — nothing was installed. Fix [packages].channel in \
+                 aterm.toml; the bundled toolchain is kept.",
+                cfg.channel(),
+                index
+                    .channels
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else if !cfg.include().is_empty() || !cfg.exclude().is_empty() {
+            println!(
+                "atpkg: seed-unusable: [packages].include/exclude narrows the bundled \
+                 registry to nothing installable on this machine ({}) — widen the filters \
+                 to receive the toolset",
+                current_triple()
+            );
+        } else {
+            // The only permanent one in this arm: the CPU will not change.
+            permanent = true;
+            println!(
+                "atpkg: seed-unusable: the bundled toolchain has no build for this Mac's \
+                 architecture ({}) — no ALab programs were installed, and none are \
+                 available for it yet",
+                current_triple()
+            );
+        }
+    } else {
+        println!(
+            "atpkg: the bundled seed has nothing further to install on this machine ({})",
+            current_triple()
+        );
+    }
+    // RECLAIM ONLY ON A PERMANENT VERDICT. Deleting ~600 MB is irreversible, so it
+    // must not hinge on something the user can change their mind about in one line
+    // of config. Two verdicts are permanent enough: `complete` (the payload was
+    // consumed — it is genuinely spent) and no-artifact-for-this-triple (the CPU
+    // will not change). The others — every offered program removed, include/exclude
+    // narrowing the set to nothing, a channel the seal does not carry — are
+    // reversible: widen the filter or reinstall one program and the seal would have
+    // served, except it is gone. That turns a typo into a permanent loss of the
+    // offline bootstrap this whole feature exists to provide.
+    if permanent {
+        reclaim_bundled_seed(seed_dir);
+    } else {
+        println!(
+            "atpkg: keeping the bundled seed — nothing is installable under the current \
+             configuration, but that is reversible and the seal would serve if it changes"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+/// Say something TRUE about a machine with no sealed registry, and leave a durable
+/// trace of it.
+///
+/// Two very different situations reach here and they deserve different sentences: a
+/// machine whose architecture the index publishes for (the toolset really will arrive
+/// over the network) and one it does not (nothing arrives until someone publishes an
+/// artifact). Assuming the optimistic one made the product promise every Intel user a
+/// toolchain at first launch and then never mention it again.
+///
+/// It also records `status.toml`, because the ABSENCE of that file is what makes
+/// Settings — the one surface a puzzled user is pointed at — say "atpkg has not run
+/// yet" on a machine where it has run correctly on every single launch.
+fn report_seedless_posture(layout: &crate::store::Layout) {
+    let cfg = crate::config::cached();
+    let triple = current_triple();
+    // No seal here, so the only thing to consult is the network index. A resolve
+    // failure is not the question being asked (offline is not "unsupported"), so it
+    // degrades to the generic sentence rather than an alarming one.
+    let fetcher = resolve_fetcher(layout);
+    let serves_us = crate::resolve_verified_index(
+        &*fetcher,
+        layout,
+        &effective_anchor(layout),
+        build_floor(layout),
+        now_unix(),
+    )
+    .ok()
+    .map(|index| !seed_serviceable(layout, &*fetcher, &index, cfg).is_empty());
+    if serves_us == Some(false) {
+        println!(
+            "atpkg: {SEED_UNUSABLE_MARKER}no ALab build is published for this Mac's \
+             architecture ({triple}) yet — nothing was installed, and nothing arrives \
+             until one is"
+        );
+        record_status(
+            layout,
+            "*toolset*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: String::from("unavailable: no build for this architecture"),
+                tree_root: String::new(),
+            },
+            format!("no ALab build is published for {triple} yet"),
+        );
+    } else {
+        println!(
+            "atpkg: no bundled toolchain in this app — atpkg installs the ALab toolset from \
+             the signed index instead, and keeps it current from here on"
+        );
+    }
+}
+
+/// Delete the consumed bundled seed, reclaiming its disk (§9.1).
+///
+/// Best-effort by design, and silent on the ordinary failure: the app bundle may
+/// legitimately not be ours to write (installed to `/Applications` by another
+/// admin, or on a read-only mount), and a machine that keeps its seed is merely
+/// carrying dead weight — never broken. The disk-space win is not worth turning
+/// a successful toolchain install into a failure.
+///
+/// Only ever called after a seed install SUCCEEDED, so the bytes are provably
+/// redundant: they are now extracted in the store, and the seed lane refuses to
+/// read them again on a non-empty store.
+fn reclaim_bundled_seed(seed_dir: &std::path::Path) {
+    // NOT OURS TO DELETE. `/Applications/aterm.app` is shared by every account on
+    // the Mac, and the store this pass just filled belongs to ONE of them. If the
+    // bundle is not owned by us, deleting the payload would reclaim our disk by
+    // taking the offline batteries away from every other user on the machine —
+    // they would each fall back to a network bootstrap for bytes that were sitting
+    // right there. Owning the bundle is the closest available proxy for "this app
+    // is mine to modify", and it also covers the root-owned/managed-fleet case,
+    // where the delete would fail anyway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let ours = std::fs::symlink_metadata(seed_dir)
+            .map(|m| m.uid() == crate::platform::our_uid())
+            .unwrap_or(false);
+        if !ours {
+            println!(
+                "atpkg: leaving the bundled seed in place — {} is not owned by this user, and \
+                 other accounts on this Mac may still need it to install offline",
+                seed_dir.display()
+            );
+            return;
+        }
+    }
+    /// Recursive byte count, best-effort: this only sizes a log line, so an
+    /// unreadable entry contributes zero rather than derailing the reclaim.
+    fn dir_bytes(dir: &std::path::Path) -> u64 {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|e| match e.file_type() {
+                Ok(t) if t.is_dir() => dir_bytes(&e.path()),
+                _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+            })
+            .sum()
+    }
+    let freed = dir_bytes(seed_dir);
+    match std::fs::remove_dir_all(seed_dir) {
+        Ok(()) => println!(
+            "atpkg: reclaimed the bundled seed ({:.0} MB) — a provisioned store never reads \
+             it again",
+            freed as f64 / 1_000_000.0
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Common and harmless: say it once, at a level that does not read as
+            // an install failure.
+            println!(
+                "atpkg: the bundled seed stays on disk (no write access to {}) — harmless, \
+                 just unreclaimed space",
+                seed_dir.display()
+            );
+        }
+        Err(e) => println!(
+            "atpkg: could not reclaim the bundled seed at {}: {e} (harmless — the toolchain \
+             is installed either way)",
+            seed_dir.display()
+        ),
+    }
+}
+
+/// Retire the `*seed*` pending-consent row (the offer was taken, or nothing is
+/// installable here). `record_status` MERGES the program map, so a row nobody
+/// removes lives forever — Settings ▸ Packages would keep advertising an offer
+/// the user already accepted.
+fn clear_seed_status(layout: &crate::store::Layout) {
+    let Some(mut status) = crate::status::read(layout) else {
+        return;
+    };
+    if status.programs.remove("*seed*").is_none() {
+        return;
+    }
+    status.updated_at = now_rfc3339();
+    status.outcome = "bundled seed: nothing pending".to_string();
+    let _ = crate::status::write(layout, &status);
+}
+
+/// The consent-pending half of the bundled-seed lane (§11, the
+/// `[packages].seed_install = false` posture): resolve the ONE verified index
+/// through the chain, count the channel-pinned installable members not yet
+/// installed, and say so — a stable stdout marker line (`seed-pending: …`,
+/// what the GUI's launch-time seed run parses for the first-run notice) plus a
+/// `status.toml` entry so Settings ▸ Packages shows the same truth.
+/// Announcement only: nothing is downloaded or extracted, and a failure to
+/// resolve the index here is itself only announced (the seed is an offer, not
+/// an obligation).
+fn announce_pending_seed(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    cfg: &crate::config::PackagesConfig,
+    seed_dir: &std::path::Path,
+) {
+    let floor = build_floor(layout);
+    let index = match crate::resolve_verified_index(
+        fetcher,
+        layout,
+        &effective_anchor(layout),
+        floor,
+        now_unix(),
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            println!(
+                "atpkg: bundled seed present ({}) but its index did not verify: {e}",
+                seed_dir.display()
+            );
+            return;
+        }
+    };
+    let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
+        println!(
+            "atpkg: bundled seed present ({}) but names no '{}' channel — nothing to offer",
+            seed_dir.display(),
+            cfg.channel()
+        );
+        return;
+    };
+    let installed = crate::active_builds(layout);
+    let wanted = index.installable(cfg.include(), cfg.exclude());
+    // A program with no artifact for THIS triple can never be installed here
+    // (`install_default_set` clean-skips it, §6), so offering it would be a
+    // pill and a status row the user can never satisfy. Narrow to what the
+    // seed can actually lay down on this machine via the §11 bootstrap prescan
+    // ([`crate::flow::group_missing_triple`]).
+    //
+    // The prescan runs at the SAME GRANULARITY the install uses, and that is the
+    // whole point of doing it per group rather than per program: a coherence
+    // tuple is all-or-nothing, so `install_default_set` passes the whole member
+    // slice and clean-skips the ENTIRE group when any one member lacks an
+    // artifact for this triple. A per-member prescan disagreed with that — for a
+    // mixed-coverage tuple it advertised the members that DO have artifacts,
+    // which neither advertised route would then install, and via the GUI the
+    // failure was silent-and-green (a clean skip is zero failures, so the
+    // Packages page reported "Succeeded" over an empty store).
+    let triple = current_triple();
+    let mut missing: Vec<String> = Vec::new();
+    for group in crate::plan_groups(&index, ch) {
+        let group_missing: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+            .cloned()
+            .collect();
+        if group_missing.is_empty() {
+            continue;
+        }
+        // Ungrouped members carry a one-element slice, so this is the identical
+        // call for both shapes — the difference is only what the slice spans.
+        let probe: &[String] = match &group.group {
+            Some(_) => &group.members,
+            None => &group_missing,
+        };
+        if crate::flow::group_missing_triple(fetcher, &index, cfg.channel(), triple, probe)
+            .is_none()
+        {
+            missing.extend(group_missing);
+        }
+    }
+    if missing.is_empty() {
+        // Nothing left to offer: retire any stale pending-consent row so the
+        // Packages page cannot keep showing an offer that is already taken
+        // (record_status MERGES the program map, so an untouched row lingers
+        // forever — adversarial review 2026-07-30).
+        clear_seed_status(layout);
+        return;
+    }
+    missing.sort();
+    let list = missing.join(", ");
+    // The stable marker the GUI parses — change it and the first-run notice
+    // goes blind (crates/aterm-gui, spawn_pkg_update_check).
+    println!(
+        "atpkg: seed-pending: {} program(s) ready to install from the bundled seed: {list} \
+         (Settings ▸ Packages ▸ Install ALab toolset, or `aterm pkg install --default-set`)",
+        missing.len()
+    );
+    // Value-first so the offer survives the Packages card's truncation width
+    // (UX review 2026-07-30: "bundled seed offers: ay · 2026-…" truncated the
+    // payload away); the page's own "Install ALab toolset" button is the act.
+    record_status(
+        layout,
+        "*seed*",
+        crate::ProgramStatus {
+            installed_build: None,
+            state: format!("pending-consent: {list}"),
+            tree_root: String::new(),
+        },
+        format!("ALab toolchain ready: {list} — Install ALab toolset below"),
+    );
 }
 
 /// Reconcile the `[packages.links]` config at the CLI edge of every network verb:
@@ -2238,8 +3423,15 @@ mod tests {
     /// over the dispatch table so a new verb must be classified deliberately.
     #[test]
     fn store_lock_verb_roster_is_exact() {
+        // EXHAUSTIVE over VERBS: a verb added to the dispatch without a place in
+        // one of these two lists fails here rather than silently defaulting to
+        // lock-free. The `seed` verb landed while this test only enumerated the
+        // verbs it already knew, so it classified nothing and proved nothing
+        // about the new store mutator.
+        let mut classified: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for mutator in [
             "install",
+            "seed",
             "update",
             "rollback",
             "uninstall",
@@ -2250,6 +3442,7 @@ mod tests {
             "pin",
             "unpin",
         ] {
+            classified.insert(mutator);
             assert!(
                 verb_mutates_store(mutator),
                 "{mutator} mutates the store and must take the lock"
@@ -2269,11 +3462,249 @@ mod tests {
             "-h",
             "--help",
         ] {
+            classified.insert(read_only);
             assert!(
                 !verb_mutates_store(read_only),
                 "{read_only} is read-only and must stay lock-free"
             );
         }
+        let unclassified: Vec<&&str> = VERBS.iter().filter(|v| !classified.contains(*v)).collect();
+        assert!(
+            unclassified.is_empty(),
+            "every advertised verb must be classified as a store mutator or read-only here \
+             (a new verb defaults to lock-free, which is the dangerous direction): \
+             {unclassified:?}"
+        );
+    }
+
+    /// The bundled seed is a BOOTSTRAP source and nothing else (§9.1) — the
+    /// premise both 2026-07-30 teeth rest on. A populated store must never
+    /// re-arm the chain: that is what kept sealed pins from rolling installed
+    /// builds backwards on the unattended pass, and what keeps a seed-leg
+    /// success from standing in for a network answer once there is real state
+    /// to protect. Pinned here because the inline version of this rule shipped
+    /// twice with no test.
+    #[test]
+    fn the_seed_leg_joins_only_on_an_empty_store() {
+        let seed = std::path::PathBuf::from("/Applications/aterm.app/Contents/Resources/toolchain-seed");
+        assert_eq!(
+            seed_bootstrap_leg(Some(seed.clone()), true),
+            Some(seed.clone()),
+            "an empty store with a sealed seed is exactly the bootstrap case"
+        );
+        assert_eq!(
+            seed_bootstrap_leg(Some(seed), false),
+            None,
+            "a populated store must NOT re-arm the seed chain — the seed is never an \
+             update source (downgrade + cache-masking teeth, adversarial review 2026-07-30)"
+        );
+        // No seed sealed: network-only in both store states, never a chain over
+        // a path that does not exist.
+        assert_eq!(seed_bootstrap_leg(None, true), None);
+        assert_eq!(seed_bootstrap_leg(None, false), None);
+    }
+
+    /// ADOPTION is what keeps a user's toolchain the WHOLE toolchain as the suite grows
+    /// (§11): consent to a multi-GB download is asked once (`auto_install`), but a machine
+    /// that already runs the set gets newly-published members without being asked again.
+    /// The lifecycle is small enough to pin exactly, and getting it wrong is silent in both
+    /// directions — a missing marker decays the toolset, a sticky one reinstalls what the
+    /// user deliberately removed.
+    #[test]
+    fn adoption_is_recorded_by_the_whole_set_and_forgotten_by_uninstall() {
+        let dir = std::env::temp_dir().join(format!("atpkg-adopt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = crate::store::Layout {
+            prefix: dir.clone(),
+        };
+
+        // A fresh store has NOT adopted: the consent question is still open.
+        assert!(!adopted(&layout), "a fresh store has adopted nothing");
+
+        // A whole-set install records it, and is idempotent.
+        record_adoption(&layout);
+        assert!(adopted(&layout), "the whole-set install adopts");
+        let first = std::fs::read(layout.adopted()).unwrap();
+        record_adoption(&layout);
+        assert_eq!(
+            std::fs::read(layout.adopted()).unwrap(),
+            first,
+            "re-adopting rewrites nothing"
+        );
+
+        // The marker is 0600 like every other durable store file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(layout.adopted())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "adoption marker must be 0600");
+        }
+
+        // Adoption is the file's EXISTENCE — never a parsed value, so a garbled or
+        // truncated write can never read as some other answer.
+        std::fs::write(layout.adopted(), b"\0\0garbage").unwrap();
+        assert!(adopted(&layout), "existence is the whole predicate");
+
+        // Uninstall forgets it: set-completion must never undo an explicit removal.
+        clear_adoption(&layout);
+        assert!(!adopted(&layout), "uninstall opts out of set completion");
+        // Clearing what is already clear is not an error.
+        clear_adoption(&layout);
+        assert!(!adopted(&layout));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TARGETED removal must stick too. The resumable seed lane installs whatever
+    /// the store lacks, so without a per-program record `atpkg uninstall ny` came
+    /// back on the next launch — the manager undoing a deliberate act, which is the
+    /// single most infuriating thing a package manager can do. Asking for it back
+    /// lifts the record, so nobody has to learn a marker file exists.
+    #[test]
+    fn a_single_program_removal_is_not_undone_by_the_seed_lane() {
+        let dir = std::env::temp_dir().join(format!("atpkg-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = crate::store::Layout { prefix: dir.clone() };
+
+        assert!(removed_programs(&layout).is_empty());
+        record_removed(&layout, "ny");
+        record_removed(&layout, "clean");
+        record_removed(&layout, "ny"); // idempotent
+        let rm = removed_programs(&layout);
+        assert!(rm.contains("ny") && rm.contains("clean"), "{rm:?}");
+        assert_eq!(rm.len(), 2, "no duplicate from the repeat: {rm:?}");
+        // The comment header must never read as a program name.
+        assert!(!rm.iter().any(|p| p.starts_with('#')), "{rm:?}");
+
+        clear_removed(&layout, &["ny".to_string()]);
+        let rm = removed_programs(&layout);
+        assert!(!rm.contains("ny"), "an explicit install lifts just that one");
+        assert!(rm.contains("clean"), "and leaves the others alone");
+
+        clear_removed(&layout, &["clean".to_string()]);
+        assert!(
+            removed_programs(&layout).is_empty(),
+            "emptying the set removes the file rather than leaving a header behind"
+        );
+        assert!(!layout.removed().exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REMOVAL MUST STICK. The seed lane is resumable — it installs whatever the
+    /// store lacks, so an interrupted first run can finish later — and that same
+    /// property means it would happily reinstall everything `uninstall --all` just
+    /// removed, on the very next launch. The decline marker is what stops that, and
+    /// an explicit install is what lifts it. Both directions are pinned here because
+    /// getting either wrong is user-hostile in a way tests are the only defence
+    /// against: one way the manager fights the user, the other way a change of mind
+    /// requires deleting a file nobody documented.
+    #[test]
+    fn declining_the_toolset_survives_until_an_explicit_install() {
+        let dir = std::env::temp_dir().join(format!("atpkg-decline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layout = crate::store::Layout {
+            prefix: dir.clone(),
+        };
+
+        assert!(!declined(&layout), "a fresh store has declined nothing");
+        record_decline(&layout);
+        assert!(declined(&layout), "uninstall --all declines the toolset");
+        // Idempotent, and 0600 like every other durable marker.
+        record_decline(&layout);
+        assert!(declined(&layout));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(layout.declined())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "decline marker must be 0600");
+        }
+        // Existence is the predicate — never a parsed value.
+        std::fs::write(layout.declined(), b"\0garbage").unwrap();
+        assert!(declined(&layout));
+
+        clear_decline(&layout);
+        assert!(!declined(&layout), "an explicit install lifts the decline");
+        clear_decline(&layout); // clearing what is clear is not an error
+
+        // Decline and adoption are INDEPENDENT facts: declining must not read as
+        // adoption, or a removed toolset would still get set-completion.
+        record_decline(&layout);
+        assert!(!adopted(&layout), "declining is not adopting");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The PRODUCING half of the cross-crate seed-marker contract
+    /// (crates/aterm-gui `parse_seed_markers` is the consuming half, and its
+    /// own tests feed it strings it wrote itself — which is why the contract
+    /// broke undetected once already). These are the exact prefixes `cmd_seed`
+    /// and `announce_pending_seed` print; if either moves, the GUI's first-run
+    /// notice goes blind, so the literals are pinned on this side too.
+    #[test]
+    fn the_seed_marker_prefixes_are_the_ones_the_gui_parses() {
+        // Search PRODUCTION code only. The previous version searched the whole file,
+        // including this test — whose own array contains the very literals it looks
+        // for — so it matched itself and passed with every `println!` deleted. A
+        // test that cannot fail is worse than no test: it is a standing claim that
+        // the cross-crate contract is checked when nothing checks it.
+        let src = include_str!("cli.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            production.len() < src.len(),
+            "the test module must be excluded, or this test can match itself"
+        );
+        for marker in [
+            "atpkg: seed-installed: ",
+            "atpkg: seed-pending: ",
+            "atpkg: seed-unusable: ",
+            "atpkg: seed-failed: ",
+            "atpkg: seed-partial: ",
+        ] {
+            assert!(
+                production.contains(marker),
+                "the {marker:?} marker must be EMITTED by production code — \
+                 crates/aterm-gui's parse_seed_line strips exactly this prefix, and a \
+                 marker nothing prints leaves its announcement unanswered on screen"
+            );
+        }
+    }
+
+    /// THE CONSENT POLICY, as a table. Every consent regression this branch shipped
+    /// lived in this one boolean, and none of them had a test — reverting either
+    /// round-3 fix left the whole suite green, which is precisely why they shipped.
+    #[test]
+    fn set_completion_honours_decline_over_adoption_and_auto_install() {
+        // Nothing asked for: the default posture installs nothing over the network.
+        assert!(!should_complete_set(false, false, false));
+        // Adopted (installing aterm is wanting the toolset) ⇒ keep the set complete.
+        assert!(should_complete_set(false, true, false));
+        // The explicit network-consent switch also enables it.
+        assert!(should_complete_set(true, false, false));
+        // DECLINED outranks BOTH. Honouring a removal on the local lane while the
+        // 6-hour network pass quietly reinstalled the set made the decline work for
+        // exactly one launch.
+        assert!(
+            !should_complete_set(false, true, true),
+            "a declined machine must not be re-completed just because it once adopted"
+        );
+        assert!(
+            !should_complete_set(true, true, true),
+            "declining outranks the auto_install switch too — it is the later, more \
+             specific act"
+        );
+        assert!(!should_complete_set(true, false, true));
     }
 
     /// Read-only surfaces keep working WHILE a mutator holds the store lock — the

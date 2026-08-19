@@ -181,7 +181,7 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
     "    Cmd-S / Cmd-R     Emacs search forward / backward; repeat to navigate + wrap.\n",
     "    Cmd-,             Open the native Settings tab; Manual edits aterm.toml.\n",
-    "    Cmd-N             Open a new window (separate process).\n",
+    "    Cmd-N             Open a new window (same process, same sessions).\n",
     "    Cmd-T             Open a new tab (new shell, same window).\n",
     "    Cmd-W             Close the active tab; closing the last tab quits.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
@@ -200,7 +200,7 @@ const KEYS_HELP: &str = concat!(
     "                         Use Manual there for assisted aterm.toml editing.\n",
     "    Ctrl+Shift+A         About: name / version / build in a simple info dialog\n",
     "                         (OK, the close dot, or Esc closes). This IS the \"About\" menu.\n",
-    "    Ctrl+Shift+N         Open a new window (separate process).\n",
+    "    Ctrl+Shift+N         Open a new window (same process, same sessions).\n",
     "    Ctrl+Shift+T         Open a new tab (new shell, same window).\n",
     "    Ctrl+Shift+W         Close the active tab; closing the last tab quits.\n",
     "    Ctrl+Shift+Right/Left  Next / previous tab (or Ctrl+PgUp / Ctrl+PgDn).\n",
@@ -525,6 +525,9 @@ const STARTER_CONFIG: &str = "\
 #                                  #   (both loop gates are read at LAUNCH)
 # auto_install = false             # ALSO bootstrap-install missing default-set members —
 #                                  #   multi-GB consent; the Settings switch is the click
+# seed_install = true              # install the BUNDLED seed on first launch (batteries
+#                                  #   included — the bytes ship inside the app; false
+#                                  #   turns the first run into an announced offer)
 # account = \"alabsystems\"          # index owner; omit → the compiled default
 # channel = \"stable\"               # the pin set install/update/rollback resolve against
 # include = [\"ay\", \"ty\"]           # narrowing-only filters over the SIGNED index

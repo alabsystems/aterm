@@ -2,6 +2,8 @@
 // Copyright 2026 Andrew Yates
 //
 // TRAIL SYNTH — what the sound of typing costs (audit findings TS-1..TS-5).
+// (The `tone/` groups at the bottom of this file price TN-1, the typing-mood
+// classifier that steers the synth's melody tables — see their own header.)
 //
 // HONEST FRAMING, FIRST. This is the one aterm-effects engine that does NOT run
 // on the frame path. `TrailSynth::render` is ticked by AudioToolbox's own
@@ -182,14 +184,20 @@
 //     2.3 us/buffer (10 %) and the structurally-silent default's per-sample
 //     call+compare is necessarily well under that.
 
+use std::time::Duration;
+
 use aterm_effects::cursor_glow::GlowStyle;
-use aterm_effects::tone::Tone;
+use aterm_effects::tone::{
+    self, BUCKETS, MIN_NGRAMS, Tone, ToneModel, ToneScratch, for_each_ngram_bucket,
+};
 use aterm_effects::trail_sound::{
     BedVariant, CHANNELS, CelebrationGesture, SoundEvent, SoundGesture, SoundKind, SoundVoice,
     TrailSynth,
 };
+use criterion::measurement::WallTime;
 use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+    BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput, black_box, criterion_group,
+    criterion_main,
 };
 
 /// The host's stream rate (`aterm_gui::trail_audio::SAMPLE_RATE`).
@@ -1051,10 +1059,520 @@ fn trail_synth_push(c: &mut Criterion) {
     group.finish();
 }
 
+// ===========================================================================
+// tone/ — the typing-mood classifier (audit finding TN-1)
+// ===========================================================================
+//
+// A DIFFERENT THREAD, A DIFFERENT DEADLINE. Unlike everything above, the tone
+// classifier never touches the audio callback OR the frame path: it runs on
+// the winit KEY-PRESS thread. The host (`aterm_gui::tone_infer::ToneTracker`)
+// keeps a rolling window of the committed text before the caret — at most
+// BUF_CAP = 160 chars (`TONE_WINDOW_CAP` below) — and calls
+// `ToneModel::classify_opt` at most once per 6 keystrokes or once per 500 ms,
+// whichever opens first. SLOW TYPING THEREFORE INFERS ON EVERY KEYSTROKE, on
+// the input path whose latency budget is the sacred one. The in-crate
+// `classification_fits_the_line_budget` test pins a <100 us/line CEILING; a
+// ceiling proves "under 100 us", not "did my change make it faster", which is
+// what this group exists to answer. When tone inference is inactive
+// (`tone_melody` off, sound muted, no live audio host) the model is never
+// even loaded and none of this code runs — the truly-disabled path costs this
+// crate nothing, which is why the idle arm here is the ABSTENTION path (the
+// cheapest call a live tracker can make: a near-empty window right after
+// Enter), not a disabled engine.
+//
+// WHAT ONE INFERENCE IS. `classify_opt` -> `scores`, two halves:
+//   1. FEATURIZE — `for_each_ngram_bucket` FNV-hashes every 1/2/3-gram of the
+//      window (exactly 3*chars - 3 of them when no whitespace runs collapse)
+//      and, per n-gram, gathers a 32-float embedding row into the mean-pool
+//      sum. Cost scales with WINDOW LENGTH.
+//   2. CLASSIFY — a fixed 32x64 matmul + 64 tanh + 64x5 output + softmax.
+//      Cost is CONSTANT per call.
+// TN-1 lives entirely in half 2: the mean-pool normaliser `inv = 1/n` is
+// multiplied inside the 2048-iteration matmul instead of scaling the pooled
+// vector once, and the inner loop strides `w1` by 256 bytes so the 8 KB
+// matrix is walked 64 times scattered. Both halves of the audited fix are
+// bit-identical by construction (same operands, same order — the verdict is
+// an argmax over near-tied softmax scores, so bit identity is the acceptance
+// bar), which means the ONLY way to price the fix is a time A/B. That shapes
+// the workloads:
+//   * the fix must shift `classify/*` by the SAME ABSOLUTE amount at 6, 40
+//     and 160 chars — the matmul does not scale with the window, so a delta
+//     that grows with length is NOT TN-1's fix;
+//   * `classify/ascii_006` is the sharpest needle: at 6 chars the featurizer
+//     is 15 hashes and the fixed matmul dominates the call;
+//   * `featurize/*` times half 1's HASHING alone, so `classify - featurize`
+//     at equal length is the gather + matmul + softmax term the fix lands in.
+//     (The featurize body keeps the bucket values live through an XOR fold —
+//     an EMPTY closure would let the optimiser delete the very masking/
+//     hashing being timed, since the returned count alone needs neither. It
+//     still understates production featurization, which also gathers 32
+//     floats per n-gram; that gather is deliberately left on the classify
+//     side of the split.)
+//
+// WHY ASCII AND CJK BOTH. Equal CHAR counts give equal N-GRAM counts by
+// construction (the featurizer is script-agnostic — that is its whole design
+// point), so the ascii/cjk pair at the same length isolates embedding-gather
+// cache behaviour (CJK unigrams scatter across different rows of the 256 KB
+// dequantized embedding table) from featurization cost. `mixed_160` is the
+// shape the budget test uses — prose + CJK + a shell command — the realistic
+// worst window. The `_160` workloads sit AT the host's window cap:
+// production cannot hand this code a longer input, so there is no bigger
+// state to price.
+//
+// GUARDS, TWO-SIDED BY CONSTRUCTION. The classifier is a pure function of
+// (frozen text, frozen weights) — no clock, no rng, no allocation — so the
+// guards pin EXACT values rather than envelopes: the n-gram count must equal
+// 3*chars - 3 exactly (the bench texts contain no whitespace runs, and a
+// drift here is a FEATURIZATION change, which would silently invalidate the
+// shipped weights — training and inference share this exact function), the
+// distinct-bucket count is pinned exactly, the argmax verdict is pinned
+// exactly, and the softmax must be a genuine distribution (sum ~ 1, every
+// class > 0, top strictly between uniform 0.2 and 1.0). An empty or
+// degenerate input cannot pass: it produces `None` and fails every
+// Some-shaped guard, and the abstain arms assert the mirror image (exact
+// count BELOW the evidence floor, `None`, and the neutral fold). Determinism
+// itself is CHECKED (two runs, bit-compared), which is what licenses the
+// resident-scratch `b.iter` loop — production reuses one `ToneScratch`
+// forever, and so does the timed body.
+//
+// EMITTED VOLUME: the hashed n-gram count per window is this classifier's
+// volume, recorded in `tone_volume` as counts-as-nanoseconds (the
+// cursor_glow_volume idiom: 1 ns == 1 n-gram) so a featurization change
+// lands in criterion's baseline/A-B machinery instead of only this file's
+// asserts.
+//
+// FIRST RUN, for orientation only — re-measure, never cite these (Apple M5
+// Max, macOS 26.5, `--warm-up-time 1 --measurement-time 2`, other builds
+// sharing the machine; time per INFERENCE):
+//   abstain/empty 3.3 ns   abstain/thin 25.4 ns
+//   classify ascii 6/40/160 chars: 1.18 / 2.13 / 4.57 us
+//   classify cjk   6/40/160 chars: 1.18 / 2.05 / 4.83 us   mixed_160 4.82 us
+//   featurize ascii_160 394 ns    featurize cjk_160 678 ns
+// Reading those against TN-1: the classify-over-length line has a ~1.04 us
+// intercept (ascii slope ~22 ns/char over 6..160), and intercept ~= the
+// fixed matmul + softmax half — i.e. the term TN-1's fix must move, ~88 % of
+// a 6-char call and ~23 % of a cap-length one. `classify - featurize` at 160
+// chars (4.57 - 0.39 = 4.18 us ascii) is gather + matmul + softmax; the
+// hash-only featurize half is ~0.8 ns/n-gram ascii, ~1.4 cjk (multi-byte
+// folds). The worst production window costs ~4.9 us — 20x inside the 100 us
+// contract — so TN-1 stays impact-low exactly as audited; this group's job
+// is to make its bit-identical fix PRICEABLE, and to catch the day an
+// innocent-looking model change stops being cheap.
+
+/// `aterm_gui::tone_infer::BUF_CAP`, mirrored (it is private to the host, and
+/// widening a host's visibility to bench a callee is backwards): the rolling
+/// char window the tracker classifies is never longer than this, so the
+/// `_160` workloads sit AT the production input cap.
+const TONE_WINDOW_CAP: usize = 160;
+
+/// ASCII prose, >= `TONE_WINDOW_CAP` chars, SINGLE spaces only — a
+/// whitespace run collapses inside the featurizer and would silently shrink
+/// the n-gram count the guards pin (the count guard fails loudly if this
+/// stops being true). The register is deliberately the loud Frustrated
+/// surface the corpus trains on: an unambiguous line keeps the pinned
+/// verdict far from a coin flip.
+const TONE_ASCII: &str = "why does the build keep failing on me again ugh i swear i \
+     fixed this exact bug last week and now the linker is angry about something \
+     new every single time i touch it honestly";
+
+/// CJK text (Japanese + Chinese + a Korean laughter token), no whitespace at
+/// all: same char counts as the ASCII texts, so identical n-gram counts with
+/// a completely different embedding-row access pattern.
+const TONE_CJK: &str = "なんでまた壊れたの今日はとてもいい天気ですね太棒了我们成功了そ\
+     れはいいですねゆっくりで大丈夫です为什么又坏了ㅋㅋㅋㅋ너무웃겨ビルドがまた失敗し\
+     て本当に困っています今度こそ直したと思ったのにリンカがまた怒っている毎回同じエラ\
+     ーで嫌になるでも諦めないで頑張りましょう成功するまで何度でも試すつもりです応援し\
+     ていますありがとうございました";
+
+/// The budget test's shape, extended past the window cap: multilingual prose
+/// with a shell command in the middle — the realistic worst window.
+const TONE_MIXED: &str = "why does the build break every time i touch this file \
+     为什么又坏了 なんでまた壊れたの systemctl restart nginx --now ok let me try \
+     again 다시 해볼게요 git rebase --continue && cargo test --workspace \
+     ちょっと待ってね done";
+
+/// What a tone workload must prove about its classification output before it
+/// may be timed.
+#[derive(Clone, Copy)]
+enum ToneExpect {
+    /// Below [`MIN_NGRAMS`] the model must return `None` (and `classify`
+    /// folds to the neutral Technical). The cheap path a real host hits right
+    /// after Enter clears the window.
+    Abstain,
+    /// The exact argmax verdict of the shipped weights on this frozen text.
+    /// Pinned, not ranged: inference is bit-deterministic, so a moved verdict
+    /// is a changed model or featurizer, never noise — and the in-crate
+    /// conformance tests already pin verdicts this way.
+    Classified(Tone),
+}
+
+#[derive(Clone)]
+struct ToneWorkload {
+    /// "abstain" | "classify" | "featurize" — also selects the timed body.
+    kind: &'static str,
+    param: &'static str,
+    text: String,
+    /// Effective chars (== chars handed in: the texts have no whitespace
+    /// runs, and the exact-count guard fails if that drifts).
+    chars: usize,
+    /// Exact distinct-bucket count over the window, pinned because both the
+    /// featurizer and the text are frozen: the hash constants ARE the trained
+    /// weights' view of text, so a drift here invalidates the model asset —
+    /// exactly the change this pin exists to catch.
+    distinct: usize,
+    expect: ToneExpect,
+}
+
+/// First `n` chars of `base` — the texts are real prose truncated, never
+/// cycled (cycling repeats n-grams and flatters the embedding-gather cache).
+fn tone_take(base: &str, n: usize) -> String {
+    assert!(
+        base.chars().count() >= n,
+        "tone bench text is only {} chars, need {n}",
+        base.chars().count()
+    );
+    base.chars().take(n).collect()
+}
+
+fn tone_workloads() -> Vec<ToneWorkload> {
+    let mut out = Vec::new();
+    // The idle/trivial arms: what the tracker pays when the window carries no
+    // evidence. `empty` is the just-cleared window (zero n-grams — the
+    // featurizer sees no chars at all); `thin` is two typed chars (3 n-grams,
+    // REAL hashing, still below the MIN_NGRAMS = 6 evidence floor). Both must
+    // abstain; `thin` proves the floor is what stops them, not an accidental
+    // empty input.
+    out.push(ToneWorkload {
+        kind: "abstain",
+        param: "empty",
+        text: String::new(),
+        chars: 0,
+        distinct: 0,
+        expect: ToneExpect::Abstain,
+    });
+    out.push(ToneWorkload {
+        kind: "abstain",
+        param: "thin",
+        text: "ok".into(),
+        chars: 2,
+        distinct: 3,
+        expect: ToneExpect::Abstain,
+    });
+    // The classify sweep: 6 chars (the smallest window past the evidence
+    // floor for full words), 40 (a typical part-line), 160 (the host cap).
+    // Verdicts and distinct-bucket counts are the measured values of the
+    // shipped weights on these frozen texts — see the guard docs for why
+    // exact pins are correct here.
+    // ("why do" reading as Excited is a fact about the shipped weights, not a
+    // claim this file makes about six chars of text — the pin only has to be
+    // STABLE, and bit-determinism makes it so.)
+    let sweep: [(&'static str, &'static str, usize, Tone, usize); 7] = [
+        ("ascii_006", TONE_ASCII, 6, Tone::Excited, 15),
+        ("ascii_040", TONE_ASCII, 40, Tone::Frustrated, 92),
+        ("ascii_160", TONE_ASCII, TONE_WINDOW_CAP, Tone::Frustrated, 242),
+        ("cjk_006", TONE_CJK, 6, Tone::Frustrated, 14),
+        ("cjk_040", TONE_CJK, 40, Tone::Frustrated, 99),
+        ("cjk_160", TONE_CJK, TONE_WINDOW_CAP, Tone::Frustrated, 342),
+        ("mixed_160", TONE_MIXED, TONE_WINDOW_CAP, Tone::Technical, 301),
+    ];
+    for (param, base, n, want, distinct) in sweep {
+        out.push(ToneWorkload {
+            kind: "classify",
+            param,
+            text: tone_take(base, n),
+            chars: n,
+            distinct,
+            expect: ToneExpect::Classified(want),
+        });
+    }
+    // The featurize halves of the two cap-length scripts, sharing text and
+    // pins with their classify twins so the subtraction is exact.
+    for param in ["ascii_160", "cjk_160"] {
+        let twin = out
+            .iter()
+            .find(|w| w.kind == "classify" && w.param == param)
+            .expect("featurize twins mirror classify workloads")
+            .clone();
+        out.push(ToneWorkload {
+            kind: "featurize",
+            ..twin
+        });
+    }
+    out
+}
+
+/// Everything one workload's run showed — gathered for ALL workloads first,
+/// printed as a table, and only then asserted, so a broken pin still prints
+/// the full evidence it should be corrected from.
+struct ToneEvidence {
+    ngrams: usize,
+    distinct: usize,
+    /// Two full `scores` runs were bit-identical.
+    deterministic: bool,
+    verdict: Option<Tone>,
+    sum: f32,
+    top: f32,
+    min: f32,
+    checksum: u64,
+}
+
+fn observe_tone(w: &ToneWorkload, m: &ToneModel) -> ToneEvidence {
+    let mut seen = vec![false; BUCKETS];
+    let mut distinct = 0usize;
+    let ngrams = for_each_ngram_bucket(&w.text, |b| {
+        if !seen[b] {
+            seen[b] = true;
+            distinct += 1;
+        }
+    });
+    let mut s1 = ToneScratch::default();
+    let mut s2 = ToneScratch::default();
+    let a = m.scores(&w.text, &mut s1);
+    let b = m.scores(&w.text, &mut s2);
+    let deterministic = match (&a, &b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => x.iter().zip(y.iter()).all(|(p, q)| p.to_bits() == q.to_bits()),
+        _ => false,
+    };
+    let verdict = m.classify_opt(&w.text, &mut s1);
+    let (sum, top, min, cks) = match a {
+        Some(sc) => (
+            sc.iter().sum::<f32>(),
+            sc.iter().fold(0.0f32, |acc, &x| acc.max(x)),
+            sc.iter().fold(f32::MAX, |acc, &x| acc.min(x)),
+            checksum(&sc),
+        ),
+        None => (0.0, 0.0, 0.0, 0),
+    };
+    ToneEvidence {
+        ngrams,
+        distinct,
+        deterministic,
+        verdict,
+        sum,
+        top,
+        min,
+        checksum: cks,
+    }
+}
+
+/// Prove the workload reaches the code it claims — the featurizer really
+/// hashed, the matmul really ran (or provably did not, for the abstain arms)
+/// — before a nanosecond is timed.
+fn verify_tone_reaches_target(w: &ToneWorkload, e: &ToneEvidence) {
+    // Exact from BOTH sides: 3*chars - 3 n-grams, no more, no fewer. An empty
+    // input yields 0 and cannot impersonate a real window; a featurization
+    // change (new order, changed folding) moves the count and fails here.
+    let expected = if w.chars == 0 { 0 } else { 3 * w.chars - 3 };
+    assert_eq!(
+        e.ngrams, expected,
+        "tone {}/{}: {} n-grams from {} chars, expected exactly {expected} — \
+         either the text grew a whitespace run or the featurizer changed shape \
+         (which would invalidate the shipped weights)",
+        w.kind, w.param, e.ngrams, w.chars
+    );
+    assert_eq!(
+        e.distinct, w.distinct,
+        "tone {}/{}: {} distinct buckets, pinned {} — the FNV stream moved, \
+         which is a featurization change, not noise",
+        w.kind, w.param, e.distinct, w.distinct
+    );
+    assert!(
+        e.deterministic,
+        "tone {}/{}: two runs over the same text disagreed at the bit level — \
+         the purity that licenses the resident-scratch timing loop is gone",
+        w.kind, w.param
+    );
+    match w.expect {
+        ToneExpect::Abstain => {
+            assert!(
+                e.ngrams < MIN_NGRAMS,
+                "tone {}/{}: {} n-grams reaches the evidence floor ({MIN_NGRAMS}) \
+                 — this arm exists to time the abstention path and would be \
+                 timing a full inference under an idle arm's name",
+                w.kind, w.param, e.ngrams
+            );
+            assert_eq!(
+                e.verdict, None,
+                "tone {}/{}: the model spoke on evidence below the floor",
+                w.kind, w.param
+            );
+        }
+        ToneExpect::Classified(want) => {
+            assert!(
+                e.ngrams >= MIN_NGRAMS,
+                "tone {}/{}: only {} n-grams — below the evidence floor, so \
+                 `scores` would return None before the matmul this workload \
+                 exists to reach",
+                w.kind, w.param, e.ngrams
+            );
+            assert_eq!(
+                e.verdict,
+                Some(want),
+                "tone {}/{}: verdict moved off the pinned {want:?} — inference \
+                 is bit-deterministic, so this is a changed model/featurizer \
+                 (or a fix that was NOT the bit-identical one TN-1 requires)",
+                w.kind,
+                w.param
+            );
+            // A genuine distribution, bounded from BOTH sides: sum ~ 1 and
+            // min > 0 prove the softmax ran over finite logits; top > 0.2
+            // (uniform) proves a real preference — a degenerate all-equal
+            // output cannot pass; top < 1.0 proves no class underflowed to
+            // fake certainty.
+            assert!(
+                e.sum > 0.999 && e.sum < 1.001,
+                "tone {}/{}: softmax sum {} is not a distribution",
+                w.kind, w.param, e.sum
+            );
+            assert!(
+                e.top > 0.2 && e.top < 1.0,
+                "tone {}/{}: top score {} outside (0.2, 1.0) — uniform or \
+                 degenerate output",
+                w.kind, w.param, e.top
+            );
+            assert!(
+                e.min > 0.0,
+                "tone {}/{}: a class underflowed to exactly zero",
+                w.kind, w.param
+            );
+        }
+    }
+}
+
+/// Record a COUNT as a criterion measurement: the reported "time" in
+/// NANOSECONDS is the item count (1 ns == 1 hashed n-gram), so counts get
+/// baselines and regression verdicts exactly like timings. The idiom — spin
+/// loop and `k % 4` jitter included — is `cursor_glow_tick.rs`'s
+/// `bench_count`, where both non-ceremony parts are documented at length: the
+/// spin burns wall time proportional to `iters` so criterion's warm-up
+/// (which measures WALL time, not the returned sample) terminates, and the
+/// ~3 ns jitter spread over a whole sample keeps the distribution's variance
+/// non-zero so criterion's KDE plot does not divide by zero.
+fn tone_bench_count(g: &mut BenchmarkGroup<'_, WallTime>, id: &str, count: usize) {
+    assert!(
+        count > 0,
+        "{id}: a zero count cannot be recorded as a duration — only workloads \
+         with a proven positive n-gram count are recorded"
+    );
+    let n = count as u64;
+    let mut k = 0u64;
+    g.bench_function(BenchmarkId::from_parameter(id), |b| {
+        b.iter_custom(|iters| {
+            let mut spin = 0u64;
+            for i in 0..iters {
+                spin = spin.wrapping_add(black_box(i));
+            }
+            black_box(spin);
+            k = k.wrapping_add(1);
+            Duration::from_nanos(n.saturating_mul(iters).saturating_add(k % 4))
+        });
+    });
+}
+
+fn tone_model(c: &mut Criterion) {
+    let m = tone::builtin().expect("the shipped tone weight asset must verify");
+    let workloads = tone_workloads();
+    // PROVE FIRST, TIME SECOND — but gather ALL evidence before asserting any
+    // of it, so a broken pin prints the full table it should be corrected
+    // from instead of dying on the first row.
+    let rows: Vec<(&ToneWorkload, ToneEvidence)> = workloads
+        .iter()
+        .map(|w| (w, observe_tone(w, m)))
+        .collect();
+
+    println!(
+        "\nTONE — typing-mood classifier evidence (window chars -> hashed \
+         n-grams -> softmax verdict; the host window caps at \
+         {TONE_WINDOW_CAP} chars and infers at most once per 6 keys / 500 ms)\n\
+         {:<20} {:>5} {:>6} {:>8}  {:<10} {:>7} {:>9} {:>7}  checksum",
+        "workload", "chars", "ngrams", "distinct", "verdict", "top", "min", "sum"
+    );
+    for (w, e) in &rows {
+        println!(
+            "{:<20} {:>5} {:>6} {:>8}  {:<10} {:>7.4} {:>9.2e} {:>7.4}  {:016x}",
+            format!("{}/{}", w.kind, w.param),
+            w.chars,
+            e.ngrams,
+            e.distinct,
+            e.verdict.map_or("abstain", Tone::label),
+            e.top,
+            e.min,
+            e.sum,
+            e.checksum
+        );
+    }
+    println!();
+    for (w, e) in &rows {
+        verify_tone_reaches_target(w, e);
+    }
+
+    let mut group = c.benchmark_group("tone");
+    for (w, _) in &rows {
+        match w.kind {
+            // The abstain arms carry no throughput: the per-CALL time is the
+            // number (they run first, before any throughput is set on the
+            // group — group throughput is sticky across benches).
+            "abstain" => {
+                group.bench_function(BenchmarkId::new(w.kind, w.param), |b| {
+                    // Resident scratch, exactly as production: the tracker
+                    // owns one `ToneScratch` forever. Purity (checked above)
+                    // is what makes reuse sound.
+                    let mut scratch = ToneScratch::default();
+                    b.iter(|| black_box(m.classify_opt(black_box(w.text.as_str()), &mut scratch)));
+                });
+            }
+            "classify" => {
+                // elem/s == chars/s through the classifier; per-inference
+                // time is the printed number. Cadence context: at the host's
+                // throttle this runs at most ~12/s (6-key batches at fast
+                // typing) or once per keystroke at slow typing.
+                group.throughput(Throughput::Elements(w.chars as u64));
+                group.bench_function(BenchmarkId::new(w.kind, w.param), |b| {
+                    let mut scratch = ToneScratch::default();
+                    b.iter(|| black_box(m.classify_opt(black_box(w.text.as_str()), &mut scratch)));
+                });
+            }
+            "featurize" => {
+                group.throughput(Throughput::Elements(w.chars as u64));
+                group.bench_function(BenchmarkId::new(w.kind, w.param), |b| {
+                    b.iter(|| {
+                        // XOR-fold the buckets so the hash/mask cannot be
+                        // dead-code-eliminated under an ignored argument —
+                        // one register op per n-gram, noise against the FNV
+                        // folds being timed.
+                        let mut acc = 0usize;
+                        let n =
+                            for_each_ngram_bucket(black_box(w.text.as_str()), |bkt| acc ^= bkt);
+                        black_box((acc, n))
+                    });
+                });
+            }
+            other => unreachable!("unknown tone workload kind {other}"),
+        }
+    }
+    group.finish();
+
+    // The counts, as measurements — near-free to produce, so the group runs
+    // at criterion's floor. Featurize twins share their classify twin's text,
+    // so each unique window is recorded once.
+    let mut vol = c.benchmark_group("tone_volume");
+    vol.warm_up_time(Duration::from_millis(1))
+        .measurement_time(Duration::from_millis(10))
+        .sample_size(10);
+    for (w, e) in &rows {
+        if w.kind != "featurize" && e.ngrams > 0 {
+            tone_bench_count(&mut vol, &format!("ngrams/{}", w.param), e.ngrams);
+        }
+    }
+    vol.finish();
+}
+
 criterion_group!(
     benches,
     trail_synth_render,
     trail_synth_script,
-    trail_synth_push
+    trail_synth_push,
+    tone_model
 );
 criterion_main!(benches);

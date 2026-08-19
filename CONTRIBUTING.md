@@ -36,14 +36,11 @@ derived-model obligation is discharged in-process, so a stock clone verifies
 for real. Where the Trust tools add an analysis the in-process checker cannot
 express, that analysis is skipped on machines without them: the test still
 reports `ok`, and the reason is printed to stderr — run
-`cargo test -- --nocapture` to see it. A few certificate lanes instead fail
-outright without those tools and are not expected to pass on a stock clone.
+`cargo test -- --nocapture` to see it. Nothing here requires those tools to go
+green.
 
-Run the focused tests for every crate you change. A few test targets ship here
-but read internal proof packets and the changelog that the export omits — the
-`ay` certificate and bundle-hygiene tests in `aterm-spec`, and the changelog
-test in `aterm-release`; they fail on this tree and are not part of the
-contributor gate.
+Run the focused tests for every crate you change; they are expected to pass on
+a fresh clone of this tree.
 
 There is no hosted CI: nothing runs automatically on a pull request, so paste
 the output of the tests you ran into the description.

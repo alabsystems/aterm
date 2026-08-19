@@ -75,10 +75,18 @@ impl Toolchain {
         is_executable_file(&self.targo)
     }
 
-    /// A built Trust stage2 names its documentation driver `trustdoc`. Bound
-    /// through `RUSTDOC` for the test and doctest stages only; without it Cargo
-    /// keeps its normal rustdoc discovery and any inability to run doctests
-    /// remains a real gate failure rather than a skip.
+    /// A built Trust stage2 names its documentation driver `trustdoc`. When an
+    /// EXECUTABLE one is there (a present file without an exec bit counts as
+    /// not there — it could not drive anything), the doc-running stages bind
+    /// it through `RUSTDOC`; otherwise cargo's own discovery decides — a caller-exported `RUSTDOC`/
+    /// `CARGO_BUILD_RUSTDOC` first, else the config's bare
+    /// `[build] rustdoc = "trustdoc"` resolved from the children's PATH (the
+    /// `~/.local/bin` farm link). Either of those still runs fail-closed with
+    /// real doctest verdicts; only when a doctest-compiling run has NOTHING to
+    /// exec does the test stage declare COULD-NOT-RUN up front
+    /// ([`Self::missing_trustdoc_label`]) and the later doc-running stages
+    /// skip pointing at it, instead of cargo dying at exec with a raw OS error
+    /// that names no remedy. The full rule lives in `stages::doc_driver`.
     #[must_use]
     pub fn have_trustdoc(&self) -> bool {
         is_executable_file(&self.trustdoc)
@@ -107,6 +115,26 @@ impl Toolchain {
         format!(
             "targo not found at {} (build the Trust stage2: python3 x.py build --stage 2 in $HOME/trust, or set TRUST_STAGE2_BIN)",
             self.targo.display()
+        )
+    }
+
+    /// The diagnostic for a doc-running stage that cannot start: no `trustdoc`
+    /// in the stage2, no caller-exported `RUSTDOC`, and no bare `trustdoc` on
+    /// the children's PATH, so cargo's `[build] rustdoc = "trustdoc"`
+    /// (.cargo/config.toml) has nothing to exec. The one remedy that works
+    /// from THIS state is rebuilding the stage2 — a farm link needs a stage2
+    /// trustdoc to point at, so `cargo ship provision` can only link
+    /// `~/.local/bin/trustdoc` (for direct cargo runs) once the rebuild lands.
+    #[must_use]
+    pub fn missing_trustdoc_label(&self) -> String {
+        format!(
+            "no doc driver: {} is not an executable doc driver and no `trustdoc` \
+             resolves on PATH, so cargo's [build] rustdoc = \"trustdoc\" \
+             (.cargo/config.toml) has nothing to exec for the doctest lane. Rebuild the \
+             stage2 so it carries trustdoc (python3 x.py build --stage 2 in $HOME/trust, or \
+             `atpkg install trust`) — the gate then binds it directly, and `cargo ship \
+             provision` can link ~/.local/bin/trustdoc for direct cargo runs",
+            self.trustdoc.display()
         )
     }
 
@@ -143,6 +171,15 @@ mod tests {
         );
         assert!(!t.have_targo());
         assert!(t.tippy.is_none());
+    }
+
+    #[test]
+    fn the_missing_trustdoc_diagnosis_names_the_config_key_and_both_remedies() {
+        let t = Toolchain::discover(None, Path::new("/nonexistent-home"));
+        let label = t.missing_trustdoc_label();
+        assert!(label.contains("x.py build --stage 2"), "{label}");
+        assert!(label.contains("~/.local/bin/trustdoc"), "{label}");
+        assert!(label.contains(".cargo/config.toml"), "{label}");
     }
 
     #[test]
