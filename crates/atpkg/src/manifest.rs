@@ -98,8 +98,9 @@ pub struct Index {
     #[serde(default)]
     pub machine_id: Option<String>,
     /// The roster generation that authorized the machine which signed this index. Bound
-    /// to the roster actually used, so an old roster cannot be paired with a new index
-    /// (nor a new roster with an old index). Absent ⇒ [`crate::sig::Reject::SeqMismatch`].
+    /// to the roster actually used, so an old roster cannot be paired with a new index; a
+    /// NEWER roster with an older index is admitted (the roster travels on the channel
+    /// head). Absent ⇒ [`crate::sig::Reject::SeqMismatch`].
     #[serde(default)]
     pub roster_seq: Option<u64>,
     /// `[programs.<name>]` — the open-ended allow-list. The map key is the program name

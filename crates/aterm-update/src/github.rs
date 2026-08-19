@@ -4703,18 +4703,41 @@ mod tests {
 
     /// THE RATCHET AND THE BIND, on the transport path, under the new authority.
     ///
-    /// `roster_seq` appears in two documents and both must agree: the roster's own
-    /// generation, and the copy inside the signed appcast. A manifest that names a
-    /// DIFFERENT generation is refused after the parse — that is what stops an old roster
-    /// being paired with a new release. And the accepted generation must reach the caller,
-    /// or the durable floor never advances and the replay defence is inert.
+    /// `roster_seq` appears in two documents: the roster's own generation, and the copy
+    /// inside the signed appcast. The appcast may not claim a generation NEWER than the
+    /// roster that authorized it — that is what stops an old roster being paired with a
+    /// new release. It MAY claim an older one (2026-08-18): the roster travels as an
+    /// asset on the channel head, and a join attaches the new pair to releases attributed
+    /// under the previous generation — the steady state of a multi-machine channel, and
+    /// verifying under a newer roster is strictly stronger. And the accepted generation
+    /// must reach the caller, or the durable floor never advances and the replay defence
+    /// is inert.
     #[test]
     fn the_roster_generation_must_agree_between_the_roster_and_the_signed_manifest() {
         let m3_pub = pub_b64(&M3_SEED_FIXTURE);
         let keyset = [m3_pub.as_str()];
-        // The roster is at generation 6; the appcast claims 5 — inside its own signed
-        // bytes, so this is a genuine signature over a mismatched claim.
+        // The roster is at generation 6; the appcast claims 7 — inside its own signed
+        // bytes, so this is a genuine signature over a claim the roster cannot back:
+        // an OLD roster presented with a NEWER release.
         let lying = chain(
+            &[("m3", M3_SEED_FIXTURE)],
+            &[],
+            ("m3", M3_SEED_FIXTURE),
+            6,
+            &MASTER_SEED_FIXTURE,
+            7,
+        );
+        let masters = [lying.master_pub.as_str()];
+        let (refused, _) = run_chain(&lying, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(
+            refused.selected.is_none() && refused.manifest_rejected,
+            "an appcast may not name a roster generation newer than the one that \
+             authorized it"
+        );
+        // The roster is at generation 6; the appcast was attributed under 5 — a release
+        // published before a join, now carrying the newer pair: ADMITTED, and the floor
+        // ratchets to the roster's generation (6), not the manifest's.
+        let redressed = chain(
             &[("m3", M3_SEED_FIXTURE)],
             &[],
             ("m3", M3_SEED_FIXTURE),
@@ -4722,13 +4745,12 @@ mod tests {
             &MASTER_SEED_FIXTURE,
             5,
         );
-        let masters = [lying.master_pub.as_str()];
-        let (refused, _) = run_chain(&lying, &keyset, &masters, 0, ROSTER_NOW);
+        let (admitted, _) = run_chain(&redressed, &keyset, &masters, 0, ROSTER_NOW);
         assert!(
-            refused.selected.is_none() && refused.manifest_rejected,
-            "an appcast may not name a roster generation other than the one that \
-             authorized it"
+            admitted.selected.is_some(),
+            "a newer roster paired with an older release is the post-join steady state"
         );
+        assert_eq!(admitted.observed_roster_seq, Some(6));
 
         // Truthful, same everything else: accepted, and the generation is handed back for
         // the durable floor to ratchet.

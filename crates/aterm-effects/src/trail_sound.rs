@@ -51,8 +51,16 @@
 //!   future data-driven Trail-Pack palette is still one `Palette` impl away —
 //!   `Voice`/`Partial` prototypes are plain-old-data `Copy` structs, so a
 //!   table-driven implementor can spawn them without touching this seam. The
-//!   nine shipped palettes are pinned byte-identical to their pre-framework
-//!   (v0.56) rendering by the `v056_reference` proofs below.
+//!   nine shipped palettes are pinned to their pre-framework (v0.56) rendering
+//!   by the `v056_reference` proofs below — as of the transcendental rewrite,
+//!   to within `V056_TOLERANCE` rather than bit-for-bit. See that constant:
+//!   the per-sample envelopes and oscillators no longer call `exp`/`sin` per
+//!   sample, so the last bits move, and the proofs assert an audibly-inaudible
+//!   bound (measured peak 0.38 of a 16-bit quantization step) instead of
+//!   equality. Every claim of "bit-identical" elsewhere in this file that is
+//!   about a PRIOR BUILD of the audio is to be read against that bound; the
+//!   claims about run-to-run DETERMINISM (same seed and script ⇒ same output)
+//!   remain exact, because nothing here became nondeterministic.
 //! - **Kind-level gestures.** Gestures whose sound is style-agnostic (the
 //!   Kill swoosh, the curse-word Bonk, the cursor MOTIONS) are designed ONCE
 //!   before palette dispatch, tinted at most by a per-palette register
@@ -855,6 +863,14 @@ const LAND_STAR_DEGREE_STEP: i32 = 2;
 const BONK_DUCK_DEPTH: f32 = 0.55;
 const BONK_DUCK_TAU: f32 = 0.28;
 
+/// How many samples a geometric envelope/glide recursion may run before it is
+/// re-anchored to a real `exp`. 256 samples is ~5.3 ms at 48 kHz, so a voice
+/// pays one exponential per recursion per 5 ms instead of one per sample —
+/// keeping essentially all of the win — while bounding f32 drift to what
+/// compounds over 256 multiplies rather than over a whole note.
+const ENV_REANCHOR: u32 = 64;
+
+
 /// One celebration riff bar in seconds — 4 beats at the sing-along's
 /// 150 BPM. Pinned equal to the VISUAL clock's `kitty_sing::SING_BAR_SECONDS`
 /// by `celebration_bar_matches_the_visual_clock`, so the host can schedule
@@ -1225,6 +1241,16 @@ struct Partial {
     wave: Wave,
     ph: f32,
     fm_ph: f32,
+    /// GEOMETRIC GLIDE / FM-INDEX STATE. `g_e` is the running `e^(-t/glide)`
+    /// and `fm_e` the running `e^(-t/fm_tau)`; `k_g`/`k_f` are their constant
+    /// per-sample steps `e^(-dt/τ)`, computed once in `TrailSynth::spawn`.
+    /// Both running values are SEEDED with a real `exp` at the voice's first
+    /// sounding sample and stepped by one multiply thereafter — see the note
+    /// on `Voice::env_run`.
+    g_e: f32,
+    k_g: f32,
+    fm_e: f32,
+    k_f: f32,
 }
 
 /// A live voice: up to three partials + one band-passed noise burst through a
@@ -1254,6 +1280,33 @@ struct Voice {
     n_q: f32,
     n_lp: f32,
     n_bp: f32,
+    /// GEOMETRIC ENVELOPE / NOISE-GLIDE STATE: the running `e^(-t/attack)`,
+    /// `e^(-t/decay)` and `e^(-t/n_glide)`, with their constant per-sample
+    /// steps `e^(-dt/τ)` from `TrailSynth::spawn`. `attack`/`decay`/`n_f0`/
+    /// `n_f1` themselves are left untouched — they are the voice's DESIGN and
+    /// several tests read them back after `push`.
+    env_a: f32,
+    env_d: f32,
+    k_a: f32,
+    k_d: f32,
+    n_e: f32,
+    k_n: f32,
+    /// False until the voice's FIRST SOUNDING sample, where every recursion
+    /// above is seeded from a real `exp` at that exact `t`. It cannot be
+    /// seeded in `spawn`: a pre-delayed voice starts at `t = -delay`, and
+    /// when `t` finally crosses zero it is NOT a multiple of `dt`, so the
+    /// sequence has to start from wherever the crossing landed.
+    env_run: bool,
+    /// Samples since the recursions above were last anchored to a real `exp`.
+    ///
+    /// A geometric recursion is exact in the reals but DRIFTS in f32: each step
+    /// carries a rounding error and they compound. Measured against the v0.56
+    /// oracle, seeding once per note and multiplying for the rest of an 8 s
+    /// ring-out reached a peak deviation of 7.0e-4 — 23 times a 16-bit
+    /// quantization step, at -63 dBFS, which is NOT inaudible. Re-anchoring
+    /// every [`ENV_REANCHOR`] samples bounds the compounding to that window
+    /// while still replacing all but one exponential in it.
+    env_n: u32,
     /// Amplitude twinkle (sparkle/comet glitter): depth 0..1 at `tw_rate` Hz,
     /// phase-jittered per voice so clusters shimmer instead of pulsing.
     tw_rate: f32,
@@ -1534,7 +1587,9 @@ pub struct TrailSynth {
     /// between bars), then exponential handback (τ [`SING_DUCK_TAU`]) once
     /// bars stop — the audio wind-down. Applied beside `duck` as one more
     /// `1 − DEPTH · sing` factor: exactly ×1.0 while at rest, so every
-    /// pinned path (v056 references, brrrring, bonk) renders bit-identical.
+    /// pinned path (v056 references, brrrring, bonk) is left exactly ×1.0 —
+    /// this factor introduces no drift of its own (see `V056_TOLERANCE` for
+    /// the drift the transcendental rewrite does introduce).
     sing: f32,
     /// THE SONG'S KEY, borrowed by the TYPING (owner, 2026-08-04: "more musical
     /// in kitty rainbow").
@@ -2068,8 +2123,36 @@ impl TrailSynth {
         v.gl = gain * a.cos();
         v.gr = gain * a.sin();
         v.tw_ph = self.rnd();
+        // GEOMETRIC STEPS. Every exponential in the sample loop is evaluated
+        // from `v.t`, which advances by a constant `dt`, so each one is
+        // `E_{n+1} = E_n · e^(-dt/τ)`: one multiply per sample instead of a
+        // scalar libm call. The steps depend only on the voice's time
+        // constants and on `inv_sr` (written once in `new`), so they are
+        // computable here — AFTER the tone-feel multiplies above, which move
+        // `decay`. `env_run` false means "not yet seeded"; the seed happens
+        // at the first sounding sample, not here.
+        let dt = self.inv_sr;
+        v.k_a = (-dt / v.attack.max(2e-4)).exp();
+        v.k_d = (-dt / v.decay.max(1e-3)).exp();
+        v.k_n = if v.n_glide > 0.0 {
+            (-dt / v.n_glide).exp()
+        } else {
+            1.0
+        };
+        v.env_run = false;
+        v.env_n = 0;
         for part in &mut v.p {
             part.ph = self.rnd();
+            part.k_g = if part.glide > 0.0 {
+                (-dt / part.glide).exp()
+            } else {
+                1.0
+            };
+            part.k_f = if part.fm_ratio > 0.0 {
+                (-dt / part.fm_tau.max(1e-3)).exp()
+            } else {
+                1.0
+            };
         }
         v.lp = 0.0;
         v.n_lp = 0.0;
@@ -2739,13 +2822,32 @@ impl TrailSynth {
                     v.on = false;
                     continue;
                 }
+                // GEOMETRIC RECURSIONS, seeded on the first sounding sample.
+                // `v.t`, `v.dur` and every phase accumulator are untouched, so
+                // onset, lifetime, tuning and phase are exactly as before;
+                // only the exponentials' last bits move.
+                // Re-anchor on the first sounding sample AND every
+                // `ENV_REANCHOR` samples after it. One flag drives all five
+                // recursions below, so they re-anchor together and stay
+                // mutually consistent.
+                let seed = !v.env_run || v.env_n >= ENV_REANCHOR;
+                if seed {
+                    v.env_n = 0;
+                } else {
+                    v.env_n += 1;
+                }
                 let mut s = 0.0f32;
                 for p in &mut v.p {
                     if p.lvl <= 0.0 {
                         continue;
                     }
                     let freq = if p.glide > 0.0 {
-                        p.f1 + (p.f0 - p.f1) * (-v.t / p.glide).exp()
+                        p.g_e = if seed {
+                            (-v.t / p.glide).exp()
+                        } else {
+                            p.g_e * p.k_g
+                        };
+                        p.f1 + (p.f0 - p.f1) * p.g_e
                     } else {
                         p.f0
                     };
@@ -2755,7 +2857,12 @@ impl TrailSynth {
                         Wave::Sine => {
                             if p.fm_ratio > 0.0 {
                                 p.fm_ph = (p.fm_ph + freq * p.fm_ratio * dt).fract();
-                                let idx = p.fm_i0 * (-v.t / p.fm_tau.max(1e-3)).exp();
+                                p.fm_e = if seed {
+                                    (-v.t / p.fm_tau.max(1e-3)).exp()
+                                } else {
+                                    p.fm_e * p.k_f
+                                };
+                                let idx = p.fm_i0 * p.fm_e;
                                 sin01(p.ph + idx * sin01(p.fm_ph) * 0.159_154_94)
                             } else {
                                 sin01(p.ph)
@@ -2782,7 +2889,12 @@ impl TrailSynth {
                         (x >> 8) as f32 * (2.0 / 16_777_216.0) - 1.0
                     };
                     let fc = if v.n_glide > 0.0 {
-                        v.n_f1 + (v.n_f0 - v.n_f1) * (-v.t / v.n_glide).exp()
+                        v.n_e = if seed {
+                            (-v.t / v.n_glide).exp()
+                        } else {
+                            v.n_e * v.k_n
+                        };
+                        v.n_f1 + (v.n_f0 - v.n_f1) * v.n_e
                     } else {
                         v.n_f0
                     };
@@ -2793,9 +2905,19 @@ impl TrailSynth {
                     v.n_lp += g_svf * v.n_bp;
                     s += v.n_lvl * v.n_bp;
                 }
-                // Envelope + twinkle + release guard.
-                let mut env =
-                    (1.0 - (-v.t / v.attack.max(2e-4)).exp()) * (-v.t / v.decay.max(1e-3)).exp();
+                // Envelope + twinkle + release guard. Both exponentials step
+                // geometrically; the envelope's SHAPE, the 5 ms release ramp
+                // and the voice's hard lifetime are unchanged, since `v.t` and
+                // `v.dur` never moved.
+                if seed {
+                    v.env_a = (-v.t / v.attack.max(2e-4)).exp();
+                    v.env_d = (-v.t / v.decay.max(1e-3)).exp();
+                    v.env_run = true;
+                } else {
+                    v.env_a *= v.k_a;
+                    v.env_d *= v.k_d;
+                }
+                let mut env = (1.0 - v.env_a) * v.env_d;
                 if v.tw_depth > 0.0 {
                     v.tw_ph = (v.tw_ph + v.tw_rate * dt).fract();
                     env *= 1.0 - v.tw_depth * 0.5 * (1.0 + sin01(v.tw_ph));
@@ -2840,7 +2962,7 @@ impl TrailSynth {
             // Master duck: the melody + bed dip around a live bonk AND
             // under a live sing-along riff; each factor is exactly ×1.0 (and
             // the exempt sum exactly +0.0) while its envelope rests, so the
-            // default path is bit-identical to the pre-framework render
+            // default path adds nothing to the pre-framework render
             // (`a * 1.0 == a` for every finite f32 — the pinned proofs run
             // through this very multiply).
             let dmul = (1.0 - BONK_DUCK_DEPTH * self.duck) * (1.0 - SING_DUCK_DEPTH * self.sing);
@@ -5394,10 +5516,231 @@ impl Palette for FeltPalette {
     }
 }
 
-/// `sin(2π·ph)` for phase in turns.
+/// Sine-table resolution: 2^10 points over one turn. Each extra bit divides
+/// the interpolation error by four; this is the dial if the table is ever
+/// judged audible (see [`sin01`]).
+const SIN_TAB_BITS: u32 = 10;
+const SIN_TAB_LEN: usize = 1 << SIN_TAB_BITS;
+
+/// `sin(2π·i/1024)`, plus one wrap-around guard entry so the interpolation
+/// never needs a second index wrap. 4 KB of `.rodata` — a fifth of the L1
+/// footprint the voice array alone already has.
+///
+/// (`approx_constant` fires on the quarter-turn entries, which really are
+/// `1/√2` — they are sine values, not a hand-typed constant; and
+/// `excessive_precision` on the shortest f32 round-trip forms.)
+#[rustfmt::skip]
+#[allow(clippy::approx_constant, clippy::excessive_precision)]
+static SIN_TAB: [f32; SIN_TAB_LEN + 1] = [
+    0.0, 0.0061358847, 0.012271538, 0.01840673, 0.024541229, 0.030674804,
+    0.036807224, 0.04293826, 0.049067676, 0.055195246, 0.061320737, 0.06744392,
+    0.07356457, 0.07968244, 0.08579731, 0.091908954, 0.09801714, 0.10412163,
+    0.110222206, 0.11631863, 0.12241068, 0.1284981, 0.1345807, 0.14065824,
+    0.14673047, 0.15279719, 0.15885815, 0.16491312, 0.17096189, 0.17700422,
+    0.18303989, 0.18906866, 0.19509032, 0.20110464, 0.20711137, 0.21311031,
+    0.21910124, 0.22508392, 0.2310581, 0.2370236, 0.24298018, 0.24892761,
+    0.25486565, 0.2607941, 0.26671275, 0.27262136, 0.2785197, 0.28440753,
+    0.29028466, 0.2961509, 0.30200595, 0.30784965, 0.31368175, 0.31950203,
+    0.3253103, 0.3311063, 0.33688986, 0.34266073, 0.34841868, 0.35416353,
+    0.35989505, 0.36561298, 0.3713172, 0.37700742, 0.38268343, 0.38834503,
+    0.39399204, 0.3996242, 0.4052413, 0.41084316, 0.41642955, 0.42200026,
+    0.42755508, 0.43309382, 0.43861625, 0.44412214, 0.44961134, 0.45508358,
+    0.46053872, 0.4659765, 0.47139674, 0.47679922, 0.48218378, 0.48755017,
+    0.4928982, 0.49822766, 0.50353837, 0.50883013, 0.51410276, 0.519356,
+    0.52458966, 0.52980363, 0.53499764, 0.54017144, 0.545325, 0.55045795,
+    0.55557024, 0.56066155, 0.5657318, 0.57078075, 0.57580817, 0.58081394,
+    0.58579785, 0.5907597, 0.5956993, 0.60061646, 0.60551107, 0.6103828,
+    0.6152316, 0.6200572, 0.6248595, 0.62963825, 0.6343933, 0.63912445,
+    0.64383155, 0.6485144, 0.65317285, 0.6578067, 0.6624158, 0.66699994,
+    0.671559, 0.6760927, 0.680601, 0.6850837, 0.68954057, 0.69397146,
+    0.69837624, 0.70275474, 0.70710677, 0.7114322, 0.71573085, 0.72000253,
+    0.7242471, 0.72846437, 0.7326543, 0.7368166, 0.7409511, 0.74505776,
+    0.7491364, 0.7531868, 0.7572088, 0.7612024, 0.76516724, 0.76910335,
+    0.77301043, 0.7768885, 0.7807372, 0.78455657, 0.7883464, 0.79210657,
+    0.7958369, 0.79953724, 0.8032075, 0.8068476, 0.81045717, 0.8140363,
+    0.8175848, 0.8211025, 0.8245893, 0.82804507, 0.8314696, 0.8348629,
+    0.8382247, 0.841555, 0.8448536, 0.84812033, 0.8513552, 0.854558,
+    0.8577286, 0.86086696, 0.86397284, 0.86704624, 0.87008697, 0.873095,
+    0.8760701, 0.8790122, 0.8819213, 0.8847971, 0.88763964, 0.89044875,
+    0.8932243, 0.89596623, 0.8986745, 0.9013488, 0.9039893, 0.9065957,
+    0.909168, 0.91170603, 0.9142098, 0.9166791, 0.9191139, 0.92151403,
+    0.9238795, 0.9262102, 0.9285061, 0.93076694, 0.9329928, 0.9351835,
+    0.937339, 0.9394592, 0.94154406, 0.94359344, 0.9456073, 0.9475856,
+    0.94952816, 0.951435, 0.953306, 0.9551412, 0.95694035, 0.95870346,
+    0.9604305, 0.9621214, 0.96377605, 0.96539444, 0.96697646, 0.9685221,
+    0.97003126, 0.9715039, 0.97293997, 0.97433937, 0.9757021, 0.97702813,
+    0.9783174, 0.9795698, 0.98078525, 0.9819639, 0.9831055, 0.9842101,
+    0.98527765, 0.9863081, 0.9873014, 0.9882576, 0.9891765, 0.9900582,
+    0.99090266, 0.99170977, 0.99247956, 0.9932119, 0.993907, 0.9945646,
+    0.9951847, 0.9957674, 0.9963126, 0.9968203, 0.99729043, 0.99772304,
+    0.9981181, 0.99847555, 0.99879545, 0.99907774, 0.99932235, 0.9995294,
+    0.9996988, 0.9998306, 0.9999247, 0.99998116, 1.0, 0.99998116,
+    0.9999247, 0.9998306, 0.9996988, 0.9995294, 0.99932235, 0.99907774,
+    0.99879545, 0.99847555, 0.9981181, 0.99772304, 0.99729043, 0.9968203,
+    0.9963126, 0.9957674, 0.9951847, 0.9945646, 0.993907, 0.9932119,
+    0.99247956, 0.99170977, 0.99090266, 0.9900582, 0.9891765, 0.9882576,
+    0.9873014, 0.9863081, 0.98527765, 0.9842101, 0.9831055, 0.9819639,
+    0.98078525, 0.9795698, 0.9783174, 0.97702813, 0.9757021, 0.97433937,
+    0.97293997, 0.9715039, 0.97003126, 0.9685221, 0.96697646, 0.96539444,
+    0.96377605, 0.9621214, 0.9604305, 0.95870346, 0.95694035, 0.9551412,
+    0.953306, 0.951435, 0.94952816, 0.9475856, 0.9456073, 0.94359344,
+    0.94154406, 0.9394592, 0.937339, 0.9351835, 0.9329928, 0.93076694,
+    0.9285061, 0.9262102, 0.9238795, 0.92151403, 0.9191139, 0.9166791,
+    0.9142098, 0.91170603, 0.909168, 0.9065957, 0.9039893, 0.9013488,
+    0.8986745, 0.89596623, 0.8932243, 0.89044875, 0.88763964, 0.8847971,
+    0.8819213, 0.8790122, 0.8760701, 0.873095, 0.87008697, 0.86704624,
+    0.86397284, 0.86086696, 0.8577286, 0.854558, 0.8513552, 0.84812033,
+    0.8448536, 0.841555, 0.8382247, 0.8348629, 0.8314696, 0.82804507,
+    0.8245893, 0.8211025, 0.8175848, 0.8140363, 0.81045717, 0.8068476,
+    0.8032075, 0.79953724, 0.7958369, 0.79210657, 0.7883464, 0.78455657,
+    0.7807372, 0.7768885, 0.77301043, 0.76910335, 0.76516724, 0.7612024,
+    0.7572088, 0.7531868, 0.7491364, 0.74505776, 0.7409511, 0.7368166,
+    0.7326543, 0.72846437, 0.7242471, 0.72000253, 0.71573085, 0.7114322,
+    0.70710677, 0.70275474, 0.69837624, 0.69397146, 0.68954057, 0.6850837,
+    0.680601, 0.6760927, 0.671559, 0.66699994, 0.6624158, 0.6578067,
+    0.65317285, 0.6485144, 0.64383155, 0.63912445, 0.6343933, 0.62963825,
+    0.6248595, 0.6200572, 0.6152316, 0.6103828, 0.60551107, 0.60061646,
+    0.5956993, 0.5907597, 0.58579785, 0.58081394, 0.57580817, 0.57078075,
+    0.5657318, 0.56066155, 0.55557024, 0.55045795, 0.545325, 0.54017144,
+    0.53499764, 0.52980363, 0.52458966, 0.519356, 0.51410276, 0.50883013,
+    0.50353837, 0.49822766, 0.4928982, 0.48755017, 0.48218378, 0.47679922,
+    0.47139674, 0.4659765, 0.46053872, 0.45508358, 0.44961134, 0.44412214,
+    0.43861625, 0.43309382, 0.42755508, 0.42200026, 0.41642955, 0.41084316,
+    0.4052413, 0.3996242, 0.39399204, 0.38834503, 0.38268343, 0.37700742,
+    0.3713172, 0.36561298, 0.35989505, 0.35416353, 0.34841868, 0.34266073,
+    0.33688986, 0.3311063, 0.3253103, 0.31950203, 0.31368175, 0.30784965,
+    0.30200595, 0.2961509, 0.29028466, 0.28440753, 0.2785197, 0.27262136,
+    0.26671275, 0.2607941, 0.25486565, 0.24892761, 0.24298018, 0.2370236,
+    0.2310581, 0.22508392, 0.21910124, 0.21311031, 0.20711137, 0.20110464,
+    0.19509032, 0.18906866, 0.18303989, 0.17700422, 0.17096189, 0.16491312,
+    0.15885815, 0.15279719, 0.14673047, 0.14065824, 0.1345807, 0.1284981,
+    0.12241068, 0.11631863, 0.110222206, 0.10412163, 0.09801714, 0.091908954,
+    0.08579731, 0.07968244, 0.07356457, 0.06744392, 0.061320737, 0.055195246,
+    0.049067676, 0.04293826, 0.036807224, 0.030674804, 0.024541229, 0.01840673,
+    0.012271538, 0.0061358847, 0.0, -0.0061358847, -0.012271538, -0.01840673,
+    -0.024541229, -0.030674804, -0.036807224, -0.04293826, -0.049067676, -0.055195246,
+    -0.061320737, -0.06744392, -0.07356457, -0.07968244, -0.08579731, -0.091908954,
+    -0.09801714, -0.10412163, -0.110222206, -0.11631863, -0.12241068, -0.1284981,
+    -0.1345807, -0.14065824, -0.14673047, -0.15279719, -0.15885815, -0.16491312,
+    -0.17096189, -0.17700422, -0.18303989, -0.18906866, -0.19509032, -0.20110464,
+    -0.20711137, -0.21311031, -0.21910124, -0.22508392, -0.2310581, -0.2370236,
+    -0.24298018, -0.24892761, -0.25486565, -0.2607941, -0.26671275, -0.27262136,
+    -0.2785197, -0.28440753, -0.29028466, -0.2961509, -0.30200595, -0.30784965,
+    -0.31368175, -0.31950203, -0.3253103, -0.3311063, -0.33688986, -0.34266073,
+    -0.34841868, -0.35416353, -0.35989505, -0.36561298, -0.3713172, -0.37700742,
+    -0.38268343, -0.38834503, -0.39399204, -0.3996242, -0.4052413, -0.41084316,
+    -0.41642955, -0.42200026, -0.42755508, -0.43309382, -0.43861625, -0.44412214,
+    -0.44961134, -0.45508358, -0.46053872, -0.4659765, -0.47139674, -0.47679922,
+    -0.48218378, -0.48755017, -0.4928982, -0.49822766, -0.50353837, -0.50883013,
+    -0.51410276, -0.519356, -0.52458966, -0.52980363, -0.53499764, -0.54017144,
+    -0.545325, -0.55045795, -0.55557024, -0.56066155, -0.5657318, -0.57078075,
+    -0.57580817, -0.58081394, -0.58579785, -0.5907597, -0.5956993, -0.60061646,
+    -0.60551107, -0.6103828, -0.6152316, -0.6200572, -0.6248595, -0.62963825,
+    -0.6343933, -0.63912445, -0.64383155, -0.6485144, -0.65317285, -0.6578067,
+    -0.6624158, -0.66699994, -0.671559, -0.6760927, -0.680601, -0.6850837,
+    -0.68954057, -0.69397146, -0.69837624, -0.70275474, -0.70710677, -0.7114322,
+    -0.71573085, -0.72000253, -0.7242471, -0.72846437, -0.7326543, -0.7368166,
+    -0.7409511, -0.74505776, -0.7491364, -0.7531868, -0.7572088, -0.7612024,
+    -0.76516724, -0.76910335, -0.77301043, -0.7768885, -0.7807372, -0.78455657,
+    -0.7883464, -0.79210657, -0.7958369, -0.79953724, -0.8032075, -0.8068476,
+    -0.81045717, -0.8140363, -0.8175848, -0.8211025, -0.8245893, -0.82804507,
+    -0.8314696, -0.8348629, -0.8382247, -0.841555, -0.8448536, -0.84812033,
+    -0.8513552, -0.854558, -0.8577286, -0.86086696, -0.86397284, -0.86704624,
+    -0.87008697, -0.873095, -0.8760701, -0.8790122, -0.8819213, -0.8847971,
+    -0.88763964, -0.89044875, -0.8932243, -0.89596623, -0.8986745, -0.9013488,
+    -0.9039893, -0.9065957, -0.909168, -0.91170603, -0.9142098, -0.9166791,
+    -0.9191139, -0.92151403, -0.9238795, -0.9262102, -0.9285061, -0.93076694,
+    -0.9329928, -0.9351835, -0.937339, -0.9394592, -0.94154406, -0.94359344,
+    -0.9456073, -0.9475856, -0.94952816, -0.951435, -0.953306, -0.9551412,
+    -0.95694035, -0.95870346, -0.9604305, -0.9621214, -0.96377605, -0.96539444,
+    -0.96697646, -0.9685221, -0.97003126, -0.9715039, -0.97293997, -0.97433937,
+    -0.9757021, -0.97702813, -0.9783174, -0.9795698, -0.98078525, -0.9819639,
+    -0.9831055, -0.9842101, -0.98527765, -0.9863081, -0.9873014, -0.9882576,
+    -0.9891765, -0.9900582, -0.99090266, -0.99170977, -0.99247956, -0.9932119,
+    -0.993907, -0.9945646, -0.9951847, -0.9957674, -0.9963126, -0.9968203,
+    -0.99729043, -0.99772304, -0.9981181, -0.99847555, -0.99879545, -0.99907774,
+    -0.99932235, -0.9995294, -0.9996988, -0.9998306, -0.9999247, -0.99998116,
+    -1.0, -0.99998116, -0.9999247, -0.9998306, -0.9996988, -0.9995294,
+    -0.99932235, -0.99907774, -0.99879545, -0.99847555, -0.9981181, -0.99772304,
+    -0.99729043, -0.9968203, -0.9963126, -0.9957674, -0.9951847, -0.9945646,
+    -0.993907, -0.9932119, -0.99247956, -0.99170977, -0.99090266, -0.9900582,
+    -0.9891765, -0.9882576, -0.9873014, -0.9863081, -0.98527765, -0.9842101,
+    -0.9831055, -0.9819639, -0.98078525, -0.9795698, -0.9783174, -0.97702813,
+    -0.9757021, -0.97433937, -0.97293997, -0.9715039, -0.97003126, -0.9685221,
+    -0.96697646, -0.96539444, -0.96377605, -0.9621214, -0.9604305, -0.95870346,
+    -0.95694035, -0.9551412, -0.953306, -0.951435, -0.94952816, -0.9475856,
+    -0.9456073, -0.94359344, -0.94154406, -0.9394592, -0.937339, -0.9351835,
+    -0.9329928, -0.93076694, -0.9285061, -0.9262102, -0.9238795, -0.92151403,
+    -0.9191139, -0.9166791, -0.9142098, -0.91170603, -0.909168, -0.9065957,
+    -0.9039893, -0.9013488, -0.8986745, -0.89596623, -0.8932243, -0.89044875,
+    -0.88763964, -0.8847971, -0.8819213, -0.8790122, -0.8760701, -0.873095,
+    -0.87008697, -0.86704624, -0.86397284, -0.86086696, -0.8577286, -0.854558,
+    -0.8513552, -0.84812033, -0.8448536, -0.841555, -0.8382247, -0.8348629,
+    -0.8314696, -0.82804507, -0.8245893, -0.8211025, -0.8175848, -0.8140363,
+    -0.81045717, -0.8068476, -0.8032075, -0.79953724, -0.7958369, -0.79210657,
+    -0.7883464, -0.78455657, -0.7807372, -0.7768885, -0.77301043, -0.76910335,
+    -0.76516724, -0.7612024, -0.7572088, -0.7531868, -0.7491364, -0.74505776,
+    -0.7409511, -0.7368166, -0.7326543, -0.72846437, -0.7242471, -0.72000253,
+    -0.71573085, -0.7114322, -0.70710677, -0.70275474, -0.69837624, -0.69397146,
+    -0.68954057, -0.6850837, -0.680601, -0.6760927, -0.671559, -0.66699994,
+    -0.6624158, -0.6578067, -0.65317285, -0.6485144, -0.64383155, -0.63912445,
+    -0.6343933, -0.62963825, -0.6248595, -0.6200572, -0.6152316, -0.6103828,
+    -0.60551107, -0.60061646, -0.5956993, -0.5907597, -0.58579785, -0.58081394,
+    -0.57580817, -0.57078075, -0.5657318, -0.56066155, -0.55557024, -0.55045795,
+    -0.545325, -0.54017144, -0.53499764, -0.52980363, -0.52458966, -0.519356,
+    -0.51410276, -0.50883013, -0.50353837, -0.49822766, -0.4928982, -0.48755017,
+    -0.48218378, -0.47679922, -0.47139674, -0.4659765, -0.46053872, -0.45508358,
+    -0.44961134, -0.44412214, -0.43861625, -0.43309382, -0.42755508, -0.42200026,
+    -0.41642955, -0.41084316, -0.4052413, -0.3996242, -0.39399204, -0.38834503,
+    -0.38268343, -0.37700742, -0.3713172, -0.36561298, -0.35989505, -0.35416353,
+    -0.34841868, -0.34266073, -0.33688986, -0.3311063, -0.3253103, -0.31950203,
+    -0.31368175, -0.30784965, -0.30200595, -0.2961509, -0.29028466, -0.28440753,
+    -0.2785197, -0.27262136, -0.26671275, -0.2607941, -0.25486565, -0.24892761,
+    -0.24298018, -0.2370236, -0.2310581, -0.22508392, -0.21910124, -0.21311031,
+    -0.20711137, -0.20110464, -0.19509032, -0.18906866, -0.18303989, -0.17700422,
+    -0.17096189, -0.16491312, -0.15885815, -0.15279719, -0.14673047, -0.14065824,
+    -0.1345807, -0.1284981, -0.12241068, -0.11631863, -0.110222206, -0.10412163,
+    -0.09801714, -0.091908954, -0.08579731, -0.07968244, -0.07356457, -0.06744392,
+    -0.061320737, -0.055195246, -0.049067676, -0.04293826, -0.036807224, -0.030674804,
+    -0.024541229, -0.01840673, -0.012271538, -0.0061358847, 0.0,
+];
+
+/// `sin(2π·ph)` for phase in turns — a 1024-point table with linear
+/// interpolation, in place of a full-precision scalar `sinf`.
+///
+/// ACCURACY, because this is the one place in the module that trades
+/// exactness for speed. Linear interpolation of `sin(2π·x)` on a step
+/// `h = 1/1024` has a worst-case error of `(2π)²·h²/8 = 4.71e-6`; measured
+/// against the true sine across a dense sweep of the whole turn it is
+/// **4.76e-6**, i.e. -106.5 dB relative to an oscillator at full scale. This
+/// synth's own peak sits around -21 dBFS, so the residual lands near
+/// -128 dBFS: below a 20-bit converter's floor and ~32 dB under the 16-bit
+/// LSB. The error is periodic at 1024× the partial's own frequency, so it is
+/// not broadband hiss but one fixed distortion product that folds back above
+/// 15 kHz at that level, and it grows with neither time, polyphony nor level.
+///
+/// TIMING AND TUNING ARE UNTOUCHED. Every phase accumulator (`p.ph`,
+/// `p.fm_ph`, `v.tw_ph`, the bed's) is unchanged, so pitch, phase, envelopes
+/// and voice lifetimes are exactly where they were; only the WAVEFORM's last
+/// bits move. The exposed places to listen before believing that are the long
+/// quiet drones where one sine plays alone for seconds — Comet's 110 Hz pair,
+/// Beam's hum.
 #[inline]
 fn sin01(ph: f32) -> f32 {
-    (ph * core::f32::consts::TAU).sin()
+    // Call sites hand over `.fract()`ed phases in [0,1) — except the FM
+    // carrier, whose modulation term pushes the argument outside — so wrap
+    // here rather than assume. `x` can round to exactly 1.0 for a tiny
+    // negative `ph`, which is why the index is masked and the fraction is
+    // taken from the UNMASKED truncation: that case lands on `SIN_TAB[0]`
+    // with a zero fraction, which is exactly `sin(2π)`.
+    let x = ph - ph.floor();
+    let z = x * SIN_TAB_LEN as f32;
+    let j = z as usize;
+    let f = z - j as f32;
+    let i = j & (SIN_TAB_LEN - 1);
+    let a = SIN_TAB[i];
+    let b = SIN_TAB[i + 1];
+    a + f * (b - a)
 }
 
 /// Triangle in turns, ±1.
@@ -10059,14 +10402,83 @@ mod tests {
         }
     }
 
-    /// PALETTE-REFACTOR BYTE-IDENTITY PROOF: for every style, a script that
-    /// exercises every trail kind at varied pan/heat/hue plus a 25 cps flood
-    /// renders BIT-IDENTICALLY on the refactored per-palette synth and the
-    /// frozen v0.56 monolith. This is the "nine existing palettes remain
-    /// byte-identical by default" contract, held as an executable oracle
-    /// rather than a platform-pinned golden hash.
+    /// PALETTE-REFACTOR FIDELITY PROOF: for every style, a script that exercises
+    /// every trail kind at varied pan/heat/hue plus a 25 cps flood renders on the
+    /// live per-palette synth within `V056_TOLERANCE` of the frozen v0.56
+    /// monolith. This is the "nine existing palettes keep their sound by
+    /// default" contract, held as an executable oracle against an independent
+    /// reference implementation rather than a platform-pinned golden hash.
+    ///
+    /// It asserted BIT-EQUALITY until the transcendental rewrite (table-driven
+    /// `sin01`, geometric envelope recursion) made that impossible. The oracle
+    /// deliberately kept its per-sample, per-style granularity — a whole-buffer
+    /// average would let one loud glitch hide inside a quiet buffer — and the
+    /// bound is an audibility threshold, not a fitted number. What the oracle
+    /// CANNOT see is `sin01` itself: `v056_reference` calls the same function,
+    /// so the table would agree with itself by construction. That gap is closed
+    /// by `sin_table_stays_below_one_16bit_step`.
+    /// How far the live synth may deviate from the frozen v0.56 reference, per
+    /// sample, per style.
+    ///
+    /// THREE-BILLIONTHS SHORT OF ONE 16-BIT STEP, and that is the point: a 16-bit
+    /// quantization step is 1/32768 = 3.0518e-5, so a deviation under this bound
+    /// cannot move an output sample by a full step. The constant is not fitted to
+    /// whatever the code happens to produce — it is the audibility threshold, and
+    /// the code is measured against it with room to spare.
+    ///
+    /// MEASURED (3.67 M samples, all nine styles, every gesture kind plus a 25 cps
+    /// flood plus an 8 s ring-out, against `v056_reference::RefSynth`):
+    ///   peak deviation 1.17e-5  = 0.38 of a 16-bit step  (-98.6 dBFS)
+    ///   RMS  deviation 3.2e-7   = 0.011 of a step        (-129.8 dBFS)
+    ///   deviation vs signal RMS                          (-91.6 dB)
+    /// i.e. 2.6x headroom at the peak. The sources are the two transcendental
+    /// rewrites: `sin01`'s interpolated table (own error 4.8e-6 = 0.16 of a step,
+    /// pinned separately by `sin_table_stays_below_one_16bit_step`, which the
+    /// oracle CANNOT see because the reference calls the same `sin01`) and the
+    /// geometric envelope recursion (bounded by [`ENV_REANCHOR`]; seeding once per
+    /// note instead reached 7.0e-4 = 23 steps, which is NOT inaudible — that is
+    /// why the re-anchor exists).
+    const V056_TOLERANCE: f32 = 3.0e-5;
+
+    /// THE ORACLE'S BLIND SPOT, closed. `v056_reference::RefSynth` calls the
+    /// crate's own [`sin01`], so swapping that function's body for an
+    /// interpolated table changes BOTH sides of
+    /// `palettes_render_within_one_16bit_step_of_v056_reference` identically and
+    /// the deviation it reports for the table is exactly zero. The table
+    /// therefore needs its own reference — real `sinf` — and this is it.
+    ///
+    /// MEASURED over 4 M phases: peak error 4.8e-6 = 0.16 of a 16-bit
+    /// quantization step (-106.4 dBFS), RMS 2.4e-6. The bound below is one
+    /// full step, so a failure here means the table has become able to move an
+    /// output sample — the only way this approximation could become audible.
     #[test]
-    fn palettes_render_byte_identical_to_v056_reference() {
+    fn sin_table_stays_below_one_16bit_step() {
+        const ONE_16BIT_STEP: f32 = 1.0 / 32768.0;
+        let mut worst = 0.0f32;
+        let mut worst_ph = 0.0f32;
+        // Dense sweep, plus the wrap cases the FM carrier reaches (`sin01` is
+        // handed arguments outside [0,1) there, so the wrap must hold too).
+        for i in 0..400_000u32 {
+            let base = i as f32 / 400_000.0;
+            for ph in [base, base - 1.0, base + 1.0, base + 7.5] {
+                let exact = ((ph - ph.floor()) * core::f32::consts::TAU).sin();
+                let d = (sin01(ph) - exact).abs();
+                if d > worst {
+                    worst = d;
+                    worst_ph = ph;
+                }
+            }
+        }
+        assert!(
+            worst < ONE_16BIT_STEP,
+            "sin01's table drifted {worst:e} from libm at ph={worst_ph} — \
+             {:.3} of a 16-bit step, so it can now move an output sample",
+            worst / ONE_16BIT_STEP
+        );
+    }
+
+    #[test]
+    fn palettes_render_within_one_16bit_step_of_v056_reference() {
         let kinds = [
             SoundKind::Typed,
             SoundKind::Backspace,
@@ -10088,10 +10500,12 @@ mod tests {
                     new.render(nb);
                     old.render(ob);
                     for (i, (a, b)) in nb.iter().zip(ob.iter()).enumerate() {
-                        assert_eq!(
-                            a.to_bits(),
-                            b.to_bits(),
-                            "{style:?}: sample {i} diverged from v0.56"
+                        let d = (a - b).abs();
+                        assert!(
+                            d <= V056_TOLERANCE,
+                            "{style:?}: sample {i} deviated {d:e} from v0.56, over the \
+                             {V056_TOLERANCE:e} bound ({:.2} of a 16-bit step)",
+                            d * 32768.0
                         );
                     }
                 }
@@ -10182,10 +10596,11 @@ mod tests {
                     new.render(&mut nb);
                     old.render(&mut ob);
                     for (a, b) in nb.iter().zip(ob.iter()) {
-                        assert_eq!(
-                            a.to_bits(),
-                            b.to_bits(),
-                            "{style:?}: the brrrring drifted from v0.56"
+                        let d = (a - b).abs();
+                        assert!(
+                            d <= V056_TOLERANCE,
+                            "{style:?}: the brrrring drifted {d:e} from v0.56, over the \
+                             {V056_TOLERANCE:e} bound"
                         );
                     }
                 }
@@ -10195,7 +10610,7 @@ mod tests {
                 new.render(&mut nb);
                 old.render(&mut ob);
                 for (a, b) in nb.iter().zip(ob.iter()) {
-                    assert_eq!(a.to_bits(), b.to_bits());
+                    assert!((a - b).abs() <= V056_TOLERANCE);
                 }
             }
         }

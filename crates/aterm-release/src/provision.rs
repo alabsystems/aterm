@@ -1229,17 +1229,32 @@ fn profile_check(
         };
     }
     match (creds.signing_identity_sha1(), apple_sha1) {
-        // The pin and the certificate this run PROVED can sign disagree — a renewal, or a
-        // profile carried over from a machine that was re-certified. `select_devid_identity`
-        // refuses exactly this at cut time, twenty minutes in, and it is the failure the
+        // The pin names a different certificate than the one this run happened to prove
+        // first. With more than one valid Developer ID identity installed that is NOT yet a
+        // gap — `security find-identity` orders them unstably (measured 2026-08-18: two
+        // certificates, alternate runs blessed each), and the cut accepts any valid pinned
+        // identity that can sign (`select_devid_identity`). So prove the PINNED one; only a
+        // pin that names nothing valid, or a certificate that cannot sign unattended (a
+        // renewal, a profile carried over from a re-certified machine), is the failure the
         // audit exists to move to the front.
-        (Some(pinned), Some(proved)) if !pinned.eq_ignore_ascii_case(proved) => Check::Fail {
-            what: format!(
-                "{} pins signing_identity_sha1 {pinned}, but this machine signs with {proved}",
-                path.display()
-            ),
-            fix: rewrite,
-        },
+        (Some(pinned), Some(proved)) if !pinned.eq_ignore_ascii_case(proved) => {
+            match crate::apple::pinned_identity_proves(pinned) {
+                Ok(()) => Check::Pass(format!(
+                    "{} pins signing_identity_sha1 {pinned} — installed, valid and proved \
+                     to sign (this run's first-listed identity was {proved}; both are \
+                     usable)",
+                    path.display()
+                )),
+                Err(why) => Check::Fail {
+                    what: format!(
+                        "{} pins signing_identity_sha1 {pinned}, which cannot sign here \
+                         ({why}); this machine signs with {proved}",
+                        path.display()
+                    ),
+                    fix: rewrite,
+                },
+            }
+        }
         // An absent pin is NOT a gap: the cut accepts it whenever the keychain holds
         // exactly one Developer ID Application certificate, and refusing here would be the
         // mirror of the defect above — the audit rejecting what the cut admits.

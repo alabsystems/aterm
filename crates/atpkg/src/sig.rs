@@ -142,8 +142,10 @@ pub enum Reject {
     /// The document carries no `machine_id`, so it cannot be attributed. Under an armed
     /// anchor an unattributed index is refused: attribution is a requirement.
     Unattributed,
-    /// The document's `roster_seq` does not equal the authorizing roster's — an attempt
-    /// to pair an old roster with a new index, or a new roster with an old index.
+    /// The document's `roster_seq` is NEWER than the authorizing roster's (or absent) —
+    /// an attempt to pair an old roster with a new index. A newer roster with an older
+    /// index is admitted (`aterm_update_core::roster::Attribution::bind`, 2026-08-18: the
+    /// roster travels on the channel head, and a join re-dresses published releases).
     SeqMismatch,
     /// The index's freshness window has lapsed (`now >= valid_until`), or the roster's
     /// has.
@@ -1256,11 +1258,13 @@ mod tests {
             Some(Reject::Unattributed)
         );
 
-        // The wrong generation, in both directions.
-        let wrong = index_body("m3", 2, 41);
-        assert_eq!(
-            roster.authorize_index(wrong.clone(), &sign(&M3_SEED, &wrong)).err(),
-            Some(Reject::SeqMismatch)
+        // An OLDER attribution under this newer roster is admitted (the post-join steady
+        // state); a generation AHEAD of the roster is the old-roster/new-index pairing
+        // that stays refused.
+        let older = index_body("m3", 2, 41);
+        assert!(
+            roster.authorize_index(older.clone(), &sign(&M3_SEED, &older)).is_ok(),
+            "an index attributed under an older generation verifies under a newer roster"
         );
         let ahead = index_body("m3", 4, 41);
         assert_eq!(

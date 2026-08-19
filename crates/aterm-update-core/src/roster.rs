@@ -139,8 +139,9 @@ pub enum RosterReject {
     Rollback,
     /// `now >= valid_until`: the roster's freshness window has lapsed.
     Stale,
-    /// The appcast's `roster_seq` does not match the roster's — an attempt to pair an old
-    /// roster with a new release, or vice versa.
+    /// The appcast's `roster_seq` is NEWER than the roster it verified under, or absent —
+    /// an attempt to pair an old roster with a new release. (A NEWER roster paired with
+    /// an older release is admitted: see [`Attribution::bind`].)
     SeqMismatch,
     /// The appcast carries no `machine_id`, so the release cannot be attributed. Under an
     /// armed master anchor an unattributed release is refused: attribution is a
@@ -529,8 +530,22 @@ impl Attribution {
     ///   anchor — "I can track which computer does what" is a requirement) and must equal
     ///   the machine whose key verified, which is what stops a genuine signature from one
     ///   machine being relabelled as another;
-    /// * `roster_seq` must equal the roster's, which stops an old roster being paired with
-    ///   a new release or a new roster with an old one.
+    /// * `roster_seq` must not EXCEED the roster's: the release was signed under
+    ///   generation `s`, and it may be verified under any generation `≥ s` (the roster it
+    ///   was cut with, or a NEWER master-signed one that still lists the machine as live).
+    ///   What is refused is the other direction — a release attributed under a newer
+    ///   generation than the roster presented, i.e. an OLD roster paired with a NEW
+    ///   release, which is the pairing that could resurrect a since-revoked machine.
+    ///
+    ///   Why "≤" and not "==" (changed 2026-08-18): the roster is distributed as an asset
+    ///   on the channel's latest release, so when a machine joins (seq n+1) the new pair is
+    ///   attached to releases whose manifests were attributed under seq n. Under `==` every
+    ///   such release became uninstallable for the whole fleet — MEASURED: v0.23.0 and
+    ///   v0.24.0 refused with `SeqMismatch` for hours after a join — with no security won:
+    ///   verifying under a NEWER roster is strictly stronger (the newer deny-list applies,
+    ///   `Revoked` is checked first, and `Rollback` already forbids anything below the
+    ///   client's observed floor). A newer roster with an older release is the normal
+    ///   steady state of a multi-machine channel, not an attack.
     pub fn bind(
         &self,
         manifest_machine_id: Option<&str>,
@@ -541,7 +556,7 @@ impl Attribution {
             return Err(RosterReject::UnknownMachine);
         }
         match manifest_roster_seq {
-            Some(seq) if seq == self.roster_seq => Ok(()),
+            Some(seq) if seq <= self.roster_seq => Ok(()),
             // Absent is a mismatch, not a pass: a release cut without a roster_seq cannot
             // be paired with any particular roster generation, which is the whole point.
             _ => Err(RosterReject::SeqMismatch),
@@ -863,19 +878,32 @@ mod tests {
         assert!(r.machine("m3", before).is_ok());
     }
 
-    /// STEP 9's cross-check: an old roster cannot be paired with a new release, and an
+    /// STEP 9's cross-check: an old roster cannot be paired with a NEW release (the
+    /// manifest may not claim a generation newer than the roster it verified under), a
+    /// NEWER roster paired with an older release is admitted (the roster travels on the
+    /// channel head; a join re-dresses published releases with the new pair), and an
     /// unattributed release is refused outright under an armed anchor.
     #[test]
-    fn the_manifest_must_name_its_machine_and_its_roster_generation() {
+    fn the_manifest_must_name_its_machine_and_not_outrun_its_roster_generation() {
         let a = Attribution {
             machine_id: "m3".into(),
             pubkey_b64: pk(&kp(&M3_SEED)),
             roster_seq: 3,
         };
-        assert_eq!(a.bind(Some("m3"), Some(3)), Ok(()));
+        assert_eq!(a.bind(Some("m3"), Some(3)), Ok(()), "same generation");
+        assert_eq!(
+            a.bind(Some("m3"), Some(2)),
+            Ok(()),
+            "an older attribution under a newer roster is the steady state after a join"
+        );
         assert_eq!(a.bind(None, Some(3)), Err(RosterReject::Unattributed));
         assert_eq!(a.bind(Some("m3"), None), Err(RosterReject::SeqMismatch));
-        assert_eq!(a.bind(Some("m3"), Some(2)), Err(RosterReject::SeqMismatch));
+        assert_eq!(
+            a.bind(Some("m3"), Some(4)),
+            Err(RosterReject::SeqMismatch),
+            "a release attributed under a NEWER generation than the roster presented is \
+             the old-roster/new-release pairing that stays refused"
+        );
         assert_eq!(
             a.bind(Some("m11"), Some(3)),
             Err(RosterReject::UnknownMachine)

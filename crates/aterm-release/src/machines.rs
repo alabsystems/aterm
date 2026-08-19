@@ -261,6 +261,71 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 ///
 /// `now_unix` is injected for the same reason it is on the client: the freshness gate is
 /// pure, and every expiry case is testable without waiting for one.
+/// THE FLEET'S ROSTER FLOOR, read from where the fleet reads it: the `roster_seq` of
+/// the master-admitted `aterm-machines.toml` on the channel's LATEST release, or `None`
+/// when that release carries no roster at all (a channel from before the tier). This is
+/// the generation every client that has checked for updates has ratcheted its floor to
+/// (`Floor::bump_and_write` ratchets on OBSERVATION of the asset), so it is the number a
+/// cut's attribution must reach — and it is NOT necessarily the number inside the head
+/// manifest: MEASURED 2026-08-18, a machine that joined the roster (seq 3) attached the
+/// new pair to the already-published v0.23.0/v0.24.0 releases, whose manifests still
+/// said `roster_seq = 2`; the pre-claim ratchet read the manifest, passed 2 ≥ 2, and the
+/// cut shipped an attribution every client refused with `SeqMismatch` for hours.
+///
+/// Anonymous (`https://github.com/<slug>/releases/latest/download/…`, the same seed
+/// path `provision` uses — no token, no API rate limit) and admitted under the committed
+/// paper master, so an unsigned or forged asset cannot ratchet the producer. Errors are
+/// transport or verification failures, returned as such — the caller decides whether
+/// "cannot tell" fails the gate (it does: a wrong answer here burns a build number).
+pub(crate) fn channel_roster_seq(slug: &str) -> std::result::Result<Option<u64>, String> {
+    let url = |asset: &str| format!("https://github.com/{slug}/releases/latest/download/{asset}");
+    let bytes = match anonymous_fetch(&url(aterm_update_core::roster::ROSTER_ASSET), 65_536) {
+        Ok(b) => b,
+        // No roster on the latest release: no floor. curl -f reports the HTTP status in
+        // its stderr; anything that is not a clean 404 is "cannot tell", never "none".
+        Err(e) if e.contains("returned error: 404") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let sig = anonymous_fetch(&url(aterm_update_core::roster::ROSTER_SIG_ASSET), 4_096)?;
+    let verified = verify_roster(aterm_update_core::pins::PAPER_MASTER_PUBKEYS, bytes, &sig)
+        .map_err(|e| format!("the channel roster did not verify under the committed paper master ({e:?})"))?;
+    let parsed = Roster::parse(&verified)
+        .map_err(|e| format!("the channel roster verified but did not parse ({e:?})"))?;
+    Ok(Some(parsed.roster_seq))
+}
+
+/// One bounded anonymous download (the client's own roster limits: 64 KiB body, 4 KiB
+/// signature — a floor read must never accept more than the fleet would).
+fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
+    let cap_s = cap.to_string();
+    let out = std::process::Command::new("curl")
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-time",
+            "60",
+            "--max-filesize",
+            &cap_s,
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("curl {url}: {}", err.trim()));
+    }
+    if out.stdout.len() > cap {
+        return Err(format!("{url}: exceeded the {cap}-byte cap"));
+    }
+    if out.stdout.is_empty() {
+        return Err(format!("{url}: zero bytes"));
+    }
+    Ok(out.stdout)
+}
+
 pub fn authorize_cut(
     master_pubkeys: &[&str],
     roster_bytes: Vec<u8>,

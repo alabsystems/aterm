@@ -455,6 +455,32 @@ fn has_terminal() -> bool {
         .is_ok_and(|f| std::io::IsTerminal::is_terminal(&f))
 }
 
+/// Prove that a PINNED identity (the profile's `signing_identity_sha1`) is one of this
+/// machine's valid Developer ID Application identities AND can sign unattended — the
+/// same test signature [`verdict`] runs, aimed at the certificate the operator actually
+/// pinned rather than at whichever one `security find-identity` happened to list first.
+///
+/// Why this exists: `find-identity`'s order is not stable across runs (MEASURED on m3,
+/// 2026-08-18: two valid certificates for the team, and consecutive `provision --check`
+/// runs proved a different `ids[0]` each time), so an audit that blesses only `ids[0]`
+/// and then fails the profile for pinning "the other one" flips between PASS and FAIL
+/// with no change on the machine — and its "fix" (rewrite the profile) would just chase
+/// the enumeration order. A pin that names a valid identity that proves it can sign is
+/// exactly what the cut accepts (`select_devid_identity`), so it is what the audit passes.
+pub(crate) fn pinned_identity_proves(sha1: &str) -> Result<(), String> {
+    let (ids, lookup_failed) = valid_identities();
+    if let Some(why) = lookup_failed {
+        return Err(format!("cannot read the keychain: {why}"));
+    }
+    if !ids.iter().any(|id| id.eq_ignore_ascii_case(sha1)) {
+        return Err(format!(
+            "no valid Developer ID Application identity {sha1} for team {} in the keychain",
+            pins::APPLE_TEAM_ID
+        ));
+    }
+    prove_can_sign(sha1)
+}
+
 /// The single place a green Apple verdict is produced, so the proof cannot be skipped on
 /// some paths and not others. A signature that does not succeed is NOT ready: reporting
 /// it as ready is precisely the "discovered at minute twenty of a cut" failure this verb

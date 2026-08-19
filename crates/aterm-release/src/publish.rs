@@ -7013,7 +7013,42 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // head's manifest. Both refusals must land before the claim: a cut whose roster is
     // older than the channel's is one the fleet refuses on sight, and finding that out
     // after burning a build number costs a number that can never be reused.
-    let newest_roster_seq = published_roster_seq(newest_channel)?;
+    // The floor the FLEET actually holds is the roster GENERATION it has observed on the
+    // public channel's latest release — the master-admitted `aterm-machines.toml` asset —
+    // which can run AHEAD of the head manifest's own attribution: another machine may
+    // join the roster and attach the new pair to already-published releases (measured
+    // 2026-08-18: v0.23.0/v0.24.0 said `roster_seq = 2`, their roster asset said 3, and
+    // every client refused the cut this gate had passed with `SeqMismatch`). So the
+    // ratchet reads BOTH and takes the greater. Only a real cut has a public channel to
+    // ask; a rehearsal/dry run keeps the manifest-only floor.
+    let manifest_roster_seq = published_roster_seq(newest_channel)?;
+    let observed_roster_seq = match (&mirror_slug, kind) {
+        (Some(slug), CutKind::Real) if *slug != origin_slug => {
+            machines::channel_roster_seq(slug).map_err(|e| {
+                Error::new(format!(
+                    "cannot read the machine roster on the public channel {slug}'s latest \
+                     release ({e}); refusing to reason about the fleet's roster floor — a \
+                     wrong answer here burns a build number and strands every client"
+                ))
+            })?
+        }
+        _ => None,
+    };
+    let newest_roster_seq = match (manifest_roster_seq, observed_roster_seq) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    if let (Some(observed), Some(manifest)) = (observed_roster_seq, manifest_roster_seq)
+        && observed > manifest
+    {
+        step(
+            "roster",
+            &format!(
+                "the public channel head carries roster generation {observed} while its \
+                 manifest was attributed under {manifest} — the fleet's floor is {observed}"
+            ),
+        );
+    }
     roster_floor_covered(
         signature_verdict
             .attribution
