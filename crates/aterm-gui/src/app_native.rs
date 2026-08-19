@@ -7925,10 +7925,15 @@ mod tests {
         }
     }
 
+    /// PRODUCTION SHAPE: the sealed `ATermGitCommit` an installed bundle carries is
+    /// the 12-char SHORT sha (`248091d23ab0` on v0.27.0), not the manifest's full
+    /// 40. The first activation-lane tests all used a full sha and passed while
+    /// the field import rejected every real bundle; the fixture now says what the
+    /// bundle says.
     fn installed_update(build: u64) -> InstalledUpdate {
         InstalledUpdate {
             build,
-            commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            commit: "248091d23ab0".to_string(),
             version: None,
             receipt_build: None,
             receipt_dmg_sha256: None,

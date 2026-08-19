@@ -216,18 +216,24 @@ impl InstalledUpdate {
     /// [`installed_activation_digest`]. `None` when the bundle is not newer.
     #[must_use]
     pub(crate) fn activation_stage(&self, running_build: u64, generation: u64) -> Option<StagedUpdate> {
-        (self.build > running_build).then(|| StagedUpdate {
-            build: self.build,
-            version: bounded(
-                self.version
-                    .clone()
-                    .unwrap_or_else(|| format!("build {}", self.build)),
-                MAX_SHORT_TEXT_BYTES,
-            ),
-            commit: Some(self.commit.clone()),
-            dmg_sha256: installed_activation_digest(self.build, &self.commit),
-            changelog: None,
-            generation,
+        // The same identity rule the import applies (`staged_from_status`), so a
+        // bundle whose sealed commit is unusable is not an activation at all —
+        // it must not retire a download it can never replace.
+        (self.build > running_build && usable_commit_identity(&self.commit)).then(|| {
+            let commit = self.commit.trim().to_ascii_lowercase();
+            StagedUpdate {
+                build: self.build,
+                version: bounded(
+                    self.version
+                        .clone()
+                        .unwrap_or_else(|| format!("build {}", self.build)),
+                    MAX_SHORT_TEXT_BYTES,
+                ),
+                dmg_sha256: installed_activation_digest(self.build, &commit),
+                commit: Some(commit),
+                changelog: None,
+                generation,
+            }
         })
     }
 }
@@ -1355,6 +1361,15 @@ impl NativeUpdaterService {
     }
 }
 
+/// A commit string that can serve as a stage identity: 7..=40 hex digits (a short
+/// or full sha). Shared by the durable-status import and the activation import so
+/// the two can never disagree about whether an installed bundle is stageable.
+#[must_use]
+pub(crate) fn usable_commit_identity(commit: &str) -> bool {
+    let commit = commit.trim();
+    (7..=40).contains(&commit.len()) && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn staged_from_status(
     running_build: u64,
     generation: u64,
@@ -1370,12 +1385,29 @@ fn staged_from_status(
         .map(str::trim)
         .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))?
         .to_ascii_lowercase();
+    // A DOWNLOAD stage's commit is the manifest's full 40-char sha and nothing
+    // shorter mints stage authority (`missing_or_unsealed_commit_never_mints_…`).
+    // An ACTIVATION carries the installed bundle's sealed `ATermGitCommit`, which
+    // the build writes as the 12-char short sha (`ATermGitCommit = 248091d23ab0`
+    // on v0.27.0), and its digest is `installed_activation_digest(build, commit)`
+    // — self-certifying: the digest binds exactly this commit. Demanding 40 for
+    // it rejected every activation import in the field: the reducer logged
+    // "activating it in place", staged nothing, and the control apply answered
+    // "No newer verified update is staged" — the parking the lane exists to end.
+    // So: 40 hex for a download; 7..=40 hex when the digest IS the activation
+    // digest over that very commit. Every downstream comparison is prefix-
+    // tolerant at >= 7 (`commit_matches`, `seamless::normalize_commit`), and an
+    // activation can only ever re-exec the bundle already installed and verified
+    // under this executable.
     let commit = status
         .staged_commit
         .as_deref()
         .map(str::trim)
-        .filter(|commit| commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))?
+        .filter(|commit| usable_commit_identity(commit))?
         .to_ascii_lowercase();
+    if commit.len() != 40 && installed_activation_digest(build, &commit) != dmg_sha256 {
+        return None;
+    }
     let version = status
         .staged_version
         .as_deref()
@@ -1702,6 +1734,76 @@ mod tests {
 
     /// The activation identity is a well-formed 64-hex artifact digest, a pure
     /// function of (build, commit), and can never be mistaken for a download.
+    /// The field bug behind v0.26.0's dead activation lane: an installed bundle
+    /// seals a 12-char short sha and the import demanded 40, so "activating it in
+    /// place" was logged and nothing was staged. Both the durable import and the
+    /// activation constructor now share one identity rule.
+    #[test]
+    fn a_short_sha_is_a_usable_stage_identity_and_a_stub_is_not() {
+        assert!(usable_commit_identity("248091d23ab0"));
+        assert!(usable_commit_identity(" 248091D23AB0 "));
+        assert!(usable_commit_identity(&"a".repeat(40)));
+        assert!(!usable_commit_identity("248091"), "six hex is not an identity");
+        assert!(!usable_commit_identity(&"a".repeat(41)));
+        assert!(!usable_commit_identity("unknown"));
+        assert!(!usable_commit_identity("248091d23ab0-dirty"));
+        // A DOWNLOAD marker (a real DMG digest) with a short sha still mints nothing:
+        // the short-sha allowance is bound to the activation digest and only it.
+        let mut download = DurableUpdateStatus {
+            enabled: true,
+            current_build: 11,
+            staged_build: Some(12),
+            staged_version: Some("0.27.0".to_string()),
+            staged_commit: Some("248091d23ab0".to_string()),
+            staged_dmg_sha256: Some("ab".repeat(32)),
+            changelog: None,
+            outcome: String::new(),
+            failing_checks: 0,
+            failing_persistent: false,
+            failing_kind: String::new(),
+        };
+        assert!(staged_from_status(11, 0, &download).is_none());
+        download.staged_commit = Some("0".repeat(40));
+        assert!(staged_from_status(11, 0, &download).is_some());
+
+        let installed = InstalledUpdate {
+            build: 12,
+            commit: "248091D23AB0".to_string(),
+            version: Some("0.27.0".to_string()),
+            receipt_build: None,
+            receipt_dmg_sha256: None,
+        };
+        let stage = installed
+            .activation_stage(11, 0)
+            .expect("a short-sha bundle newer than the process is an activation");
+        assert_eq!(stage.commit.as_deref(), Some("248091d23ab0"), "lowercased");
+        assert!(stage.is_installed_activation());
+        // …and the durable import accepts exactly what the activation constructed.
+        let status = DurableUpdateStatus {
+            enabled: true,
+            current_build: 11,
+            staged_build: Some(12),
+            staged_version: Some("0.27.0".to_string()),
+            staged_commit: stage.commit.clone(),
+            staged_dmg_sha256: Some(stage.dmg_sha256.clone()),
+            changelog: None,
+            outcome: String::new(),
+            failing_checks: 0,
+            failing_persistent: false,
+            failing_kind: String::new(),
+        };
+        let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
+        assert_eq!(imported.commit, stage.commit);
+        assert_eq!(imported.dmg_sha256, stage.dmg_sha256);
+        // A bundle sealing an unusable commit is not an activation at all — it must
+        // never retire a download it cannot replace.
+        let stub = InstalledUpdate {
+            commit: "unknown".to_string(),
+            ..installed
+        };
+        assert!(stub.activation_stage(11, 0).is_none());
+    }
+
     #[test]
     fn the_activation_identity_is_well_formed_pure_and_distinct() {
         let a = installed_activation_digest(11, TEST_COMMIT);
