@@ -42,6 +42,8 @@ pub(crate) struct UpdateState {
     /// of one failure class, not a blip): the headline says so instead of "You're
     /// up to date", and `outcome` carries the ledger's own sentence with the cause.
     failing_persistent: bool,
+    /// The failing CLASS (`apply`, `pipeline`, …) when `failing_persistent`.
+    failing_kind: String,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
 }
@@ -104,6 +106,7 @@ impl UpdateState {
             enabled: snapshot.enabled,
             outcome: snapshot.outcome.clone(),
             failing_persistent: snapshot.failing_persistent,
+            failing_kind: snapshot.failing_kind.clone(),
             checking,
         }
     }
@@ -149,6 +152,7 @@ impl UpdateState {
             enabled: status.map(|s| s.enabled).unwrap_or(false),
             outcome: status.map(|s| s.outcome.clone()).unwrap_or_default(),
             failing_persistent: status.is_some_and(|s| s.enabled && s.is_failing_persistently()),
+            failing_kind: status.map(|s| s.failing_kind.clone()).unwrap_or_default(),
             checking,
         }
     }
@@ -164,7 +168,7 @@ impl UpdateState {
             enabled: self.enabled,
             outcome: self.outcome.clone(),
             checking: self.checking,
-            failing_persistent: self.failing_persistent && self.enabled && !self.checking && self.staged.is_none(),
+            failing_persistent: self.failing_persistent && self.enabled && !self.checking,
             headline: self.headline(),
             detail: self.detail(),
         }
@@ -212,6 +216,12 @@ impl UpdateState {
     fn headline(&self) -> String {
         if self.checking {
             "Checking for updates\u{2026}".to_string()
+        } else if self.staged.is_some() && self.enabled && self.failing_persistent {
+            // A stage that is persistently FAILING TO APPLY (the apply class: the
+            // handoff keeps ending ChildDied) is not "Update ready" — the health
+            // notice points the user here, and this line must not contradict it
+            // (2026-08-19 round-3 audit). The cause is the detail below.
+            "Update ready, but it keeps failing to apply.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
         } else if !self.enabled {
@@ -231,6 +241,16 @@ impl UpdateState {
     /// (`Some` only when a build is ready), rendered small under the accent headline.
     fn detail(&self) -> Option<String> {
         if let Some((b, v)) = self.staged.as_ref() {
+            if self.enabled && self.failing_persistent {
+                // Not the ledger `outcome`: the check lane rewrites that every cycle
+                // with the healthy "staged … ready to apply" sentence while a stage
+                // is held. The durable fact is the class that is failing.
+                return Some(format!(
+                    "Version {v} \u{00b7} build {b} \u{00b7} every attempt to start it has \
+                     failed; see aterm.log (Updates are failing: {})",
+                    if self.failing_kind.is_empty() { "apply" } else { self.failing_kind.as_str() }
+                ));
+            }
             return Some(format!("Version {v} \u{00b7} build {b}"));
         }
         if self.failing_persistent && !self.checking && self.enabled {
@@ -871,6 +891,25 @@ mod tests {
             cols: 120,
             panel_rows: s.card_rows() + 8,
         }
+    }
+
+    /// A staged build whose apply keeps failing persistently is not "Update ready":
+    /// the headline says so and the detail names the failing class, not the
+    /// churned ledger outcome.
+    #[test]
+    fn a_staged_build_that_keeps_failing_to_apply_says_so() {
+        let mut st = staged_status();
+        st.failing_applies = 3;
+        st.failing_kind = "apply".to_string();
+        st.failing_persistent = true;
+        st.outcome = "staged 0.5.15 (build 830) — verified and ready to apply".to_string();
+        let s = UpdateState::from_status(828, "0.5.14", Some(&st), false);
+        let p = s.projection();
+        assert!(p.failing_persistent, "the projection no longer masks a failure while staged");
+        assert_eq!(p.headline, "Update ready, but it keeps failing to apply.");
+        let detail = p.detail.expect("detail");
+        assert!(detail.contains("build 830") && detail.contains("apply"), "{detail}");
+        assert!(!detail.contains("ready to apply"), "not the ledger's healthy sentence: {detail}");
     }
 
     #[test]

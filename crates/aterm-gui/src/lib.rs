@@ -8152,6 +8152,10 @@ struct App {
     /// below which a disk observation predates that stage and must not retire it
     /// (`app_native::reconcile_native_update_facts`).
     native_stage_imported_at: Option<Instant>,
+    /// How many times in a row a control apply's facts came back stale and were
+    /// re-requested; bounded so a wedged facts worker (sequences restarted below
+    /// the last reduced one) cannot turn one `update apply` into a hot loop.
+    control_apply_stale_retries: u8,
     deferred_native_update_reconcile: Option<(
         app_native::NativeUpdateReconcilePurpose,
         app_native::NativeUpdateReconcileFacts,
@@ -10360,6 +10364,7 @@ impl App {
             next_native_update_reconcile_sequence: 1,
             last_native_update_reconcile_sequence: 0,
             native_stage_imported_at: None,
+            control_apply_stale_retries: 0,
             deferred_native_update_reconcile: None,
             pending_native_update_reconcile_purpose: None,
             native_config_inflight: false,
@@ -15420,6 +15425,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let out_of_band_handoff = handoff_rendezvous::rendezvous_present();
     #[cfg(not(target_os = "macos"))]
     let out_of_band_handoff = false;
+    // The proof term the PARENT hashed its expectation over — stated on the wire,
+    // because a launched attempt that fell back to the fork lane still expects
+    // device terms while the descriptors arrived by inheritance. An older parent
+    // says nothing and the lane decides, as before.
+    #[cfg(target_os = "macos")]
+    let device_proof_term =
+        handoff_rendezvous::take_device_proof_term().unwrap_or(out_of_band_handoff);
+    #[cfg(not(target_os = "macos"))]
+    let device_proof_term = false;
     #[cfg(target_os = "macos")]
     if out_of_band_handoff {
         /// How long this process will wait on its own dial. Short because every
@@ -15450,6 +15464,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                      session"
                 );
                 eprintln!("aterm-gui: overlap handoff could not be claimed: {error}");
+                // This launch COUNTED a boot-trial launch for its build moments ago
+                // (`check_boot_health`, inside the boot apply above), and it is now
+                // exiting BY RULE — the outgoing process gave up before the transfer
+                // — not crashing. Give the launch back here, in the one process that
+                // knows it observed it (a parent-side forgive could race ahead of the
+                // observation); left counted, three such pre-transfer failures on a
+                // busy machine revert and permanently poison a healthy build.
+                aterm_update::forgive_trial_launch(
+                    build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                );
                 return;
             }
         }
@@ -16608,6 +16632,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         next_native_update_reconcile_sequence: 1,
         last_native_update_reconcile_sequence: 0,
         native_stage_imported_at: None,
+        control_apply_stale_retries: 0,
         deferred_native_update_reconcile: None,
         pending_native_update_reconcile_purpose: None,
         native_config_inflight: false,
@@ -16715,9 +16740,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         handoff_reader_gate,
         incoming_handoff_pending: overlap_channels_present && adopting,
         handoff_degraded: overlap_degraded,
-        // Derived from how the descriptors arrived, never configured. See the
-        // field's docs for why a wrong answer here costs the automatic lane.
-        handoff_device_proof_term: out_of_band_handoff,
+        // The parent's stated proof term (or, for an older parent, how the
+        // descriptors arrived). See the field's docs for why a wrong answer here
+        // costs the automatic lane.
+        handoff_device_proof_term: device_proof_term,
         bootstrap_session_adopted: adopting,
         quit_capture: None,
         winit_to_window: HashMap::new(),

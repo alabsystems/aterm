@@ -273,10 +273,15 @@ fn foreign_trial_path(staging: &Staging) -> PathBuf {
     staging.root.join("foreign-trial")
 }
 
+/// How long another PRESENT install's trial must have sat untouched before a
+/// sibling's budgeted escape may disarm it (see `escape_wedged_foreign_trial`).
+const FOREIGN_TRIAL_OWNER_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Last-modified time of `path`, or `None` when it does not exist / cannot be
-/// stat'd. Used ONLY to compare two files in the SAME directory against each other,
-/// never against a wall clock — so a system clock jump moves both or neither, and
-/// the comparison stays meaningful.
+/// stat'd. Used to compare two files in the SAME directory against each other (a
+/// system clock jump moves both or neither), and — for the present-owner idle test
+/// in `escape_wedged_foreign_trial` only — against the wall clock, where a future
+/// stamp (skew, a restored backup) reads as "not idle", the fail-safe direction.
 fn mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -589,7 +594,36 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
         let _ = counter.arm(armed_build);
     }
     let observed = counter.observe_launch(armed_build).unwrap_or(0);
-    if observed < MAX_BOOT_ATTEMPTS || sentinel.confirm().is_err() {
+    if observed < MAX_BOOT_ATTEMPTS {
+        return false;
+    }
+    // A trial OWNED BY ANOTHER INSTALL THAT STILL EXISTS keeps its protection unless
+    // that owner has been idle for a long time: three launches of a sibling copy in
+    // one afternoon must not strip the crash-loop revert from the install that is
+    // actually mid-trial (2026-08-19 round-3 audit). Idle = the sentinel untouched
+    // for `FOREIGN_TRIAL_OWNER_IDLE` — the owner's every launch rewrites it.
+    let owned_elsewhere = crate::manifest::FailedMark::read(&staging.trial())
+        .and_then(|trial| trial.install_root)
+        .is_some_and(|root| {
+            let root = Path::new(&root);
+            // Present unless the path is demonstrably GONE (`NotFound`): an
+            // unmounted volume or a TCC-protected folder still owns its trial,
+            // exactly as `trial_owned_by` judges it.
+            let present = !matches!(
+                std::fs::symlink_metadata(root),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            );
+            present && bundle::resolve_layout().is_none_or(|b| !same_install_root(root, &b.app_root))
+        });
+    if owned_elsewhere {
+        let idle_long_enough = mtime(&staging.root.join("boot.sentinel"))
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age >= FOREIGN_TRIAL_OWNER_IDLE);
+        if !idle_long_enough {
+            return false;
+        }
+    }
+    if sentinel.confirm().is_err() {
         return false;
     }
     crate::manifest::FailedMark::clear(&staging.trial());
@@ -2908,6 +2942,14 @@ pub(crate) fn forgive_trial_launch(target_build: u64) {
     if !matches!(sentinel.read_state(), Some((b, _)) if b == target_build) {
         return;
     }
+    // Only a launch this install COUNTED may be given back: `check_boot_health`
+    // does not count launches against a trial another install owns, so forgiving
+    // from here would decrement the owner's count for a launch it never saw.
+    if let Some(b) = bundle::resolve_layout()
+        && !trial_owned_by(&staging, &b.app_root)
+    {
+        return;
+    }
     let Ok(_apply_lock) = FileLock::acquire(&staging.apply_lock) else {
         crate::warn(&format!(
             "could not take the apply lock to forgive a killed trial launch of build \
@@ -4132,6 +4174,36 @@ staged_at = "2026-08-17T00:00:00Z"
                 .unwrap()
                 .contains("updates re-enabled")
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A trial OWNED BY ANOTHER INSTALL THAT STILL EXISTS is not disarmed by a
+    /// sibling's exhausted budget unless that owner has been idle for a day; an owner
+    /// that is GONE cedes at the budget as before.
+    #[test]
+    fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idle() {
+        let (s, root) = temp_staging();
+        let owner = root.join("Applications").join("aterm.app");
+        make_app(&owner, "OWNER");
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(1000).unwrap();
+        crate::manifest::FailedMark::record_required(&s.trial(), 1000, &"ab".repeat(32), Some(&owner))
+            .unwrap();
+        for _ in 0..MAX_BOOT_ATTEMPTS + 2 {
+            assert!(
+                !escape_wedged_foreign_trial(&s, 1001, 1000),
+                "a present, recently-touched owner keeps its trial past the budget"
+            );
+        }
+        assert_eq!(sentinel.read_state(), Some((1000, 0)), "still armed, still untouched");
+        // The owner install GONE: the next exhausted budget disarms (ghost cedes).
+        std::fs::remove_dir_all(&owner).unwrap();
+        let mut disarmed = false;
+        for _ in 0..MAX_BOOT_ATTEMPTS + 1 {
+            disarmed |= escape_wedged_foreign_trial(&s, 1001, 1000);
+        }
+        assert!(disarmed, "a ghost owner cedes at the budget");
+        assert_eq!(sentinel.read_state(), None);
         let _ = std::fs::remove_dir_all(root);
     }
 

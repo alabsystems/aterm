@@ -791,6 +791,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     if st.enabled
         && let Some(installed) = cached_installed_update_facts()
         && installed.build_number > st.current_build
+        && !installed.yanked
         && crate::native_updater_service::usable_commit_identity(&installed.git_commit)
     {
         st.staged_build = Some(installed.build_number);

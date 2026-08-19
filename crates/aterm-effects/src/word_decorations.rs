@@ -55,7 +55,8 @@ use crate::cat_glyphs_gen::{CatGlyphId, GLYPHS};
 use crate::color_math::{hsv2rgb, hue_nudge, relative_luminance};
 use crate::genome::{
     self, CatAge, Genome, NovaFeatures, NovaMagic, VoteScratch, accessory_variant_v4, cat_age_v4,
-    cat_fills_v4, cat_magic, cat_variant_v4, mix, nova_features, nova_magic, special_variant_v4,
+    cat_fills_v4, cat_magic, cat_variant_v4, mix, nova_duration_ms, nova_features, nova_magic,
+    nova_palette, nova_radius, special_variant_v4,
 };
 use crate::nova::{self, NovaEnv};
 use crate::spec::{
@@ -2404,7 +2405,11 @@ fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
     let win = match ep.burst_kind {
         Some(BurstKind::SuperNova) if ep.burst_roll => super_window_of(ep.burst_tier),
         Some(BurstKind::Nova) => {
-            Duration::from_millis(u64::from(nova_features(ep.genome.gkey).duration_ms))
+            // Duration-only decode (audit driver-04): this predicate runs from
+            // `super_prepass`'s full-map walk and the parked summaries every
+            // tick, and the one field it reads never justified the whole
+            // 9-field genome decode.
+            Duration::from_millis(u64::from(nova_duration_ms(ep.genome.gkey)))
         }
         _ => return None,
     };
@@ -7308,16 +7313,18 @@ impl WordDecorations {
             if ep.nova_done {
                 continue;
             }
-            let feats = nova_features(occ.genome.gkey);
-            let magic = if cfg.profanity_magic {
-                nova_magic(occ.genome.magic)
-            } else {
-                None
-            };
+            // Radius-only decode (audit driver-04): every not-yet-granted
+            // episode on screen takes this arm every frame — the limiter feeds
+            // grants out two per rolling second, so a screenful of rolled-on
+            // words waits here for many seconds — and the full 9-field genome
+            // decode it used to pay per frame is deferred to the `NovaLive`
+            // push below, which at most `nova::MAX_ACTIVE_NOVAS` occurrences
+            // per frame ever reach. Same `field` windows, same arithmetic
+            // (pinned in genome.rs), so nothing on the glass can move.
             // Novas have no size floor (they scale, §6.3).
             let ch = i32::from(geom.cell_h);
             let (cx, cy) = burst_center(occ, geom);
-            let r_max = feats.radius * ch.max(1) as f32;
+            let r_max = nova_radius(occ.genome.gkey) * ch.max(1) as f32;
             if ep.nova_start.is_none() {
                 // v3 §6 `chance_pct`: a rolled-off burst never ignites
                 // (episodes with a pre-granted `nova_start` — tests pinning
@@ -7380,7 +7387,7 @@ impl WordDecorations {
                 }
             }
             let Some(start) = ep.nova_start else { continue };
-            let d = Duration::from_millis(u64::from(feats.duration_ms));
+            let d = Duration::from_millis(u64::from(nova_duration_ms(occ.genome.gkey)));
             if now >= start + d {
                 // The window elapsed: the episode's one nova is spent (§3.6).
                 ep.nova_done = true;
@@ -7401,8 +7408,14 @@ impl WordDecorations {
                 start,
                 center_px: (cx, cy),
                 r_max,
-                feats,
-                magic,
+                // The one full decode left on this path — per LIVE nova, not
+                // per occurrence.
+                feats: nova_features(occ.genome.gkey),
+                magic: if cfg.profanity_magic {
+                    nova_magic(occ.genome.magic)
+                } else {
+                    None
+                },
             });
         }
         // §6.5 coupling: per live nova, the MAX_COUPLING_WORDS nearest
@@ -7650,17 +7663,18 @@ fn emit_nova_axis(
             let spent = ep.is_some_and(|e| {
                 e.nova_done
                     && e.nova_start.is_some_and(|s| {
-                        let feats = nova_features(occ.genome.gkey);
                         now >= s + Duration::from_millis(
-                            u64::from(feats.duration_ms) + RESIDUAL_FADE_MS,
+                            u64::from(nova_duration_ms(occ.genome.gkey)) + RESIDUAL_FADE_MS,
                         )
                     })
             });
             (!rolled_off && !spent).then_some(1.0f32)
         } else if done && !occ.inert {
             ep.and_then(|e| e.nova_start).and_then(|s| {
-                let feats = nova_features(occ.genome.gkey);
-                let end = s + Duration::from_millis(u64::from(feats.duration_ms));
+                // Duration-only decode (audit driver-04): every FINISHED nova
+                // still on screen answers "has the ember fade elapsed" here
+                // every frame, forever.
+                let end = s + Duration::from_millis(u64::from(nova_duration_ms(occ.genome.gkey)));
                 let t = now.saturating_duration_since(end).as_millis() as u64;
                 (t < RESIDUAL_FADE_MS).then(|| {
                     let f = 1.0 - t as f32 / RESIDUAL_FADE_MS as f32;
@@ -7673,13 +7687,14 @@ fn emit_nova_axis(
             None
         };
         if let Some(f) = fade {
-            let feats = nova_features(occ.genome.gkey);
             let magic = if cfg.profanity_magic {
                 nova_magic(occ.genome.magic)
             } else {
                 None
             };
-            let (_, ember) = nova::ember_pair(nova::palette(feats.palette), magic);
+            // Palette-only decode: the residual star reads one field, not nine.
+            let (_, ember) =
+                nova::ember_pair(nova::palette(nova_palette(occ.genome.gkey)), magic);
             let d = WordDecoration {
                 row: occ.row,
                 col: occ.start_col,
@@ -8105,13 +8120,16 @@ fn ink_fx(
         break;
     }
     if occ.spec.burst.map(|b| b.kind) == Some(BurstKind::Nova) {
-        let feats = nova_features(occ.genome.gkey);
+        // Palette/duration-only decodes (audit driver-04): this resolver runs
+        // once per ink-bearing nova word per frame and reads exactly two
+        // fields of a genome that is fixed for the occurrence's life — it was
+        // the widest full-decode cluster the audit found.
         let magic = if cfg.profanity_magic {
             nova_magic(occ.genome.magic)
         } else {
             None
         };
-        let (core, fringe) = nova::palette(feats.palette);
+        let (core, fringe) = nova::palette(nova_palette(occ.genome.gkey));
         let (n0, n1) = genome::ink_pair_nudges(Class::Profanity, occ.genome.gkey);
         let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
         let ep = persist.get(&occ.ident);
@@ -8127,7 +8145,7 @@ fn ink_fx(
                 && now >= start
             {
                 let t = now.saturating_duration_since(start).as_millis() as u64;
-                if t < u64::from(feats.duration_ms) {
+                if t < u64::from(nova_duration_ms(occ.genome.gkey)) {
                     fx.freeze = true;
                     fx.dim = nova::dip_envelope(t);
                     fx.frame_live = t < nova::DIP_MS;

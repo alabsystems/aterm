@@ -629,6 +629,10 @@ pub struct InstalledUpdateFacts {
     pub version: Option<String>,
     pub receipt_build_number: Option<u64>,
     pub receipt_dmg_sha256: Option<String>,
+    /// The installed build sits BELOW the operator apply floor (`Floor::min_build`,
+    /// a yank). Still reported — the bundle is what it is — but an activation of
+    /// it is refused at every gate, and the GUI does not stage it as one.
+    pub yanked: bool,
 }
 
 /// Collect installed provenance and the trial marker. This may spawn PlistBuddy and
@@ -646,15 +650,21 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
     let build_number = verify::bundle_build_number(&installed.app_root).ok()?;
     let git_commit = verify::bundle_git_commit(&installed.app_root).ok()?;
     let version = verify::bundle_short_version(&installed.app_root).ok();
-    let receipt = paths::Staging::resolve()
+    let staging = paths::Staging::resolve();
+    let receipt = staging
+        .as_ref()
         .and_then(|staging| manifest::InstalledReceipt::read(&staging.installed_receipt()))
         .filter(|receipt| receipt.matches_sealed(build_number, &git_commit));
+    let yanked = staging
+        .as_ref()
+        .is_some_and(|staging| build_number < manifest::Floor::read(&staging.floor()).min_build);
     Some(InstalledUpdateFacts {
         build_number,
         git_commit,
         version,
         receipt_build_number: receipt.as_ref().map(|receipt| receipt.build_number),
         receipt_dmg_sha256: receipt.map(|receipt| receipt.dmg_sha256),
+        yanked,
     })
 }
 

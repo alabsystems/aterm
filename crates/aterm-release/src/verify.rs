@@ -1247,6 +1247,35 @@ fn verified_channel_successor(
     Ok(Some(successor.clone()))
 }
 
+/// The yank's successor must be the head the FLEET installs from: when a public
+/// update channel is configured, the channel's newest release must be this exact
+/// build carrying at least this `min_build`. Without a channel, the origin is the
+/// channel and the origin proof stands.
+fn prove_successor_on_channel(repo: &Path, successor: &Published) -> Result<()> {
+    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
+        .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
+    let Some(mirror_slug) = crate::mirror::update_channel_slug(&cargo_text)? else {
+        return Ok(());
+    };
+    let head = scan_published_channel(&mirror_slug, true)?;
+    let head = head.first();
+    let mirrored = head.is_some_and(|h| h.build == successor.build && h.min_build >= successor.min_build);
+    if mirrored {
+        return Ok(());
+    }
+    Err(Error::new(format!(
+        "the yank successor v{} (build {}, min_build {:?}) is live on the origin but NOT the \
+         head of the public channel {mirror_slug} (head: {:?}); the fleet installs from the \
+         channel, so the bad build is not poisoned yet. Mirror the successor first (`cargo ship \
+         cut --resume` if its journal is parked at mirror; a retired-unmirrored successor needs \
+         a fresh cut under the current roster generation), then re-run yank",
+        successor.version,
+        successor.build,
+        successor.min_build,
+        head.map(|h| (h.version.clone(), h.build, h.min_build))
+    )))
+}
+
 /// Re-prove that the bad release is already inert before every cleanup
 /// mutation. The full post-publish replay covers canonical arbitration, exact
 /// manifest bytes, current signature + all signed history, and DMG availability.
@@ -1565,6 +1594,13 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     let successor = prove_yank_successor(repo, &slug, &bad)?.ok_or_else(|| {
         Error::new("successor cut returned without establishing the required yank proof")
     })?;
+    // THE FLEET READS THE PUBLIC CHANNEL, NOT THE ORIGIN. A successor that is live on
+    // the origin only (a cut retired unmirrored after a roster join, or a mirror
+    // step that never ran) poisons nothing for any installed copy; deleting the bad
+    // build here would leave the channel's head BELOW the bad build's floor with no
+    // manifest carrying it (2026-08-19 round-3 audit). Prove the successor on the
+    // channel before any cleanup mutation.
+    prove_successor_on_channel(repo, &successor)?;
     let cleanup_owner = published_commit(&successor)?;
 
     // Cleanup is a release-channel mutation even though the bad build has
@@ -1832,8 +1868,22 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
     // The two refusals `step_mirror` can issue for good, and only those: the fleet's
     // generation is strictly AHEAD of this cut's, or EQUAL with a different document
     // (a lineage fork). Anything else is `--resume`'s case.
-    let local_roster = fs::read(repo.join("dist").join(aterm_update_core::roster::ROSTER_ASSET))
-        .map_err(|e| Error::new(format!("read this cut's roster asset from dist/: {e}")))?;
+    // The roster THIS CUT SHIPPED is the asset on its origin release — not dist/,
+    // which the fork remedy tells the operator to overwrite with the channel's
+    // document (which would then make the fork invisible from here and wedge).
+    let shipped_roster = || -> Result<Vec<u8>> {
+        let release_id = journal.release_id.ok_or_else(|| {
+            Error::new(format!(
+                "journal v{version} records no origin release ID; cannot read the roster this \
+                 cut shipped"
+            ))
+        })?;
+        publish::download_release_asset_for_release_id(
+            &slug,
+            release_id,
+            aterm_update_core::roster::ROSTER_ASSET,
+        )
+    };
     match (carried, fleet.as_ref()) {
         (Some(carried), Some((fleet, _))) if *fleet > carried => step(
             "retire",
@@ -1842,7 +1892,7 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
                  {fleet} — the mirror can never proceed, so this cut retires unmirrored"
             ),
         ),
-        (Some(carried), Some((fleet, bytes))) if *fleet == carried && local_roster != *bytes => {
+        (Some(carried), Some((fleet, bytes))) if *fleet == carried && shipped_roster()? != *bytes => {
             step(
                 "retire",
                 &format!(
@@ -1872,29 +1922,43 @@ pub fn run_retire_unmirrored(repo: &Path, version: &str) -> Result<()> {
         // older-generation roster with no journal pointing at it. Delete it by its
         // immutable ID, only if it is still a draft under our tag.
         if let Some(id) = journal.mirror_release_id {
-            match publish::release_object_by_id(&mirror_slug, id)? {
-                Some(draft) if draft.draft && draft.tag == tag => {
-                    let endpoint = format!("repos/{mirror_slug}/releases/{id}");
-                    let out = publish::gh_raw(&["api", "--method", "DELETE", &endpoint])?;
-                    if publish::release_object_by_id(&mirror_slug, id)?.is_some() {
+            // Under the CHANNEL credential: the dev account cannot see a draft on
+            // the public channel (404), and "not found" here would otherwise read as
+            // "already gone". A missing channel token is a refusal, not a skip.
+            if publish::channel_token().is_none() {
+                return Err(Error::new(format!(
+                    "this cut created public draft {tag} (ID {id}) on {mirror_slug}, and deleting \
+                     it needs the release-org token ({}); provide it before retiring",
+                    publish::channel_token_path()
+                        .map_or_else(|| "channel token".to_string(), |p| p.display().to_string())
+                )));
+            }
+            publish::with_channel_cred(|| {
+                match publish::release_object_by_id(&mirror_slug, id)? {
+                    Some(draft) if draft.draft && draft.tag == tag => {
+                        let endpoint = format!("repos/{mirror_slug}/releases/{id}");
+                        let out = publish::gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+                        if publish::release_object_by_id(&mirror_slug, id)?.is_some() {
+                            return Err(Error::new(format!(
+                                "could not delete the orphaned public draft {tag} (ID {id}) on \
+                                 {mirror_slug}: {}",
+                                out.stderr_utf8().trim()
+                            )));
+                        }
+                        step("retire", &format!("orphaned public draft {tag} (ID {id}) deleted"));
+                    }
+                    Some(other) => {
                         return Err(Error::new(format!(
-                            "could not delete the orphaned public draft {tag} (ID {id}) on \
-                             {mirror_slug}: {}",
-                            out.stderr_utf8().trim()
+                            "the public release ID {id} on {mirror_slug} is {} under tag {:?}; \
+                             refusing to touch it",
+                            if other.draft { "a draft" } else { "LIVE" },
+                            other.tag
                         )));
                     }
-                    step("retire", &format!("orphaned public draft {tag} (ID {id}) deleted"));
+                    None => {}
                 }
-                Some(other) => {
-                    return Err(Error::new(format!(
-                        "the public release ID {id} on {mirror_slug} is {} under tag {:?}; \
-                         refusing to touch it",
-                        if other.draft { "a draft" } else { "LIVE" },
-                        other.tag
-                    )));
-                }
-                None => {}
-            }
+                Ok(())
+            })?;
         }
         let released = publish::release_completed_publisher_session(&git, &owner, &fence)?;
         if released == publish::LeaseRelease::AlreadySuperseded {

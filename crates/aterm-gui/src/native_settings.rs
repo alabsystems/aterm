@@ -13999,6 +13999,8 @@ fn update_release_notes_card(
 fn compact_update_headline(update: &UpdateProjection) -> String {
     if update.checking {
         "Checking".to_string()
+    } else if update.staged.is_some() && update.failing_persistent {
+        "Not applying".to_string()
     } else if update.staged.is_some() {
         "Ready".to_string()
     } else if update.failing_persistent {
@@ -14013,6 +14015,8 @@ fn compact_update_headline(update: &UpdateProjection) -> String {
 fn compact_update_detail(update: &UpdateProjection) -> String {
     if update.checking {
         "Contacting service…".to_string()
+    } else if update.staged.is_some() && update.failing_persistent {
+        "Ready, but it keeps failing to apply.".to_string()
     } else if update.staged.is_some() {
         "Ready to install.".to_string()
     } else if update.failing_persistent {
@@ -14046,6 +14050,8 @@ fn fit_native_bold_label(value: &str, max_width: f32, px: f32) -> String {
 fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     if update.checking {
         "Checking…"
+    } else if update.staged.is_some() && update.failing_persistent {
+        "Not applying"
     } else if update.staged.is_some() {
         "Ready"
     } else if update.failing_persistent {

@@ -354,6 +354,17 @@ impl Drop for ChannelCred {
     }
 }
 
+/// Run `body` with the public-channel credential in force (RAII, cleared on every
+/// exit path). For callers outside this module that must talk to the channel —
+/// `verify::run_retire_unmirrored` deleting an orphaned public draft — so the call
+/// is authenticated as the release org, not the dev account (which cannot even SEE
+/// a draft on the channel: GitHub answers 404, and the caller would "succeed" by
+/// doing nothing).
+pub(crate) fn with_channel_cred<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _cred = ChannelCred::enter();
+    body()
+}
+
 /// The token to authenticate the current call with, or `None` for `gh`'s own auth.
 /// Kept out of argv: callers put it in the environment or a private header file.
 fn active_channel_token() -> Option<String> {

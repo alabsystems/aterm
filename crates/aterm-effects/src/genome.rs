@@ -564,6 +564,29 @@ pub fn nova_features(g: u64) -> NovaFeatures {
     }
 }
 
+/// §3.4 single-field decodes, for the per-frame sites that read ONE feature
+/// of a genome that never changes for the life of its episode (audit
+/// driver-04): the burst-mutex predicate and the residual-fade windows read
+/// `duration_ms`, the ember/ink tints read `palette`, and the ignition-grant
+/// radius reads `radius`. Each used to pay the whole 9-field [`nova_features`]
+/// decode per occurrence per frame. The expressions are copied VERBATIM from
+/// the corresponding rows above and pinned bit-for-bit by
+/// `nova_single_field_accessors_match_full_decode` — a drift here is a silent
+/// visual change (a wrong window or a wrong tint), not a perf bug.
+pub fn nova_duration_ms(g: u64) -> u32 {
+    1000 + field(g, 9, 2) as u32 * 400 / 3
+}
+
+/// See [`nova_duration_ms`]: the `palette` row of [`nova_features`], alone.
+pub fn nova_palette(g: u64) -> u8 {
+    field(g, 0, 3) as u8
+}
+
+/// See [`nova_duration_ms`]: the `radius` row of [`nova_features`], alone.
+pub fn nova_radius(g: u64) -> f32 {
+    1.6 + field(g, 5, 2) as f32 * 0.2
+}
+
 /// §4.2/§3.4: the Gray-decoded ink-pair hue-nudge codes for a class. Profanity
 /// reads the NOVA layout window (bits 19..26); every other ink-bearing class —
 /// including `emphasis`, pinned by §4.2 — reads the CAT layout window
@@ -1239,6 +1262,23 @@ mod tests {
         assert!(irises.iter().all(|&b| b), "all 8 iris stops reachable");
         assert!(ages.iter().all(|&b| b), "all 4 age bands reachable");
         assert_eq!(rays, (5, 8), "rays span 5..=8");
+    }
+
+    /// The single-field nova accessors ARE the corresponding rows of
+    /// [`nova_features`] — bit-for-bit, over the same `mix` stream the range
+    /// test sweeps. This equality is what makes substituting them at the hot
+    /// per-frame sites invisible on the glass: same duration ⇒ same burst and
+    /// fade windows, same palette ⇒ same tints, same radius ⇒ same rings.
+    /// (`to_bits` on the radius so the pin is exact, not epsilon-close.)
+    #[test]
+    fn nova_single_field_accessors_match_full_decode() {
+        for i in 0..8192u64 {
+            let g = mix(i);
+            let nf = nova_features(g);
+            assert_eq!(nova_duration_ms(g), nf.duration_ms);
+            assert_eq!(nova_palette(g), nf.palette);
+            assert_eq!(nova_radius(g).to_bits(), nf.radius.to_bits());
+        }
     }
 
     /// Deterministic voter-set stream for the §3.2 kernel-equivalence battery.

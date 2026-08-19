@@ -1316,6 +1316,26 @@ struct Voice {
     /// the master "keep it soft" control every palette leans on.
     lp_cut: f32,
     lp: f32,
+    /// PRECOMPUTED render coefficients — the sample loop's REMAINING
+    /// per-sample loop invariants, resolved once by [`TrailSynth::spawn`]
+    /// from fields that never move again (`dt` is `inv_sr`, written once in
+    /// `new` and never again; the geometric `k_*` steps above already work
+    /// this way). Same expressions, same operands, evaluated once instead
+    /// of 48 000 times a second — IEEE-754 ops are deterministic, so every
+    /// rendered sample stays bit-identical.
+    ///
+    /// `lp_k` is the per-voice softening-lowpass coefficient; `n_damp` the
+    /// noise SVF's damping `1/Q`. `svf_g`/`svf_den` are the SVF coefficient
+    /// and DENOMINATOR — cached only when the noise cutoff is a lifetime
+    /// constant (`n_lvl > 0` and `n_glide <= 0`, which is Lumen's and
+    /// Comet's air band), where the loop was paying a scalar `tanf` per
+    /// sample for a number that never changed. The DIVISOR is cached, not
+    /// its reciprocal: `x / d` and `x * (1.0 / d)` are different f32 values
+    /// and this render is judged on bits.
+    lp_k: f32,
+    n_damp: f32,
+    svf_g: f32,
+    svf_den: f32,
     /// Exempt from the master duck envelope. Only the bonk sets this: the
     /// duck exists to make room FOR it, so ducking the bonk itself would
     /// cancel the gesture. `false` (every trail voice, every bed grain)
@@ -2157,6 +2177,21 @@ impl TrailSynth {
         v.lp = 0.0;
         v.n_lp = 0.0;
         v.n_bp = 0.0;
+        // Render-loop invariants, resolved here instead of 48 000 times a
+        // second. Kept AFTER the tone-feel multiplies above on principle
+        // (they move `dur`/`decay`/`delay` — none of the inputs below, but
+        // "derived fields come last" is the invariant worth keeping whole).
+        // None of these inputs can move during the voice's life: the render
+        // loop never writes `lp_cut`/`n_q`/`n_f0`/`n_glide`/`n_lvl`.
+        v.lp_k = (v.lp_cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
+        if v.n_lvl > 0.0 {
+            v.n_damp = 1.0 / v.n_q.max(0.3);
+            if v.n_glide <= 0.0 {
+                // Constant cutoff ⇒ constant SVF coefficient and divisor.
+                v.svf_g = (core::f32::consts::PI * (v.n_f0 * dt).min(0.45)).tan();
+                v.svf_den = 1.0 + v.svf_g * (v.svf_g + v.n_damp);
+            }
+        }
         self.voices[idx] = v;
     }
 
@@ -2888,19 +2923,29 @@ impl TrailSynth {
                         self.rng = x;
                         (x >> 8) as f32 * (2.0 / 16_777_216.0) - 1.0
                     };
-                    let fc = if v.n_glide > 0.0 {
+                    // The damping is `spawn`'s cached `1.0 / n_q.max(0.3)`
+                    // — the identical f32 the per-sample divide produced.
+                    let damp = v.n_damp;
+                    let (g_svf, den) = if v.n_glide > 0.0 {
+                        // A SWEPT cutoff really does move per sample: the
+                        // geometric `n_e` recursion supplies `fc`, and the
+                        // `tan` has to follow it.
                         v.n_e = if seed {
                             (-v.t / v.n_glide).exp()
                         } else {
                             v.n_e * v.k_n
                         };
-                        v.n_f1 + (v.n_f0 - v.n_f1) * v.n_e
+                        let fc = v.n_f1 + (v.n_f0 - v.n_f1) * v.n_e;
+                        let g = (core::f32::consts::PI * (fc * dt).min(0.45)).tan();
+                        (g, 1.0 + g * (g + damp))
                     } else {
-                        v.n_f0
+                        // A CONSTANT cutoff: coefficient and divisor were
+                        // both computed in `spawn` from the identical
+                        // operands (see `Voice::svf_g`) — this branch was
+                        // paying a scalar `tanf` per sample for them.
+                        (v.svf_g, v.svf_den)
                     };
-                    let g_svf = (core::f32::consts::PI * (fc * dt).min(0.45)).tan();
-                    let damp = 1.0 / v.n_q.max(0.3);
-                    let hp = (white - v.n_lp - damp * v.n_bp) / (1.0 + g_svf * (g_svf + damp));
+                    let hp = (white - v.n_lp - damp * v.n_bp) / den;
                     v.n_bp += g_svf * hp;
                     v.n_lp += g_svf * v.n_bp;
                     s += v.n_lvl * v.n_bp;
@@ -2932,9 +2977,9 @@ impl TrailSynth {
                 if v.damp > 0.0 {
                     env *= v.damp / CELEBRATION_DAMP_S;
                 }
-                // Per-voice softening lowpass.
-                let k = (v.lp_cut * dt * core::f32::consts::TAU).clamp(0.0, 1.0);
-                v.lp += k * (s - v.lp);
+                // Per-voice softening lowpass (coefficient cached by
+                // `spawn` from the identical expression — see `Voice::lp_k`).
+                v.lp += v.lp_k * (s - v.lp);
                 let y = v.lp * env;
                 if v.duck_exempt {
                     xl += y * v.gl;

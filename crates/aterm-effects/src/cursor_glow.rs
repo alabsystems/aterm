@@ -373,6 +373,25 @@ static RAINBOW_BANDS_HSV: std::sync::LazyLock<[(f32, f32, f32); RAINBOW_BANDS.le
         out
     });
 
+/// The six anchors through EACH light-theme compositing role's darkening
+/// policy — [`RAINBOW_BANDS_HSV`]'s siblings, under the same argument: the
+/// input side is six COMPILE-TIME CONSTANTS. [`light_ink_bold`] solves a hue
+/// normalization, the pure hue's luma and the `(S, V)` pair that lands on the
+/// bar — ~25 flops with three divides — and [`light_ink`] a luma plus a
+/// channel scale; both were being re-solved fresh, per swept ribbon cell and
+/// per live ink pop, per frame, from a domain of exactly these six values.
+///
+/// BUILT BY THE RECIPES THEMSELVES at first use, never transcribed: each entry
+/// is the identical function on the identical constant, so every emitted
+/// colour byte is unchanged — pinned by `rainbow_band_ink_tables_are_the_recipes`.
+/// Band SELECTION shares one clamp with [`rainbow_band_of`] (see
+/// [`rainbow_band_index_of`]), so a table read and a recipe call can never
+/// disagree about which anchor a sweep position names.
+static RAINBOW_BANDS_INK_LEADING: std::sync::LazyLock<[u32; RAINBOW_BANDS.len()]> =
+    std::sync::LazyLock::new(|| RAINBOW_BANDS.map(light_ink_bold));
+static RAINBOW_BANDS_INK_OVERTEXT: std::sync::LazyLock<[u32; RAINBOW_BANDS.len()]> =
+    std::sync::LazyLock::new(|| RAINBOW_BANDS.map(light_ink));
+
 // ---- ADDITIVE-LIGHT BUDGET OVER TEXT (the legibility bound) ---------------
 //
 // TWO caps below, not one budget divided, because the layers compose along
@@ -974,6 +993,20 @@ impl InkRole {
         }
     }
 
+    /// [`Self::ink`] over one of the six [`RAINBOW_BANDS`] anchors, pre-solved
+    /// — the read half of [`RAINBOW_BANDS_INK_LEADING`] /
+    /// [`RAINBOW_BANDS_INK_OVERTEXT`]. Callers hand the band INDEX (from
+    /// [`rainbow_band_index_of`] / [`rainbow_band_index_at`]) instead of the
+    /// colour, so the recipe solve never runs on the frame path for a colour
+    /// that is always one of six constants.
+    #[inline]
+    fn band_ink(self, band: usize) -> u32 {
+        match self {
+            Self::Leading => RAINBOW_BANDS_INK_LEADING[band],
+            Self::OverText => RAINBOW_BANDS_INK_OVERTEXT[band],
+        }
+    }
+
     /// This role's per-pixel CENTRE over-alpha ceiling.
     #[inline]
     pub(crate) fn alpha_cap(self) -> f32 {
@@ -1041,14 +1074,38 @@ pub(crate) fn rainbow_sweep_reflect(x: f32) -> f32 {
 /// colour to come from a finite set to stay independently assertable.
 #[inline]
 pub(crate) fn rainbow_band_of(sweep: f32) -> u32 {
-    RAINBOW_BANDS[((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)]
+    RAINBOW_BANDS[rainbow_band_index_of(sweep)]
 }
 
-/// [`rainbow_band_of`] at a column and phase — the one call every mark on the
-/// light rail line (and the caret above it) makes.
+/// THE ONE BAND'S INDEX — [`rainbow_band_of`]'s selection, alone: the single
+/// clamp expression both share (so the two can never disagree about which
+/// band a sweep position names), and the key the pre-solved light-ink tables
+/// ([`InkRole::band_ink`]) are read by. Carrying the index instead of the
+/// resolved colour is what lets a light-theme call site skip re-solving an
+/// ink recipe whose input is always one of six constants.
+#[inline]
+fn rainbow_band_index_of(sweep: f32) -> usize {
+    ((sweep * RAINBOW_BANDS.len() as f32) as usize).min(RAINBOW_BANDS.len() - 1)
+}
+
+/// [`rainbow_band_of`] at a column and phase. Until the band-ink tables landed
+/// this was the call every mark on the light rail line made; the rail now
+/// resolves through [`rainbow_band_index_at`] so the darkened-ink table and the
+/// anchor colour cannot disagree, which leaves this composition with TEST
+/// callers only — the spectrum-agreement proofs in `cursor_rainbow` and the
+/// band-resolver pin below. Test-gated so the lint tells the truth about the
+/// shipping binary rather than us keeping a dead export warm.
+#[cfg(test)]
 #[inline]
 pub(crate) fn rainbow_band_at(col: u16, phase: f32) -> u32 {
     rainbow_band_of(rainbow_sweep_at(col, phase))
+}
+
+/// [`rainbow_band_index_of`] at a column and phase — [`rainbow_band_at`]'s
+/// index twin, for the call sites that read the pre-solved ink tables.
+#[inline]
+fn rainbow_band_index_at(col: u16, phase: f32) -> usize {
+    rainbow_band_index_of(rainbow_sweep_at(col, phase))
 }
 
 /// The light ribbon's ONE rail: how far BELOW the glyph centre it sits, how
@@ -2372,13 +2429,16 @@ fn fresh_ink_scale(u: f32) -> f32 {
 /// by the same `over_rgb(glyph, veil, cap)` argument, and pinned across ALL SIX
 /// bands by `fresh_ink_light_veil_centre_is_capped_for_legibility`.
 ///
-/// `band` is always one of the six [`RAINBOW_BANDS`] anchors, never a point on
-/// the continuous gradient — see `is_fresh_ink_veil` for why that matters.
+/// `band` names one of the six [`RAINBOW_BANDS`] anchors BY INDEX, never a
+/// point on the continuous gradient — see `is_fresh_ink_veil` for why the
+/// quantization matters and [`InkRole::band_ink`] for the pre-solved darkened
+/// ink the index buys (this runs per live pop per frame, and its input domain
+/// is exactly six values).
 #[inline]
-fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
+fn fresh_ink_veil_tinted(cap: u8, band: usize) -> u32 {
     let ink = lerp_rgb(
         FRESH_INK_LIGHT_VEIL,
-        InkRole::Leading.ink(band),
+        InkRole::Leading.band_ink(band),
         FRESH_INK_LIGHT_TINT,
     );
     (ink & 0x00FF_FFFF) | ((cap as u32) << 24)
@@ -2404,9 +2464,8 @@ fn fresh_ink_veil_tinted(cap: u8, band: u32) -> u32 {
 #[cfg(test)]
 #[inline]
 fn is_fresh_ink_veil(color: u32) -> bool {
-    RAINBOW_BANDS
-        .iter()
-        .any(|&b| fresh_ink_veil_tinted(0, b) & 0x00FF_FFFF == color & 0x00FF_FFFF)
+    (0..RAINBOW_BANDS.len())
+        .any(|b| fresh_ink_veil_tinted(0, b) & 0x00FF_FFFF == color & 0x00FF_FFFF)
 }
 
 /// One comet cell, fading from `born`.
@@ -13667,7 +13726,8 @@ impl CursorGlow {
             // letter above it are one colour rather than three.
             // LEADING role: `DY − RY` puts the rail wholly in the inter-line
             // leading, clear of every descender.
-            let hue = InkRole::Leading.ink(rainbow_band_at(s.col, self.rainbow.phase));
+            let band = rainbow_band_index_at(s.col, self.rainbow.phase);
+            let hue = InkRole::Leading.band_ink(band);
             // rx spans well past the cell so neighbouring rails merge
             // into ONE continuous band with no ripple (the radii are
             // constant now, so the merge is actually smooth).
@@ -14685,8 +14745,12 @@ impl CursorGlow {
                 //
                 // The band is read from the light rail's own sweep expression so
                 // the pop and the rail it swells are never two colours, then
-                // QUANTIZED to the six anchors (see [`is_fresh_ink_veil`]).
-                let band = rainbow_band_at(p.col, self.rainbow.phase);
+                // QUANTIZED to the six anchors (see [`is_fresh_ink_veil`]) —
+                // and carried as the anchor's INDEX, so the darkened inks the
+                // veil, the flash and the mote below need come out of the
+                // pre-solved tables ([`InkRole::band_ink`]) instead of
+                // re-running the recipes per pop per frame.
+                let band = rainbow_band_index_at(p.col, self.rainbow.phase);
                 let rail_dy = chf * RAINBOW_LIGHT_RAIL_DY;
                 // THE POP MARKS THE NEW CHARACTER; THE RAIL MARKS THE TRAIL.
                 //
@@ -14824,7 +14888,7 @@ impl CursorGlow {
                                 cx,
                                 cy + dy,
                                 star_arm(chf, STAR_ARM_FINE * STAR_ARM_INK) * scale,
-                                band,
+                                RAINBOW_BANDS[band],
                                 false,
                                 scov as u8,
                             );
@@ -14881,7 +14945,7 @@ impl CursorGlow {
                             let cap1 = InkRole::OverText.alpha_cap() / 255.0;
                             let ceiling = (1.0 - (1.0 - cap1).powi(3)) * 255.0;
                             let a = (stacked * 255.0).clamp(1.0, ceiling) as u32;
-                            let dot = (InkRole::OverText.ink(band) & 0x00FF_FFFF) | (a << 24);
+                            let dot = (InkRole::OverText.band_ink(band) & 0x00FF_FFFF) | (a << 24);
                             push_halo_over(halos, geom, cx, cy + dy, r, r, dot, 255);
                         }
                     }
@@ -27833,6 +27897,28 @@ mod tests {
         assert_eq!(light_ink_bold(0), 0);
     }
 
+    /// The pre-solved band-ink tables ARE the recipes — entry for entry, both
+    /// roles — and the index twin names the same anchor [`rainbow_band_of`]
+    /// resolves across the whole sweep range: the two halves of the table
+    /// read, pinned so no emitted colour byte can have moved.
+    #[test]
+    fn rainbow_band_ink_tables_are_the_recipes() {
+        for (i, &band) in RAINBOW_BANDS.iter().enumerate() {
+            assert_eq!(InkRole::Leading.band_ink(i), light_ink_bold(band));
+            assert_eq!(InkRole::OverText.band_ink(i), light_ink(band));
+        }
+        for k in 0..=400u32 {
+            // Sweep positions cover all six bands and both edges of every
+            // boundary the shared clamp defines.
+            let sweep = k as f32 / 400.0;
+            assert_eq!(
+                RAINBOW_BANDS[rainbow_band_index_of(sweep)],
+                rainbow_band_of(sweep),
+                "sweep {sweep}"
+            );
+        }
+    }
+
     /// THE ONE LIGHT-INK RULE: exactly one darkening policy per COMPOSITING
     /// ROLE, and the role — not the emitter — picks both the ink and the
     /// centre over-alpha ceiling.
@@ -34729,8 +34815,8 @@ halo = "add"
         // to a GLYPH is no longer asked here and cannot be: the bars live on the
         // rail lines, clear of the glyph band, which
         // `fresh_ink_light_theme_pops_with_a_darken_veil` pins geometrically.
-        for &band in &RAINBOW_BANDS {
-            let veil = fresh_ink_veil_tinted(ceiling, band);
+        for (bi, &band) in RAINBOW_BANDS.iter().enumerate() {
+            let veil = fresh_ink_veil_tinted(ceiling, bi);
             let over_white = aterm_render::over_rgb(0x00FF_FFFF, veil, ceiling);
             assert!(
                 luma709(over_white) < luma709(0x00FF_FFFF) * 0.65,

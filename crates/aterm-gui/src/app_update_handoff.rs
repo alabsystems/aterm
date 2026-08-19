@@ -1596,6 +1596,24 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         }
     }
 
+    // THE PROOF TERM TRAVELS WITH THE LANE. `expected` was computed once, over the
+    // terms the lane choice picked (PTY DEVICE terms for the launched lane, fd
+    // numbers for the fork lane). A launched attempt that falls back to the fork
+    // lane at runtime (`ForkInstead`: the rendezvous could not bind, LaunchServices
+    // refused) keeps that device-term proof — and a forked successor that inferred
+    // its term from "no rendezvous in the environment" hashed fd numbers, so every
+    // fallback ended in AdoptionMismatch after the child had already swapped the
+    // bundle (2026-08-19 round-3 audit). Say the term explicitly; the successor
+    // computes device terms on inherited masters just as well.
+    #[cfg(target_os = "macos")]
+    {
+        let proof_term = match job.lane {
+            HandoffLane::OutOfBand => "device",
+            HandoffLane::Fork => "fd",
+        };
+        job.command
+            .env(crate::handoff_rendezvous::ENV_PROOF_TERM, proof_term);
+    }
     job.command
         .env("ATERM_SEAMLESS_MANIFEST", path)
         .env("ATERM_SEAMLESS_NONCE", &nonce)

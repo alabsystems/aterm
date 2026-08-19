@@ -118,6 +118,29 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     let local = read_local_candidate(&roster_path)?;
     let fetched = fetch_channel_candidate(&slug);
     let seeded_from_channel = local.is_none() && fetched.is_ok();
+    // A MINT MUST SEE THE CHANNEL. "The fetch failed" is not "the channel has no
+    // roster": a 429/403/timeout on the anonymous asset path says nothing about
+    // what generation the fleet is on, and minting from a stale local pair while a
+    // peer has already published the next generation forks the lineage — two
+    // master-signed documents at one number, each de-authorizing the other's
+    // successors (2026-08-19 round-3 audit). Only a clean 404 (no roster published
+    // yet) lets a mint proceed from the local pair alone.
+    let channel_unreadable = match &fetched {
+        Err(e) if !e.starts_with(NO_CHANNEL_ROSTER) => Some(e.clone()),
+        _ => None,
+    };
+    if let Some(why) = channel_unreadable.as_ref() {
+        // Said HERE, at phase 1, so `--check` shows it and the real run refuses before
+        // the acquiring phases (an Apple identity, a notary profile) are spent on a
+        // mint that will be refused anyway.
+        step(
+            "roster",
+            &format!(
+                "the public channel could not be read ({why}); a mint will be REFUSED until it \
+                 answers — auditing the rest, minting nothing"
+            ),
+        );
+    }
     let (chosen, install, how) = choose_candidate(&roster_path, &slug, local, fetched)?;
     if install && !check_only {
         install_pair(&roster_path, &chosen)?;
@@ -284,6 +307,12 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // shell shows and the exit code carries.
     let minted = if already || check_only || blocking > 0 {
         false
+    } else if let Some(why) = channel_unreadable.as_ref() {
+        return Err(Error::new(format!(
+            "refusing to mint a roster id while the public channel cannot be read ({why}): a \
+             mint has to see the fleet's current roster generation, or two machines end up \
+             minting the same one (a lineage fork). Retry when the channel answers"
+        )));
     } else {
         mint(repo, id, &roster_path)?;
         true
@@ -543,10 +572,26 @@ fn read_local_candidate(roster_path: &Path) -> Result<Option<Candidate>> {
 /// The latest channel release's pair, fetched anonymously and admitted.
 #[cfg(unix)]
 fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String> {
-    let bytes = curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536)?;
-    let sig = curl_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)?;
+    let bytes = curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
+        // Only the BODY's clean 404 means "no roster published yet"; everything else
+        // (a missing signature beside a present body, 429/403, a timeout, a
+        // wrongly-slugged or private repo answering 404 for the sig only) is "cannot
+        // tell" — the mint gate treats those differently.
+        if e.contains("returned error: 404") {
+            format!("{NO_CHANNEL_ROSTER}: {e}")
+        } else {
+            e
+        }
+    })?;
+    let sig = curl_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)
+        .map_err(|e| format!("roster present but its signature could not be fetched: {e}"))?;
     admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
 }
+
+/// Marker prefix `fetch_channel_candidate` puts on the one failure that is NOT
+/// "cannot tell": the roster body answered a clean 404 — no roster published yet.
+#[cfg(unix)]
+const NO_CHANNEL_ROSTER: &str = "no roster on the channel";
 
 /// `https://github.com/<slug>/releases/latest/download/<asset>` — the anonymous asset
 /// path, deliberately not `gh`: a machine being provisioned has no tokens yet, and the

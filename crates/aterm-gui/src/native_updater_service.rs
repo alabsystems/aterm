@@ -784,6 +784,35 @@ impl NativeUpdaterService {
     }
 
     /// Reduce the exact result of one `aterm_update::check_now` worker.
+    /// Absorb the ledger's FAILURE verdict from a reconcile that imports no stage
+    /// (the exact-match early path, or a held stage that refuses a new check):
+    /// `finish_check` is otherwise the only writer of `failing_persistent`, and an
+    /// apply-class streak builds while a stage is HELD — so the headline the
+    /// health notice pointed at never changed (2026-08-19 round-3 audit). Badges
+    /// the false→true edge exactly as `finish_check` does.
+    pub(crate) fn absorb_failure_state(&mut self, status: &DurableUpdateStatus) -> bool {
+        if !self.snapshot.enabled || !status.enabled {
+            return false;
+        }
+        let now_persistent = status.failing_persistent;
+        let kind = if now_persistent {
+            bounded(status.failing_kind.clone(), MAX_SHORT_TEXT_BYTES)
+        } else {
+            String::new()
+        };
+        if self.snapshot.failing_persistent == now_persistent && self.snapshot.failing_kind == kind {
+            return false;
+        }
+        let was_persistent = self.snapshot.failing_persistent;
+        self.snapshot.failing_persistent = now_persistent;
+        self.snapshot.failing_kind = kind;
+        self.publish();
+        if now_persistent && !was_persistent {
+            self.snapshot.attention_revision = Some(self.snapshot.revision);
+        }
+        true
+    }
+
     pub(crate) fn finish_check(
         &mut self,
         ticket: UpdaterWorkTicket,
@@ -1802,6 +1831,32 @@ mod tests {
             ..installed
         };
         assert!(stub.activation_stage(11, 0).is_none());
+    }
+
+    /// The ledger's persistent verdict reaches the snapshot while a stage is HELD
+    /// (an apply-class streak builds then, and `finish_check` cannot run): once, with
+    /// the attention badge on the false→true edge, idempotent on repeats (no revision
+    /// churn), and cleared when the ledger heals.
+    #[test]
+    fn absorbing_a_persistent_failure_while_staged_badges_once_and_is_idempotent() {
+        let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+        stage(&mut service, 11);
+        let rev0 = service.snapshot().revision;
+        let mut failing = status(Some(11));
+        failing.failing_persistent = true;
+        failing.failing_kind = "apply".to_string();
+        assert!(service.absorb_failure_state(&failing));
+        let snap = service.snapshot();
+        assert!(snap.failing_persistent && snap.failing_kind == "apply");
+        assert!(snap.staged.is_some(), "the stage is untouched");
+        assert_eq!(snap.attention_revision, Some(snap.revision), "badged on the edge");
+        assert!(snap.revision > rev0);
+        let rev1 = snap.revision;
+        assert!(!service.absorb_failure_state(&failing), "a repeat changes nothing");
+        assert_eq!(service.snapshot().revision, rev1, "no revision churn per cycle");
+        let healed = status(Some(11));
+        assert!(service.absorb_failure_state(&healed));
+        assert!(!service.snapshot().failing_persistent);
     }
 
     #[test]

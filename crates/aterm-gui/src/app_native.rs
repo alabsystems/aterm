@@ -237,13 +237,20 @@ fn read_native_update_reconcile_facts(
         observation_sequence,
         || aterm_update::status(current_build).map(durable_update_status),
         || {
-            aterm_update::installed_update_facts().map(|installed| InstalledUpdate {
-                build: installed.build_number,
-                commit: installed.git_commit,
-                version: installed.version,
-                receipt_build: installed.receipt_build_number,
-                receipt_dmg_sha256: installed.receipt_dmg_sha256,
-            })
+            aterm_update::installed_update_facts()
+                // A YANKED bundle newer than this process is not an activation
+                // candidate: reporting it as installed would retire a good download
+                // for an activation every handoff then refuses at the floor
+                // (2026-08-19 round-3 audit). A yanked bundle at or below the running
+                // build is still the bundle we run from and stays reported.
+                .filter(|installed| !(installed.yanked && installed.build_number > current_build))
+                .map(|installed| InstalledUpdate {
+                    build: installed.build_number,
+                    commit: installed.git_commit,
+                    version: installed.version,
+                    receipt_build: installed.receipt_build_number,
+                    receipt_dmg_sha256: installed.receipt_dmg_sha256,
+                })
         },
     )
 }
@@ -1514,7 +1521,35 @@ impl App {
             None => (purpose, facts),
         };
         match self.reconcile_native_update_facts(facts) {
-            NativeUpdateFactsResult::IgnoredStale => {}
+            NativeUpdateFactsResult::IgnoredStale => {
+                // The FACTS were stale, the PURPOSE is not: a control apply whose read
+                // began before this process imported its stage must be re-observed,
+                // not dropped with its "OK apply requested" already sent. Bounded: a
+                // facts worker whose sequence restarted below the last reduced one
+                // answers stale forever, and one control request must not become a
+                // hot loop — after a few tries the request is refused, loudly.
+                const MAX_CONTROL_APPLY_STALE_RETRIES: u8 = 3;
+                if purpose == NativeUpdateReconcilePurpose::ApplyControl
+                    && (self.control_apply_stale_retries >= MAX_CONTROL_APPLY_STALE_RETRIES || {
+                        self.control_apply_stale_retries += 1;
+                        !self.request_native_update_reconcile(purpose)
+                    })
+                {
+                    self.control_apply_stale_retries = 0;
+                    let reason = "Updater facts could not be collected safely";
+                    aterm_update::record_apply_refusal(
+                        self.native_updater_service.snapshot().current_build,
+                        reason,
+                    );
+                    self.surface_update_apply_outcome(
+                        "control request",
+                        UpdateOutcome::Blocked {
+                            reasons: vec![reason.to_string()],
+                        },
+                        false,
+                    );
+                }
+            }
             NativeUpdateFactsResult::Deferred(facts) => {
                 self.deferred_native_update_reconcile =
                     Some(match self.deferred_native_update_reconcile.take() {
@@ -1532,6 +1567,9 @@ impl App {
                     });
             }
             NativeUpdateFactsResult::Reduced { effective_stage } => {
+                if purpose == NativeUpdateReconcilePurpose::ApplyControl {
+                    self.control_apply_stale_retries = 0;
+                }
                 let newly_announced = effective_stage
                     .as_ref()
                     .is_some_and(|stage| announced_before != Some(stage.build));
@@ -1568,7 +1606,15 @@ impl App {
 
                     if purpose == NativeUpdateReconcilePurpose::ApplyControl {
                         let outcome = self.apply_native_update(ApplyMode::Immediate);
+                        let landed = matches!(outcome, UpdateOutcome::Accepted);
                         self.surface_update_apply_outcome("control request", outcome, false);
+                        // A control apply that did not land (preflight blocked, deferred)
+                        // leaves the stage exactly as armed as any other import would:
+                        // the automatic lane picks it up instead of waiting for the
+                        // background thread's next announcement.
+                        if !landed {
+                            self.arm_native_auto_apply(stage.build, &stage.dmg_sha256);
+                        }
                     } else {
                         self.arm_native_auto_apply(stage.build, &stage.dmg_sha256);
                         self.try_pending_native_auto_apply(newly_announced);
@@ -5487,6 +5533,17 @@ impl App {
             }
         }
 
+        // The ledger's failure verdict reaches the snapshot on EVERY reconcile that
+        // holds a stage — exact or not (an activation never matches the durable
+        // marker, and `request_check` refuses while a stage is held, so
+        // `finish_check` cannot carry it): an apply-class streak builds while a
+        // stage is held, and the headline must say so.
+        if self.native_updater_service.snapshot().staged.is_some()
+            && let Some(durable) = durable.as_ref()
+            && self.native_updater_service.absorb_failure_state(durable)
+        {
+            self.publish_native_update_state();
+        }
         let effective = self.native_updater_service.snapshot().staged.as_ref();
         let exact_effective = effective.is_some_and(|staged| {
             crate::native_updater_service::durable_artifact_identity_matches(

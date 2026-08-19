@@ -452,12 +452,14 @@ pub fn emit_super(
 ///
 /// The emitter's structural cap is 160 wash rows plus at most 120 ring / 26
 /// crown / 12 charge pieces, with only the small crown/ring subset sharing a
-/// row.  Overlap is a strictly PER-ROW relation, so the sweep is row-bucketed
-/// ([`peak_additive_channel`]) and costs `Σ_r m_r³` over the per-row quad
-/// populations `m_r` — tens of thousands of integer compares on the worst
-/// shock frame, far below a pixel raster and inside the engine's per-frame
-/// budget.  (The pre-bucketing form re-scanned the WHOLE slice at both inner
-/// levels — `filter` skips nothing — which cost `n · Σ_r m_r²` instead.)
+/// row.  Overlap is a strictly PER-ROW relation, so the probe is row-bucketed
+/// and, inside each bucket, EDGE-SWEPT ([`peak_additive_channel`]): the cost
+/// is `Σ_r (m_r log m_r + m_r²)` over the per-row quad populations `m_r`.
+/// (The lineage, every step value-identical: the first form re-scanned the
+/// WHOLE slice at both inner probe levels — `n · Σ_r m_r²`; row-bucketing cut
+/// that to `Σ_r m_r³` — still tens of thousands of integer compares on the
+/// worst shock frame, re-summing the same subsets from scratch at every
+/// probe; the sweep reads each probe off a running total instead.)
 fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     let peak = peak_additive_channel(quads);
     if peak <= MAX_VIEWPORT_OVERLAY {
@@ -471,43 +473,106 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
 /// The exact peak aggregate RGB channel over the probe points of `quads`.
 ///
 /// Every quad is confined to ONE cell row by [`QuadSink::push`], so a quad can
-/// only ever overlap quads on its own row: bucketing by row leaves the probed
-/// `(px, py)` set and each probe's summed subset exactly as the whole-slice
-/// scan's `q.row == x_edge.row` filters selected them (those filters skipped
-/// nothing — they re-walked all `n` quads at both inner levels).  `peak` is a
-/// max of order-independent `u32` sums (≤ 900 quads × 255 cannot overflow), so
-/// the value — and therefore every colour [`scale_rgb_floor`] derives from it,
-/// and every emitted byte — is bit-identical to the unbucketed sweep.
+/// only ever overlap quads on its own row: the scan buckets by row and, inside
+/// a bucket, runs one ascending-x sweep per y-edge — admitting each quad's
+/// channels at its start edge `x`, retiring them at `x + w`, and reading the
+/// running per-channel totals at every admitted start edge.  VALUE-IDENTICAL
+/// to the exhaustive `(x-edge × y-edge)` probe it replaces — not merely close
+/// — by two facts, pinned bit-for-bit against the retained reference by
+/// `peak_sweep_is_bit_identical_to_exhaustive_probe`:
+///
+/// * at a fixed `py`, each channel's aggregate is a step function of `px` that
+///   only RISES at the start edge of a quad containing `py`, so its maximum
+///   over ALL probe columns is attained at one of those start edges — which
+///   are exactly the columns the sweep reads (the exhaustive form's extra
+///   probes sit inside constant segments and can never exceed those readings);
+/// * every reading is the same order-independent `u32` sum over the same
+///   containment subset (≤ 900 quads × 255 cannot overflow, and a retirement
+///   only ever subtracts a value the sweep previously admitted).
+///
+/// `peak` — and therefore every colour [`scale_rgb_floor`] derives from it,
+/// and every emitted byte — is bit-identical to the probe form's.
 fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
-    // A SIDE permutation: the emitted `GlowQuad` order is observable (the
+    // SIDE permutations: the emitted `GlowQuad` order is observable (the
     // stream is uploaded verbatim and byte-compared by the GPU nova parity
-    // suite), so `quads` itself is never reordered.  ≤ `S_MAX_BOUND` entries,
-    // i.e. one ~7 KB scratch per episode frame.
-    let mut by_row: Vec<&GlowQuad> = quads.iter().collect();
-    by_row.sort_unstable_by_key(|q| q.row);
-    let mut peak = 0u32;
-    for row in by_row.chunk_by(|a, b| a.row == b.row) {
-        for x_edge in row {
-            let px = u32::from(x_edge.x);
+    // suite), so `quads` itself is never reordered — the sweep sorts resident
+    // COPIES (the `overshoot_c` thread-local idiom; the collecting form this
+    // replaces also re-paid a fresh ~7 KB allocation on every burst frame).
+    // In-bucket order is free: every reading is an order-independent sum.
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Vec<GlowQuad>, Vec<GlowQuad>)> =
+            const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    }
+    SCRATCH.with_borrow_mut(|(by_row, by_end)| {
+        by_row.clear();
+        by_row.extend_from_slice(quads);
+        by_row.sort_unstable_by_key(|q| q.row);
+        let mut peak = 0u32;
+        for row in by_row.chunk_by_mut(|a, b| a.row == b.row) {
+            // One bucket = one cell row.  Admissions walk `row` by start
+            // edge; retirements walk `by_end` by end edge; both orders are
+            // set up once per bucket, then every y-band below is one merge.
+            row.sort_unstable_by_key(|q| q.x);
+            by_end.clear();
+            by_end.extend_from_slice(row);
+            by_end.sort_unstable_by_key(|q| u32::from(q.x) + u32::from(q.w));
+            let row = &*row;
             for y_edge in row {
                 let py = u32::from(y_edge.y);
                 let mut sum = [0u32; 3];
-                for q in row {
-                    if px >= u32::from(q.x)
-                        && px < u32::from(q.x) + u32::from(q.w)
-                        && py >= u32::from(q.y)
-                        && py < u32::from(q.y) + u32::from(q.h)
-                    {
-                        sum[0] += (q.color >> 16) & 0xff;
-                        sum[1] += (q.color >> 8) & 0xff;
-                        sum[2] += q.color & 0xff;
+                let (mut i, mut j) = (0, 0);
+                while i < row.len() {
+                    let px = u32::from(row[i].x);
+                    // The probe predicate is HALF-OPEN (`px < x + w`): a quad
+                    // ending exactly at `px` does not contain it, so it must
+                    // retire BEFORE the reading at `px`.  The retirement
+                    // condition mirrors the admission condition below, so
+                    // the running `u32` totals cannot underflow.
+                    while j < by_end.len() {
+                        let q = &by_end[j];
+                        if u32::from(q.x) + u32::from(q.w) > px {
+                            break;
+                        }
+                        if u32::from(q.w) > 0
+                            && py >= u32::from(q.y)
+                            && py < u32::from(q.y) + u32::from(q.h)
+                        {
+                            sum[0] -= (q.color >> 16) & 0xff;
+                            sum[1] -= (q.color >> 8) & 0xff;
+                            sum[2] -= q.color & 0xff;
+                        }
+                        j += 1;
+                    }
+                    // Admit EVERY quad starting at `px` before reading — the
+                    // exhaustive probe at `(px, py)` saw all of them at once.
+                    // A quad that cannot contain the probe (`w == 0`, or `py`
+                    // outside its band) is skipped on BOTH sides and opens no
+                    // reading of its own: between rises each channel total is
+                    // constant, and every rise happens at an admitted quad's
+                    // start edge, so dropping such a column cannot lower the
+                    // maximum (the doc's step-function argument).
+                    let mut read = false;
+                    while i < row.len() && u32::from(row[i].x) == px {
+                        let q = &row[i];
+                        if u32::from(q.w) > 0
+                            && py >= u32::from(q.y)
+                            && py < u32::from(q.y) + u32::from(q.h)
+                        {
+                            sum[0] += (q.color >> 16) & 0xff;
+                            sum[1] += (q.color >> 8) & 0xff;
+                            sum[2] += q.color & 0xff;
+                            read = true;
+                        }
+                        i += 1;
+                    }
+                    if read {
+                        peak = peak.max(sum.into_iter().max().unwrap_or(0));
                     }
                 }
-                peak = peak.max(sum.into_iter().max().unwrap_or(0));
             }
         }
-    }
-    peak
+        peak
+    })
 }
 
 #[cfg(test)]
@@ -1165,6 +1230,111 @@ mod tests {
             crossed.iter().all(|q| q.color != 0),
             "both crossed shapes remain visible"
         );
+    }
+
+    /// CF-1 differential pin: the two-pointer edge sweep must return EXACTLY
+    /// the exhaustive probe scan's value — the reference below IS the
+    /// replaced implementation, kept verbatim — over the full deployed
+    /// emission space (every 10 ms of the window × both themes × {64, 160}
+    /// rows × every deployed cell height), plus hand-built shapes the
+    /// emitter cannot produce, aimed at the sweep's edge conditions
+    /// (half-open retirement, shared start edges, duplicates, zero-extent
+    /// degenerates, a hottest point that is neither quad's own corner).
+    /// `peak` feeds ONE uniform [`scale_rgb_floor`] over the whole frame, so
+    /// a one-count drift here would recolour the entire detonation: this
+    /// test is the sweep's shipping gate, not documentation.
+    #[test]
+    fn peak_sweep_is_bit_identical_to_exhaustive_probe() {
+        fn exhaustive(quads: &[GlowQuad]) -> u32 {
+            let mut by_row: Vec<&GlowQuad> = quads.iter().collect();
+            by_row.sort_unstable_by_key(|q| q.row);
+            let mut peak = 0u32;
+            for row in by_row.chunk_by(|a, b| a.row == b.row) {
+                for x_edge in row {
+                    let px = u32::from(x_edge.x);
+                    for y_edge in row {
+                        let py = u32::from(y_edge.y);
+                        let mut sum = [0u32; 3];
+                        for q in row {
+                            if px >= u32::from(q.x)
+                                && px < u32::from(q.x) + u32::from(q.w)
+                                && py >= u32::from(q.y)
+                                && py < u32::from(q.y) + u32::from(q.h)
+                            {
+                                sum[0] += (q.color >> 16) & 0xff;
+                                sum[1] += (q.color >> 8) & 0xff;
+                                sum[2] += q.color & 0xff;
+                            }
+                        }
+                        peak = peak.max(sum.into_iter().max().unwrap_or(0));
+                    }
+                }
+            }
+            peak
+        }
+        // The deployed space (the `super_budget_s_max_bound` sweep).
+        for ch in [14i32, 20, 40, 56] {
+            for rows in [64i32, 160] {
+                for light in [false, true] {
+                    let e = env(ch, light, rows);
+                    for t in (0..SUPER_TOTAL_MS).step_by(10) {
+                        let mut quads = Vec::new();
+                        emit_super(t, &e, MAX_SUPER_QUADS_PER, &mut quads);
+                        assert_eq!(
+                            peak_additive_channel(&quads),
+                            exhaustive(&quads),
+                            "sweep drifted at t={t} ch={ch} rows={rows} light={light}"
+                        );
+                    }
+                }
+            }
+        }
+        // The adversarial shapes.
+        let quad = |row, x, y, w, h, color| GlowQuad {
+            row,
+            x,
+            y,
+            w,
+            h,
+            color,
+        };
+        let shapes: [&[GlowQuad]; 5] = [
+            &[],
+            // Crossed: the hottest point pairs one quad's x with the other's y.
+            &[
+                quad(0, 0, 5, 10, 10, 0x00FF_0000),
+                quad(0, 5, 0, 10, 10, 0x00FF_0000),
+            ],
+            // Duplicates + a shared start edge inside the pile.
+            &[
+                quad(3, 4, 4, 8, 8, 0x0011_2233),
+                quad(3, 4, 4, 8, 8, 0x0044_5566),
+                quad(3, 4, 8, 2, 2, 0x0077_8899),
+            ],
+            // Zero-width and zero-height degenerates over a live quad: their
+            // edges are probe coordinates in the reference but can never
+            // contribute or open a reading in the sweep.
+            &[
+                quad(1, 2, 2, 0, 4, 0x00FF_FFFF),
+                quad(1, 2, 2, 4, 0, 0x00FF_FFFF),
+                quad(1, 0, 0, 6, 6, 0x0010_2030),
+            ],
+            // A staircase whose retirements interleave its admissions, plus a
+            // second row bucket to exercise the bucket walk.
+            &[
+                quad(2, 0, 0, 4, 4, 0x00A0_0000),
+                quad(2, 2, 1, 4, 4, 0x0000_B000),
+                quad(2, 4, 2, 4, 4, 0x0000_00C0),
+                quad(9, 1, 1, 3, 3, 0x0055_5555),
+            ],
+        ];
+        for (i, s) in shapes.into_iter().enumerate() {
+            assert_eq!(
+                peak_additive_channel(s),
+                exhaustive(s),
+                "adversarial shape {i}"
+            );
+        }
     }
 
     /// FIX I regression: on a viewport TALLER than [`MAX_WASH_ROWS`], the

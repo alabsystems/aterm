@@ -1145,6 +1145,26 @@ pub(crate) fn rendezvous_present() -> bool {
     std::env::var_os(ENV_RENDEZVOUS).is_some() || std::env::var_os(ENV_CLAIM).is_some()
 }
 
+/// The parent's explicit statement of which PROOF TERM its expected adoption
+/// proof was hashed over: `device` (PTY `st_rdev`, the launched lane's term) or
+/// `fd` (descriptor numbers, the fork lane's). Consumed once at boot. A launched
+/// attempt that falls back to the fork lane keeps its device-term proof, so the
+/// successor must not infer the term from how the descriptors arrived.
+pub(crate) const ENV_PROOF_TERM: &str = "ATERM_HANDOFF_PROOF_TERM";
+
+/// Consume [`ENV_PROOF_TERM`]: `Some(true)` for device terms, `Some(false)` for fd
+/// numbers, `None` when the parent said nothing (an older parent — infer from the
+/// lane as before).
+#[must_use]
+pub(crate) fn take_device_proof_term() -> Option<bool> {
+    let value = aterm_log::env::take(ENV_PROOF_TERM)?;
+    match value.to_string_lossy().as_ref() {
+        "device" => Some(true),
+        "fd" => Some(false),
+        _ => None,
+    }
+}
+
 /// Dial the rendezvous named in this launch's environment, present the claim,
 /// and take delivery of every descriptor.
 ///

@@ -111,6 +111,42 @@ struct Edge {
     dxdy: f32,
 }
 
+/// Reusable working memory for [`fill_path`]'s scanline core — one set per
+/// thread, length-reset per call, never returned to the allocator.
+///
+/// The old body allocated all six of these fresh on EVERY call (edge list,
+/// active-edge list, crossing + span buffers, the two row-coverage
+/// accumulators). That is fine for a bake-once glyph, but this rasterizer also
+/// sits on per-frame lanes: the pet's mote tiles and the sing-along notes fill
+/// small squares (~11–20 px) every presented frame — up to four mote tiles at
+/// once (`PET_MOTES_MAX`) — and at that tile size the malloc/free pairs cost as
+/// much as the scanline work they wrap. Thread-local rather than caller-passed
+/// so no public signature changes and every caller (cat/pet/robi bakers, note
+/// and mote bakes) gets the reuse for free; same discipline as the
+/// `word_decorations` ease-out memo. The retained footprint is a few hundred
+/// `Edge`s plus two rows of `i32` at the widest tile ever filled on the thread.
+struct FillScratch {
+    edges: Vec<Edge>,
+    active: Vec<Edge>,
+    xs: Vec<(u32, f32)>,
+    spans: Vec<(f32, f32)>,
+    diff: Vec<i32>,
+    extra: Vec<i32>,
+}
+
+thread_local! {
+    static FILL_SCRATCH: std::cell::RefCell<FillScratch> = const {
+        std::cell::RefCell::new(FillScratch {
+            edges: Vec::new(),
+            active: Vec::new(),
+            xs: Vec::new(),
+            spans: Vec::new(),
+            diff: Vec::new(),
+            extra: Vec::new(),
+        })
+    };
+}
+
 /// Fill `paths` (even-odd per path, union across paths) into `tile` with `rgb` at
 /// `alpha`, 4×4-supersampled, blended through [`Tile::over`]/[`Tile::over_run`].
 /// Degenerate input (empty paths, zero-area geometry, off-tile geometry) is a no-op.
@@ -130,6 +166,39 @@ pub fn fill_path(
     if alpha <= 0.0 || tile.width() == 0 || tile.height() == 0 || paths.is_empty() {
         return;
     }
+    // The scratch borrow spans exactly one core run. Nothing under
+    // `fill_scanline` can re-enter `fill_path` (it calls only `Tile` blends and
+    // local helpers), so the RefCell can never observe a nested borrow; and if
+    // a fill ever unwinds mid-row, the next call re-establishes every invariant
+    // below by length-resetting each buffer before use.
+    FILL_SCRATCH.with_borrow_mut(|scratch| fill_scanline(tile, paths, rgb, alpha, t, scratch));
+}
+
+/// The scanline core of [`fill_path`], with its working memory handed in.
+///
+/// The raster is UNTOUCHED by the split: capacity is the only thing reuse
+/// changes. Every buffer is length-reset here exactly where the old code
+/// created it, the coverage accumulators are rebuilt zeroed at the same
+/// call-exact lengths the old `vec![0; ..]`s had (`add_span` reads
+/// `extra.len()` as the row width, so those lengths are load-bearing), and the
+/// values pushed, sorted and blended are bit-identical to the allocating form
+/// — sorts depend on contents, never on capacity.
+fn fill_scanline(
+    tile: &mut Tile,
+    paths: &[&[PathCmd]],
+    rgb: (f32, f32, f32),
+    alpha: f32,
+    t: PathTransform,
+    scratch: &mut FillScratch,
+) {
+    let FillScratch {
+        edges,
+        active,
+        xs,
+        spans,
+        diff,
+        extra,
+    } = scratch;
     // Flatten every path to device-space edges; track the union bbox.
     let mut bbox = BBox::empty();
     // Size the edge list up front. It otherwise doubles from empty to several
@@ -150,25 +219,30 @@ pub fn fill_path(
             n.saturating_add(e)
         })
     });
-    let mut edges: Vec<Edge> = Vec::with_capacity(est);
+    edges.clear();
+    edges.reserve(est);
     for (pid, p) in paths.iter().enumerate() {
-        flatten_path(p, pid as u32, t, &mut bbox, &mut edges);
+        flatten_path(p, pid as u32, t, &mut bbox, edges);
     }
     let Some((x0, x1, y0, y1)) = bbox.pixel_range(tile.width(), tile.height()) else {
         return;
     };
     let width = x1 - x0;
     edges.sort_unstable_by(|a, b| a.ytop.total_cmp(&b.ytop));
-    let mut active: Vec<Edge> = Vec::new();
+    active.clear();
     let mut next = 0usize;
-    // Per-sub-scanline scratch: (path, x) crossings and merged union spans.
-    let mut xs: Vec<(u32, f32)> = Vec::new();
-    let mut spans: Vec<(f32, f32)> = Vec::new();
+    // Per-sub-scanline scratch (`xs`, `spans`): cleared at every use inside the
+    // loop, exactly as before, so no reset is needed here.
     // Row coverage accumulators (reset in the flush pass, so rows cost O(touched)):
     // `diff` takes ±4 at full-pixel span boundaries (prefix sum = interior coverage),
     // `extra` takes the per-subsample counts of the few partial boundary pixels.
-    let mut diff = vec![0i32; width + 1];
-    let mut extra = vec![0i32; width];
+    // clear+resize is the same zero-fill the old `vec![0; ..]`s did, minus the
+    // malloc/free pair — and it re-zeroes unconditionally, so the flush-pass
+    // invariant is re-established even after an unwound fill.
+    diff.clear();
+    diff.resize(width + 1, 0);
+    extra.clear();
+    extra.resize(width, 0);
     const INV16: f32 = 1.0 / 16.0;
     for py in y0..y1 {
         // Touched pixel range of this row (union over its 4 sub-scanlines).
@@ -193,7 +267,7 @@ pub fn fill_path(
             }
             // Crossings, grouped by path for even-odd pairing.
             xs.clear();
-            for e in &active {
+            for e in active.iter() {
                 xs.push((e.path, e.xtop + (sy - e.ytop) * e.dxdy));
             }
             xs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
@@ -219,13 +293,13 @@ pub fn fill_path(
                     None => Some((a, b)),
                     Some((ca, cb)) if a <= cb => Some((ca, cb.max(b))),
                     Some((ca, cb)) => {
-                        add_span(&mut diff, &mut extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                        add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
                         Some((a, b))
                     }
                 };
             }
             if let Some((ca, cb)) = cur {
-                add_span(&mut diff, &mut extra, x0, ca, cb, &mut lo_t, &mut hi_t);
+                add_span(diff, extra, x0, ca, cb, &mut lo_t, &mut hi_t);
             }
         }
         if lo_t >= hi_t {
