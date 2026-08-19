@@ -2100,29 +2100,6 @@ pub fn apply_staged_if_ready(
     outcome
 }
 
-/// Whether a staged marker's recorded roster generation has been SUPERSEDED by the
-/// newest generation this client has accepted ([`crate::manifest::Floor::roster_seq`]).
-///
-/// Split out because it is the only part of the apply gate a unit test can hold still —
-/// `apply_staged_if_ready_inner` swaps bundles and execs — and because the `None` case
-/// is a judgement worth stating once, in one place.
-///
-/// `None` means the marker records NO generation, which is UNKNOWN rather than exempt:
-/// it was written by a build that predates the field, so it is evidence of nothing. Two
-/// readings were available and they are not symmetric. Treating it as exempt keeps a
-/// stage that a revocation may already have withdrawn — the exact hole this gate exists
-/// to close. Treating it as superseded costs one re-download, once, on the upgrade that
-/// introduced the field, and only on a client whose floor has actually accepted a
-/// roster: `accepted_floor == 0` means there is no generation to be behind, so an
-/// unarmed or pre-roster client pays nothing at all.
-#[must_use]
-fn roster_generation_superseded(recorded: Option<u64>, accepted_floor: u64) -> bool {
-    match recorded {
-        Some(seq) => seq < accepted_floor,
-        None => accepted_floor > 0,
-    }
-}
-
 fn apply_staged_if_ready_inner(
     current_build: u64,
     current_commit: Option<&str>,
@@ -2288,35 +2265,29 @@ fn apply_staged_if_ready_inner(
         );
         return ApplyOutcome::NoUpdate;
     }
-    // 4c. Honor the ROSTER GENERATION the same way. A stage is an authorization made
-    //     at stage time by a machine the roster named THEN; a revocation lands later,
-    //     and nothing re-asked the question — `roster_authority_superseded` guards the
-    //     stage lane and had no apply-time twin, so a build staged at 10:00 by a
-    //     machine revoked at 10:30 installed at the next launch regardless.
+    // 4c. NO ROSTER-GENERATION GATE HERE, and the reason is worth recording.
     //
-    //     A marker with NO recorded generation is UNKNOWN, not exempt: it was written
-    //     by a build that predates these fields and carries no evidence either way.
-    //     Under a floor that has actually accepted a roster the safe reading is to
-    //     re-stage under the current generation — one re-download, once, on the
-    //     upgrade that introduced the fields. A client that has never accepted a
-    //     roster has no generation to be behind and pays nothing.
-    if roster_generation_superseded(ready.roster_seq, floor.roster_seq) {
-        crate::warn(&format!(
-            "staged build {} was authorized under roster generation {:?}, below the \
-             accepted generation {}; discarding so the next check re-authorizes it",
-            ready.build_number, ready.roster_seq, floor.roster_seq
-        ));
-        staging.retire_published();
-        crate::status::record(
-            &staging,
-            current_build,
-            &format!(
-                "held: staged build {} predates roster generation {} (re-authorizing)",
-                ready.build_number, floor.roster_seq
-            ),
-        );
-        return ApplyOutcome::NoUpdate;
-    }
+    //     A stage is an authorization made at stage time, and a revocation lands
+    //     afterwards, so "retract an already-staged build" is a real gap. But the
+    //     apply lane cannot answer it: revocation is a LIST inside the roster
+    //     document, and all this lane holds is `Floor::roster_seq`, a number.
+    //
+    //     Comparing the marker's recorded generation against that floor LOOKS like
+    //     the missing check and is not. `Floor::roster_seq` ratchets to the
+    //     generation of the roster ASSET the client observed, while the marker
+    //     records the generation the MANIFEST was attributed under — and those two
+    //     legitimately differ. A machine joining the roster attaches the new pair to
+    //     releases that already shipped, so `manifest_seq < floor` is the ordinary
+    //     POST-JOIN STEADY STATE, which `authorize_by_roster` deliberately admits
+    //     ("a newer roster paired with an older release"). Gating on it would retire
+    //     a perfectly good stage on every launch after any join: the update never
+    //     applies and the container is downloaded again forever — the exact
+    //     never-updates shape this file already carries two other scars from.
+    //
+    //     The check lane is where the answer lives, because that is where the roster
+    //     document (and its `revoked` list) is in hand. `Ready` records `machine_id`
+    //     and `roster_seq` so that retraction can be written there without a second
+    //     marker migration; it is deliberately NOT enforced from here.
     if !ready.is_publishable(&staging) {
         staging.retire_published();
         return ApplyOutcome::NoUpdate;
@@ -3135,33 +3106,7 @@ mod tests {
         std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
     }
 
-    /// A REVOCATION MUST REACH AN ALREADY-STAGED BUILD. The stage lane refuses a
-    /// release whose roster generation the client has moved past
-    /// (`roster_authority_superseded`); the apply lane had no twin, so a build staged
-    /// at 10:00 by a machine revoked at 10:30 installed at the next launch anyway and
-    /// only a separate `min_build` yank could have stopped it.
-    #[test]
-    fn a_stage_below_the_accepted_roster_generation_is_superseded() {
-        // Authorized under the generation the client is on: apply.
-        assert!(!roster_generation_superseded(Some(7), 7));
-        // Authorized under a LATER generation than this client has accepted — the
-        // ratchet is monotonic, so this is not a downgrade to refuse here.
-        assert!(!roster_generation_superseded(Some(8), 7));
-        // Staged under 6, client has since accepted 7 (the revocation): withdraw it.
-        assert!(roster_generation_superseded(Some(6), 7));
-    }
 
-    /// An unrecorded generation is UNKNOWN, and the cost of the safe reading is bounded
-    /// to clients that have actually accepted a roster.
-    #[test]
-    fn an_unrecorded_roster_generation_is_unknown_not_exempt() {
-        // A client that has never accepted a roster has no generation to be behind, so
-        // a pre-field marker still applies and nobody pays a re-download.
-        assert!(!roster_generation_superseded(None, 0));
-        // Once a generation HAS been accepted, a marker that cannot say which one it
-        // was authorized under is re-staged rather than trusted.
-        assert!(roster_generation_superseded(None, 1));
-    }
 
     /// A `ready.toml` whose staged bundle is GONE must clear itself. This recovery runs
     /// before the `is_publishable` retirement, so returning Err made that retirement

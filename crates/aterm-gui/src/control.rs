@@ -6527,10 +6527,32 @@ mod tests {
         // DEAD listener: entry present, socket file present, nobody listening.
         let dead = SessionId::generate();
         let dead_sock = dir.join("aterm-77002.sock");
+        let _ = std::fs::remove_file(&dead_sock);
         drop(std::os::unix::net::UnixListener::bind(&dead_sock).expect("bind then drop"));
         std::fs::write(dir.join("aterm-77002.token"), "beef\n").expect("token");
         crate::proxy::write_graph_entry(&dir, &dead, &dead_sock.to_string_lossy(), &nonce);
         let dead_line = format!("@{} text", dead.as_str());
+        // PRECONDITION, stated rather than assumed: the kernel must answer this
+        // dial with ECONNREFUSED. `socket_is_live` deliberately treats ANY OTHER
+        // connect error (EMFILE under a saturated test process, EINTR, EAGAIN) as
+        // "maybe live — never hijack", so under load the plan below can legitimately
+        // return `Some` for reasons that are the environment's, not the code's.
+        // Wait out that transient instead of reporting it as a proxy defect.
+        let refused = (0..50).any(|_| {
+            match aterm_uds::CtlStream::connect(&dead_sock) {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => true,
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    false
+                }
+                Ok(_) => panic!("nobody should be listening on the dead sibling socket"),
+            }
+        });
+        assert!(
+            refused,
+            "PRECONDITION: the dead sibling socket never answered ECONNREFUSED (transient \
+             connect errors persisted for a second) — environment, not the proxy"
+        );
         assert!(
             proxy_forward_plan(&dead_line, Scope::Owner, &store, &dir).is_none(),
             "a dead sibling must fail closed, not hang a dial",

@@ -626,6 +626,14 @@ struct AuthoritativeFetch {
     /// machine the owner just revoked. Having SEEN generation 10, this client must refuse
     /// 9 forever, whether or not it went on to install anything.
     observed_roster_seq: Option<u64>,
+    /// The machine IDS the admitted roster REVOKES, carried out on the same
+    /// observation as [`Self::observed_roster_seq`] and for the same reason.
+    ///
+    /// The seq says a newer generation was seen; this says what that generation
+    /// withdrew. The caller needs it to retract an already-staged build, which is a
+    /// question only this lane can answer: revocation is a LIST inside the roster
+    /// document, and the apply lane holds nothing but the floor NUMBER.
+    observed_revocations: Vec<String>,
 }
 
 /// Unix seconds now, for the roster's freshness and per-machine expiry gates.
@@ -697,6 +705,7 @@ fn authorize_by_roster(
     policy: &RosterPolicy<'_>,
     download: &mut impl FnMut(&str, u64) -> Result<Vec<u8>, String>,
     observed_roster_seq: &mut Option<u64>,
+    observed_revocations: &mut Vec<String>,
 ) -> Result<aterm_update_core::roster::Attribution, RosterFailure> {
     use aterm_update_core::roster::{ROSTER_ASSET, ROSTER_SIG_ASSET, Roster, verify_roster};
     use RosterFailure::{Refused, Transport};
@@ -782,6 +791,9 @@ fn authorize_by_roster(
     // generation has been SEEN — recorded here, before the appcast authorization,
     // so a refusal below (a revoked signer, above all) still advances the floor.
     *observed_roster_seq = Some(roster.roster_seq);
+    // Observed on the SAME event, so a roster that refuses this release below still
+    // tells the caller whom it withdrew.
+    observed_revocations.clone_from(&roster.revoked);
 
     // (6) Deny-list before crypto, then the artifact signature.
     roster
@@ -910,9 +922,17 @@ fn fetch_authoritative_release(
         // caller's ratchet must advance on that observation even when the release itself
         // is refused (see `AuthoritativeFetch::observed_roster_seq`).
         let mut observed_roster_seq = None;
-        let authorized =
-            authorize_by_roster(&candidate, &bytes, roster, download, &mut observed_roster_seq);
+        let mut observed_revocations = Vec::new();
+        let authorized = authorize_by_roster(
+            &candidate,
+            &bytes,
+            roster,
+            download,
+            &mut observed_roster_seq,
+            &mut observed_revocations,
+        );
         fetched.observed_roster_seq = observed_roster_seq;
+        fetched.observed_revocations = observed_revocations;
         match authorized {
             Ok(who) => {
                 // The compatibility NOTE, not a gate. A release signed by a machine
@@ -1035,6 +1055,19 @@ fn fetch_authoritative_release(
 /// generation — at which point staging an artifact authorized under the older generation
 /// would act on authority this client already knows is withdrawn. The refusal is
 /// transient: the next check re-runs under the advanced floor.
+/// Whether an admitted roster's revocations withdraw the machine that authorized the
+/// staged build.
+///
+/// Split out so the decision is testable — the surrounding check lane fetches over the
+/// network — and so the `None` case is stated once: a marker that records NO machine
+/// predates the attribution fields, and an unnamed machine can never be matched against
+/// a revocation list. It is left alone rather than retired, because "I cannot tell who
+/// signed this" is not evidence of withdrawal, and guessing costs a re-download on every
+/// check forever.
+fn revocation_withdraws_stage(revocations: &[String], staged_machine: Option<&str>) -> bool {
+    staged_machine.is_some_and(|machine| revocations.iter().any(|id| id == machine))
+}
+
 fn roster_authority_superseded(observed: Option<u64>, floor_now: u64) -> bool {
     observed.is_some_and(|seq| seq < floor_now)
 }
@@ -1519,6 +1552,70 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         0,
         observed_roster_seq.unwrap_or(0),
     );
+    // A REVOCATION NOW REACHES AN ALREADY-STAGED BUILD. The ratchet above records
+    // that a newer generation was SEEN; this acts on what that generation SAYS.
+    //
+    // A stage is an authorization made earlier, and nothing revisited it: a build
+    // staged at 10:00 by a machine revoked at 10:30 installed at the next launch
+    // regardless, and only a separate `min_build` yank could have stopped a
+    // withdrawn machine's artifact.
+    //
+    // IT BELONGS HERE, NOT IN THE APPLY LANE. Revocation is a LIST, and this is the
+    // only place the roster document is in hand; the apply lane holds a floor NUMBER,
+    // and the obvious comparison there is not merely weaker but WRONG — a manifest
+    // attributed under an older generation than the roster asset is the ordinary
+    // post-join steady state, which `authorize_by_roster` deliberately admits, so
+    // gating on it retires good stages forever (see `install`, gate 4c).
+    //
+    // Matching on `machine_id` is what makes this exact: the id sits inside the
+    // manifest's SIGNED bytes and the roster maps ids to keys, so a genuine
+    // signature by one machine cannot be relabelled as another's.
+    if !fetched.observed_revocations.is_empty()
+        && let Some(staged) = Ready::read_publishable(&staging)
+        && let Some(machine) = staged.machine_id.as_deref()
+        && revocation_withdraws_stage(&fetched.observed_revocations, Some(machine))
+    {
+        // UNDER THE APPLY LOCK, like every other retirement of the published stage.
+        // `apply_staged_if_ready` in a concurrently LAUNCHING instance verifies the
+        // staged `.app` and then renames it into place under `apply_lock`; a
+        // `remove_dir_all` racing that rename would gut the tree it was in the
+        // middle of installing (and, fd-relative, keep unlinking inside the same
+        // inode after the rename — the live install), which the boot sentinel would
+        // then read as a crash loop and revert with the build poisoned. Lock order
+        // is respected (nothing is held here; the stage lock is taken later), and a
+        // boot apply that wins the lock first simply consumes the marker — the
+        // re-read below then finds nothing to retire, which is the honest outcome:
+        // an installed build from a revoked machine is `min_build`'s to yank.
+        match aterm_update_core::FileLock::acquire(&staging.apply_lock) {
+            Ok(_apply_lock) => {
+                if Ready::read_publishable(&staging)
+                    .is_some_and(|still| still.build_number == staged.build_number)
+                {
+                    crate::warn(&format!(
+                        "staged build {} was authorized by machine {machine:?}, which \
+                         roster generation {} revokes; discarding it",
+                        staged.build_number,
+                        observed_roster_seq.unwrap_or(0)
+                    ));
+                    staging.retire_published();
+                    crate::status::record(
+                        &staging,
+                        current_build,
+                        &format!(
+                            "held: staged build {} was signed by machine {machine}, which \
+                             the machine roster has revoked",
+                            staged.build_number
+                        ),
+                    );
+                }
+            }
+            Err(error) => crate::warn(&format!(
+                "staged build {} is signed by revoked machine {machine:?} but the apply \
+                 lock could not be taken to retire it ({error}); the next check retries",
+                staged.build_number
+            )),
+        }
+    }
     let effective_min_build = floor.min_build.max(seen_min_build);
 
     let Some((manifest, release, artifact)) = best else {
@@ -4689,6 +4786,27 @@ mod tests {
     /// while the check was in flight. Strictly `<` — this run's own ratchet write makes
     /// the floor EQUAL in the quiescent case, and an inert tier (no observation) can
     /// never be superseded.
+    /// A REVOCATION MUST REACH AN ALREADY-STAGED BUILD, and must reach nothing else.
+    ///
+    /// The stage lane refuses a release whose signer the roster withdrew, but a build
+    /// already on disk was authorized earlier and nothing revisited it: staged at 10:00
+    /// by a machine revoked at 10:30, installed at the next launch regardless.
+    #[test]
+    fn a_revoked_signer_withdraws_the_stage_it_authorized_and_no_other() {
+        let revoked = vec!["m11".to_string(), "m19".to_string()];
+        assert!(revocation_withdraws_stage(&revoked, Some("m11")));
+        assert!(revocation_withdraws_stage(&revoked, Some("m19")));
+        // The machine that signed this stage is still on the roster.
+        assert!(!revocation_withdraws_stage(&revoked, Some("m3")));
+        // Nothing revoked at all is the overwhelmingly common case.
+        assert!(!revocation_withdraws_stage(&[], Some("m3")));
+        // A marker written before the attribution fields existed names no machine. It
+        // must be LEFT ALONE: "I cannot tell who signed this" is not evidence of
+        // withdrawal, and retiring on it would re-download on every check forever —
+        // the same never-updates shape the apply-lane seq gate had to be removed for.
+        assert!(!revocation_withdraws_stage(&revoked, None));
+    }
+
     #[test]
     fn a_release_is_held_when_its_roster_generation_was_superseded_mid_check() {
         // Quiescent: our own write put the floor at our generation.
