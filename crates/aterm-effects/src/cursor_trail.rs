@@ -1189,6 +1189,42 @@ mod tests {
         assert_eq!(cad.intensity(t + Duration::from_secs(10)), 0.0);
     }
 
+    /// CF-6 SEAM LAW: [`TypingCadence::sample`] is bit-identical to the pair
+    /// of separate reads at the same instant — cold (`last: None`), at every
+    /// key of an igniting burst, and across the decay tail. The gui driver
+    /// swaps three decays per presented frame for one (and skips the read
+    /// outright when no cursor effect can observe it) on the strength of
+    /// exactly this equivalence, so it is pinned here, at the engine, where
+    /// the shared `heat_at` construction lives.
+    #[test]
+    fn sample_matches_the_separate_reads_bit_for_bit() {
+        fn check(cad: &TypingCadence, now: Instant, tag: &str) {
+            let (i, w) = cad.sample(now);
+            assert_eq!(
+                i.to_bits(),
+                cad.intensity(now).to_bits(),
+                "{tag}: intensity"
+            );
+            assert_eq!(w.to_bits(), cad.warmth(now).to_bits(), "{tag}: warmth");
+        }
+        let t0 = Instant::now();
+        let mut cad = TypingCadence::default();
+        check(&cad, t0, "cold, untouched tracker");
+        let mut t = t0;
+        for k in 0..16 {
+            cad.on_keystroke(t);
+            check(&cad, t, &format!("burst key {k}"));
+            t += Duration::from_millis(40);
+        }
+        for ms in [1u64, 100, 300, 600, 5000] {
+            check(
+                &cad,
+                t + Duration::from_millis(ms),
+                &format!("decay +{ms} ms"),
+            );
+        }
+    }
+
     #[test]
     fn readability_cap_bounds_every_cell_at_any_intensity() {
         // The non-negotiable guard: no swept cell ever exceeds the readable ceiling,

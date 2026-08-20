@@ -9984,7 +9984,53 @@ impl App {
                 aterm_core::terminal::CursorStyle::BlinkingBlock
             ),
         };
-        let rainbow_energy = ws.typing_cadence.intensity(frame_started);
+        // CF-6 (gui half): ONE cadence decay per presented frame — and NONE
+        // when nobody is listening. Every `TypingCadence` read re-runs
+        // `decay_heat`'s `powf`, and this pass used to pay it three times per
+        // frame at the same `frame_started` (this energy read + the two reads
+        // inside the `ignite` stamp below), unconditionally — even with every
+        // cursor effect off. One `sample` now feeds all three consumers; the
+        // engine derives both channels from ONE shared decay, so the pair is
+        // bit-identical to the separate reads at this instant (pinned by
+        // `sample_matches_the_separate_reads_bit_for_bit`).
+        //
+        // The skip arm is exact, not approximate — each consumer of the pair
+        // is provably inert when `cadence_heard` is false:
+        //   • rainbow/phaser: the only two body ticks fed the energy. Both
+        //     require their style + `rainbow_block`, and both open with a full
+        //     early-out (`!enabled || degenerate geometry || intensity <= 0.0`
+        //     → clear state, `fp: 0`) — the energy argument only ever reaches
+        //     a local they discard before that early-out. `rainbow_cfg
+        //     .intensity` IS the shared CursorGlow amplitude × shed envelope
+        //     the phaser config repeats verbatim, so one term covers both.
+        //   • trail: a disabled comet's tick reads NONE of the ignited fields
+        //     (it clears sparks and returns fp 0 before touching the config),
+        //     and the returned `trail_color` is consumed by the renderer only
+        //     per live trail cell / under a non-empty-trail dirty guard — both
+        //     vacuously quiet with the trail off. `ignite` at `(0.0, 0.0)` is
+        //     the byte-identical identity stamp (its own doc contract), so the
+        //     colour cannot drift either.
+        // NOTHING stops advancing on the skip arm: cadence reads are
+        // `&self`-pure — heat moves only on `on_keystroke` (still fed by the
+        // input path) and decays as a pure function of the read instant. An
+        // effect toggled back on therefore samples EXACTLY what an
+        // always-sampling build would have — same heat, same instant, same
+        // bits — so a re-enable can neither conjure a phantom hot ribbon nor
+        // lose a real one: mid-burst it ignites hot, precisely as a build
+        // that never skipped would.
+        let cadence_heard = trail_cfg.enabled
+            || (rainbow_block
+                && rainbow_cfg.intensity > 0.0
+                && matches!(
+                    glow_cfg.style,
+                    crate::cursor_glow::GlowStyle::RainbowKitty
+                        | crate::cursor_glow::GlowStyle::Phaser
+                ));
+        let (rainbow_energy, cadence_warmth) = if cadence_heard {
+            ws.typing_cadence.sample(frame_started)
+        } else {
+            (0.0, 0.0)
+        };
         let rainbow_frame = ws.cursor_rainbow.tick(
             cur,
             frame_started,
@@ -10186,14 +10232,12 @@ impl App {
         // coords; the strip splice shifts its rows down like the aurora). Stamp the
         // live typing-cadence ignition onto the config first: a fast sustained burst
         // heats the comet (longer, hotter, capped under the readability ceiling) while
-        // a few keys / slow typing stay a gentle whisper. The cadence read is
-        // non-mutating (idle simply decays to 0), so a steady screen produces no cells
+        // a few keys / slow typing stay a gentle whisper. The stamp rides the
+        // frame's ONE cadence `sample` (CF-6 — bit-identical to the retired
+        // per-call reads; `(0.0, 0.0)` on the skip arm is the identity stamp);
+        // idle decays to 0, so a steady screen produces no cells
         // → `trail_fp == 0` → the early-out returns to 0% idle.
-        crate::cursor_trail::ignite(
-            &mut trail_cfg,
-            ws.typing_cadence.intensity(frame_started),
-            ws.typing_cadence.warmth(frame_started),
-        );
+        crate::cursor_trail::ignite(&mut trail_cfg, rainbow_energy, cadence_warmth);
         let trail_fp = ws
             .cursor_trail
             .tick(cur, frame_started, &trail_cfg, &mut ws.trail_scratch);
@@ -10639,11 +10683,12 @@ impl App {
         let forge_fill = forge_cursor_fill(cursor_body_allowed, &glow_config, || {
             window.cursor_glow.forge_fill()
         });
-        crate::cursor_trail::ignite(
-            &mut trail_config,
-            window.typing_cadence.intensity(now),
-            window.typing_cadence.warmth(now),
-        );
+        // CF-6: both ignition channels from ONE decay — `sample` shares the
+        // `powf` under `intensity`/`warmth`, bit-identical to the retired
+        // separate reads at this same `now` (engine-pinned), at half the
+        // transcendental cost.
+        let (cadence_intensity, cadence_warmth) = window.typing_cadence.sample(now);
+        crate::cursor_trail::ignite(&mut trail_config, cadence_intensity, cadence_warmth);
         window
             .cursor_trail
             .tick(effect_cursor, now, &trail_config, &mut window.trail_scratch);
@@ -17352,11 +17397,10 @@ impl App {
             // Cadence-comet trail off the SAME focused-pane cursor (window coords),
             // ignited by the window's typing cadence — the aurora crown's directional
             // body in split panes too. Idle → zero cells → `trail_fp == 0`.
-            crate::cursor_trail::ignite(
-                &mut trail_cfg,
-                ws.typing_cadence.intensity(now),
-                ws.typing_cadence.warmth(now),
-            );
+            // CF-6: one shared decay for both ignition channels — see the
+            // single-pane driver; bit-equality is pinned engine-side.
+            let (cadence_intensity, cadence_warmth) = ws.typing_cadence.sample(now);
+            crate::cursor_trail::ignite(&mut trail_cfg, cadence_intensity, cadence_warmth);
             let trail_fp = ws
                 .cursor_trail
                 .tick(win_cur, now, &trail_cfg, &mut ws.trail_scratch);

@@ -372,12 +372,20 @@ fn verify_effects_off() -> (BenchApp, Instant) {
         "effects_off.cold",
         &format!("trail_color {cold_color:#08x} (unblended base)"),
     );
-    assert_ne!(
+    // FLIPPED WITNESS (the guard this replaces asserted hot != cold). The
+    // pre-fix driver ran the cadence triple + ignite blend on every presented
+    // frame even with all cursor effects off, so a typed-hot fixture's
+    // trail_color moved with cadence heat — and this guard pinned that waste
+    // by asserting the difference. The CF-6 early-out fix makes the off frame
+    // skip the blend entirely, so hot and cold must now match: an off frame's
+    // colour must NOT depend on typing history. If this ever fails again in
+    // the hot != cold direction, the driver has regressed to paying the
+    // cadence on off frames.
+    assert_eq!(
         hot_color, cold_color,
-        "CF-6 witness: with every cursor effect off, the returned trail_color no longer \
-         moves with cadence heat — the ignite blend (and with it the cadence triple) \
-         did not run on the off frame. If a fix legitimately early-outs this, revisit \
-         this guard alongside it (see the file header)."
+        "CF-6 witness (post-fix): an all-effects-off frame's trail_color moved \
+         with cadence heat — the early-out regressed and the driver is paying \
+         the ignite blend on off frames again."
     );
 
     // LIT control (DarkUnless): only the off switch differs; the script adds a

@@ -926,8 +926,18 @@ fn apply_group(
     // that declined the set is not asking for the set (2026-08-20 independent
     // derivation).
     let declined = layout.declined().is_file();
-    let deliberately_absent =
-        |m: &String| (declined || removed.contains(m)) && !installed.contains_key(m);
+    // `[packages].exclude` is what `uninstall` ITSELF tells the user to reach for —
+    // "keep the set and drop just this one" — and it narrowed the bootstrap lane while
+    // this path ignored it entirely, so the excluded program was pulled straight back
+    // into any coherence tuple whose sibling was installed. A promise the product makes
+    // in its own error message has to be kept by the lane that would break it
+    // (2026-08-20 independent derivation).
+    let cfg = crate::config::cached();
+    let excluded = cfg.exclude();
+    let deliberately_absent = |m: &String| {
+        (declined || removed.contains(m) || excluded.iter().any(|e| e == m))
+            && !installed.contains_key(m)
+    };
     if group.members.iter().any(deliberately_absent) {
         let present = Group {
             members: group
