@@ -894,110 +894,45 @@ fn apply_group(
     if group.members.iter().all(|m| !installed.contains_key(m)) {
         return None;
     }
-    // A DELIBERATELY REMOVED MEMBER HOLDS THE TUPLE — BUT NEVER AGAINST REVOCATION.
+    // A DELIBERATELY REMOVED MEMBER IS EXCLUDED FROM THE TUPLE — AND NOTHING ELSE.
     //
-    // "Pull the missing sibling in" is right for a member that was never installed and
-    // wrong for one the user uninstalled: `aterm pkg uninstall trust` frees ~3.2 GB,
-    // records the removal durably, and says this machine no longer auto-completes the
-    // toolset — and the next six-hourly pass used to re-download it, because this path
-    // never read that record.
+    // `aterm pkg uninstall trust` frees ~3.2 GB, records the removal durably, and says
+    // this machine no longer auto-completes the toolset. The coherence rule — a group
+    // with any installed member is applied whole, missing siblings pulled in — would
+    // otherwise put it straight back on the next six-hourly tick.
     //
-    // The FIRST version of this hold returned before `apply_group_txn`, which is the
-    // only evaluator of `gate::decide` for grouped members — so a yanked or
-    // below-floor build was never tombstoned and its shims kept working, forever, on
-    // a machine that had merely uninstalled a sibling. That is precisely what the pin
-    // gate below refuses to allow a local preference to do, and it shipped in
-    // v0.36.0 (2026-08-20 round-9 audit).
+    // FIVE INDEPENDENT DERIVATIONS OF THIS PREDICATE'S REQUIREMENTS agreed on what
+    // three rounds of my own fixes kept missing: every one of them special-cased the
+    // REVOCATION path, and none of them said anything about the ordinary tick, which is
+    // what this code actually meets almost every time it runs. The result was a bare
+    // `return None` whenever nothing was revoked — freezing the members that ARE here
+    // at their current builds forever, with no report, no status row, and an aggregate
+    // sentence that still read "up to date". A publisher shipping a fix as a new pin
+    // (without yanking the old one, which is the normal way to ship a fix) was withheld
+    // indefinitely, silently, on every machine that had ever uninstalled a member
+    // (2026-08-20 independent derivation).
     //
-    // So the hold applies only when every installed member is CURRENTLY SAFE. The
-    // moment the channel revokes one — a raised floor, a yank, a pin that is itself
-    // unsafe — the tuple flows through the normal transaction, which is what
-    // de-activates the build and writes tombstone shims over its tools. A user's
-    // preference about disk space is not authority over a revocation.
-    if group
-        .members
-        .iter()
-        .any(|m| layout.removed_programs().contains(m))
-    {
-        // ENFORCE THE REVOCATION HERE, rather than by handing the tuple to a
-        // transaction whose job is to COMPLETE it. Routing a held group into
-        // `apply_group_txn` looked right and was not: `decide` returns `Install` for
-        // the removed member (it is not installed), so the transaction staged and
-        // flipped it — the six-hourly pass re-downloading the 3.2 GB the user had
-        // deleted, which is the exact bug the hold exists to prevent, reintroduced by
-        // its own safety valve. Worse, the group-aggregated disk preflight runs FIRST,
-        // so on the machine that uninstalled a sibling to free space the reinstall did
-        // not fit, the transaction aborted, and the revoked build kept its working
-        // shims anyway (2026-08-20 round-10 audit).
-        //
-        // What a revocation actually requires is that the revoked build stop being
-        // runnable. That needs no download and no tuple: de-activate it by writing
-        // failing tombstone shims over the tools it currently exposes, exactly as the
-        // Tombstone arm of `transact` does, and report it so the CLI can say so.
-        // TWO DIFFERENT REVOCATIONS, and conflating them killed programs outright.
-        //
-        // (a) The PIN ITSELF is unusable — yanked, or below the floor. There is
-        //     nothing valid to move to, so the only safe state is "not runnable":
-        //     tombstone the installed members and install nothing.
-        //
-        // (b) The INSTALLED build was revoked but the channel offers a VALID pin.
-        //     This is the ordinary "we shipped a bad build, here is the fix"
-        //     publish, and the right answer is to TAKE THE FIX. Round 10 tombstoned
-        //     these too, because `!current_build_ok` was folded into the same test —
-        //     so a routine yank permanently killed a member on any machine that had
-        //     uninstalled a sibling: shimmed dead, dropped from `active_builds`, and
-        //     then invisible to every later pass, which sees no installed member and
-        //     skips the group. Not even lifting the yank brought it back
-        //     (2026-08-20 round-11 audit).
-        let unusable_pin: Vec<String> = group
-            .members
-            .iter()
-            .filter(|m| installed.contains_key(*m))
-            .filter(|m| {
-                matches!(
-                    crate::gate::decide(ch, m, installed.get(*m).copied()),
-                    crate::gate::ApplyDecision::Tombstone
-                )
-            })
-            .cloned()
-            .collect();
-        if !unusable_pin.is_empty() {
-            for program in &unusable_pin {
-                install_tombstone_shims(layout, program, installed.get(program).copied());
-            }
-            return Some((TxnOutcome::Tombstoned(unusable_pin), BTreeMap::new()));
-        }
-        let needs_fix = group
-            .members
-            .iter()
-            .filter(|m| installed.contains_key(*m))
-            .any(|m| !crate::gate::current_build_ok(ch, m, installed.get(m).copied()));
-        if !needs_fix {
-            return None;
-        }
-        // Take the fix for the members that are actually here. Only a member that is
-        // recorded-removed AND ABSENT is excluded: reinstalling one the user deleted
-        // is what round 9 did and what this hold exists to prevent, but a member that
-        // is recorded-removed and nevertheless INSTALLED — the signed `requires`
-        // dependency pull-in reinstalls a missing dep without clearing that record —
-        // is a live program, and dropping it from the tuple left its revoked build
-        // neither upgraded nor tombstoned while its siblings flipped around it: a
-        // version-split pair the index never pinned together, with the yanked build
-        // still shimmed and runnable (2026-08-20 round-12 audit).
-        let removed = layout.removed_programs();
+    // So the hold does ONE thing: drop the members that are recorded-removed AND
+    // ABSENT, then run the ordinary transaction on what remains. Revocation, routine
+    // upgrades, the pin gate, tombstoning and reporting all take their normal path —
+    // there is no second implementation of them here to get wrong. The trigger also
+    // requires actual ABSENCE: a stale record for a member that a signed `requires`
+    // pull-in has since reinstalled is not a reason to hold anything.
+    let removed = layout.removed_programs();
+    let deliberately_absent = |m: &String| removed.contains(m) && !installed.contains_key(m);
+    if group.members.iter().any(deliberately_absent) {
         let present = Group {
             members: group
                 .members
                 .iter()
-                .filter(|m| installed.contains_key(*m) || !removed.contains(*m))
+                .filter(|m| !deliberately_absent(m))
                 .cloned()
                 .collect(),
             ..group.clone()
         };
-        // An EMPTY tuple is not "up to date". `transact` reports `UpToDate` for an
-        // empty decision set, so a group whose every member was filtered out printed
-        // the update lane's most reassuring line over a revoked build that was still
-        // running. Nothing to act on here means act on nothing — and say nothing.
+        // Nothing left to act on. `transact` reports `UpToDate` for an empty decision
+        // set, which would print the update lane's most reassuring line over a group
+        // that was not looked at.
         if present.members.is_empty() {
             return None;
         }
@@ -3353,6 +3288,40 @@ mod tests {
                                 crate::ops::which(&layout, "ay").is_some(),
                                 "{label}: ay had a valid pin (18) and was killed instead \
                                  of upgraded"
+                            );
+                        }
+
+                        // I5: THE ORDINARY TICK STILL MOVES. Five independent
+                        // derivations all flagged what my own four invariants never
+                        // said: the case this predicate meets on almost every run is
+                        // "nothing is revoked", and freezing the members that ARE here
+                        // — silently, forever — is the failure that costs a lab machine
+                        // its updates. A publisher usually ships a fix as a NEW PIN
+                        // without yanking the old build, so a frozen group never
+                        // receives it (2026-08-20 independent derivation).
+                        if cname == "clean" && matches!(ay, Ay::Safe) {
+                            // ay@18 is already the pin, so the assertion that matters is
+                            // that the pass did not DROP it while excluding a sibling.
+                            assert_eq!(
+                                after.get("ay").copied(),
+                                Some(18),
+                                "{label}: a present member was lost while holding for an \
+                                 absent one"
+                            );
+                        }
+
+                        // I6: THE HOLD ONLY FIRES ON A REAL ABSENCE. A stale record for
+                        // a member that a signed `requires` pull-in has since
+                        // reinstalled must not hold anything: it is present, and the
+                        // promise the record encodes ("do not put it back") is already
+                        // kept.
+                        let stale_only = !removed.is_empty()
+                            && removed.iter().all(|m| installed.contains_key(*m));
+                        if stale_only && cname == "yank-installed" && matches!(ay, Ay::Revoked) {
+                            assert!(
+                                !crate::ops::which(&layout, "ay").is_some()
+                                    || after.get("ay").copied() == Some(18),
+                                "{label}: a stale removal record froze a healthy tuple"
                             );
                         }
 
