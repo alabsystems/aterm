@@ -926,18 +926,20 @@ fn apply_group(
     // that declined the set is not asking for the set (2026-08-20 independent
     // derivation).
     let declined = layout.declined().is_file();
-    // `[packages].exclude` is what `uninstall` ITSELF tells the user to reach for —
-    // "keep the set and drop just this one" — and it narrowed the bootstrap lane while
-    // this path ignored it entirely, so the excluded program was pulled straight back
-    // into any coherence tuple whose sibling was installed. A promise the product makes
-    // in its own error message has to be kept by the lane that would break it
-    // (2026-08-20 independent derivation).
-    let cfg = crate::config::cached();
-    let excluded = cfg.exclude();
-    let deliberately_absent = |m: &String| {
-        (declined || removed.contains(m) || excluded.iter().any(|e| e == m))
-            && !installed.contains_key(m)
-    };
+    // NOTE — `[packages].exclude` is deliberately NOT read here, even though
+    // `uninstall` tells the user it is the way to "keep the set and drop just this
+    // one". I wired it in and took it out again: `config::cached()` is a process-global
+    // OnceLock over the INVOKING user's aterm.toml, and this layer decides against a
+    // caller-supplied `layout`. Reading it here made a synthetic-layout call apply some
+    // other prefix's exclusions and made this file's own unit tests depend on the
+    // developer's real config — in a module that refuses to touch the real `~/.aterm`
+    // for exactly that reason (2026-08-20 round-13 audit).
+    //
+    // The two records consulted below both come from the layout, so they are honest for
+    // whatever store is being acted on. Honouring `exclude` needs it threaded in the
+    // same way; until then the gap is a documented one rather than hidden global state.
+    let deliberately_absent =
+        |m: &String| (declined || removed.contains(m)) && !installed.contains_key(m);
     if group.members.iter().any(deliberately_absent) {
         let present = Group {
             members: group
@@ -1105,11 +1107,28 @@ fn apply_group_txn(
         // reclaim space. The upgrade is what could not be afforded; disabling the
         // revoked build costs nothing and is the half of the decision that must still
         // happen (2026-08-20 independent derivation).
-        for (program, _) in decisions
+        let disabled: Vec<String> = decisions
             .iter()
-            .filter(|(p, d)| *d == ApplyDecision::Install && !crate::gate::current_build_ok(ch, p, installed.get(p).copied()))
-        {
+            .filter(|(p, d)| {
+                *d == ApplyDecision::Install
+                    && !crate::gate::current_build_ok(ch, p, installed.get(p).copied())
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for program in &disabled {
             install_tombstone_shims(layout, program, installed.get(program).copied());
+        }
+        // SAY IT. Disabling a program's tools is the loudest thing this pass can do to a
+        // machine, and it was the only tombstone site in this file that reported
+        // nothing — while the abort message immediately below told the user the group
+        // "stays coherent on its previous builds", which is the opposite of what just
+        // happened to these members (2026-08-20 round-13 audit).
+        for program in &disabled {
+            println!(
+                "atpkg: {program} was recalled and there is not room to install its \
+                 replacement — its commands are disabled until there is. Free space and \
+                 run `atpkg update`."
+            );
         }
         // Stage NOTHING — the group stays coherent on its current builds.
         return (
@@ -3151,6 +3170,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
     // --- rollback + local pin + apply_program (steps 9/10/11) --------------------------
 
     /// Lay down a COMPLETE build dir with `bin/<program>`; `activate` also shims + activates
@@ -4460,6 +4480,12 @@ mod tests {
         let live_sig = testkit::sign(&testkit::MASTER_SEED, &live_bytes);
         assert!(crate::sig::admit_roster(&anchor, live_bytes, &live_sig, testkit::NOW).is_ok());
     }
+
+
+
+
+
+
 
 
 

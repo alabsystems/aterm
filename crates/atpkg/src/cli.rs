@@ -1557,10 +1557,17 @@ fn cmd_update_all() -> ExitCode {
     // The ACTIVE build per program (what the shims point at), NOT the max complete build
     // on disk — so `decide` never treats a staged-but-unactivated build as the running one
     // (which would silently skip a needed re-flip, #19).
-    // The DECISION-TIME view: a program whose tools were tombstoned by an earlier
-    // revocation is still installed, and must stay visible to this pass or the
-    // tombstone is a one-way door (2026-08-20 independent derivation).
-    let installed: std::collections::BTreeMap<String, u64> = crate::installed_builds(&layout);
+    // THE SHIM VIEW, deliberately. Its SILENCE for a tombstoned program is the
+    // self-heal: `decide` then returns Install for the build `store/<p>/current`
+    // already names, the transaction re-stages it (`Staged::was_live` exists for
+    // exactly that member), and the shims come back. Widening this to include the
+    // authority link — which I did, to close what an independent derivation called a
+    // "one-way door" — REMOVED that silence and made the door real: a tombstoned
+    // program whose pin had not moved decided UpToDate forever, a rollback re-pointed
+    // its shims into the revoked build, and `uninstall --all` on a declined machine
+    // revived it. The derivation's claim was wrong and so was my fix
+    // (2026-08-20 round-13 audit).
+    let installed: std::collections::BTreeMap<String, u64> = crate::active_builds(&layout);
     // WHO gets set-completion: a machine that has ADOPTED the toolset (the seed bootstrap
     // or an explicit "Install ALab toolset" already laid the whole set down), or one whose
     // owner ticked `auto_install` to authorize a from-scratch network bootstrap. The two

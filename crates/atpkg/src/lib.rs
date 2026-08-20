@@ -133,7 +133,7 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, parse_pkg,
 };
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
-pub use ops::{active_builds, installed_builds, list_installed, uninstall, which};
+pub use ops::{active_builds, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
 pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,
