@@ -130,6 +130,7 @@ impl UpdateState {
             installable: snapshot.installable,
             checking,
         }
+        .without_inapplicable_stage()
     }
 
     /// Snapshot the current updater state. `status` is `aterm_update::status(build)` —
@@ -178,6 +179,35 @@ impl UpdateState {
             installable: status.is_none_or(|s| s.installable),
             checking,
         }
+        .without_inapplicable_stage()
+    }
+
+    /// A stage this copy CANNOT APPLY is not a stage for this copy.
+    ///
+    /// `aterm_update::status()` reads a HOME-keyed Updates directory, so every copy
+    /// of the app for one user shares ONE ready.toml — while `installable` is
+    /// per-copy (`bundle::resolve()`). `staged.is_some() && !installable` is
+    /// therefore a REACHABLE state: the user's installed /Applications copy stages
+    /// build N+1, and they open an older aterm.app from a mounted DMG or a
+    /// translocated download. Every surface tests `staged` first, so that window
+    /// headlined "Update ready", printed the full release notes for a build it could
+    /// never install, and offered an enabled Install button whose apply lane returns
+    /// NotApplicable — the exact over-claim the `installable` work removed
+    /// everywhere else (2026-08-19 round-7 audit).
+    ///
+    /// Clearing it here fixes every surface at once, including the default action,
+    /// rather than adding a `!installable` guard to each and waiting for the next one
+    /// to be written without it.
+    fn without_inapplicable_stage(mut self) -> Self {
+        if !self.installable {
+            self.staged = None;
+            self.changelog.clear();
+            // The ledger's own sentence describes the check the INSTALLED copy ran;
+            // this copy has never run one, and "up to date" under a headline saying
+            // it can never update is the same contradiction one row lower.
+            self.outcome.clear();
+        }
+        self
     }
 
     /// Snapshot the exact state the existing update card paints for native tab
@@ -955,6 +985,27 @@ mod tests {
     /// `installable` — which is how a page whose headline said "This copy of aterm
     /// can't update itself" carried a card underneath saying the running version
     /// was the latest build (2026-08-19 round-6 audit).
+    /// The stage ledger is HOME-keyed and shared by every copy of the app; a copy
+    /// that cannot replace itself must not present the installed copy's staged build
+    /// as its own. Before this, that window headlined "Update ready" with notes and
+    /// an enabled Install button (2026-08-19 round-7 audit).
+    #[test]
+    fn a_stage_this_copy_cannot_apply_is_not_shown_as_ready() {
+        let mut st = staged_status();
+        st.installable = false;
+        let p = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+        assert!(p.staged.is_none(), "a stage it cannot apply is not this copy's");
+        assert!(p.changelog.is_empty(), "…nor are that build's release notes");
+        assert!(p.outcome.is_empty(), "…nor the check verdict it never ran");
+        assert_eq!(p.headline, "This copy of aterm can\u{2019}t update itself.");
+
+        // The same ledger on an ordinary install is still a ready update.
+        st.installable = true;
+        let ok = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+        assert_eq!(ok.staged, Some((830, "0.5.15".to_string())));
+        assert_eq!(ok.headline, "Update ready");
+    }
+
     #[test]
     fn the_projection_carries_whether_this_copy_can_be_replaced_at_all() {
         let mut st = staged_status();

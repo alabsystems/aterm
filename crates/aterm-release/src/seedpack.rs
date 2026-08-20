@@ -353,9 +353,14 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     {
         println!(
             "    WARNING: the seed carries NO x86_64-apple-darwin artifacts (targets: {}) — \
-             the universal app installs NOTHING from the seed on Intel Macs, which download \
-             the payload regardless. Publish an x86_64 lane (tools/atpkg-pack.sh TRIPLE=…), \
-             or acknowledge with ATERM_SEED_ARCH_ACK=1.",
+             an Intel Mac installs NOTHING from the seal. It does NOT fall back to a network \
+             install either: the published index carries no x86_64 packages at all, so on \
+             Intel there is no ALab toolchain by any route, and the client says so \
+             (`seed-unusable: no build for this Mac's architecture`). The blocker is \
+             upstream, not packaging: Trust has no x86_64-apple-darwin std, so the `trust` \
+             and `trust-mc` sysroot bundles cannot be produced for that triple at all \
+             (see buildplan.rs, the compat-slice comment). Acknowledge with \
+             ATERM_SEED_ARCH_ACK=1.",
             listed()
         );
     }

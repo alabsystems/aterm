@@ -7903,7 +7903,7 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             // matters: the release is already live, verified and mirrored, and the
             // only casualty is this machine's convenience, so it warns rather than
             // failing a completed cut.
-            match bundle::place_finished_bundle(&ctx.dist) {
+            match bundle::place_finished_bundle(&ctx.dist, &ctx.version, ctx.build) {
                 Ok(bytes) => step(
                     "place",
                     &format!(
@@ -9278,14 +9278,13 @@ fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) ->
     // absent immediate probe after timeout may be visibility lag, not proof
     // of non-delivery; resume will first converge on any exact-name object.
     let out = post.issue(permit)?;
-    if release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)?.is_some() {
-        verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
-        return Ok(());
-    }
-    // NOTHING WAS SENT — so nothing can have been received, and the intent that
-    // exists only to stop a duplicate POST is protecting against a POST that never
-    // happened. Retract it, and this cut stays resumable once the local cause is
-    // fixed. Without this a curl that rejects its own arguments burns the release.
+    // BEFORE ANY REMOTE PROBE. This verdict is local and provable, and the probe
+    // below is a network call that can fail — under exactly the conditions that
+    // produce a curl exit 2 in the first place (memory pressure kills the gh spawn;
+    // a hammered API answers 5xx three times). A failed probe used to return early
+    // and leave the intent standing, restoring the permanent wedge this retraction
+    // exists to prevent (2026-08-19 round-7 audit). The pre-POST probe above already
+    // answered "did this asset exist beforehand".
     if transport_never_started(&out) {
         ctx.retract_upload_intent(name)?;
         return Err(Error::new(format!(
@@ -9294,6 +9293,10 @@ fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) ->
             out.status,
             out.stderr_utf8().trim()
         )));
+    }
+    if release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)?.is_some() {
+        verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
+        return Ok(());
     }
     Err(Error::new(format!(
         "exact-ID upload of {name} returned {} but no asset is visible; refusing an ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
@@ -10363,12 +10366,8 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
     ensure_ctx_release_lease(ctx)?;
     let permit = ctx.persist_mirror_upload_intent(name)?;
     let out = post.issue(permit)?;
-    if release_asset_identity_for_release_id_optional(slug, release_id, name)?.is_some() {
-        verify_release_asset_id_matches_local(slug, release_id, name, file)?;
-        return Ok(());
-    }
-    // Same rule as the private leg: a request that never left this machine cannot
-    // have been delivered, so the anti-duplicate intent has nothing to protect.
+    // Local, provable, and evaluated before the network probe — same ordering rule
+    // as the private leg, for the same reason.
     if transport_never_started(&out) {
         ctx.retract_mirror_upload_intent(name)?;
         return Err(Error::new(format!(
@@ -10378,6 +10377,10 @@ fn upload_mirror_asset(ctx: &mut CutCtx, slug: &str, release_id: u64, file: &Pat
             out.status,
             out.stderr_utf8().trim()
         )));
+    }
+    if release_asset_identity_for_release_id_optional(slug, release_id, name)?.is_some() {
+        verify_release_asset_id_matches_local(slug, release_id, name, file)?;
+        return Ok(());
     }
     Err(Error::new(format!(
         "mirror upload of {name} returned {} but no asset is visible on {slug}; refusing an \
@@ -10555,6 +10558,31 @@ mod transport_body_tests {
         // curl would look for a file literally named "@/dist/…".
         let flag = args.iter().position(|a| a == "--upload-file").unwrap();
         assert_eq!(args[flag + 1], "/dist/aterm-0.33.0.dmg");
+    }
+
+    /// The retraction must be decided from the LOCAL result, before any network
+    /// probe — a probe that fails would otherwise return early and leave the intent
+    /// standing, which is the permanent wedge the retraction exists to prevent. This
+    /// asserts the ordering as source, because there is nothing else to observe: the
+    /// probe needs a live GitHub release (2026-08-19 round-7 audit).
+    #[test]
+    fn the_retraction_is_decided_before_any_remote_probe() {
+        let src = include_str!("publish.rs");
+        for (func, retract) in [
+            ("fn upload_release_asset_by_id", "ctx.retract_upload_intent(name)?"),
+            ("fn upload_mirror_asset", "ctx.retract_mirror_upload_intent(name)?"),
+        ] {
+            let body = &src[src.find(func).expect("function present")..];
+            let issue = body.find("post.issue(permit)?").expect("the POST");
+            let retracted = body[issue..].find(retract).expect("the retraction");
+            let probed = body[issue..]
+                .find("release_asset_identity_for_release_id_optional")
+                .expect("the visibility probe");
+            assert!(
+                retracted < probed,
+                "{func}: the local never-sent verdict must precede the remote probe"
+            );
+        }
     }
 
     fn out(status: i32, stderr: &str) -> RunOut {

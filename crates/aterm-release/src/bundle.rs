@@ -211,6 +211,23 @@ pub fn dev_install_app_path(dist: &Path) -> PathBuf {
     dist.join("aterm.app")
 }
 
+/// Read one `<key>K</key><string>V</string>` value out of a stamped Info.plist.
+///
+/// Local rather than borrowed from `manifest_out`: this module is mounted on its own
+/// by several integration tests (`#[path]` module mounts), and a cross-module call
+/// would make it uncompilable there for a six-line string scan. It reads what
+/// [`set_plist_string`] writes.
+fn sealed_plist_string(plist: &str, key: &str) -> Option<String> {
+    let key_tag = format!("<key>{key}</key>");
+    let after = plist.find(&key_tag)? + key_tag.len();
+    let start = plist[after..].find("<string>")? + after + "<string>".len();
+    if plist[after..start].contains("<key>") {
+        return None;
+    }
+    let end = plist[start..].find("</string>")? + start;
+    Some(plist[start..end].to_string())
+}
+
 /// Put this cut's finished bundle at `dist/aterm.app`, where the dev install runs
 /// from — the LAST thing a cut does, after the release is live and verified.
 ///
@@ -230,10 +247,35 @@ pub fn dev_install_app_path(dist: &Path) -> PathBuf {
 /// that window would simply fail to find the app.
 ///
 /// Returns the number of bytes the placed bundle carries.
-pub fn place_finished_bundle(dist: &Path) -> Result<u64, String> {
+pub fn place_finished_bundle(dist: &Path, version: &str, build: u64) -> Result<u64, String> {
     let staged = staged_app_path(dist);
     if !staged.is_dir() {
         return Err(format!("{} is not a bundle", staged.display()));
+    }
+    // PROVE IT IS THIS CUT'S BUNDLE. `dist/cut-app/` is never cleaned, and two
+    // pipelines reach this line without having assembled anything: a RECOVERY of
+    // another machine's published release (its journal marks `build` done, so
+    // `assemble` never runs) and any resume past `build`. Whatever an earlier
+    // `--dry-run` or `--rehearse` left behind would otherwise be copied over the dev
+    // install under a transcript line calling it "this cut's verified bundle" —
+    // downgrading the machine, or, if that leftover carries a HIGHER provisional
+    // build number (a dry run claims `max(tail + 1, now)` and is signed and
+    // notarized for real), handing the activation lane a build that was never
+    // released. The lane accepts on build number + policy alone; it does not compare
+    // against the published manifest (2026-08-19 round-7 audit).
+    let plist = std::fs::read_to_string(staged.join("Contents/Info.plist"))
+        .map_err(|e| format!("read {}: {e}", staged.join("Contents/Info.plist").display()))?;
+    let sealed_version = sealed_plist_string(&plist, "CFBundleShortVersionString");
+    let sealed_build = sealed_plist_string(&plist, "CFBundleVersion");
+    if sealed_version.as_deref() != Some(version) || sealed_build.as_deref() != Some(&build.to_string())
+    {
+        return Err(format!(
+            "{} carries {} build {}, not this cut's {version} build {build} — refusing to \
+             hand the dev install a bundle this cut did not produce",
+            staged.display(),
+            sealed_version.as_deref().unwrap_or("no version"),
+            sealed_build.as_deref().unwrap_or("no build"),
+        ));
     }
     let live = dev_install_app_path(dist);
     let incoming = dist.join(".aterm.app.incoming");

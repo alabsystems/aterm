@@ -48,6 +48,92 @@ pub struct Asset {
     pub url: String,
 }
 
+/// The release-download base for `slug` (`owner/repo`), or `None` if the slug is not
+/// exactly one `owner/repo` pair of non-empty, path-safe segments.
+///
+/// Deliberately strict. These builders synthesize a URL instead of reading one out of an
+/// API response, so a slug carrying a slash, a `..`, an empty half, or a scheme would
+/// otherwise splice into a URL pointing somewhere else entirely. Returning `None` costs
+/// only the enumeration fallback, which is the behaviour that shipped before.
+fn release_download_base(slug: &str) -> Option<String> {
+    let (owner, repo) = slug.split_once('/')?;
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !ok(owner) || !ok(repo) {
+        return None;
+    }
+    let mut base = String::from("https://github.com/");
+    base.push_str(owner);
+    base.push('/');
+    base.push_str(repo);
+    base.push_str("/releases/download/");
+    Some(base)
+}
+
+/// The `(pkg-<program>-<build>.toml, .sig)` CDN URLs for a build already pinned by the
+/// signed index — no API request, no discovery. `None` when the slug or program name is
+/// not URL-safe, in which case the caller falls back to release enumeration.
+///
+/// The publishing tag convention is `atpkg-<program>-<build>` (tools/atpkg-publish.sh),
+/// the same string the pack scripts create the release under.
+fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
+    let base = release_download_base(slug)?;
+    if program.is_empty()
+        || !program
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let b = crate::dec_u64(build);
+    // `atpkg-<program>-<build>/pkg-<program>-<build>.toml`
+    let mut toml = base;
+    toml.push_str("atpkg-");
+    toml.push_str(program);
+    toml.push('-');
+    toml.push_str(&b);
+    toml.push_str("/pkg-");
+    toml.push_str(program);
+    toml.push('-');
+    toml.push_str(&b);
+    toml.push_str(".toml");
+    let mut sig = toml.clone();
+    sig.push_str(".sig");
+    Some((toml, sig))
+}
+
+/// The CDN URL for a release ASSET whose name already encodes its build
+/// (`ty-2973.tar.zst` lives under tag `atpkg-ty-2973`), so the tag is the file name with
+/// its extension removed. `None` when the name has no extension to strip or is not
+/// URL-safe — again falling back to enumeration rather than guessing.
+fn direct_asset_url(slug: &str, asset: &str) -> Option<String> {
+    let base = release_download_base(slug)?;
+    // Strip the FULL extension: these are `.tar.zst`, and `Path::file_stem` would leave
+    // `ty-2973.tar`, naming a tag that does not exist.
+    let stem = asset.split_once('.')?.0;
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !asset
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return None;
+    }
+    let mut url = base;
+    url.push_str("atpkg-");
+    url.push_str(stem);
+    url.push('/');
+    url.push_str(asset);
+    Some(url)
+}
+
 /// Find the `(name, name.sig)` asset-URL pair in a release's assets, if **both** are
 /// present. The signed pair is the unit the verifier needs; a release missing either is
 /// skipped (no half-signed artifact is ever fetched).
@@ -410,6 +496,43 @@ impl crate::flow::Fetcher for GithubFetcher {
         name.push('-');
         name.push_str(&crate::dec_u64(build));
         name.push_str(".toml");
+        // ZERO-API FAST PATH. The release TAG is `atpkg-<program>-<build>` by publishing
+        // convention, and `build` arrived here from the SIGNED index's channel `pin`
+        // table — so the exact asset URL is already determined and there is nothing to
+        // discover. Enumerating `…/releases` to find an asset whose name was just
+        // constructed on the line above costs API requests for information already held.
+        //
+        // That cost is not academic: `…/releases?per_page=100` is an api.github.com call,
+        // the unauthenticated budget is 60/hour PER IP, and a 10-program default set
+        // spends all of it — measured 2026-08-19, a clean `install --default-set`
+        // installed 7 of 10 and then took HTTP 403 on ny, trust-mc and ty. The advertised
+        // install is `curl … | bash`, whose user has no token, so the lane that must work
+        // for a stranger was the lane that could not finish.
+        //
+        // Release DOWNLOADS are not API calls. `…/releases/download/<tag>/<asset>` 302s to
+        // release-assets.githubusercontent.com and is CDN-served: measured with the API at
+        // `remaining: 0`, that URL still returned HTTP 200. So this path is not merely
+        // cheaper, it is unmetered.
+        //
+        // It is also STRICTER. Enumeration picks a release from an UNSIGNED API listing;
+        // this derives the URL from the signed pin, so the answer to "which build" comes
+        // only from bytes the master-rooted chain covers. The bytes fetched are still
+        // verified exactly as before (`verify_pkg` → `parse_pkg`, which re-binds program
+        // and build), so the host remains a transport, never an authenticity input (§8).
+        //
+        // Falls back to enumeration on ANY failure — a repo whose tags predate the
+        // convention, or a private mirror that names releases differently, keeps working.
+        if let Some((toml_url, sig_url)) = direct_manifest_urls(&slug, program, build)
+            && let Ok(toml) =
+                aterm_update_core::download_bytes(&toml_url, self.credential(), MANIFEST_CAP)
+            && let Ok(sig) = aterm_update_core::download_bytes(&sig_url, self.credential(), SIG_CAP)
+        {
+            let pair = std::sync::Arc::new((toml, sig));
+            if let Ok(mut memo) = self.manifests.lock() {
+                memo.insert(key.clone(), std::sync::Arc::clone(&pair));
+            }
+            return Ok((*pair).clone());
+        }
         let releases = self.releases_at(&slug)?;
         for r in releases.iter() {
             if let Some((toml_url, sig_url)) = find_pair(&r.assets, &name) {
@@ -468,6 +591,17 @@ impl crate::flow::Fetcher for GithubFetcher {
         // `[packages.links]` fetch override redirects it identically (same token). The
         // listing is the memoized one this program's `pkg_manifest` already paid for.
         let slug = self.slug_for(program, repo);
+        // Same zero-API derivation as `pkg_manifest` (see its note): the artifact rides
+        // the release its manifest does, and the asset name carries the build, so the tag
+        // follows from the name alone (`ty-2973.tar.zst` → `atpkg-ty-2973`). This is the
+        // request that actually moves hundreds of megabytes, and routing it through the
+        // CDN URL rather than the assets API is what takes a default-set install off the
+        // 60/hour meter entirely.
+        if let Some(url) = direct_asset_url(&slug, asset)
+            && aterm_update_core::download_to(&url, self.credential(), dest, ARTIFACT_CAP).is_ok()
+        {
+            return Ok(());
+        }
         let releases = self.releases_at(&slug)?;
         for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
@@ -795,6 +929,67 @@ mod tests {
         assert!(find_pair(&releases[1].assets, "index.toml").is_none());
     }
 
+    /// The zero-API URLs are SYNTHESIZED, not read out of an API response, so the exact
+    /// strings are the contract with the publisher's tag convention
+    /// (`atpkg-<program>-<build>`). A drift here silently sends every fetch to a 404 and
+    /// falls back to the metered lane, which is the failure this path exists to remove.
+    #[test]
+    fn direct_urls_match_the_publishing_tag_convention() {
+        let (toml, sig) = super::direct_manifest_urls("alabsystems/ty", "ty", 2973).unwrap();
+        assert_eq!(
+            toml,
+            "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/pkg-ty-2973.toml"
+        );
+        assert_eq!(
+            sig,
+            "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/pkg-ty-2973.toml.sig"
+        );
+        assert_eq!(
+            super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst").unwrap(),
+            "https://github.com/alabsystems/ty/releases/download/atpkg-ty-2973/ty-2973.tar.zst"
+        );
+        // A hyphenated program name must not confuse the tag: the whole stem is the tag.
+        assert_eq!(
+            super::direct_asset_url("alabsystems/trust-mc", "trust-mc-20011.tar.zst").unwrap(),
+            "https://github.com/alabsystems/trust-mc/releases/download/atpkg-trust-mc-20011/trust-mc-20011.tar.zst"
+        );
+        // `.tar.zst` is a DOUBLE extension: stripping only the last one would name the
+        // non-existent tag `atpkg-ty-2973.tar`.
+        assert!(
+            !super::direct_asset_url("alabsystems/ty", "ty-2973.tar.zst")
+                .unwrap()
+                .contains(".tar/")
+        );
+    }
+
+    /// Anything that could splice a synthesized URL onto another host or path must decline
+    /// and take the enumeration fallback — never emit a URL built from it.
+    #[test]
+    fn direct_urls_refuse_unsafe_slugs_and_names() {
+        for bad in [
+            "alabsystems",                      // no repo half
+            "alabsystems/ty/extra",             // an extra path segment
+            "alabsystems/",                     // empty repo
+            "/ty",                              // empty owner
+            "alabsystems/..",                   // parent traversal
+            "evil.com/x/../../alabsystems/ty",  // traversal via a long slug
+            "https://evil.com/a",               // a scheme smuggled in as a slug
+        ] {
+            assert!(
+                super::direct_manifest_urls(bad, "ty", 1).is_none(),
+                "manifest URL built from unsafe slug {bad:?}"
+            );
+            assert!(
+                super::direct_asset_url(bad, "ty-1.tar.zst").is_none(),
+                "asset URL built from unsafe slug {bad:?}"
+            );
+        }
+        assert!(super::direct_manifest_urls("a/b", "../ty", 1).is_none());
+        assert!(super::direct_manifest_urls("a/b", "", 1).is_none());
+        assert!(super::direct_asset_url("a/b", "../x.tar.zst").is_none());
+        assert!(super::direct_asset_url("a/b", "noextension").is_none());
+    }
+
     #[test]
     fn find_pair_requires_both_and_exact_names() {
         let r = parse_releases(RELEASES_JSON).unwrap();
@@ -1070,14 +1265,28 @@ mod tests {
     /// signature, because the `.lproj` seal tolerates absence but not modification.
     ///
     /// The fix is one `remove_file(dest)`; this proves the registry survives a retry.
-    /// THE ANONYMOUS DELIVERY BUDGET. Candidate gathering costs four asset downloads
-    /// each and is the dominant term in a first bootstrap's GitHub API usage. The
-    /// advertised `curl … | bash` install has no token, so it draws on the anonymous
-    /// 60-requests-per-hour-per-IP limit — and at the old cap of 20 this ALONE cost up
-    /// to 80, a deterministic failure before any package was fetched. Pinned as a
-    /// number rather than a comment because it is a product guarantee, not a tuning
-    /// preference: raising it silently re-breaks delivery for every tokenless user,
-    /// and on a shared corporate NAT for everyone behind it.
+    /// THE ANONYMOUS DELIVERY BUDGET — the FIXED, per-run half of it.
+    ///
+    /// READ THIS BEFORE TRUSTING IT. This test measures candidate gathering ONLY, and
+    /// for a long time its doc comment called that "the dominant term in a first
+    /// bootstrap's GitHub API usage". That was wrong, and being both green and confidently
+    /// worded is what made it harmful: the dominant term was the PER-PROGRAM discovery
+    /// this test never counted — roughly four calls each, ten programs — so the sum it
+    /// certified as fitting was never the sum that had to fit.
+    ///
+    /// Measured on the live channel 2026-08-19: a clean `install --default-set` spent the
+    /// entire 60/hour budget and installed 7 of 10, taking HTTP 403 on the last three,
+    /// while this test passed throughout.
+    ///
+    /// The per-program term is now ZERO — `pkg_manifest`/`download_for` derive the CDN
+    /// URL from the signed channel pin instead of enumerating releases (see their notes),
+    /// and release downloads are not API calls. The same measurement afterwards: 7
+    /// requests total for all ten programs. So this bound is once again worth pinning —
+    /// but as what it actually is, the fixed per-run cost, not as the whole budget.
+    ///
+    /// A REAL end-to-end guarantee cannot be asserted in-process; it needs an install
+    /// against the live channel with no token. Keep this as the cheap regression on the
+    /// fixed term, and do that measurement before shipping a delivery change.
     #[test]
     fn candidate_gathering_fits_the_anonymous_api_budget() {
         const ANONYMOUS_HOURLY_LIMIT: usize = 60;
