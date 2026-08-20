@@ -190,7 +190,11 @@ impl GlowStyle {
 }
 
 /// Resolved tunables (Copy so the host reads it out before borrowing window state).
-#[derive(Clone, Copy, Debug)]
+/// `PartialEq` (structural; never `Eq` — f32 fields) backs the `last_cfg`
+/// compare-on-write in [`CursorGlow::tick`]: two configs that compare equal
+/// hold the same field values, so they must — and do — produce the identical
+/// frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlowConfig {
     pub enabled: bool,
     pub style: GlowStyle,
@@ -3790,6 +3794,22 @@ pub struct CursorGlow {
     /// forged from when the NEXT tick detects a switch (`last_style` alone
     /// cannot reproduce the outgoing colours/length/pack for the residue).
     last_cfg: Option<GlowConfig>,
+    /// LATCH: the `!cfg.enabled` teardown has already run and nothing has
+    /// dirtied wiped state since (driver-02). While set, the dark tick skips
+    /// the ~60-80 idempotent stores of [`Self::clear_transient_state`] +
+    /// [`Self::clear_thermals`] it used to re-issue every frame — and a
+    /// wake-off session pays that dark tick on every presented frame, because
+    /// the pipeline's gate is `enabled_any()`, never per-engine. Dropped by
+    /// every enabled tick, by [`Self::reset`], and via [`Self::unsettle`] at
+    /// each mutating entry that writes wiped state. Entries that only move
+    /// state TOWARD the wiped fixpoint (`clear_blink`, `clear_typed`,
+    /// `drop_row_probe`, the drains/takes/swaps) keep it, as do the two that
+    /// are structurally inert while dark: `cue_keystroke` no-ops once the
+    /// dark tick forces `sound_live` false, and `observe_neighbor_rows`
+    /// no-ops until an `observe_row` — which unsettles — lands first.
+    /// `#[derive(Default)]` starts it false, so the first dark tick still
+    /// runs one (no-op) wipe before latching.
+    dark_settled: bool,
 }
 
 /// Window-space geometry the host passes in (pixels). Effect-stream pixel
@@ -4982,6 +5002,7 @@ impl CursorGlow {
     /// no heat. The hint — not move shape — is the classifier, so plain
     /// arrow-left navigation never quenches.
     pub fn note_backspace(&mut self, now: Instant) {
+        self.unsettle();
         self.quench = (self.quench + Self::QUENCH_GAIN).min(1.0);
         self.heat *= Self::QUENCH_COOL;
         self.coal *= Self::QUENCH_COOL;
@@ -5021,6 +5042,7 @@ impl CursorGlow {
     /// arms the hint; it never touches heat/coal, so a live blaze from real
     /// typing keeps cooling naturally while you navigate through it.
     pub fn note_navigation(&mut self, now: Instant) {
+        self.unsettle();
         self.nav_hint = Some(now);
     }
 
@@ -5046,6 +5068,7 @@ impl CursorGlow {
     /// spend. Everything a plain keyboard produces goes through the 1-cell
     /// [`Self::note_typed`] wrapper unchanged.
     pub fn note_typed_cells(&mut self, now: Instant, cells: u16) {
+        self.unsettle();
         self.type_hint = Some(now);
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
         self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some((now, credits));
@@ -5056,6 +5079,7 @@ impl CursorGlow {
     /// A main-screen ENTER keypress landed — arm the RETURN license (see
     /// [`Self::return_hint`]). Never gates bytes; never classifies as typing.
     pub fn note_return(&mut self, now: Instant) {
+        self.unsettle();
         self.return_hint = Some(now);
     }
 
@@ -5071,6 +5095,7 @@ impl CursorGlow {
     /// retirement that the row change it is about to see was AUTHORED, so the
     /// line above still holds the text its trail decorates.
     pub fn note_newline_break(&mut self, now: Instant) {
+        self.unsettle();
         self.newline_hint = Some(now);
     }
 
@@ -5082,6 +5107,7 @@ impl CursorGlow {
     /// a reflow every ~50 ms during a live drag, and one streak per step reads as
     /// a rainbow scribble rather than a gesture.
     pub fn note_reflow(&mut self, now: Instant) {
+        self.unsettle();
         self.reflow_hint = Some(now);
     }
 
@@ -5193,6 +5219,7 @@ impl CursorGlow {
     /// they never hide inside sync) every hinted alt-screen jump keeps its
     /// owner-mandated meteor/ZOOM. Never gates bytes.
     pub fn note_repaint_blink(&mut self, now: Instant) {
+        self.unsettle();
         self.blink_hint = Some(now);
     }
 
@@ -5234,6 +5261,7 @@ impl CursorGlow {
     /// typed glyph's wake, heat, and rainbow kitty momentum (adversarial-review
     /// finding).
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
+        self.unsettle();
         self.kill_hint = Some(now);
         self.quench = (self.quench + Self::KILL_QUENCH_GAIN).min(1.0);
         self.heat *= Self::QUENCH_COOL;
@@ -5314,6 +5342,7 @@ impl CursorGlow {
     /// natural decay takes over — never a hard cut. Uses the same `set_value` seam as the collection hello's
     /// "guaranteed visible at full momentum" arm.
     pub fn celebrate(&mut self, now: Instant, drive: f32) {
+        self.unsettle();
         let drive = if drive.is_finite() {
             drive.clamp(0.0, 1.0)
         } else {
@@ -5334,6 +5363,7 @@ impl CursorGlow {
     /// this only refuses to let the failure's own prompt jump re-arm the
     /// party mid-grief; momentum re-earns normally once the droop ends.
     pub fn hush_fanfare(&mut self, now: Instant) {
+        self.unsettle();
         self.rainbow.momentum.set_value(now, 0.0);
     }
 
@@ -5498,6 +5528,7 @@ impl CursorGlow {
     /// skipping a frame (scrolled back, split pane unwired, headless) simply
     /// leaves the previous probe in place and the poof detector idle.
     pub fn observe_row(&mut self, row: u16, caret: u16, cols: &[char], now: Instant) {
+        self.unsettle();
         self.row_cur.clear();
         self.row_cur.extend_from_slice(cols);
         // FILL = one past the last non-blank column. A wide continuation
@@ -5908,6 +5939,19 @@ impl CursorGlow {
         self.last_type = None;
     }
 
+    /// UN-LATCH the dark-settled fast path (see [`Self::dark_settled`]): the
+    /// caller is about to write state the `!cfg.enabled` teardown owns — a
+    /// hint, a thermal kick, a row probe, freshly spawned light — so the next
+    /// disabled tick must run the FULL wipe once more instead of trusting the
+    /// latch. Idempotent and ~free; invoked from every externally reachable
+    /// mutation of wiped state, so the latch can never hold a freshly armed
+    /// hint alive across a dark frame (exactly the "stale hint fires on
+    /// re-enable" drift [`Self::clear_transient_state`]'s doc warns about).
+    #[inline]
+    fn unsettle(&mut self) {
+        self.dark_settled = false;
+    }
+
     /// Drop all in-flight light and forget the last cursor position. Used when the
     /// cursor's coordinate space changes out from under the animator (e.g. a single
     /// pane ⇄ split-pane layout transition), so the next tick can't spawn a comet
@@ -5922,6 +5966,7 @@ impl CursorGlow {
         // `sound_live` is deliberately NOT cleared: the engine is still
         // enabled and the next tick re-states it; a reset is a
         // coordinate-space event, not a darkness one.
+        self.unsettle();
         self.clear_transient_state();
         self.clear_thermals();
         self.last = None;
@@ -5966,12 +6011,28 @@ impl CursorGlow {
             // master is off, a keypress records no cue — and any credit banked
             // before the switch dies with the cues it was accounting for.
             self.sound_live = false;
-            self.clear_transient_state();
-            self.clear_thermals();
+            // LATCHED (driver-02): after one full teardown every store in the
+            // wipe pair below is already at its cleared value, and only an
+            // enabled tick, [`Self::reset`], or an [`Self::unsettle`] caller
+            // can dirty them again — each of which drops the latch. So the
+            // wipe runs ONCE per darkness, not once per frame, and a session
+            // running e.g. only sparkle words pays two tracking stores here
+            // instead of the ~60-80-store teardown. The cursor tracking stays
+            // OUTSIDE the latch on purpose: re-enabling mid-session must see
+            // the live position, or the first lit frame spawns one giant
+            // spurious comet (the cursor_trail.rs disabled-branch rationale).
+            if !self.dark_settled {
+                self.clear_transient_state();
+                self.clear_thermals();
+                self.dark_settled = true;
+            }
             self.last = cur;
             self.last_visible = cur.map(|c| (c, now));
             return 0;
         }
+        // Any ENABLED tick may spawn light, bank heat, or arm hints: the next
+        // dark frame must run one full teardown before it may latch again.
+        self.dark_settled = false;
         if self.rng == 0 {
             self.rng = 0x9E37_79B9;
         }
@@ -6007,7 +6068,19 @@ impl CursorGlow {
         }
         self.last_style = Some(cfg.style);
         self.last_pack_fp = live_pack_fp;
-        self.last_cfg = Some(*cfg);
+        // COMPARE-ON-WRITE (driver-05): `last_cfg` backs exactly one cold
+        // read — the outgoing-fade snapshot in `begin_style_fade` — yet the
+        // unconditional store moved ~0.5 KiB per enabled frame. The invariant
+        // is unchanged: after every enabled tick `last_cfg == Some(*cfg)`
+        // still holds (equal ⇒ the stored bytes already ARE this tick's
+        // values; the derive is structural), so the steady state pays a
+        // short-circuiting field compare — the `Option<TrailParams>`
+        // discriminant test skips the ~440-byte pack body whenever no pack is
+        // armed — instead of the copy. A NaN field compares unequal and
+        // simply re-stores: today's behaviour, made explicit.
+        if self.last_cfg.as_ref() != Some(cfg) {
+            self.last_cfg = Some(*cfg);
+        }
         // Incoming ramp-IN (~120 ms): scale the live style's amplitude so it
         // RISES under the outgoing fade instead of popping to full brightness.
         // Strictly inert without a recent switch: `ramp_in_scale` returns
@@ -7003,6 +7076,9 @@ impl CursorGlow {
         cfg: &GlowConfig,
         geom: Geom,
     ) {
+        // Direct-drive seam (tests call `spawn` without a tick): sparks and
+        // thermals are wiped state, so the latch must not survive a spawn.
+        self.unsettle();
         let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom);
         let gap = self.update_typing_thermals(&mv);
         self.retire_abandoned_light(&mv);

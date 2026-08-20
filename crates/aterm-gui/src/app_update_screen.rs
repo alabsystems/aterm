@@ -343,6 +343,21 @@ impl App {
         self.request_redraw_all_windows();
     }
 
+    /// The same card, held for work that is genuinely still running.
+    ///
+    /// A toolchain install extracts multiple GB over minutes; the default card is
+    /// gone in 5.4 s, and `status.toml` is not written until a member finishes, so
+    /// the page the card points at reads "No package activity yet" the whole time.
+    /// The announcement has to outlive the announcement's own first breath — and it
+    /// is replaced the instant a terminal marker arrives (2026-08-20 round-8 audit).
+    pub(crate) fn surface_held_update_status(&mut self, text: &str) {
+        self.notice = Some(
+            crate::notice::TransientNotice::update_status(text, std::time::Instant::now())
+                .holding(std::time::Duration::from_secs(20 * 60)),
+        );
+        self.request_redraw_all_windows();
+    }
+
     /// Re-sync the macOS VERSION menu (the rightmost menu-bar title) to the live update
     /// state: `v<cur> ⬆️` + the one-click "Update to v<staged> — restart now" first item
     /// while a strictly-newer build is staged; `v<cur> ⬆️` + the "Updated to v<cur> just

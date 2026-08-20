@@ -894,6 +894,22 @@ fn apply_group(
     if group.members.iter().all(|m| !installed.contains_key(m)) {
         return None;
     }
+    // A DELIBERATELY REMOVED MEMBER HOLDS THE WHOLE TUPLE. "Pull the missing sibling
+    // in" is right for a member that was never installed and wrong for one the user
+    // uninstalled: `aterm pkg uninstall trust` frees ~3.2 GB, records the removal
+    // durably, and says this machine no longer auto-completes the toolset — and then
+    // the next six-hourly pass re-downloaded it, because this path never read that
+    // record. Coherence is still not violated: rather than flip a partial tuple, the
+    // group is skipped whole and the CLI says so, leaving the user the two honest
+    // moves — reinstall the member, or uninstall its siblings
+    // (2026-08-20 round-8 audit).
+    if group
+        .members
+        .iter()
+        .any(|m| layout.removed_programs().contains(m))
+    {
+        return None;
+    }
     Some(apply_group_txn(
         fetcher, layout, index, ch, channel, triple, group, installed,
     ))
@@ -1562,6 +1578,41 @@ pub(crate) fn verified_pkg(
     let verified = index.verify_pkg(raw, &sig).ok()?;
     let pkg = parse_pkg(&verified).ok()?;
     Some((pinned, repo, pkg))
+}
+
+/// Recover the SIGNED `tree_root` for a build that is already installed.
+///
+/// The attestation is recorded when a member is flipped, and a pass that dies inside
+/// the flip window leaves the member LIVE with no row: `atpkg list` shows it, its
+/// shims work, and `atpkg verify` fails closed forever with "no signed tree_root
+/// recorded; reinstall to enable verification" — while `seed` says "fully installed"
+/// and `update` says "up to date", so nothing repairs it. That window is one power
+/// loss during a first run (2026-08-20 round-8 audit).
+///
+/// This re-derives it from the same authority the install used — fetch, verify under
+/// the index, bind program and build — so a recovered row is exactly the row the
+/// original flip would have written, and never a locally computed guess. `None` on
+/// any doubt: an unrecoverable root leaves the fail-closed state untouched.
+pub fn signed_root_for_installed(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    program: &str,
+    build: u64,
+    triple: &str,
+) -> Option<String> {
+    let repo = index.program(program)?.repo.clone();
+    let (raw, sig) = fetcher.pkg_manifest(&repo, program, build).ok()?;
+    let verified = index.verify_pkg(raw, &sig).ok()?;
+    let pkg = parse_pkg(&verified).ok()?;
+    if !pkg.is_for(program) || pkg.build_number != build {
+        return None;
+    }
+    let root = pkg
+        .artifacts
+        .iter()
+        .find(|a| a.target == triple)
+        .map(|a| a.tree_root.clone())?;
+    (!root.is_empty()).then_some(root)
 }
 
 /// Stage one group member: fetch + verify + parse its per-build manifest, bind program +

@@ -190,7 +190,7 @@ fn main() -> ExitCode {
 }
 
 /// Whether the managed store resolves `tool` — the IN-PROCESS `atpkg::which`
-/// against the same `store::resolve(None)` layout `pkg which` uses, mirroring
+/// against the same `store::resolve_configured()` layout `pkg which` uses, mirroring
 /// the binary era's co-located `atpkg which` probe. Best-effort: an unset HOME
 /// (no layout) or an unresolvable shim both mean "not a tool".
 //
@@ -205,7 +205,7 @@ fn main() -> ExitCode {
 // machine load, against a ~1.4 ms `/bin/echo` spawn baseline (and ~0.5 s cold,
 // with the page cache empty).
 fn store_resolves(tool: &str) -> bool {
-    atpkg::store::resolve(None).is_some_and(|layout| atpkg::which(&layout, tool).is_some())
+    atpkg::store::resolve_configured().is_some_and(|layout| atpkg::which(&layout, tool).is_some())
 }
 
 /// TTY probe for the mode fork. std's `IsTerminal` on stdin: a Finder/.app

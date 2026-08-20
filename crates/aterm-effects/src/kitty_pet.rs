@@ -2264,6 +2264,98 @@ impl PetBrain {
             // 78-column retreat, and the pet would fade in already flinching
             // from a backspace nobody typed. A caret that went away and came
             // back is a NEW sighting, not a move.
+            //
+            // ── the retired fast path (PET-04) ─────────────────────────────
+            // The host ticks this brain once per presented frame FOREVER —
+            // unconditionally, so `needs_frames()` stays truthful — which
+            // means a pet the user never enabled (or whose fade finished
+            // long ago) still pays the whole arm below every frame: ~40
+            // stores of values that are provably already there, one `exp()`
+            // in `enter_settled`, and a full `emit()` whose frame the host
+            // discards at its very first test (`alpha > 0`). Skip all of it,
+            // but ONLY when every skipped write is a no-op:
+            //
+            //   alpha == 0.0, last_caret None — the fade write and the
+            //     forget write have already landed;
+            //   pending_worn None — the look-park landing has nothing to
+            //     land (a parked pair takes the slow arm exactly once, which
+            //     lands it at zero alpha, then this path resumes);
+            //   action == Sleep AND quiet ≥ SLEEP_AFTER + BREATH_WINDOW —
+            //     `enter_settled` would verdict `Sleep` (quiet only grows in
+            //     this arm, so that verdict is now permanent) making its
+            //     `set_action_keep` a no-op, and `emit` would take the
+            //     past-the-breath-window Sleep arm, whose frame is exactly
+            //     the CONSTANT built below (no breath phase, no scale mods,
+            //     no purr);
+            //   speed == 0.0, stride integral — `enter_settled`'s two other
+            //     writes are no-ops. An eased stride usually stalls a few
+            //     ULP shy of its integral target, so a pet that ever WALKED
+            //     simply keeps taking the slow arm — correct, just not
+            //     accelerated; the never-enabled brain this path exists for
+            //     has stride exactly 0.0 forever;
+            //   stimulus latches empty — the arm DROPS bell/cheer/sulk/pet/
+            //     bat/look (no audience, no theater), so a stimulus noted
+            //     while hidden must still meet the slow arm and be dropped,
+            //     never survive into the next appearance;
+            //   motes/departures empty — `resolve_motes`/`_departures` have
+            //     no lives left to expire (until the lanes empty, the slow
+            //     arm keeps running their clocks every frame).
+            //
+            // Everything else the arm clears is written ONLY by the live
+            // path or by the arm itself, and `alpha == 0 && last_caret ==
+            // None` is reachable only through this arm (or `default()`,
+            // whose values are all rest values) — so those fields are
+            // already at rest by induction, and the only public methods
+            // that can disturb rest between ticks are exactly the gates
+            // above (the note_* latches and `sync_look`'s park).
+            //
+            // The clocks still advance: `last_now`/`clock` moved in the
+            // prologue, and `quiet` moves here — a frozen quiet would wake
+            // the pet in the wrong pose (`enter_settled` reads it on the
+            // first frame back). The emitted constant matches `emit`'s
+            // deep-sleep frame field for field, including `emit`'s ONE
+            // state effect on this path: the position clamp (live geometry
+            // can shrink while the pet is retired; the wake's
+            // `station_safe` re-places the body anyway, but the clamp keeps
+            // the held position bit-identical to the slow arm's).
+            if self.alpha == 0.0
+                && self.last_caret.is_none()
+                && self.pending_worn.is_none()
+                && self.action == PetAction::Sleep
+                && self.quiet >= SLEEP_AFTER + BREATH_WINDOW
+                && self.speed == 0.0
+                && self.stride == self.stride.round()
+                && self.pending_bell.is_none()
+                && self.pending_cheer.is_none()
+                && !self.pending_sulk
+                && self.pending_pet == 0
+                && self.pet_at.is_none()
+                && self.pending_bat.is_none()
+                && self.pending_look.is_none()
+                && self.motes.iter().all(Option::is_none)
+                && self.departures.iter().all(Option::is_none)
+            {
+                self.quiet += elapsed;
+                let max_col = (f32::from(sense.cols) - width).max(0.0);
+                let max_row = f32::from(sense.rows.saturating_sub(1));
+                self.col = self.col.clamp(0.0, max_col);
+                self.row = self.row.clamp(0.0, max_row);
+                return PetFrame {
+                    alpha: 0,
+                    action: self.action,
+                    pose: self.species.skin(PetGlyphId::PetSleep0),
+                    col: self.col,
+                    row: self.row,
+                    lift: 0.0,
+                    facing_left: self.facing_left,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    purr: 0.0,
+                    under_ink: self.hiding,
+                    motes: [None; PET_MOTES_MAX],
+                    departures: [None; PET_DEPARTURES_MAX],
+                };
+            }
             self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
             // The envelope has reached zero: a look sync parked mid-appearance
             // ([`Self::sync_look`]) lands now, so the NEXT appearance is the

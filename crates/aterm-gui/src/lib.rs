@@ -14623,7 +14623,7 @@ impl ApplicationHandler<Wake> for App {
                     .and_then(|(_, t)| t.strip_suffix(')'))
                     .map(|s| format!(" {s}"))
                     .unwrap_or_default();
-                self.surface_nonmodal_update_status(&format!(
+                self.surface_held_update_status(&format!(
                     "⇣ Installing the ALab toolchain{size}…"
                 ));
             }
@@ -15425,16 +15425,31 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // tick is skipped when it did, so the toolchain is not re-fetched
             // seconds after being installed.
             let mut seed_installed_something = false;
+            // HOLD OFF THE SELF-UPDATER for as long as this child reads the seal.
+            // It extracts gigabytes out of THIS bundle by path, and an automatic
+            // apply mid-extraction swaps the bundle for one whose seal was stripped
+            // (2026-08-20 round-8 audit). Cleared on every exit path below.
+            let mut saw_marker = false;
+            aterm_update::set_toolchain_install_active(true);
+            // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
+            // dispatch edge — store-lock contention, an unwritable or symlinked
+            // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
+            // stderr and emit no marker. With stderr going to /dev/null the GUI
+            // raised no event, wrote no status and logged nothing, so a launch that
+            // silently did nothing was indistinguishable from one that had nothing
+            // to do (2026-08-20 round-8 audit).
             if let Ok(mut child) = std::process::Command::new(&atpkg)
                 .arg("seed")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
                 .spawn()
             {
+                let mut refusal = child.stderr.take();
                 if let Some(out) = child.stdout.take() {
                     use std::io::BufRead as _;
                     for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
                         if let Some(event) = parse_seed_line(&line) {
+                            saw_marker = true;
                             if matches!(event, Wake::PkgSeed { .. } | Wake::PkgSeedPartial { .. }) {
                                 seed_installed_something = true;
                             }
@@ -15442,8 +15457,30 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         }
                     }
                 }
-                let _ = child.wait();
+                let said = refusal
+                    .as_mut()
+                    .map(|pipe| {
+                        use std::io::Read as _;
+                        let mut text = String::new();
+                        let _ = pipe.read_to_string(&mut text);
+                        text
+                    })
+                    .unwrap_or_default();
+                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                // A non-zero exit that produced no marker is the silent case.
+                if !ok && !saw_marker {
+                    let why = said.trim();
+                    aterm_log::warn!(
+                        "the ALab toolchain install did not run: {}",
+                        if why.is_empty() {
+                            "atpkg exited without saying why"
+                        } else {
+                            why
+                        }
+                    );
+                }
             }
+            aterm_update::set_toolchain_install_active(false);
             if !run_update_loop {
                 // `auto_update = false`: the batteries went in above, and that
                 // is all this thread was asked to do.

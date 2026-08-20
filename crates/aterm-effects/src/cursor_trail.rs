@@ -154,6 +154,22 @@ struct Spark {
     life_ms: u64,
 }
 
+/// One slot of the trail's resident dedup table (the `dedup` field on
+/// [`CursorTrail`]): maps a packed cell key to that cell's slot in the `out`
+/// Vec being built THIS tick. A slot belongs to the current tick only while
+/// its `epoch` matches `CursorTrail::dedup_epoch` — stale epochs read as
+/// empty, which is what makes the per-tick "clear" a single counter bump
+/// instead of a table walk.
+#[derive(Clone, Copy, Default)]
+struct DedupSlot {
+    /// The `dedup_epoch` value of the tick that claimed this slot.
+    epoch: u64,
+    /// Packed cell `(row << 16) | col` this slot indexes.
+    key: u32,
+    /// The cell's index in this tick's `out`.
+    out_idx: u32,
+}
+
 /// Per-window trail animation state.
 #[derive(Default)]
 pub struct CursorTrail {
@@ -198,12 +214,30 @@ pub struct CursorTrail {
     /// host each frame beside the glow's). `false` (main screen / unwired
     /// host) keeps the re-anchor classifier byte-identical.
     ctx_alt: bool,
+    /// The resident cell→`out`-slot probe table behind [`Self::tick`]'s
+    /// overlap merge (see the emit loop there for the WHY): allocated lazily
+    /// on the first lit tick — an idle or disabled window never pays the
+    /// 16 KiB — then reused for the life of the window. Slots are validated
+    /// by `dedup_epoch`, never bulk-cleared.
+    dedup: Vec<DedupSlot>,
+    /// The tick stamp that validates `dedup` slots: a slot whose `epoch`
+    /// differs from the current tick's value reads as EMPTY. Bumped once per
+    /// lit tick. `u64`, so it cannot wrap within a process lifetime — and a
+    /// zeroed fresh table (every slot at epoch 0) can never read as claimed
+    /// against a counter that starts its life at 1.
+    dedup_epoch: u64,
 }
 
 impl CursorTrail {
     /// Hard cap on live sparks (defends against a pathological flood of moves):
     /// far more than a few hundred ms of typing or one capped jump can produce.
     const MAX_SPARKS: usize = 512;
+    /// Slot count of the dedup probe table: a power of two (mask-probing) at
+    /// 2 × [`Self::MAX_SPARKS`], so even a cap-saturated tick (512 distinct
+    /// live cells) leaves the load factor ≤ 1/2 — every linear probe reaches
+    /// an empty slot long before it could wrap, and the average probe length
+    /// stays ~1.
+    const DEDUP_SLOTS: usize = 1024;
     /// A typed-echo key-hint stays armed this long for its paired move
     /// (seconds) — mirrors `CursorGlow::TYPE_HINT_FRESH`.
     const TYPE_HINT_FRESH: f32 = 0.25;
@@ -349,8 +383,30 @@ impl CursorTrail {
             .retain(|s| (now.saturating_duration_since(s.born).as_millis() as u64) < s.life_ms);
 
         // Resolve each spark's current coverage and accumulate into `out`,
-        // de-duplicating overlapping cells (keep the brightest). Small N, so the
-        // linear scan is cheaper than a map.
+        // de-duplicating overlapping cells (keep the brightest). The lookup is
+        // one O(1) probe of the resident epoch-stamped table — NOT a rescan of
+        // everything emitted so far: N here is bounded by MAX_SPARKS = 512
+        // TOTAL live sparks (an app walking its caret every frame keeps
+        // hundreds of DISTINCT cells live at once), not by one comet's length,
+        // and the retired `out.iter_mut().find(..)` made this merge
+        // O(live × deduped) — ~131k probe iterations on a flood frame.
+        // Emission is byte-identical to that scan: sparks are walked in the
+        // same order, a first-seen cell claims its `out` slot at first touch,
+        // and a later overlap only max()es the alpha in place — so `out`'s
+        // contents AND order, and with them the order-dependent fingerprint
+        // fold below, are exactly the linear scan's (pinned by
+        // `dedup_index_matches_the_linear_scan_byte_for_byte`).
+        if !self.sparks.is_empty() {
+            if self.dedup.is_empty() {
+                // First lit tick of this window: size the table once. Idle and
+                // disabled windows never reach this (their sparks stay empty).
+                self.dedup = vec![DedupSlot::default(); Self::DEDUP_SLOTS];
+            }
+            // One counter bump invalidates every slot at once — the O(1)
+            // whole-table "clear" that replaces walking 1024 slots per frame.
+            self.dedup_epoch += 1;
+        }
+        let epoch = self.dedup_epoch;
         for s in &self.sparks {
             let life_ms = s.life_ms.max(1);
             let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
@@ -360,16 +416,41 @@ impl CursorTrail {
             if alpha == 0 {
                 continue;
             }
-            match out
-                .iter_mut()
-                .find(|t| t.row == s.row as usize && t.col == s.col as usize)
-            {
-                Some(existing) => existing.alpha = existing.alpha.max(alpha),
-                None => out.push(TrailCell {
-                    row: s.row as usize,
-                    col: s.col as usize,
-                    alpha,
-                }),
+            let key = (u32::from(s.row) << 16) | u32::from(s.col);
+            // Fibonacci-hash the packed cell to a slot (the top
+            // log2(DEDUP_SLOTS) bits of the golden-ratio product), then
+            // linear-probe. TERMINATION: at most MAX_SPARKS = 512 distinct
+            // keys are claimed per epoch against DEDUP_SLOTS = 1024, so a
+            // stale-epoch (empty) slot is always reached before a wrap.
+            let mask = Self::DEDUP_SLOTS - 1;
+            let shift = 32 - Self::DEDUP_SLOTS.trailing_zeros();
+            let mut i = (key.wrapping_mul(0x9E37_79B9) >> shift) as usize;
+            loop {
+                let slot = &mut self.dedup[i];
+                if slot.epoch != epoch {
+                    // First touch of this cell this tick: claim the slot and
+                    // push — the same first-spark-wins position the linear
+                    // scan gave the cell.
+                    *slot = DedupSlot {
+                        epoch,
+                        key,
+                        out_idx: out.len() as u32,
+                    };
+                    out.push(TrailCell {
+                        row: s.row as usize,
+                        col: s.col as usize,
+                        alpha,
+                    });
+                    break;
+                }
+                if slot.key == key {
+                    // Already emitted this tick: merge exactly as before —
+                    // the brightest overlapping spark wins.
+                    let cell = &mut out[slot.out_idx as usize];
+                    cell.alpha = cell.alpha.max(alpha);
+                    break;
+                }
+                i = (i + 1) & mask;
             }
         }
 
@@ -614,19 +695,36 @@ impl TypingCadence {
         self.last = Some(now);
     }
 
-    /// The ignition intensity `0.0..=1.0` as of `now` — the heat decayed forward to
-    /// `now`, then run through [`ignition_intensity`]. Non-mutating (safe to call
-    /// every frame): a long idle simply reads as a fully-decayed, gentle `0.0`.
-    #[must_use]
-    pub fn intensity(&self, now: Instant) -> f32 {
-        let heat = match self.last {
+    /// The standing heat decayed forward to `now` — the ONE lazy read every
+    /// public accessor derives from. Factored out so [`Self::sample`] can pay
+    /// the transcendental decay (`decay_heat`'s `powf`) exactly once for both
+    /// derived channels, while [`Self::intensity`] / [`Self::warmth`] — which
+    /// delegate here too — stay bit-identical to their pre-factoring bodies
+    /// (same expression, same f32 ops, same order).
+    fn heat_at(&self, now: Instant) -> f32 {
+        match self.last {
             Some(last) => {
                 let dt = now.saturating_duration_since(last);
                 decay_heat(self.heat, dt, self.params.half_life)
             }
             None => 0.0,
-        };
-        ignition_intensity(heat, self.params.knee_lo, self.params.knee_hi)
+        }
+    }
+
+    /// The pure heat→warmth mapping shared by [`Self::warmth`] and
+    /// [`Self::sample`] — kept in one place so the two callers cannot drift.
+    /// See [`Self::warmth`] for the full contract.
+    fn warmth_of(&self, heat: f32) -> f32 {
+        let span = (self.params.knee_lo - self.params.gain).max(f32::EPSILON);
+        ((heat - self.params.gain) / span).clamp(0.0, 1.0)
+    }
+
+    /// The ignition intensity `0.0..=1.0` as of `now` — the heat decayed forward to
+    /// `now`, then run through [`ignition_intensity`]. Non-mutating (safe to call
+    /// every frame): a long idle simply reads as a fully-decayed, gentle `0.0`.
+    #[must_use]
+    pub fn intensity(&self, now: Instant) -> f32 {
+        ignition_intensity(self.heat_at(now), self.params.knee_lo, self.params.knee_hi)
     }
 
     /// Sub-ignition "WARMTH" `0.0..=1.0` as of `now`: `0` at or below ONE key's
@@ -640,15 +738,23 @@ impl TypingCadence {
     /// exactly as today. Non-mutating, like [`Self::intensity`].
     #[must_use]
     pub fn warmth(&self, now: Instant) -> f32 {
-        let heat = match self.last {
-            Some(last) => {
-                let dt = now.saturating_duration_since(last);
-                decay_heat(self.heat, dt, self.params.half_life)
-            }
-            None => 0.0,
-        };
-        let span = (self.params.knee_lo - self.params.gain).max(f32::EPSILON);
-        ((heat - self.params.gain) / span).clamp(0.0, 1.0)
+        self.warmth_of(self.heat_at(now))
+    }
+
+    /// BOTH per-frame channels from ONE lazy decay (driver-01): calling the
+    /// two accessors above with the same `now` decays the same `heat` twice —
+    /// two identical `powf`s per frame on the driver's hot path, forever once
+    /// any key has been pressed. Returns `(intensity, warmth)` derived from a
+    /// single decayed heat: bit-for-bit the pair the accessors return for the
+    /// same `now` (identical inputs through the identical pure f32 pipeline),
+    /// minus the redundant transcendental.
+    #[must_use]
+    pub fn sample(&self, now: Instant) -> (f32, f32) {
+        let heat = self.heat_at(now);
+        (
+            ignition_intensity(heat, self.params.knee_lo, self.params.knee_hi),
+            self.warmth_of(heat),
+        )
     }
 }
 
@@ -1183,5 +1289,68 @@ mod tests {
         assert_eq!(fp, 0, "navigation lays no comet");
         assert!(out.is_empty());
         assert!(!nav.is_active());
+    }
+
+    /// CF-2 DEDUP LAW: the probe-table merge in `tick` emits byte-identically
+    /// — contents AND order — to the retired `out.iter_mut().find(..)` linear
+    /// rescan. The reference fold below IS that original algorithm, run over
+    /// the exact live sparks (same order, same instant) the tick just walked.
+    /// The scripted trace covers the adversarial shapes: a serpentine caret
+    /// walk (hundreds of DISTINCT cells — where the scan went quadratic, and
+    /// the population saturates MAX_SPARKS), a same-row ping-pong (hundreds
+    /// of sparks STACKED on ~48 cells — the merge branch every probe), and
+    /// the decay tail through the alpha==0 skip out to empty.
+    #[test]
+    fn dedup_index_matches_the_linear_scan_byte_for_byte() {
+        let c = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(260),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 1.0,
+            warmth: 0.0,
+        };
+        let mut trail = CursorTrail::default();
+        let mut out = Vec::new();
+        let mut now = Instant::now();
+        for f in 0u64..420 {
+            now += Duration::from_millis(16);
+            let cur = if f < 180 {
+                // Serpentine: 24-cell hops, 10 per 240-column row — cells
+                // revisit only after 600 frames, far past any spark lifetime.
+                (((f / 10) % 60) as u16, ((f % 10) * 24) as u16)
+            } else if f < 360 {
+                // Ping-pong: a 200-column unhinted move every frame.
+                (4, if f.is_multiple_of(2) { 5 } else { 205 })
+            } else {
+                // Stop moving: the population decays out to empty.
+                (4, 205)
+            };
+            let fp = trail.tick(Some(cur), now, &c, &mut out);
+            // The reference: the retired linear-scan merge, byte for byte.
+            let mut want: Vec<TrailCell> = Vec::new();
+            for s in &trail.sparks {
+                let life_ms = s.life_ms.max(1);
+                let age_ms = now.saturating_duration_since(s.born).as_millis() as u64;
+                let tf = ((life_ms - age_ms) * 255 / life_ms) as u32;
+                let alpha = ((s.born_alpha as u32 * tf) / 255) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                match want
+                    .iter_mut()
+                    .find(|t| t.row == s.row as usize && t.col == s.col as usize)
+                {
+                    Some(existing) => existing.alpha = existing.alpha.max(alpha),
+                    None => want.push(TrailCell {
+                        row: s.row as usize,
+                        col: s.col as usize,
+                        alpha,
+                    }),
+                }
+            }
+            assert_eq!(out, want, "frame {f}: emitted cells diverged");
+            assert_eq!(fp == 0, out.is_empty(), "frame {f}: fp/emptiness law");
+        }
     }
 }

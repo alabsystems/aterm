@@ -654,6 +654,94 @@ fn now_rfc3339() -> String {
 /// The signed `tree_root` to persist for `program`: the freshly-applied one when non-empty,
 /// otherwise the ALREADY-RECORDED root. An `already_current` install / an untouched
 /// coherence-group sibling reports an empty tree_root (nothing was flipped) — persisting that
+/// Re-record the signed `tree_root` for any program that is LIVE but unattested.
+///
+/// See the call site for the window that produces one. Silent and best-effort in
+/// both directions: a program whose root cannot be re-derived is left exactly as it
+/// was — fail-closed — and nothing here can fail an update.
+fn recover_missing_roots(layout: &crate::store::Layout, fetcher: &dyn crate::flow::Fetcher) {
+    let live = crate::active_builds(layout);
+    if live.is_empty() {
+        return;
+    }
+    let recorded = crate::status::read(layout).map(|s| s.programs).unwrap_or_default();
+    let unattested: Vec<(String, u64)> = live
+        .iter()
+        .filter(|(program, _)| {
+            recorded
+                .get(program.as_str())
+                .is_none_or(|row| row.tree_root.is_empty())
+        })
+        .map(|(program, build)| (program.clone(), *build))
+        .collect();
+    if unattested.is_empty() {
+        return;
+    }
+    let Ok(index) = crate::resolve_verified_index(
+        fetcher,
+        layout,
+        &effective_anchor(layout),
+        build_floor(layout),
+        now_unix(),
+    ) else {
+        return;
+    };
+    for (program, build) in unattested {
+        let Some(root) =
+            crate::flow::signed_root_for_installed(fetcher, &index, &program, build, current_triple())
+        else {
+            continue;
+        };
+        println!("atpkg: {program} was installed without its signed attestation — recorded");
+        record_status(
+            layout,
+            &program,
+            crate::ProgramStatus {
+                installed_build: Some(build),
+                state: String::from("active"),
+                tree_root: root,
+            },
+            format!("recovered the signed attestation for {program}"),
+        );
+    }
+}
+
+/// Replace the aggregate `status.outcome` sentence without touching per-program rows.
+///
+/// The counterpart to [`clear_status_row`] for the line Settings ▸ Packages actually
+/// shows: retiring a failure row while leaving its sentence behind just makes the
+/// staleness quieter (2026-08-20 round-8 audit).
+fn record_outcome(layout: &crate::store::Layout, outcome: String) {
+    let Some(existing) = crate::status::read(layout) else {
+        return;
+    };
+    let _ = crate::status::write(
+        layout,
+        &crate::Status {
+            outcome,
+            ..existing
+        },
+    );
+}
+
+/// Remove one bookkeeping row from `status.toml` — the counterpart to
+/// [`record_status`] for a failure a later pass has disproved.
+///
+/// Rows like `*index*` and `*toolset*` are WRITE-ONLY diagnostics: nothing ever
+/// deleted one, so a transient failure was indistinguishable from a standing one
+/// for the life of the machine. Best-effort and silent, exactly like the writer:
+/// observability must never fail an update.
+fn clear_status_row(layout: &crate::store::Layout, program: &str) {
+    let Some(existing) = crate::status::read(layout) else {
+        return;
+    };
+    let mut programs = existing.programs;
+    if programs.remove(program).is_none() {
+        return;
+    }
+    let _ = crate::status::write(layout, &crate::Status { programs, ..existing });
+}
+
 /// empty value would erase a perfectly good attestation and break `atpkg verify` for an
 /// untampered program. So an empty new root means "keep what we had", never "forget it".
 fn effective_tree_root(layout: &crate::store::Layout, program: &str, new_root: &str) -> String {
@@ -998,15 +1086,9 @@ fn clear_adoption(layout: &crate::store::Layout) {
 
 /// The programs this user removed individually ([`crate::store::Layout::removed`]).
 fn removed_programs(layout: &crate::store::Layout) -> std::collections::BTreeSet<String> {
-    std::fs::read_to_string(layout.removed())
-        .map(|t| {
-            t.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    // ONE reader, on the layout: the unattended update lanes need the same answer,
+    // and a second copy here is how they came to disagree.
+    layout.removed_programs()
 }
 
 /// Record that `program` was removed on purpose, so no unattended pass puts it back.
@@ -1518,6 +1600,24 @@ fn cmd_update_all() -> ExitCode {
         };
         // Advance the durable anti-rollback floor to the index we just trusted (§8 gate 3).
         advance_floors(&layout, report.index_build, report.roster_seq);
+        // AND CLEAR THE FAILURE THIS PASS JUST DISPROVED. The `*index*` row is
+        // written when a resolve fails and was never removed by anything, so a
+        // single transient network error — a hotel wifi captive portal, a laptop
+        // waking mid-poll — left `atpkg doctor` and Settings ▸ Packages reporting a
+        // broken toolset forever, on a machine that had been updating cleanly every
+        // six hours since (2026-08-20 round-8 audit).
+        clear_status_row(&layout, "*index*");
+        // REPAIR A MEMBER THAT WENT LIVE WITHOUT ITS ATTESTATION. A pass killed
+        // inside the flip window leaves the program installed and working but with
+        // no recorded signed root, and `atpkg verify` fails closed on that forever
+        // while `seed` says "fully installed" and `update` says "up to date" — so
+        // nothing repaired it. Re-derive the root from the same authority the
+        // install used, never a local recomputation (2026-08-20 round-8 audit).
+        recover_missing_roots(&layout, &*fetcher);
+        // …and the SENTENCE that row left behind. `status.outcome` is what Settings
+        // ▸ Packages prints as its detail line, so clearing the row while leaving
+        // "update failed: …" in place swaps one stale verdict for a quieter one.
+        record_outcome(&layout, format!("up to date (index build {})", report.index_build));
         failures = report_channel_apply(&layout, &installed, &report);
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
@@ -1558,6 +1658,31 @@ fn cmd_update_all() -> ExitCode {
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
     crate::hooks::refresh(&layout);
     if failures == 0 {
+        // A PASS THAT INSTALLED NOTHING ON AN EMPTY STORE IS NOT A SUCCESS TO SHOW.
+        // Every group clean-skips when the index publishes no artifact for this
+        // triple, so `failures` stays zero and the verb exited 0 with nothing
+        // installed and no status written — and the Settings button that runs it
+        // reported a green "toolchain up to date" on a machine where the toolchain
+        // can never arrive. Say the true thing instead, durably
+        // (2026-08-20 round-8 audit).
+        if crate::active_builds(&layout).is_empty() {
+            println!(
+                "atpkg: nothing is installed and nothing was installable — the index \
+                 publishes no build for this Mac's architecture ({})",
+                current_triple()
+            );
+            record_status(
+                &layout,
+                "*toolset*",
+                crate::ProgramStatus {
+                    installed_build: None,
+                    state: String::from("unavailable: no build for this architecture"),
+                    tree_root: String::new(),
+                },
+                format!("no ALab build is published for {} yet", current_triple()),
+            );
+            return ExitCode::from(1);
+        }
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -2243,6 +2368,10 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // would break `codesign --verify` and, with it, the updater's verification of
     // the installed bundle at the next apply.
     if failures == 0 {
+        // The toolset is in: retire any standing "blocked"/"unavailable" row this
+        // pass just disproved, so a disk-space or architecture verdict from an
+        // earlier launch stops being Settings' answer forever.
+        clear_status_row(&layout, "*toolset*");
         reclaim_bundled_seed(&seed_dir);
     } else {
         println!(
@@ -2461,6 +2590,23 @@ fn finish_unusable_seed(
                  to receive the toolset",
                 current_triple()
             );
+        } else if running_translated() {
+            // NOT PERMANENT, AND NOT THIS MACHINE'S ARCHITECTURE. `current_triple()`
+            // is a compile-time cfg, so the x86_64 slice of the universal binary
+            // reports x86_64 even on Apple Silicon — which is what runs when someone
+            // ticks "Open using Rosetta", or under any translated parent. Treating
+            // that as "the CPU will not change" deleted the seal from an M-series
+            // Mac that could have installed every program natively, and unticking
+            // the box does not bring it back: only re-downloading the DMG does
+            // (2026-08-20 round-8 audit). tools/install.sh already refuses to decide
+            // a container from the running process's arch for this exact reason.
+            println!(
+                "atpkg: keeping the bundled seed — this process is running under \
+                 Rosetta translation, so {} is not this Mac's real architecture. \
+                 Relaunch aterm natively (Finder ▸ Get Info ▸ uncheck \"Open using \
+                 Rosetta\") and the sealed toolchain installs.",
+                current_triple()
+            );
         } else {
             // The only permanent one in this arm: the CPU will not change.
             permanent = true;
@@ -2469,6 +2615,22 @@ fn finish_unusable_seed(
                  architecture ({}) — no ALab programs were installed, and none are \
                  available for it yet",
                 current_triple()
+            );
+            // AND LEAVE A DURABLE TRACE. Without this the whole first session had no
+            // status.toml at all, so Settings ▸ Packages — the surface the notice
+            // sends the user to — said "atpkg has not run yet" on a machine where it
+            // had run correctly and reached a definite verdict. An honest "no" is
+            // still an answer, and the absence of one reads as a broken install
+            // (2026-08-20 round-8 audit).
+            record_status(
+                layout,
+                "*toolset*",
+                crate::ProgramStatus {
+                    installed_build: None,
+                    state: String::from("unavailable: no build for this architecture"),
+                    tree_root: String::new(),
+                },
+                format!("no ALab build is published for {} yet", current_triple()),
             );
         }
     } else {
@@ -2495,6 +2657,32 @@ fn finish_unusable_seed(
         );
     }
     ExitCode::SUCCESS
+}
+
+/// Is this process running under Rosetta translation?
+///
+/// `sysctl sysctl.proc_translated` is the documented answer (1 = translated). It
+/// matters here because [`current_triple`] is a compile-time `cfg(target_arch)`: the
+/// x86_64 slice of the shipped universal binary reports `x86_64-apple-darwin` on an
+/// Apple Silicon Mac, and any verdict of the form "no build for this architecture"
+/// is then a statement about the SLICE, not the machine. Anything irreversible
+/// keyed on that verdict must ask this first.
+///
+/// Fail-safe: an unreadable sysctl answers `false`, which is the pre-existing
+/// behaviour on every non-translated process.
+#[cfg(target_os = "macos")]
+fn running_translated() -> bool {
+    std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "sysctl.proc_translated"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn running_translated() -> bool {
+    false
 }
 
 /// Say something TRUE about a machine with no sealed registry, and leave a durable
@@ -2524,7 +2712,19 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
         now_unix(),
     )
     .ok()
-    .map(|index| !seed_serviceable(layout, &*fetcher, &index, cfg).is_empty());
+    .map(|index| {
+        // `seed_serviceable` answers "what is left to install HERE", so it returns
+        // empty for two opposite states: nothing is published for this CPU, and
+        // everything is already installed. The second one is the product's happy
+        // path — the seal is consumed and reclaimed after a successful first run —
+        // and reading empty as "unsupported architecture" told every fully
+        // provisioned Apple Silicon Mac that its own architecture was unserved, once
+        // per launch, forever: a stdout marker, a GUI warning pill, a `*toolset*`
+        // row reading "unavailable", and a Settings detail line saying no build
+        // exists (2026-08-20 round-8 audit). Ask the other question first.
+        !seed_serviceable(layout, &*fetcher, &index, cfg).is_empty()
+            || !crate::active_builds(layout).is_empty()
+    });
     if serves_us == Some(false) {
         println!(
             "atpkg: {SEED_UNUSABLE_MARKER}no ALab build is published for this Mac's \
@@ -3039,8 +3239,17 @@ fn report_channel_apply(
                         prog,
                         crate::ProgramStatus {
                             installed_build: installed.get(prog).copied(),
+                            // KEEP THE RECORDED ROOT. These arms describe a program
+                            // that is installed and whose tree did NOT change — a
+                            // held pin, a tombstoned pin, the post-state of an
+                            // aborted transaction. Writing an empty root there
+                            // DELETED the signed attestation of bytes nothing had
+                            // touched, and `atpkg verify` treats an empty root as
+                            // fail-closed, so a single `atpkg pin trust` turned into
+                            // "reinstall 3.2 GB to enable verification"
+                            // (2026-08-20 round-8 audit).
                             state: "tombstoned: pin yanked/below floor".into(),
-                            tree_root: String::new(),
+                            tree_root: effective_tree_root(layout, prog, ""),
                         },
                         format!("group {label}: tombstoned"),
                     );
@@ -3055,7 +3264,7 @@ fn report_channel_apply(
                         crate::ProgramStatus {
                             installed_build: installed.get(prog).copied(),
                             state: "pinned: held against update".into(),
-                            tree_root: String::new(),
+                            tree_root: effective_tree_root(layout, prog, ""),
                         },
                         format!("group {label}: held by pin"),
                     );
@@ -3081,7 +3290,7 @@ fn report_channel_apply(
                     crate::ProgramStatus {
                         installed_build: post.get(failed).copied(),
                         state: format!("aborted: {phase}"),
-                        tree_root: String::new(),
+                        tree_root: effective_tree_root(layout, failed, ""),
                     },
                     format!("group {label}: aborted at {failed} during {phase}"),
                 );
@@ -3367,6 +3576,55 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A translated process must never reach a permanent "wrong architecture"
+    /// verdict: `current_triple()` is a compile-time cfg, so the x86_64 slice of the
+    /// universal binary says x86_64 on an Apple Silicon Mac, and the verdict that
+    /// follows deleted the seal from a machine that could have installed every
+    /// program natively (2026-08-20 round-8 audit).
+    #[test]
+    fn a_translated_process_is_not_evidence_about_this_mac() {
+        // On the native arm64 slice this is false, which is the pre-existing path.
+        // The point of the test is that the decision CONSULTS it at all: the arch
+        // arm of `finish_unusable_seed` must be gated on it before setting
+        // `permanent`, or the reclaim is keyed on a compile-time constant.
+        let src = include_str!("cli.rs");
+        let arm = src
+            .find("the bundled toolchain has no build for this Mac's")
+            .expect("the architecture verdict");
+        let guard = src[..arm]
+            .rfind("running_translated()")
+            .expect("a translation check before the architecture verdict");
+        let permanent = src[..arm]
+            .rfind("permanent = true;")
+            .expect("the permanent assignment");
+        assert!(
+            guard < permanent,
+            "the translation check must come BEFORE the permanent architecture verdict \
+             it gates"
+        );
+        assert!(!running_translated() || cfg!(target_arch = "x86_64"));
+    }
+
+    /// An unattended update must not undo a deliberate uninstall. The coherence
+    /// rule ("a group with any installed member is applied whole, missing siblings
+    /// pulled in") re-downloaded ~3.2 GB of `trust` on the next tick after the user
+    /// removed it (2026-08-20 round-8 audit).
+    #[test]
+    fn a_removed_program_is_read_from_the_layout_by_every_lane() {
+        let root = std::env::temp_dir().join(format!("atpkg-removed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let layout = crate::store::resolve(Some(&root)).expect("layout");
+        std::fs::write(layout.removed(), "# deliberate\ntrust\n\n").unwrap();
+        let removed = layout.removed_programs();
+        assert!(removed.contains("trust"), "the durable record is the answer");
+        assert_eq!(removed.len(), 1, "comments and blanks are not programs");
+        // The CLI reader and the flow reader must be the same answer, or the
+        // unattended lane disagrees with the verb the user ran.
+        assert_eq!(removed, removed_programs(&layout));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A seal inside a build output belongs to whatever produced it. Deleting one
     /// took a gigabyte out of a release mid-package on 2026-08-19; every other

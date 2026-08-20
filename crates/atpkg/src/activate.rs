@@ -17,7 +17,7 @@ use std::io;
 use std::path::Path;
 
 use crate::Layout;
-use crate::platform::{self, ensure_private_dir};
+use crate::platform::{self};
 use crate::store::{ToolName, split_exposed};
 
 /// Atomically point `link` at `target`. The OS-specific indirection primitive:
@@ -60,7 +60,14 @@ pub fn activate_channel(layout: &Layout, channel: &str, build_dir: &Path) -> io:
     let parent = current
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "channel path has no parent"))?;
-    ensure_private_dir(parent)?;
+    // THROUGH THE LAYOUT, so a root-owned SYSTEM prefix gets 0755 rather than 0700.
+    // `Layout::ensure_dir` exists for exactly this and documents the failure it
+    // prevents as observed: an unconditional 0700 installs a toolchain only root can
+    // run, and it fails at the only moment that matters — the first non-root
+    // invocation, with a bare "Permission denied". These three call sites were
+    // reverted to the unconditional helper as collateral in a large rebase
+    // (2026-08-20 round-8 audit).
+    layout.ensure_dir(parent)?;
     atomic_symlink(build_dir, &current)
 }
 
@@ -97,7 +104,7 @@ pub(crate) fn install_tools(
     tools: &[ToolName],
 ) -> io::Result<()> {
     let bin = layout.bin_dir();
-    ensure_private_dir(&bin)?;
+    layout.ensure_dir(&bin)?;
     for tool in tools {
         platform::install_shim(&build_dir.join("bin"), tool, &layout.shim(tool))?;
     }
@@ -208,7 +215,7 @@ pub(crate) fn undo_activation(layout: &Layout, channel: &str, build_dir: &Path) 
 /// this regular-file tombstone with a fresh symlink, so the disable clears itself on recovery.
 pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()> {
     let bin = layout.bin_dir();
-    ensure_private_dir(&bin)?;
+    layout.ensure_dir(&bin)?;
     let shim = layout.shim(tool);
 
     // The failing-shim message. The tool-bearing text is the only variable part; the

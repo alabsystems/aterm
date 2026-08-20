@@ -718,16 +718,31 @@ fn ms_since(now: Instant, at: Instant) -> u64 {
 }
 
 /// Deterministic tip pick: filter the bank by `want`, index by the seed.
+///
+/// Allocation-free ON PURPOSE (PET-02): this runs on every frame of a tip
+/// window (~13.7 % of all presented frames while Robi is on), and the old
+/// form re-collected a `Vec` over the 27-entry const bank each call only to
+/// index it once and drop it. Two passes over `ROBI_TIPS` instead: count the
+/// matches, then walk to the k-th one. `filter` preserves source order, so
+/// the k-th survivor IS the `pool[k]` the Vec held — the returned index is
+/// bit-identical for every `(seed, want)` pair.
 fn pick_tip(seed: u64, want: impl Fn(TipKind) -> bool) -> u16 {
-    let pool: Vec<u16> = ROBI_TIPS
+    let n = ROBI_TIPS.iter().filter(|tip| want(tip.kind)).count();
+    debug_assert!(n > 0);
+    let k = (genome::mix(seed) % n.max(1) as u64) as usize;
+    match ROBI_TIPS
         .iter()
         .enumerate()
         .filter(|(_, tip)| want(tip.kind))
-        .map(|(i, _)| i as u16)
-        .collect();
-    debug_assert!(!pool.is_empty());
-    let n = pool.len().max(1) as u64;
-    pool[(genome::mix(seed) % n) as usize]
+        .nth(k)
+    {
+        Some((i, _)) => i as u16,
+        // `k < n` by construction, so this arm is reachable only when the
+        // bank has NO match at all — the same impossible state the old form
+        // met by indexing into an empty Vec (a panic there too; the
+        // tip-bank test pins every `want` at five-plus matches).
+        None => unreachable!("pick_tip: no ROBI_TIPS entry matches `want`"),
+    }
 }
 
 /// The ladder's extent at cycle-phase `p`: full until the retract starts,

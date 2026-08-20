@@ -253,7 +253,10 @@ fn collection_error_summary(errors: Vec<String>, total: usize) -> Option<String>
 /// (no network, no subprocess). MUST run off the event loop (worker threads
 /// only): it stats the co-located binary and parses `status.toml`.
 pub(crate) fn collect_packages_status(available: bool) -> PackagesStatusReport {
-    let layout = atpkg::store::resolve(None);
+    // The CONFIGURED prefix, not the default: this page is what every seed notice
+    // points at, and reading the default store made a relocated lab store report
+    // "No package activity yet" forever (2026-08-20 round-8 audit).
+    let layout = atpkg::store::resolve_configured();
     collect_packages_status_from_layout(available, layout.as_ref())
 }
 

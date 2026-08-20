@@ -749,6 +749,31 @@ pub fn forgive_trial_launch(target_build: u64) {
 static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// A toolchain install is extracting FROM THIS BUNDLE'S sealed payload right now.
+///
+/// The batteries-included seal lives inside the app bundle, and `atpkg seed` reads
+/// it lazily by PATH over minutes and gigabytes. An automatic apply in that window
+/// `RENAME_SWAP`s the bundle out from under it — and the replacement came from the
+/// lean updater zip, which has the seal stripped. The installer's next read resolves
+/// into a bundle whose payload does not exist, mid-transaction, on exactly the
+/// machines the offline seal exists for (2026-08-20 round-8 audit).
+///
+/// An apply deferred here is not an apply lost: the lane retries on its own cadence,
+/// and the install it is waiting for is minutes, not hours.
+static TOOLCHAIN_INSTALL_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark a toolchain install in flight for the lifetime of the extracting child.
+pub fn set_toolchain_install_active(active: bool) {
+    TOOLCHAIN_INSTALL_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a toolchain install is reading this bundle's sealed payload right now.
+#[must_use]
+pub fn is_toolchain_install_active() -> bool {
+    TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Mark this process an uncommitted handoff candidate (`true` at boot when the
 /// launch carries a handoff; `false` once it is committed).
 pub fn set_uncommitted_handoff_candidate(uncommitted: bool) {

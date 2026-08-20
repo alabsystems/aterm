@@ -437,6 +437,29 @@ impl TrustedIndex {
         self.roster.seq()
     }
 
+    /// The generation THIS INDEX ITSELF DECLARES, from inside its own signed bytes.
+    ///
+    /// Not the same question as [`Self::roster_seq`], which reports the generation of
+    /// the roster blob the candidate was SERVED WITH. `Attribution::bind` deliberately
+    /// admits `index.roster_seq <= roster.roster_seq`, so an old index verifies
+    /// perfectly well beside a newer roster — and whoever assembles a candidate
+    /// chooses which pair to publish. Anything that WAIVES a durable floor has to ask
+    /// this one: pairing the owner's own unmodified older index with the owner's own
+    /// unmodified newer roster otherwise re-based the anti-rollback floor downward
+    /// without forging anything (2026-08-20 round-8 audit).
+    ///
+    /// The master's rescue lever is unaffected: minting a generation and PUBLISHING AN
+    /// INDEX THAT DECLARES IT is still the master's alone, and that index waives the
+    /// floor exactly as designed.
+    #[must_use]
+    pub fn authorizing_seq(&self) -> u64 {
+        // An index that declares NO generation cannot waive a generation floor. Zero
+        // is never strictly greater than a recorded floor, so such a candidate falls
+        // through to the plain anti-rollback comparison — which is exactly the
+        // pre-roster behaviour.
+        self.index.roster_seq.unwrap_or(0)
+    }
+
     /// The roster generation behind it, for a caller that must authorize something else
     /// under the very same generation.
     #[must_use]
@@ -921,6 +944,29 @@ mod tests {
 
     /// An `index.toml` body naming `machine_id` / `roster_seq` — the attribution the
     /// bind (step 10) checks against the key that actually verified.
+    /// Waiving the anti-rollback floor must require an index that DECLARES the newer
+    /// generation, not merely one served beside a newer roster. `Attribution::bind`
+    /// admits `index.roster_seq <= roster.roster_seq`, so re-pairing the owner's own
+    /// unmodified old index with the owner's own unmodified new roster forged nothing
+    /// and still re-based the floor downward (2026-08-20 round-8 audit).
+    #[test]
+    fn only_the_generation_an_index_declares_waives_the_floor() {
+        let floor = BuildFloor {
+            index_build: 100,
+            roster_seq: 4,
+        };
+        // The master's rescue: a NEW index that declares generation 5.
+        assert!(floor.admits(5, 1), "a genuinely newer generation re-bases the floor");
+        // The replay: an OLD index (declaring 4) served beside a generation-5 roster.
+        assert!(
+            !floor.admits(4, 99),
+            "an index below the floor must not be admitted by its neighbour's roster"
+        );
+        assert!(floor.admits(4, 100), "…while the floor itself still passes");
+        // An index that declares nothing cannot waive a generation floor.
+        assert!(!floor.admits(0, 99));
+    }
+
     fn index_body(machine_id: &str, roster_seq: u64, index_build: u64) -> Vec<u8> {
         let mut s = String::from("schema = 2\nindex_build = ");
         s.push_str(&index_build.to_string());

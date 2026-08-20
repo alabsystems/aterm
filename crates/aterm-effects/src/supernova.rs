@@ -893,17 +893,87 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
     bound_shade_opacity(&mut out[out_start..]);
 }
 
-/// Bound the eclipse's full-cell source-over opacity at each host cell.
-/// `Shade` is cell-confined and every supernova Shade has zero jitter, so
-/// `(row, col)` is an exact overlap class.  The stream is capped at 224 shade
-/// stamps.  One frame-wide scale, based on the worst exact `(row, col)` overlap,
-/// preserves the radial veil falloff; the allocation-free quadratic scan runs
-/// only during the 300 ms light-theme detonation.
-fn bound_shade_opacity(decos: &mut [WordDecoration]) {
-    let is_shade = |d: &WordDecoration| {
-        matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
-    };
-    let peak = decos
+/// The exact population the eclipse bound governs — blend AND glyph, because
+/// the light-theme charge motes and debris ride `Over` too and must not be
+/// darkened with the veil (they are mote-sized accents, not cell-covering
+/// shade).
+fn is_shade(d: &WordDecoration) -> bool {
+    matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
+}
+
+/// Slot count of [`peak_shade_probe`]'s stack table. 512 is 2x the emitter's
+/// structural Shade ceiling (<= 200 veil cells + 24 crown stamps in the
+/// eclipse window; the ring fringe's <= 16 live in a disjoint window), so at
+/// [`bound_shade_opacity`]'s <= `SHADE_TAB / 2` admission the load factor
+/// stays <= 1/2 and linear-probe chains stay short.
+const SHADE_TAB_BITS: u32 = 9;
+const SHADE_TAB: usize = 1 << SHADE_TAB_BITS;
+
+/// The worst per-`(row, col)` aggregate Shade alpha, found in ONE pass
+/// (audit CF-3): per-cell sums accumulate in a fixed linear-probe table on
+/// the stack instead of re-walking the whole slice once per stamp — the
+/// previous nested-filter scan was O(shade²), ~65k two-`matches!` predicate
+/// runs per frame at the 224-stamp eclipse ceiling, every frame of the
+/// 300 ms light-theme detonation. Still allocation-free, and the returned
+/// peak is equal BIT FOR BIT to [`peak_shade_quadratic`]'s: per-cell sums of
+/// u32 alphas are order-independent, and max-of-sums does not care which
+/// pass found them (the differential test below pins exactly this).
+///
+/// CALLER CONTRACT: strictly fewer distinct `(row, col)` keys than
+/// [`SHADE_TAB`] slots, or the probe loop can never find a free slot.
+/// [`bound_shade_opacity`] admits at most `SHADE_TAB / 2` Shade stamps
+/// (distinct keys <= stamps) and routes anything larger — unreachable
+/// through `emit_super_decos` — to the quadratic reference instead.
+fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
+    // `u64::MAX` cannot collide with a real key: keys are `row << 16 | col`
+    // over two u16s, so they occupy only the low 32 bits.
+    const EMPTY: u64 = u64::MAX;
+    let mut keys = [EMPTY; SHADE_TAB];
+    let mut sums = [0u32; SHADE_TAB];
+    let mut peak = 0u32;
+    for d in decos.iter().filter(|d| is_shade(d)) {
+        // The exact-overlap-class premise the whole bound rests on: every
+        // supernova Shade is stamped cell-aligned, so `(row, col)` alone
+        // names its coverage.
+        debug_assert_eq!((d.dx, d.dy), (0, 0));
+        let key = u64::from(d.row) << 16 | u64::from(d.col);
+        // Fibonacci multiplicative hash, HIGH bits. The veil's keys are a
+        // dense row-major block (<= 7 contiguous rows x <= 28 contiguous
+        // cols); a masked-low-bits slot would fold each column's 7 rows onto
+        // one slot and pack the columns into one contiguous cluster,
+        // degrading the probe back toward the quadratic this function
+        // replaces. The golden-ratio multiply scatters exactly that
+        // structure.
+        let mut slot = (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SHADE_TAB_BITS)) as usize;
+        loop {
+            if keys[slot] == key {
+                sums[slot] += u32::from(d.alpha);
+                break;
+            }
+            if keys[slot] == EMPTY {
+                keys[slot] = key;
+                sums[slot] = u32::from(d.alpha);
+                break;
+            }
+            slot = (slot + 1) & (SHADE_TAB - 1);
+        }
+        // Alphas are non-negative, so a cell's running sum is largest at its
+        // LAST add: the inline max sees every cell's final sum and can never
+        // overshoot one — no second table walk needed.
+        peak = peak.max(sums[slot]);
+    }
+    peak
+}
+
+/// The replaced implementation's peak arm, kept VERBATIM: it is the semantic
+/// reference the differential test pins [`peak_shade_probe`] against bit for
+/// bit, and the totality fallback for Shade populations past the probe
+/// table's admission — unreachable through `emit_super_decos`, whose
+/// emitters cap Shade structurally ([`MAX_VEIL_CELLS`] veil + 24 crown, 16
+/// fringe) independent of the caller's `cap`, but kept total rather than
+/// assumed away.
+fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
+    decos
         .iter()
         .filter(|d| is_shade(d))
         .map(|d| {
@@ -915,7 +985,31 @@ fn bound_shade_opacity(decos: &mut [WordDecoration]) {
                 .sum()
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// Bound the eclipse's full-cell source-over opacity at each host cell.
+/// `Shade` is cell-confined and every supernova Shade has zero jitter, so
+/// `(row, col)` is an exact overlap class.  The stream is capped at 224 shade
+/// stamps.  One frame-wide scale, based on the worst exact `(row, col)` overlap,
+/// preserves the radial veil falloff; the peak scan is one linear pass
+/// (audit CF-3 — [`peak_shade_probe`]) and only runs at all while Shade
+/// stamps exist, i.e. the light-theme detonation and shock windows.
+fn bound_shade_opacity(decos: &mut [WordDecoration]) {
+    // Pre-count before touching the probe table, for two reasons: dark
+    // themes and the light debris phase carry ZERO Shade stamps and must
+    // keep costing one linear scan — not a 6 KB table clear — and the count
+    // is what proves the probe loop's termination bound (distinct keys <=
+    // stamps <= SHADE_TAB / 2) before any insertion happens.
+    let shade_count = decos.iter().filter(|d| is_shade(d)).count();
+    if shade_count == 0 {
+        return;
+    }
+    let peak = if shade_count <= SHADE_TAB / 2 {
+        peak_shade_probe(decos)
+    } else {
+        peak_shade_quadratic(decos)
+    };
     if peak <= MAX_VIEWPORT_OVERLAY {
         return;
     }
@@ -1189,6 +1283,144 @@ mod tests {
             }),
             "small rainbow debris stays vivid"
         );
+    }
+
+    /// CF-3 differential pin: the one-pass probe-table peak must return
+    /// EXACTLY the nested quadratic scan's value — [`peak_shade_quadratic`]
+    /// IS the replaced implementation's peak arm, kept verbatim — over the
+    /// full deployed emission space (every 10 ms of the window x both themes
+    /// x the deployed cell heights x both viewport row counts), plus
+    /// hand-built streams the emitter cannot produce, aimed at the probe's
+    /// edge conditions (crown-on-veil duplicate keys, Over non-Shade and
+    /// Add-blend Shade impostors, an alpha-zero stamp, the
+    /// `(u16::MAX, u16::MAX)` key adjacent to the table's empty sentinel,
+    /// and a population past the `SHADE_TAB / 2` admission that must route
+    /// to the fallback). `peak` feeds ONE uniform scale over every Shade
+    /// stamp, so a one-count drift here would re-darken the whole eclipse:
+    /// this test is the probe's shipping gate, not documentation.
+    #[test]
+    fn shade_peak_probe_is_bit_identical_to_quadratic_reference() {
+        // The replaced bound, whole and verbatim (quadratic peak + scale):
+        // the probe-backed `bound_shade_opacity` must reproduce its OUTPUT
+        // BYTES exactly, not merely its peak.
+        fn reference_bound(decos: &mut [WordDecoration]) {
+            let peak = peak_shade_quadratic(decos);
+            if peak <= MAX_VIEWPORT_OVERLAY {
+                return;
+            }
+            for d in decos.iter_mut().filter(|d| is_shade(d)) {
+                d.alpha = (u32::from(d.alpha) * MAX_VIEWPORT_OVERLAY / peak) as u8;
+            }
+        }
+        // Any stream inside the probe's admission: identical peaks by both
+        // arms, identical bytes out of both bounds.
+        let check = |label: &str, stream: &[WordDecoration]| {
+            assert_eq!(
+                peak_shade_probe(stream),
+                peak_shade_quadratic(stream),
+                "peak diverged: {label}"
+            );
+            let mut fast = stream.to_vec();
+            let mut slow = stream.to_vec();
+            bound_shade_opacity(&mut fast);
+            reference_bound(&mut slow);
+            assert_eq!(fast, slow, "bounded bytes diverged: {label}");
+        };
+
+        // (a) The deployed emission space — the same sweep the budget pin
+        // walks. These streams are post-bound, so the scale arm is a no-op
+        // on them; what this leg proves is peak agreement on every stream
+        // the engine actually ships, including the zero-Shade dark frames,
+        // the mote-only charge phase, and the fringe's sparse stamps.
+        for ch in [14i32, 20, 40, 56] {
+            for rows in [64i32, 160] {
+                for light in [false, true] {
+                    let e = env(ch, light, rows);
+                    for t in (0..SUPER_TOTAL_MS).step_by(10) {
+                        let mut out = Vec::new();
+                        emit_super_decos(t, &e, &mut out, 256);
+                        check(
+                            &format!("emitted t={t} ch={ch} rows={rows} light={light}"),
+                            &out,
+                        );
+                    }
+                }
+            }
+        }
+
+        // (b) A synthetic PRE-bound eclipse (the emitter only ever hands the
+        // bound its own unbounded stream mid-call, which no public API
+        // exposes): a dense 7 x 28 veil block at raw charge plus crown
+        // stamps landing ON veil cells — the duplicate-key case the probe's
+        // key-match arm accumulates — with impostors that must stay
+        // uncounted and untouched.
+        let stamp =
+            |row: u16, col: u16, glyph: DecoGlyph, blend: DecoBlend, alpha: u8| WordDecoration {
+                row,
+                col,
+                dx: 0,
+                dy: 0,
+                glyph,
+                blend,
+                color: VEIL_TONE,
+                alpha,
+            };
+        let mut veil = Vec::new();
+        for r in 0..7u16 {
+            for c in 0..28u16 {
+                veil.push(stamp(
+                    30 + r,
+                    40 + c,
+                    DecoGlyph::Shade,
+                    DecoBlend::Over,
+                    200,
+                ));
+            }
+        }
+        for k in 0..24u16 {
+            veil.push(stamp(33, 40 + k, DecoGlyph::Shade, DecoBlend::Over, 180));
+        }
+        // Impostors on a veiled cell: a bright Over mote and an Add-blend
+        // Shade — both outside `is_shade`, both invisible to the peak and
+        // untouched by the scale in BOTH implementations.
+        veil.push(stamp(33, 44, DecoGlyph::Dot, DecoBlend::Over, 255));
+        veil.push(stamp(33, 44, DecoGlyph::Shade, DecoBlend::Add, 255));
+        // Alpha-zero Shade: contributes 0 to its cell in both scans.
+        veil.push(stamp(0, 0, DecoGlyph::Shade, DecoBlend::Over, 0));
+        // The largest real key, one bit shy of the probe's u64::MAX empty
+        // sentinel: must be stored as an entry, not read as a hole.
+        veil.push(stamp(
+            u16::MAX,
+            u16::MAX,
+            DecoGlyph::Shade,
+            DecoBlend::Over,
+            7,
+        ));
+        assert!(
+            peak_shade_quadratic(&veil) > MAX_VIEWPORT_OVERLAY,
+            "the synthetic eclipse must exceed the cap, or the scale-arm \
+             comparison below is two no-ops agreeing"
+        );
+        check("synthetic pre-bound eclipse", &veil);
+
+        // (c) Past the SHADE_TAB / 2 admission: 24 x 24 = 576 distinct cells
+        // is more than the probe table has SLOTS, so `bound_shade_opacity`
+        // must route to the quadratic fallback (the probe itself is never
+        // allowed to see this stream — its caller contract) and still emit
+        // the reference bytes. Unreachable through the emitter; this is the
+        // totality guard's own test.
+        let mut big = Vec::new();
+        for r in 0..24u16 {
+            for c in 0..24u16 {
+                big.push(stamp(r, c, DecoGlyph::Shade, DecoBlend::Over, 100));
+            }
+        }
+        big.push(stamp(0, 0, DecoGlyph::Shade, DecoBlend::Over, 100));
+        let mut fast = big.clone();
+        let mut slow = big;
+        bound_shade_opacity(&mut fast);
+        reference_bound(&mut slow);
+        assert_eq!(fast, slow, "fallback-path bytes diverged");
     }
 
     /// The limiter is one frame-wide scale, not one normalization per row.

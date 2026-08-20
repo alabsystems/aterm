@@ -2220,6 +2220,17 @@ fn apply_staged_if_ready_inner(
     {
         return outcome;
     }
+    // NEVER SWAP THE BUNDLE OUT FROM UNDER A TOOLCHAIN INSTALL. `atpkg seed` reads
+    // the sealed payload inside this bundle by path, lazily, for minutes; the swap
+    // below would leave its next read resolving into the replacement, which came
+    // from the lean zip with the seal stripped. Deliberately AFTER the boot-health
+    // lane above, so a crash-looping build can still revert (2026-08-20 round-8
+    // audit).
+    if crate::is_toolchain_install_active() {
+        return ApplyOutcome::Deferred(
+            "a toolchain install is reading this bundle's sealed payload".to_string(),
+        );
+    }
     if reexec_authority == ReexecAuthority::Invalid {
         crate::warn(
             "ignoring a spoofed/stale ATERM_UPDATE_REEXEC (no matching stamp); proceeding with a normal update check",

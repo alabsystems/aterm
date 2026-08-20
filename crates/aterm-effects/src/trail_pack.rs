@@ -81,8 +81,8 @@ pub const CUSTOM_MIX_WHITE: u32 = 0x00FF_FFFF;
 
 /// One resolved Trail Pack, ready for the engine. Fully `Copy` (fixed arrays /
 /// enums / scalars — no heap), so it rides the `Copy` `GlowConfig` inline. NOT
-/// `Eq` — it carries `f32` fields (matching `GlowConfig`, which derives only
-/// `Clone, Copy, Debug`). Size ≈ 0.5 KiB.
+/// `Eq` — it carries `f32` fields (matching `GlowConfig`, which is likewise
+/// `PartialEq` but never `Eq`). Size ≈ 0.5 KiB.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrailParams {
     /// Compile-time fingerprint of `(id, source bytes)` — the style-switch /

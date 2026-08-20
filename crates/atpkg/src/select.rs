@@ -211,7 +211,9 @@ pub fn select_index(
         // the generation that recorded the floor: a strictly newer generation re-bases it,
         // which is what keeps one machine's absurd `index_build` from bricking the store
         // beyond the master's reach. See `BuildFloor`.
-        if !floor.admits(index.roster_seq(), index.index_build) {
+        // The generation the index DECLARES, never the one it was served beside —
+        // see `TrustedIndex::authorizing_seq`.
+        if !floor.admits(index.authorizing_seq(), index.index_build) {
             continue;
         }
         // (4) Highest signed index_build wins, within the newest generation.

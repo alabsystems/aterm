@@ -102,6 +102,67 @@ pub fn refresh(layout: &Layout) {
         return;
     }
     let _ = write_hooks(&shell_d, &layout.bin_dir());
+    ensure_command_links(&home);
+}
+
+/// Put `aterm` and `atpkg` in `~/.local/bin` when we are running from an app bundle.
+///
+/// This module deliberately does NOT write into `~/.zshrc`, so the documented route
+/// to a managed tool from a Terminal.app / ssh / CI shell is `aterm <tool>` or
+/// `atpkg run`. On the DMG install route those two commands did not exist on any
+/// PATH either — the binaries live only inside `/Applications/aterm.app/Contents/
+/// MacOS`, and only `tools/install.sh` ever linked them out. So the fallback the
+/// docs name was itself unreachable for anyone who dragged the app to Applications,
+/// which README offers as a first-class option: the ten programs installed, and
+/// nothing could reach them from outside aterm (2026-08-20 round-8 audit).
+///
+/// Deliberately narrow: symlinks only, into the same `~/.local/bin` that
+/// `tools/install.sh` uses, and NEVER over anything that is not already ours — a
+/// real file there is someone's own build. No dotfile is touched; `atpkg doctor`
+/// still prints the rc line for putting the managed `bin/` itself on PATH.
+fn ensure_command_links(home: &Path) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Ok(exe) = exe.canonicalize() else {
+        return;
+    };
+    // Only from inside a bundle: a source build's target/release is the developer's
+    // own tree, and linking out of it would outlive the checkout.
+    if !exe.parent().is_some_and(|d| d.ends_with("Contents/MacOS")) {
+        return;
+    }
+    let Some(macos) = exe.parent() else {
+        return;
+    };
+    let bin = home.join(".local/bin");
+    if fs::create_dir_all(&bin).is_err() {
+        return;
+    }
+    for name in ["aterm", "atpkg"] {
+        let target = macos.join(name);
+        if !target.exists() {
+            continue;
+        }
+        let link = bin.join(name);
+        match fs::symlink_metadata(&link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // Ours to repoint only if it already points into an app bundle;
+                // anything else belongs to whoever put it there.
+                let ours = fs::read_link(&link)
+                    .ok()
+                    .is_some_and(|old| old.to_string_lossy().contains("/aterm.app/Contents/MacOS/"));
+                if !ours || fs::read_link(&link).is_ok_and(|old| old == target) {
+                    continue;
+                }
+                let _ = fs::remove_file(&link);
+            }
+            // A real file is a hand-built binary; leave it.
+            Ok(_) => continue,
+            Err(_) => {}
+        }
+        let _ = std::os::unix::fs::symlink(&target, &link);
+    }
 }
 
 /// Render `bin_dir` for a double-quoted shell string, escaping the four metacharacters a

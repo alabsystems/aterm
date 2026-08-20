@@ -112,6 +112,12 @@ pub(crate) struct TransientNotice {
     /// the host refreshes it each frame so the bubble follows him. `None`
     /// (every update notice) keeps the classic top-center placement.
     anchor: Option<(f32, f32)>,
+    /// How long THIS card lives. Defaults to [`TTL`]; a card that reports work
+    /// still in progress overrides it, because a notice that outlives its own
+    /// truth is worse than none — the "Installing the ALab toolchain" card
+    /// announced a multi-GB extraction and vanished 5.4 s in, leaving the page it
+    /// points at empty for minutes (2026-08-20 round-8 audit).
+    ttl: Duration,
 }
 
 impl TransientNotice {
@@ -120,6 +126,7 @@ impl TransientNotice {
             kind: NoticeKind::UpdateReady { version, build },
             spawned: now,
             anchor: None,
+            ttl: TTL,
         }
     }
 
@@ -128,6 +135,7 @@ impl TransientNotice {
             kind: NoticeKind::LevelUp { build },
             spawned: now,
             anchor: None,
+            ttl: TTL,
         }
     }
 
@@ -136,6 +144,7 @@ impl TransientNotice {
             kind: NoticeKind::UpdateStatus { text: text.into() },
             spawned: now,
             anchor: None,
+            ttl: TTL,
         }
     }
 
@@ -144,6 +153,7 @@ impl TransientNotice {
             kind: NoticeKind::RobiTip { text },
             spawned: now,
             anchor,
+            ttl: TTL,
         }
     }
 
@@ -175,9 +185,17 @@ impl TransientNotice {
         matches!(self.kind, NoticeKind::LevelUp { .. })
     }
 
+    /// Hold this card for `ttl` instead of the default, for work that genuinely
+    /// takes that long. It is still replaced the moment a terminal marker arrives.
+    #[must_use]
+    pub(crate) const fn holding(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
     /// Fully gone (past its whole lifetime) — the caller drops it.
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.spawned) >= TTL
+        now.duration_since(self.spawned) >= self.ttl
     }
 
     /// The next wake time: animate every [`FRAME`] while the card is moving (the
@@ -185,7 +203,7 @@ impl TransientNotice {
     /// steady hold needs no intermediate repaints.
     pub(crate) fn deadline(&self, now: Instant) -> Instant {
         let elapsed = now.duration_since(self.spawned);
-        let fade_start = TTL.saturating_sub(FADE);
+        let fade_start = self.ttl.saturating_sub(FADE);
         if elapsed < ENTER || elapsed >= fade_start {
             now + FRAME
         } else {
@@ -197,7 +215,7 @@ impl TransientNotice {
     /// through the hold, then an eased ramp 1→0 across the exit tail.
     pub(crate) fn alpha(&self, now: Instant) -> f32 {
         let elapsed = now.duration_since(self.spawned).as_secs_f32();
-        let (ttl, enter, fade) = (TTL.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
+        let (ttl, enter, fade) = (self.ttl.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
         let fade_start = ttl - fade;
         if elapsed <= 0.0 {
             0.0
@@ -216,7 +234,7 @@ impl TransientNotice {
     /// thing that blinks on and dissolves. `0` throughout the hold.
     pub(crate) fn rise(&self, now: Instant) -> f32 {
         let elapsed = now.duration_since(self.spawned).as_secs_f32();
-        let (ttl, enter, fade) = (TTL.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
+        let (ttl, enter, fade) = (self.ttl.as_secs_f32(), ENTER.as_secs_f32(), FADE.as_secs_f32());
         let fade_start = ttl - fade;
         if elapsed <= 0.0 {
             -1.0

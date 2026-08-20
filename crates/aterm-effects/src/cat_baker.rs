@@ -447,6 +447,42 @@ impl CatBaker {
             ay: y0 as u16,
         })
     }
+
+    /// Peek [`CatBaker::host_tile`]'s cache WITHOUT supplying texels: the
+    /// exact hit branch of `host_tile` — same lookup, same `last_used` LRU
+    /// touch (dropping the touch would change which slot a later miss
+    /// evicts, which CAN change a pixel: a still-alive tile silently gone
+    /// for a frame) — returning `None` on a miss instead of baking.
+    ///
+    /// Exists for callers whose tile bytes are EXPENSIVE to produce yet a
+    /// pure function of the id itself (the pet's mote lane in
+    /// [`crate::word_decorations::WordDecorations::pet_cursor`]):
+    /// `host_tile` discards `rgba` on every hit, so pre-baking the bytes
+    /// just to look the slot up is discarded work on every warm frame.
+    /// Peek first; rasterize and call `host_tile` only on the miss. No
+    /// version bump and no bake-budget spend here — both belong exclusively
+    /// to the miss path, exactly as inside `host_tile` today (its hit
+    /// branch touches neither).
+    pub fn host_peek(&mut self, host_id: u64) -> Option<CatTile> {
+        // The uninitialised-baker refusal, mirrored from `host_tile`. Also
+        // unreachable-with-a-match in practice: `begin_frame` wholesale-
+        // clears the slots on any metric change, so a zero cell height has
+        // no populated slot for the lookup below to find.
+        if self.cell_h == 0 {
+            return None;
+        }
+        let slot_h = 2 * usize::from(self.cell_h);
+        let i = self
+            .slots
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|s| s.host == Some(host_id)))?;
+        let slot = self.slots[i].as_mut().expect("position() found it");
+        slot.last_used = self.clock;
+        Some(CatTile {
+            ax: 0,
+            ay: (i * slot_h) as u16,
+        })
+    }
 }
 
 // ────────────────────────────── §5.3 palettes ──────────────────────────────

@@ -599,11 +599,36 @@ uninstall_everything() {
 		skipped=$((skipped + 1))
 	}
 
+	# 0. THE TOOLCHAIN STORE, BEFORE THE BUNDLE THAT OWNS IT. `atpkg` exists on
+	#    disk in exactly one place — an argv0 symlink inside the app bundle — and
+	#    the store it fills is multiple GB under Application Support. Deleting the
+	#    bundle first (which this did) removed the only binary that knows how to
+	#    remove the store, so the documented `atpkg uninstall --all` remedy became
+	#    unrunnable and multiple GB were stranded with no supported way out
+	#    (2026-08-20 round-8 audit). Best-effort and never fatal: an uninstall must
+	#    still remove the app if the toolchain sweep cannot run.
+	local dir app plist id
+	local atpkg_bin=""
+	for dir in /Applications "$HOME/Applications" "${ATERM_INSTALL_DIR:-}"; do
+		[[ -n "$dir" && -x "$dir/aterm.app/Contents/MacOS/atpkg" ]] || continue
+		atpkg_bin="$dir/aterm.app/Contents/MacOS/atpkg"
+		break
+	done
+	if [[ -n "$atpkg_bin" ]]; then
+		echo "install.sh: removing the ALab toolchain store (atpkg uninstall --all)…"
+		if "$atpkg_bin" uninstall --all >/dev/null 2>&1; then
+			echo "install.sh: removed the ALab toolchain store"
+			removed=$((removed + 1))
+		else
+			_skip "the ALab toolchain store" \
+				"\`$atpkg_bin uninstall --all\` failed; run it by hand before deleting the app"
+		fi
+	fi
+
 	# 1. app bundle — every candidate dir, but only genuine aterm bundles.
 	# An explicit ATERM_INSTALL_DIR names THE install location — scan only it.
 	# Scanning the defaults as well would let an override aimed at a scratch dir
 	# reach out and delete the real /Applications/aterm.app.
-	local dir app plist id
 	local app_dirs=(/Applications "$HOME/Applications")
 	[[ -n "${ATERM_INSTALL_DIR:-}" ]] && app_dirs=("$ATERM_INSTALL_DIR")
 	for dir in "${app_dirs[@]}"; do

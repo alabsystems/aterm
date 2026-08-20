@@ -4338,11 +4338,23 @@ impl App {
                 // the process result separately: the old status may predate a
                 // failed launch/non-zero exit and must never be presented as
                 // the result of this attempt.
+                // STDERR IS KEPT. atpkg explains its refusals there — "another
+                // atpkg process holds the store lock at …" is the common one, since
+                // the six-hourly loop can hold that lock for the length of a
+                // multi-GB download. Discarding it turned an explainable wait into
+                // "atpkg update exited with exit status: 1", repeated on every retry
+                // for as long as the download ran (2026-08-20 round-8 audit).
                 let result = std::process::Command::new(&atpkg)
                     .args(&verb)
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                    .stderr(std::process::Stdio::piped())
+                    .output();
+                let said = result
+                    .as_ref()
+                    .ok()
+                    .map(|out| String::from_utf8_lossy(&out.stderr).trim().to_string())
+                    .unwrap_or_default();
+                let result = result.map(|out| out.status);
                 let command = match result {
                     Ok(status) if status.success() => {
                         PackagesCommandOutcome::Succeeded { operation: busy }
@@ -4363,7 +4375,13 @@ impl App {
                     },
                     Ok(status) => PackagesCommandOutcome::Failed {
                         operation: busy,
-                        message: format!("atpkg {} exited with {status}", verb.join(" ")),
+                        message: if said.is_empty() {
+                            format!("atpkg {} exited with {status}", verb.join(" "))
+                        } else {
+                            // atpkg's own sentence, which names the cause and often
+                            // the remedy — better than the exit code every time.
+                            said.lines().last().unwrap_or(&said).to_string()
+                        },
                     },
                     Err(error) => PackagesCommandOutcome::Failed {
                         operation: busy,

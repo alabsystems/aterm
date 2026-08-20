@@ -108,6 +108,7 @@ pub(crate) fn push_fx_rect(
 }
 
 /// Per-channel linear interpolation between two `0x00RRGGBB` colours, `t` 0..1.
+#[inline]
 pub(crate) fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     let mix = |sh: u32| {
@@ -118,55 +119,88 @@ pub(crate) fn lerp_rgb(a: u32, b: u32, t: f32) -> u32 {
     (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
+/// The FIRE ramp's stops: deep red → orange → yellow → near-white core.
+///
+/// Module-level `const` ON PURPOSE (both stop tables were function locals):
+/// the ramps run per particle per frame in the fire/water emit paths, and a
+/// local table is re-materialized on the stack every call the moment the
+/// inliner declines the body. [`ramp_5stop`] leans on this table's SHAPE —
+/// stop positions strictly ascending, first exactly 0.0, last exactly 1.0 —
+/// pinned by `ramp_stop_tables_hold_the_branchless_contract`.
+const FIRE_STOPS: [(f32, u32); 5] = [
+    (0.0, 0x002A_0000),
+    (0.25, 0x008B_1A00),
+    (0.5, 0x00E0_4A00),
+    (0.75, 0x00FF_B020),
+    (1.0, 0x00FF_F0C0),
+];
+
+/// The OCEAN ramp's stops: deep-sea abyss → open-ocean blue → turquoise →
+/// vivid aqua crest → foam. Deliberately SATURATED and green-leaning through
+/// the midband: the old pale sky-cyan stops read as ICE (live review: "WE ARE
+/// NOT DOING ICE") — real water is rich blue-green, and foam-white appears
+/// only at the very crest. Same shape contract as [`FIRE_STOPS`].
+const WATER_STOPS: [(f32, u32); 5] = [
+    (0.0, 0x0005_2C48),
+    (0.35, 0x000E_66B4),
+    (0.65, 0x0014_AAC8),
+    (0.85, 0x0032_DCDE),
+    (1.0, 0x00C2_F2F5),
+];
+
+/// The shared 5-stop ramp core: a BRANCHLESS window select feeding the exact
+/// `(t - t0) / (t1 - t0)` + [`lerp_rgb`] arithmetic the old `windows(2)` walk
+/// fed, on the same f32 stop values — so every output is bit-equal to the
+/// walk. Not asserted, SWEPT: a verbatim copy of the old formulation is the
+/// oracle in `ramp_rewrite_is_bit_identical_to_the_stop_walk`, and its
+/// `--ignored` twin runs all 2^32 bit patterns for palette retunes.
+///
+/// WHY (driver-03): both ramps built their stop table as a function local and
+/// linear-searched it PER CALL, while the fire/water emit paths call them per
+/// particle per frame (the ember-shower loop, the water sparks, the
+/// fireball/droplet nucleus bands). Hoisting one constant-argument call site
+/// was measured as invisible (wave-2 `cg2-undertow-hoist`: no win), so the
+/// fix is at the source instead: the window index IS the count of interior
+/// stop positions strictly below `t` — three compares summed, no stack
+/// table, no slice iterator, no early-exit compare chain — the exact
+/// complement of the walk's "first window with `t <= t1`", boundaries
+/// included.
+// NOT `.clamp()`: `f32::clamp` PROPAGATES NaN, and the walk compared
+// `NaN <= t1` false on every window, falling through to the RAW crest
+// colour. `f32::min`/`max` return the OTHER operand for a NaN input, so
+// clamping min-FIRST pins NaN to 1.0 — and the lerp at `local == 1.0` lands
+// EXACTLY on the crest (channel bytes are exact in f32, and `crest + 0.5`
+// truncates back to `crest`), so even a poisoned `t` keeps its old colour
+// without buying a dedicated NaN branch. Same idiom as
+// `aterm_render::sdr_glow_budget`.
+#[allow(clippy::manual_clamp)]
+#[inline]
+fn ramp_5stop(stops: &[(f32, u32); 5], t: f32) -> u32 {
+    let t = t.min(1.0).max(0.0);
+    let idx =
+        usize::from(t > stops[1].0) + usize::from(t > stops[2].0) + usize::from(t > stops[3].0);
+    let (t0, c0) = stops[idx];
+    let (t1, c1) = stops[idx + 1];
+    // The walk's `if t1 > t0` divide guard is gone, not hidden: positions
+    // strictly ascend by table contract (tested), so it was dead in every
+    // window and its only effect was one more branch in a per-particle path.
+    lerp_rgb(c0, c1, (t - t0) / (t1 - t0))
+}
+
 /// Black-body-ish FIRE ramp, `t` 0 (cool, deep red) → 1 (hot, white-yellow) —
 /// the one palette behind the aurora's fire comet/curtain and the fireball
 /// nucleus.
+#[inline]
 pub(crate) fn fire_ramp(t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    // deep red → orange → yellow → near-white core.
-    let stops = [
-        (0.0f32, 0x002A_0000u32),
-        (0.25, 0x008B_1A00),
-        (0.5, 0x00E0_4A00),
-        (0.75, 0x00FF_B020),
-        (1.0, 0x00FF_F0C0),
-    ];
-    for w in stops.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if t <= t1 {
-            let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
-            return lerp_rgb(c0, c1, local);
-        }
-    }
-    stops[stops.len() - 1].1
+    ramp_5stop(&FIRE_STOPS, t)
 }
 
 /// OCEAN ramp, `t` 0 (deep navy) → 1 (bright cyan crest, just shy of foam) —
 /// the one water palette behind the aurora's fluid wake, the droplet nucleus,
 /// and the word-decoration splash (ORCA_PALETTE).
+#[inline]
 pub(crate) fn water_ramp(t: f32) -> u32 {
-    let t = t.clamp(0.0, 1.0);
-    // deep-sea abyss → open-ocean blue → turquoise → vivid aqua crest → foam.
-    // Deliberately SATURATED and green-leaning through the midband: the old pale
-    // sky-cyan stops read as ICE (live review: "WE ARE NOT DOING ICE") — real
-    // water is rich blue-green, and foam-white appears only at the very crest.
-    let stops = [
-        (0.0f32, 0x0005_2C48u32),
-        (0.35, 0x000E_66B4),
-        (0.65, 0x0014_AAC8),
-        (0.85, 0x0032_DCDE),
-        (1.0, 0x00C2_F2F5),
-    ];
-    for w in stops.windows(2) {
-        let (t0, c0) = w[0];
-        let (t1, c1) = w[1];
-        if t <= t1 {
-            let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
-            return lerp_rgb(c0, c1, local);
-        }
-    }
-    stops[stops.len() - 1].1
+    ramp_5stop(&WATER_STOPS, t)
 }
 
 /// THE TWINKLE'S OWN PALETTE — the white/gold pair the typing starfield and the
@@ -1171,5 +1205,114 @@ mod tests {
             !push_dust_mote(&mut tight, g, cx, cy, 5, cov, 0x00FF_FFFF, 1),
             "a mote that ran out of budget must report it"
         );
+    }
+
+    /// The BRANCHLESS SHAPE CONTRACT behind [`ramp_5stop`]: stop positions
+    /// strictly ascending, running exactly 0.0 → 1.0, in BOTH tables. The
+    /// core counts interior stops below `t` instead of walking windows, drops
+    /// the walk's `t1 > t0` divide guard, and pins NaN to the 1.0 end — all
+    /// three moves lean on this shape, so a future palette retune that breaks
+    /// it must fail HERE with a table name, not as a colour glitch on a wake.
+    #[test]
+    fn ramp_stop_tables_hold_the_branchless_contract() {
+        for (name, stops) in [("fire", &FIRE_STOPS), ("water", &WATER_STOPS)] {
+            assert!(stops[0].0 == 0.0, "{name}: the ramp must start at 0.0");
+            assert!(stops[4].0 == 1.0, "{name}: the ramp must end at 1.0");
+            for w in stops.windows(2) {
+                assert!(
+                    w[1].0 > w[0].0,
+                    "{name}: stop positions must strictly ascend ({} then {})",
+                    w[0].0,
+                    w[1].0
+                );
+            }
+        }
+    }
+
+    /// The PRE-REWRITE ramp, VERBATIM (function-local stop table, `windows(2)`
+    /// walk, divide guard, raw-crest fall-through): the byte-identity oracle
+    /// for the branchless [`ramp_5stop`]. Do NOT "simplify" this to call the
+    /// live code — its entire value is being the OLD arithmetic.
+    fn walked_ramp(stops: &[(f32, u32); 5], t: f32) -> u32 {
+        let t = t.clamp(0.0, 1.0);
+        for w in stops.windows(2) {
+            let (t0, c0) = w[0];
+            let (t1, c1) = w[1];
+            if t <= t1 {
+                let local = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+                return lerp_rgb(c0, c1, local);
+            }
+        }
+        stops[stops.len() - 1].1
+    }
+
+    /// One f32 bit pattern through BOTH live ramps against the walk oracle.
+    fn assert_ramps_match_walk(bits: u32) {
+        let t = f32::from_bits(bits);
+        assert_eq!(
+            fire_ramp(t),
+            walked_ramp(&FIRE_STOPS, t),
+            "fire_ramp diverged from the stop walk at bits {bits:#010x} (t = {t:?})"
+        );
+        assert_eq!(
+            water_ramp(t),
+            walked_ramp(&WATER_STOPS, t),
+            "water_ramp diverged from the stop walk at bits {bits:#010x} (t = {t:?})"
+        );
+    }
+
+    /// BYTE-IDENTITY of the driver-03 rewrite: same input, bit-equal u32 out.
+    /// These two functions ARE the fire and water palettes, and the frame
+    /// fingerprint / volume gates cannot see a one-count colour drift, so the
+    /// pin lives at the function itself. Three passes: a prime-strided march
+    /// over the ENTIRE f32 bit space (~1M probes — every exponent, both
+    /// signs, both infinities, NaN payloads), a dense ±16Ki-ULP band around
+    /// every stop position of both tables (where a `<=`-vs-`>` complement
+    /// mistake in the window select would surface) plus each band's sign-bit
+    /// mirror, and the named specials. The `--ignored` twin below is the
+    /// exhaustive version for palette retunes.
+    #[test]
+    fn ramp_rewrite_is_bit_identical_to_the_stop_walk() {
+        // 4099 is prime, so the probes never lock onto a mantissa stride.
+        for bits in (0..=u32::MAX).step_by(4099) {
+            assert_ramps_match_walk(bits);
+        }
+        for anchor in [0.0f32, 0.25, 0.35, 0.5, 0.65, 0.75, 0.85, 1.0] {
+            let b = anchor.to_bits();
+            for bits in b.saturating_sub(16_384)..=b.saturating_add(16_384) {
+                assert_ramps_match_walk(bits);
+                // The mirror: tiny negatives around -0.0 and every negated
+                // anchor all clamp to 0.0, and must clamp IDENTICALLY.
+                assert_ramps_match_walk(bits | 0x8000_0000);
+            }
+        }
+        for t in [
+            f32::NAN,
+            -f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::EPSILON,
+            f32::from_bits(1), // the smallest subnormal
+            -0.0,
+            2.0,
+            f32::MAX,
+            f32::MIN,
+        ] {
+            assert_ramps_match_walk(t.to_bits());
+        }
+    }
+
+    /// The EXHAUSTIVE twin: all 2^32 f32 bit patterns through both ramps, new
+    /// against old. Too slow for the default suite by design; run it in
+    /// release whenever the ramps or their tables are touched:
+    /// `cargo test -p aterm-effects --release -- --ignored bit_identical_exhaustively`
+    #[test]
+    #[ignore = "2^32-pattern sweep — run in release when touching the ramps"]
+    fn ramp_rewrite_is_bit_identical_exhaustively() {
+        for bits in 0..=u32::MAX {
+            assert_ramps_match_walk(bits);
+        }
     }
 }

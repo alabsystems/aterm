@@ -3616,8 +3616,25 @@ impl WordDecorations {
             let side = Self::pet_mote_side(geom.cell_h);
             let bucket = Self::pet_mote_rot_bucket(m.rot);
             let host = Self::pet_mote_host_id(m.kind, bucket, side);
-            let paint = Self::bake_pet_mote(m.kind, bucket, side);
-            let Some(tile) = self.cat_baker.host_tile(host, side, side, paint.pixels()) else {
+            // CACHE-FIRST (PET-01): peek the shared atlas BEFORE rasterizing.
+            // `host_tile` never reads the supplied texels on a hit, so baking
+            // eagerly re-paid `bake_pet_mote` — a fresh `aterm_scene::Tile`
+            // plus discs / `rot_poly` + `fill_path`, ~14 heap allocs and two
+            // scanline fills for a Note — per visible mote per frame, for
+            // bytes the atlas then discarded. And the warm hit IS the steady
+            // state: a mote's tile identity `(kind, bucket, side)` holds for
+            // many frames at a time. `host_peek` is `host_tile`'s hit branch
+            // verbatim (same lookup, same `last_used` LRU touch, so eviction
+            // order under pressure is unchanged); only a genuine miss
+            // rasterizes now, and it hands `host_tile` the same bytes it
+            // always got — same bake, same version bump, same spend against
+            // the shared two-bakes-per-frame budget. The atlas texels are
+            // byte-identical either way: the bake is a pure function of the
+            // exact triple that forms the host id.
+            let Some(tile) = self.cat_baker.host_peek(host).or_else(|| {
+                let paint = Self::bake_pet_mote(m.kind, bucket, side);
+                self.cat_baker.host_tile(host, side, side, paint.pixels())
+            }) else {
                 continue; // budget spent; this mote lands next frame
             };
             let dest =

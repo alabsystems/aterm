@@ -1112,12 +1112,25 @@ impl EffectsPipeline {
         // here so the embedder's config surface decides. Ignite a COPY of the
         // persistent config with this frame's typing-cadence intensity (mutating
         // the stored cfg would compound the colour heat every frame).
+        //
+        // GATED on the STORED flag (driver-01): with the comet off the ignited
+        // copy is dead state — `CursorTrail::tick`'s `!cfg.enabled` branch
+        // never reads intensity/warmth/colour, and the colour publish below is
+        // keyed on the same stored flag — so the cadence heat decay (`powf`)
+        // and the 3-lerp colour blend stop burning on every frame of a
+        // trail-less session (`last` is `Some` forever after the first key, so
+        // the decays would otherwise run for the session's whole life). The
+        // STORED flag, not the focus-gated local: an unfocused frame still
+        // publishes the live ignited colour below, and gating on the local
+        // would freeze that publish at a stale value across a focus blip.
         let mut trail_cfg = self.trail_cfg;
-        crate::cursor_trail::ignite(
-            &mut trail_cfg,
-            self.typing_cadence.intensity(now),
-            self.typing_cadence.warmth(now),
-        );
+        if self.trail_cfg.enabled {
+            // ONE lazy heat decay for both cadence channels (driver-01): the
+            // separate `intensity(now)` + `warmth(now)` accessors each re-ran
+            // the identical `powf` decay against the same `heat`/`last`.
+            let (intensity, warmth) = self.typing_cadence.sample(now);
+            crate::cursor_trail::ignite(&mut trail_cfg, intensity, warmth);
+        }
         trail_cfg.enabled &= self.focused;
         let trail_fp = self
             .trail
@@ -1137,15 +1150,25 @@ impl EffectsPipeline {
         // win == grid extents), so window-absolute emissions coincide with the
         // historical grid-relative ones byte-for-byte.
         let glow_geom = self.chrome_geom(rows, cols, cell_w, cell_h);
-        // Why: a COPY — zeroing the stored intensity would destroy the user's
-        // configured value, which only `set_cursor_glow` ever republishes.
-        // `intensity <= 0` is the engine's documented unfocus channel (it cools
-        // the thermal integrators instead of wiping them, as `enabled=false` would).
-        let mut glow_cfg = self.glow_cfg;
-        glow_cfg.intensity *= motion_amp;
+        // Why IN PLACE + RESTORE (driver-05): the old `let mut glow_cfg =
+        // self.glow_cfg;` moved ~0.5 KiB per enabled frame — `GlowConfig`
+        // carries the whole resolved Trail Pack inline (`Option<TrailParams>`,
+        // ~440 B, sized in even while `None`) — just to fold `motion_amp` into
+        // ONE f32. Scaling the stored field for the tick's duration is safe:
+        // nothing between the scale and the restore reads it (the forge-fill
+        // gate below runs AFTER the restore, against the configured value it
+        // always read), and the restore reinstates the user's dial bit-for-bit
+        // — only `set_cursor_glow` may republish it, the invariant
+        // `unfocusing_never_consumes_the_configured_glow_intensity` pins.
+        // `intensity <= 0` stays the engine's documented unfocus channel (it
+        // cools the thermal integrators instead of wiping them, as
+        // `enabled=false` would).
+        let configured_intensity = self.glow_cfg.intensity;
+        self.glow_cfg.intensity *= motion_amp;
         let glow_fp = self
             .glow
-            .tick(cur, now, &glow_cfg, glow_geom, &mut self.glow_scratch);
+            .tick(cur, now, &self.glow_cfg, glow_geom, &mut self.glow_scratch);
+        self.glow_cfg.intensity = configured_intensity;
         std::mem::swap(&mut input.cursor_glow_add, &mut self.glow_scratch);
         // The glow engine's OTHER output streams, spliced exactly like the
         // native app's block (app_render): the RADIAL halos (fire embers /
@@ -2102,9 +2125,11 @@ mod tests {
         );
     }
 
-    /// The gate scales a COPY. Zeroing the stored intensity would silently
-    /// destroy the user's configured value — only `set_cursor_glow` ever
-    /// republishes it, and the host posts that on a settings change alone.
+    /// The gate scales the stored value IN PLACE and restores it before
+    /// `apply` returns (driver-05 dropped the ~0.5 KiB per-frame copy).
+    /// Consuming the configured intensity would silently destroy the user's
+    /// value — only `set_cursor_glow` ever republishes it, and the host posts
+    /// that on a settings change alone — so this pins the restore exactly.
     #[test]
     fn unfocusing_never_consumes_the_configured_glow_intensity() {
         let mut p = EffectsPipeline::new();

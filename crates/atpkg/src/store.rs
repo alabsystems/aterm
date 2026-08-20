@@ -283,6 +283,28 @@ impl Layout {
         self.prefix.join("removed")
     }
 
+    /// The programs this machine removed ON PURPOSE.
+    ///
+    /// Lives here rather than in the CLI because the UNATTENDED lanes need it too:
+    /// a coherence group is processed whenever any member is installed, and a
+    /// missing sibling is pulled back in to keep the tuple locked — which silently
+    /// re-downloaded programs the user had just uninstalled (`aterm pkg uninstall
+    /// trust` frees ~3.2 GB; the next six-hourly tick put it straight back). The
+    /// record was already durable; only the update path never read it
+    /// (2026-08-20 round-8 audit).
+    #[must_use]
+    pub fn removed_programs(&self) -> std::collections::BTreeSet<String> {
+        std::fs::read_to_string(self.removed())
+            .map(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// `declined` — the durable "this machine does not want the bundled toolset"
     /// marker, written by `uninstall --all`.
     ///
@@ -603,6 +625,25 @@ pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
     Some(Layout {
         prefix: vet_prefix(configured, &home),
     })
+}
+
+/// Resolve the layout THE USER CONFIGURED — `[packages].prefix` when set, the
+/// default otherwise.
+///
+/// The one edge every caller outside `atpkg`'s own CLI should use. Both of the
+/// others hardcoded `resolve(None)`, so on a machine with a relocated or shared lab
+/// store the `aterm <tool>` front door reported the ten programs as an unknown
+/// aterm option, and Settings ▸ Packages — the page every seed notice points at —
+/// reported a fully installed toolset as "No package activity yet". The store was
+/// correct the whole time; only the two readers were looking somewhere else
+/// (2026-08-20 round-8 audit).
+#[must_use]
+pub fn resolve_configured() -> Option<Layout> {
+    resolve(
+        crate::config::load()
+            .prefix_path(aterm_types::dirs::home_dir().as_deref())
+            .as_deref(),
+    )
 }
 
 /// Validate a configured prefix against `home`, returning it if safe or the trusted
