@@ -74,6 +74,13 @@ pub(crate) const EDIT_TONE_MELODY: &str = "tone_melody";
 /// Robi the helper robot (`Config::robi`, default ON): the chrome-walking
 /// tip-sharing robot show (see `app_config`'s field doc).
 pub(crate) const EDIT_ROBI: &str = "robi";
+/// Rainbow sparkles on the post-update celebration notice (`Config::notice_sparkle`,
+/// default ON — user-facing features ship enabled; this is an opt-OUT). The card that
+/// says "Updated — now on vX" wears a hue-cycling badge and a ring of twinkling
+/// sparkles instead of the flat cursor-coloured badge. Decorative only: it never
+/// changes the wording, the timing, or what the notice is for, and reduced motion
+/// holds the colours still.
+pub(crate) const EDIT_NOTICE_SPARKLE: &str = "notice_sparkle";
 /// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF — the owner
 /// dislikes the drone): ON re-enables the continuous per-style background
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
@@ -1015,6 +1022,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // effect itself, not the Settings workbench scene — the decorative-table
     // rationale (`sparkle_words.*`) for a single top-level key.
     EDIT_ROBI,
+    // Decorative, previewed by the thing itself (the celebration card appears after
+    // an update) rather than by the Settings workbench — same rationale as `robi`.
+    EDIT_NOTICE_SPARKLE,
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
@@ -1391,6 +1401,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TRAIL_SOUNDS
         | EDIT_TONE_MELODY
         | EDIT_ROBI
+        | EDIT_NOTICE_SPARKLE
         | EDIT_TRAIL_SOUND_BED
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND

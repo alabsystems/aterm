@@ -18917,7 +18917,18 @@ impl App {
             .is_none_or(|c| c.fp != fp || c.geom != geom_key)
         {
             let mut tray =
-                crate::notice::notice_tray(notice, &geom, theme, cursor, now, motion, clear_rows);
+                crate::notice::notice_tray(
+                    notice,
+                    &geom,
+                    crate::notice::NoticeChrome {
+                        theme,
+                        cursor,
+                        sparkle: self.config.notice_sparkle_or_default(),
+                    },
+                    now,
+                    motion,
+                    clear_rows,
+                );
             let tray_w = (cols * cw) as f32;
             let (card_x, card_y, card_w, card_h) = tray.card;
             // THE shadow budget, taken from the module that draws the shadow rather than

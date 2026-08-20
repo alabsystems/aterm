@@ -438,18 +438,48 @@ impl crate::flow::Fetcher for GithubFetcher {
         let mut out = Vec::new();
         // Newest-first, capped ([`index_pair_urls`]): the paginated listing may now span
         // hundreds of releases, and only the newest carrying releases can win selection.
+        // The index repo's own `owner/repo`, built the same way `slug_for` builds a
+        // program's (manual concat — see its note on `format!` and the Trust gate).
+        let slug = {
+            let mut s = self.owner.clone();
+            s.push('/');
+            s.push_str(&crate::discovery::index_repo());
+            s
+        };
         for u in index_pair_urls(&releases) {
-            let index_bytes =
-                aterm_update_core::download_bytes(u.index, self.credential(), MANIFEST_CAP)?;
-            let sig = aterm_update_core::download_bytes(u.index_sig, self.credential(), SIG_CAP)?;
+            // ZERO-API ASSET FETCH, same derivation as `pkg_manifest`/`download_for`.
+            // `u.label` IS the release tag, so each of these four assets has a
+            // deterministic CDN URL and none of them needs the assets API. This is the
+            // dominant remaining term: the listing above is ONE request, but the four
+            // assets were four more PER CANDIDATE, which is what made index resolution
+            // cost ~7 requests after the per-program cost went to zero.
+            //
+            // `direct` falls back to the API URL the listing already handed us whenever
+            // the slug is not URL-safe or the download fails, so a private mirror or an
+            // unusual asset host keeps working exactly as before.
+            let direct = |asset: &str, api_url: &str, cap: u64| -> Result<Vec<u8>, String> {
+                if let Some(base) = release_download_base(&slug) {
+                    let mut url = base;
+                    url.push_str(u.label);
+                    url.push('/');
+                    url.push_str(asset);
+                    if let Ok(bytes) = aterm_update_core::download_bytes(&url, None, cap) {
+                        return Ok(bytes);
+                    }
+                }
+                aterm_update_core::download_bytes(api_url, self.credential(), cap)
+            };
+            let index_bytes = direct("index.toml", u.index, MANIFEST_CAP)?;
+            let sig = direct("index.toml.sig", u.index_sig, SIG_CAP)?;
             // The roster rides the SAME release, so it is fetched here rather than once
             // per repo: a candidate is an index PLUS the generation that authorized its
             // signer, and pairing an index with any other generation is the substitution
             // the per-candidate binding exists to refuse.
-            let roster_bytes =
-                aterm_update_core::download_bytes(u.roster, self.credential(), ROSTER_CAP)?;
-            let roster_sig =
-                aterm_update_core::download_bytes(u.roster_sig, self.credential(), SIG_CAP)?;
+            let roster_asset = aterm_update_core::roster::ROSTER_ASSET;
+            let roster_bytes = direct(roster_asset, u.roster, ROSTER_CAP)?;
+            let mut roster_sig_name = String::from(roster_asset);
+            roster_sig_name.push_str(".sig");
+            let roster_sig = direct(&roster_sig_name, u.roster_sig, SIG_CAP)?;
             out.push(Candidate {
                 label: u.label.to_string(),
                 index_bytes,

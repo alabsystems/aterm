@@ -3190,6 +3190,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_ROBI => {
             " · a permanent resident: typing robi or robot makes him greet you · hidden only under reduced motion or serious mode"
         }
+        crate::prefs::EDIT_NOTICE_SPARKLE => {
+            " · decorative only: the post-update card wears a hue-cycling badge and a ring of twinkling sparkles · reduced motion keeps the colour and holds it still · no other notice is affected"
+        }
         // Every SYNTH voice shares the one macOS-only output path, so they share
         // one platform caveat. Grown with the Sound menu: these keys are now
         // reachable from Settings, so Manual must state the same limit the panel

@@ -173,6 +173,15 @@ pub(crate) struct Config {
     /// static, so a resting Robi costs zero repaints. Hidden only under
     /// reduced motion, serious mode, or `false` — never by focus or time.
     pub(crate) robi: Option<bool>,
+    /// RAINBOW SPARKLE CELEBRATION (`notice_sparkle`, default ON — user-facing
+    /// features ship enabled; this is an opt-OUT). The post-update notice — the
+    /// one card whose whole job is to feel like a small reward — wears a
+    /// hue-cycling badge and a ring of twinkling rainbow sparkles instead of a
+    /// flat cursor-coloured disc. Purely decorative: the wording, the timing and
+    /// the click behaviour are untouched, every OTHER notice (update ready,
+    /// background status, Robi's tips) is unchanged, and reduced motion holds the
+    /// hues still so the card is colourful without moving.
+    pub(crate) notice_sparkle: Option<bool>,
     /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
     /// ship enabled; this is an opt-OUT).
     ///
@@ -2637,6 +2646,11 @@ impl Config {
     /// Robi the helper robot on/off (`robi`, default ON — see the field doc).
     pub(crate) fn robi_or_default(&self) -> bool {
         self.robi.unwrap_or(true)
+    }
+
+    /// Rainbow sparkles on the post-update celebration (default ON — opt-OUT).
+    pub(crate) fn notice_sparkle_or_default(&self) -> bool {
+        self.notice_sparkle.unwrap_or(true)
     }
 
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is

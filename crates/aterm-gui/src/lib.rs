@@ -15430,7 +15430,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // apply mid-extraction swaps the bundle for one whose seal was stripped
             // (2026-08-20 round-8 audit). Cleared on every exit path below.
             let mut saw_marker = false;
-            aterm_update::set_toolchain_install_active(true);
+            let mut saw_start = false;
+            // The durable marker is written AFTER the spawn, with the CHILD's pid —
+            // see `note_toolchain_install_pid`. The in-process flag opens here so the
+            // window between spawn and marker is still covered.
+            aterm_update::begin_toolchain_install();
             // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
             // dispatch edge — store-lock contention, an unwritable or symlinked
             // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
@@ -15444,6 +15448,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 .stderr(std::process::Stdio::piped())
                 .spawn()
             {
+                aterm_update::note_toolchain_install_pid(child.id());
                 let mut refusal = child.stderr.take();
                 if let Some(out) = child.stdout.take() {
                     use std::io::BufRead as _;
@@ -15455,7 +15460,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                             // card up for its full 20 minutes — the two failures this
                             // pair of fixes exists to prevent, defeated by their own
                             // bookkeeping (2026-08-20 round-9 audit).
-                            if !matches!(event, Wake::PkgSeedStarted { .. }) {
+                            if matches!(event, Wake::PkgSeedStarted { .. }) {
+                                // The announcement was OPENED. Only then is there a
+                                // held card that needs retiring below.
+                                saw_start = true;
+                            } else {
                                 saw_marker = true;
                             }
                             if matches!(event, Wake::PkgSeed { .. } | Wake::PkgSeedPartial { .. }) {
@@ -15475,10 +15484,18 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     })
                     .unwrap_or_default();
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
-                // A non-zero exit that produced no marker is the silent case.
-                if !saw_marker {
-                    // Retire the card the announcement raised, whatever happened:
-                    // it is held for 20 minutes and nothing else would take it down.
+                // RETIRE ONLY A CARD THAT WAS ACTUALLY RAISED. `saw_start` is the
+                // whole condition: `atpkg seed` exits quietly and MARKERLESSLY on
+                // every ordinary launch of a provisioned Mac — the seal is reclaimed
+                // after the first success, so the steady state prints a plain
+                // sentence and exits 0 — and firing the failure event there put
+                // "⚠ ALab toolchain install failed" on screen at every single launch
+                // of a perfectly healthy machine. Same for a declined toolset, a
+                // disabled manager, and `seed_install = false`
+                // (2026-08-20 round-10 audit).
+                if saw_start && !saw_marker {
+                    // The announcement is held for 20 minutes and nothing else would
+                    // take it down, so answer it however the child ended.
                     let _ = proxy.send_event(Wake::PkgSeedFailed {
                         detail: if said.trim().is_empty() {
                             "atpkg ended without saying what happened".to_string()
@@ -15487,6 +15504,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         },
                     });
                 }
+                // The LOG is a different question from the pill: a non-zero exit with
+                // no marker is the CLI-edge refusal (store-lock contention, an
+                // unwritable prefix) that round 8 made visible, and it happens
+                // without any announcement having been opened. Gating this on
+                // `saw_start` would have re-silenced it.
                 if !ok && !saw_marker {
                     let why = said.trim();
                     aterm_log::warn!(
@@ -15499,7 +15521,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     );
                 }
             }
-            aterm_update::set_toolchain_install_active(false);
+            aterm_update::end_toolchain_install();
             if !run_update_loop {
                 // `auto_update = false`: the batteries went in above, and that
                 // is all this thread was asked to do.

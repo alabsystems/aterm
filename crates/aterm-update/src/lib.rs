@@ -769,17 +769,32 @@ static TOOLCHAIN_INSTALL_ACTIVE: std::sync::atomic::AtomicBool =
 /// one that works: the apply this guards runs at the top of a SUCCESSOR image's
 /// boot, in a process that never set the flag, so the atomic alone was always false
 /// when the guard read it (2026-08-20 round-9 audit).
-pub fn set_toolchain_install_active(active: bool) {
-    TOOLCHAIN_INSTALL_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+pub fn begin_toolchain_install() {
+    TOOLCHAIN_INSTALL_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Record the EXTRACTING CHILD'S pid durably, once it exists.
+///
+/// Not ours. The installer outlives us: it is an ordinary spawned process with no
+/// kill-on-parent-death, so quitting aterm mid-install leaves it reparented to
+/// launchd and still reading the sealed payload out of the bundle by path. A marker
+/// carrying our pid went stale the instant we exited, and the next launch's boot
+/// apply — the one this guard exists for — then swapped the bundle out from under a
+/// live extraction (2026-08-20 round-10 audit).
+pub fn note_toolchain_install_pid(pid: u32) {
     let Some(staging) = paths::Staging::resolve() else {
         return;
     };
-    let marker = staging.toolchain_install();
-    if active {
-        let _ = std::fs::write(&marker, std::process::id().to_string());
-    } else {
-        let _ = std::fs::remove_file(&marker);
-    }
+    let _ = std::fs::write(staging.toolchain_install(), pid.to_string());
+}
+
+/// The install is over: drop both the in-process flag and the durable marker.
+pub fn end_toolchain_install() {
+    TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    let _ = std::fs::remove_file(staging.toolchain_install());
 }
 
 /// Whether a toolchain install is reading this bundle's sealed payload right now.

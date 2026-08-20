@@ -919,15 +919,40 @@ fn apply_group(
         .iter()
         .any(|m| layout.removed_programs().contains(m))
     {
-        let revocation_pending = group.members.iter().any(|m| {
-            matches!(
-                crate::gate::decide(ch, m, installed.get(m).copied()),
-                crate::gate::ApplyDecision::Tombstone
-            ) || !crate::gate::current_build_ok(ch, m, installed.get(m).copied())
-        });
-        if !revocation_pending {
+        // ENFORCE THE REVOCATION HERE, rather than by handing the tuple to a
+        // transaction whose job is to COMPLETE it. Routing a held group into
+        // `apply_group_txn` looked right and was not: `decide` returns `Install` for
+        // the removed member (it is not installed), so the transaction staged and
+        // flipped it — the six-hourly pass re-downloading the 3.2 GB the user had
+        // deleted, which is the exact bug the hold exists to prevent, reintroduced by
+        // its own safety valve. Worse, the group-aggregated disk preflight runs FIRST,
+        // so on the machine that uninstalled a sibling to free space the reinstall did
+        // not fit, the transaction aborted, and the revoked build kept its working
+        // shims anyway (2026-08-20 round-10 audit).
+        //
+        // What a revocation actually requires is that the revoked build stop being
+        // runnable. That needs no download and no tuple: de-activate it by writing
+        // failing tombstone shims over the tools it currently exposes, exactly as the
+        // Tombstone arm of `transact` does, and report it so the CLI can say so.
+        let revoked: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| installed.contains_key(*m))
+            .filter(|m| {
+                matches!(
+                    crate::gate::decide(ch, m, installed.get(*m).copied()),
+                    crate::gate::ApplyDecision::Tombstone
+                ) || !crate::gate::current_build_ok(ch, m, installed.get(*m).copied())
+            })
+            .cloned()
+            .collect();
+        if revoked.is_empty() {
             return None;
         }
+        for program in &revoked {
+            install_tombstone_shims(layout, program, installed.get(program).copied());
+        }
+        return Some((TxnOutcome::Tombstoned(revoked), BTreeMap::new()));
     }
     Some(apply_group_txn(
         fetcher, layout, index, ch, channel, triple, group, installed,
@@ -4229,4 +4254,10 @@ mod tests {
         let live_sig = testkit::sign(&testkit::MASTER_SEED, &live_bytes);
         assert!(crate::sig::admit_roster(&anchor, live_bytes, &live_sig, testkit::NOW).is_ok());
     }
+
+
+
+
+
+
 }

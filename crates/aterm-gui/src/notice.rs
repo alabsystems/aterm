@@ -702,6 +702,73 @@ pub(crate) fn notice_rect(
     (p.x, p.y, p.w, p.h)
 }
 
+
+/// A fully-saturated rainbow colour at hue `h` turns (0..1 wraps).
+///
+/// Full saturation and value on purpose: this is party trim, not a UI role, and it is
+/// only ever used for the celebration card's badge and its sparkles — never for text,
+/// a state colour, or anything a reader has to interpret.
+fn rainbow(h: f32) -> [u8; 3] {
+    let h = (h.fract() + 1.0).fract() * 6.0;
+    let i = h.floor();
+    let f = h - i;
+    let (q, t) = (1.0 - f, f);
+    let (r, g, b) = match i as u32 % 6 {
+        0 => (1.0, t, 0.0),
+        1 => (q, 1.0, 0.0),
+        2 => (0.0, 1.0, t),
+        3 => (0.0, q, 1.0),
+        4 => (t, 0.0, 1.0),
+        _ => (1.0, 0.0, q),
+    };
+    [
+        (r * 255.0) as u8,
+        (g * 255.0) as u8,
+        (b * 255.0) as u8,
+    ]
+}
+
+/// How many sparkles ring the celebration card.
+const SPARKLES: usize = 14;
+/// Hue turns per second for the badge and the ring — slow enough to read as a shimmer
+/// rather than a strobe.
+const RAINBOW_TURNS_PER_SEC: f32 = 0.22;
+
+/// How far outside the card the sparkle ring sits, in tray px. Kept well inside
+/// [`SHADOW_MARGIN`] so the compositor's paint region already covers it.
+const SPARKLE_INSET: f32 = 3.0;
+/// Sparkle radius at its dimmest and brightest.
+const SPARKLE_MIN_R: f32 = 0.7;
+const SPARKLE_MAX_R: f32 = 2.1;
+
+/// A point at fraction `f` (0..1) around the perimeter of a rounded rect, walked as a
+/// plain rectangle — close enough for decorative trim, and unlike a circle it keeps
+/// the spacing even along a long pill.
+fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
+    let per = 2.0 * (w + h);
+    let d = (f.fract() + 1.0).fract() * per;
+    if d < w {
+        (x + d, y)
+    } else if d < w + h {
+        (x + w, y + (d - w))
+    } else if d < 2.0 * w + h {
+        (x + w - (d - w - h), y + h)
+    } else {
+        (x, y + h - (d - 2.0 * w - h))
+    }
+}
+
+/// The look inputs a notice card needs, grouped so the painter keeps one argument for
+/// "how it is drawn" rather than one per knob.
+#[derive(Clone, Copy)]
+pub(crate) struct NoticeChrome {
+    pub(crate) theme: Theme,
+    /// The live cursor colour — the celebration badge's colour when sparkles are off.
+    pub(crate) cursor: [u8; 3],
+    /// Rainbow sparkles on the post-update celebration (`[effects] notice_sparkle`).
+    pub(crate) sparkle: bool,
+}
+
 /// Build the notice card as pure [`DrawPrim`]s, with the whole card's alpha scaled by
 /// `n.alpha(now)` (the fade). The tone decides the badge: filled accent for the clickable
 /// "Update ready", the live cursor colour for the level-up flourish, a hollow ring for the
@@ -709,12 +776,16 @@ pub(crate) fn notice_rect(
 pub(crate) fn notice_tray(
     n: &TransientNotice,
     g: &SettingsGeom,
-    theme: Theme,
-    cursor: [u8; 3],
+    chrome: NoticeChrome,
     now: Instant,
     motion: f32,
     clear_rows: f32,
 ) -> TrayInput {
+    let NoticeChrome {
+        theme,
+        cursor,
+        sparkle,
+    } = chrome;
     let r = Roles::from_theme(theme);
     let p = layout(n, g, now, motion, clear_rows);
     let a = n.alpha(now);
@@ -768,10 +839,74 @@ pub(crate) fn notice_tray(
         color: rgba(r.separator, sa(0x99)),
     });
 
+    // THE CELEBRATION WEARS A RAINBOW. Only this tone, only when the flag is on: the
+    // post-update card is the one notice whose whole job is to feel like a small
+    // reward, and a flat disc was doing that job joylessly. Under reduced motion the
+    // hue is FROZEN at the card's own spawn phase — still colourful, never moving,
+    // which is what a motion-sensitive reader asked for and not a downgrade to grey.
+    let party = sparkle && matches!(p.tone, Tone::Celebrate);
+    let phase = if party {
+        let spin = if motion > 0.0 {
+            now.duration_since(n.spawned).as_secs_f32() * RAINBOW_TURNS_PER_SEC * motion
+        } else {
+            0.0
+        };
+        // Seed from the card's own caption so two celebrations do not start on the
+        // same colour, then advance with time. Deliberately NOT `fingerprint`, which
+        // folds in the animation step and would re-seed on every frame.
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        n.text().hash(&mut hasher);
+        Some((hasher.finish() % 997) as f32 / 997.0 + spin)
+    } else {
+        None
+    };
+    // THE SPARKLE RING. Drawn AFTER the rim and BEFORE the badge and caption, so it
+    // sits behind everything that has to stay readable: sparkles are trim, and no
+    // amount of party may cost a word its contrast. They ride just outside the card's
+    // edge, inside SHADOW_MARGIN, so the compositor's existing paint region already
+    // covers them and no repaint bookkeeping changes.
+    //
+    // Each sparkle owns a phase, so they twinkle out of step rather than pulsing as
+    // one blinking halo. Under reduced motion `motion` is 0: the sizes freeze at their
+    // phase offsets and the hues hold — a still rainbow, which is colourful without
+    // animating.
+    if let Some(hue) = phase {
+        let t = if motion > 0.0 {
+            now.duration_since(n.spawned).as_secs_f32() * motion
+        } else {
+            0.0
+        };
+        let ring_x = x - SPARKLE_INSET;
+        let ring_y = y - SPARKLE_INSET;
+        let ring_w = w + 2.0 * SPARKLE_INSET;
+        let ring_h = h + 2.0 * SPARKLE_INSET;
+        for i in 0..SPARKLES {
+            let f = i as f32 / SPARKLES as f32;
+            // Walk the perimeter rather than a circle: the card is a long pill, and a
+            // circle of sparkles around it would bunch at the ends.
+            let (cx, cy) = perimeter_point(ring_x, ring_y, ring_w, ring_h, f);
+            // Out-of-step twinkle: a sine per sparkle, offset by its position.
+            let tw = 0.5 + 0.5 * (t * 2.2 + f * std::f32::consts::TAU * 2.0).sin();
+            let rr = SPARKLE_MIN_R + (SPARKLE_MAX_R - SPARKLE_MIN_R) * tw;
+            let alpha = (0x50 as f32 + 0x9F as f32 * tw) as u8;
+            prims.push(DrawPrim::Dot {
+                cx,
+                cy,
+                r: rr,
+                color: rgba(rainbow(hue + f), sa(alpha)),
+                breathe: false,
+            });
+        }
+    }
+
     // The badge: the pictogram lives HERE, not as the first letter of the sentence. (The
     // old pill accent-coloured the caption's first CHARACTER, which on an unmarked
     // caption tinted a random letter — "U" in "Update stopped safely".)
-    let badge = legible_on(p.tone.color(&r, cursor), r.elevated);
+    let badge = match phase {
+        Some(h) => legible_on(rainbow(h), r.elevated),
+        None => legible_on(p.tone.color(&r, cursor), r.elevated),
+    };
     let glyph_color = if p.tone.filled() {
         prims.push(DrawPrim::Dot {
             cx: p.badge_cx,
@@ -891,6 +1026,14 @@ mod tests {
             !SHADOW_LAYERS.is_empty(),
             "no layers means nothing was checked"
         );
+    }
+
+    fn chrome(sparkle: bool) -> NoticeChrome {
+        NoticeChrome {
+            theme: Theme::default(),
+            cursor: [0, 255, 0],
+            sparkle,
+        }
     }
 
     fn geom() -> SettingsGeom {
@@ -1102,7 +1245,7 @@ mod tests {
         let n = TransientNotice::update_ready("0.5.15".into(), 830, now + Duration::ZERO);
         let g = geom();
         let at = now + ENTER; // settled, so the rect is the rest rect
-        let t = notice_tray(&n, &g, Theme::default(), [0, 255, 0], at, 1.0, 0.0);
+        let t = notice_tray(&n, &g, chrome(false), at, 1.0, 0.0);
         let painted = texts(&t);
         assert!(
             painted.iter().any(|(s, _, _)| s == "Update ready"),
@@ -1134,15 +1277,7 @@ mod tests {
         assert_eq!(lines, 2, "the actionable notice gets a chevron");
         let quiet =
             TransientNotice::update_status("\u{2191} Update paused \u{2014} see Version menu", at);
-        let qt = notice_tray(
-            &quiet,
-            &g,
-            Theme::default(),
-            [0, 255, 0],
-            at + ENTER,
-            1.0,
-            0.0,
-        );
+        let qt = notice_tray(&quiet, &g, chrome(false), at + ENTER, 1.0, 0.0);
         assert_eq!(
             qt.prims
                 .iter()
@@ -1177,7 +1312,7 @@ mod tests {
         );
 
         let (x, _, w, _) = notice_rect(&n, &narrow, at, 1.0, 0.0);
-        let t = notice_tray(&n, &narrow, Theme::default(), [0, 255, 0], at, 1.0, 0.0);
+        let t = notice_tray(&n, &narrow, chrome(false), at, 1.0, 0.0);
         let painted = texts(&t);
         assert!(!painted.is_empty(), "something is still painted");
         for (s, tx, tw) in &painted {
@@ -1219,7 +1354,7 @@ mod tests {
                 "fits at {cols} cols: {x}+{w} > {tray_w}"
             );
             assert!(y > 0.0, "the card never rides off the top at {cols} cols");
-            let t = notice_tray(&n, &g, Theme::default(), [0, 255, 0], at, 1.0, 0.0);
+            let t = notice_tray(&n, &g, chrome(false), at, 1.0, 0.0);
             saw_a_card |= !t.prims.is_empty();
             // Below the width that fits a badge the widget paints NOTHING — never a
             // caption hanging off a clamped zero-width card.
@@ -1347,4 +1482,56 @@ mod tests {
             );
         }
     }
+
+    /// The party is confined to the ONE card whose job is to feel like a reward, it
+    /// is decorative only, and reduced motion keeps the colour while dropping the
+    /// movement — a still rainbow, not a downgrade to grey.
+    #[test]
+    fn rainbow_sparkles_ride_only_the_celebration_and_never_cost_legibility() {
+        let g = geom();
+        let at = Instant::now();
+        let dots = |n: &TransientNotice, sparkle: bool, motion: f32| {
+            notice_tray(n, &g, chrome(sparkle), at, motion, 0.0)
+                .prims
+                .iter()
+                .filter(|p| matches!(p, DrawPrim::Dot { .. }))
+                .count()
+        };
+        let party = TransientNotice::level_up(1787199766, at);
+        let plain = TransientNotice::update_status("⇣ Installing", at);
+
+        // The badge is itself a Dot, so the ring is the DIFFERENCE.
+        let with = dots(&party, true, 1.0);
+        let without = dots(&party, false, 1.0);
+        assert_eq!(
+            with - without,
+            SPARKLES,
+            "the celebration gains exactly the sparkle ring"
+        );
+        assert_eq!(
+            dots(&plain, true, 1.0),
+            dots(&plain, false, 1.0),
+            "no other notice sprouts sparkles"
+        );
+        // Reduced motion keeps the ring (colour) and freezes it (no movement).
+        assert_eq!(
+            dots(&party, true, 0.0) - dots(&party, false, 0.0),
+            SPARKLES,
+            "reduced motion keeps a still rainbow rather than dropping it"
+        );
+
+        // The caption text is unchanged by the decoration — the wording is a
+        // contract the update-lane tests pin.
+        assert_eq!(
+            TransientNotice::level_up(1787199766, at).text(),
+            party.text()
+        );
+
+        // Every hue is a real colour, and the wheel wraps without panicking.
+        for i in 0..24 {
+            let c = rainbow(i as f32 / 7.0 - 1.0);
+            assert!(c.iter().any(|&v| v > 0), "hue {i} produced black");
+        }
+    }
+
 }
