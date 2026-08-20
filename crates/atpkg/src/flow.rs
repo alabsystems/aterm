@@ -975,19 +975,32 @@ fn apply_group(
         if !needs_fix {
             return None;
         }
-        // Take the fix for the members that are actually here. The removed one is
-        // excluded from the tuple rather than pulled back in — reinstalling it is
-        // what round 9 did and what the hold exists to prevent. The members present
-        // stay version-locked with each other, which is what coherence protects.
+        // Take the fix for the members that are actually here. Only a member that is
+        // recorded-removed AND ABSENT is excluded: reinstalling one the user deleted
+        // is what round 9 did and what this hold exists to prevent, but a member that
+        // is recorded-removed and nevertheless INSTALLED — the signed `requires`
+        // dependency pull-in reinstalls a missing dep without clearing that record —
+        // is a live program, and dropping it from the tuple left its revoked build
+        // neither upgraded nor tombstoned while its siblings flipped around it: a
+        // version-split pair the index never pinned together, with the yanked build
+        // still shimmed and runnable (2026-08-20 round-12 audit).
+        let removed = layout.removed_programs();
         let present = Group {
             members: group
                 .members
                 .iter()
-                .filter(|m| !layout.removed_programs().contains(*m))
+                .filter(|m| installed.contains_key(*m) || !removed.contains(*m))
                 .cloned()
                 .collect(),
             ..group.clone()
         };
+        // An EMPTY tuple is not "up to date". `transact` reports `UpToDate` for an
+        // empty decision set, so a group whose every member was filtered out printed
+        // the update lane's most reassuring line over a revoked build that was still
+        // running. Nothing to act on here means act on nothing — and say nothing.
+        if present.members.is_empty() {
+            return None;
+        }
         return Some(apply_group_txn(
             fetcher, layout, index, ch, channel, triple, &present, installed,
         ));
@@ -3211,6 +3224,155 @@ mod tests {
 
     /// [`group_fixture`] but whose stable channel YANKS `ay@18`, so `decide` tombstones the
     /// group (to prove a pin never suppresses a tombstone).
+    /// EXHAUSTIVE CONFORMANCE FOR THE REMOVED-MEMBER HOLD.
+    ///
+    /// This one predicate — what an unattended update does to a coherence tuple when
+    /// the user has deliberately uninstalled part of it — took a defect in three
+    /// consecutive audit rounds. Every fix was reasonable and every one was wrong in a
+    /// NEW way: reinstalling the deleted member, tombstoning a member that had a valid
+    /// upgrade waiting, dropping a removed-but-installed member so its revoked build
+    /// stayed runnable while its siblings moved, and reporting "up to date" over an
+    /// empty tuple. Inspection kept missing them because the state space is small but
+    /// not small enough to hold in your head: per member, {absent, safe, revoked} ×
+    /// {recorded-removed or not}, against {clean, installed-build-yanked, pin-yanked}.
+    ///
+    /// So it is enumerated instead of argued about. The assertions below are the
+    /// INVARIANTS, not the expected outputs of any particular branch — they are what
+    /// must hold whatever the implementation decides:
+    ///
+    ///   I1. A member that is recorded-removed AND absent is never installed. That is
+    ///       the whole point of the record.
+    ///   I2. A revoked installed build is never left RUNNABLE. It is either upgraded to
+    ///       the valid pin or its tools are tombstoned — never silently kept.
+    ///   I3. The pass never claims `UpToDate` while some installed member is revoked.
+    #[test]
+    fn the_removed_member_hold_is_exhaustively_safe() {
+        #[derive(Clone, Copy, Debug)]
+        enum Ay {
+            Absent,
+            Safe,
+            Revoked,
+        }
+        type Fixture = fn(&Path) -> Fake;
+        let channels: [(&str, Fixture); 3] = [
+            ("clean", group_fixture),
+            ("yank-installed", group_fixture_yanking_ay17),
+            ("yank-pin", group_fixture_yanking_ay18),
+        ];
+        let mut checked = 0;
+        for (cname, make) in channels {
+            for ay in [Ay::Absent, Ay::Safe, Ay::Revoked] {
+                for trust_installed in [false, true] {
+                    for removed in [
+                        &[][..],
+                        &["ay"][..],
+                        &["trust"][..],
+                        &["ay", "trust"][..],
+                    ] {
+                        let label =
+                            format!("{cname}-{ay:?}-t{trust_installed}-r{}", removed.len());
+                        let dir = scratch(&format!("hold-{label}"));
+                        let fake = make(&dir);
+                        let layout = layout(&dir);
+                        let mut installed = std::collections::BTreeMap::new();
+                        match ay {
+                            Ay::Absent => {}
+                            Ay::Safe => {
+                                seed_build(&layout, "ay", 18, true);
+                                installed.insert("ay".to_string(), 18u64);
+                            }
+                            Ay::Revoked => {
+                                seed_build(&layout, "ay", 17, true);
+                                installed.insert("ay".to_string(), 17u64);
+                            }
+                        }
+                        if trust_installed {
+                            seed_build(&layout, "trust", 4821, true);
+                            installed.insert("trust".to_string(), 4821u64);
+                        }
+                        if !removed.is_empty() {
+                            // The prefix exists only once something has been seeded, and
+                            // the absent/absent cases seed nothing.
+                            std::fs::create_dir_all(&layout.prefix).unwrap();
+                            std::fs::write(layout.removed(), removed.join("\n")).unwrap();
+                        }
+
+                        let report = apply_channel(
+                            &fake,
+                            &layout,
+                            &anchor(),
+                            "stable",
+                            TRIPLE,
+                            &installed,
+                            fl(0),
+                            0,
+                        );
+                        let Ok(report) = report else {
+                            // A resolve/verify failure is not this predicate's business.
+                            continue;
+                        };
+                        checked += 1;
+                        let after = crate::ops::active_builds(&layout);
+
+                        // I1: a recorded-removed, ABSENT member is never installed.
+                        for program in removed {
+                            let was_absent = !installed.contains_key(*program);
+                            if was_absent {
+                                assert!(
+                                    !after.contains_key(*program),
+                                    "{label}: {program} was deleted on purpose and came back"
+                                );
+                            }
+                        }
+
+                        // I2: a revoked installed build is never left runnable.
+                        if matches!(ay, Ay::Revoked) && cname != "clean" {
+                            let live = after.get("ay").copied();
+                            let runnable = crate::ops::which(&layout, "ay").is_some();
+                            let safe = live.is_some_and(|b| b == 18);
+                            assert!(
+                                safe || !runnable,
+                                "{label}: revoked ay is still runnable at {live:?}"
+                            );
+                        }
+
+                        // I4: A MEMBER WITH A VALID REPLACEMENT IS NEVER LEFT DEAD.
+                        // I2 alone calls tombstoning "safe", and it is — but it is the
+                        // WRONG safe answer when the channel is offering a fix, and
+                        // that is exactly the shape that shipped: a routine yank
+                        // disabled a program that had a working upgrade waiting, and
+                        // the corpse then vanished from `active_builds` so no later
+                        // pass could see or repair it. An invariant set that only asks
+                        // "is anything unsafe running" cannot see this; it has to ask
+                        // "did anything that should live, die".
+                        if cname == "yank-installed"
+                            && matches!(ay, Ay::Revoked)
+                            && !(removed.contains(&"ay") && !installed.contains_key("ay"))
+                        {
+                            assert!(
+                                crate::ops::which(&layout, "ay").is_some(),
+                                "{label}: ay had a valid pin (18) and was killed instead \
+                                 of upgraded"
+                            );
+                        }
+
+                        // I3: never "up to date" over a revocation.
+                        if matches!(ay, Ay::Revoked) && cname != "clean" {
+                            for (_, outcome) in &report.groups {
+                                assert!(
+                                    !matches!(outcome, TxnOutcome::UpToDate),
+                                    "{label}: reported UpToDate over a revoked build"
+                                );
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                }
+            }
+        }
+        assert!(checked >= 24, "the enumeration ran only {checked} cases");
+    }
+
     fn group_fixture_yanking_ay18(dir: &Path) -> Fake {
         let mut f = group_fixture(dir);
         let index_body = format!(

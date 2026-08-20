@@ -13227,7 +13227,7 @@ impl ApplicationHandler<Wake> for App {
         // The transient update NOTICE animates: wake at the fade start (steady hold) then
         // every frame through the fade tail (see `TransientNotice::deadline`).
         if let Some(n) = &self.notice {
-            let d = n.deadline(Instant::now());
+            let d = n.deadline(Instant::now(), self.notice_is_sparkling());
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,

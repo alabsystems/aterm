@@ -12927,6 +12927,9 @@ impl App {
             // …and WHICH animal it draws, hoisted for the same reason (a `Copy`
             // enum, so the borrow below is unaffected).
             let pet_species = self.trail_pet_species();
+            // Hoisted for the same reason as the two above: a `bool`, read before the
+            // mutable window borrow below.
+            let notice_sparkling = self.notice_is_sparkling();
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
@@ -14176,7 +14179,7 @@ impl App {
             let notice_fp = self
                 .notice
                 .as_ref()
-                .map_or(0, |n| n.fingerprint(std::time::Instant::now()));
+                .map_or(0, |n| n.fingerprint(std::time::Instant::now(), notice_sparkling));
             // LEVEL-UP celebration — quantized to its ~30fps step so the glow/arrow re-
             // present every frame while up; `0` when idle (byte-identical no-celebration).
             let level_up_fp = self
@@ -17635,7 +17638,7 @@ impl App {
         let notice_fp = self
             .notice
             .as_ref()
-            .map_or(0, |n| n.fingerprint(std::time::Instant::now()));
+            .map_or(0, |n| n.fingerprint(std::time::Instant::now(), self.notice_is_sparkling()));
         let level_up_fp = self.level_up.as_ref().map_or(0, |l| l.fingerprint(now));
         let key = RepaintKey {
             damage_epoch,
@@ -18855,7 +18858,7 @@ impl App {
     /// [`Self::splice_build_badge`].
     pub(crate) fn splice_notice(&mut self, wid: WindowId) {
         let now = std::time::Instant::now();
-        let Some(fp) = self.notice.as_ref().map(|n| n.fingerprint(now)) else {
+        let Some(fp) = self.notice.as_ref().map(|n| n.fingerprint(now, self.notice_is_sparkling())) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.notice_card = None;
             }

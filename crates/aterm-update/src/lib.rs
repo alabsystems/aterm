@@ -785,7 +785,27 @@ pub fn note_toolchain_install_pid(pid: u32) {
     let Some(staging) = paths::Staging::resolve() else {
         return;
     };
-    let _ = std::fs::write(staging.toolchain_install(), pid.to_string());
+    let marker = staging.toolchain_install();
+    // NEVER OVERWRITE A LIVE OWNER. One slot, shared by every aterm process, and an
+    // installer outlives the app that started it. A second launch's seed child — which
+    // atpkg turns away in milliseconds because the first still holds the store lock —
+    // used to stamp its own pid here, making the marker its own; it then passed the
+    // teardown's ownership check and deleted the record of the extraction that was
+    // still running. The check added in round 11 could never fire, because the clobber
+    // happened before it (2026-08-20 round-12 audit).
+    //
+    // Yielding is the safe direction: the live owner keeps the guard, and our own
+    // short-lived child needs no protection precisely because it is about to be
+    // refused.
+    if let Ok(text) = std::fs::read_to_string(&marker)
+        && let Ok(existing) = text.trim().parse::<i32>()
+        && existing > 0
+        && existing != pid as i32
+        && unsafe { libc::kill(existing, 0) } == 0
+    {
+        return;
+    }
+    let _ = std::fs::write(&marker, pid.to_string());
 }
 
 /// The install is over: drop both the in-process flag and the durable marker.

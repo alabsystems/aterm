@@ -343,6 +343,18 @@ impl App {
         self.request_redraw_all_windows();
     }
 
+    /// Whether the celebration card's pixels are actually MOVING right now — sparkles
+    /// enabled and motion live. The notice cannot know either: one is config, the
+    /// other is the reduced-motion amplitude. Both must be true before the card earns
+    /// a per-frame wake and a re-raster (2026-08-20 round-12 audit).
+    pub(crate) fn notice_is_sparkling(&self) -> bool {
+        self.config.notice_sparkle_or_default()
+            && self
+                .motion_policy(true)
+                .amplitude(crate::motion::MotionEffect::NoticePill)
+                > 0.0
+    }
+
     /// The same card, held for work that is genuinely still running.
     ///
     /// A toolchain install extracts multiple GB over minutes; the default card is

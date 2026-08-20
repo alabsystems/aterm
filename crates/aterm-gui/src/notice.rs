@@ -201,7 +201,7 @@ impl TransientNotice {
     /// The next wake time: animate every [`FRAME`] while the card is moving (the
     /// entrance ramp and the exit tail), otherwise just wake at the exit boundary — a
     /// steady hold needs no intermediate repaints.
-    pub(crate) fn deadline(&self, now: Instant) -> Instant {
+    pub(crate) fn deadline(&self, now: Instant, sparkling: bool) -> Instant {
         let elapsed = now.duration_since(self.spawned);
         let fade_start = self.ttl.saturating_sub(FADE);
         // A SPARKLING CARD IS ALWAYS MOVING. The steady-hold shortcut below exists
@@ -210,17 +210,23 @@ impl TransientNotice {
         // frame through the hold froze them for most of the card's life. The badge
         // advanced 0.048 of a turn across the entrance and then stopped, so the
         // "rainbow" was in practice a fixed colour (2026-08-20 round-11 audit).
-        if self.animates() || elapsed < ENTER || elapsed >= fade_start {
+        if self.animates(sparkling) || elapsed < ENTER || elapsed >= fade_start {
             now + FRAME
         } else {
             self.spawned + fade_start
         }
     }
 
-    /// Whether this card's pixels change with time DURING its hold — true only for
-    /// the sparkling celebration, so nothing else starts churning repaints.
-    pub(crate) const fn animates(&self) -> bool {
-        matches!(self.kind, NoticeKind::LevelUp { .. })
+    /// Whether this card's pixels change with time DURING its hold.
+    ///
+    /// `sparkling` is the RUNTIME fact — sparkles enabled and motion live — because
+    /// the kind alone cannot know it. With `[effects] notice_sparkle = false` no ring
+    /// is drawn at all, and under reduced motion the hue and twinkle are frozen by
+    /// design; keying on the kind alone woke the compositor every frame and
+    /// re-rasterized ~130 times for pixel-identical output, hardest on exactly the
+    /// reader whose setting exists to stop that (2026-08-20 round-12 audit).
+    pub(crate) const fn animates(&self, sparkling: bool) -> bool {
+        sparkling && matches!(self.kind, NoticeKind::LevelUp { .. })
     }
 
     /// The whole-card alpha at `now`: an eased ramp 0→1 across the entrance, `1.0`
@@ -262,7 +268,7 @@ impl TransientNotice {
     /// A repaint fingerprint folded into `RepaintKey::notice_fp`, quantized so the card
     /// re-presents on each animation step but NOT every idle frame during the hold. `0` is
     /// the no-notice sentinel, so a live notice is forced non-zero.
-    pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
+    pub(crate) fn fingerprint(&self, now: Instant, sparkling: bool) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         match &self.kind {
@@ -294,7 +300,7 @@ impl TransientNotice {
         // raster was reused for the whole 4.4 s and the sparkles never twinkled. ~24
         // steps/second is finer than the present cadence and coarse enough that a
         // still card (every other kind) hashes identically frame to frame.
-        if self.animates() {
+        if self.animates(sparkling) {
             ((now.duration_since(self.spawned).as_secs_f32() * 24.0) as u64).hash(&mut h);
         }
         // The speech-bubble anchor moves with its speaker — quantized to 2px
@@ -1168,7 +1174,7 @@ mod tests {
     fn fingerprint_zeroes_never_and_changes_across_the_motion() {
         let now = t0();
         let n = TransientNotice::level_up(830, now);
-        assert_ne!(n.fingerprint(now), 0);
+        assert_ne!(n.fingerprint(now, true), 0);
         // The hold is stable for a STILL card; both ramps change the fingerprint.
         //
         // The subject here used to be the level-up card, which no longer holds still:
@@ -1178,20 +1184,20 @@ mod tests {
         // worth pinning — it is now pinned on a card that actually holds steady, and
         // the exemption is asserted below rather than assumed.
         let still = TransientNotice::update_status("⇣ Installing", now);
-        let hold_a = still.fingerprint(now + ENTER + Duration::from_millis(50));
-        let hold_b = still.fingerprint(now + ENTER + Duration::from_millis(250));
+        let hold_a = still.fingerprint(now + ENTER + Duration::from_millis(50), true);
+        let hold_b = still.fingerprint(now + ENTER + Duration::from_millis(250), true);
         assert_eq!(hold_a, hold_b, "stable during hold");
-        assert!(!still.animates());
+        assert!(!still.animates(true));
         assert_ne!(
-            n.fingerprint(now + ENTER + Duration::from_millis(50)),
-            n.fingerprint(now + ENTER + Duration::from_millis(250)),
+            n.fingerprint(now + ENTER + Duration::from_millis(50), true),
+            n.fingerprint(now + ENTER + Duration::from_millis(250), true),
             "the ONE animating card is deliberately not stable during its hold"
         );
-        let enter_a = n.fingerprint(now + Duration::from_millis(20));
-        let enter_b = n.fingerprint(now + Duration::from_millis(120));
+        let enter_a = n.fingerprint(now + Duration::from_millis(20), true);
+        let enter_b = n.fingerprint(now + Duration::from_millis(120), true);
         assert_ne!(enter_a, enter_b, "changes across the entrance");
-        let fade_a = n.fingerprint(now + TTL - FADE + Duration::from_millis(100));
-        let fade_b = n.fingerprint(now + TTL - FADE + Duration::from_millis(500));
+        let fade_a = n.fingerprint(now + TTL - FADE + Duration::from_millis(100), true);
+        let fade_b = n.fingerprint(now + TTL - FADE + Duration::from_millis(500), true);
         assert_ne!(fade_a, fade_b, "changes across the exit");
     }
 
@@ -1201,7 +1207,7 @@ mod tests {
     fn every_frame_of_the_ramps_is_a_distinct_fingerprint_step() {
         let now = t0();
         let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
-        let sample = |ms: u64| n.fingerprint(now + Duration::from_millis(ms));
+        let sample = |ms: u64| n.fingerprint(now + Duration::from_millis(ms), true);
         let enter_steps = (0..ENTER.as_millis() as u64)
             .step_by(FRAME.as_millis() as usize)
             .map(sample)
@@ -1217,15 +1223,15 @@ mod tests {
     fn deadline_wakes_per_frame_while_moving_and_sleeps_through_the_hold() {
         let now = t0();
         let n = TransientNotice::update_ready("0.5.15".into(), 830, now);
-        assert_eq!(n.deadline(now), now + FRAME, "entrance animates");
+        assert_eq!(n.deadline(now, true), now + FRAME, "entrance animates");
         let held = now + ENTER + Duration::from_millis(100);
         assert_eq!(
-            n.deadline(held),
+            n.deadline(held, true),
             now + (TTL - FADE),
             "the hold sleeps to the exit boundary"
         );
         let leaving = now + TTL - FADE / 2;
-        assert_eq!(n.deadline(leaving), leaving + FRAME, "the exit animates");
+        assert_eq!(n.deadline(leaving, true), leaving + FRAME, "the exit animates");
     }
 
     #[test]
@@ -1570,17 +1576,21 @@ mod tests {
         );
         // The celebration animates during its hold; nothing else does, so nothing
         // else starts churning repaints.
-        assert!(party.animates(), "the celebration's pixels move while it holds");
-        assert!(!plain.animates() && !tip.animates());
+        assert!(party.animates(true), "the celebration's pixels move while it holds");
+        assert!(
+            !party.animates(false),
+            "…and stand still when sparkles are off or motion is reduced — no wake, no re-raster"
+        );
+        assert!(!plain.animates(true) && !tip.animates(true));
         let held = at + ENTER + Duration::from_millis(500);
         assert_ne!(
-            party.fingerprint(held),
-            party.fingerprint(held + Duration::from_millis(200)),
+            party.fingerprint(held, true),
+            party.fingerprint(held + Duration::from_millis(200), true),
             "a sparkling card must re-rasterize during the hold, or it freezes"
         );
         assert_eq!(
-            plain.fingerprint(held),
-            plain.fingerprint(held + Duration::from_millis(200)),
+            plain.fingerprint(held, true),
+            plain.fingerprint(held + Duration::from_millis(200), true),
             "a still card must keep hashing identically"
         );
         // Reduced motion keeps the ring (colour) and freezes it (no movement).
