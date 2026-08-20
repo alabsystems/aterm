@@ -1557,7 +1557,10 @@ fn cmd_update_all() -> ExitCode {
     // The ACTIVE build per program (what the shims point at), NOT the max complete build
     // on disk — so `decide` never treats a staged-but-unactivated build as the running one
     // (which would silently skip a needed re-flip, #19).
-    let installed: std::collections::BTreeMap<String, u64> = crate::active_builds(&layout);
+    // The DECISION-TIME view: a program whose tools were tombstoned by an earlier
+    // revocation is still installed, and must stay visible to this pass or the
+    // tombstone is a one-way door (2026-08-20 independent derivation).
+    let installed: std::collections::BTreeMap<String, u64> = crate::installed_builds(&layout);
     // WHO gets set-completion: a machine that has ADOPTED the toolset (the seed bootstrap
     // or an explicit "Install ALab toolset" already laid the whole set down), or one whose
     // owner ticked `auto_install` to authorize a from-scratch network bootstrap. The two

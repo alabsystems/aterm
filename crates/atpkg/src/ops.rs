@@ -117,6 +117,44 @@ pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     out
 }
 
+/// Every program the store HAS, including one whose tools are currently tombstoned.
+///
+/// [`active_builds`] folds the shim view, and a tombstone REPLACES the shims with
+/// failing regular files — so a program disabled by a revocation vanishes from it.
+/// That made tombstoning a ONE-WAY DOOR: the update pass builds its `installed` map
+/// from the shim view, so a disabled member was invisible to every later pass, and
+/// republishing a valid pin could never bring it back. The user's only route was to
+/// notice and reinstall by hand, which is not a route on an unattended machine
+/// (2026-08-20 independent derivation).
+///
+/// The authority link `store/<program>/current` survives a tombstone — GC already
+/// relies on that — so it is what answers "is this program installed" for anything
+/// DECIDING, as opposed to anything asking "what can I run right now".
+#[must_use]
+pub fn installed_builds(layout: &Layout) -> BTreeMap<String, u64> {
+    let mut out = active_builds(layout);
+    let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) else {
+        return out;
+    };
+    for entry in programs.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if out.contains_key(&name) {
+            continue;
+        }
+        // A resolved per-program `current` is the build this program is ON, whatever
+        // its shims currently say.
+        if let Ok(target) = std::fs::canonicalize(entry.path().join("current"))
+            && let Some((program, build)) = program_build_of_target(&target)
+            && program == name
+        {
+            out.insert(program, build);
+        }
+    }
+    out
+}
+
 /// The **tool names** whose `bin/` shims currently point into `store/<program>/<build>/`
 /// — the exact tool set a rollback must re-point (or drop). Reuses
 /// [`program_build_of_target`], so it matches only shims that actually resolve into this

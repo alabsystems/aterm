@@ -841,11 +841,11 @@ pub fn apply_channel(
             }
             continue;
         }
-        if let Some((outcome, group_applied)) = apply_group(
+        if let Some((acted, outcome, group_applied)) = apply_group(
             fetcher, layout, &index, &ch, channel, triple, group, installed,
         ) {
             applied.extend(group_applied);
-            results.push((group.clone(), outcome));
+            results.push((acted, outcome));
         }
     }
     // (Shell.d hook refresh runs at the main.rs CLI edge, not here — see the note in
@@ -886,7 +886,7 @@ fn apply_group(
     triple: &str,
     group: &Group,
     installed: &BTreeMap<String, u64>,
-) -> Option<(TxnOutcome, BTreeMap<String, AppliedMember>)> {
+) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
     // `update` touches INSTALLED groups only: skip a group with no installed member (that
     // would be a fresh `install`, not an update). A coherence group with even ONE member
     // installed IS processed in full — the locked tuple must stay coherent, so a missing
@@ -919,7 +919,15 @@ fn apply_group(
     // requires actual ABSENCE: a stale record for a member that a signed `requires`
     // pull-in has since reinstalled is not a reason to hold anything.
     let removed = layout.removed_programs();
-    let deliberately_absent = |m: &String| removed.contains(m) && !installed.contains_key(m);
+    // `uninstall --all` writes `declined` — the durable "this machine does not want the
+    // bundled toolset" — and clears nothing per-program. The flow layer never read it,
+    // so `uninstall --all` followed by installing ONE program let the next unattended
+    // pass pull the rest of its coherence tuple back, gigabytes, unannounced. A machine
+    // that declined the set is not asking for the set (2026-08-20 independent
+    // derivation).
+    let declined = layout.declined().is_file();
+    let deliberately_absent =
+        |m: &String| (declined || removed.contains(m)) && !installed.contains_key(m);
     if group.members.iter().any(deliberately_absent) {
         let present = Group {
             members: group
@@ -936,13 +944,18 @@ fn apply_group(
         if present.members.is_empty() {
             return None;
         }
-        return Some(apply_group_txn(
-            fetcher, layout, index, ch, channel, triple, &present, installed,
-        ));
+        // REPORT THE GROUP THAT WAS ACTED ON, not the nominal one. The caller wrote
+        // per-program status rows from the group it was handed, so a filtered tuple
+        // produced an `active` row for the very program the user deleted — a phantom
+        // installation in the surface the user is sent to check
+        // (2026-08-20 independent derivation).
+        let (outcome, applied) =
+            apply_group_txn(fetcher, layout, index, ch, channel, triple, &present, installed);
+        return Some((present, outcome, applied));
     }
-    Some(apply_group_txn(
-        fetcher, layout, index, ch, channel, triple, group, installed,
-    ))
+    let (outcome, applied) =
+        apply_group_txn(fetcher, layout, index, ch, channel, triple, group, installed);
+    Some((group.clone(), outcome, applied))
 }
 
 /// §11 bootstrap: apply ONE coherence group all-or-nothing against a caller-resolved,
@@ -1074,6 +1087,20 @@ fn apply_group_txn(
         && let Some(required) = group_disk_required(fetcher, index, ch, &install_members, triple)
         && disk_gate(required, crate::freespace::available_bytes(&layout.prefix)).is_err()
     {
+        // Stage NOTHING — the group stays coherent on its current builds. But
+        // "coherent" must not mean "the revoked build keeps working": `decide` returns
+        // Install to FORCE-UPGRADE off a yanked or below-floor build, so an abort here
+        // leaves exactly that build runnable, on exactly the machine this path is most
+        // likely to meet — the one whose owner uninstalled a multi-gigabyte sibling to
+        // reclaim space. The upgrade is what could not be afforded; disabling the
+        // revoked build costs nothing and is the half of the decision that must still
+        // happen (2026-08-20 independent derivation).
+        for (program, _) in decisions
+            .iter()
+            .filter(|(p, d)| *d == ApplyDecision::Install && !crate::gate::current_build_ok(ch, p, installed.get(p).copied()))
+        {
+            install_tombstone_shims(layout, program, installed.get(program).copied());
+        }
         // Stage NOTHING — the group stays coherent on its current builds.
         return (
             TxnOutcome::Aborted {
@@ -1515,11 +1542,11 @@ pub fn apply_program(
     }
     let mut results = Vec::new();
     let mut applied: BTreeMap<String, AppliedMember> = BTreeMap::new();
-    if let Some((o, group_applied)) = apply_group(
+    if let Some((acted, o, group_applied)) = apply_group(
         fetcher, layout, &index, &ch, channel, triple, &group, installed,
     ) {
         applied.extend(group_applied);
-        results.push((group, o));
+        results.push((acted, o));
     }
     // (Shell.d hook refresh runs at the main.rs CLI edge — see the note in `install`.)
     Ok(ChannelApplyReport {
