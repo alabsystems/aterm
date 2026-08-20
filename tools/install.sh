@@ -615,8 +615,13 @@ uninstall_everything() {
 		break
 	done
 	if [[ -n "$atpkg_bin" ]]; then
-		echo "install.sh: removing the ALab toolchain store (atpkg uninstall --all)…"
-		if "$atpkg_bin" uninstall --all >/dev/null 2>&1; then
+		# DRY RUN MEANS DRY. `atpkg uninstall --all` deletes multiple GB and writes a
+		# durable "declined" marker; running it here unconditionally made
+		# `--uninstall --dry-run` — a command whose entire promise is that it changes
+		# nothing — the most destructive path in this script (2026-08-20 round-9 audit).
+		if [[ "$DRY_RUN" -eq 1 ]]; then
+			echo "install.sh: $act the ALab toolchain store: $atpkg_bin uninstall --all"
+		elif "$atpkg_bin" uninstall --all >/dev/null 2>&1; then
 			echo "install.sh: removed the ALab toolchain store"
 			removed=$((removed + 1))
 		else
@@ -646,6 +651,17 @@ uninstall_everything() {
 
 	# 2. the `aterm` symlink — only when it still resolves into a bundle or our
 	#    store. A real file there is someone's own build, not ours to delete.
+	# The `atpkg` companion link, planted by the app itself on every run from a
+	# bundle (crates/atpkg/src/hooks.rs). Nothing else removes it, so leaving it
+	# behind guaranteed a dangling command after the app is gone
+	# (2026-08-20 round-9 audit).
+	local atpkg_link="${ATERM_BIN_DIR:-$HOME/.local/bin}/atpkg"
+	if [[ -L "$atpkg_link" ]]; then
+		case "$(readlink "$atpkg_link" 2>/dev/null || true)" in
+		*/aterm.app/Contents/MacOS/*) _rm "$atpkg_link" "atpkg command" ;;
+		*) _skip "$atpkg_link" "symlink points outside an aterm bundle" ;;
+		esac
+	fi
 	local bin="${ATERM_BIN_DIR:-$HOME/.local/bin}/aterm"
 	local store="${ATERM_STORE_DIR:-$HOME/.local/lib/aterm/bin}"
 	if [[ -L "$bin" ]]; then
