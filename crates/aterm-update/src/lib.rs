@@ -764,14 +764,51 @@ static TOOLCHAIN_INSTALL_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Mark a toolchain install in flight for the lifetime of the extracting child.
+///
+/// Writes a DURABLE marker as well as the in-process flag. The durable half is the
+/// one that works: the apply this guards runs at the top of a SUCCESSOR image's
+/// boot, in a process that never set the flag, so the atomic alone was always false
+/// when the guard read it (2026-08-20 round-9 audit).
 pub fn set_toolchain_install_active(active: bool) {
     TOOLCHAIN_INSTALL_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    let marker = staging.toolchain_install();
+    if active {
+        let _ = std::fs::write(&marker, std::process::id().to_string());
+    } else {
+        let _ = std::fs::remove_file(&marker);
+    }
 }
 
 /// Whether a toolchain install is reading this bundle's sealed payload right now.
+///
+/// True when this process set the flag, OR when a LIVE process left the durable
+/// marker. A marker whose pid is gone — the installer was killed — is stale and is
+/// removed here rather than blocking updates forever.
 #[must_use]
 pub fn is_toolchain_install_active() -> bool {
-    TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    if TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return true;
+    }
+    let Some(staging) = paths::Staging::resolve() else {
+        return false;
+    };
+    let marker = staging.toolchain_install();
+    let Ok(text) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<i32>() else {
+        let _ = std::fs::remove_file(&marker);
+        return false;
+    };
+    // `kill(pid, 0)` asks only "does this process exist and may I signal it".
+    let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
+    if !alive {
+        let _ = std::fs::remove_file(&marker);
+    }
+    alive
 }
 
 /// Mark this process an uncommitted handoff candidate (`true` at boot when the

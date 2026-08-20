@@ -894,21 +894,40 @@ fn apply_group(
     if group.members.iter().all(|m| !installed.contains_key(m)) {
         return None;
     }
-    // A DELIBERATELY REMOVED MEMBER HOLDS THE WHOLE TUPLE. "Pull the missing sibling
-    // in" is right for a member that was never installed and wrong for one the user
-    // uninstalled: `aterm pkg uninstall trust` frees ~3.2 GB, records the removal
-    // durably, and says this machine no longer auto-completes the toolset — and then
-    // the next six-hourly pass re-downloaded it, because this path never read that
-    // record. Coherence is still not violated: rather than flip a partial tuple, the
-    // group is skipped whole and the CLI says so, leaving the user the two honest
-    // moves — reinstall the member, or uninstall its siblings
-    // (2026-08-20 round-8 audit).
+    // A DELIBERATELY REMOVED MEMBER HOLDS THE TUPLE — BUT NEVER AGAINST REVOCATION.
+    //
+    // "Pull the missing sibling in" is right for a member that was never installed and
+    // wrong for one the user uninstalled: `aterm pkg uninstall trust` frees ~3.2 GB,
+    // records the removal durably, and says this machine no longer auto-completes the
+    // toolset — and the next six-hourly pass used to re-download it, because this path
+    // never read that record.
+    //
+    // The FIRST version of this hold returned before `apply_group_txn`, which is the
+    // only evaluator of `gate::decide` for grouped members — so a yanked or
+    // below-floor build was never tombstoned and its shims kept working, forever, on
+    // a machine that had merely uninstalled a sibling. That is precisely what the pin
+    // gate below refuses to allow a local preference to do, and it shipped in
+    // v0.36.0 (2026-08-20 round-9 audit).
+    //
+    // So the hold applies only when every installed member is CURRENTLY SAFE. The
+    // moment the channel revokes one — a raised floor, a yank, a pin that is itself
+    // unsafe — the tuple flows through the normal transaction, which is what
+    // de-activates the build and writes tombstone shims over its tools. A user's
+    // preference about disk space is not authority over a revocation.
     if group
         .members
         .iter()
         .any(|m| layout.removed_programs().contains(m))
     {
-        return None;
+        let revocation_pending = group.members.iter().any(|m| {
+            matches!(
+                crate::gate::decide(ch, m, installed.get(m).copied()),
+                crate::gate::ApplyDecision::Tombstone
+            ) || !crate::gate::current_build_ok(ch, m, installed.get(m).copied())
+        });
+        if !revocation_pending {
+            return None;
+        }
     }
     Some(apply_group_txn(
         fetcher, layout, index, ch, channel, triple, group, installed,

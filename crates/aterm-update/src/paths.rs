@@ -94,6 +94,17 @@ impl Staging {
         self.root.join("failed.toml")
     }
 
+    /// The "a toolchain install is reading this bundle" marker, holding the pid of
+    /// the process whose child is extracting.
+    ///
+    /// DURABLE ON PURPOSE. A process-local flag cannot work here: the apply that
+    /// swaps the bundle runs at the top of the SUCCESSOR image's boot, in a process
+    /// that never set anything, so an in-memory atomic is always false exactly when
+    /// it is read (2026-08-20 round-9 audit).
+    pub fn toolchain_install(&self) -> PathBuf {
+        self.root.join("toolchain-install")
+    }
+
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside
     /// the boot sentinel at apply time so a LATER crash-loop revert — which no longer
     /// holds the ready marker — can poison exactly the build that crash-looped, so it

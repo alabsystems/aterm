@@ -15449,7 +15449,15 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     use std::io::BufRead as _;
                     for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
                         if let Some(event) = parse_seed_line(&line) {
-                            saw_marker = true;
+                            // ONLY A TERMINAL MARKER COUNTS. `seed-starting:` OPENS the
+                            // announcement; treating it as an answer meant a child that
+                            // died after printing it logged nothing and left the held
+                            // card up for its full 20 minutes — the two failures this
+                            // pair of fixes exists to prevent, defeated by their own
+                            // bookkeeping (2026-08-20 round-9 audit).
+                            if !matches!(event, Wake::PkgSeedStarted { .. }) {
+                                saw_marker = true;
+                            }
                             if matches!(event, Wake::PkgSeed { .. } | Wake::PkgSeedPartial { .. }) {
                                 seed_installed_something = true;
                             }
@@ -15468,6 +15476,17 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     .unwrap_or_default();
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
                 // A non-zero exit that produced no marker is the silent case.
+                if !saw_marker {
+                    // Retire the card the announcement raised, whatever happened:
+                    // it is held for 20 minutes and nothing else would take it down.
+                    let _ = proxy.send_event(Wake::PkgSeedFailed {
+                        detail: if said.trim().is_empty() {
+                            "atpkg ended without saying what happened".to_string()
+                        } else {
+                            said.trim().to_string()
+                        },
+                    });
+                }
                 if !ok && !saw_marker {
                     let why = said.trim();
                     aterm_log::warn!(

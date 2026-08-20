@@ -649,11 +649,6 @@ fn now_rfc3339() -> String {
     aterm_types::rfc3339::format_rfc3339(secs as u64)
 }
 
-/// Record the install outcome to `status.toml` (the silent manager's observability surface,
-/// §5/§9). Best-effort — diagnostics, never load-bearing.
-/// The signed `tree_root` to persist for `program`: the freshly-applied one when non-empty,
-/// otherwise the ALREADY-RECORDED root. An `already_current` install / an untouched
-/// coherence-group sibling reports an empty tree_root (nothing was flipped) — persisting that
 /// Re-record the signed `tree_root` for any program that is LIVE but unattested.
 ///
 /// See the call site for the window that produces one. Silent and best-effort in
@@ -719,6 +714,11 @@ fn record_outcome(layout: &crate::store::Layout, outcome: String) {
         layout,
         &crate::Status {
             outcome,
+            // The TIMESTAMP moves with the sentence. Refreshing one and not the other
+            // paired a fresh verdict with the moment of the last failure, which is
+            // what Settings and `atpkg doctor` show side by side
+            // (2026-08-20 round-9 audit).
+            updated_at: now_rfc3339(),
             ..existing
         },
     );
@@ -742,8 +742,12 @@ fn clear_status_row(layout: &crate::store::Layout, program: &str) {
     let _ = crate::status::write(layout, &crate::Status { programs, ..existing });
 }
 
-/// empty value would erase a perfectly good attestation and break `atpkg verify` for an
-/// untampered program. So an empty new root means "keep what we had", never "forget it".
+/// The signed `tree_root` to persist for `program`: the freshly-applied one when
+/// non-empty, otherwise the ALREADY-RECORDED root. An `already_current` install, or an
+/// untouched coherence-group sibling, reports an empty tree_root (nothing was flipped) —
+/// persisting that empty value would erase a perfectly good attestation and break
+/// `atpkg verify` for an untampered program. So an empty new root means "keep what we
+/// had", never "forget it".
 fn effective_tree_root(layout: &crate::store::Layout, program: &str, new_root: &str) -> String {
     if !new_root.is_empty() {
         return new_root.to_string();
@@ -753,6 +757,8 @@ fn effective_tree_root(layout: &crate::store::Layout, program: &str, new_root: &
         .unwrap_or_default()
 }
 
+/// Record the install outcome to `status.toml` (the silent manager's observability
+/// surface, §5/§9). Best-effort — diagnostics, never load-bearing.
 fn record_status(
     layout: &crate::store::Layout,
     program: &str,
@@ -1666,23 +1672,77 @@ fn cmd_update_all() -> ExitCode {
         // can never arrive. Say the true thing instead, durably
         // (2026-08-20 round-8 audit).
         if crate::active_builds(&layout).is_empty() {
-            println!(
-                "atpkg: nothing is installed and nothing was installable — the index \
-                 publishes no build for this Mac's architecture ({})",
-                current_triple()
-            );
+            // STDERR AND EXIT 2, matching `cmd_install_default_set`. The GUI keeps
+            // stderr and discards stdout, and it maps 2 to the honest "not a
+            // temporary error" sentence while 1 is a retryable failure it renders as
+            // a bare exit code — so printing the reason on stdout and exiting 1
+            // produced exactly the opaque message these fixes set out to kill
+            // (2026-08-20 round-9 audit).
+            // DO NOT BLAME THE CPU FOR EVERY EMPTY STORE. "Nothing installed and
+            // nothing installed this pass" has more than one cause: a triple the
+            // index does not serve, a translated process reporting a triple that is
+            // not this Mac's, and a channel that revoked everything. The seed lane
+            // already distinguishes these; this one asserted the architecture answer
+            // for all of them (2026-08-20 round-9 audit).
+            if running_translated() {
+                eprintln!(
+                    "atpkg: nothing is installed — this process is running under \
+                     Rosetta translation, so {} is not this Mac's real architecture. \
+                     Relaunch aterm natively and the toolset installs.",
+                    current_triple()
+                );
+                return ExitCode::from(2);
+            }
+            let serves_us = crate::resolve_verified_index(
+                &*fetcher,
+                &layout,
+                &effective_anchor(&layout),
+                build_floor(&layout),
+                now_unix(),
+            )
+            .ok()
+            .map(|index| !seed_serviceable(&layout, &*fetcher, &index, cfg).is_empty());
+            let (said, state) = if serves_us == Some(true) {
+                // The index DOES publish for this triple, so something else refused
+                // every member — a revocation, a floor, a filter. Saying "no build
+                // for your architecture" here sends the user to fix the wrong thing.
+                (
+                    format!(
+                        "nothing is installed and nothing was installable — the index \
+                         publishes builds for {} but every one was refused (revoked, \
+                         below the floor, or filtered out); see `atpkg doctor`",
+                        current_triple()
+                    ),
+                    "unavailable: every published build was refused",
+                )
+            } else {
+                (
+                    format!(
+                        "nothing is installed and nothing was installable — the index \
+                         publishes no build for this Mac's architecture ({})",
+                        current_triple()
+                    ),
+                    "unavailable: no build for this architecture",
+                )
+            };
+            eprintln!("atpkg: {said}");
             record_status(
                 &layout,
                 "*toolset*",
                 crate::ProgramStatus {
                     installed_build: None,
-                    state: String::from("unavailable: no build for this architecture"),
+                    state: String::from(state),
                     tree_root: String::new(),
                 },
-                format!("no ALab build is published for {} yet", current_triple()),
+                said,
             );
-            return ExitCode::from(1);
+            return ExitCode::from(2);
         }
+        // The toolset is present: retire any "unavailable" verdict an earlier
+        // pass recorded. Only the seed lane cleared this row, and a machine
+        // whose triple the index did not serve yet reaches the toolset through
+        // THIS lane once artifacts are published (2026-08-20 round-9 audit).
+        clear_status_row(&layout, "*toolset*");
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

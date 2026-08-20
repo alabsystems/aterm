@@ -132,6 +132,17 @@ fn ensure_command_links(home: &Path) {
     if !exe.parent().is_some_and(|d| d.ends_with("Contents/MacOS")) {
         return;
     }
+    // AND NOT FROM A TRANSLOCATED ONE. Gatekeeper runs a quarantined download from a
+    // read-only, randomly-named mount that disappears when the app quits, so a link
+    // into it is dangling by the next login — pointing at a path that will never
+    // exist again, on a machine whose real install is elsewhere
+    // (2026-08-20 round-9 audit).
+    if exe
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with("AppTranslocation"))
+    {
+        return;
+    }
     let Some(macos) = exe.parent() else {
         return;
     };
