@@ -8562,7 +8562,10 @@ pub(crate) struct CursorFxInputs {
     pub default_fg: u32,
 }
 
-#[cfg(test)]
+// bench-support: the frame-latency bench builds its per-frame inputs by
+// MUTATING this constructor's neutral frame (never a bare literal), so the
+// "one constructor beside the struct" law below holds for the bench target too.
+#[cfg(any(test, feature = "bench-support"))]
 impl CursorFxInputs {
     /// A neutral frame for tests that drive [`App::tick_cursor_fx`] without
     /// caring about the terminal's exact state.

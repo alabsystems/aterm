@@ -78,6 +78,14 @@ mod app_update_screen;
 mod app_window;
 #[cfg(test)]
 mod artifact_transaction_conformance;
+/// BENCH-ONLY observation seam (the `test-open-probe` precedent applied to this
+/// crate): the one public wrapper the external `frame_latency` bench drives the
+/// `#[cfg(any(test, feature = "bench-support"))]` headless fixtures through.
+/// `pub` because a bench target links the crate like any consumer — but the
+/// feature is enabled only by that bench (`required-features`), so no shipping
+/// build compiles this module.
+#[cfg(feature = "bench-support")]
+pub mod bench_support;
 mod bench_knobs;
 mod build_badge;
 mod build_info;
@@ -10293,7 +10301,10 @@ impl App {
     /// exercise the genuine windows/pool/frontmost/`CloseOutcome` logic. It NEVER
     /// touches `proxy`/`session_factory` (no spawn), so `None`/an empty factory is
     /// fine. Threads spawned (notify delivery) are harmless and exit at process end.
-    #[cfg(test)]
+    // bench-support: the frame-latency bench builds this exact fixture through
+    // src/bench_support.rs; the feature is enabled only by that bench target,
+    // so every other build compiles this out exactly as before.
+    #[cfg(any(test, feature = "bench-support"))]
     fn headless_for_test() -> App {
         Self::headless_for_test_with_sink(Arc::new(SinkWriter::new(-1)))
     }
@@ -10301,13 +10312,13 @@ impl App {
     /// The headless App's launch-kitty seed: FIXED so a test can name the
     /// exact cat the harness wears (`KittyLook::for_launch(TEST_LAUNCH_SEED)`)
     /// and so no test ever rolls a random breed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) const TEST_LAUNCH_SEED: u64 = 0x5EED;
 
     /// [`Self::headless_for_test`] with an observing sink installed in every
     /// session capability from construction time. This keeps PTY-byte tests on
     /// the real per-session routing path instead of swapping only one mirror.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     fn headless_for_test_with_sink(sink: Arc<SinkWriter>) -> App {
         // LEDGER ISOLATION (2026-08-15): every headless test process points
         // the update crate's staging root at its own scratch dir, ONCE. The
@@ -15435,6 +15446,8 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // see `note_toolchain_install_pid`. The in-process flag opens here so the
             // window between spawn and marker is still covered.
             aterm_update::begin_toolchain_install();
+            // Remembered out here so the teardown below can prove the marker is ours.
+            let mut installer_pid: Option<u32> = None;
             // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
             // dispatch edge — store-lock contention, an unwritable or symlinked
             // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
@@ -15448,6 +15461,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 .stderr(std::process::Stdio::piped())
                 .spawn()
             {
+                installer_pid = Some(child.id());
                 aterm_update::note_toolchain_install_pid(child.id());
                 let mut refusal = child.stderr.take();
                 if let Some(out) = child.stdout.take() {
@@ -15521,7 +15535,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     );
                 }
             }
-            aterm_update::end_toolchain_install();
+            aterm_update::end_toolchain_install(installer_pid);
             if !run_update_loop {
                 // `auto_update = false`: the batteries went in above, and that
                 // is all this thread was asked to do.
@@ -17587,14 +17601,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
 /// terminal tabs with no PTY, isolating pool/window/frontmost bookkeeping without
 /// spawning a shell. Production code never constructs one. (Mirrors
 /// `session_pool_tests::test_session`.)
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-support"))]
 fn stub_session(id: u64) -> Session {
     stub_session_with_sink(id, Arc::new(SinkWriter::new(-1)))
 }
 
 /// [`stub_session`] with a caller-provided sink, used when a conformance test
 /// must observe bytes crossing the real per-session egress boundary.
-#[cfg(test)]
+#[cfg(any(test, feature = "bench-support"))]
 fn stub_session_with_sink(id: u64, sink: Arc<SinkWriter>) -> Session {
     let ctx = Arc::new(SessionCtx {
         sink,

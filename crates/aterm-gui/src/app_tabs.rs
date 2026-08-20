@@ -1916,7 +1916,9 @@ impl App {
     /// equal `self.next_session_id` (the test builds it that way), which is then
     /// bumped. Used to stage a multi-tab front window for the detach test. Publishes
     /// the appended terminal as the window's canonical front capability.
-    #[cfg(test)]
+    // bench-support: many_tabs_idle in benches/frame_latency.rs stages its
+    // N-tab window through this exact helper (see src/bench_support.rs).
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn push_stub_tab(&mut self, wid: WindowId, session: crate::Session) {
         debug_assert_eq!(
             session.id, self.next_session_id,
@@ -1944,7 +1946,9 @@ impl App {
     /// spawning a fresh stub session for the new (now-focused) pane. Mirrors
     /// `split_focused_pane`'s pooling/registration without a real PTY. Returns the
     /// new pane's session id. Used to exercise split-tab teardown headlessly.
-    #[cfg(test)]
+    // bench-support: the flood/pet compose fixtures in benches/frame_latency.rs
+    // stage their 2-pane split through this exact helper (src/bench_support.rs).
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn split_active_stub_tab(&mut self, wid: WindowId) -> u64 {
         let sid = self.next_session_id;
         self.next_session_id += 1;

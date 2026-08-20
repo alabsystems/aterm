@@ -204,11 +204,23 @@ impl TransientNotice {
     pub(crate) fn deadline(&self, now: Instant) -> Instant {
         let elapsed = now.duration_since(self.spawned);
         let fade_start = self.ttl.saturating_sub(FADE);
-        if elapsed < ENTER || elapsed >= fade_start {
+        // A SPARKLING CARD IS ALWAYS MOVING. The steady-hold shortcut below exists
+        // because a static caption needs no intermediate repaints — but the
+        // celebration's hue walk and twinkle are functions of time, and holding one
+        // frame through the hold froze them for most of the card's life. The badge
+        // advanced 0.048 of a turn across the entrance and then stopped, so the
+        // "rainbow" was in practice a fixed colour (2026-08-20 round-11 audit).
+        if self.animates() || elapsed < ENTER || elapsed >= fade_start {
             now + FRAME
         } else {
             self.spawned + fade_start
         }
+    }
+
+    /// Whether this card's pixels change with time DURING its hold — true only for
+    /// the sparkling celebration, so nothing else starts churning repaints.
+    pub(crate) const fn animates(&self) -> bool {
+        matches!(self.kind, NoticeKind::LevelUp { .. })
     }
 
     /// The whole-card alpha at `now`: an eased ramp 0→1 across the entrance, `1.0`
@@ -277,6 +289,14 @@ impl TransientNotice {
         // 60fps cadence can consume, so no step is ever quantized away.
         ((self.alpha(now) * 48.0) as u64).hash(&mut h);
         ((self.rise(now).abs() * 48.0) as u64).hash(&mut h);
+        // …and a TIME term for the one card whose pixels move while it holds. Alpha
+        // and rise are both constant through the hold, so without this the cached
+        // raster was reused for the whole 4.4 s and the sparkles never twinkled. ~24
+        // steps/second is finer than the present cadence and coarse enough that a
+        // still card (every other kind) hashes identically frame to frame.
+        if self.animates() {
+            ((now.duration_since(self.spawned).as_secs_f32() * 24.0) as u64).hash(&mut h);
+        }
         // The speech-bubble anchor moves with its speaker — quantized to 2px
         // steps so a swinging Robi re-rasters his bubble along the way.
         if let Some((ax, ay)) = self.anchor {
@@ -844,7 +864,13 @@ pub(crate) fn notice_tray(
     // reward, and a flat disc was doing that job joylessly. Under reduced motion the
     // hue is FROZEN at the card's own spawn phase — still colourful, never moving,
     // which is what a motion-sensitive reader asked for and not a downgrade to grey.
-    let party = sparkle && matches!(p.tone, Tone::Celebrate);
+    // THE KIND, NOT THE TONE. `Tone::Celebrate` is worn by two different notices —
+    // the post-update card AND every one of Robi's tips, which deliberately borrow the
+    // celebration badge. Gating on the tone therefore put the rainbow ring on a
+    // permanent resident's constant chatter, contradicting this feature's own text in
+    // Settings and the Manual ("no other notice is affected") and turning a rare
+    // reward into all-day confetti (2026-08-20 round-11 audit).
+    let party = sparkle && matches!(n.kind, NoticeKind::LevelUp { .. });
     let phase = if party {
         let spin = if motion > 0.0 {
             now.duration_since(n.spawned).as_secs_f32() * RAINBOW_TURNS_PER_SEC * motion
@@ -1143,10 +1169,24 @@ mod tests {
         let now = t0();
         let n = TransientNotice::level_up(830, now);
         assert_ne!(n.fingerprint(now), 0);
-        // The hold is stable; both ramps change the fingerprint.
-        let hold_a = n.fingerprint(now + ENTER + Duration::from_millis(50));
-        let hold_b = n.fingerprint(now + ENTER + Duration::from_millis(250));
+        // The hold is stable for a STILL card; both ramps change the fingerprint.
+        //
+        // The subject here used to be the level-up card, which no longer holds still:
+        // its hue walk and twinkle are functions of time, so it carries a time term
+        // and re-rasterizes through the hold ON PURPOSE (2026-08-20 round-11 audit).
+        // The "a steady hold does not churn repaints" property is still real and still
+        // worth pinning — it is now pinned on a card that actually holds steady, and
+        // the exemption is asserted below rather than assumed.
+        let still = TransientNotice::update_status("⇣ Installing", now);
+        let hold_a = still.fingerprint(now + ENTER + Duration::from_millis(50));
+        let hold_b = still.fingerprint(now + ENTER + Duration::from_millis(250));
         assert_eq!(hold_a, hold_b, "stable during hold");
+        assert!(!still.animates());
+        assert_ne!(
+            n.fingerprint(now + ENTER + Duration::from_millis(50)),
+            n.fingerprint(now + ENTER + Duration::from_millis(250)),
+            "the ONE animating card is deliberately not stable during its hold"
+        );
         let enter_a = n.fingerprint(now + Duration::from_millis(20));
         let enter_b = n.fingerprint(now + Duration::from_millis(120));
         assert_ne!(enter_a, enter_b, "changes across the entrance");
@@ -1512,6 +1552,36 @@ mod tests {
             dots(&plain, true, 1.0),
             dots(&plain, false, 1.0),
             "no other notice sprouts sparkles"
+        );
+        // ROBI SHARES THE CELEBRATION TONE. Gating the party on the tone put the ring
+        // on a permanent resident's constant chatter; the previous version of this
+        // test could not catch it, because the only counter-example it checked was a
+        // Quiet status pill (2026-08-20 round-11 audit).
+        let tip = TransientNotice::robi_tip("try aterm ctl", None, at);
+        assert_eq!(
+            Tone::of(&tip.kind, None),
+            Tone::Celebrate,
+            "precondition: Robi still wears the celebration badge"
+        );
+        assert_eq!(
+            dots(&tip, true, 1.0),
+            dots(&tip, false, 1.0),
+            "Robi's tips must not sprout sparkles"
+        );
+        // The celebration animates during its hold; nothing else does, so nothing
+        // else starts churning repaints.
+        assert!(party.animates(), "the celebration's pixels move while it holds");
+        assert!(!plain.animates() && !tip.animates());
+        let held = at + ENTER + Duration::from_millis(500);
+        assert_ne!(
+            party.fingerprint(held),
+            party.fingerprint(held + Duration::from_millis(200)),
+            "a sparkling card must re-rasterize during the hold, or it freezes"
+        );
+        assert_eq!(
+            plain.fingerprint(held),
+            plain.fingerprint(held + Duration::from_millis(200)),
+            "a still card must keep hashing identically"
         );
         // Reduced motion keeps the ring (colour) and freezes it (no movement).
         assert_eq!(

@@ -1399,7 +1399,10 @@ impl KittyLogHost {
 
     /// An in-memory-only host (no ledger file) — the headless-test App, which
     /// must never read or write the developer's real ledger.
-    #[cfg(test)]
+    // bench-support: `headless_for_test` (which the frame-latency bench builds
+    // through) requires the in-memory host for the same never-touch-the-real-
+    // ledger reason the unit suite does.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn in_memory() -> Self {
         Self::load(None)
     }

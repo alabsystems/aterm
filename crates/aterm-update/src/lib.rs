@@ -789,12 +789,31 @@ pub fn note_toolchain_install_pid(pid: u32) {
 }
 
 /// The install is over: drop both the in-process flag and the durable marker.
-pub fn end_toolchain_install() {
+pub fn end_toolchain_install(pid: Option<u32>) {
     TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     let Some(staging) = paths::Staging::resolve() else {
         return;
     };
-    let _ = std::fs::remove_file(staging.toolchain_install());
+    let marker = staging.toolchain_install();
+    // ONLY OUR OWN MARKER. It is one slot shared by every aterm process, and an
+    // installer outlives the app that started it: quit mid-install and a second
+    // launch's seed child — refused in milliseconds because the first still holds the
+    // store lock — used to tear down the marker belonging to that live extraction.
+    // The next boot apply then swapped the bundle out from under it, which is exactly
+    // the failure the marker exists to prevent (2026-08-20 round-11 audit).
+    //
+    // A `None` pid means we never got as far as spawning, so we own nothing here.
+    let Some(pid) = pid else {
+        return;
+    };
+    if std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok())
+        != Some(pid)
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// Whether a toolchain install is reading this bundle's sealed payload right now.

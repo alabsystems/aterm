@@ -934,7 +934,22 @@ fn apply_group(
         // runnable. That needs no download and no tuple: de-activate it by writing
         // failing tombstone shims over the tools it currently exposes, exactly as the
         // Tombstone arm of `transact` does, and report it so the CLI can say so.
-        let revoked: Vec<String> = group
+        // TWO DIFFERENT REVOCATIONS, and conflating them killed programs outright.
+        //
+        // (a) The PIN ITSELF is unusable — yanked, or below the floor. There is
+        //     nothing valid to move to, so the only safe state is "not runnable":
+        //     tombstone the installed members and install nothing.
+        //
+        // (b) The INSTALLED build was revoked but the channel offers a VALID pin.
+        //     This is the ordinary "we shipped a bad build, here is the fix"
+        //     publish, and the right answer is to TAKE THE FIX. Round 10 tombstoned
+        //     these too, because `!current_build_ok` was folded into the same test —
+        //     so a routine yank permanently killed a member on any machine that had
+        //     uninstalled a sibling: shimmed dead, dropped from `active_builds`, and
+        //     then invisible to every later pass, which sees no installed member and
+        //     skips the group. Not even lifting the yank brought it back
+        //     (2026-08-20 round-11 audit).
+        let unusable_pin: Vec<String> = group
             .members
             .iter()
             .filter(|m| installed.contains_key(*m))
@@ -942,17 +957,40 @@ fn apply_group(
                 matches!(
                     crate::gate::decide(ch, m, installed.get(*m).copied()),
                     crate::gate::ApplyDecision::Tombstone
-                ) || !crate::gate::current_build_ok(ch, m, installed.get(*m).copied())
+                )
             })
             .cloned()
             .collect();
-        if revoked.is_empty() {
+        if !unusable_pin.is_empty() {
+            for program in &unusable_pin {
+                install_tombstone_shims(layout, program, installed.get(program).copied());
+            }
+            return Some((TxnOutcome::Tombstoned(unusable_pin), BTreeMap::new()));
+        }
+        let needs_fix = group
+            .members
+            .iter()
+            .filter(|m| installed.contains_key(*m))
+            .any(|m| !crate::gate::current_build_ok(ch, m, installed.get(m).copied()));
+        if !needs_fix {
             return None;
         }
-        for program in &revoked {
-            install_tombstone_shims(layout, program, installed.get(program).copied());
-        }
-        return Some((TxnOutcome::Tombstoned(revoked), BTreeMap::new()));
+        // Take the fix for the members that are actually here. The removed one is
+        // excluded from the tuple rather than pulled back in — reinstalling it is
+        // what round 9 did and what the hold exists to prevent. The members present
+        // stay version-locked with each other, which is what coherence protects.
+        let present = Group {
+            members: group
+                .members
+                .iter()
+                .filter(|m| !layout.removed_programs().contains(*m))
+                .cloned()
+                .collect(),
+            ..group.clone()
+        };
+        return Some(apply_group_txn(
+            fetcher, layout, index, ch, channel, triple, &present, installed,
+        ));
     }
     Some(apply_group_txn(
         fetcher, layout, index, ch, channel, triple, group, installed,

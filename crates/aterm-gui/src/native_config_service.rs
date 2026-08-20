@@ -190,7 +190,9 @@ pub(crate) struct VersionedConfigService {
 }
 
 impl VersionedConfigService {
-    #[cfg(test)]
+    // bench-support: `headless_for_test` (which the frame-latency bench builds
+    // through) constructs its config service with this deterministic ctor.
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn new(text: String) -> Result<Self, String> {
         Self::new_with_themes(text, crate::app_config::ThemeCatalog::empty())
     }
@@ -203,7 +205,7 @@ impl VersionedConfigService {
         Self::new_with_themes_mode(text, crate::app_config::ThemeCatalog::discover(), true)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-support"))]
     fn new_with_themes(
         text: String,
         themes: Arc<crate::app_config::ThemeCatalog>,

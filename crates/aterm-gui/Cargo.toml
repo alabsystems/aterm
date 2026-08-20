@@ -75,6 +75,16 @@ a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
 # can run the suite (a bin gets no dev-dependencies). OFF by default: the shipped
 # GUI carries neither the gate nor the suite.
 control-conformance = ["aterm-control/conformance"]
+# Bench-only observation seam (src/bench_support.rs), the `test-open-probe`
+# precedent applied to this crate: `benches/frame_latency.rs` is an EXTERNAL
+# target, so it sees only the crate's public surface — but the frame-path
+# fixtures it must drive (`App::headless_for_test`, the stub sessions/tabs)
+# are `#[cfg(test)]` crate internals. This feature widens exactly those
+# fixture gates to `#[cfg(any(test, feature = "bench-support"))]` and compiles
+# the one public wrapper module the bench drives them through. OFF everywhere
+# except the bench target below (`required-features`); no shipping crate
+# enables it, so `cargo build -p aterm-gui` stays byte-identical.
+bench-support = []
 
 [dependencies]
 # `bidi`: compile in the UAX #9 visual-reordering bridge so RTL (Hebrew/Arabic)
@@ -226,6 +236,11 @@ winit = { workspace = true, features = ["aterm-test-key-event"] }
 aterm-spec = { workspace = true }
 # Property tests for the typography config mapping (`Config::text_shaping`).
 proptest = { workspace = true }
+# The frame-latency benchmark (`benches/frame_latency.rs`): the same harness the
+# aterm-effects per-frame benches ride. Until it landed the ~360k-line frame
+# path (keystroke-to-echo, PTY-flood-to-present) had NO bench target at all —
+# the audits' GUI-half findings (CF-6 driver, PET-03 gui) were unpriceable.
+criterion = "0.5"
 # TRUST_NATIVE_TLA Phase 2: the relocated `spec_xref_closure` gate lives in this
 # binary's TEST build (`#[cfg(test)] mod spec_xref_gate` in main.rs). It collects
 # the ISOLATION-family `#[refines]`/`#[spec_unmodeled]` anchors via `inventory`, so
@@ -333,6 +348,16 @@ block2 = "0.5"
 # aterm.toml. Only the small `passwords` API is used (Security.framework is an
 # OS dylib — no C build).
 security-framework = "3"
+
+# The per-presented-frame cost of the GUI frame path, measured headless off the
+# same fixtures the unit tests drive (see the bench's own header for what a
+# headless frame can and cannot model). `required-features` keeps the seam out
+# of every default build — run it with
+#   cargo bench -p aterm-gui --features bench-support --bench frame_latency
+[[bench]]
+name = "frame_latency"
+harness = false
+required-features = ["bench-support"]
 
 [lints]
 workspace = true
