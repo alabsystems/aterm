@@ -822,6 +822,29 @@ require_free_space() { # <dir> <bytes-needed> <what-for>
 	fi
 }
 
+# The desktop-identity lane's ownership receipt. ~/.local/share/applications
+# and the hicolor icon tree are shared, user-owned space, and the NAME `aterm`
+# has meant other software for decades (the X11 aterm), so a basename can never
+# authorise a removal there. The entry this installer writes carries this exact
+# comment line, and the uninstall sweep removes ONLY an entry that still does —
+# the same marker-pair discipline as the PATH block. ONE definition, shared by
+# the writer and the sweep, so the two can never drift.
+ATERM_DESKTOP_MARKER="# Managed by aterm install.sh — its uninstall removes only an entry carrying this line."
+
+# Whether a binary path may ride the desktop entry's Exec= line UNQUOTED. The
+# desktop-entry spec's quoting/escaping rules are subtle enough (double-escaped
+# backslashes, %-field codes) that carrying an escaper here would be its own
+# risk surface — so the lane instead REFUSES any path outside a strict
+# character allowlist and writes plain text. Pure, so the deterministic suite
+# pins both sides: /-rooted and only [A-Za-z0-9/._+-] — no whitespace, no
+# quotes, no %, nothing the Exec parser could interpret.
+desktop_exec_path_ok() {
+	local p="$1"
+	local LC_ALL=C
+	[[ "$p" == /* ]] || return 1
+	[[ "$p" =~ ^[A-Za-z0-9/._+-]+$ ]]
+}
+
 # Six random bytes as hex. od reads EXACTLY its byte count, so pipefail never
 # sees a SIGPIPE here (a `head -c` over /dev/urandom would).
 random_suffix() {
@@ -839,9 +862,10 @@ fi
 
 # --- uninstall: reverse exactly what this installer places ------------------
 #
-# Removes the five things install.sh creates — app bundle, the ONE `aterm`
-# symlink, the source-built store, man pages, shell completions — plus the
-# update token and its keychain item. Nothing else.
+# Removes the six things install.sh creates — app bundle, the ONE `aterm`
+# symlink, the source-built store, man pages, shell completions, the Linux
+# desktop entry + icons — plus the update token and its keychain item.
+# Nothing else.
 #
 # EVERY removal is OWNERSHIP-CHECKED first. The installer writes into shared,
 # user-owned locations (/Applications, ~/.local/bin, the XDG man and completion
@@ -1036,7 +1060,43 @@ uninstall_everything() {
 		[[ -e "$comp" ]] && _rm "$comp" "shell completion"
 	done
 
-	# 6. the update token, its keychain twin, and the support dir when EMPTY.
+	# 6. the Linux desktop identity: the launcher entry + the hicolor icons.
+	#    The basename authorises NOTHING here — `aterm` named an unrelated X11
+	#    terminal for decades, and both trees are shared user space — so the
+	#    only authorisation is the exact ATERM_DESKTOP_MARKER line the writer
+	#    put in the entry. The icons were only ever installed WITH that entry
+	#    (install_linux_desktop_entry writes both or neither tree), so the
+	#    marker-owned entry — found here, or just removed by this sweep — is
+	#    what vouches for them too; without it every aterm.png is UNKNOWN and
+	#    skipped, never deleted. A no-op on macOS: neither path exists there.
+	local desktop_entry="$xdg_data/applications/aterm.desktop" desktop_owned=0 icon
+	if [[ -f "$desktop_entry" || -L "$desktop_entry" ]]; then
+		if [[ ! -L "$desktop_entry" ]] &&
+			grep -qxF "$ATERM_DESKTOP_MARKER" "$desktop_entry" 2>/dev/null; then
+			desktop_owned=1
+			_rm "$desktop_entry" "desktop entry"
+			# Best-effort, real runs only (--dry-run changes nothing): tell the
+			# desktop database the entry is gone so launchers drop it now.
+			if [[ "$DRY_RUN" -eq 0 ]] && command -v update-desktop-database >/dev/null 2>&1; then
+				update-desktop-database "$xdg_data/applications" >/dev/null 2>&1 || true
+			fi
+		else
+			_skip "$desktop_entry" "not a desktop entry this installer wrote (missing its marker line)"
+		fi
+	fi
+	# Only the five sizes THIS installer ships — a foreign aterm.png at any
+	# other size (a user's own 48x48, a distro package's) is not ours to sweep,
+	# marker-vouched or not.
+	for icon in "$xdg_data"/icons/hicolor/{32x32,64x64,128x128,256x256,512x512}/apps/aterm.png; do
+		[[ -e "$icon" ]] || continue
+		if [[ "$desktop_owned" -eq 1 ]]; then
+			_rm "$icon" "app icon"
+		else
+			_skip "$icon" "no marker-owned aterm.desktop vouches for it"
+		fi
+	done
+
+	# 7. the update token, its keychain twin, and the support dir when EMPTY.
 	#    The support dir also holds settings and staged updates, so it is only
 	#    rmdir'd (never rm -rf'd) — a non-empty one is left exactly as it is.
 	#    A dry run PROBES both (read-only) and reports the same decisions the
@@ -1069,7 +1129,7 @@ uninstall_everything() {
 		fi
 	fi
 
-	# 7. the PATH block `wire_shell_path` appended. Same ownership rule as every
+	# 8. the PATH block `wire_shell_path` appended. Same ownership rule as every
 	#    removal above: a login file is full of lines this installer did not
 	#    write, so the ONLY thing that authorises an edit is our exact marker
 	#    pair being present. The rewrite goes through the original inode so the
@@ -2012,6 +2072,7 @@ install_cli() {
 	retire_exposed_siblings
 	install_cli_manpages
 	install_cli_completions
+	install_linux_desktop_entry
 	# The hand-edit PATH hint is DEFERRED to the end of the run: printed here
 	# it told the user to edit the very profile wire_shell_path was about to
 	# edit for them (with a block that now carries $BIN_DIR). The final
@@ -2226,6 +2287,99 @@ install_cli_completions() {
 		echo "install.sh: NOTE: zsh completions landed in $zsh_dir, which ~/.zshrc does not put on \$fpath — add:" >&2
 		echo "  fpath=(\"$zsh_dir\" \$fpath)" >&2
 		echo "  autoload -Uz compinit && compinit" >&2
+	fi
+	return 0
+}
+
+install_linux_desktop_entry() {
+	# Desktop identity (best-effort, NON-FATAL, Linux only): GNOME/KDE identify
+	# an aterm window by the Wayland app_id / X11 WM_CLASS the GUI sets
+	# ("aterm", crates/aterm-gui/src/app_window.rs) and resolve its icon,
+	# launcher entry, and dock pinning through a desktop file of the SAME
+	# basename — without aterm.desktop the compositor shows a generic gear and
+	# no launcher entry exists. So: aterm.desktop into the XDG applications
+	# dir, and the repo's shipped hicolor PNGs (assets/linux/icons/hicolor,
+	# cut from the same brand art as the mac/windows icons) beside it. Same
+	# contract as man pages/completions: the binaries are already in place, so
+	# an unwritable tree or a missing source skips just this trimming, loudly,
+	# never the install. Every skip names its remedy.
+	[[ "$(uname -s)" == Linux ]] || return 0
+	local aterm_bin="$BIN_DIR/aterm"
+	# The entry launches the INSTALLED command (the store-backed symlink), so a
+	# run that never landed one (pure trimmings repair) writes nothing.
+	[[ -x "$aterm_bin" ]] || return 0
+	if ! desktop_exec_path_ok "$aterm_bin"; then
+		# Exec= is written unquoted by design (desktop_exec_path_ok), so a path
+		# outside the allowlist is refused outright rather than escaped.
+		echo "install.sh: SKIPPED the desktop entry: $aterm_bin contains characters an unquoted desktop Exec= line cannot carry safely (set ATERM_BIN_DIR to a plain path)" >&2
+		return 0
+	fi
+	local xdg_data="${XDG_DATA_HOME:-$HOME/.local/share}"
+	local app_dir="$xdg_data/applications"
+	# mkdir -p succeeds on an existing unwritable dir, hence the explicit -w.
+	if ! mkdir -p "$app_dir" 2>/dev/null || [[ ! -w "$app_dir" ]]; then
+		echo "install.sh: SKIPPED the desktop entry: cannot create/write $app_dir" >&2
+		return 0
+	fi
+	local entry="$app_dir/aterm.desktop"
+	# A pre-existing entry WITHOUT our marker is someone else's file. Replacing
+	# it is what an installer does, but silently is not — say so, because a
+	# later uninstall removes OUR replacement and their original stays gone.
+	if [[ -f "$entry" ]] && ! grep -qF "$ATERM_DESKTOP_MARKER" "$entry" 2>/dev/null; then
+		echo "install.sh: NOTE: replacing a pre-existing $entry this installer did not write (no backup is kept)"
+	fi
+	# Write to a temp then rename, so a mid-write failure never leaves a
+	# half-written entry behind. The marker line is the uninstall sweep's
+	# ownership receipt (ATERM_DESKTOP_MARKER) — keep it first.
+	if ! printf '%s\n' \
+		"$ATERM_DESKTOP_MARKER" \
+		"[Desktop Entry]" \
+		"Type=Application" \
+		"Name=aterm" \
+		"GenericName=Terminal" \
+		"Comment=The batteries-included terminal for AI" \
+		"TryExec=$aterm_bin" \
+		"Exec=$aterm_bin --window" \
+		"Icon=aterm" \
+		"Terminal=false" \
+		"Categories=System;TerminalEmulator;" \
+		"Keywords=terminal;shell;console;command line;" \
+		"StartupNotify=true" \
+		"StartupWMClass=aterm" >"$entry.tmp.$$" 2>/dev/null ||
+		! mv "$entry.tmp.$$" "$entry" 2>/dev/null; then
+		rm -f "$entry.tmp.$$" 2>/dev/null
+		echo "install.sh: SKIPPED the desktop entry: could not write $entry" >&2
+		return 0
+	fi
+
+	# The icon, at every size the repo ships. Source is the CHECKOUT (icons
+	# live in the repo, not the released tarball — the tarball follow-up is
+	# tracked); a piped run has none, and the entry above still buys window
+	# grouping + the launcher row, so that is a NOTE, not a rollback.
+	local icon_n=0 src size dest
+	if [[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]]; then
+		for src in "$ROOT"/assets/linux/icons/hicolor/*/apps/aterm.png; do
+			[[ -e "$src" ]] || continue
+			size="${src#"$ROOT/assets/linux/icons/hicolor/"}"
+			size="${size%%/*}"
+			dest="$xdg_data/icons/hicolor/$size/apps"
+			if mkdir -p "$dest" 2>/dev/null && install -m 644 "$src" "$dest/aterm.png" 2>/dev/null; then
+				icon_n=$((icon_n + 1))
+			fi
+		done
+	fi
+
+	# Best-effort: tell launchers the entry exists NOW rather than at their next
+	# rescan. Its absence (or failure) is fine — desktops rescan on their own.
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$app_dir" >/dev/null 2>&1 || true
+	fi
+
+	if [[ "$icon_n" -gt 0 ]]; then
+		echo "install.sh: installed the desktop entry -> $entry (+ the aterm icon at $icon_n size(s) under $xdg_data/icons/hicolor)"
+	else
+		echo "install.sh: installed the desktop entry -> $entry"
+		echo "install.sh: NOTE: no checkout to source the aterm icon from — the launcher entry works, with a generic icon; run tools/install.sh from a clone to add it" >&2
 	fi
 	return 0
 }
