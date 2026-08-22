@@ -11,8 +11,8 @@
 
 pub use aterm_search::streaming;
 pub use aterm_search::{
-    BloomFilter, BudgetedSearch, DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, SearchDirection,
-    SearchIndex, SearchMatch, SearchOptionsError, SearchResults, TerminalSearch,
+    BloomFilter, BudgetedSearch, DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch,
+    SearchDirection, SearchIndex, SearchMatch, SearchOptionsError, SearchResults, TerminalSearch,
     max_cached_for_retained,
 };
 

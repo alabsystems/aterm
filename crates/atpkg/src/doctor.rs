@@ -18,6 +18,87 @@ use crate::store::Layout;
 
 const GIB: u64 = 1 << 30;
 
+/// Whether a recorded program `state` describes a FAULT this machine should act on.
+///
+/// The five fault prefixes are the ones the install/update paths actually write. Two were
+/// missing until 2026-08-20 round-11, and both absences were the mirror image of the
+/// stray-row bug fixed the same day: that one made doctor report a fault where none
+/// existed, these made it MISS ones that did.
+///
+/// * `aborted: <phase>` (cli.rs, the `TxnOutcome::Aborted` arm) — a coherence-group
+///   transaction killed mid-flight, precisely the state in which a tuple's members may
+///   disagree with each other. Recorded against the FAILED member only, and on a group
+///   disk-shortfall that member is an arbitrary one of the tuple, so the row names where
+///   the transaction stopped rather than what is individually wrong.
+/// * `tombstoned: pin yanked/below floor` — the worse of the two, because it is silent
+///   everywhere else. A yanked pin replaces the program's working shims with failing
+///   stubs that print "was yanked/revoked" ([`crate::activate::install_tombstone_shim`]);
+///   the broken-shim scan skips tombstones BY DESIGN, and a tombstoned program drops out
+///   of `active_builds` entirely. So doctor saw no broken shim, no active build, and no
+///   recognized fault, and pronounced "healthy" on a machine whose compiler had become a
+///   stub. Both clear themselves: a later successful update rewrites the row and replaces
+///   the tombstone shim with a real symlink.
+///
+/// Deliberately NOT a fault: `active`, `dev-linked (skipped)` (a §13 hard-skip the user
+/// asked for), and any future informational state. The list is allow-by-prefix so an
+/// unrecognized state reads as benign rather than as a failure — a diagnostic that invents
+/// faults from states it does not understand trains people to ignore it.
+fn is_problem_state(state: &str) -> bool {
+    state.starts_with("error:")
+        || state.starts_with("unavailable:")
+        || state.starts_with("blocked:")
+        || state.starts_with("aborted:")
+        || state.starts_with("tombstoned:")
+}
+
+/// Where the per-problem listing should START — or `None` when no verdict owns it.
+///
+/// The listing must hang off the branch that actually printed a verdict, which is why this
+/// is a function rather than an expression at the loop. Deriving it from `store_empty`
+/// alone was wrong in both directions on a DECLINED store: with an empty store it skipped
+/// problem #1 that no branch had named (silently losing the only finding, since
+/// `*toolset*: unavailable: …` is the normal single row on a Mac the index does not serve),
+/// and with a populated store it printed every problem as an orphan line under "the ALab
+/// toolset was removed on this machine" — lines describing a verdict nobody gave.
+///
+/// A declined store lists nothing: the decline IS the verdict, and a stale fault row
+/// describes a toolset the user deliberately removed. Whether such a row should also flip
+/// the exit code is a separate product question, deliberately not answered here.
+fn problem_listing_start(declined: bool, store_empty: bool, problems: usize) -> Option<usize> {
+    if declined || problems == 0 {
+        None
+    } else if store_empty {
+        // That verdict names its first reason inline; listing resumes after it.
+        Some(1)
+    } else {
+        Some(0)
+    }
+}
+
+/// EVERY recorded fault, formatted `"<program>: <state>"`, in program order — `BTreeMap`
+/// order, i.e. alphabetical by program name.
+///
+/// Pulled out of [`run_with`] so it can be tested for what it actually promises. This used
+/// to be a `.find()` inline, which returned at most ONE finding: a second failing program
+/// stayed invisible until the first was repaired, and since `status.toml` is a `BTreeMap`,
+/// which one you were shown was alphabetical accident. A diagnostic that reveals its
+/// findings one per repair cycle is a guessing game.
+///
+/// Stray rows (keys beginning with `-`) are excluded — see the caller: they cannot be
+/// programs at all, and counting them condemned healthy toolsets.
+fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
+    status
+        .map(|s| {
+            s.programs
+                .iter()
+                .filter(|(name, _)| !name.starts_with('-'))
+                .filter(|(_, p)| is_problem_state(&p.state))
+                .map(|(name, p)| format!("{name}: {}", p.state))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Run the health surface, printing the report. Returns `true` iff there were NO structural
 /// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
 /// + the `[packages]` config account + the token chain's SOURCE label — never the token).
@@ -53,6 +134,27 @@ pub fn run_with(
     token_source: Option<&str>,
 ) -> bool {
     let mut fails = 0usize;
+
+    // (0) WHICH atpkg IS SPEAKING. Every line below is only as good as the binary printing
+    // it, and that binary is NOT self-evident: `atpkg` ships inside the aterm app, so a
+    // machine can easily have several — an installed /Applications copy, a dev `dist/`
+    // build, a `target/release` one — and `which atpkg` picks whichever PATH happens to
+    // reach first.
+    //
+    // This is not hypothetical. Measured 2026-08-20: a stale in-bundle atpkg answered
+    // "trust is not installed" for a store that a current atpkg verified as
+    // "build 6459 OK (matches signed tree_root)". A wrong answer from a manager about its
+    // own store is the most expensive kind of wrong, because the natural next step is to
+    // reinstall something that was never broken. Naming the speaker makes that verifiable
+    // in one line instead of an afternoon.
+    println!(
+        "doctor: this atpkg is {} at {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown path>".to_string())
+    );
+    report_aterm_posture(layout);
 
     // (1) TRUST ROOT + INDEX SOURCE + TOKEN SOURCE.
     println!(
@@ -140,6 +242,60 @@ pub fn run_with(
         }
     }
     println!("doctor: ok — {} program(s) active", active.len());
+
+    // (5c) SOLVERS THE `trust` BUNDLE PINS PRIVATELY.
+    //
+    // trustc resolves its SMT solver as a SIBLING of its own executable — see
+    // `sibling_solver_candidate` / `resolve_ay_solver_identity_from_candidates`
+    // in trust's `compiler/rustc_mir_transform/src/trust_verify.rs`: an explicit
+    // `AY_PATH` wins, otherwise the copy inside the bundle's own `bin/`, and
+    // there is NO PATH fallback at all.
+    //
+    // The pin itself is deliberate and should not be "fixed" away: trust
+    // snapshots and fingerprints the solver binary so a proof records which
+    // solver produced it, and a solver that floated with whatever atpkg last
+    // installed would make proof identity float with it.
+    //
+    // What was wrong is that NOTHING said so. atpkg dutifully kept `ay` current
+    // while every Trust build went on using a copy three minor versions behind,
+    // and the only way to find out was to compare two `--version` strings
+    // nobody had a reason to compare. Measured 2026-08-20 on a clean v0.44.0
+    // install: bundle `ay 0.10.0`, `ty 0.12.0`, `clean 0.1.0` against managed
+    // `0.13.0`, `0.13.0`, `0.2.0`.
+    //
+    // So: reported, never failed. A pin by design is not a problem; a pin
+    // nobody can see is.
+    if let Some(trust_build) = active.iter().find(|(p, _)| p.as_str() == "trust").map(|(_, b)| *b) {
+        let bundle_bin = layout.build_dir("trust", trust_build).join("bin");
+        for (program, managed_build) in &active {
+            if program.as_str() == "trust" {
+                continue;
+            }
+            let pinned = bundle_bin.join(program);
+            if !pinned.is_file() {
+                continue;
+            }
+            let pinned_version = probe_version(&pinned);
+            let managed_version =
+                probe_version(&layout.build_dir(program, *managed_build).join("bin").join(program));
+            // Equal versions are the healthy case. An unanswered probe on
+            // either side is NOT evidence of divergence, so it stays silent
+            // rather than reporting "pinned unknown vs managed 0.13.0" — a
+            // line that reads like a finding and carries none.
+            if pinned_version == managed_version
+                || pinned_version == "unknown"
+                || managed_version == "unknown"
+            {
+                continue;
+            }
+            let override_hint = if program.as_str() == "ay" { " (override: AY_PATH)" } else { "" };
+            println!(
+                "doctor: note — Trust builds use the {program} pinned inside the trust bundle \
+                 ({pinned_version}), not the managed {program} {managed_version} \
+                 (build {managed_build}){override_hint}"
+            );
+        }
+    }
 
     // (5b) LIVE-BUILD WITNESS. `gc` reclaims a program's superseded builds only when the
     // authoritative `store/<program>/current` symlink and the derived `bin/` shim view name
@@ -299,18 +455,33 @@ pub fn run_with(
     // the only self-service path to understanding.
     let installed = crate::ops::active_builds(layout);
     let status = crate::status::read(layout);
-    let recorded_problem = status.as_ref().and_then(|s| {
-        s.programs
-            .iter()
-            .find(|(_, p)| {
-                p.state.starts_with("error:")
-                    || p.state.starts_with("unavailable:")
-                    || p.state.starts_with("blocked:")
-            })
-            .map(|(name, p)| format!("{name}: {}", p.state))
-    });
+    // A recorded key beginning with `-` cannot ever be a program: no shim can be created
+    // under one and the signed index cannot name one. Such a row is a STRAY — the residue
+    // of a mistyped `atpkg install --help`, which used to resolve the flag as a name and
+    // persist the failure forever. Counting it as a missing member let one typo report a
+    // fully healthy ten-program toolset as incomplete, and — because `tools/install.sh`
+    // hands `pkg doctor` to every failed-seed installer as THE diagnostic — took the exit
+    // code down with it, outside this repo (2026-08-20 round-10 audit).
+    let strays: Vec<&String> = status
+        .as_ref()
+        .map(|s| s.programs.keys().filter(|k| k.starts_with('-')).collect())
+        .unwrap_or_default();
+    for stray in &strays {
+        println!(
+            "doctor: warn — the record holds a stray row for {stray:?}, which cannot be a \
+             program name (it is a command-line flag, left by a mistyped `atpkg install`). \
+             No program is missing because of it; the next successful `aterm pkg update` \
+             clears it"
+        );
+    }
+    // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
+    // program was invisible until the first was fixed — a diagnostic that reveals its
+    // findings one per repair cycle is not triage, it is a guessing game, and `status.toml`
+    // is a `BTreeMap` so which one won was alphabetical accident.
+    let recorded_problems = recorded_problems(status.as_ref());
+    let declined = layout.declined().is_file();
     let mut toolset_problem = false;
-    if layout.declined().is_file() {
+    if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
         println!(
             "doctor: the ALab toolset was removed on this machine (`aterm pkg install \
@@ -318,24 +489,45 @@ pub fn run_with(
         );
     } else if installed.is_empty() {
         toolset_problem = true;
-        match &recorded_problem {
+        match recorded_problems.first() {
             Some(why) => println!("doctor: PROBLEM — no ALab programs are installed ({why})"),
-            None => println!(
-                "doctor: PROBLEM — no ALab programs are installed. Run \
-                 `aterm pkg install --default-set` to see why (it names the reason and \
-                 exits 2 when no build is published for this Mac)"
-            ),
+            // No per-program row survives an ENVIRONMENTAL failure any more — an
+            // unreachable index says nothing about any particular program — so the
+            // aggregate sentence is now the only place the reason lives. Preferring it to
+            // the generic hint is what keeps "why did nothing arrive?" answerable offline.
+            None => match status.as_ref().map(|s| s.outcome.as_str()).filter(|o| !o.is_empty()) {
+                Some(outcome) => println!(
+                    "doctor: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
+                ),
+                None => println!(
+                    "doctor: PROBLEM — no ALab programs are installed. Run \
+                     `aterm pkg install --default-set` to see why (it names the reason and \
+                     exits 2 when no build is published for this Mac)"
+                ),
+            },
         }
-    } else if let Some(why) = &recorded_problem {
-        // Something IS installed, but the record carries a live failure — a partial
-        // first run, a blocked disk, a member with no build for this triple.
+    } else if !recorded_problems.is_empty() {
+        // Something IS installed, but the record carries live failures — a partial first
+        // run, a blocked disk, a member with no build for this triple, an aborted
+        // coherence-group transaction.
         toolset_problem = true;
+        // No COUNT here. The tail already prints "found N problem(s)" on its own arithmetic
+        // (structural failures + the toolset condition as one), and a verdict line carrying
+        // a different N would contradict it in the same report — the tail is the line a
+        // human reads last and a script would grep. The problems are listed immediately
+        // below, so the number is there to be read.
         println!(
-            "doctor: PROBLEM — the toolset is incomplete ({why}); {} program(s) active",
+            "doctor: PROBLEM — the toolset is incomplete; {} program(s) active",
             installed.len()
         );
     } else {
         println!("doctor: {} ALab program(s) active", installed.len());
+    }
+    if let Some(start) = problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
+    {
+        for why in recorded_problems.iter().skip(start) {
+            println!("doctor:   {why}");
+        }
     }
 
     if fails == 0 && !toolset_problem {
@@ -346,6 +538,35 @@ pub fn run_with(
         println!("doctor: found {total} problem(s)");
         false
     }
+}
+
+/// The bare version token from `<bin> --version`, for comparing two copies of
+/// the same program at a glance.
+///
+/// Takes the SECOND whitespace token (`ay 0.13.0+build.8174.…` -> `0.13.0…`)
+/// and drops any `+build…`/commit/date suffix, because the question this
+/// answers is "are these the same release", not "which exact commit".
+///
+/// Best-effort by construction: a binary that will not run, will not answer, or
+/// answers in some other shape reports `unknown` and the caller stays quiet
+/// about it. `doctor` must never fail because a probe failed — the probe is a
+/// convenience, and the store integrity checks above are the real verdict.
+fn probe_version(bin: &Path) -> String {
+    const UNKNOWN: &str = "unknown";
+    let Ok(out) = std::process::Command::new(bin).arg("--version").output() else {
+        return UNKNOWN.to_string();
+    };
+    if !out.status.success() {
+        return UNKNOWN.to_string();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let Some(line) = text.lines().next() else {
+        return UNKNOWN.to_string();
+    };
+    let Some(token) = line.split_whitespace().nth(1) else {
+        return UNKNOWN.to_string();
+    };
+    token.split('+').next().unwrap_or(token).to_string()
 }
 
 /// Render a divergence's contested build numbers for the report line.
@@ -395,6 +616,49 @@ fn native_hook_ext() -> &'static str {
 #[cfg(not(windows))]
 fn native_hook_ext() -> &'static str {
     "zsh"
+}
+
+/// Report the aterm app's own update posture beside the toolchain's.
+///
+/// THE DESIGN OVERSIGHT THIS PARTIALLY CLOSES. atpkg manages the ALab toolchain; the aterm
+/// app manages itself through a SEPARATE updater; and `atpkg` is a binary inside that app.
+/// So the component a user is most likely to be running a stale copy of is the one thing
+/// atpkg had nothing to say about — you could ask it about ten programs and get no hint
+/// that the eleventh, the one answering, was months old.
+///
+/// The app cannot simply BECOME an atpkg program: swapping a running, notarized `.app`
+/// needs Gatekeeper assessment, a crash-loop boot sentinel, and a live-process handoff,
+/// none of which the shim-and-store model provides. What atpkg can do — and now does — is
+/// stop pretending the app is not there, by reading the updater's own records rather than
+/// forming a second opinion about them.
+///
+/// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
+/// fault.
+fn report_aterm_posture(layout: &crate::store::Layout) {
+    let Some(support) = layout.prefix.parent() else {
+        return;
+    };
+    let updates = support.join("Updates");
+    let field = |file: &str, key: &str| -> Option<String> {
+        let text = std::fs::read_to_string(updates.join(file)).ok()?;
+        text.lines()
+            .find_map(|l| l.split_once('='). filter(|(k, _)| k.trim() == key))
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+    };
+    let Some(installed) = field("installed.toml", "build_number") else {
+        return;
+    };
+    match (field("status.toml", "current_build"), field("status.toml", "staged_build")) {
+        (Some(current), Some(staged)) if current != staged => println!(
+            "doctor: note — aterm is RUNNING build {current}, installed {installed}, with \
+             build {staged} staged and waiting for a restart"
+        ),
+        (Some(current), _) if current != installed => println!(
+            "doctor: note — aterm is RUNNING build {current} but build {installed} is \
+             installed; the running process predates it"
+        ),
+        _ => println!("doctor: ok — aterm build {installed} installed"),
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +756,195 @@ mod tests {
             !run_with(&l, Some(&home), Some(&path), 0, None, None),
             "a store with no ALab programs must report a problem, not health"
         );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ONE TYPO MUST NOT CONDEMN A HEALTHY TOOLSET.
+    ///
+    /// A key beginning with `-` cannot be a program: no shim exists under one and the
+    /// signed index cannot name one. Before this, a single `atpkg install --help` minted
+    /// `[programs.--help]` permanently and doctor read it back as a missing member — so a
+    /// machine with ten verified programs reported "the toolset is incomplete" and exited
+    /// 1, forever. That exit code is a published contract: `tools/install.sh` hands
+    /// `pkg doctor` to every failed-seed installer as THE diagnostic to trust.
+    ///
+    /// The second case is the one that gives the first its teeth — it proves the scan was
+    /// NARROWED to stray flags, not disabled.
+    #[test]
+    fn a_stray_flag_row_is_not_a_missing_program() {
+        let stray_row = |name: &str| {
+            let l = layout(&format!("stray-{}", name.trim_start_matches('-')));
+            install(&l, "ay", 18);
+            let existing = crate::status::read(&l).unwrap_or_default();
+            let mut programs = existing.programs;
+            programs.insert(
+                "ay".to_string(),
+                crate::ProgramStatus {
+                    installed_build: Some(18),
+                    state: "active".into(),
+                    tree_root: String::new(),
+                },
+            );
+            programs.insert(
+                name.to_string(),
+                crate::ProgramStatus {
+                    installed_build: None,
+                    state: format!("error: {name} is not named in the signed index"),
+                    tree_root: String::new(),
+                },
+            );
+            crate::status::write(&l, &crate::Status { programs, ..existing }).unwrap();
+            l
+        };
+
+        let l = stray_row("--help");
+        let home = synthetic_home("stray-help");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        assert!(
+            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            "a mistyped flag left in the record is a stray row, not a missing program"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+
+        // …and a plausible PROGRAM name in the same error state still fails, so the change
+        // narrowed the scan rather than blunting it.
+        let l = stray_row("trust-vc");
+        let home = synthetic_home("stray-real");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        assert!(
+            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            "a real program name in an error state is still a problem doctor must report"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE SCAN MUST SEE WHAT IT IS FOR. Two independent blindnesses, fixed together
+    /// because they are the same failure — a diagnostic that under-reports.
+    ///
+    /// `aborted: <phase>` is written for every member of a coherence group whose
+    /// transaction was killed mid-flight — precisely the state in which a tuple's members
+    /// may disagree with each other — and the scan matched only three prefixes, so doctor
+    /// pronounced such a machine healthy. That is the mirror image of the stray-row bug:
+    /// one invented a fault, this one missed a real one.
+    #[test]
+    fn an_aborted_transaction_is_a_problem_doctor_can_see() {
+        assert!(
+            is_problem_state("aborted: activate"),
+            "a killed coherence-group transaction is a fault, not an informational state"
+        );
+        for fault in ["error: x", "unavailable: y", "blocked: z"] {
+            assert!(is_problem_state(fault), "{fault} stays a fault");
+        }
+        // Allow-by-prefix: a state the scan does not recognize reads as benign. Inventing
+        // faults from unknown states is how a diagnostic teaches people to ignore it.
+        for benign in ["active", "dev-linked (skipped)", "staged 4821"] {
+            assert!(!is_problem_state(benign), "{benign} is not a fault");
+        }
+    }
+
+    /// A YANKED PIN IS NOT HEALTH — the quietest fault in the crate.
+    ///
+    /// A tombstoned program's shims are replaced by stubs that print "was yanked/revoked",
+    /// the broken-shim scan skips tombstones by design, and the program drops out of
+    /// `active_builds` — so every other check went quiet at once and doctor said "healthy"
+    /// about a machine whose compiler had become a stub.
+    #[test]
+    fn a_yanked_pin_is_a_problem_not_silence() {
+        assert!(
+            is_problem_state("tombstoned: pin yanked/below floor"),
+            "a yanked pin leaves failing stubs behind; that is not health"
+        );
+    }
+
+    /// THE LISTING MUST HANG OFF THE BRANCH THAT SPOKE.
+    ///
+    /// Derived from `store_empty` alone, it was wrong in both directions on a DECLINED
+    /// store: with an empty store it skipped a problem no branch had named — losing the
+    /// only finding, since `*toolset*: unavailable: …` is the normal single row on a Mac
+    /// the index does not serve — and with a populated store it printed every problem as
+    /// an orphan line under "the ALab toolset was removed on this machine".
+    ///
+    /// Exhaustive over (declined) x (store empty) x (0 / 1 / many problems), because that
+    /// is the matrix the bug lived in and no single case would have exposed it.
+    #[test]
+    fn the_problem_listing_follows_the_verdict_that_named_it() {
+        for empty in [true, false] {
+            for n in [0, 1, 5] {
+                assert_eq!(
+                    problem_listing_start(true, empty, n),
+                    None,
+                    "a declined store lists nothing (empty={empty}, n={n}): the decline is \
+                     the verdict, and orphan lines would describe one nobody gave"
+                );
+            }
+        }
+        // Empty store: the verdict names reason #1 inline, so the listing resumes after it
+        // and each problem is printed exactly once.
+        assert_eq!(problem_listing_start(false, true, 0), None);
+        assert_eq!(problem_listing_start(false, true, 1), Some(1));
+        assert_eq!(problem_listing_start(false, true, 5), Some(1));
+        // Populated store: the verdict names only a count, so all of them list.
+        assert_eq!(problem_listing_start(false, false, 0), None);
+        assert_eq!(problem_listing_start(false, false, 1), Some(0));
+        assert_eq!(problem_listing_start(false, false, 5), Some(0));
+    }
+
+    /// …and it must report ALL of them. The scan used to `.find()`, so a second failing
+    /// program stayed invisible until the first was repaired — and because `status.toml` is
+    /// a `BTreeMap`, which failure you were shown was alphabetical accident.
+    #[test]
+    fn every_recorded_problem_is_reported_not_just_the_first() {
+        let l = layout("multi-problem");
+        install(&l, "ay", 18);
+        let existing = crate::status::read(&l).unwrap_or_default();
+        let mut programs = existing.programs;
+        for (name, state) in [
+            ("ay", "active"),
+            ("clean", "error: no build for this Mac"),
+            ("trust", "blocked: disk full"),
+            ("ty", "aborted: activate"),
+        ] {
+            programs.insert(
+                name.to_string(),
+                crate::ProgramStatus {
+                    installed_build: None,
+                    state: state.into(),
+                    tree_root: String::new(),
+                },
+            );
+        }
+        crate::status::write(&l, &crate::Status { programs, ..existing }).unwrap();
+
+        let home = synthetic_home("multi-problem");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        assert!(
+            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            "three recorded faults must fail the health verdict"
+        );
+
+        // THE ASSERTION THAT PROVES THE FIX. Against the real collector, not a
+        // re-implementation of it: the old `.find()` could return at most one of these, and
+        // `clean` — alphabetically first — is the one it would have returned, leaving
+        // `trust` and `ty` unseen.
+        let status = crate::status::read(&l).expect("status present");
+        assert_eq!(
+            recorded_problems(Some(&status)),
+            vec![
+                "clean: error: no build for this Mac".to_string(),
+                "trust: blocked: disk full".to_string(),
+                "ty: aborted: activate".to_string(),
+            ],
+            "all three faults are reported — one error, one blocked, one aborted"
+        );
+        // The healthy member is not swept up in the reporting.
+        assert!(
+            !recorded_problems(Some(&status)).iter().any(|p| p.starts_with("ay:")),
+            "an active program is not a problem"
+        );
+
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);
     }

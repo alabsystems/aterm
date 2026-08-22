@@ -116,6 +116,78 @@ struct BgInstance {
     color: [u8; 4],
 }
 
+/// One background RUN under construction by a row's emission walk: `(x, w,
+/// colour)` in framebuffer pixels. The row band (`y`, `h`) is the same for every
+/// quad in a run, so it is supplied at flush time rather than carried here.
+type BgRun = (u16, u16, [u8; 4]);
+
+/// Extend the in-flight background run with the quad `(x, w, color)`, or FLUSH
+/// the run and start a new one when this quad is not its contiguous same-colour
+/// continuation.
+///
+/// WHY RUNS AND NOT CELLS. The bg emission walk used to push one 12-byte
+/// [`BgInstance`] per materialized CELL, so the stream scaled with `cols` —
+/// ~24,000 quads on a 200x120 4K grid — to paint what a real terminal row
+/// actually is: one to five horizontal colour spans (a prompt line is 2-4, a
+/// page of plain text is ONE). Every full repaint the present gate forces pays
+/// that ~50-300x amplification twice over: once building + uploading the stream
+/// (`queue.write_buffer` staging traffic) and once pushing the primitives
+/// through assembly/rasterization.
+///
+/// BYTE-EXACT BY CONSTRUCTION, and it needs no property of the blend state.
+/// Merging is only ever applied to two CONSECUTIVE pushes into the SAME stream
+/// that carry the same colour bytes, the same row band, and satisfy
+/// `x2 == x1 + w1`. The merged quad then covers exactly
+/// `[x1, x1 + w1) ∪ [x1 + w1, x1 + w1 + w2)` — the union of the two quads'
+/// pixels, no more — in the same draw order, with the same colour, through the
+/// same pipeline, so every pixel is still written exactly once with the same
+/// value whether the pipeline REPLACEs or blends. Any non-contiguity flushes: a
+/// skipped cell (the wallpaper default-bg `continue`, an off-framebuffer clip), a
+/// [`clip_x_span`] run boundary on a mixed DEC line-size row, and the
+/// non-monotone x of two overlapping mixed-DEC runs all fail `x2 == x1 + w1`, so
+/// a merge can neither claim a pixel that no quad owned nor reorder two quads
+/// that overlap. Interleaved pushes into OTHER streams (`image_bg_cover`,
+/// `wallpaper`) are untouched and stay per-cell.
+///
+/// The merged width is bounded to the u16 `BgInstance.rect` packing with the
+/// same saturating discipline as [`sat_pos_u16`]: a would-be overflow flushes
+/// and starts a fresh run instead of wrapping into view.
+#[inline]
+fn push_bg_run(
+    bg: &mut Vec<BgInstance>,
+    run: &mut Option<BgRun>,
+    y: u16,
+    h: u16,
+    x: u16,
+    w: u16,
+    color: [u8; 4],
+) {
+    if let Some((rx, rw, rc)) = run
+        && *rc == color
+        && u32::from(*rx) + u32::from(*rw) == u32::from(x)
+        && u32::from(*rw) + u32::from(w) <= u32::from(u16::MAX)
+    {
+        *rw += w;
+        return;
+    }
+    flush_bg_run(bg, run, y, h);
+    *run = Some((x, w, color));
+}
+
+/// Emit the in-flight background run (if any) as ONE [`BgInstance`] over the row
+/// band `[y, y + h)` and clear it. Called at every non-contiguity inside
+/// [`push_bg_run`] and once at the END of each row's bg emission, so a run can
+/// never span two rows (their `y` differs) nor outlive the row that opened it.
+#[inline]
+fn flush_bg_run(bg: &mut Vec<BgInstance>, run: &mut Option<BgRun>, y: u16, h: u16) {
+    if let Some((x, w, color)) = run.take() {
+        bg.push(BgInstance {
+            rect: [x, y, w, h],
+            color,
+        });
+    }
+}
+
 /// One glyph quad: a pixel-space dest rect, an atlas UV rect, a fg colour, and
 /// the HOME-CELL background under it.
 ///
@@ -2347,11 +2419,33 @@ pub(crate) struct GpuImageCache {
         usize,
         GpuDecodedImage,
     )>,
+    /// Running sum of the cached entries' `rgba.len()` — the decoded-byte
+    /// budget `put` enforces. Ported from the CPU `ImageCache` after this
+    /// cache reproduced the SAME failure that budget fixed there: a count-only
+    /// cap (the old `MAX = 8`) meant that with N > cap DISTINCT visible
+    /// images, `build_image_plane`'s deterministic row-major layout scan
+    /// missed on EVERY probe and re-decoded ALL N images on EVERY present,
+    /// forever — a 9-thumbnail contact sheet paid 9 full PNG decodes per
+    /// cursor-blink tick — while the cap simultaneously admitted 8 UNBOUNDED
+    /// footprints (~264 MB of decoded full-window 4K RGBA). The byte budget
+    /// is the real memory bound; the entry cap is only a probe-scan bound.
+    bytes: usize,
 }
 
 impl GpuImageCache {
-    /// Maximum distinct decoded images retained — matches the CPU cap.
-    const MAX: usize = 8;
+    /// Entry-count ceiling — matches the CPU `ImageCache::MAX_ENTRIES`. Sized
+    /// PAST any realistic thumbnail/contact-sheet set: the admission policy
+    /// must be able to hold a frame's whole DISTINCT visible working set (the
+    /// set `build_image_plane` materializes in `order`), because a cap smaller
+    /// than the working set turns the deterministic sequential probe order
+    /// into a permanent 100% miss rate (LRU evicts the entry that will be
+    /// probed FIRST next frame). The memory bound is `MAX_BYTES`; this count
+    /// only bounds the `Arc::ptr_eq` linear scan in `get`/`peek`.
+    const MAX_ENTRIES: usize = 64;
+    /// Decoded-RGBA byte budget — matches the CPU `ImageCache::MAX_BYTES` and
+    /// the engine's `MAX_KITTY_STORE_BYTES`. The real memory bound: the old
+    /// count-only cap admitted eight unbounded footprints.
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
 
     /// Look up a decoded image by `Arc::ptr_eq` identity + footprint, promoting it
     /// to MRU on a hit. Matching the held `Arc` (not a freed-able raw pointer) is
@@ -2388,7 +2482,12 @@ impl GpuImageCache {
     }
 
     /// Insert a freshly decoded image, holding an `Arc` clone of its source to pin
-    /// the allocation, and evicting the LRU entry past the cap.
+    /// the allocation, and evicting LRU entries until both the entry-count and
+    /// decoded-byte budgets fit — the CPU `ImageCache::put` policy, ported
+    /// verbatim (it is the proven fix for the sequential-scan thrash this
+    /// cache exhibited past 8 distinct visible images). A single over-budget
+    /// image still inserts alone (the loop stops on an empty list), so `put`
+    /// terminates and even a huge image is decoded once, not once per frame.
     fn put(
         &mut self,
         image: std::sync::Arc<aterm_core::grid::extra::ImageData>,
@@ -2396,9 +2495,14 @@ impl GpuImageCache {
         fp_h: usize,
         value: GpuDecodedImage,
     ) {
-        if self.entries.len() >= Self::MAX {
-            self.entries.remove(0);
+        while !self.entries.is_empty()
+            && (self.entries.len() >= Self::MAX_ENTRIES
+                || self.bytes + value.rgba.len() > Self::MAX_BYTES)
+        {
+            let (_, _, _, evicted) = self.entries.remove(0);
+            self.bytes -= evicted.rgba.len();
         }
+        self.bytes += value.rgba.len();
         self.entries.push((image, fp_w, fp_h, value));
     }
 }
@@ -2429,7 +2533,7 @@ pub(crate) struct ImagePlane {
     /// reuse fast-path compares those keys; without holding the Arcs, a placed
     /// image whose address is freed could be reused by a new same-footprint image
     /// (ABA), making the key compare equal while the texels are stale. The decode
-    /// cache only pins up to `GpuImageCache::MAX` images, but `placements` can
+    /// cache only pins what its entry/byte budgets admit, but `placements` can
     /// reference more, so the plane must pin its own placed set. Never read —
     /// existence is the guarantee.
     _pinned_images: Vec<std::sync::Arc<aterm_core::grid::extra::ImageData>>,
@@ -2738,6 +2842,13 @@ pub struct GpuRenderer {
     // DECDHL/DECDWL... no: DECDWL is safe; DECDHL/selection/scroll frames fall
     // back to full.
     scissor_taken: u64,
+    // How many presents took the E7 SCROLL-BLIT RESCUE: a `compute_dirty_rows`
+    // FullRepaint verdict that `scroll_blit_plan` turned into a band shift plus an
+    // exposed-strip scissor. A subset of `scissor_taken` (a rescued frame counts as
+    // scissored, because that is the encode it runs), reported separately so a test
+    // or a bench can tell "the scroll was rescued" from "the frame happened to have
+    // few dirty rows".
+    scroll_rescues: u64,
     full_repaints: u64,
     // TEST/DIAGNOSTIC: how many settings-card `write_texture` uploads actually
     // ran (an unchanged card skips the upload — see `ensure_tray_overlay`).
@@ -2747,6 +2858,12 @@ pub struct GpuRenderer {
     // frame's instances — the proportional-to-dirty-rows win the benchmark
     // reports.
     last_instances: usize,
+    // The BACKGROUND stream's own instance count for the LAST encoded frame — the
+    // one `last_instances` folds into a 16-stream sum, which is exactly the wrong
+    // shape for pricing the bg RUN coalescing (`push_bg_run`): the glyph stream is
+    // per-cell by nature and would swamp a bg drop from `cols` to `runs`. Kept
+    // beside its sum so the two can never be read from different frames.
+    last_bg_instances: usize,
     // TEST/DIAGNOSTIC: how many render passes the LAST `encode_frame` opened on
     // the offscreen attachment. Each pass is a full-framebuffer TBDR tile load +
     // store (~23 MB at 3024x1964x4B) regardless of the dirty-row scissor, so this
@@ -4505,9 +4622,11 @@ impl GpuRenderer {
             image_seen_scratch: FxHashSet::default(),
             image_placements_scratch: FxHashMap::default(),
             scissor_taken: 0,
+            scroll_rescues: 0,
             full_repaints: 0,
             tray_uploads: 0,
             last_instances: 0,
+            last_bg_instances: 0,
             last_frame_passes: 0,
         })
     }
@@ -5070,6 +5189,16 @@ impl GpuRenderer {
         self.scissor_taken
     }
 
+    /// TEST/DIAGNOSTIC: how many presents took the E7 whole-row SCROLL-BLIT rescue
+    /// — the rigid history scrolls that used to re-encode every row and now shift
+    /// the retained band and re-encode only the newly-exposed strip. Always a
+    /// subset of [`Self::scissor_taken`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scroll_rescues(&self) -> u64 {
+        self.scroll_rescues
+    }
+
     /// TEST/DIAGNOSTIC: number of `present_input` frames that did a FULL repaint
     /// (Clear + all rows) — the first frame, a geometry/scrollback/selection
     /// change, a double-HEIGHT row, etc. (the conservative always-correct path).
@@ -5110,6 +5239,19 @@ impl GpuRenderer {
     #[must_use]
     pub fn last_instances(&self) -> usize {
         self.last_instances
+    }
+
+    /// TEST/DIAGNOSTIC: instances built in the LAST encoded frame by the
+    /// BACKGROUND stream alone. This is the counter the bg RUN coalescing
+    /// (`push_bg_run`) moves: a repainted row costs the number of distinct
+    /// horizontal colour RUNS it carries, not `cols` quads, so a page of plain
+    /// text is ~1 per row instead of ~200. Reported separately from
+    /// [`Self::last_instances`] because that sum is dominated by the per-cell
+    /// glyph stream, which this change deliberately does not touch.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_bg_instances(&self) -> usize {
+        self.last_bg_instances
     }
 
     /// TEST/DIAGNOSTIC: how many render passes the LAST encoded frame opened on
@@ -5794,8 +5936,9 @@ impl GpuRenderer {
                 continue;
             };
             pinned_images.push(std::sync::Arc::clone(image));
-            // The decoded LRU is bounded (`GpuImageCache::MAX`) while `placements`
-            // is not: when more than that many DISTINCT images are visible, the
+            // The decoded LRU is bounded (`GpuImageCache::MAX_ENTRIES` entries /
+            // `MAX_BYTES` decoded bytes) while `placements`
+            // is not: when the visible distinct set exceeds a budget, the
             // layout loop above evicted this already-placed key before we re-read
             // it here. Skip such a footprint — its reserved rows stay transparent,
             // so the covered cell's bg shows through — instead of panicking. This
@@ -6253,11 +6396,10 @@ impl GpuRenderer {
         if frac == 0 {
             return;
         }
-        let mag = frac.unsigned_abs() as usize;
         let Some(off) = win.offscreen.as_ref() else {
             return;
         };
-        let (w, h) = (off.w, off.h);
+        let h = off.h;
         // The renderer's own row→px mapping, clamped to the framebuffer — the SAME
         // helper the CPU present path calls, so the two bands cannot drift.
         let (y0, y1) = aterm_render::scroll_translate::grid_band_px(
@@ -6267,6 +6409,47 @@ impl GpuRenderer {
             input.grid_bot_row,
             h as usize,
         );
+        self.shift_offscreen_band_px(win, y0, y1, frac);
+    }
+
+    /// E7 WHOLE-ROW SCROLL BLIT (GPU): shift the offscreen's FULL grid band by
+    /// `delta_rows` whole rows, so a rescued scrollback frame re-encodes only the
+    /// newly-exposed strip.
+    ///
+    /// The band is the CPU's, term for term — `render_input_cached` shifts
+    /// `[grid_top, grid_top + rows·cell_h)` clamped to the framebuffer, NOT the
+    /// `grid_top_row`/`grid_bot_row` chrome partition the sub-row glide uses (a
+    /// history scroll relocates the whole grid; the M1b band exists to keep spliced
+    /// chrome pinned during a glide, and `scroll_blit_plan` refuses any frame whose
+    /// rows are not a rigid translation anyway). Deriving both from the same
+    /// arithmetic as the CPU is what keeps the two backends' seams identical.
+    fn shift_offscreen_rows(&mut self, win: &mut WindowGpu, delta_rows: i32, rows: usize) {
+        let Some(h) = win.offscreen.as_ref().map(|o| o.h as usize) else {
+            return;
+        };
+        let cell_h = self.cell_size().1;
+        let grid_top = self.cpu.grid_top();
+        let y0 = grid_top.min(h);
+        let y1 = grid_top.saturating_add(rows.saturating_mul(cell_h)).min(h);
+        self.shift_offscreen_band_px(win, y0, y1, i64::from(delta_rows) * cell_h as i64);
+    }
+
+    /// The shared staged band move: shift `[y0, y1)` of this window's offscreen by
+    /// the SIGNED `delta` device pixels (positive == up), leaving the `|delta|`-px
+    /// strip at the opposite edge as the placeholder — the same bytes the CPU
+    /// [`aterm_render::scroll_translate::translate_grid_band_in_place`] leaves.
+    /// Extracted VERBATIM from the sub-row path so the fractional glide and the
+    /// whole-row scroll blit cannot drift: one scratch texture, one submit, the
+    /// same two copies, the same `moved == 0` no-op.
+    fn shift_offscreen_band_px(&mut self, win: &mut WindowGpu, y0: usize, y1: usize, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mag = delta.unsigned_abs() as usize;
+        let Some(off) = win.offscreen.as_ref() else {
+            return;
+        };
+        let (w, h) = (off.w, off.h);
         let band_h = y1.saturating_sub(y0);
         let moved = band_h.saturating_sub(mag); // destination rows that pull in-band
         if moved == 0 {
@@ -6278,7 +6461,7 @@ impl GpuRenderer {
         // distinct scratch texture stages the move either way, so no overlap UB and
         // the copy order is irrelevant — byte-identical to the CPU bottom-up/top-down
         // in-place walk (`translate_grid_band_in_place`).
-        let (src_y, dst_y) = if frac > 0 {
+        let (src_y, dst_y) = if delta > 0 {
             (y0 + mag, y0)
         } else {
             (y0, y0 + mag)
@@ -7211,15 +7394,47 @@ impl GpuRenderer {
         //    `win.offscreen` (built once, reused across presents at the same
         //    dimensions; rebuilt only on a resize), so this present allocates no
         //    per-frame texture / view / blit bind group.
-        // The tray is baked into the PERSISTENT offscreen below; the scissored
-        // dirty-row path would otherwise re-blend it over itself (alpha compounding)
-        // or leave stale card pixels when the card moves/closes. Force a full clean
-        // repaint while a card is shown, and on the present that first drops it. Cheap
-        // (a card shows only during settings UI, never on the typing hot path).
-        let tray_full = tray.is_some() || win.tray_overlay.is_some();
-        if tray_full {
-            win.present_prev = None;
-        }
+        // THE TRAY NO LONGER KILLS THE SCISSOR. A resident card used to force
+        // `present_prev = None` on EVERY present for its whole lifetime, because the
+        // card is composited INTO the persistent offscreen — the scissor base — so a
+        // Load-preserved band would re-blend the same straight-alpha quad over itself
+        // (compounding) and a moved/closed card would strand stale pixels. The
+        // budget that justified it ("a card shows only during settings UI, never on
+        // the typing hot path") does not hold: the frontend's composite slot is
+        // `route_card.or(settings_card).or(level_up_card).or(notice_card)
+        //  .or(badge_card)`, and `badge_card` is the STATIC top-right version pill —
+        // `Some` for the ENTIRE SESSION once `show_build_badge` is on. Flipping one
+        // cosmetic ~200x40 px toggle therefore converted every keystroke echo and
+        // every cursor blink from a one-row scissor into a full O(rows·cols) grid
+        // re-encode + full-target Clear + full present-offscreen re-copy. The update
+        // notice and the level-up burst did the same for their lifetimes.
+        //
+        // So route the card exactly the way the comet halo is already routed: over
+        // the THROWAWAY `present_offscreen` copy, never into the scissor base. That
+        // mechanism is built, proven and already carries two clients (the bloom halo
+        // and the heat shimmer): `compose_present_offscreen` re-copies
+        // (offscreen writes since the last sync) ∪ (last sync's effect footprint)
+        // into the copy, so anything drawn over the copy is erased and redrawn
+        // exactly — no accumulation, no stale pixels, no repaint owed. A card is a
+        // STRICTLY SIMPLER client of that contract than the halo: an axis-aligned
+        // quad with a known rect, so its `present_offscreen_fx` footprint is EXACT
+        // rather than a dilated bbox, and a card that moves or closes is erased by
+        // the same re-copy that erases a moved comet.
+        //
+        // Z-ORDER IS PRESERVED, which is why the presented frame is byte-identical:
+        // a tray frame carrying a live effect used to take `bake_in_place` (halo INTO
+        // the offscreen, then the card INTO the offscreen on top of it) — card over
+        // halo. On the copy route the card is recorded into the SAME encoder AFTER
+        // `compose_present_offscreen` has drawn the halo and the haze over the copy —
+        // card over halo again, same pipeline, same straight-alpha src-over, over
+        // byte-identical underlying pixels (a same-format `copy_texture_to_texture`
+        // of the offscreen).
+        //
+        // The one frame class that KEEPS the in-offscreen composite is the sub-row
+        // scroll (`shift_full` below): it mutates the offscreen in place anyway, has
+        // already invalidated `present_prev`, and its baked halo must stay under the
+        // chrome and ride the band shift. `tray_over_copy` is exactly its complement.
+        let tray_resident = tray.is_some() || win.tray_overlay.is_some();
         // M1b sub-row scroll: a fractional frame MUTATES the offscreen (the grid-band
         // shift below), so the scissored dirty-row diff must never compare against
         // it. Force a full clean repaint (fresh UNtranslated offscreen) whenever the
@@ -7234,6 +7449,14 @@ impl GpuRenderer {
         if shift_full {
             win.present_prev = None;
         }
+        // Which route this frame's card takes — decided BEFORE the encode because
+        // the encode's scissor decision depends on it (`tray_over_copy` is the frame
+        // class where `present_prev` survives a resident card). `tray_in_place` is
+        // its complement RESTRICTED to a card actually being drawn this frame: only
+        // a real composite dirties the offscreen, and only that owes the
+        // end-of-present invalidation below.
+        let tray_over_copy = tray_resident && !shift_full;
+        let tray_in_place = tray.is_some() && !tray_over_copy;
         let (fw, fh) = self.encode_present_frame(win, input);
 
         let bloom_glow_present = self.enable_bloom && !input.cursor_glow_add.is_empty();
@@ -7254,7 +7477,11 @@ impl GpuRenderer {
         // haloed offscreen is never diffed against. The hot typing path (no tray, no
         // shift) keeps the offscreen a CLEAN halo-free scissor base and composites
         // the halo over a throwaway `present_offscreen` below.
-        let bake_in_place = fx_present && (tray_full || shift_full);
+        // Only the sub-row-scroll frame bakes in place now: the tray term moved to
+        // the `present_offscreen` route above, and `tray_in_place` (a card on a
+        // shift frame) is a SUBSET of `shift_full`, so dropping it from this
+        // disjunction changes no frame's routing.
+        let bake_in_place = fx_present && shift_full;
         // When a bloom composite below builds + uploads the UNGATED glow
         // instances (`vbufs.bloom_glow`), remember the count — the EDR/SDR
         // crown passes read the same buffer and must not build it twice.
@@ -7277,10 +7504,18 @@ impl GpuRenderer {
         self.shift_offscreen_band(win, input);
         win.prev_frac = frac;
 
-        // Composite frontend chrome INTO the already-translated offscreen (the
-        // single source of truth). A `None` tray drops any resident overlay.
+        // Composite frontend chrome. On the copy route the card is DEFERRED to
+        // `draw_tray_over_present_copy` below (after the halo/haze, so the z-order is
+        // the one `bake_in_place` produced); the in-place sub-row-scroll frame still
+        // bakes it INTO the already-translated offscreen, the single source of truth
+        // for that frame. A `None` tray drops any resident overlay on either route —
+        // and on the copy route the drop owes NO repaint at all, because the
+        // offscreen never held the card: the next `compose_present_offscreen`
+        // re-copies the footprint this card recorded last frame, and a later present
+        // that composes nothing blits the (always card-free) offscreen directly.
         match tray {
-            Some(t) => self.draw_tray_into_offscreen(win, t),
+            Some(t) if tray_in_place => self.draw_tray_into_offscreen(win, t),
+            Some(_) => {}
             None => win.tray_overlay = None,
         }
 
@@ -7301,7 +7536,12 @@ impl GpuRenderer {
         // under the 16.7 ms frame budget — and every frame is halo-consistent.
         // The offscreen stays a clean halo-free scissor base either way, so
         // `present_prev` diffing is unaffected.
-        let use_present_off = fx_present && !bake_in_place;
+        // The copy is also the card's target, so a card-bearing frame composes one
+        // even with every effect off. COST: the copy is a resident full-frame texture
+        // and the sync copies the encode's own scissor rect — i.e. a one-row band on
+        // a typing frame — which is the trade this whole change is: a bounded
+        // per-frame band copy in place of an unbounded full grid re-encode.
+        let use_present_off = (fx_present && !bake_in_place) || tray_over_copy;
         // ONE command buffer for the rest of the present. The composite below and
         // the letterbox blit further down used to commit SEPARATE Metal command
         // buffers, and each commit is real driver work on the frame that carries
@@ -7323,10 +7563,18 @@ impl GpuRenderer {
         if use_present_off && let Some(n) = self.compose_present_offscreen(win, input, &mut enc) {
             ungated_built = Some(n);
         }
+        // The card, over the finished copy — AFTER the halo and the haze, so the
+        // chrome sits on top exactly as it did when both were baked into the
+        // offscreen. Same encoder ⇒ record order ⇒ execution order.
+        if tray_over_copy && let Some(t) = tray {
+            self.draw_tray_over_present_copy(win, t, &mut enc);
+        }
 
         // 2. Ensure a blit pipeline for this destination format exists. The tray is
-        //    already composited into the offscreen (step above), so the blit just
-        //    blits the offscreen-with-card — no swapchain-side tray pass.
+        //    already composited (into the offscreen on the in-place route, over the
+        //    `present_offscreen` copy on the copy route — and the blit binds whichever
+        //    of the two this frame composited into, see `use_present_off`), so the
+        //    blit just blits the frame-with-card — no swapchain-side tray pass.
         let format = dest.format;
         self.ensure_blit_pipeline(format);
         // M3 phase B: the PROVEN present gate (HdrPresentGate.Present — see
@@ -7693,12 +7941,20 @@ impl GpuRenderer {
         }
         self.ctx.queue.submit([enc.finish()]);
 
-        // A tray/scroll frame composited the halo IN PLACE into the offscreen, so it
-        // is no longer a clean base+aurora frame: the NEXT present must not scissor
-        // against it (the halo would be Load-preserved and re-added). Force a clean
-        // FULL repaint next present. (One extra Full frame after the rare
-        // settings-card / scroll-end tick; the hot typing path never bakes in place.)
-        if bake_in_place {
+        // A scroll frame composited the halo IN PLACE into the offscreen, and an
+        // in-place card baked itself there too, so the offscreen is no longer the
+        // clean base+aurora frame `encode_present_frame` just stamped `present_prev`
+        // for: the NEXT present must not scissor against it (the halo would be
+        // Load-preserved and re-added; the card would compound and strand). Force a
+        // clean FULL repaint next present.
+        //
+        // `tray_in_place` is load-bearing, not belt-and-braces: it is the seam where
+        // a card LEAVES the in-place route. A frame that ends a sub-row glide bakes
+        // the card into the offscreen and stamps `present_prev`; without this the
+        // NEXT frame (frac back to 0 ⇒ `tray_over_copy`) would trust that stamp,
+        // scissor against an offscreen carrying a baked card, and then draw the card
+        // AGAIN over the copy — a doubled, and on a moved card a stranded, pill.
+        if bake_in_place || tray_in_place {
             win.present_prev = None;
         }
     }
@@ -8055,6 +8311,12 @@ impl GpuRenderer {
         let mut dirty = std::mem::take(&mut self.dirty_scratch);
         let prev_present = win.present_prev.take();
         let prev_input = std::mem::take(&mut win.prev_input);
+        // E7 SCROLL-BLIT RESCUE (the GPU arm). `Some(delta)` ⇒ this frame is a RIGID
+        // whole-row history scroll and `dirty` holds exactly the exposed strip, the
+        // overshoot apron and the cursor's rows; the offscreen's grid band is shifted
+        // by `delta` rows BELOW, before the encode, so the scissored encode paints
+        // only those rows over already-correct pixels.
+        let mut scroll_delta: Option<i32> = None;
         let scope = match (&prev_present, offscreen_holds_prev) {
             (Some(prev), true) if prev.grid_top == self.cpu.grid_top() => match compute_dirty_rows(
                 // The prior presented frame's snapshot lives in this window's
@@ -8084,9 +8346,38 @@ impl GpuRenderer {
                 // handled correctly downstream — Load preserves the prior frame and
                 // the empty dirty set draws nothing, the cheapest possible encode.
                 DirtyDecision::Rows(_) => RepaintScope::Dirty(&dirty),
-                // Not reusable (geometry / scrollback / selection / double-height):
-                // the conservative full repaint.
-                DirtyDecision::FullRepaint => RepaintScope::Full,
+                // Not reusable by the row diff — but `FullRepaint` is the verdict for
+                // ORDINARY SCROLLBACK NAVIGATION (offset AND anchor both shifted),
+                // where the grid merely slid by a known integer row delta and every
+                // retained row was rasterized last frame. Consult the SHARED planner
+                // the CPU backend already rescues that case with
+                // (`scroll_blit_plan`): on `Some(delta)` the retained rows are
+                // shifted in the offscreen by `delta·cell_h` device px and only the
+                // exposed strip + apron + cursor rows re-encode. Its refusal clauses
+                // (geometry / default-bg change, double-height, wallpaper, any
+                // position-keyed overlay or selection, a moving or appearing cursor,
+                // a changed retained row, |delta| >= rows) all hold verbatim for the
+                // GPU: glyph placement is the same pure Y-translation, so a retained
+                // row shifted by whole cells is byte-identical to re-encoding it.
+                // `None` leaves the always-correct full repaint exactly as before —
+                // this arm can only ever turn a Full frame into a Dirty one.
+                DirtyDecision::FullRepaint => {
+                    scroll_delta = aterm_render::scroll_blit_plan(
+                        &prev_input,
+                        input,
+                        prev.blink_phase,
+                        prev.cursor_style_override,
+                        cur_blink,
+                        cur_override,
+                        ch,
+                        &mut dirty,
+                    );
+                    if scroll_delta.is_some() {
+                        RepaintScope::Dirty(&dirty)
+                    } else {
+                        RepaintScope::Full
+                    }
+                }
             },
             // No prior frame, or the offscreen no longer holds it: full repaint.
             _ => RepaintScope::Full,
@@ -8095,6 +8386,16 @@ impl GpuRenderer {
         match &scope {
             RepaintScope::Dirty(_) => self.scissor_taken += 1,
             RepaintScope::Full => self.full_repaints += 1,
+        }
+        // THE BLIT ITSELF, before the encode: a staged texture-to-texture band move
+        // of the retained rows, so the scissored encode below lands on a frame that
+        // is already correct everywhere it does not paint. It MUST precede
+        // `encode_frame` — the encode's `LoadOp::Load` reads exactly these texels —
+        // and it is the only offscreen writer here, so `present_prev` still describes
+        // the offscreen's contents once the encode has run.
+        if let Some(delta) = scroll_delta {
+            self.scroll_rescues += 1;
+            self.shift_offscreen_rows(win, delta, input.rows);
         }
         let dims = self.encode_frame(win, input, &scope);
         // Done with the borrowed scope; restore the scratch (capacity retained).
@@ -9781,6 +10082,104 @@ impl GpuRenderer {
         self.ctx.queue.submit([enc.finish()]);
     }
 
+    /// Composite the settings-card TRAY over this window's THROWAWAY
+    /// `present_offscreen` copy — the twin of [`Self::draw_tray_into_offscreen`]
+    /// for the frame class that keeps the offscreen a CLEAN scissor base.
+    ///
+    /// Identical pipeline, identical uniform, identical straight-alpha src-over
+    /// `LoadOp::Load` quad; only the attachment differs. Two consequences make it
+    /// the cheaper design rather than merely a relocation:
+    ///
+    /// * `present_prev` survives a resident card, so a keystroke echo under the
+    ///   build badge is a one-row scissor again instead of a full grid re-encode.
+    /// * the card's footprint is recorded EXACTLY in `present_offscreen_fx`, so the
+    ///   next `compose_present_offscreen` re-copies precisely the card rect from the
+    ///   clean offscreen — which is what erases a card that moved, changed or closed.
+    ///   `union_rect_opt`'s `None` stays absorbing, so if the tracker has already
+    ///   degraded to "everything" this can only keep it there (a full copy, never a
+    ///   stale one).
+    ///
+    /// Recorded into the CALLER's encoder (the one that also carries the compose and
+    /// the letterbox blit) rather than submitting its own — one commit, and record
+    /// order puts the card after the halo/haze, the z-order the in-place route
+    /// produced. Runs only when `compose_present_offscreen` has already ensured the
+    /// copy this frame; the `else` guard makes a missing copy a no-op rather than a
+    /// panic.
+    fn draw_tray_over_present_copy(
+        &mut self,
+        win: &mut WindowGpu,
+        tray: TrayQuad<'_>,
+        enc: &mut wgpu::CommandEncoder,
+    ) {
+        // Same attachment format as the in-offscreen twin: `present_offscreen` is
+        // created by `offscreen_texture`, so the proven tray pipeline attaches it
+        // unchanged (C1/C2 — the pipeline cannot drift from the attachment).
+        let format = self.ctx.offscreen_format();
+        // (1) ALL `&mut self` / `&mut win` work FIRST, before the immutable borrows.
+        self.ensure_tray_pipeline(format);
+        self.ensure_tray_overlay(win, tray.rgba, tray.pw, tray.ph);
+        let Some((fw, fh)) = win.present_offscreen.as_ref().map(|p| (p.w, p.h)) else {
+            return;
+        };
+        // (2) Placement uniform. `fb` is the COPY's dims — the same padded extent as
+        //     the offscreen it was copied from, so `dx/dy/pw/ph` mean exactly what
+        //     they meant on the in-place route.
+        let want = TrayUniform {
+            rect: [
+                tray.dx as f32,
+                tray.dy as f32,
+                tray.pw as f32,
+                tray.ph as f32,
+            ],
+            fb: [fw as f32, fh as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.ctx
+            .queue
+            .write_buffer(&self.tray_uniform_buf, 0, bytemuck::bytes_of(&want));
+        // (3) The EXACT footprint this draw puts over the copy, clamped to it, so the
+        //     next sync re-copies the card rect and nothing else. Unioned (not
+        //     assigned) because `compose_present_offscreen` has already recorded the
+        //     halo/haze footprint into the same tracker for this frame.
+        let rect = [
+            tray.dx.min(fw),
+            tray.dy.min(fh),
+            tray.dx.saturating_add(tray.pw).min(fw),
+            tray.dy.saturating_add(tray.ph).min(fh),
+        ];
+        win.present_offscreen_fx = union_rect_opt(win.present_offscreen_fx, Some(rect), (fw, fh));
+        // (4) NOW the immutable borrows: the copy's view (render target) and the
+        //     resident overlay bind. LoadOp::Load PRESERVES the composed frame under
+        //     the card; the ALPHA_BLENDING quad composites straight-alpha src-over.
+        let po = win
+            .present_offscreen
+            .as_ref()
+            .expect("the dims read above imply a resident copy");
+        let t = win
+            .tray_overlay
+            .as_ref()
+            .expect("ensure_tray_overlay set it above");
+        let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("aterm-gpu tray present-copy pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &po.view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.tray_pipelines[&format]);
+        pass.set_bind_group(0, &t.bind, &[]);
+        pass.draw(0..4, 0..1); // 4-vert triangle-strip quad
+    }
+
     /// THE GPU DIRTY-GATE — the per-frame PRESENTATION hot path.
     ///
     /// On an UNCHANGED frame this does ZERO GPU work: no encode, no submit, no
@@ -10989,6 +11388,15 @@ impl GpuRenderer {
                 aterm_render::FireHaloWalk::new(u16::try_from(r).map_or(&[][..], |row| {
                     aterm_render::fire_halo_row_slice(&input.fire_halo, row)
                 }));
+            // THIS ROW's in-flight background run (see `push_bg_run`): the two bg
+            // loops below feed it instead of pushing one quad per cell, and it is
+            // flushed once after the tail loop — before any other stream pushes —
+            // so a run is always a maximal set of CONSECUTIVE same-colour bg pushes
+            // and the emitted quads tile exactly the pixels the per-cell quads did.
+            // The full-row band quad below is deliberately NOT routed through it:
+            // it is the band re-establish, pushed first and then overwritten, and
+            // starting the run empty keeps that ordering literal.
+            let mut bg_run: Option<BgRun> = None;
             // SCISSORED PATH ONLY: a FULL-ROW-WIDTH theme-bg quad FIRST, so the
             // band is fully re-established from background even if the per-cell
             // fills below leave any sliver (degenerate cols). bg is REPLACE and the
@@ -11083,7 +11491,13 @@ impl GpuRenderer {
                     rect: [bx, y0u, bw, ch as u16],
                     color,
                 };
-                bg_inst.push(instance);
+                // RUN-COALESCED (see `push_bg_run`): a contiguous same-colour
+                // neighbour widens the open run instead of adding a quad. The
+                // per-cell `instance` above is still the exact rect this cell owns,
+                // and the image-cover stream below KEEPS it per-cell — that stream
+                // is empty on every ordinary frame and its z tier is per-cell by
+                // definition, so there is nothing to coalesce there.
+                push_bg_run(bg_inst, &mut bg_run, y0u, ch as u16, bx, bw, color);
                 // Kitty's deepest z tier sits below selected cells and cells
                 // carrying a non-default background, but above the default
                 // frame clear. Repaint only those covering backgrounds after
@@ -11161,7 +11575,12 @@ impl GpuRenderer {
                         rect: [bx, y0u, bw, ch as u16],
                         color,
                     };
-                    bg_inst.push(instance);
+                    // Same run coalescing as the materialized loop, and the run is
+                    // still OPEN from it: a tail cell whose colour continues the
+                    // last materialized cell's simply widens that run across the
+                    // prefix/tail seam (the tail starts at `materialized`, i.e.
+                    // exactly where the prefix stopped, so the rects are contiguous).
+                    push_bg_run(bg_inst, &mut bg_run, y0u, ch as u16, bx, bw, color);
                     if selected
                         && input.image_at(r, c).is_some_and(|image| {
                             aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
@@ -11171,6 +11590,11 @@ impl GpuRenderer {
                     }
                 }
             }
+            // END OF THIS ROW's bg emission: flush the open run. Nothing pushes into
+            // `bg_inst` between here and the next row's first cell, so this is the
+            // last possible moment a merge could still be legal and the first at
+            // which the run is complete.
+            flush_bg_run(bg_inst, &mut bg_run, y0u, ch as u16);
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // Same per-column placement as the bg loop above (uniform rows keep
                 // `c · rcw`), so a cell's glyph lands on its own fill.
@@ -13619,6 +14043,7 @@ impl GpuRenderer {
         // Record the total instances built this frame (diagnostic). In the
         // scissored path this is ~proportional to the dirty-row count, not the
         // screen — the headline win.
+        self.last_bg_instances = self.inst.bg.len();
         self.last_instances = self.inst.bg.len()
             + self.inst.image_below_bg.len()
             + self.inst.image_bg_cover.len()
@@ -14168,9 +14593,9 @@ mod tests {
     }
 
     /// REGRESSION (inline-image plane panic, renderer.rs:2158): the decoded LRU
-    /// is bounded to `GpuImageCache::MAX`, but the per-frame placement map that
-    /// drives the pack loop is NOT. When more than `MAX` DISTINCT images are
-    /// visible, the layout loop evicts an already-placed key, so the pack loop's
+    /// is bounded to `GpuImageCache::MAX_ENTRIES`, but the per-frame placement map that
+    /// drives the pack loop is NOT. When the visible distinct set exceeds a
+    /// budget, the layout loop evicts an already-placed key, so the pack loop's
     /// lookup of that key MUST be able to miss. This proves `peek` returns `None`
     /// for an evicted-but-still-placed key — the exact condition that made the
     /// pack loop's old `.expect("placed image is cached")` abort `encode_frame`.
@@ -14183,21 +14608,107 @@ mod tests {
             h: 1,
             rgba: vec![i as u8, 0, 0, 255],
         };
-        // Insert one more DISTINCT image than the cache can hold (the >8 case). Each
+        // Insert one more DISTINCT image than the entry cap can hold. Each
         // `Arc` is retained so we can look it up by `Arc::ptr_eq` afterwards.
-        let n = GpuImageCache::MAX + 1;
+        let n = GpuImageCache::MAX_ENTRIES + 1;
         let imgs: Vec<_> = (0..n).map(|_| test_image_data()).collect();
         for (i, img) in imgs.iter().enumerate() {
             cache.put(img.clone(), 1, 1, mk_decoded(i));
         }
         // The cache never exceeds its cap.
-        assert!(cache.entries.len() <= GpuImageCache::MAX);
+        assert!(cache.entries.len() <= GpuImageCache::MAX_ENTRIES);
         // The FIRST-inserted image was evicted: a pack loop whose (unbounded)
         // placement map still references it gets `None` here — the fix skips it
         // instead of `.expect()`-panicking.
         assert!(cache.peek(&imgs[0], 1, 1).is_none());
         // The most-recently inserted image is still resident.
         assert!(cache.peek(&imgs[n - 1], 1, 1).is_some());
+    }
+
+    /// REGRESSION (IMG-2, the count-only-LRU thrash): a steady frame whose
+    /// DISTINCT visible-image set exceeds the OLD count cap of 8 must decode
+    /// each image ONCE, not once per present. `build_image_plane`'s layout
+    /// loop probes the cache in deterministic row-major order, so a cap
+    /// smaller than the working set makes LRU evict exactly the entry the
+    /// next present probes first — a permanent 100% miss rate (the CPU
+    /// `ImageCache` comment records the identical pathology, fixed there by
+    /// the 64-entry + 64 MB byte-budget design this cache now ports). This
+    /// drives the probe-then-fill pattern of the layout loop for three
+    /// "presents" over 9 distinct images and counts decodes: the fix pays 9
+    /// (first present only); the old cache paid 27 (9 per present, forever).
+    #[test]
+    fn image_cache_nine_distinct_images_decode_once_not_per_present() {
+        let mut cache = GpuImageCache::default();
+        let imgs: Vec<_> = (0..9).map(|_| test_image_data()).collect();
+        let mut decodes = 0usize;
+        for _present in 0..3 {
+            // The layout loop's shape: sequential probe, decode+insert on miss.
+            for img in &imgs {
+                if cache.get(img, 2, 2).is_none() {
+                    decodes += 1;
+                    cache.put(
+                        img.clone(),
+                        2,
+                        2,
+                        GpuDecodedImage {
+                            w: 2,
+                            h: 2,
+                            rgba: vec![0x55; 2 * 2 * 4],
+                        },
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            decodes, 9,
+            "a 9-image working set must decode once per image, then run \
+             decode-free on every later present (count-only LRU re-decoded \
+             all 9 per present)"
+        );
+    }
+
+    /// The decoded-BYTE budget (ported from the CPU `ImageCache`): entries are
+    /// evicted LRU-first once the running `rgba` total would exceed
+    /// `MAX_BYTES`, and a single over-budget image still inserts ALONE (the
+    /// eviction loop stops on an empty list) so a huge image is decoded once,
+    /// not once per frame. Both sides are pinned: the budget actually evicts
+    /// (the count cap alone would admit everything here), and it never wedges
+    /// `put` into refusing an admission.
+    #[test]
+    fn image_cache_byte_budget_evicts_lru_and_admits_an_oversize_image_alone() {
+        let mut cache = GpuImageCache::default();
+        // Three entries of MAX_BYTES/4 each fit together...
+        let quarter = GpuImageCache::MAX_BYTES / 4;
+        let imgs: Vec<_> = (0..4).map(|_| test_image_data()).collect();
+        let big = |len: usize| GpuDecodedImage {
+            w: 1,
+            h: 1,
+            rgba: vec![0; len],
+        };
+        for img in imgs.iter().take(3) {
+            cache.put(img.clone(), 1, 1, big(quarter));
+        }
+        assert!(cache.peek(&imgs[0], 1, 1).is_some());
+        // ...and a fourth of MAX_BYTES/2 forces the OLDEST out (bytes bound,
+        // not the 64-entry count bound — only 4 entries are present).
+        cache.put(imgs[3].clone(), 1, 1, big(GpuImageCache::MAX_BYTES / 2));
+        assert!(
+            cache.peek(&imgs[0], 1, 1).is_none(),
+            "the LRU entry must be evicted to fit the byte budget"
+        );
+        assert!(cache.peek(&imgs[1], 1, 1).is_some());
+        assert!(cache.peek(&imgs[2], 1, 1).is_some());
+        assert!(cache.peek(&imgs[3], 1, 1).is_some());
+        // A single image LARGER than the whole budget evicts everything else
+        // yet still inserts (decoded once, reused across presents).
+        let huge = test_image_data();
+        cache.put(huge.clone(), 1, 1, big(GpuImageCache::MAX_BYTES + 1));
+        assert!(
+            cache.peek(&huge, 1, 1).is_some(),
+            "a single over-budget image must still insert alone"
+        );
+        assert!(cache.peek(&imgs[3], 1, 1).is_none());
+        assert_eq!(cache.entries.len(), 1);
     }
 
     /// REGRESSION (inline-image ABA, idx5): two DISTINCT images with the IDENTICAL

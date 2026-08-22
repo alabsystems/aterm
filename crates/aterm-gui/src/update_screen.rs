@@ -51,6 +51,12 @@ pub(crate) struct UpdateState {
     failing_applies: u32,
     /// This launch has a bundle the updater could replace at all.
     installable: bool,
+    /// The STRANDED verdict: checks complete but the release channel cannot be
+    /// read (401/403/404 with nothing to try, or a renamed repo). Deliberately
+    /// records ZERO ledger failures, so `failing_persistent` can never carry it —
+    /// without this field the headline said "You're up to date." at a machine
+    /// that will never update (round-11 audit). The explanation rides `outcome`.
+    channel_unreadable: bool,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
 }
@@ -82,6 +88,9 @@ pub(crate) struct UpdateProjection {
     /// under "This copy of aterm can't update itself" — a claim about a release
     /// list this process never fetched (2026-08-19 round-6 audit).
     pub(crate) installable: bool,
+    /// The stranded verdict (see [`UpdateState`]): the compact card must say
+    /// "Can't check", never "Current", while the channel is unreadable.
+    pub(crate) channel_unreadable: bool,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
 }
@@ -128,6 +137,7 @@ impl UpdateState {
             failing_kind: snapshot.failing_kind.clone(),
             failing_applies: snapshot.failing_applies,
             installable: snapshot.installable,
+            channel_unreadable: snapshot.channel_unreadable,
             checking,
         }
         .without_inapplicable_stage()
@@ -177,6 +187,7 @@ impl UpdateState {
             failing_kind: status.map(|s| s.failing_kind.clone()).unwrap_or_default(),
             failing_applies: status.map_or(0, |s| s.failing_applies),
             installable: status.is_none_or(|s| s.installable),
+            channel_unreadable: status.is_some_and(|s| s.enabled && s.channel_unreadable),
             checking,
         }
         .without_inapplicable_stage()
@@ -224,6 +235,7 @@ impl UpdateState {
             failing_persistent: self.failing_persistent && self.enabled && !self.checking,
             apply_is_failing: self.apply_is_failing() && self.enabled && !self.checking,
             installable: self.installable,
+            channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
             headline: self.headline(),
             detail: self.detail(),
         }
@@ -261,6 +273,7 @@ impl UpdateState {
         self.changelog.hash(&mut h);
         self.enabled.hash(&mut h);
         self.outcome.hash(&mut h);
+        self.channel_unreadable.hash(&mut h);
         self.checking.hash(&mut h);
         h.finish() | 1
     }
@@ -301,6 +314,13 @@ impl UpdateState {
             "This copy of aterm can\u{2019}t update itself.".to_string()
         } else if !self.enabled {
             "Automatic updates are off.".to_string()
+        } else if self.channel_unreadable {
+            // A permanently stranded machine — the channel cannot be read, and the
+            // state deliberately records ZERO ledger failures, so the
+            // failing_persistent arm below can never catch it. Before this arm the
+            // headline was "You're up to date." over an outcome that says "will
+            // NEVER receive an update until it is fixed" (round-11 audit).
+            "aterm can\u{2019}t check for updates on this Mac.".to_string()
         } else if self.failing_persistent {
             // NEVER "up to date" while the ledger says otherwise: for eight hours on
             // 2026-08-18 every check was rejected publisher-side and this line said
@@ -350,7 +370,10 @@ impl UpdateState {
             }
             return Some(format!("Version {v} \u{00b7} build {b}"));
         }
-        if self.failing_persistent && !self.checking && self.enabled {
+        if (self.failing_persistent || self.channel_unreadable) && !self.checking && self.enabled {
+            // For the stranded state the outcome IS the full explanation — cause,
+            // every indistinguishable alternative, and the copy-pasteable remedy —
+            // rewritten on every check so it cannot go stale.
             let cause = self.outcome.trim();
             return Some(if cause.is_empty() {
                 "Every recent check failed the same way; run `aterm ctl update status` for the ledger.".to_string()
@@ -978,6 +1001,8 @@ mod tests {
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,
+            failing_checks_kind: String::new(),
+            channel_unreadable: false,
         }
     }
 

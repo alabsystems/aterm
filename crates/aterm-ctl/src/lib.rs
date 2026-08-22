@@ -397,19 +397,38 @@ fn zsh_completion(verbs: &str) -> String {
     s.push_str("verbs=(");
     s.push_str(verbs);
     s.push_str(")\n");
-    s.push_str("local state\n");
-    s.push_str("_arguments -C \\\n");
-    s.push_str("    '--sock[control socket path]:path:_files' \\\n");
-    s.push_str("    '--pid[instance pid]:pid' \\\n");
-    s.push_str("    '--timeout[per-op deadline in seconds]:seconds' \\\n");
-    s.push_str("    '(- *)--help[print help and exit]' \\\n");
-    s.push_str("    '(- *)--version[print version and exit]' \\\n");
-    s.push_str("    '1: :->verb' \\\n");
-    s.push_str("    '*:: :->args'\n");
-    s.push_str("case $state in\n");
-    s.push_str("    verb) compadd -a verbs ;;\n");
-    s.push_str("esac\n");
+    push_zsh_ctl_arguments(&mut s, "", "verbs");
     s
+}
+
+/// The zsh `_arguments` + verb-`compadd` body for the CTL surface — rendered by
+/// BOTH the `aterm-ctl` compdef ([`zsh_completion`]) and the `aterm ctl`
+/// delegation arm of the front-door compdef ([`front_door_completion_script`]),
+/// so the two scripts describe the same ctl flags and can never drift. `indent`
+/// prefixes every line (the delegation arm nests inside an `if`); `array` names
+/// the zsh array holding the ctl verb set.
+fn push_zsh_ctl_arguments(s: &mut String, indent: &str, array: &str) {
+    for line in [
+        "local state\n",
+        "_arguments -C \\\n",
+        "    '--sock[control socket path]:path:_files' \\\n",
+        "    '--pid[instance pid]:pid' \\\n",
+        "    '--timeout[per-op deadline in seconds]:seconds' \\\n",
+        "    '(- *)--help[print help and exit]' \\\n",
+        "    '(- *)--version[print version and exit]' \\\n",
+        "    '1: :->verb' \\\n",
+        "    '*:: :->args'\n",
+        "case $state in\n",
+    ] {
+        s.push_str(indent);
+        s.push_str(line);
+    }
+    s.push_str(indent);
+    s.push_str("    verb) compadd -a ");
+    s.push_str(array);
+    s.push_str(" ;;\n");
+    s.push_str(indent);
+    s.push_str("esac\n");
 }
 
 /// A fish completion: the verb set gated to the first token
@@ -421,12 +440,230 @@ fn fish_completion(verbs: &str) -> String {
     s.push_str("complete -c aterm-ctl -n __fish_use_subcommand -a '");
     s.push_str(verbs);
     s.push_str("'\n");
-    s.push_str("complete -c aterm-ctl -l sock -r -d 'control socket path'\n");
-    s.push_str("complete -c aterm-ctl -l pid -r -d 'instance pid'\n");
-    s.push_str("complete -c aterm-ctl -l timeout -r -d 'per-op deadline in seconds'\n");
-    s.push_str("complete -c aterm-ctl -l help -d 'print help and exit'\n");
-    s.push_str("complete -c aterm-ctl -l version -d 'print version and exit'\n");
+    push_fish_ctl_flags(&mut s, "complete -c aterm-ctl ");
     s
+}
+
+/// The ctl flag lines for fish — ONE renderer for the `aterm-ctl` script and
+/// the front door's `aterm ctl` arm ([`front_door_completion_script`]), so the
+/// flag/description text cannot drift between the two. `preamble` carries the
+/// per-surface `complete -c <cmd> [-n <gate>] ` prefix.
+fn push_fish_ctl_flags(s: &mut String, preamble: &str) {
+    for line in [
+        "-l sock -r -d 'control socket path'\n",
+        "-l pid -r -d 'instance pid'\n",
+        "-l timeout -r -d 'per-op deadline in seconds'\n",
+        "-l help -d 'print help and exit'\n",
+        "-l version -d 'print version and exit'\n",
+    ] {
+        s.push_str(preamble);
+        s.push_str(line);
+    }
+}
+
+/// The FRONT DOOR's completion script for `shell` (`bash`/`zsh`/`fish`), or
+/// `None` for an unknown shell name. The installed command is `aterm` — the
+/// installer strips the `aterm-ctl` sibling off `PATH`, so a completion that
+/// only knows the sibling completes a command nobody has. `verbs`/`flags` are
+/// `aterm`'s OWN first-position surface, supplied by the `aterm` crate (whose
+/// routing tables they must mirror — pinned by that crate's tests). The
+/// `aterm ctl <TAB>` delegation arm renders from THIS crate's
+/// [`completion_verb_list`] / [`COMPLETION_FLAGS`] — the same source the
+/// `aterm-ctl` scripts render — so the ctl verb set cannot drift between the
+/// sibling script and the front door's.
+///
+/// CONTRACT (install.sh): the zsh script's FIRST line is `#compdef aterm`;
+/// bash and fish follow the same conventions as the `aterm-ctl` scripts.
+#[must_use]
+pub fn front_door_completion_script(
+    shell: &str,
+    verbs: &[&str],
+    flags: &[(&str, &str)],
+) -> Option<String> {
+    let front_verbs = join_words(verbs);
+    let ctl_verbs = completion_verb_list();
+    match shell {
+        "bash" => Some(front_door_bash(&front_verbs, flags, &ctl_verbs)),
+        "zsh" => Some(front_door_zsh(&front_verbs, flags, &ctl_verbs)),
+        "fish" => Some(front_door_fish(&front_verbs, flags, &ctl_verbs)),
+        _ => None,
+    }
+}
+
+/// Space-join `words` — the shape every shell's word-list slot takes.
+fn join_words(words: &[&str]) -> String {
+    let mut s = String::new();
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(word);
+    }
+    s
+}
+
+/// The front-door bash completion: `_aterm` offers the front-door verb set at
+/// the first position, the front-door flags for a `-`-prefixed word, and — past
+/// a first-position `ctl` — the CTL verb/flag sets, exactly the pair the
+/// `aterm-ctl` script offers.
+fn front_door_bash(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# aterm bash completion (generated by `aterm --completions bash`).\n");
+    s.push_str("_aterm() {\n");
+    s.push_str("    local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n");
+    s.push_str("    local verbs=\"");
+    s.push_str(verbs);
+    s.push_str("\"\n");
+    s.push_str("    local flags=\"");
+    s.push_str(&join_flag_names(flags));
+    s.push_str("\"\n");
+    s.push_str("    local ctl_verbs=\"");
+    s.push_str(ctl_verbs);
+    s.push_str("\"\n");
+    s.push_str("    local ctl_flags=\"");
+    s.push_str(COMPLETION_FLAGS);
+    s.push_str("\"\n");
+    s.push_str("    if [[ $COMP_CWORD -ge 2 && \"${COMP_WORDS[1]}\" == \"ctl\" ]]; then\n");
+    s.push_str("        if [[ \"$cur\" == -* ]]; then\n");
+    s.push_str("            COMPREPLY=( $(compgen -W \"$ctl_flags\" -- \"$cur\") )\n");
+    s.push_str("        else\n");
+    s.push_str("            COMPREPLY=( $(compgen -W \"$ctl_verbs\" -- \"$cur\") )\n");
+    s.push_str("        fi\n");
+    s.push_str("        return\n");
+    s.push_str("    fi\n");
+    s.push_str("    if [[ \"$cur\" == -* ]]; then\n");
+    s.push_str("        COMPREPLY=( $(compgen -W \"$flags\" -- \"$cur\") )\n");
+    s.push_str("    elif [[ $COMP_CWORD -eq 1 ]]; then\n");
+    s.push_str("        COMPREPLY=( $(compgen -W \"$verbs\" -- \"$cur\") )\n");
+    s.push_str("    fi\n");
+    s.push_str("}\n");
+    s.push_str("complete -F _aterm aterm\n");
+    s
+}
+
+/// Space-join the flag NAMES out of `(flag, description)` pairs (bash offers
+/// bare words; the descriptions are zsh/fish material).
+fn join_flag_names(flags: &[(&str, &str)]) -> String {
+    let mut s = String::new();
+    for (i, (flag, _)) in flags.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(flag);
+    }
+    s
+}
+
+/// The front-door zsh completion: `#compdef aterm` (the first line is the
+/// install.sh contract), the front-door verb/flag sets via `_arguments`, and a
+/// first-word `ctl` dispatch that shifts onto the CTL surface — the SAME
+/// `_arguments` body [`zsh_completion`] renders, via [`push_zsh_ctl_arguments`].
+fn front_door_zsh(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
+    let mut s = String::new();
+    s.push_str("#compdef aterm\n");
+    s.push_str("# aterm zsh completion (generated by `aterm --completions zsh`).\n");
+    s.push_str("local -a verbs ctl_verbs\n");
+    s.push_str("verbs=(");
+    s.push_str(verbs);
+    s.push_str(")\n");
+    s.push_str("ctl_verbs=(");
+    s.push_str(ctl_verbs);
+    s.push_str(")\n");
+    s.push_str("if (( CURRENT > 2 )) && [[ ${words[2]} == ctl ]]; then\n");
+    s.push_str("    # `aterm ctl …` IS the ctl client: shift the verb off and complete\n");
+    s.push_str("    # with the ctl surface's own flag/verb set.\n");
+    s.push_str("    shift words\n");
+    s.push_str("    (( CURRENT-- ))\n");
+    push_zsh_ctl_arguments(&mut s, "    ", "ctl_verbs");
+    s.push_str("    return\n");
+    s.push_str("fi\n");
+    s.push_str("local state\n");
+    s.push_str("_arguments -C \\\n");
+    for (flag, desc) in flags {
+        s.push_str("    '");
+        s.push_str(flag);
+        s.push('[');
+        s.push_str(desc);
+        s.push_str("]' \\\n");
+    }
+    s.push_str("    '1: :->verb' \\\n");
+    s.push_str("    '*:: :->args'\n");
+    s.push_str("case $state in\n");
+    s.push_str("    verb) compadd -a verbs ;;\n");
+    s.push_str("esac\n");
+    s
+}
+
+/// The front-door fish completion: front-door verbs/flags gated to the first
+/// token (`__fish_use_subcommand`), plus the CTL verb/flag sets gated behind a
+/// seen `ctl` — the flag lines through [`push_fish_ctl_flags`], the same
+/// renderer the `aterm-ctl` script uses.
+fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> String {
+    let mut s = String::new();
+    s.push_str("# aterm fish completion (generated by `aterm --completions fish`).\n");
+    s.push_str("complete -c aterm -f\n");
+    s.push_str("complete -c aterm -n __fish_use_subcommand -a '");
+    s.push_str(verbs);
+    s.push_str("'\n");
+    s.push_str("complete -c aterm -n '__fish_seen_subcommand_from ctl' -a '");
+    s.push_str(ctl_verbs);
+    s.push_str("'\n");
+    push_fish_ctl_flags(&mut s, "complete -c aterm -n '__fish_seen_subcommand_from ctl' ");
+    for (flag, desc) in flags {
+        s.push_str("complete -c aterm -n __fish_use_subcommand -l ");
+        s.push_str(flag.trim_start_matches('-'));
+        s.push_str(" -d '");
+        s.push_str(desc);
+        s.push_str("'\n");
+    }
+    s
+}
+
+/// The front door's `--completions <shell>` as a callable: print the `aterm`
+/// completion script to stdout, or a clear error to stderr (FAILURE) for a
+/// missing or unknown shell name — the same errors the sibling `aterm-ctl`
+/// flag reports. `verbs`/`flags` as in [`front_door_completion_script`]; the
+/// ONE `aterm` binary supplies them from its own routing tables.
+pub fn front_door_completions_entry(
+    shell: Option<&str>,
+    verbs: &[&str],
+    flags: &[(&str, &str)],
+) -> ExitCode {
+    match front_door_completions_result(shell, verbs, flags) {
+        Ok(code) => code,
+        Err(e) => {
+            // Manual form of `eprintln!("aterm: {e}")` (the strict Trust gate
+            // cannot lower inline `format_args!`); a failed diagnostic write is
+            // ignored — the process is already exiting FAILURE.
+            let stderr = io::stderr();
+            let mut err = stderr.lock();
+            let _ = err.write_all(b"aterm: ");
+            let _ = err.write_all(e.to_string().as_bytes());
+            let _ = err.write_all(b"\n");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// [`front_door_completions_entry`]'s fallible core, mirroring
+/// [`emit_completions`]: a missing shell name and an unknown one are the same
+/// two clear errors the `aterm-ctl --completions` path raises.
+fn front_door_completions_result(
+    shell: Option<&str>,
+    verbs: &[&str],
+    flags: &[(&str, &str)],
+) -> io::Result<ExitCode> {
+    let Some(shell) = shell else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--completions requires a shell name (bash, zsh, or fish)",
+        ));
+    };
+    let script = front_door_completion_script(shell, verbs, flags).ok_or_else(unknown_shell_error)?;
+    let stdout = stdout_handle();
+    let mut out = stdout.lock();
+    out.write_all(script.as_bytes())?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Environment variable consulted for the socket path when `--sock`/`--pid`
@@ -1451,15 +1688,31 @@ const EXCHANGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(90
 // output; `Display` rendering happens behind opaque `to_string` calls).
 
 /// The "connect <path>: <cause>" connection error, preserving the original
-/// [`io::ErrorKind`]. Message bytes are identical to the previous
-/// `format!("connect {path}: {e}")`.
+/// [`io::ErrorKind`]. `NotFound` and `ConnectionRefused` on a control socket
+/// both mean ONE operator-visible thing — no aterm engine is serving that
+/// socket — so those two carry [`NOT_RUNNING_HINT`] on the line the user
+/// actually reads, instead of a bare `No such file or directory (os error 2)`.
+/// Every other kind keeps the raw cause alone: a permission error is NOT "not
+/// running", and claiming so would send the operator to the wrong fix.
 fn connect_error(path: &str, e: &io::Error) -> io::Error {
     let mut msg = String::from("connect ");
     msg.push_str(path);
     msg.push_str(": ");
     msg.push_str(&e.to_string());
+    if matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    ) {
+        msg.push_str(NOT_RUNNING_HINT);
+    }
     io::Error::new(e.kind(), msg)
 }
+
+/// The remedy [`connect_error`] appends when nothing serves the socket. A
+/// SESSION serves no control socket (`aterm --help`): the introspectable
+/// engine is the window/headless mode, so the fix is launching the app.
+const NOT_RUNNING_HINT: &str = " — aterm isn't running (nothing is serving this \
+control socket); launch aterm.app (`open -a aterm`) and retry";
 
 /// The "malformed response header" error for a status line that lacks a
 /// parseable count. Renders `status_line` exactly like `{status_line:?}`:
@@ -2337,15 +2590,45 @@ mod tests {
     }
 
     /// `connect_error` composes its message by hand for the same reason; pin
-    /// it to the `format!("connect {path}: {e}")` it replaced, and check the
-    /// original error kind is preserved.
+    /// the `connect {path}: {cause}` frame and check the original error kind
+    /// is preserved. The two "no engine serves this socket" kinds additionally
+    /// carry the not-running remedy — a raw `No such file or directory (os
+    /// error 2)` told the one user the installer leaves with only `aterm` on
+    /// PATH nothing about what to DO.
     #[test]
     fn connect_error_matches_format_and_keeps_kind() {
-        let cause = io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused");
         let path = "/tmp/aterm-test/aterm.sock";
+        // A kind that does NOT mean "not running" keeps the bare cause: a
+        // permission error must never claim aterm is down.
+        let cause = io::Error::new(io::ErrorKind::PermissionDenied, "Permission denied");
         let e = connect_error(path, &cause);
         assert_eq!(e.to_string(), format!("connect {path}: {cause}"));
-        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+
+        // NotFound / ConnectionRefused say what the failure MEANS and what to
+        // do, still framed on the path tried, still kind-preserving (the exit
+        // mapping and callers key on the kind).
+        for (kind, oserr) in [
+            (
+                io::ErrorKind::NotFound,
+                "No such file or directory (os error 2)",
+            ),
+            (
+                io::ErrorKind::ConnectionRefused,
+                "Connection refused (os error 61)",
+            ),
+        ] {
+            let cause = io::Error::new(kind, oserr);
+            let e = connect_error(path, &cause);
+            let msg = e.to_string();
+            assert!(
+                msg.starts_with(&format!("connect {path}: {oserr}")),
+                "the raw cause stays first: {msg}"
+            );
+            assert!(msg.contains("aterm isn't running"), "{msg}");
+            assert!(msg.contains("open -a aterm"), "the remedy is named: {msg}");
+            assert_eq!(e.kind(), kind);
+        }
     }
 
     /// The streaming-verb set and the selector-aware `image read` detection
@@ -2893,6 +3176,56 @@ mod tests {
         let e = unknown_shell_error();
         assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
         assert!(e.to_string().contains("unknown shell"), "got {e}");
+    }
+
+    /// The FRONT-DOOR generator: the completions the installer actually wires
+    /// complete `aterm` (the sibling is stripped off PATH), and the `aterm ctl`
+    /// delegation arm renders the SAME ctl verb set as the sibling script —
+    /// both come out of `completion_verb_list`, so they cannot drift. The
+    /// front-door verb/flag tables themselves are supplied (and pinned against
+    /// the routing tables) by the `aterm` crate's tests.
+    #[test]
+    fn front_door_completions_complete_aterm_and_carry_the_ctl_surface() {
+        let verbs = ["help", "ctl", "pkg", "fleet", "drive"];
+        let flags = [("--window", "open the GPU window"), ("--version", "print the version")];
+        for (shell, wiring) in [
+            ("bash", "complete -F _aterm aterm\n"),
+            ("zsh", "#compdef aterm\n"),
+            ("fish", "complete -c aterm -f\n"),
+        ] {
+            let script = front_door_completion_script(shell, &verbs, &flags)
+                .expect("known shell yields a script");
+            assert!(script.contains(wiring), "{shell} wires `aterm`: {script}");
+            for verb in verbs {
+                assert!(script.contains(verb), "{shell} completes `{verb}`");
+            }
+            for (flag, _) in flags {
+                // fish names long flags dash-less (`-l window`).
+                let probe = if shell == "fish" {
+                    flag.trim_start_matches('-')
+                } else {
+                    flag
+                };
+                assert!(script.contains(probe), "{shell} completes `{flag}`");
+            }
+            // The `aterm ctl` arm renders the ctl surface: every protocol verb,
+            // the client-only discovery verbs, and the ctl flags.
+            for spec in aterm_types::control_verbs::VERBS {
+                assert!(
+                    script.contains(spec.name),
+                    "{shell} must complete `aterm ctl {}`",
+                    spec.name
+                );
+            }
+            assert!(script.contains("ls instances"), "{shell} has the client verbs");
+            let sock = if shell == "fish" { "-l sock" } else { "--sock" };
+            assert!(script.contains(sock), "{shell} has the ctl flags");
+        }
+        // CONTRACT (install.sh): the zsh script's FIRST line is `#compdef aterm`.
+        let zsh = front_door_completion_script("zsh", &verbs, &flags).expect("zsh");
+        assert_eq!(zsh.lines().next(), Some("#compdef aterm"));
+        // An unknown shell has no script, exactly like the sibling generator.
+        assert!(front_door_completion_script("powershell", &verbs, &flags).is_none());
     }
 
     /// `aterm-uds` keeps a std-only MIRROR of the token-filename rule so it can

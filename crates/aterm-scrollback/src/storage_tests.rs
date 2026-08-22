@@ -652,3 +652,104 @@ fn get_line_returns_borrowed_for_hot_tier() {
     );
     assert_eq!(newest.to_string(), "line-5");
 }
+
+// =========================================================================
+// Streaming-iterator parity oracles (ST-6)
+// =========================================================================
+
+/// Differential oracle: the block-streaming forward iterator must yield
+/// EXACTLY what a per-line `get_line` walk yields, over a store populated in
+/// all three tiers and additionally front-truncated (non-zero front offsets
+/// are the trickiest segment-slicing case).
+#[test]
+fn streaming_iter_matches_get_line_walk_memory() {
+    // Small limits force all three tiers + multiple blocks/pages.
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..60 {
+        sb.push_str(&format!("line-{i:03}"));
+    }
+    // Front-truncate to a non-block-aligned boundary: cold front_offset > 0.
+    sb.truncate(53).unwrap();
+    assert!(sb.cold_line_count() > 0, "oracle needs a populated cold tier");
+    assert!(sb.warm_line_count() > 0, "oracle needs a populated warm tier");
+    assert!(sb.hot_line_count() > 0, "oracle needs a populated hot tier");
+
+    let via_get: Vec<String> = (0..sb.line_count())
+        .map(|i| {
+            sb.get_line(i)
+                .expect("no error")
+                .expect("line present")
+                .to_string()
+        })
+        .collect();
+    let iter = sb.iter();
+    let via_iter: Vec<String> = iter.map(|l| l.to_string()).collect();
+    assert_eq!(via_iter, via_get, "streaming iter must match get_line walk");
+
+    // And through the storage facade (its own streaming iterator).
+    let storage: ScrollbackStorage = sb.into();
+    let via_storage: Vec<String> = storage.iter().map(|l| l.to_string()).collect();
+    assert_eq!(via_storage, via_get);
+}
+
+/// Corrupt-segment parity: a corrupt warm block is skipped WHOLE, and
+/// `skipped_lines()` reports exactly the block's line count — the same total
+/// the old per-line walk accumulated one error at a time (#5947).
+#[test]
+fn streaming_iter_skips_corrupt_block_with_same_totals() {
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..24 {
+        sb.push_str(&format!("line-{i:02}"));
+    }
+    let corrupt_lines = 5;
+    sb.inject_corrupted_warm_block(corrupt_lines);
+    let total = sb.line_count();
+
+    let mut iter = sb.iter();
+    let yielded = iter.by_ref().count();
+    assert_eq!(
+        yielded,
+        total - corrupt_lines,
+        "all healthy lines must still be yielded"
+    );
+    assert_eq!(
+        iter.skipped_lines(),
+        corrupt_lines,
+        "skip total must equal the corrupt block's line count"
+    );
+}
+
+/// Disk-backed twin of the parity oracle: cold pages live in the `.dtrm`
+/// file, and the streaming walk must match the per-line walk across the
+/// disk/warm/hot boundaries, including after front truncation.
+#[cfg(feature = "disk-tier")]
+#[test]
+fn streaming_iter_matches_get_line_walk_disk() {
+    let temp_dir = aterm_tempfile::tempdir().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("stream-parity.dtrm");
+    let config = DiskBackedScrollbackConfig::new(&path)
+        .with_hot_limit(4)
+        .with_warm_limit(12)
+        .with_block_size(4);
+    let mut storage: ScrollbackStorage =
+        DiskBackedScrollback::with_config(config).expect("store").into();
+    for i in 0..60 {
+        storage.push_line(Line::from(&*format!("dline-{i:03}"))).unwrap();
+    }
+    // ScrollbackStorage exposes truncation through the line limit.
+    storage.set_line_limit(Some(53));
+    assert_eq!(storage.line_count(), 53);
+
+    let via_get: Vec<String> = (0..storage.line_count())
+        .map(|i| {
+            storage
+                .get_line(i)
+                .expect("no error")
+                .expect("line present")
+                .to_string()
+        })
+        .collect();
+    let via_iter: Vec<String> = storage.iter().map(|l| l.to_string()).collect();
+    assert_eq!(via_iter, via_get, "disk streaming iter must match get_line");
+    assert!(!via_get.is_empty());
+}

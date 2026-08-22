@@ -18,8 +18,14 @@
 //! gate): a release that silently fell back to upstream must be impossible.
 //!
 //! The ONE exception: the x86_64-apple-darwin compat slice of the universal
-//! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable` (Trust has no
-//! x86_64 std yet). That pin lives HERE and nowhere else, and the lane scrubs
+//! binary rides upstream stable via `RUSTUP_TOOLCHAIN=stable`. The reason is
+//! NOT that Trust lacks an x86_64 std — it has one, and six ALab programs ship
+//! x86_64 artifacts built with it. What a CROSS-HOST Trust sysroot lacks is
+//! rustc_private, so an out-of-tree rustc-driver tool cannot link against it;
+//! that is a narrower gap than "no std", and it is why the rustc coherence
+//! group is still aarch64-only while the plain programs are not. The compat
+//! slice rides stable because this lane wants no Trust-specific state on it at
+//! all. That pin lives HERE and nowhere else, and the lane scrubs
 //! inherited RUSTC/RUSTFLAGS state so stale shell exports cannot steer it.
 //!
 //! Preserved semantics:
@@ -135,9 +141,9 @@ pub fn run(plan: &BuildPlan) -> Result<BuildOutput, String> {
     println!("    arm64 done in {}", fmt_elapsed(t));
 
     if !plan.arm64_only {
-        // x86_64 compat slice: upstream stable via rustup's target std (Trust
-        // has no x86_64-apple-darwin std yet — THE one exception to the
-        // single Trust lane; see the module docs). NOT auto-added here: spec
+        // x86_64 compat slice: upstream stable via rustup's target std — THE
+        // one exception to the single Trust lane; see the module docs for why
+        // (it is NOT that Trust lacks an x86_64 std; it has one). NOT auto-added here: spec
         // decision 18 — print the remediation and require an explicit
         // --arm64-only to ship single-arch.
         let t = Instant::now();
@@ -300,7 +306,8 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     // tool dir — never a PATH `cargo`, which since the stock-name purge is a
     // rustup shim the repo's toolchain pin can no longer satisfy. Compat
     // slice: upstream stable's `cargo` via the rustup shim — the ONE
-    // deliberately stock lane (Trust has no x86_64-apple-darwin std).
+    // deliberately stock lane (see the module docs; Trust DOES have an
+    // x86_64-apple-darwin std, so that is not the reason).
     let driver: (PathBuf, &'static str) = if target.is_some() {
         (PathBuf::from("cargo"), "cargo")
     } else {
@@ -368,7 +375,8 @@ fn build_one(plan: &BuildPlan, pkg: &str, target: Option<&str>) -> Result<(), St
     // targo supplies trustc and .cargo/config.toml (which targo reads, same
     // discovery as cargo) the verification opt-out; adding env here would
     // create a second, undocumented lane. Compat slice: RUSTUP_TOOLCHAIN=stable
-    // overrides the toolchain file (Trust has no x86_64 std), and inherited
+    // overrides the toolchain file (a deliberate stock lane, not a Trust
+    // limitation — see the module docs), and inherited
     // RUSTC/RUSTC_BOOTSTRAP/RUSTFLAGS are scrubbed on BOTH lanes — a release
     // cutter must not be steerable by stale shell state (same rule as the
     // CARGO_PROFILE pins above).

@@ -3467,6 +3467,21 @@ pub const XHEIGHT_SCALE_MIN: f32 = 0.75;
 /// See [`XHEIGHT_SCALE_MIN`].
 pub const XHEIGHT_SCALE_MAX: f32 = 1.25;
 
+/// W8 (g): the hardest horizontal CONDENSE a fallback glyph may take — its
+/// coverage is never squeezed below `1/4` of its rasterized width, so a face
+/// with an absurd ink box is left partly spilling (the (h) column-band
+/// backstop trims the residue) rather than smeared into a vertical bar.
+///
+/// The number that forced this: STIX Two Math's long arrows (U+27F5..U+27FC)
+/// are ONE design — advance 1.612 em, ink 1.499 em — and neither SF Mono nor
+/// Arial Unicode carries them, so they land on the symbol tier and rasterize
+/// ~2.9 cells wide inside a ONE-cell grid box, burying the two columns to
+/// their right and shearing any box-drawing table they appear in. 2.9:1 sits
+/// comfortably inside 4:1; past 4:1 the condense stops buying legibility (a
+/// 0.05-em stem lands under a quarter device pixel and the glyph dissolves),
+/// so the policy prefers a bounded, clamped overhang to a vertical smear.
+pub const CONDENSE_MAX_RATIO: usize = 4;
+
 /// W8 (a/c): the per-face rasterization SCALE for a CJK fallback face —
 /// chosen so a full-width ideograph's advance (`ideo_adv_px`, the face's
 /// U+4E00 `hmtx` advance at the primary's px) fills the 2-cell box
@@ -3541,6 +3556,62 @@ pub fn wide_center_offset(box_w: i32, adv_px: i32) -> i32 {
     (box_w - adv_px).div_euclid(2)
 }
 
+/// W8 (g): the CONDENSED width, in device px, of a fallback glyph whose
+/// RASTERIZED coverage (`ink_w`) is wider than the cell box the grid gave it
+/// (`box_w`) — the target the x-only area filter resamples to.
+///
+/// ## What forced this
+///
+/// `char_width` is not the problem and must not be touched: the shell, the
+/// pager and whatever drew the table all agree with it (U+27F5..U+27FC are
+/// East_Asian_Width Neutral, so system `wcwidth` says 1 and aterm says 1, and
+/// the grid is provably right — widening them would consume a column nobody
+/// budgeted). The PAINT is the problem: the symbol tier (STIX Two Math)
+/// designs those arrows 1.499 em wide, the x-height normalization scales that
+/// UP another ~11%, and nothing downstream ever narrowed it, so the raster
+/// covered ~2.9 cells inside a 1-cell box. Sibling (d) (`wide_center_offset`)
+/// only ever ran for `char_width == 2`; width-1 glyphs got no horizontal
+/// treatment at all. This is that missing treatment.
+///
+/// ## Why it keys off the RASTER, not the em box
+///
+/// All-integer, and the operand is the width the rasterizer ACTUALLY
+/// returned — not a prediction from `glyph_bounding_box` at the default
+/// instance. A face that misreports its bbox, a CFF outline that inks past
+/// its own box, and CoreText's hinting/smoothing pad all move the bitmap and
+/// not the prediction; keying off the bitmap is what makes the fit exact, and
+/// what makes the (h) backstop provably INERT in the fitted regime (see
+/// `condense_then_clamp_never_fight` in the Tier-1 file) rather than a second
+/// authority that can fight the first.
+///
+/// # Invariant (proven)
+///
+/// Total for every `usize` pair — all-integer, so unlike [`scale_clamped`]
+/// there is no NaN/∞ arm to write:
+///
+/// * NEVER WIDENS: `condense_ink_w(w, b) <= w`.
+/// * IDENTITY IFF ALREADY FITTING: the result is `w` exactly when `w <= b` or
+///   `b == 0` (a degenerate cell box yields the pre-fix raster — the same
+///   "junk metrics must never distort a face" rule [`scale_clamped`] states).
+/// * FITS WHEN ACHIEVABLE: `b > 0 && w <= CONDENSE_MAX_RATIO * b` ⇒ the
+///   result is `b` EXACTLY (zero fit error — the "exact when achievable" half
+///   of the [`fallback_cjk_scale`] law).
+/// * BOUNDED DISTORTION: the result is always `>= w.div_ceil(CONDENSE_MAX_RATIO)`,
+///   so no face is ever squeezed past 4:1 into a vertical smear.
+/// * NON-VANISHING: `w >= 1` ⇒ result `>= 1` (a condense never erases ink).
+///
+/// WAIVER (Tier-0): `div_ceil` is division, outside `ty`'s Expr language —
+/// the same documented waiver [`area_overlap`] carries for its products and
+/// the box-drawing rounding law carries for its rounding. The exhaustive
+/// Tier-1 lattice in `tests/fallback_harmony.rs` is the binding layer.
+#[must_use]
+pub fn condense_ink_w(ink_w: usize, box_w: usize) -> usize {
+    if box_w == 0 || ink_w <= box_w {
+        return ink_w;
+    }
+    box_w.max(ink_w.div_ceil(CONDENSE_MAX_RATIO))
+}
+
 /// W8 (f): clamp a fallback glyph's bitmap rows to its CELL ROW BAND. `top`
 /// is the ink's cell-relative top row (`baseline - height - ymin`), `height`
 /// the bitmap rows, `band_h` the cell height. Returns `(skip, new_height)`:
@@ -3557,17 +3628,60 @@ pub fn wide_center_offset(box_w: i32, adv_px: i32) -> i32 {
 /// lies inside the band). An in-band glyph is untouched:
 /// `top >= 0 && top + height <= band_h  ⇒  (0, height)`. Tier-0 twin:
 /// `fallback_band_clip_model`; Tier-1: `tests/fallback_harmony.rs`.
+///
+/// The arithmetic lives in [`clamp_to_band`], shared verbatim with the column
+/// twin [`clamp_to_col_band`] — the axis is the only thing that differs.
 #[must_use]
 pub fn clamp_to_row_band(top: i32, height: usize, band_h: usize) -> (usize, usize) {
-    // i64 so extreme i32 tops / huge heights cannot overflow (total function).
-    let (top, h, band) = (top as i64, height as i64, band_h as i64);
-    let skip = (-top).clamp(0, h);
-    let new_top = top + skip;
-    if new_top >= band {
+    clamp_to_band(top, height, band_h)
+}
+
+/// W8 (h): clamp a fallback glyph's bitmap COLUMNS to its CELL COLUMN BAND —
+/// the exact twin of [`clamp_to_row_band`], one axis over. `left` is the
+/// ink's band-relative left column (the glyph's `xmin` shifted into band
+/// coordinates by the bleed), `width` the bitmap columns, `band_w` the cell
+/// box widened by that bleed. Returns `(skip, new_width)`: drop `skip`
+/// leading columns and keep `new_width`.
+///
+/// This is the BACKSTOP under the (g) condense, not the fix: the condense
+/// keys off the rasterized width and therefore fits in integers, so this
+/// clamp is the exact identity on everything the condense already fitted
+/// (proven in the Tier-1 file). It exists for the three cases the condense
+/// cannot reach — the `CONDENSE_MAX_RATIO` floor binding on a pathological
+/// face, a face whose designed side bearing throws an already-fitting glyph
+/// out of its box, and any future code that widens coverage — so the crate
+/// can state an UNCONDITIONAL law instead of one that rests on trusting the
+/// rasterizer's reported width.
+///
+/// # Invariant (proven)
+///
+/// Inherited verbatim from [`clamp_to_band`], because the body is literally
+/// the same function: total for all inputs; `skip + new_width <= width` (only
+/// ever trims); either `new_width == 0` or
+/// `left + skip >= 0 && (left + skip) + new_width <= band_w`; and an in-band
+/// bitmap is untouched (`left >= 0 && left + width <= band_w ⇒ (0, width)`).
+/// Tier-0 twin: `fallback_band_clip_model` — the model's arithmetic is
+/// axis-free, so it twins BOTH wrappers; Tier-1: `tests/fallback_harmony.rs`
+/// (which additionally pins that the two wrappers agree pointwise).
+#[must_use]
+pub fn clamp_to_col_band(left: i32, width: usize, band_w: usize) -> (usize, usize) {
+    clamp_to_band(left, width, band_w)
+}
+
+/// Shared core of the two band clamps (W8 (f) rows, W8 (h) columns): given an
+/// ink run at band-relative position `pos` of length `len`, return
+/// `(skip, keep)` — the leading elements to drop and the count to keep so the
+/// run lies inside `[0, band)`. Total; only ever trims.
+fn clamp_to_band(pos: i32, len: usize, band: usize) -> (usize, usize) {
+    // i64 so extreme i32 positions / huge lengths cannot overflow (total function).
+    let (pos, len, band) = (pos as i64, len as i64, band as i64);
+    let skip = (-pos).clamp(0, len);
+    let new_pos = pos + skip;
+    if new_pos >= band {
         return (skip as usize, 0);
     }
-    let new_h = (h - skip).min(band - new_top).max(0);
-    (skip as usize, new_h as usize)
+    let new_len = (len - skip).min(band - new_pos).max(0);
+    (skip as usize, new_len as usize)
 }
 
 /// W8 (e): the runtime-fallback candidate RANK for a face of OS/2 weight
@@ -6674,7 +6788,16 @@ impl Renderer {
     ///   ([`wide_center_offset`], the colour-emoji recipe);
     /// * (f) coverage clamped to the cell row band ([`clamp_to_row_band`]), so
     ///   a fallback blit can never paint outside its row — on the CPU blit and
-    ///   the GPU atlas quad alike (they share these bytes + placement).
+    ///   the GPU atlas quad alike (they share these bytes + placement);
+    /// * (g) a glyph whose RASTER overruns its cell box is CONDENSED along x
+    ///   to fit ([`condense_ink_w`] + the [`area_overlap`] weights) and centred
+    ///   by [`wide_center_offset`] — the fix for symbol-tier glyphs like the
+    ///   1.499 em long arrows (U+27F5..U+27FC), which used to paint ~2.9 cells
+    ///   inside a 1-cell grid box and bury the two columns to their right;
+    /// * (h) coverage clamped to the cell COLUMN band ([`clamp_to_col_band`])
+    ///   as a hard backstop, the twin of the (f) row clamp — so a fallback
+    ///   blit can never paint far into its neighbours' columns even when the
+    ///   condense floor binds.
     ///
     /// Fail-safe on every missing part: the primary face's `.notdef` raster,
     /// exactly the pre-W8 behaviour.
@@ -6793,7 +6916,7 @@ impl Renderer {
             let (m, b) = self.font.rasterize(ch, self.px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
         };
-        self.harmonize_fallback_raster(ch, raw)
+        self.harmonize_fallback_raster(source, ch, raw)
     }
 
     /// Drop the chain entry backed by `bytes` because its DEFERRED fontdue parse
@@ -6859,22 +6982,89 @@ impl Renderer {
         x_height_em_of(&face, upem)
     }
 
-    /// W8 (d)+(f): post-process a fallback raster — centre a WIDE glyph's
-    /// advance box in the 2-cell box, then clamp the coverage rows to the cell
-    /// row band. Pure placement/trim edits of the tuple; the proven policies
-    /// are [`wide_center_offset`] and [`clamp_to_row_band`].
+    /// W8 (d)+(g)+(f)+(h): post-process a fallback raster, in that order —
+    /// centre a WIDE glyph's advance box in the 2-cell box, CONDENSE a glyph
+    /// whose coverage overruns its cell box until it fits and centre it, clamp
+    /// the coverage rows to the cell row band, then clamp the coverage columns
+    /// to the cell column band as a backstop. Pure placement/trim/resample
+    /// edits of the tuple; the proven policies are [`wide_center_offset`],
+    /// [`condense_ink_w`], [`clamp_to_row_band`] and [`clamp_to_col_band`].
+    ///
+    /// ANTI-FIGHT LAW: (g) and (h) are two mechanisms aimed at one axis, so
+    /// they must not be able to disagree. They cannot: (g) keys off the
+    /// rasterized width and fits in integers, and (h)'s band is the cell box
+    /// widened by half a cell per side, so on everything (g) fitted, (h)
+    /// returns the exact identity. The only regime where BOTH act is the
+    /// `CONDENSE_MAX_RATIO` floor — i.e. precisely "no legible fit exists".
+    /// Pinned by `condense_then_clamp_never_fight` in the Tier-1 file.
     fn harmonize_fallback_raster(
         &self,
+        source: FaceId,
         ch: char,
         raw: (usize, usize, i32, i32, f32, Vec<u8>),
     ) -> (usize, usize, i32, i32, f32, Vec<u8>) {
-        let (w, mut h, mut xmin, mut ymin, mut adv, mut bytes) = raw;
-        if aterm_grapheme::char_width(ch) == 2 {
-            let box_w = (2 * self.cell_w) as i32;
+        let (mut w, mut h, mut xmin, mut ymin, mut adv, mut bytes) = raw;
+        let cw = aterm_grapheme::char_width(ch);
+        // (g)/(h) apply to the THREE fallback TIERS only. `DisplayMix` also
+        // rasterizes through this function but is deliberately excluded twice
+        // over: `display_fit_place` recomputes its `xmin` downstream (so a
+        // condense-time centring would simply be overwritten), and
+        // `calibrate_fitted_cell` GROWS `cell_w` to the widest measured glyph
+        // — condensing against a `cell_w` that is itself derived from the
+        // condensed widths could ping-pong. Display faces already carry the
+        // "never past the cell" law by their own route (`tests/display_faces.rs`).
+        let harmonized = matches!(
+            source,
+            FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
+        );
+        // The grid's own box. `cw == 0` (combining marks) is EXCLUDED from
+        // both stages, not folded to one cell: a mark's overhang is the
+        // mechanism, not a defect — U+0361 is DESIGNED to span two base cells
+        // — and its on-screen left comes from `mark_cell_x_at`'s centring,
+        // which cancels `xmin` entirely, so band coordinates are not even
+        // knowable here.
+        let box_w = cw * self.cell_w;
+        if cw == 2 {
+            let box_w = box_w as i32;
             // `round` (not truncate) so a x.5 advance splits its gap evenly.
             xmin += wide_center_offset(box_w, adv.round() as i32);
             // The wide glyph OWNS its 2-cell box (the emoji recipe).
             adv = box_w as f32;
+        }
+        // (g) CONDENSE. A fallback glyph whose RASTER is wider than its cell
+        // box is area-resampled along x until it fits (at most
+        // `CONDENSE_MAX_RATIO`:1) and its ink centred in the box. This is the
+        // fix for the long-arrow overrun: U+27F5..U+27FC paint ~2.9 cells of
+        // STIX Two Math inside a 1-cell grid box and bury their neighbours.
+        // MUST run before the (f) row clamp, which slices `bytes` by the
+        // current `w` — so `w` has to be final by then.
+        // `cw == 1` ONLY. A 2-cell glyph is already fitted by the emoji recipe
+        // immediately above — it is centred in its box and OWNS its advance —
+        // and it must not then be condensed as well. The CoreText raster's
+        // width includes the antialiasing pad, so an ideograph whose ink fits
+        // its 2-cell box perfectly well can still report `w > 2 * cell_w` and
+        // be squashed by a stage that only ever meant to catch the 1-cell
+        // overrun. That is a regression of the CJK fitting this function was
+        // written for, and it is why the gate is an equality, not `>= 1`.
+        if harmonized && cw == 1 && w > 0 && h > 0 {
+            let new_w = condense_ink_w(w, box_w);
+            if new_w != w {
+                bytes = condense_coverage(&bytes, w, h, new_w);
+                // ASSIGN, not `+=`: a side bearing designed for a 1.61 em
+                // advance is meaningless once the ink lives in a 0.58 em cell,
+                // so it is folded away and the ink placed by the proven
+                // balance law instead.
+                xmin = wide_center_offset(box_w as i32, new_w as i32);
+                w = new_w;
+                // And the ADVANCE follows the ink. The face's advance described
+                // the glyph that no longer exists (the arrows report 1.61 em —
+                // 2.9 cells — after condensing to one); no live layout consults
+                // it for a mono fallback glyph today, but a metric that
+                // contradicts the raster beside it is a trap for the first
+                // consumer that does. Same rule as the `cw == 2` branch: the
+                // glyph OWNS its box.
+                adv = box_w as f32;
+            }
         }
         let top = self.baseline - h as i32 - ymin;
         let (skip, new_h) = clamp_to_row_band(top, h, self.cell_h);
@@ -6885,6 +7075,37 @@ impl Renderer {
             // dropping top rows only lowers the anchor (ymin untouched).
             ymin += bottom_trim as i32;
             h = new_h;
+        }
+        // (h) BACKSTOP. No fallback glyph may paint more than HALF A CELL
+        // outside its own cell box, whatever the face claims. Inert in the
+        // fitted regime (see the anti-fight law above); it exists for the
+        // `CONDENSE_MAX_RATIO` floor, a pathological side bearing, and future
+        // faces — so the law here is unconditional rather than resting on
+        // trusting the rasterizer's reported width. Marks (`cw == 0`) are
+        // excluded for the reason given at `box_w` above.
+        if harmonized && cw >= 1 && w > 0 && h > 0 {
+            let bleed = (self.cell_w / 2).max(1);
+            let band_w = box_w + 2 * bleed;
+            let (skip, new_w) = clamp_to_col_band(xmin + bleed as i32, w, band_w);
+            // NEVER ANNIHILATE. A trim that leaves no coverage renders the cell
+            // BLANK, and a blank cell is strictly worse than the overrun this
+            // stage exists to bound — the reader loses the character entirely
+            // rather than seeing it encroach. Measured: U+E000 and U+E001 were
+            // erased outright by an unguarded trim (their rasters already fitted
+            // the box; a far-off `xmin` put the whole band off their ink). The
+            // backstop is a bound on spill, never a licence to delete a glyph.
+            let trimmed = (new_w != w).then(|| trim_coverage_cols(&bytes, w, h, skip, new_w));
+            let survives = trimmed
+                .as_ref()
+                .is_some_and(|t| t.iter().any(|&px| px != 0));
+            if let Some(t) = trimmed.filter(|_| survives) {
+                bytes = t;
+                // Dropping LEADING columns moves the ink's origin right;
+                // dropping trailing ones does not (the mirror of the row
+                // clamp's `ymin` rule, which the bottom trim raises).
+                xmin += skip as i32;
+                w = new_w;
+            }
         }
         (w, h, xmin, ymin, adv, bytes)
     }
@@ -13907,6 +14128,89 @@ fn image_below_non_default_bg_covers(
         .is_ok_and(|i| kitty_image_is_below_non_default_bg(row_images[i].1.image.z_index))
 }
 
+/// Call-scoped memo for CROSS-`Arc` inline-image payload equality inside ONE
+/// diff pass (IMG-1).
+///
+/// WHY THIS EXISTS: `ImageRef`'s derived `Eq` deep-compares `ImageData` —
+/// `bytes: Vec<u8>` included — whenever the two `Arc`s are pointer-DISTINCT
+/// (std's `Arc` eq only short-circuits on pointer-EQUAL). Every client that
+/// re-transmits an image allocates a FRESH `Arc` (there is no payload
+/// interning at ingest), so the per-row diff of a re-transmitted frame used to
+/// restart that memcmp at EVERY covered cell: O(covered_cells × payload_bytes)
+/// per present — a 1500-cell × 800 KB preview redraw (yazi/ranger) is ~1.2 GB
+/// of memcmp, and kitty raw-RGBA video on a still scene (byte-identical
+/// ~8 MB payloads × ~10k covered cells) is a multi-second stall per tick.
+/// The verdict for a given (prev-Arc, cur-Arc) PAIR is a constant within one
+/// diff, so memoizing it prices the deep compare ONCE per DISTINCT image pair
+/// per frame: the diff cost scales with distinct images (realistically 1–8),
+/// not covered cells × payload bytes. The verdict itself is byte-exact — the
+/// same derived `ImageData` equality decides it (equal-bytes re-transmissions
+/// must keep SUPPRESSING the repaint, so the compare cannot be dropped for
+/// pointer identity) — it is just consulted once per pair instead of per cell.
+///
+/// SOUNDNESS of the raw-pointer key: a memo lives strictly INSIDE one
+/// [`compute_dirty_rows`] / [`scroll_blit_plan`] call, whose two
+/// `&RenderInput` borrows keep every referenced `Arc` alive for the whole
+/// call — an address can never be freed and reused by a DIFFERENT image while
+/// its verdict is cached. That is exactly the ABA hazard that FORBIDS
+/// persisting this map across frames (the decode caches hold `Arc` clones for
+/// the same reason), which is why every top-level diff constructs its own.
+/// `FxHashMap` does not allocate until the first insert, so image-free and
+/// same-`Arc` (steady, no re-transmit) frames pay nothing for it.
+#[derive(Default)]
+struct ImageEqMemo {
+    /// `(prev Arc addr, cur Arc addr) -> payloads equal`; valid for one call.
+    verdicts: FxHashMap<(usize, usize), bool>,
+}
+
+impl ImageEqMemo {
+    /// Payload equality for two image handles: `Arc::ptr_eq` fast path (the
+    /// steady-frame case — no re-transmit — stays O(1) with no memo traffic),
+    /// then the memoized deep compare — exactly the derived `ImageData` eq,
+    /// evaluated once per distinct pointer pair.
+    fn image_eq(
+        &mut self,
+        a: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
+        b: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
+    ) -> bool {
+        if std::sync::Arc::ptr_eq(a, b) {
+            return true;
+        }
+        let key = (
+            std::sync::Arc::as_ptr(a) as usize,
+            std::sync::Arc::as_ptr(b) as usize,
+        );
+        if let Some(&verdict) = self.verdicts.get(&key) {
+            return verdict;
+        }
+        // The one deep compare this pair pays per frame. UNCHANGED semantics:
+        // bytes + format + cols + rows + z, the derived `ImageData` equality.
+        let verdict = **a == **b;
+        self.verdicts.insert(key, verdict);
+        verdict
+    }
+
+    /// Memoized equality of two per-row placement lists — the drop-in
+    /// replacement for `a.images[ra] == b.images[rb]` (derived `Vec`/tuple/
+    /// `ImageRef` equality), same verdict by construction: length, column,
+    /// tile coordinates, then the shared payload via [`Self::image_eq`].
+    /// Pinned against the derived form by the
+    /// `image_eq_memo_matches_derived_row_equality` differential test.
+    fn rows_eq(
+        &mut self,
+        a: &[(usize, aterm_core::grid::extra::ImageRef)],
+        b: &[(usize, aterm_core::grid::extra::ImageRef)],
+    ) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|((ca, ia), (cb, ib))| {
+                ca == cb
+                    && ia.cell_row == ib.cell_row
+                    && ia.cell_col == ib.cell_col
+                    && self.image_eq(&ia.image, &ib.image)
+            })
+    }
+}
+
 /// Whether row `r`'s render-relevant inputs differ between two frames: the
 /// resolved cells, the sparse cluster / combining-mark lists, the DEC line size
 /// (row-level AND the per-column runs a composed row carries), or the row's
@@ -13920,9 +14224,10 @@ fn image_below_non_default_bg_covers(
 /// NOT the `RenderCell`, so without this clause an image that appeared/changed
 /// without a cell edit would not mark its rows dirty and the dirty/gate paths
 /// would skip repainting it. The common ASCII row carries an empty `images[r]`,
-/// so this is a cheap `Vec::is_empty`-fast `==` there (no allocation, no scan).
-fn row_differs(a: &RenderInput, b: &RenderInput, r: usize) -> bool {
-    row_differs_shifted(a, r, b, r)
+/// so [`ImageEqMemo::rows_eq`] is a length-0 == length-0 fast path there (no
+/// allocation, no scan, no memo traffic).
+fn row_differs(a: &RenderInput, b: &RenderInput, r: usize, memo: &mut ImageEqMemo) -> bool {
+    row_differs_shifted(a, r, b, r, memo)
 }
 
 /// Whether row `ra` of `a` differs from row `rb` of `b` in any render-relevant
@@ -13946,14 +14251,25 @@ fn row_differs(a: &RenderInput, b: &RenderInput, r: usize) -> bool {
 /// OSC 11 / DECSCNM default changed leaves every cell byte-equal (the cells hold
 /// RESOLVED colours only where they were written), while the opacity rule, the
 /// deepest image tier and the cursor/trail fallbacks all key on that default.
-fn row_differs_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
+/// The IMAGES clause routes through the caller's [`ImageEqMemo`] so a
+/// re-transmitted payload (fresh `Arc`, identical bytes) is deep-compared once
+/// per distinct Arc pair per frame instead of once per covered cell — same
+/// verdict as the derived equality it replaces (see the memo's doc), so "an
+/// unchanged row is provably safe to reuse" still holds byte-for-byte.
+fn row_differs_shifted(
+    a: &RenderInput,
+    ra: usize,
+    b: &RenderInput,
+    rb: usize,
+    memo: &mut ImageEqMemo,
+) -> bool {
     a.cells[ra] != b.cells[rb]
         || a.clusters[ra] != b.clusters[rb]
         || a.combining[ra] != b.combining[rb]
         || a.line_sizes[ra] != b.line_sizes[rb]
         || row_spans(a, ra) != row_spans(b, rb)
         || default_bg_spans(a, ra) != default_bg_spans(b, rb)
-        || a.images[ra] != b.images[rb]
+        || !memo.rows_eq(&a.images[ra], &b.images[rb])
 }
 
 /// Mark row `r` dirty if it is in range (a no-op for an out-of-range cursor row).
@@ -14263,12 +14579,22 @@ const OVERSHOOT_APRON_ROWS: usize = 2;
 ///
 /// SOUNDNESS: row rasterization is a pure translation in Y (the invariant the M1b
 /// band translate already relies on), so a retained row whose content is
-/// byte-identical to last frame's source row (checked via [`row_differs_shifted`])
+/// byte-identical to last frame's source row (checked via `row_differs_shifted`)
 /// rasterizes to byte-identical pixels once shifted by the row delta; the exposed
 /// strip is re-rasterized fresh by the same per-row passes the full path runs. The
 /// presented frame is therefore byte-identical to a full repaint.
+///
+/// PUBLIC because the damage seam has TWO consumers, exactly like
+/// [`compute_dirty_rows`] beside it. Leaving this one `pub(crate)` is what let the
+/// two backends diverge: the GPU present path consulted the planner that says
+/// "give up" (`compute_dirty_rows` → `FullRepaint`) and could not reach the one
+/// that says "slide", so every whole-row history scroll re-encoded the entire grid
+/// on the GPU while the CPU blitted the retained rows. The soundness argument
+/// above is backend-independent — it is a statement about row rasterization being
+/// a pure Y-translation, which is equally true of the GPU's glyph placement — so
+/// the rescue belongs to both or to neither.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scroll_blit_plan(
+pub fn scroll_blit_plan(
     prev: &RenderInput,
     input: &RenderInput,
     prev_blink_phase: bool,
@@ -14310,10 +14636,15 @@ pub(crate) fn scroll_blit_plan(
     }
     let da = da as i32; // |da| < rows, and rows is small
     // Every RETAINED row must survive the shift byte-identically: new row r maps
-    // to prev row r + da when in range.
+    // to prev row r + da when in range. The image memo is call-scoped (see
+    // `ImageEqMemo`), so a scrolled re-transmitted image deep-compares once,
+    // not once per surviving covered cell.
+    let mut image_memo = ImageEqMemo::default();
     for r in 0..rows {
         let src = r as i64 + i64::from(da);
-        if (0..rows as i64).contains(&src) && row_differs_shifted(input, r, prev, src as usize) {
+        if (0..rows as i64).contains(&src)
+            && row_differs_shifted(input, r, prev, src as usize, &mut image_memo)
+        {
             return None;
         }
     }
@@ -14530,9 +14861,13 @@ pub fn compute_dirty_rows(
     // frame allocates nothing — byte-identical to the old `vec![false; rows]`.
     dirty.clear();
     dirty.resize(rows, false);
+    // One image-equality memo for THIS diff (see `ImageEqMemo`): the borrows
+    // of `prev_input`/`input` outlive it, which is what makes its raw-pointer
+    // keys ABA-safe; it must NOT be hoisted into cross-frame state.
+    let mut image_memo = ImageEqMemo::default();
     let mut any_dirty = false;
     for (r, d) in dirty.iter_mut().enumerate() {
-        if row_differs(input, prev_input, r) {
+        if row_differs(input, prev_input, r, &mut image_memo) {
             *d = true;
             any_dirty = true;
         }
@@ -15378,6 +15713,81 @@ pub fn cell_style(cell: &RenderCell) -> StyleBits {
         bits |= StyleBits::ITALIC.0;
     }
     StyleBits(bits)
+}
+
+/// W8 (g): horizontally resample a coverage bitmap from `w` to `new_w`
+/// columns (`new_w <= w`) through the SAME integer area weights the W10 emoji
+/// filter uses ([`area_overlap`]). Its partition-of-unity law — for every
+/// output column `Σ_s overlap == w` — is what makes dividing by `w` an EXACT
+/// MEAN: each output pixel is the area-weighted average of its source
+/// footprint and can never overshoot it. That law is already proven over an
+/// exhaustive lattice in `tests/emoji_resample.rs`, so this transform adds a
+/// new mechanism and no new arithmetic.
+///
+/// An average preserves DENSITY, not mass: total ink scales by exactly
+/// `new_w/w` (the dual partition — for a fixed source column,
+/// `Σ_d overlap == new_w` — makes that identity, not an approximation), and
+/// peak coverage can only decrease, so a hairline stroke thins as it
+/// condenses. That is the deliberate choice for text: the alternative,
+/// conserving mass, would darken every surviving pixel toward saturation and
+/// turn a condensed glyph into a blot.
+///
+/// Coverage is LINEAR area, not sRGB, and the perceptual remap happens later
+/// in `blend_text_pre`, so — unlike [`resample_rgba`], which brackets its
+/// filter in a linearize/encode pair — averaging raw coverage here is the
+/// physically correct operation and leaves the remap's input meaning intact.
+///
+/// x only, deliberately: the long arrows are 1.499 em WIDE and 0.401 em tall,
+/// so a uniform shrink would throw away 60% of a height that was never the
+/// problem (and, on macOS, mint a fresh `CtFont` per distinct `eff_px` — each
+/// one a full `CFDataCreate` COPY of the font file, 23 MB for Arial Unicode).
+/// The condense never touches the raster size, so it costs the font caches
+/// nothing.
+///
+/// Law: `out.len() == new_w * h`; identity at `new_w == w`; an all-255 row
+/// stays all-255 (no seam); every output pixel bounded by its footprint's min
+/// and max (an exact mean — per-row ink mass scales by `new_w/w`, to
+/// rounding); total on `w == 0 || h == 0 || new_w == 0` (empty).
+#[doc(hidden)]
+#[must_use]
+pub fn condense_coverage(cov: &[u8], w: usize, h: usize, new_w: usize) -> Vec<u8> {
+    if w == 0 || h == 0 || new_w == 0 {
+        return Vec::new();
+    }
+    if new_w == w {
+        return cov.to_vec();
+    }
+    let mut out = vec![0u8; new_w * h];
+    for y in 0..h {
+        let row = &cov[y * w..y * w + w];
+        for d in 0..new_w {
+            // Source columns overlapping this footprint — the same integer
+            // bounds convention `area_rgba_premul` uses.
+            let x0 = d * w / new_w;
+            let x1 = ((d + 1) * w - 1) / new_w;
+            let acc: u64 = row[x0..=x1]
+                .iter()
+                .zip(x0..)
+                .map(|(&px, x)| area_overlap(d, x, w, new_w) * u64::from(px))
+                .sum();
+            // Round-to-nearest on the exact `1/w` normalization; `.min(255)`
+            // is belt-and-braces (the partition of unity bounds it already).
+            out[y * new_w + d] = ((acc + w as u64 / 2) / w as u64).min(255) as u8;
+        }
+    }
+    out
+}
+
+/// W8 (h): drop `skip` leading columns and every column past `new_w` from a
+/// coverage bitmap. The column twin of the (f) row clamp's byte slice — rows
+/// are contiguous, so unlike the row case this one has to RE-PACK rather than
+/// reslice. Caller guarantees `skip + new_w <= w`.
+fn trim_coverage_cols(cov: &[u8], w: usize, h: usize, skip: usize, new_w: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(new_w * h);
+    for y in 0..h {
+        out.extend_from_slice(&cov[y * w + skip..y * w + skip + new_w]);
+    }
+    out
 }
 
 /// Horizontally dilate a coverage bitmap by `e` px (synthetic BOLD): each output
@@ -18797,6 +19207,156 @@ mod tests {
         assert!(is_unchanged_frame(
             &prev, false, None, &cur, false, None, 16
         ));
+    }
+
+    /// IMG-1 DIFFERENTIAL ORACLE: the memoized per-row image equality
+    /// ([`ImageEqMemo::rows_eq`]) must agree with the derived deep equality
+    /// (`Vec<(usize, ImageRef)>` `==`) on every shape — same-`Arc`, cross-`Arc`
+    /// equal payloads, cross-`Arc` differing payloads (first AND last byte, so
+    /// neither a prefix nor a suffix shortcut could fake it), metadata-only
+    /// differences (footprint / z / tile / column), a length mismatch, and
+    /// REPEAT consultation (the second call resolves the cross-`Arc` pairs
+    /// from the memo and must return the identical verdict). The memo exists
+    /// purely to price the deep compare once per distinct Arc pair instead of
+    /// once per covered cell; any verdict drift would corrupt the dirty set.
+    #[test]
+    fn image_eq_memo_matches_derived_row_equality() {
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+        use std::sync::Arc;
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+        let mk = |bytes: Vec<u8>, cols: u16, z: i32| {
+            Arc::new(ImageData {
+                bytes,
+                format: ImageFormat::Png,
+                cols,
+                rows: 4,
+                z_index: z,
+            })
+        };
+        let base = mk(payload.clone(), 8, 0);
+        // Distinct Arc, byte-identical content: the re-transmit shape.
+        let same_bytes = mk(payload.clone(), 8, 0);
+        let mut first_flip = payload.clone();
+        first_flip[0] ^= 1;
+        let diff_first = mk(first_flip, 8, 0);
+        let mut last_flip = payload.clone();
+        *last_flip.last_mut().unwrap() ^= 1;
+        let diff_last = mk(last_flip, 8, 0);
+        let diff_meta = mk(payload.clone(), 9, 0);
+        let diff_z = mk(payload.clone(), 8, -1);
+        let row = |img: &Arc<ImageData>, col0: usize, tile: u16| {
+            (0..3usize)
+                .map(|i| {
+                    (
+                        col0 + i,
+                        ImageRef {
+                            image: img.clone(),
+                            cell_row: tile,
+                            cell_col: u16::try_from(i).unwrap(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = row(&base, 2, 0);
+        let cases = [
+            Vec::new(),             // empty vs covered
+            a.clone(),              // same Arcs, same metadata (ptr_eq path)
+            row(&base, 3, 0),       // same Arc, shifted columns
+            row(&base, 2, 1),       // same Arc, different tile row
+            row(&same_bytes, 2, 0), // distinct Arc, equal payload — EQUAL
+            row(&diff_first, 2, 0), // payload differs at byte 0
+            row(&diff_last, 2, 0),  // payload differs at the LAST byte
+            row(&diff_meta, 2, 0),  // metadata-only difference
+            row(&diff_z, 2, 0),     // z-only difference
+            a[..2].to_vec(),        // length mismatch
+        ];
+        for (i, b) in cases.iter().enumerate() {
+            let derived = a == *b;
+            let mut memo = ImageEqMemo::default();
+            assert_eq!(
+                memo.rows_eq(&a, b),
+                derived,
+                "case {i}: memoized verdict must match the derived equality"
+            );
+            assert_eq!(
+                memo.rows_eq(&a, b),
+                derived,
+                "case {i}: memo read-back must return the identical verdict"
+            );
+        }
+        // And the re-transmit case is genuinely EQUAL across distinct Arcs —
+        // the load-bearing repaint suppression this memo must preserve.
+        assert!(ImageEqMemo::default().rows_eq(&a, &row(&same_bytes, 2, 0)));
+    }
+
+    /// IMG-1 END-TO-END: a RE-TRANSMITTED image (same bytes, fresh `Arc` — the
+    /// yazi/ranger preview-redraw and kitty still-scene shapes) must still
+    /// GATE-HIT through the shared diff: the deep equality that SUPPRESSES the
+    /// repaint is preserved, merely priced once per distinct Arc pair instead
+    /// of once per covered cell. The flipped-payload twin pins the other side:
+    /// the memoized diff must still SEE a genuine payload change and dirty
+    /// exactly the covered rows (a pointer-identity "optimization" would pass
+    /// the first assert and fail this one).
+    #[test]
+    fn retransmitted_identical_image_gate_hits_and_changed_payload_does_not() {
+        use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef};
+        use std::sync::Arc;
+        let mut term = Terminal::new(6, 10);
+        let template = term.cell_frame(6, 10);
+        let payload: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(7) % 256) as u8)
+            .collect();
+        let mk = |bytes: Vec<u8>| {
+            Arc::new(ImageData {
+                bytes,
+                format: ImageFormat::Png,
+                cols: 4,
+                rows: 2,
+                z_index: 0,
+            })
+        };
+        let fill = |input: &mut RenderInput, img: &Arc<ImageData>| {
+            for r in 0..2usize {
+                for c in 0..4usize {
+                    input.images[r].push((
+                        c,
+                        ImageRef {
+                            image: img.clone(),
+                            cell_row: u16::try_from(r).unwrap(),
+                            cell_col: u16::try_from(c).unwrap(),
+                        },
+                    ));
+                }
+            }
+        };
+        let mut prev = template.clone();
+        fill(&mut prev, &mk(payload.clone()));
+        // Fresh Arc, byte-identical payload: the re-transmit.
+        let mut cur = template.clone();
+        fill(&mut cur, &mk(payload.clone()));
+        assert!(
+            is_unchanged_frame(&prev, false, None, &cur, false, None, 16),
+            "a byte-identical re-transmit must still gate-hit"
+        );
+        // Same shape, one payload byte flipped: the covered rows must dirty.
+        let mut flipped = payload;
+        flipped[1000] ^= 0x40;
+        let mut changed = template.clone();
+        fill(&mut changed, &mk(flipped));
+        assert!(
+            !is_unchanged_frame(&prev, false, None, &changed, false, None, 16),
+            "a genuine payload change must still repaint"
+        );
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(d) =
+            compute_dirty_rows(&prev, &changed, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("an image payload change stays on the row-damage path");
+        };
+        assert!(d.any_dirty, "changed payload must mark rows dirty");
+        assert!(dirty[0] && dirty[1], "both covered rows repaint");
+        assert!(!dirty[2], "uncovered rows stay clean");
     }
 
     /// BYTE-PARITY: a selection drag over wide (CJK) cells through the DAMAGED

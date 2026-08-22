@@ -466,7 +466,6 @@ impl TerminalHandler<'_> {
             self.grid,
             self.modes,
             self.style,
-            self.current_style_id,
             self.charset,
             self.alt_grid,
             self.cursor_save,

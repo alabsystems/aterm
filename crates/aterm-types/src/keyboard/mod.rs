@@ -28,7 +28,10 @@ mod term_mode;
 mod winit_map;
 
 pub use dom_map::{encode_dom_key, map_dom_key};
-pub use encode::{encode_key, encode_key_with_event, encode_key_with_layout, shifted_character};
+pub use encode::{
+    encode_key, encode_key_with_event, encode_key_with_layout, is_modifier_or_lock_key,
+    shifted_character,
+};
 pub use key_types::{Key, KeyEventType, Modifiers, NamedKey};
 pub use mode::KeyboardMode;
 pub use term_mode::TermMode;

@@ -5330,6 +5330,7 @@ mod returned_handoff_completion_lane_tests {
                     failing_kind: String::new(),
                     failing_applies: 0,
                     installable: true,
+                    channel_unreadable: false,
                 },
             ),
             CheckCompletion::Reduced,

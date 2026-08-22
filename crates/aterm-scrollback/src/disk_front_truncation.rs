@@ -36,10 +36,10 @@ impl DiskColdTier {
         self.line_count = self.line_count.saturating_sub(n);
 
         // Drop fully consumed pages from the front of the index.
-        // Count first, then drain once — avoids O(k*n) from repeated remove(0).
+        // Count first, then advance the cursor once.
         let mut pages_dropped = 0;
         let mut offset_consumed = 0usize;
-        for entry in &self.index {
+        for entry in self.live_index() {
             let page_lines = len_u32_to_usize(entry.line_count);
             if self.front_offset - offset_consumed >= page_lines {
                 offset_consumed += page_lines;
@@ -49,20 +49,16 @@ impl DiskColdTier {
             }
         }
         if pages_dropped > 0 {
-            self.index.drain(..pages_dropped);
             self.front_offset = self.front_offset.saturating_sub(offset_consumed);
 
-            // Rebuild cumulative index: drop first `pages_dropped` entries, adjust remainder.
-            if pages_dropped >= self.cumulative_lines.len() {
-                self.cumulative_lines.clear();
-            } else {
-                let physical_offset = self.cumulative_lines[pages_dropped - 1];
-                self.cumulative_lines.drain(..pages_dropped);
-                for c in &mut self.cumulative_lines {
-                    *c = c.saturating_sub(physical_offset);
-                }
-            }
-            // Invalidate cache — page indices shifted.
+            // O(pages_dropped) amortized index maintenance: the shared
+            // cursor and absolute base advance; no surviving entry of either
+            // vector is drained or rebased (the old path here memmoved the
+            // page index AND memmoved+rebased the cumulative index — O(total
+            // pages) per drop, reached from the line-limit enforcement of
+            // every push in a capped session). See drop_front_index_entries.
+            self.drop_front_index_entries(pages_dropped);
+            // Invalidate cache — live page indices shifted.
             self.clear_page_cache();
 
             // Refresh accounting only when state that feeds calculate_memory_used
@@ -77,7 +73,8 @@ impl DiskColdTier {
         // Amortized O(1): compaction rewrites O(live_bytes), but only fires
         // after accumulating dead_bytes > live_bytes, so each byte is rewritten
         // at most once per full rotation of the scrollback.
-        if self.file.is_some() && !self.index.is_empty() && self.dead_bytes() > self.live_bytes() {
+        if self.file.is_some() && !self.live_index().is_empty() && self.dead_bytes() > self.live_bytes()
+        {
             // Compaction failure is non-fatal — file works fine with dead space.
             let _ = self.compact();
         }

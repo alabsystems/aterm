@@ -591,6 +591,23 @@ impl Line {
         }
     }
 
+    /// A clone for the rewrap passthrough (RFL-4a): identical content, attrs
+    /// and sidecars, with the line FLAGS reset to the freshly-rebuilt state —
+    /// `WRAPPED` false and the transient `HAS_MATCH`/`DIRTY` render/search
+    /// bits cleared. That is exactly the flag state the rewrap's `build_line`
+    /// gives every output line, so a passed-through line is indistinguishable
+    /// from a rebuilt one (the flags are `pub(crate)`, which is why this
+    /// lives here and not at the call site).
+    // Skip: field-wise clone plus a flag reset — the idiomatic-alloc class
+    // `Clone for Line` above already skips, nothing new can panic here.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn cloned_for_rewrap(&self) -> Line {
+        let mut clone = self.clone();
+        clone.flags = LineFlags::empty();
+        clone
+    }
+
     /// Get content as a string slice (returns None if not valid UTF-8).
     #[must_use]
     // Skip: `str::from_utf8` is the hardened strict-reject class; `.ok()` is

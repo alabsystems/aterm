@@ -134,6 +134,10 @@ mod clipboard;
 // Re-export `pbcopy`/`pbpaste` (GUI OSC-52 path, `main.rs`, menu Paste), which
 // reach through the stable `crate::control::NAME` path, so those paths keep resolving.
 pub(crate) use clipboard::{pbcopy, pbpaste};
+// The X11 non-blocking own-selection read, for the OSC-52 query arm (which must
+// never block inside the terminal lock on a foreign-owned selection).
+#[cfg(target_os = "linux")]
+pub(crate) use clipboard::pbpaste_owned;
 // `primary_get`/`primary_set` (PRIMARY-selection paste/own) are wired ONLY to Linux
 // middle-click / selection-release in `app_mouse`, so their re-exports are
 // Linux-only — on macOS they would be unused imports.
@@ -822,7 +826,29 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let failing = if st.failing_checks == 0 {
         "0".to_string()
     } else {
-        format!("{}:{}", st.failing_checks, st.failing_kind)
+        // The class of the STANDING acquisition streak — the streak this count
+        // counts — never `failing_kind`, the most recent failure of ANY class:
+        // an apply failure landing after two network failures rendered
+        // `failing=2:apply`, splicing an acquisition count with an apply label
+        // and sending the reader down the wrong lane (round-11 audit; the
+        // apply lane has its own failing_applies=/apply-class tokens).
+        let kind = if st.failing_checks_kind.is_empty() {
+            st.failing_kind.as_str()
+        } else {
+            st.failing_checks_kind.as_str()
+        };
+        format!("{}:{kind}", st.failing_checks)
+    };
+    // A frozen ledger must not read as a live one: flag a last-completed-check
+    // stamp older than any lane's worst legitimate quiet period (the anonymous
+    // 30-min base × the 4-interval backoff ceiling × jitter ≈ 2.4 h; 4 h clears
+    // it with margin). Healthy lines stay byte-identical — the token appears
+    // only in the stale state, per the installable=/apply_refusal= precedent.
+    const STALE_CHECK_AFTER_SECS: u64 = 4 * 3600;
+    let stale_check = if aterm_update::rfc3339_older_than(&st.updated_at, STALE_CHECK_AFTER_SECS) {
+        format!(" stale_check={}", st.updated_at)
+    } else {
+        String::new()
     };
     // commit= is the RUNNING binary's source commit (compile-time stamp);
     // staged_commit= is the staged build's (from its release manifest). Together a
@@ -837,7 +863,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let mut out = format!(
         "OK enabled={} current_build={} commit={} staged_build={} staged_version={} \
          staged_commit={} staged_is_same_commit={} relaunch_ready={} failing={} \
-         failing_applies={} rescues={} persistent={} outcome={:?}\n",
+         failing_applies={} rescues={} persistent={}{stale_check} outcome={:?}\n",
         st.enabled,
         st.current_build,
         crate::build_info::GIT_COMMIT,
@@ -4292,7 +4318,28 @@ fn cross_resize(
         // lazy-buffer leak + all tiered history invisible). Recover to ring-only on
         // panic (audit #5).
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pending.reflow())) {
-            Ok(reflowed) => term_lock(term).finish_resize_offload(reflowed),
+            Ok(reflowed) => {
+                // CONVERGENCE (RFL-3): a width change that raced this rewrap
+                // left the store wrapped at the first width; keep rewrapping
+                // (still off the main thread, off the lock) until the settled
+                // width matches — at most one extra pass once widths settle.
+                let mut next = term_lock(term).finish_resize_offload(reflowed);
+                while let Some(follow) = next {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        follow.reflow()
+                    })) {
+                        Ok(again) => next = term_lock(term).finish_resize_offload(again),
+                        Err(_) => {
+                            aterm_log::error!(
+                                "cross-session convergence rewrap panicked for session \
+                                 {session}; aborting the offload (grid recovered)"
+                            );
+                            term_lock(term).abort_resize_offload();
+                            break;
+                        }
+                    }
+                }
+            }
             Err(_) => {
                 aterm_log::error!(
                     "cross-session reflow panicked rewrapping session {session} scrollback; \
@@ -11380,10 +11427,9 @@ mod tests {
     }
 
     /// R11 DEFAULT-SIDE: at a shell prompt, `turn` AUTO-verifies the submit against
-    /// the OSC-133 command-start (a block transitions to Executing), NOT a bare
-    /// `content_seq` advance — so an ambient repaint at the prompt cannot false-verify
-    /// a swallowed Enter. No `submit_verify=` is passed: the default detects the
-    /// prompt and picks block-verification.
+    /// the OSC-133 command-start (a block transitions to Executing). No
+    /// `submit_verify=` is passed: the default detects the prompt and picks
+    /// block-verification, and the command start attributes the press immediately.
     #[test]
     fn turn_auto_block_verifies_at_a_shell_prompt() {
         use std::cell::Cell;
@@ -11403,13 +11449,7 @@ mod tests {
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
-            if presses.get() == 1 {
-                // Ambient repaint at the prompt: content advances, but NO command
-                // starts (no 133;C). The default (auto=block here) must not verify.
-                term.lock().unwrap().process(b"\x1b[2K refresh ");
-                return true;
-            }
-            // The real submit: the shell starts the command (133;C -> Executing).
+            // The submit lands: the shell starts the command (133;C -> Executing).
             term.lock()
                 .unwrap()
                 .process(b"echo\x1b]133;C\x07\r\nrunning");
@@ -11432,10 +11472,119 @@ mod tests {
             "auto-default block-verifies once the command starts: {}",
             out.lines().next().unwrap_or("")
         );
+        assert_eq!(presses.get(), 1, "one press started the command — no re-press");
+    }
+
+    /// AUTO's honest DEGRADE (the stock-Ubuntu-bash regression): the target LOOKS
+    /// like a shell prompt (a 133;A/B block sits in EnteringCommand) but the 133
+    /// stream is desynced — no press will EVER produce a command-start (the field
+    /// case: vte.sh double-sourced by the profile chain clobbers its PS0 `133;C`,
+    /// and a sibling precmd wedges the DEBUG-trap capture). The press's echo DOES
+    /// advance `content_seq`. AUTO must not blind-re-press (each extra Enter is
+    /// REAL input typed into the target) and must not report the false
+    /// `submitted=0 status=timeout` that made drivers re-type whole turns:
+    /// it degrades to the seq verdict — submitted=1, ONE press, settled.
+    #[test]
+    fn turn_auto_degrades_when_prompt_block_is_stale() {
+        use std::cell::Cell;
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let term = &h.term;
+        // Prompt-SHAPED block state: A opens, B marks input-ready… and the stream
+        // dies there. No C will ever arrive, at this prompt or any later one.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+
+        let presses = Cell::new(0u32);
+        let paste = |text: &str| {
+            term.lock().unwrap().process(text.as_bytes());
+        };
+        let press = |_: &str| {
+            presses.set(presses.get() + 1);
+            // The shell consumed the Enter and ran the command — output flows,
+            // content advances — but NO 133 mark ever transitions a block.
+            term.lock().unwrap().process(b"\r\nran-anyway\r\n$ ");
+            true
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            // Small submit_window so the degrade point arrives fast; NO
+            // submit_verify=: AUTO picks block off the stale prompt shape.
+            "idle=50 timeout=8000 submit_window=120 run",
+            &subscribe::new_registry(),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+            },
+        );
+        assert!(
+            out.contains("submitted=1 status=settled"),
+            "stale prompt block degrades to the honest seq verdict: {}",
+            out.lines().next().unwrap_or("")
+        );
+        assert_eq!(
+            presses.get(),
+            1,
+            "a press whose echo moved the screen was consumed — re-pressing would double-type"
+        );
+    }
+
+    /// AUTO's degrade must NOT fire on a PROVEN-healthy stream: once this session
+    /// has started a command block (133;C demonstrated), no-block-plus-ambient-
+    /// movement is exactly what a swallowed Enter beside background output looks
+    /// like — claiming submitted=1 there would break the "a press VERIFIABLY
+    /// landed" contract. The strict lane holds: re-press, and report the honest
+    /// submitted=0 when nothing ever starts.
+    #[test]
+    fn turn_auto_stays_strict_when_the_stream_has_started_blocks_before() {
+        use std::cell::Cell;
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let term = &h.term;
+        // A PROVEN stream: one full command block (A/B prompt, C start, D exit),
+        // then a fresh healthy prompt.
+        term.lock().unwrap().process(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07echo\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+        );
+
+        let presses = Cell::new(0u32);
+        let paste = |text: &str| {
+            term.lock().unwrap().process(text.as_bytes());
+        };
+        let press = |_: &str| {
+            presses.set(presses.get() + 1);
+            // The Enter is SWALLOWED — but ambient output (a background job, a
+            // spinner) moves content inside the submit window anyway.
+            term.lock().unwrap().process(b"\r\n[bg] tick");
+            true
+        };
+        let out = cmd_turn(
+            term,
+            &store,
+            0,
+            "idle=50 timeout=1500 submit_window=120 presses=2 run",
+            &subscribe::new_registry(),
+            &h.ctx,
+            &TurnIo {
+                paste: &paste,
+                press: &press,
+            },
+        );
+        assert!(
+            out.contains("submitted=0"),
+            "a proven stream never degrades on ambient movement: {}",
+            out.lines().next().unwrap_or("")
+        );
         assert_eq!(
             presses.get(),
             2,
-            "the ambient repaint at the prompt did NOT verify; a second press started the command"
+            "strictness holds — the press budget retries instead of overclaiming"
         );
     }
 

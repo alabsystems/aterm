@@ -102,6 +102,18 @@ impl Grid {
                 "unscroll_from_scrollback: failed to remove {n} lines from scrollback: {e}"
             );
         }
+        // Every history row OLDER than the removed suffix keeps its line, but
+        // its absolute key `oldest_absolute_row() + i` just shifted by `n`
+        // (`scrollback_lines()` shrank while `absolute_row_counter` did not
+        // move). No content_gen / damage / absolute-row-revision signal
+        // distinguishes this wholesale renumbering from an ordinary append
+        // batch, so bump the dedicated epoch: absolute-row-keyed history
+        // caches (the terminal's incremental search-index refresh) must
+        // REBUILD, never carry shifted keys forward. Bumped even when the
+        // defensively-retained removal-failure branch above fired
+        // (unreachable per #4638): a spurious rebuild is harmless; a missed
+        // one is silently stale search results.
+        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         self.storage.content_scroll_delta = i32::MAX;
         // Only the scroll region rows changed — mark them, not the full screen.
         let top_u16 = self.storage.scroll_region.top;

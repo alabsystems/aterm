@@ -82,12 +82,6 @@ pub fn take_response(term: &mut Terminal) -> Vec<u8> {
     term.take_response().expect("expected terminal response")
 }
 
-/// Read the currently interned style identifier for the terminal state.
-#[must_use]
-pub fn current_style_id(term: &Terminal) -> StyleId {
-    term.current_style_id()
-}
-
 /// Install a text-sizing callback (OSC 66) for integration tests.
 pub fn set_text_sizing_callback<F>(term: &mut Terminal, callback: F)
 where

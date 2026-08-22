@@ -1110,6 +1110,33 @@ pub struct CellExtras {
     /// would just reintroduce the churn on the eviction path, which is the one
     /// path that refills it every time.
     hyperlink_scratch: Vec<CellCoord>,
+    /// UPPER BOUND on the number of HYPERLINK-BEARING entries in `data`.
+    ///
+    /// The quantity [`Self::enforce_hyperlink_limit`] bounds is the hyperlink
+    /// population, but the only O(1) number the map itself offers is
+    /// `data.len()` — which also counts combining marks, underline colours,
+    /// extended flags, kitty placeholders and inline-image refs (one
+    /// `place_image` inserts ~3 * rows * cols of them). Guarding on `data.len()`
+    /// therefore collapses to a full O(E) walk per hyperlinked write-run as soon
+    /// as anything ELSE fills the map, and that walk evicts nothing: measured on
+    /// `hyperlink_screen/mixed_extras_under_limit` at 1_835 futile walks per MiB
+    /// over 14_600 entries, zero evictions.
+    ///
+    /// This field tracks the right quantity instead. The invariant is
+    /// `hyperlink_upper_bound >= (entries in data whose hyperlink is Some)`:
+    ///
+    /// * every path that can RAISE the hyperlink population charges it here
+    ///   (`get_or_create`, `set`, `set_range_uniform`) — a missed charge would
+    ///   lose the memory bound, so those are mandatory;
+    /// * paths that LOWER it (row shifts dropping entries, the retain-based
+    ///   clears, compaction) need not report, because leaving the bound high is
+    ///   merely conservative — it buys one cold walk, which then repairs the
+    ///   bound EXACTLY from the walk it was already doing.
+    ///
+    /// So the structure is self-healing: drift is always in the safe direction
+    /// and is erased the next time the cold path runs. `clear()` resets it to 0
+    /// because it replaces the whole map.
+    hyperlink_upper_bound: usize,
 }
 
 impl CellExtras {
@@ -1125,6 +1152,7 @@ impl CellExtras {
             // Unallocated until the hyperlink cold path first runs; a grid that
             // never sees an OSC 8 link never pays a byte for it.
             hyperlink_scratch: Vec::new(),
+            hyperlink_upper_bound: 0,
         }
     }
 
@@ -1453,9 +1481,31 @@ impl CellExtras {
     }
 
     /// Get mutable extras for a cell, creating if needed.
+    ///
+    /// CHARGES THE HYPERLINK BUDGET when the entry does not already carry a
+    /// link. A `&mut CellExtra` handed out here can have a hyperlink written
+    /// into it — `handler_write`'s per-cell OSC 8 path and the checkpoint
+    /// restore in `scroll_fill` both do exactly that — and `CellExtra` has no
+    /// way to report that back to the collection that owns it. Charging on
+    /// handout is the only sound accounting: an entry that ALREADY has a link
+    /// can only keep it (no change) or drop it (which just leaves the bound
+    /// conservative), so the `is_none()` case is precisely the set of handouts
+    /// that can raise the population.
+    ///
+    /// Over-charging costs one cold walk per `MAX_HYPERLINK_ENTRIES` handouts,
+    /// and that walk repairs the bound exactly; under-charging would lose the
+    /// memory bound entirely. The asymmetry is deliberate.
     #[inline]
     pub fn get_or_create(&mut self, coord: CellCoord) -> &mut CellExtra {
-        self.data.entry(self.internal_coord(coord)).or_default()
+        let key = self.internal_coord(coord);
+        // Disjoint field borrows: the counter and the map are separate fields,
+        // so the charge lands without a second lookup.
+        let bound = &mut self.hyperlink_upper_bound;
+        let extra = self.data.entry(key).or_default();
+        if extra.hyperlink().is_none() {
+            *bound += 1;
+        }
+        extra
     }
 
     /// Set extras for a cell.
@@ -1465,6 +1515,12 @@ impl CellExtras {
     pub fn set(&mut self, coord: CellCoord, extra: CellExtra) {
         let internal = self.internal_coord(coord);
         if extra.has_data() {
+            // Charge only for a value that actually carries a link: DECCRA's
+            // rect copy and the RGB-only seeding in `extras_shift` store
+            // link-free extras through here and must not inflate the bound.
+            if extra.hyperlink().is_some() {
+                self.hyperlink_upper_bound += 1;
+            }
             self.data.insert(internal, extra);
         } else {
             self.data.remove(&internal);
@@ -1478,7 +1534,22 @@ impl CellExtras {
     /// cells (#7456).
     #[inline]
     pub(crate) fn remove(&mut self, coord: CellCoord) -> bool {
-        self.data.remove(&self.internal_coord(coord)).is_some()
+        let key = self.internal_coord(coord);
+        let Some(extra) = self.data.remove(&key) else {
+            return false;
+        };
+        // Give the charge back. This is the OSC 8 overwrite path — `write_split`
+        // drops the stale entry of a cell it is about to rewrite — so without
+        // the refund a screen that repaints links in place would inflate the
+        // bound by one per rewritten cell and buy a futile cold walk it does not
+        // need. The value is already in cache (it is being dropped here), so the
+        // test is a load and a branch. `saturating_sub` because the bound is a
+        // bound, not a ledger: it must never wrap, and a refund that would take
+        // it below zero can only mean it was already conservative.
+        if extra.hyperlink().is_some() {
+            self.hyperlink_upper_bound = self.hyperlink_upper_bound.saturating_sub(1);
+        }
+        true
     }
 
     /// Strip character-bearing fields (combining marks + complex-char string)
@@ -1738,6 +1809,10 @@ impl CellExtras {
         });
 
         let internal_row = self.internal_row(row);
+        // EXACT charge for the run: only a cell that did not already carry a
+        // link raises the hyperlink population, so repainting the same OSC 8 row
+        // (what every TUI redraw does) costs the budget nothing.
+        let mut new_links = 0usize;
         for col in col_start..col_end {
             let coord = CellCoord::new(internal_row, col);
             let extra = self.data.entry(coord).or_default();
@@ -1754,12 +1829,16 @@ impl CellExtras {
                 extra.set_extended_flags(vals.extended_flags);
             }
             if let Some(data) = &hyperlink {
+                if extra.hyperlink().is_none() {
+                    new_links += 1;
+                }
                 extra.set_hyperlink_data(Some(Arc::clone(data)));
             }
         }
 
         // Enforce hyperlink limit after batch insertion (#7172).
         if vals.hyperlink.is_some() {
+            self.hyperlink_upper_bound += new_links;
             self.enforce_hyperlink_limit();
         }
     }
@@ -1773,6 +1852,9 @@ impl CellExtras {
     pub fn clear(&mut self) {
         self.data = FxHashMap::default();
         self.row_offset = 0;
+        // Exact, not conservative: the map is gone, so the hyperlink population
+        // is zero. ESC[2J therefore hands the guard a clean slate.
+        self.hyperlink_upper_bound = 0;
         if let Some(ring) = &mut self.complex_ring {
             ring.clear();
         }
@@ -2095,7 +2177,8 @@ impl CellExtras {
 
     /// Enforce the hyperlink entry limit to prevent unbounded memory growth.
     ///
-    /// When the total number of extras entries exceeds [`MAX_HYPERLINK_ENTRIES`],
+    /// When the number of HYPERLINK-BEARING entries may exceed
+    /// [`MAX_HYPERLINK_ENTRIES`] (see the `hyperlink_upper_bound` field),
     /// evicts hyperlink data from the oldest entries (lowest internal row
     /// coordinates, which correspond to the earliest-written rows) until the
     /// hyperlink count is within budget.
@@ -2108,7 +2191,42 @@ impl CellExtras {
     /// memory usage from OSC 8 spam (#7172).
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
-        if self.data.len() <= MAX_HYPERLINK_ENTRIES {
+        // GUARD ON THE QUANTITY BEING BOUNDED. This used to read
+        // `self.data.len()`, i.e. the TOTAL extras population — combining marks,
+        // underline colours, extended flags, kitty placeholders and inline-image
+        // refs included. One inline image (~3 * rows * cols entries) or a
+        // colour-heavy screen therefore pushed every hyperlinked write-run into
+        // the cold path, which walked the whole map and evicted nothing.
+        //
+        // The cold path is a no-op unless the hyperlink population is over
+        // budget, so skipping it whenever that population is provably within
+        // budget is observably identical — and it is the ONLY case the old guard
+        // got wrong. See `hyperlink_screen/mixed_extras_under_limit`.
+        //
+        // TWO UPPER BOUNDS, AND THE CHEAPER VERDICT WINS. `data.len()` is ALSO a
+        // sound upper bound on the hyperlink population — every hyperlink lives
+        // in an entry, so links <= entries — so it is KEPT as a second early-out
+        // rather than replaced. Either bound proving "under budget" is proof
+        // enough, and `||` short-circuits, so the common case still costs one
+        // load and one branch.
+        //
+        // Keeping it is not cosmetic. `hyperlink_upper_bound` OVER-charges by
+        // design: `get_or_create` charges on every handout to a link-free entry
+        // because it cannot see what the caller will write, and the per-cell
+        // write path hands out an entry for EVERY extras cell — SGR 58
+        // underlines, combining marks, RGB overflow — not just hyperlinked ones.
+        // A hyperlink-free workload that repaints extras therefore drives the
+        // counter past the limit on entries that will never hold a link, and
+        // without this clause it would buy a full cold walk every
+        // MAX_HYPERLINK_ENTRIES handouts — walks the ORIGINAL `data.len()` guard
+        // never took, because a small map takes its early-out. Measured on
+        // `extras_erase/status_line_redraw` (1_600 underline entries, zero
+        // hyperlinks, 200 redraws per screen cycle): +1.45% without this clause,
+        // back to parity with it. See
+        // `small_map_never_walks_however_inflated_the_counter`.
+        if self.hyperlink_upper_bound <= MAX_HYPERLINK_ENTRIES
+            || self.data.len() <= MAX_HYPERLINK_ENTRIES
+        {
             return;
         }
         self.enforce_hyperlink_limit_cold();
@@ -2120,14 +2238,22 @@ impl CellExtras {
         let mut compacted = false;
         // ONE walk, and NO allocation on either outcome.
         //
-        // The O(1) guard in `enforce_hyperlink_limit` tests `data.len()`, but
-        // the quantity actually bounded is the number of HYPERLINK-BEARING
-        // entries. The map also holds entries carrying no hyperlink at all —
-        // one inline image is ~3 * rows * cols entries (`place_image`), plus
-        // kitty placeholders, combining marks, underline colours and extended
-        // flags — so a map over 10k entries with far fewer hyperlinks reaches
-        // here on EVERY call and evicts nothing. That outcome is the common
-        // one, and it used to cost a fresh `Vec<CellCoord>` every time.
+        // Reached only when `hyperlink_upper_bound` says the HYPERLINK-BEARING
+        // population might be over budget. That bound is conservative by design
+        // — a generic `get_or_create` handout charges for a link it may never
+        // create, and the bulk drop paths never refund — so this walk still has
+        // to decide, and its second job is to REPAIR the bound with the exact
+        // count it computes on the way, which is what keeps the conservatism
+        // from compounding.
+        //
+        // Until that bound existed the guard tested `data.len()`, the TOTAL
+        // extras population — combining marks, underline colours, extended
+        // flags, kitty placeholders, inline-image refs (one `place_image` is
+        // ~3 * rows * cols entries) — so a map over 10k entries holding far
+        // fewer hyperlinks reached here on EVERY call and evicted nothing:
+        // 1_835 futile walks per MiB on
+        // `hyperlink_screen/mixed_extras_under_limit`. That outcome was the
+        // common one, and it used to cost a fresh `Vec<CellCoord>` every time.
         //
         // Two shapes were measured against `hyperlink_screen` before this one
         // was kept. Counting first and collecting only when genuinely over is
@@ -2138,16 +2264,35 @@ impl CellExtras {
         let mut coords = std::mem::take(&mut self.hyperlink_scratch);
         loop {
             coords.clear();
+            #[cfg(any(test, feature = "testing"))]
+            crate::test_counters::count_hyperlink_walk_ops(self.data.len());
             coords.extend(
                 self.data
                     .iter()
                     .filter(|(_, extra)| extra.hyperlink().is_some())
                     .map(|(coord, _)| *coord),
             );
+            // The bound must never sit BELOW the truth, or the limit stops being
+            // enforced. This walk already knows the truth, so the check is free
+            // exactly where it can be made — and it fires in debug/test builds on
+            // any future insertion path that forgets to charge the budget.
+            debug_assert!(
+                self.hyperlink_upper_bound >= coords.len(),
+                "hyperlink_upper_bound {} under-counts the {} hyperlink entries \
+                 present — an insertion path is not charging the budget",
+                self.hyperlink_upper_bound,
+                coords.len()
+            );
 
             // The map may hold non-hyperlink extras (RGB, combining, underline)
             // that do not count toward the limit.
             if coords.len() <= MAX_HYPERLINK_ENTRIES {
+                // REPAIR: the walk just established the exact population, so the
+                // conservative drift accumulated since the last walk (dropped
+                // entries never refund, generic `get_or_create` handouts charge
+                // for links they may not create) is erased here rather than
+                // buying another walk on the next call.
+                self.hyperlink_upper_bound = coords.len();
                 break;
             }
 
@@ -2203,6 +2348,11 @@ impl CellExtras {
                 }
             }
 
+            // Every coord came from the walk above and nothing between removed
+            // one, so exactly `to_evict` links were dropped: the population is
+            // now the low-water mark, exactly.
+            self.hyperlink_upper_bound = HYPERLINK_LOW_WATER;
+
             self.maybe_shrink();
             break;
         }
@@ -2218,6 +2368,23 @@ impl CellExtras {
     #[must_use]
     pub fn max_hyperlink_entries() -> usize {
         MAX_HYPERLINK_ENTRIES
+    }
+
+    /// The current hyperlink upper bound (for the invariant tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn hyperlink_upper_bound(&self) -> usize {
+        self.hyperlink_upper_bound
+    }
+
+    /// The true number of hyperlink-bearing entries — O(E), tests only.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn hyperlink_entries_slow(&self) -> usize {
+        self.data
+            .values()
+            .filter(|extra| extra.hyperlink().is_some())
+            .count()
     }
 }
 

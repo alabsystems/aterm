@@ -2,26 +2,41 @@
 // Copyright 2026 Andrew Yates
 //
 // The linchpin correctness gate for the damage-tracking fast path in
-// `Renderer::render_input`. The optimization reuses the previous frame's pixel
-// buffer and only re-renders changed rows (plus the cursor rows), returning the
-// cached frame untouched when nothing changed. THE OUTPUT MUST BE BYTE-IDENTICAL
-// to a full repaint for every input — this test proves it.
+// `Renderer::render_input_cached`. The optimization reuses the previous
+// frame's pixel buffer and only re-renders changed rows (plus the cursor
+// rows), returning the cached frame untouched when nothing changed. THE
+// OUTPUT MUST BE BYTE-IDENTICAL to a full repaint for every input — this
+// test proves it.
 //
 // Method: drive ONE Terminal through a long sequence of mutations (typing,
 // backspace, cursor moves, SGR/colour changes, wide CJK, combining marks,
 // DECDWL double-width, DECDHL double-height, scrollback display-offset changes,
 // selection set/extend/clear, blink-phase toggles, cursor-style override,
 // resize). After EACH mutation, render the extracted `RenderInput` two ways:
-//   - through a PERSISTENT renderer that has rendered every prior frame (so its
-//     damage cache is warm and the fast path is exercised), and
-//   - through a FRESH renderer that has never rendered before (always the full
-//     repaint path).
+//   - through a PERSISTENT renderer PLUS its persistent per-window
+//     `WindowCpu` damage cache, via `render_input_cached` — the exact entry
+//     the shipping CPU present drives (`present_input_scratch` →
+//     `render_input_cached(&mut ws.cpu_cache, ..)`), so the cache is warm
+//     and the fast path is truly exercised — and
+//   - through a FRESH renderer that has never rendered before (always the
+//     full repaint path), via the owned `render_input` entry.
 // Then assert `damaged.pixels == full.pixels`, pixel for pixel. Any divergence
 // is a visual regression and fails the build.
+//
+// VACUOUSNESS PIN (the regression this warm arm repairs): when the damage
+// cache was externalized into `WindowCpu`, `render_input` became
+// throwaway-cache-per-call — unconditionally a full repaint — and this
+// test's warm arm, still calling it, silently degraded to FULL-vs-FULL:
+// byte-parity asserts that could never fail, a speedup print reading ~1.0x,
+// and the fast path it documents untested here. The warm arm now drives
+// `render_input_cached` over a persistent `WindowCpu`, and each test PINS
+// via the `DamageRig` outcome tally that the row-scoped path, the dirty
+// gate, and the full fallback all actually ran — so this gate cannot
+// silently go vacuous again.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::{CursorStyle, Terminal};
-use aterm_render::{Frame, Renderer, Theme};
+use aterm_render::{DamageOutcome, Frame, Renderer, Theme, WindowCpu};
 
 fn renderer() -> Option<Renderer> {
     Renderer::from_system(18.0, Theme::default()).map(|mut r| {
@@ -31,6 +46,33 @@ fn renderer() -> Option<Renderer> {
         // every block after the first instant).
         r.debug_block_on_lazy_fallbacks();
         r
+    })
+}
+
+/// The WARM ARM's persistent state: the renderer PLUS its per-window damage
+/// cache (`WindowCpu`) — the exact pair the shipping CPU present holds per
+/// window — and a tally of the [`DamageOutcome`]s the walk actually took, so
+/// each test can PIN that the fast paths were exercised (see the header's
+/// vacuousness note: without the pins, a refactor that reroutes the warm arm
+/// back through a throwaway cache turns every parity assert into a
+/// tautology).
+struct DamageRig {
+    r: Renderer,
+    wc: WindowCpu,
+    full_frames: usize,
+    gate_frames: usize,
+    rows_frames: usize,
+    scroll_frames: usize,
+}
+
+fn rig() -> Option<DamageRig> {
+    renderer().map(|r| DamageRig {
+        r,
+        wc: WindowCpu::new(),
+        full_frames: 0,
+        gate_frames: 0,
+        rows_frames: 0,
+        scroll_frames: 0,
     })
 }
 
@@ -53,11 +95,14 @@ impl Default for RState {
     }
 }
 
-/// Render `term` at `rows`x`cols` through `damaged` (warm cache) and through a
-/// brand-new renderer (always full repaint), under identical renderer state, and
-/// assert the framebuffers are byte-for-byte equal. `label` names the step.
+/// Render `term` at `rows`x`cols` through the warm rig (`render_input_cached`
+/// over its persistent `WindowCpu` — the damage fast path) and through a
+/// brand-new renderer (always full repaint), under identical renderer state,
+/// and assert the framebuffers are byte-for-byte equal. `label` names the
+/// step. The warm arm's [`DamageOutcome`] is tallied onto the rig so each
+/// test can pin which paths its walk exercised.
 fn assert_identical(
-    damaged: &mut Renderer,
+    damaged: &mut DamageRig,
     rows: usize,
     cols: usize,
     term: &mut Terminal,
@@ -67,9 +112,29 @@ fn assert_identical(
     // A-3: the engine builds the snapshot; the renderer consumes the value.
     let input = term.cell_frame(rows, cols);
 
-    damaged.set_cursor_blink_phase(st.blink_phase);
-    damaged.set_cursor_style_override(st.cursor_override);
-    let dmg: Frame = damaged.render_input(&input);
+    damaged.r.set_cursor_blink_phase(st.blink_phase);
+    damaged.r.set_cursor_style_override(st.cursor_override);
+    // THE WARM ARM: the persistent per-window damage cache — the shipping CPU
+    // present's entry. NOT `render_input`: that one full-repaints into a
+    // throwaway `WindowCpu` per call, which is exactly the degradation the
+    // header's vacuousness note records. The borrowed view is cloned into an
+    // owned `Frame` only so the exclusive `wc` borrow ends before the outcome
+    // tally reads it (a test-only copy; the shipping present keeps the
+    // borrow).
+    let dmg: Frame = {
+        let view = damaged.r.render_input_cached(&mut damaged.wc, &input);
+        Frame {
+            width: view.width(),
+            height: view.height(),
+            pixels: view.pixels().to_vec(),
+        }
+    };
+    match damaged.wc.last_damage() {
+        DamageOutcome::Full => damaged.full_frames += 1,
+        DamageOutcome::GateHit => damaged.gate_frames += 1,
+        DamageOutcome::Rows => damaged.rows_frames += 1,
+        DamageOutcome::Scroll { .. } => damaged.scroll_frames += 1,
+    }
 
     let mut fresh = renderer().expect("font available (checked by caller)");
     fresh.set_cursor_blink_phase(st.blink_phase);
@@ -111,7 +176,7 @@ fn assert_identical(
 /// system font is present, matching the other renderer tests' SKIP convention.
 #[test]
 fn damage_path_is_byte_identical_to_full_repaint() {
-    let Some(mut dmg) = renderer() else {
+    let Some(mut dmg) = rig() else {
         eprintln!("SKIP: no system monospace font");
         return;
     };
@@ -270,6 +335,26 @@ fn damage_path_is_byte_identical_to_full_repaint() {
     assert_identical(&mut dmg, rows, cols, &mut term, st, "shrink resize");
     term.process(b"Q");
     assert_identical(&mut dmg, rows, cols, &mut term, st, "1-cell after shrink");
+
+    // ANTI-VACUOUSNESS PINS (see the header): the walk must have exercised
+    // every class of the warm arm's damage machinery, or the parity asserts
+    // above proved nothing about the fast path.
+    assert!(
+        dmg.rows_frames > 0,
+        "warm arm never took the row-scoped damage path — the differential is vacuous"
+    );
+    assert!(
+        dmg.gate_frames > 0,
+        "warm arm never dirty-gate-hit (the no-op steps must gate) — the differential is vacuous"
+    );
+    assert!(
+        dmg.full_frames > 0,
+        "warm arm never full-repainted (first frame + resizes must) — the fallback lost coverage"
+    );
+    eprintln!(
+        "damage outcomes over the walk: rows {} | gate {} | full {} | scroll {}",
+        dmg.rows_frames, dmg.gate_frames, dmg.full_frames, dmg.scroll_frames
+    );
 }
 
 /// Rough, machine-dependent timing: how much cheaper is a warm 1-cell change
@@ -280,7 +365,7 @@ fn damage_path_is_byte_identical_to_full_repaint() {
 #[ignore]
 fn bench_one_cell_speedup() {
     use std::time::Instant;
-    let Some(mut dmg) = renderer() else {
+    let Some(mut dmg) = rig() else {
         eprintln!("SKIP: no system monospace font");
         return;
     };
@@ -292,12 +377,12 @@ fn bench_one_cell_speedup() {
         term.process(b"the quick brown fox jumps over the lazy dog 0123456789");
     }
     let st = RState::default();
-    dmg.set_cursor_blink_phase(st.blink_phase);
-    dmg.set_cursor_style_override(st.cursor_override);
+    dmg.r.set_cursor_blink_phase(st.blink_phase);
+    dmg.r.set_cursor_style_override(st.cursor_override);
 
-    // Warm the damage cache.
+    // Warm the damage cache (the persistent rig — the fast path under test).
     let input0 = term.cell_frame(rows, cols);
-    let _ = dmg.render_input(&input0);
+    let _ = dmg.r.render_input_cached(&mut dmg.wc, &input0);
 
     let iters = 200u32;
 
@@ -309,8 +394,8 @@ fn bench_one_cell_speedup() {
             term.process(b"\x1b[1;1H");
             term.process(&[ch]);
             let input = term.cell_frame(rows, cols);
-            let f = dmg.render_input(&input);
-            std::hint::black_box(&f);
+            let view = dmg.r.render_input_cached(&mut dmg.wc, &input);
+            std::hint::black_box(view.pixels().as_ptr());
         }
         start.elapsed()
     };
@@ -350,7 +435,7 @@ fn bench_one_cell_speedup() {
 /// This is the dominant interactive case the optimization targets.
 #[test]
 fn warm_single_cell_typing_is_identical() {
-    let Some(mut dmg) = renderer() else {
+    let Some(mut dmg) = rig() else {
         eprintln!("SKIP: no system monospace font");
         return;
     };
@@ -360,11 +445,13 @@ fn warm_single_cell_typing_is_identical() {
 
     assert_identical(&mut dmg, rows, cols, &mut term, st, "warm:blank");
     let text = "The quick brown fox jumps over the lazy dog 0123";
+    let mut typed = 0usize;
     for (i, ch) in text.bytes().enumerate() {
         if i >= cols {
             break;
         }
         term.process(&[ch]);
+        typed += 1;
         assert_identical(
             &mut dmg,
             rows,
@@ -374,4 +461,21 @@ fn warm_single_cell_typing_is_identical() {
             &format!("warm:type[{i}]"),
         );
     }
+
+    // The dominant interactive case must RIDE the damage path (the header's
+    // vacuousness note): only frame 0 (cache priming) may repaint fully, no
+    // keystroke may bogusly gate-hit, and every keystroke must take the
+    // row-scoped path.
+    assert_eq!(
+        dmg.full_frames, 1,
+        "warm typing: only the cache-priming first frame may full-repaint"
+    );
+    assert_eq!(
+        dmg.gate_frames, 0,
+        "warm typing: a keystroke frame dirty-gate-hit — its glyph never reached the diff"
+    );
+    assert_eq!(
+        dmg.rows_frames, typed,
+        "warm typing: every keystroke must take the row-scoped damage path"
+    );
 }

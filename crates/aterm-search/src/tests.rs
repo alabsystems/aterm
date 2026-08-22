@@ -2212,3 +2212,493 @@ fn regex_lane_tripwire() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// SA-1 incremental narrowing: differential battery.
+//
+// The contract under test: `search_literal_narrowed(q, case, None)` equals the
+// forward batch path exactly, and `search_literal_narrowed(q + c, case,
+// Some(frame_of(q)))` equals the batch path for `q + c` — for EVERY prefix
+// step, both case modes, over corpora chosen to hit the treacherous shapes
+// (Kelvin sign, sigma forms, prepend clusters, zero-width characters,
+// combining marks, overlapping matches). The frame is OCCURRENCE lines, so
+// zero-display-width matches (dropped from results) still keep their line
+// narrable — the exact hazard a reported-match frame would lose.
+// ---------------------------------------------------------------------------
+
+/// Corpus with every shape the narrowing proof cares about.
+fn narrowing_corpus() -> Vec<&'static str> {
+    vec![
+        "plain ascii find line",
+        // U+FB01/sharp-s: this index folds with `char::to_lowercase`, which
+        // leaves both alone — kept as non-ASCII lines that exercise the
+        // Unicode fold + byte-map arms, NOT as multi-char-fold cases.
+        "\u{fb01}nd zzz",
+        "stra\u{df}e stop",
+        "temperature 300\u{212a} now", // Kelvin sign folds to ascii k
+        "\u{0600}1x prepended digit",  // prepend cluster: "1" spans no column
+        "a\u{200b}b zero width",       // U+200B: zero-width-only occurrence
+        "a\u{0301}x combining acute",  // combining mark cluster
+        "BANANA banana bAnAnA",        // overlapping + mixed case
+        "no hits here at all",
+        "find find find",
+        "\u{03a3}\u{03c3}\u{03c2} sigma forms", // final-sigma folding
+        "",
+        "xfind suffix and findx prefix",
+    ]
+}
+
+fn narrowing_index() -> SearchIndex {
+    let mut index = SearchIndex::new();
+    for (i, line) in narrowing_corpus().into_iter().enumerate() {
+        index.index_line(i, line);
+    }
+    index
+}
+
+fn batch_forward(index: &SearchIndex, query: &str, case_sensitive: bool) -> SearchResults {
+    index
+        .search_results_opts_direction(query, case_sensitive, false, SearchDirection::Forward)
+        .expect("literal search cannot fail")
+}
+
+/// Type `query` one char at a time, narrowing each step from the previous
+/// step's occurrence frame, asserting batch equality at EVERY step. Returns
+/// how many steps actually ran off a frame (the reach signal).
+fn type_and_check(index: &SearchIndex, query: &str, case_sensitive: bool) -> usize {
+    let mut frame: Option<Vec<u32>> = None;
+    let mut narrowed_steps = 0usize;
+    let mut prefix = String::new();
+    for c in query.chars() {
+        prefix.push(c);
+        if frame.is_some() {
+            narrowed_steps += 1;
+        }
+        let step = index.search_literal_narrowed(&prefix, case_sensitive, frame.as_deref());
+        let batch = batch_forward(index, &prefix, case_sensitive);
+        assert_eq!(
+            step.results,
+            batch,
+            "narrowed step for {prefix:?} (case_sensitive={case_sensitive}, framed={}) \
+             must equal the batch path",
+            narrowed_steps > 0
+        );
+        frame = step.occurrence_lines;
+    }
+    narrowed_steps
+}
+
+#[test]
+fn narrowed_typing_equals_batch_for_every_prefix_step() {
+    let index = narrowing_index();
+    for case_sensitive in [false, true] {
+        for query in [
+            "find",
+            "fin",
+            "in",
+            "ss",
+            "st",
+            "1x",
+            "ban",
+            "BANANA",
+            "k n",
+            "\u{03c2}",
+            "a\u{0301}x",
+            "zzz",
+            "q",
+            "\u{200b}b",
+            "\u{0301}x",
+        ] {
+            let narrowed = type_and_check(&index, query, case_sensitive);
+            assert_eq!(
+                narrowed,
+                query.chars().count() - 1,
+                "reach: every step after the first must run off a frame \
+                 (query {query:?}, case_sensitive={case_sensitive})"
+            );
+        }
+    }
+}
+
+/// THE zero-width hazard, isolated — with the shapes this engine's fold and
+/// column map really produce. `visit_matches` drops any match whose ORIGINAL
+/// span resolves to zero display columns (`start_col == end_col`), so a line
+/// can hold a genuine occurrence of `q` with ZERO reported matches while
+/// `q + c` matches for real:
+///
+/// - a PREPEND cluster (U+0600 + "1"): the digit lives inside the cluster, so
+///   "1" alone spans no column, while "1x" crosses the cluster boundary;
+/// - a zero-width character (U+200B): it spans no column on its own, but the
+///   two-char query straddling it into the next cell does.
+///
+/// (The multi-char-fold intuition — U+FB01 as "fi", sharp s as "ss" — is NOT
+/// one of them here: this index folds with `char::to_lowercase`, which leaves
+/// both alone, so those lines carry no such occurrence at all.)
+///
+/// A reported-match frame would lose these lines outright; the occurrence
+/// frame must keep them.
+#[test]
+fn occurrence_frame_keeps_zero_width_only_lines_narrable() {
+    // (line text, zero-width-only query, one-char extension that DOES match)
+    let cases: &[(&str, &str, &str)] = &[
+        ("\u{0600}1x prepended digit", "1", "1x"),
+        ("a\u{200b}b zero width", "\u{200b}", "\u{200b}b"),
+        ("x\u{0301}y combining acute", "\u{0301}", "\u{0301}y"),
+    ];
+    for &(text, short, grown) in cases {
+        let mut index = SearchIndex::new();
+        index.index_line(0, text);
+        index.index_line(1, "unrelated");
+
+        let step_short = index.search_literal_narrowed(short, false, None);
+        assert!(
+            step_short.results.matches.is_empty(),
+            "precondition ({text:?}): {short:?} resolves to zero display columns and is dropped"
+        );
+        let frame = step_short
+            .occurrence_lines
+            .expect("uncapped walk must produce a frame");
+        assert!(
+            frame.contains(&0),
+            "the occurrence frame must retain {text:?} despite zero reported matches"
+        );
+
+        let step_grown = index.search_literal_narrowed(grown, false, Some(&frame));
+        assert_eq!(step_grown.results, batch_forward(&index, grown, false));
+        assert!(
+            step_grown.results.matches.iter().any(|m| m.line == 0),
+            "{grown:?} crossing the cluster boundary is a real, reported match on {text:?}"
+        );
+    }
+}
+
+/// The narrowing COST GUARD's input: `literal_candidate_bound` must report
+/// what the engine's own candidate machinery would really visit — `None` when
+/// there is no selectivity to offer (sub-trigram range scan), `Some(0)` when
+/// a trigram is absent outright, and otherwise the SMALLEST involved posting
+/// list (the list the candidate driver walks).
+#[test]
+fn literal_candidate_bound_reports_the_engines_own_candidate_count() {
+    let mut index = SearchIndex::new();
+    for i in 0..40 {
+        index.index_line(i, &format!("svc-api request completed size=100 seq={i}"));
+    }
+    index.index_line(40, "svc-api request completed size=977 seq=rare");
+
+    // Sub-trigram: the engine range-scans every retained line.
+    assert_eq!(index.literal_candidate_bound("s", true), None);
+    assert_eq!(index.literal_candidate_bound("si", true), None);
+
+    // Common query: bounded by the smallest posting list, which every line is
+    // in — a frame of the same size is allowed to win the tie.
+    let common = index
+        .literal_candidate_bound("size=", true)
+        .expect("a trigram-length query has a bound");
+    assert!(
+        common >= 40,
+        "every line carries the common query ({common})"
+    );
+
+    // Rare query: the "e=9" trigram exists on exactly one line, so the engine
+    // would visit one candidate — far fewer than a frame inherited from the
+    // common prefix.
+    assert_eq!(index.literal_candidate_bound("size=9", true), Some(1));
+    assert!(
+        index.literal_candidate_bound("size=9", true).unwrap() < common,
+        "the rare keystroke is exactly where a frame must be abandoned"
+    );
+
+    // Absent content: nothing to visit at all.
+    assert_eq!(index.literal_candidate_bound("zzz-absent", true), Some(0));
+
+    // Case-insensitive uses the folded query's trigrams.
+    assert_eq!(
+        index.literal_candidate_bound("SIZE=9", false),
+        index.literal_candidate_bound("size=9", true)
+    );
+
+    // The bound is honest about what the walk really costs: verifying the
+    // engine's candidates yields the same results as verifying everything.
+    let bounded = index
+        .search_literal_narrowed("size=9", true, None)
+        .results
+        .matches
+        .len();
+    assert_eq!(bounded, 1);
+}
+
+/// Backspace: a frame re-verifies ITS OWN query too (occurrences ⊇ matches),
+/// so popping the stack needs no index work either.
+#[test]
+fn frame_reverifies_its_own_query_after_backspace() {
+    let index = narrowing_index();
+    let step_f = index.search_literal_narrowed("f", false, None);
+    let frame_f = step_f.occurrence_lines.clone().expect("frame");
+    let step_fi = index.search_literal_narrowed("fi", false, Some(&frame_f));
+    let frame_fi = step_fi.occurrence_lines.expect("frame");
+    // Backspace from "fin" to "fi": re-verify "fi" against its own frame.
+    let replay = index.search_literal_narrowed("fi", false, Some(&frame_fi));
+    assert_eq!(replay.results, batch_forward(&index, "fi", false));
+    // And from "fi" to "f" using the deeper frame's ancestor.
+    let replay_f = index.search_literal_narrowed("f", false, Some(&frame_f));
+    assert_eq!(replay_f.results, batch_forward(&index, "f", false));
+}
+
+/// Capped walks: results still equal the FORWARD batch edge exactly, and no
+/// frame is produced (a truncated frame would break the subset property).
+#[test]
+fn capped_narrowed_walk_matches_forward_batch_and_yields_no_frame() {
+    let mut index = SearchIndex::new();
+    // 1_000 lines × 120 overlapping 'a' matches ≫ MAX_SEARCH_MATCHES.
+    let line = "a".repeat(120);
+    for i in 0..1_000 {
+        index.index_line(i, &line);
+    }
+    for case_sensitive in [false, true] {
+        let step = index.search_literal_narrowed("a", case_sensitive, None);
+        let batch = batch_forward(&index, "a", case_sensitive);
+        assert_eq!(
+            step.results, batch,
+            "capped case_sensitive={case_sensitive}"
+        );
+        assert_eq!(step.results.matches.len(), MAX_SEARCH_MATCHES);
+        assert!(step.results.incomplete, "the cap reports honestly");
+        assert!(
+            step.occurrence_lines.is_none(),
+            "a capped walk must not seed a frame"
+        );
+    }
+}
+
+/// The eviction honesty pair rides through narrowing untouched: after the
+/// index evicts, both paths report the same `incomplete` + watermark.
+#[test]
+fn narrowed_walk_carries_eviction_honesty_like_batch() {
+    let mut index = SearchIndex::with_max_cached_lines(8);
+    for i in 0..40 {
+        index.index_line(i, &format!("needle {i}"));
+    }
+    assert!(index.results_may_be_incomplete(), "tiny cap must evict");
+    let step = index.search_literal_narrowed("needle", false, None);
+    let batch = batch_forward(&index, "needle", false);
+    assert_eq!(step.results, batch);
+    assert!(step.results.incomplete);
+    let frame = step.occurrence_lines.expect("uncapped");
+    let step2 = index.search_literal_narrowed("needle ", false, Some(&frame));
+    assert_eq!(step2.results, batch_forward(&index, "needle ", false));
+}
+
+/// SA-3 (set-diff changed-row re-index): an arbitrary in-place edit script
+/// must leave the index RESULT-identical to a from-scratch build over the
+/// final texts — across shared / old-only / new-only trigram classes, the
+/// unchanged-row skip, Unicode↔ASCII rewrites (the lowered-pass symmetry),
+/// sigma folding, and the emptied-list prune. This is the oracle the
+/// remove-all/insert-all → symmetric-difference rewrite is gated on.
+#[test]
+fn changed_row_reindex_matches_from_scratch_rebuild() {
+    let script: &[(usize, &str)] = &[
+        (0, "hello world"),
+        (1, "GET /api/v1/items 200"),
+        (2, "stra\u{df}e \u{fb01}nd"),
+        (3, "needle alpha"),
+        (0, "hello worlq"),           // tail edit: almost all trigrams shared
+        (1, "GET /api/v1/items 500"), // digit edit mid-list (rows above exist)
+        (2, "plain ascii now"),       // full rewrite, Unicode → ASCII
+        (3, "needle alpha"),          // unchanged: the skip path
+        (3, "NEEDLE ALPHA"),          // case flip: lowered pass diverges
+        (0, "zzz totally new"),       // full rewrite, disjoint trigrams
+        (4, "\u{03a3}\u{03c2} sigma forms"),
+        (4, "\u{03c3} sigma forms"), // sigma-fold: lowered trigrams shared
+    ];
+    let mut incremental = SearchIndex::new();
+    for &(row, text) in script {
+        incremental.index_line(row, text);
+    }
+    let mut last = std::collections::BTreeMap::new();
+    for &(row, text) in script {
+        last.insert(row, text);
+    }
+    let mut fresh = SearchIndex::new();
+    for (&row, &text) in &last {
+        fresh.index_line(row, text);
+    }
+
+    for query in [
+        "hello",
+        "world",
+        "worlq",
+        "200",
+        "500",
+        "items",
+        "needle",
+        "NEEDLE",
+        "alpha",
+        "stra",
+        "\u{df}",
+        "\u{fb01}nd",
+        "ascii",
+        "zzz",
+        "sigma",
+        "\u{03c3}",
+        "GET",
+        "get",
+        "tot",
+    ] {
+        for case_sensitive in [false, true] {
+            let a = incremental
+                .search_results_opts(query, case_sensitive, false)
+                .expect("literal search cannot fail");
+            let b = fresh
+                .search_results_opts(query, case_sensitive, false)
+                .expect("literal search cannot fail");
+            assert_eq!(
+                a, b,
+                "incremental edits vs from-scratch: query {query:?} \
+                 case_sensitive={case_sensitive}"
+            );
+        }
+    }
+
+    // Negative control: content that existed only pre-edit is really gone —
+    // the old-only removals (and the emptied-list prune) did run.
+    for stale in ["world 200", "worl\u{0064} ", "\u{df}e"] {
+        assert!(
+            incremental
+                .search_results_opts(stale, true, false)
+                .expect("ok")
+                .matches
+                .len()
+                == fresh
+                    .search_results_opts(stale, true, false)
+                    .expect("ok")
+                    .matches
+                    .len(),
+            "stale probe {stale:?}"
+        );
+    }
+}
+
+/// The set-diff must also hold when the SAME text bounces A→B→A: the row ends
+/// where it started and every posting list must read as if never touched.
+#[test]
+fn changed_row_reindex_round_trip_is_identity() {
+    let mut bounced = SearchIndex::new();
+    let mut untouched = SearchIndex::new();
+    for i in 0..20 {
+        bounced.index_line(i, &format!("filler row {i} needle"));
+        untouched.index_line(i, &format!("filler row {i} needle"));
+    }
+    bounced.index_line(7, "completely different text");
+    bounced.index_line(7, "filler row 7 needle");
+
+    for query in ["filler", "needle", "row 7", "different", "complet"] {
+        for case_sensitive in [false, true] {
+            assert_eq!(
+                bounced
+                    .search_results_opts(query, case_sensitive, false)
+                    .expect("ok"),
+                untouched
+                    .search_results_opts(query, case_sensitive, false)
+                    .expect("ok"),
+                "A→B→A bounce must be observationally identity ({query:?})"
+            );
+        }
+    }
+}
+
+/// `drop_history_below` (the complete-retention twin of `retain_history_from`)
+/// must leave the index OBSERVATIONALLY IDENTICAL to a from-scratch build over
+/// the surviving rows: same matches, same completeness (complete!), same
+/// watermark — the equivalence `Terminal::indexed_search`'s incremental
+/// refresh rests on. `retain_history_from` on the same input is the contrast:
+/// identical matches but an honest `incomplete` flag.
+#[test]
+fn drop_history_below_matches_fresh_rebuild_including_completeness() {
+    let mut dropped = SearchIndex::new();
+    let mut retained = SearchIndex::new();
+    for i in 0..40 {
+        dropped.index_line(i, &format!("needle row {i}"));
+        retained.index_line(i, &format!("needle row {i}"));
+    }
+    dropped.drop_history_below(15);
+    retained.retain_history_from(15);
+
+    let mut fresh = SearchIndex::new();
+    for i in 15..40 {
+        fresh.index_line(i, &format!("needle row {i}"));
+    }
+
+    let rows = |idx: &SearchIndex| -> Vec<usize> {
+        idx.search_with_positions("needle")
+            .into_iter()
+            .map(|m| m.line)
+            .collect()
+    };
+    assert_eq!(rows(&dropped), (15..40).collect::<Vec<_>>());
+    assert_eq!(rows(&dropped), rows(&fresh), "matches equal a fresh build");
+    assert_eq!(
+        rows(&dropped),
+        rows(&retained),
+        "both twins drop the same rows"
+    );
+
+    // The observable divergence between the twins is EXACTLY the honesty pair.
+    assert!(
+        !dropped.results_may_be_incomplete(),
+        "complete-retention drop must NOT report incompleteness (fresh-build parity)"
+    );
+    assert_eq!(dropped.lowest_retained_line(), 0, "fresh-build parity");
+    assert!(
+        retained.results_may_be_incomplete(),
+        "index-side eviction keeps reporting honestly"
+    );
+    assert_eq!(retained.lowest_retained_line(), 15);
+
+    // Dropped rows are really gone from the posting lists, not merely masked:
+    // queries that ONLY ever matched below the cut return nothing, exactly as
+    // in the fresh build. (The probes must be rows with no numeric extension
+    // in range — "row 3" would also match rows 30..=39, which SURVIVE the
+    // cut, and would pass for the wrong reason.)
+    for below_cut in ["row 7", "row 14"] {
+        assert!(
+            dropped.search_with_positions(below_cut).is_empty(),
+            "{below_cut:?} only ever matched below the cut"
+        );
+        assert!(
+            fresh.search_with_positions(below_cut).is_empty(),
+            "fresh-build parity for {below_cut:?}"
+        );
+    }
+    // Positive control: a SURVIVING row stays findable, so the drop did not
+    // simply empty the postings.
+    assert_eq!(dropped.search_with_positions("row 39").len(), 1);
+    assert_eq!(
+        dropped.search_with_positions("row 39").len(),
+        fresh.search_with_positions("row 39").len()
+    );
+}
+
+/// A no-op drop (at or below the current first cached line) must change
+/// nothing — the guard the per-search refresh relies on when retention did
+/// not advance between searches.
+#[test]
+fn drop_history_below_is_a_noop_at_or_below_the_first_cached_line() {
+    let mut idx = SearchIndex::new();
+    for i in 5..25 {
+        idx.index_line(i, &format!("needle {i}"));
+    }
+    let before: Vec<usize> = idx
+        .search_with_positions("needle")
+        .into_iter()
+        .map(|m| m.line)
+        .collect();
+    idx.drop_history_below(5);
+    idx.drop_history_below(0);
+    let after: Vec<usize> = idx
+        .search_with_positions("needle")
+        .into_iter()
+        .map(|m| m.line)
+        .collect();
+    assert_eq!(before, after);
+    assert!(!idx.results_may_be_incomplete());
+}

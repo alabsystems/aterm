@@ -12,7 +12,7 @@
 use crate::cell::{CellFlags, PackedColor};
 use crate::cell_colors::PackedColors;
 use crate::cursor::Cursor;
-use crate::style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs};
+use crate::style::{ExtendedStyle, Style};
 use aterm_types::charset::CharacterSetState;
 
 /// Current style attributes for new characters.
@@ -39,22 +39,19 @@ pub struct CurrentStyle {
     /// When true, `write_ascii_blast` can be used instead of styled writes.
     /// Updated alongside `cached_colors` to avoid 4 per-bulk-call checks.
     cached_is_default: bool,
-    /// Cached StyleAttrs derived from CellFlags.
-    /// Avoids the 12-iteration `cell_flags_to_attrs` loop on color-only SGR changes.
-    /// Updated when flags change via `update_cached_colors()`.
-    cached_attrs: StyleAttrs,
-    /// Cached fg Color for style intern.
-    /// Avoids `unpack_color` branch chain on every `update_style_id`.
-    cached_fg_color: Color,
-    /// Cached bg Color for style intern.
-    cached_bg_color: Color,
-    /// Cached fg `ColorType` and palette index for style intern.
-    /// Avoids redundant `packed_color_type` branch chain on color-only SGR changes.
-    cached_fg_type: ColorType,
-    cached_fg_index: u8,
-    /// Cached bg `ColorType` and palette index for style intern.
-    cached_bg_type: ColorType,
-    cached_bg_index: u8,
+    // NOTE: this struct used to carry SEVEN more cached fields — `cached_attrs`,
+    // `cached_fg_color`, `cached_bg_color` and the two (`ColorType`, index) pairs.
+    // Not one of them was ever read by a cell writer: they existed solely to
+    // feed `StyleTable` interning on the SGR path, and the interned `StyleId`
+    // had no production consumer (no code path sets `CellFlags::USES_STYLE_ID`;
+    // cells store colours inline as `PackedColors`). Maintaining them cost a
+    // 15-entry `cell_flags_to_style_attrs` fold plus two `unpack_color` branch
+    // chains on EVERY SGR. The three survivors above are exactly the ones the
+    // writers read (`cached_colors` in `write_char_core`, `has_style_extras` in
+    // the extras gate, `is_default` in the ASCII-blast gate). `build_style` /
+    // `build_extended_style*` now compute their answer on demand, so the
+    // conversion is paid only if someone actually asks for a `Style` — which,
+    // in production, nobody does.
 }
 
 impl Default for CurrentStyle {
@@ -69,13 +66,6 @@ impl Default for CurrentStyle {
             cached_colors: crate::Cell::convert_colors(fg, bg),
             cached_has_style_extras: false,
             cached_is_default: true,
-            cached_attrs: StyleAttrs::empty(),
-            cached_fg_color: Color::DEFAULT_FG,
-            cached_bg_color: Color::DEFAULT_BG,
-            cached_fg_type: ColorType::Default,
-            cached_fg_index: 0,
-            cached_bg_type: ColorType::Default,
-            cached_bg_index: 0,
         }
     }
 }
@@ -84,9 +74,6 @@ impl CurrentStyle {
     /// Construct from explicit fields (checkpoint deserialization).
     #[must_use]
     pub fn new(fg: PackedColor, bg: PackedColor, flags: CellFlags, protected: bool) -> Self {
-        let ext = ExtendedStyle::from_packed_colors_separate(fg, bg, flags);
-        let (fg_type, fg_index) = Self::packed_color_type(fg);
-        let (bg_type, bg_index) = Self::packed_color_type(bg);
         Self {
             fg,
             bg,
@@ -95,13 +82,6 @@ impl CurrentStyle {
             cached_colors: crate::Cell::convert_colors(fg, bg),
             cached_has_style_extras: flags.has_extended_flags() || fg.is_rgb() || bg.is_rgb(),
             cached_is_default: fg.is_default() && bg.is_default() && flags.is_empty() && !protected,
-            cached_attrs: ext.style.attrs,
-            cached_fg_color: ext.style.fg,
-            cached_bg_color: ext.style.bg,
-            cached_fg_type: fg_type,
-            cached_fg_index: fg_index,
-            cached_bg_type: bg_type,
-            cached_bg_index: bg_index,
         }
     }
 
@@ -174,30 +154,17 @@ impl CurrentStyle {
             && self.bg.is_default()
             && self.flags.is_empty()
             && !self.protected;
-        // Update style intern cache: attrs from flags, colors from packed.
-        self.cached_attrs = ExtendedStyle::cell_flags_to_style_attrs(self.flags);
-        self.cached_fg_color = Self::packed_to_color(self.fg, Color::DEFAULT_FG);
-        self.cached_bg_color = Self::packed_to_color(self.bg, Color::DEFAULT_BG);
-        let (fg_type, fg_index) = Self::packed_color_type(self.fg);
-        let (bg_type, bg_index) = Self::packed_color_type(self.bg);
-        self.cached_fg_type = fg_type;
-        self.cached_fg_index = fg_index;
-        self.cached_bg_type = bg_type;
-        self.cached_bg_index = bg_index;
     }
 
     /// Recompute only the flag-derived caches after a flags-only SGR change.
     ///
     /// A flags-only SGR (e.g. `\x1b[1m`, `\x1b[7m`, `\x1b[22m`) flips attribute
-    /// bits without touching `fg`/`bg`. The cached color fields
-    /// (`cached_fg_color`, `cached_bg_color`, `cached_colors`, color types and
-    /// indices) therefore remain valid and are deliberately NOT recomputed —
-    /// only `cached_attrs` and the two flag-dependent booleans need refreshing.
-    /// This is the allocation-free fast path that avoids `convert_colors`,
-    /// `packed_to_color` and `packed_color_type` on every attribute toggle.
+    /// bits without touching `fg`/`bg`, so `cached_colors` (a pure function of
+    /// `fg`/`bg`) stays valid and is deliberately NOT recomputed — only the two
+    /// flag-dependent booleans need refreshing. This is the fast path that
+    /// avoids `convert_colors` on every attribute toggle.
     #[inline]
     pub fn update_flags_cache(&mut self) {
-        self.cached_attrs = ExtendedStyle::cell_flags_to_style_attrs(self.flags);
         self.cached_has_style_extras =
             self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
         self.cached_is_default = self.fg.is_default()
@@ -206,189 +173,62 @@ impl CurrentStyle {
             && !self.protected;
     }
 
-    /// Build just the `Style` (fg, bg, attrs) from cached fields.
+    /// Build just the `Style` (fg, bg, attrs) that this rendition denotes.
     ///
-    /// Cheaper than `build_extended_style` — omits `fg_type`/`bg_type`/index
-    /// fields. Used for L1 cache probes where only the `Style` is needed for
-    /// comparison before deciding whether to build the full `ExtendedStyle`.
+    /// Computed on demand from `fg`/`bg`/`flags` rather than read out of a
+    /// cache: the cache existed only to make `StyleTable` interning cheap on
+    /// the SGR path, and nothing interns on that path any more. No production
+    /// caller remains; this is the round-trip/inspection API (and the entry
+    /// point a future "route non-`PackedColors` styles through `USES_STYLE_ID`"
+    /// design would build on), so it must stay correct, not fast.
     #[inline]
     #[must_use]
     pub fn build_style(&self) -> Style {
-        Style {
-            fg: self.cached_fg_color,
-            bg: self.cached_bg_color,
-            attrs: self.cached_attrs,
-        }
+        self.build_extended_style().style
     }
 
-    /// Cached bg color for constructing L2 probe styles without full rebuild.
-    #[inline]
-    #[must_use]
-    pub fn cached_bg_color(&self) -> Color {
-        self.cached_bg_color
-    }
-
-    /// Cached style attrs for constructing L2 probe styles without full rebuild.
-    #[inline]
-    #[must_use]
-    pub fn cached_attrs(&self) -> StyleAttrs {
-        self.cached_attrs
-    }
-
-    /// Update only fg-related caches after an indexed fg color change.
+    /// Build the `ExtendedStyle` (colors + color types + palette indices) that
+    /// this rendition denotes.
     ///
-    /// Called on L1/L2 cache hit to keep caches consistent without the full
-    /// `build_extended_style_fg_changed` recomputation. Only updates fg color,
-    /// fg type/index, packed colors, and derived flags.
-    #[inline]
-    pub fn update_fg_cache_indexed(&mut self, index: u8) {
-        self.cached_fg_color = Color::from_ansi_256(index);
-        self.cached_fg_type = ColorType::Indexed;
-        self.cached_fg_index = index;
-        self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
-        self.cached_is_default = false;
-    }
-
-    /// Build an `ExtendedStyle` for intern lookup using cached attrs/colors.
-    ///
-    /// This avoids the `cell_flags_to_attrs` loop (12 iterations) and the
-    /// `unpack_color` branch chain when only the fg or bg color has changed.
-    /// Call `update_cached_colors()` first to ensure caches are fresh.
+    /// One `from_packed_colors_separate` call — the same conversion the seven
+    /// deleted cache fields used to precompute on every SGR whether or not
+    /// anyone would read it.
     #[inline]
     #[must_use]
     pub fn build_extended_style(&self) -> ExtendedStyle {
-        ExtendedStyle {
-            style: Style {
-                fg: self.cached_fg_color,
-                bg: self.cached_bg_color,
-                attrs: self.cached_attrs,
-            },
-            fg_type: self.cached_fg_type,
-            bg_type: self.cached_bg_type,
-            fg_index: self.cached_fg_index,
-            bg_index: self.cached_bg_index,
-        }
+        ExtendedStyle::from_packed_colors_separate(self.fg, self.bg, self.flags)
     }
 
-    /// Build an `ExtendedStyle` after only the fg color changed.
+    /// Refresh the writer caches after only the fg color changed, and return
+    /// the resulting `ExtendedStyle`.
     ///
-    /// Updates cached fg color inline, reuses cached bg color and attrs.
-    /// Avoids `update_cached_colors` + full `from_packed_colors_separate`.
+    /// Kept as a distinct entry point for callers that mutate `fg` directly;
+    /// the fg/bg/both split no longer buys anything (the surviving caches are
+    /// recomputed wholesale in three instructions), so all three variants share
+    /// `update_cached_colors`.
     #[inline]
     #[must_use]
     pub fn build_extended_style_fg_changed(&mut self) -> ExtendedStyle {
-        // Update only fg-related caches
-        self.cached_fg_color = Self::packed_to_color(self.fg, Color::DEFAULT_FG);
-        self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
-        self.cached_has_style_extras =
-            self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
-        self.cached_is_default = self.fg.is_default()
-            && self.bg.is_default()
-            && self.flags.is_empty()
-            && !self.protected;
-        let (fg_type, fg_index) = Self::packed_color_type(self.fg);
-        self.cached_fg_type = fg_type;
-        self.cached_fg_index = fg_index;
-        ExtendedStyle {
-            style: Style {
-                fg: self.cached_fg_color,
-                bg: self.cached_bg_color,
-                attrs: self.cached_attrs,
-            },
-            fg_type,
-            bg_type: self.cached_bg_type,
-            fg_index,
-            bg_index: self.cached_bg_index,
-        }
+        self.update_cached_colors();
+        self.build_extended_style()
     }
 
-    /// Build an `ExtendedStyle` after only the bg color changed.
+    /// Refresh the writer caches after only the bg color changed, and return
+    /// the resulting `ExtendedStyle`.
     #[inline]
     #[must_use]
     pub fn build_extended_style_bg_changed(&mut self) -> ExtendedStyle {
-        self.cached_bg_color = Self::packed_to_color(self.bg, Color::DEFAULT_BG);
-        self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
-        self.cached_has_style_extras =
-            self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
-        self.cached_is_default = self.fg.is_default()
-            && self.bg.is_default()
-            && self.flags.is_empty()
-            && !self.protected;
-        let (bg_type, bg_index) = Self::packed_color_type(self.bg);
-        self.cached_bg_type = bg_type;
-        self.cached_bg_index = bg_index;
-        ExtendedStyle {
-            style: Style {
-                fg: self.cached_fg_color,
-                bg: self.cached_bg_color,
-                attrs: self.cached_attrs,
-            },
-            fg_type: self.cached_fg_type,
-            bg_type,
-            fg_index: self.cached_fg_index,
-            bg_index,
-        }
+        self.update_cached_colors();
+        self.build_extended_style()
     }
 
-    /// Build an `ExtendedStyle` after both fg and bg colors changed.
+    /// Refresh the writer caches after both fg and bg changed, and return the
+    /// resulting `ExtendedStyle`.
     #[inline]
     #[must_use]
     pub fn build_extended_style_both_changed(&mut self) -> ExtendedStyle {
-        self.cached_fg_color = Self::packed_to_color(self.fg, Color::DEFAULT_FG);
-        self.cached_bg_color = Self::packed_to_color(self.bg, Color::DEFAULT_BG);
-        self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
-        self.cached_has_style_extras =
-            self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
-        self.cached_is_default = self.fg.is_default()
-            && self.bg.is_default()
-            && self.flags.is_empty()
-            && !self.protected;
-        let (fg_type, fg_index) = Self::packed_color_type(self.fg);
-        let (bg_type, bg_index) = Self::packed_color_type(self.bg);
-        self.cached_fg_type = fg_type;
-        self.cached_fg_index = fg_index;
-        self.cached_bg_type = bg_type;
-        self.cached_bg_index = bg_index;
-        ExtendedStyle {
-            style: Style {
-                fg: self.cached_fg_color,
-                bg: self.cached_bg_color,
-                attrs: self.cached_attrs,
-            },
-            fg_type,
-            bg_type,
-            fg_index,
-            bg_index,
-        }
-    }
-
-    /// Convert a `PackedColor` to a `Color`.
-    #[inline]
-    fn packed_to_color(packed: PackedColor, default: Color) -> Color {
-        if packed.is_default() {
-            default
-        } else if packed.is_indexed() {
-            Color::from_ansi_256(packed.index())
-        } else if packed.is_rgb() {
-            let (r, g, b) = packed.rgb_components();
-            Color::new(r, g, b)
-        } else {
-            default
-        }
-    }
-
-    /// Get `ColorType` and index for a `PackedColor`.
-    #[inline]
-    fn packed_color_type(packed: PackedColor) -> (crate::style::ColorType, u8) {
-        if packed.is_default() {
-            (ColorType::Default, 0)
-        } else if packed.is_indexed() {
-            (ColorType::Indexed, packed.index())
-        } else if packed.is_rgb() {
-            (ColorType::Rgb, 0)
-        } else {
-            (ColorType::Default, 0)
-        }
+        self.update_cached_colors();
+        self.build_extended_style()
     }
 
     /// Reset to default style (full reset including DECSCA protection).
@@ -444,6 +284,9 @@ pub struct SavedCursorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Color / ColorType / StyleAttrs are now TEST-ONLY names here: production
+    // code in this file no longer converts a rendition into interner types.
+    use crate::style::{Color, ColorType, StyleAttrs};
 
     // =========================================================================
     // CurrentStyle::default — empty/no attributes
@@ -492,12 +335,12 @@ mod tests {
     }
 
     #[test]
-    fn test_default_cached_attrs_empty() {
+    fn test_default_attrs_empty() {
         let style = CurrentStyle::default();
         assert_eq!(
-            style.cached_attrs,
+            style.build_style().attrs,
             StyleAttrs::empty(),
-            "default cached_attrs should be empty"
+            "default rendition should denote empty StyleAttrs"
         );
     }
 

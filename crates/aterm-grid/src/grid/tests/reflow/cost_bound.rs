@@ -155,6 +155,50 @@ fn offloaded_resize_keeps_synchronous_reflow_within_the_ring() {
     grid.assert_invariants();
 }
 
+/// RFL-1, the categorical claim: the offloaded resize path rewraps ZERO history
+/// lines synchronously — not "a bounded ring's worth", none. The tiered store
+/// detaches O(1), the ring history is lifted into the job as materialized
+/// `Line`s (no rewrap), and the resize's synchronous reflow sink sees an empty
+/// off-screen history. Strictly tightens
+/// `offloaded_resize_keeps_synchronous_reflow_within_the_ring` (kept above as
+/// the coarse budget guard): a regression that re-routes ANY history through
+/// the synchronous sink — ring or tiered — turns this red.
+#[test]
+fn offloaded_resize_synchronous_rewrap_is_zero() {
+    let (rows, cols) = (24u16, 80u16);
+    let mut grid = tiered_grid_with_deep_history(rows, cols, 2000);
+    let ring_before = grid.ring_buffer_scrollback();
+    assert!(
+        ring_before > 0,
+        "precondition: ring scrollback exists (got {ring_before}) — otherwise \
+         the zero below would be vacuous for the ring half of the claim"
+    );
+
+    let _ = take_scrollback_reflow_sync_lines(); // reset
+    let pending = grid
+        .resize_offloading_scrollback(rows, cols / 2)
+        .expect("a width change with a tiered store yields an offload job");
+    let sync = take_scrollback_reflow_sync_lines();
+    assert_eq!(
+        sync, 0,
+        "the offloaded resize must rewrap NO history lines synchronously — the \
+         ring history rides the job (RFL-1), the tiered store is detached"
+    );
+    assert!(
+        pending.line_count() > 1000 + ring_before,
+        "the job carries BOTH tiers: deep tiered history plus the {ring_before} \
+         ring lines (line_count = {})",
+        pending.line_count()
+    );
+
+    grid.reattach_reflowed_scrollback(pending.reflow());
+    assert!(
+        grid.scrollback_lines() > 1000,
+        "history preserved after the zero-synchronous round trip"
+    );
+    grid.assert_invariants();
+}
+
 /// Audit bug B: output produced DURING the reflow window must not be dropped.
 /// Short lines so the 80→40 reflow doesn't change the line count, isolating the
 /// window contribution. Ring cap is 8, so without the capture fix ~all 500

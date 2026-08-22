@@ -36,31 +36,50 @@ pub(crate) fn create_dir_restricted(path: &std::path::Path) -> std::io::Result<(
 }
 
 /// Iterator over scrollback storage lines (oldest to newest).
+///
+/// Streams whole decoded segments (ST-6): each warm block / cold page is
+/// decoded ONCE and its lines are MOVED out — no per-line binary search,
+/// cache probe, or `Line` clone on an O(N) sequential walk. Corrupt segments
+/// are skipped whole (one warning per segment, per-line skip totals
+/// unchanged), matching [`super::ScrollbackIter`].
 pub struct ScrollbackStorageIter<'a> {
     pub(crate) storage: &'a ScrollbackStorage,
     pub(crate) idx: usize,
+    /// Decoded lines of the current segment, drained front-to-back.
+    pub(crate) buf: std::collections::VecDeque<Line>,
 }
 
 impl Iterator for ScrollbackStorageIter<'_> {
     type Item = Line;
 
-    // Skip: the tier-walk driver — routes into the per-tier `get_line`s (each
-    // individually classified: guarded-index / decode class).
+    // Skip: the segment-walk driver — routes into the per-tier bulk reads
+    // (each individually classified: guarded-index / decode class).
     #[cfg_attr(trust_verify, trust::skip)]
     fn next(&mut self) -> Option<Self::Item> {
-        let total = self.storage.line_count();
-        // `saturating_add(1)`: the loop guard keeps `idx < total <= usize::MAX`,
-        // so the increment can never overflow on a real path — the saturation
-        // just discharges the strict L0 gate's unconstrained-`idx` overflow
-        // counterexample (same cursor idiom as aterm-buffer's id counters).
-        while self.idx < total {
-            match self.storage.get_line(self.idx) {
-                Ok(Some(cow_line)) => {
-                    self.idx = self.idx.saturating_add(1);
-                    return Some(cow_line.into_owned());
+        loop {
+            if let Some(line) = self.buf.pop_front() {
+                // `saturating_add(1)`: `idx < total <= usize::MAX` on every
+                // real path — the saturation just discharges the strict L0
+                // gate's unconstrained-`idx` overflow counterexample (same
+                // cursor idiom as aterm-buffer's id counters).
+                self.idx = self.idx.saturating_add(1);
+                return Some(line);
+            }
+            let total = self.storage.line_count();
+            if self.idx >= total {
+                return None;
+            }
+            match self.storage.read_segment(self.idx) {
+                Ok(lines) => {
+                    if lines.is_empty() {
+                        // In-range index with no data: stale aggregate count
+                        // or short decode — end-of-data, like the old
+                        // `Ok(None)` arm.
+                        return None;
+                    }
+                    self.buf = std::collections::VecDeque::from(lines);
                 }
-                Ok(None) => return None,
-                Err(e) => {
+                Err((e, skip)) => {
                     // Direct `warn!`: the error interpolation cannot be
                     // pre-rendered without the fmt machinery (the `Io` variant
                     // wraps `std::io::Error`), and routing it through a shim
@@ -69,12 +88,17 @@ impl Iterator for ScrollbackStorageIter<'_> {
                     // non-terminating solve. The macro-expanded `fmt::Arguments`
                     // here leaves ONE documented full-verify gap on this
                     // function (a toolchain limitation, not a refutation).
-                    aterm_log::warn!("storage iter: skipping line {}: {e}", self.idx);
-                    self.idx = self.idx.saturating_add(1);
+                    aterm_log::warn!(
+                        "storage iter: skipping {skip} line(s) at {}: {e}",
+                        self.idx
+                    );
+                    // Clamp so a corrupt tail segment cannot push the cursor
+                    // past `total`; `max(1)` guarantees forward progress.
+                    let skip = skip.min(total.saturating_sub(self.idx)).max(1);
+                    self.idx = self.idx.saturating_add(skip);
                 }
             }
         }
-        None
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -330,6 +354,32 @@ impl ScrollbackStorage {
         dispatch!(self, remove_newest(n))
     }
 
+    /// Drop the `n` OLDEST lines (front truncation), keeping the newest
+    /// `line_count() - n`. `n >= line_count()` clears the store.
+    ///
+    /// Tier-aware front consumption: both backends advance a `front_offset`
+    /// through cold → warm → hot in age order, dropping whole blocks/pages as
+    /// they empty, with NO decompression — O(1) amortized per line. This is
+    /// the reflow job's streaming-input primitive (RFL-2): the off-thread
+    /// rewrap reads its input from the FRONT of the same store it refills at
+    /// the BACK, and this call is what releases the consumed input's memory as
+    /// the job advances — so the job's peak transient memory stays
+    /// O(step budget) uncompressed instead of O(total history).
+    // Skip: dispatches into the tier truncations (blanket-drain class), like
+    // `set_line_limit` below.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn truncate_oldest(&mut self, n: usize) -> Result<(), ScrollbackError> {
+        if n == 0 {
+            return Ok(());
+        }
+        let keep = self.line_count().saturating_sub(n);
+        match self {
+            ScrollbackStorage::Memory(sb) => sb.truncate(keep),
+            #[cfg(feature = "disk-tier")]
+            ScrollbackStorage::Disk(sb) => sb.truncate(keep),
+        }
+    }
+
     /// Set the line limit.
     // Skip: dispatches into the tier truncations (blanket-drain class).
     #[cfg_attr(trust_verify, trust::skip)]
@@ -457,6 +507,18 @@ impl ScrollbackStorage {
         ScrollbackStorageIter {
             storage: self,
             idx: 0,
+            buf: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Bulk segment read backing [`ScrollbackStorageIter`] — devirtualized
+    /// dispatch to the concrete backend's `read_segment` (see the `dispatch!`
+    /// rationale above).
+    pub(crate) fn read_segment(&self, idx: usize) -> crate::iter::SegmentResult {
+        match self {
+            ScrollbackStorage::Memory(sb) => sb.read_segment(idx),
+            #[cfg(feature = "disk-tier")]
+            ScrollbackStorage::Disk(sb) => sb.read_segment(idx),
         }
     }
 

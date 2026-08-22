@@ -45,26 +45,45 @@ pub struct Toolchain {
 impl Toolchain {
     /// `$TRUST_STAGE2_BIN`, defaulting to `$HOME/trust/build/host/stage2/bin`,
     /// canonicalised when it exists.
+    ///
+    /// GOLDEN-PATH FALLBACK: when the DEFAULT stage2 tree carries no targo and
+    /// no explicit `$TRUST_STAGE2_BIN` named one, the drivers are looked up on
+    /// `path_env` — a machine provisioned by `aterm pkg seed` has no `$HOME/trust`
+    /// checkout at all; its verified toolchain lives in the managed store and
+    /// reaches this process through PATH (shell.d, or the `tools/verify.sh`
+    /// wrapper, which prepends the store's shim dir itself). Positional
+    /// stage2-only discovery left every stage on such a machine skipping with
+    /// "no targo" — the same skew class the aterm-grid compile probe had. An
+    /// EXPLICIT override never falls back: naming a toolchain that is not
+    /// there is an error to surface, not a preference to route around.
     #[must_use]
-    pub fn discover(stage2_bin: Option<&Path>, home: &Path) -> Self {
+    pub fn discover(stage2_bin: Option<&Path>, home: &Path, path_env: &OsStr) -> Self {
+        let explicit = stage2_bin.is_some();
         let declared = stage2_bin.map_or_else(
             || home.join("trust/build/host/stage2/bin"),
             Path::to_path_buf,
         );
-        let stage2_dir = if declared.is_dir() {
+        let mut tool_dir = if declared.is_dir() {
             std::fs::canonicalize(&declared).unwrap_or(declared)
         } else {
             declared
         };
+        if !explicit
+            && !is_executable_file(&tool_dir.join("targo"))
+            && let Some(from_path) = std::env::split_paths(path_env)
+                .find(|dir| is_executable_file(&dir.join("targo")))
+        {
+            tool_dir = std::fs::canonicalize(&from_path).unwrap_or(from_path);
+        }
         let tippy = ["targo-tippy", "targo-clippy"]
             .into_iter()
-            .map(|n| stage2_dir.join(n))
+            .map(|n| tool_dir.join(n))
             .find(|p| is_executable_file(p));
         Self {
-            targo: stage2_dir.join("targo"),
-            trustdoc: stage2_dir.join("trustdoc"),
+            targo: tool_dir.join("targo"),
+            trustdoc: tool_dir.join("trustdoc"),
             tippy,
-            stage2_dir,
+            stage2_dir: tool_dir,
         }
     }
 
@@ -160,7 +179,7 @@ mod tests {
 
     #[test]
     fn the_default_location_is_the_stage2_tree_under_home() {
-        let t = Toolchain::discover(None, Path::new("/nonexistent-home"));
+        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""));
         assert_eq!(
             t.targo,
             Path::new("/nonexistent-home/trust/build/host/stage2/bin/targo")
@@ -175,7 +194,7 @@ mod tests {
 
     #[test]
     fn the_missing_trustdoc_diagnosis_names_the_config_key_and_both_remedies() {
-        let t = Toolchain::discover(None, Path::new("/nonexistent-home"));
+        let t = Toolchain::discover(None, Path::new("/nonexistent-home"), OsStr::new(""));
         let label = t.missing_trustdoc_label();
         assert!(label.contains("x.py build --stage 2"), "{label}");
         assert!(label.contains("~/.local/bin/trustdoc"), "{label}");
@@ -193,7 +212,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.join("aarch64-apple-darwin"), tmp.join("host")).expect("ln");
 
         let via_link = tmp.join("host/stage2/bin");
-        let t = Toolchain::discover(Some(&via_link), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&via_link), Path::new("/unused"), OsStr::new(""));
         assert!(t.have_targo());
         assert_eq!(t.stage2_dir, fs::canonicalize(&real).expect("canonicalize"));
         assert!(
@@ -210,14 +229,14 @@ mod tests {
         // on macOS /tmp is itself a symlink to /private/tmp.
         let real = fs::canonicalize(&tmp).expect("canonicalize");
         exec_stub(&tmp.join("targo-clippy"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""));
         assert_eq!(
             t.tippy.as_deref(),
             Some(real.join("targo-clippy").as_path())
         );
 
         exec_stub(&tmp.join("targo-tippy"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""));
         assert_eq!(
             t.tippy.as_deref(),
             Some(real.join("targo-tippy").as_path()),
@@ -229,14 +248,14 @@ mod tests {
     #[test]
     fn path_is_only_rewritten_when_a_targo_is_really_there() {
         let tmp = crate::mktemp_dir("atv-path").expect("mktemp");
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""));
         assert_eq!(
             t.path_with_stage2_first(OsStr::new("/usr/bin")),
             OsString::from("/usr/bin")
         );
 
         exec_stub(&tmp.join("targo"));
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""));
         let want = format!("{}:/usr/bin", t.stage2_dir.display());
         assert_eq!(
             t.path_with_stage2_first(OsStr::new("/usr/bin")),
@@ -249,7 +268,7 @@ mod tests {
     fn a_directory_named_targo_is_not_a_driver() {
         let tmp = crate::mktemp_dir("atv-dir").expect("mktemp");
         fs::create_dir_all(tmp.join("targo")).expect("mkdir");
-        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"));
+        let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""));
         assert!(
             !t.have_targo(),
             "fail-closed: a directory is not the verified driver"

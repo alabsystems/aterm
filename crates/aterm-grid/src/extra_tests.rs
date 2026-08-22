@@ -1248,6 +1248,218 @@ fn test_hyperlink_limit_large_map_few_hyperlinks_no_eviction() {
     assert_eq!(hyperlink_count, 100, "no hyperlinks should be evicted");
 }
 
+/// The O(1) guard must test the HYPERLINK population, not the whole map.
+///
+/// `hyperlink_screen/mixed_extras_under_limit` in miniature: 14_600 entries of
+/// which only 600 carry a link. The guard used to read `data.len()`, so EVERY
+/// call fell into the cold path, walked all 14_600 entries and evicted nothing
+/// (measured on that bench at 1_835 futile walks per MiB). Now the first call
+/// repairs the bound to the true population and every later call takes the O(1)
+/// early-out — while the OUTCOME (nothing evicted) is unchanged, which is what
+/// makes this a pure cost deletion rather than a behaviour change.
+#[test]
+fn hyperlink_guard_counts_links_not_total_entries() {
+    use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
+    use crate::test_counters::take_hyperlink_walk_ops;
+
+    let mut extras = CellExtras::new();
+    // 14_000 non-hyperlink entries. The bench uses SGR 58 underline colours;
+    // an fg RGB is the same shape here (a map entry with no link) and cheaper
+    // to build.
+    for i in 0..14_000u32 {
+        extras
+            .get_or_create(CellCoord::new((i / 200) as u16, (i % 200) as u16))
+            .set_fg_rgb(Some([1, 2, 3]));
+    }
+    // 600 hyperlinks — 6 % of the limit, nowhere near it.
+    let url: Arc<str> = Arc::from("https://example.com");
+    for i in 0..600u32 {
+        extras
+            .get_or_create(CellCoord::new(70 + (i / 200) as u16, (i % 200) as u16))
+            .set_hyperlink(Some(url.clone()));
+    }
+    assert!(
+        extras.len() > MAX_HYPERLINK_ENTRIES,
+        "precondition: the map must be OVER the limit, or the old guard would \
+         have taken its early-out and this test would prove nothing"
+    );
+    assert_eq!(extras.hyperlink_entries_slow(), 600);
+
+    let _ = take_hyperlink_walk_ops(); // reset
+    extras.enforce_hyperlink_limit();
+    let first = take_hyperlink_walk_ops();
+    assert!(
+        first >= 14_600,
+        "the first call walks once to repair the bound, got {first} entries"
+    );
+
+    for _ in 0..30 {
+        extras.enforce_hyperlink_limit();
+    }
+    assert_eq!(
+        take_hyperlink_walk_ops(),
+        0,
+        "every later call must take the O(1) early-out: 600 hyperlinks is far \
+         under the {MAX_HYPERLINK_ENTRIES} limit and the map's other 14_000 \
+         entries are not the bounded quantity"
+    );
+
+    // Behaviour identity: still nothing evicted, still every entry present.
+    assert_eq!(extras.hyperlink_entries_slow(), 600);
+    assert_eq!(extras.len(), 14_600);
+}
+
+/// A map that is UNDER the limit must never walk, however inflated the counter.
+///
+/// `hyperlink_upper_bound` over-charges: `get_or_create` charges on every handout
+/// to a link-free entry, and the per-cell write path hands out an entry for every
+/// extras cell — SGR 58 underlines here, exactly as
+/// `extras_erase/status_line_redraw` does. Repainting 1_600 such cells drives the
+/// counter past MAX_HYPERLINK_ENTRIES on entries that hold no link at all.
+///
+/// `data.len()` is the second, independent upper bound (links <= entries), and it
+/// says 1_600 — so the walk is provably pointless and must not happen. Without
+/// that clause this workload buys a cold walk every MAX_HYPERLINK_ENTRIES
+/// handouts: walks the ORIGINAL `data.len()` guard never took, which is how a
+/// hyperlink-free redraw loop regressed 1.45%.
+#[test]
+fn small_map_never_walks_however_inflated_the_counter() {
+    use crate::extra_collection::MAX_HYPERLINK_ENTRIES;
+    use crate::test_counters::take_hyperlink_walk_ops;
+
+    let mut extras = CellExtras::new();
+    // A status line's worth of coloured underlines: 10 rows x 160 cols.
+    for row in 0..10u16 {
+        for col in 0..160u16 {
+            extras
+                .get_or_create(CellCoord::new(row, col))
+                .set_underline_color(Some([7, 7, 7]));
+        }
+    }
+    assert_eq!(extras.len(), 1_600);
+    assert!(
+        extras.len() <= MAX_HYPERLINK_ENTRIES,
+        "precondition: the map must be UNDER the limit"
+    );
+
+    let _ = take_hyperlink_walk_ops(); // reset
+
+    // Redraw the same cells until the counter is well past the limit. Each
+    // handout charges again — the entries already exist and hold no link.
+    for _ in 0..20 {
+        for row in 0..10u16 {
+            for col in 0..160u16 {
+                extras
+                    .get_or_create(CellCoord::new(row, col))
+                    .set_underline_color(Some([7, 7, 7]));
+            }
+        }
+        extras.enforce_hyperlink_limit();
+    }
+    assert!(
+        extras.hyperlink_upper_bound() > MAX_HYPERLINK_ENTRIES,
+        "precondition: the counter must be inflated past the limit ({} <= {}), \
+         or this test proves nothing",
+        extras.hyperlink_upper_bound(),
+        MAX_HYPERLINK_ENTRIES
+    );
+    assert_eq!(
+        take_hyperlink_walk_ops(),
+        0,
+        "a map of {} entries cannot hold more than {MAX_HYPERLINK_ENTRIES} \
+         hyperlinks, so the cold walk is provably pointless and must be skipped",
+        extras.len()
+    );
+    assert_eq!(extras.hyperlink_entries_slow(), 0);
+}
+
+/// The bound must never sit BELOW the true hyperlink population, through every
+/// shape of mutation the map supports — that inequality IS the memory bound.
+///
+/// Drift upward is legal (it costs one self-repairing cold walk); drift downward
+/// would silently switch eviction off. Each stage below is a distinct mutation
+/// family: per-cell handout, batch run, whole-value set, single removal, row
+/// clear, O(1) offset scroll + compaction, drain-rebuild region scroll, and the
+/// column shifts.
+#[test]
+fn hyperlink_upper_bound_never_under_counts() {
+    fn check(extras: &CellExtras, stage: &str) {
+        assert!(
+            extras.hyperlink_upper_bound() >= extras.hyperlink_entries_slow(),
+            "{stage}: bound {} is BELOW the true hyperlink count {} — the limit \
+             would stop being enforced",
+            extras.hyperlink_upper_bound(),
+            extras.hyperlink_entries_slow()
+        );
+    }
+
+    let mut extras = CellExtras::new();
+    let url: Arc<str> = Arc::from("https://example.com");
+
+    // 1. Per-cell handout (`handler_write`'s per-character OSC 8 path).
+    for col in 0..10u16 {
+        extras
+            .get_or_create(CellCoord::new(0, col))
+            .set_hyperlink(Some(url.clone()));
+    }
+    check(&extras, "per-cell handout");
+
+    // 2. Batch run (`write_ascii_run_with_extras` -> `set_range_uniform`).
+    let vals = UniformExtras {
+        fg_rgb: None,
+        bg_rgb: None,
+        underline_color: None,
+        extended_flags: 0,
+        hyperlink: Some(&url),
+        hyperlink_id: None,
+    };
+    extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
+    check(&extras, "batch run");
+    // Re-painting the SAME run must not charge again: the cells already carry
+    // the link, so the population is unchanged.
+    let before = extras.hyperlink_upper_bound();
+    extras.set_range_uniform(1, 0, 10, &vals, 24, 80);
+    assert_eq!(
+        extras.hyperlink_upper_bound(),
+        before,
+        "a repaint of an already-linked run must not inflate the bound"
+    );
+
+    // 3. Whole-value set (DECCRA's rect copy).
+    let mut carried = CellExtra::default();
+    carried.set_hyperlink(Some(url.clone()));
+    extras.set(CellCoord::new(2, 0), carried);
+    check(&extras, "whole-value set");
+
+    // 4. Single removal refunds.
+    assert!(extras.remove(CellCoord::new(2, 0)));
+    check(&extras, "single removal");
+
+    // 5. Row clear (retain-based; no refund by design — must stay ABOVE).
+    extras.clear_row(1);
+    check(&extras, "row clear");
+
+    // 6. O(1) offset scroll past the compaction threshold.
+    for _ in 0..300 {
+        extras.shift_rows_up_by(0, 1);
+    }
+    check(&extras, "offset scroll + compaction");
+
+    // 7. Region scroll (drain-rebuild) and column shifts.
+    extras.set_range_uniform(3, 0, 10, &vals, 24, 80);
+    extras.shift_rows_up_by(1, 1);
+    check(&extras, "region scroll");
+    extras.shift_cols_right(2, 0, 2, 80);
+    check(&extras, "ICH column shift");
+    extras.shift_cols_left(2, 0, 2, 80);
+    check(&extras, "DCH column shift");
+
+    // 8. `clear()` is exact, not conservative.
+    extras.clear();
+    assert_eq!(extras.hyperlink_upper_bound(), 0);
+    assert_eq!(extras.hyperlink_entries_slow(), 0);
+}
+
 #[path = "extra_tests/overflow.rs"]
 mod overflow;
 #[path = "extra_tests/remap_reflow_tests.rs"]

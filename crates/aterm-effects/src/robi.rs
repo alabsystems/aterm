@@ -35,7 +35,12 @@
 //! the monkey-bar hand line actually is ([`RobiSense::bar_y`]) and where the
 //! handholds sit ([`RobiSense::handholds`]) — tab-chip centers when a strip
 //! exists, an even rhythm otherwise — so the brain never needs to know which
-//! tab flavour is on screen.
+//! tab flavour is on screen. The host also hands over the window's vertical
+//! extent ([`RobiSense::win_top`] / [`RobiSense::win_bot`]): every evaluated
+//! scene — body and ladder both — is clamped fully inside it (owner
+//! directive: he is never CLIPPED by a window edge), and a window too small
+//! to hold his body at all HIDES him ([`RobiShow::frame`] → `None`) rather
+//! than clipping him.
 //!
 //! ## Caret avoidance
 //!
@@ -178,6 +183,23 @@ pub const LADDER_ASPECT: f32 = 48.0 / 32.0;
 /// Ladder width in cell-height fractions — scaled to read right beside his
 /// 3.2-row body (the NK original's 34px ladder against his 90px frame).
 pub const LADDER_W_ROWS: f32 = 1.05;
+
+/// The ladder tile's baked size `(w, h)` in px for a viewport — ONE copy of
+/// the segment law, like [`body_size_px`]: the emitter
+/// (`WordDecorations::robi`) bakes with it, and the window clamp
+/// ([`RobiShow::frame`]) reads the same numbers because the emitter's
+/// segment stack may overshoot `ladder.top_y` by up to a quarter tile (its
+/// reach-the-bar slack) — the clamp must hold the STACK inside the window,
+/// not just the abstract extent.
+#[must_use]
+pub fn ladder_tile_px(geom: &EffectGeom) -> (u16, u16) {
+    // The authored proportion against his body, so the ladder grows with him
+    // instead of thinning into a wire beside a big robot.
+    let w_rows = LADDER_W_ROWS * art_rows(geom) / ART_ROWS;
+    let w = (w_rows * f32::from(geom.cell_h)).round().max(2.0) as u16;
+    let h = ((f32::from(w) / LADDER_ASPECT).round()).max(2.0) as u16;
+    (w, h)
+}
 
 /// The most handholds a cycle will traverse (and the most the host need
 /// resolve). Fixed-size so [`RobiSense`] stays `Copy`.
@@ -410,6 +432,15 @@ pub struct RobiSense {
     /// Handhold x-centers in grid px, left→right, `handhold_count` valid.
     pub handholds: [i32; MAX_HANDHOLDS],
     pub handhold_count: u8,
+    /// The window's TOP edge in grid px (≤ 0 — how far above row 0 the glass
+    /// really extends: `-(pad_top + head + strip_px)`). The brain clamps his
+    /// body and ladder into `win_top..win_bot` so no scene is ever clipped
+    /// by a window edge; a window too small to hold his body hides him
+    /// instead ([`RobiShow::frame`] → `None`).
+    pub win_top: i32,
+    /// The window's BOTTOM edge in grid px (≥ `rows·cell_h` — the bottom
+    /// padding sits below the grid). The other half of the `win_top` clamp.
+    pub win_bot: i32,
 }
 
 /// The resident's whole state: a birth instant plus the roll (or [`Default`]:
@@ -473,6 +504,39 @@ impl RobiShow {
         let body_w = (art_rows * ART_ASPECT * f32::from(g.cell_h)).round() as i32;
         let margin = body_w / 2 + 2;
         let clamp_x = |x: i32| x.clamp(margin, (grid_w - margin).max(margin));
+
+        // THE WINDOW CLAMP (owner directive: "he must never be clipped by
+        // the window edge"). `win_top..win_bot` is the window's vertical
+        // extent in grid px; the fit test first — a window too small to hold
+        // his drawn body HIDES him (clamping a body that cannot fit would
+        // clip it at one edge or the other). Horizontal fit is against the
+        // grid (stricter than the padded window), the same margin `clamp_x`
+        // keeps.
+        let body_h = i32::from(body_size_px(&g).1);
+        if grid_w < 2 * margin || body_h > sense.win_bot - sense.win_top {
+            return None;
+        }
+        // The vertical body clamp — the SAME top law as [`body_rect_px`]
+        // (anchor fraction, same rounding), so the drawn rect lands exactly
+        // inside `win_top..win_bot`, not approximately.
+        let clamp_anchor_y = |anchor_y: i32, anchor: RobiAnchor| -> i32 {
+            let frac = match anchor {
+                RobiAnchor::Feet => FEET_FRAC,
+                RobiAnchor::Grip => GRIP_FRAC,
+            };
+            let off = (body_h as f32 * frac).round() as i32;
+            let top = (anchor_y - off).clamp(sense.win_top, sense.win_bot - body_h);
+            top + off
+        };
+        // The ladder clamp: the emitter's segment stack overshoots `top_y`
+        // by up to a quarter tile ([`ladder_tile_px`] — its reach-the-bar
+        // slack), so the top holds that much inside the edge.
+        let ladder_lh = i32::from(ladder_tile_px(&g).1);
+        let clamp_ladder = |l: RobiLadder| RobiLadder {
+            x: l.x,
+            top_y: l.top_y.max(sense.win_top + ladder_lh / 4),
+            bot_y: l.bot_y.min(sense.win_bot),
+        };
 
         // The "textbox" ground: the bottom edge of the caret's row.
         let ground = (i32::from(sense.cursor.0) + 1) * ch;
@@ -701,11 +765,11 @@ impl RobiShow {
         Some(RobiFrame {
             pose,
             x: clamp_x(x),
-            anchor_y,
+            anchor_y: clamp_anchor_y(anchor_y, anchor),
             anchor,
             flip_x,
             alpha,
-            ladder,
+            ladder: ladder.map(clamp_ladder),
             tip,
             animating: animating || t < FADE_IN_MS,
         })
@@ -800,6 +864,10 @@ mod tests {
             },
             cursor: (28, 40),
             bar_y: -10,
+            // Headroom past the hanging body and footroom past the grid, so
+            // the window clamp is inert everywhere the beat tests probe.
+            win_top: -30,
+            win_bot: 30 * 20 + 10,
             handholds,
             handhold_count: 6,
         }
@@ -1053,6 +1121,68 @@ mod tests {
             cycle_picks.len() >= 6,
             "one resident's cycles should span many tips"
         );
+    }
+
+    /// THE WINDOW CLAMP (owner directive: never clipped by a window edge).
+    /// A shallow window — NO headroom above row 0, NO padding below the
+    /// grid, the bar line above the top edge (the chromeless-window band),
+    /// the caret on the TOP row so every ground scene would naturally poke
+    /// his head past the top — must keep his DRAWN body ([`body_px`], the
+    /// emitter's own placement law) and his ladder stack (top segment
+    /// overshoot included, [`ladder_tile_px`]) fully inside the window, in
+    /// every scene of every cycle.
+    #[test]
+    fn every_scene_stays_inside_a_shallow_window() {
+        let base = t0();
+        let s = show(base);
+        let mut se = sense();
+        se.cursor = (0, 40); // ground = 20 px — a standing body wants top −42
+        se.bar_y = -7; // the no-headroom hand line (−ch/3)
+        se.win_top = 0; // chromeless: the glass ends AT row 0
+        se.win_bot = 30 * 20; // …and at the grid's last row
+        let grid_w = 100 * 10;
+        let lh = i32::from(ladder_tile_px(&se.geom).1);
+        // From the end of the birth fade (an alpha-0 frame has no body).
+        for t in (FADE_IN_MS..2 * CYCLE_MS).step_by(97) {
+            let f = s.frame(at(base, t), &se).expect("the window holds him");
+            let (x0, x1, y0, y1) = body_px(&f, &se.geom).expect("on glass");
+            assert!(y0 >= se.win_top, "t={t}: body top {y0} pokes past the edge");
+            assert!(y1 <= se.win_bot, "t={t}: body bottom {y1} clips");
+            assert!(x0 >= 0 && x1 <= grid_w, "t={t}: body x {x0}..{x1} clips");
+            if let Some(l) = f.ladder {
+                assert!(
+                    l.top_y - lh / 4 >= se.win_top,
+                    "t={t}: ladder stack top {} clips (top_y {})",
+                    l.top_y - lh / 4,
+                    l.top_y
+                );
+                assert!(l.bot_y <= se.win_bot, "t={t}: ladder foot {} clips", l.bot_y);
+            }
+        }
+    }
+
+    /// A window too small to hold his body HIDES him — `frame` → `None`, no
+    /// clipped sliver — and he walks right back once the window can hold him
+    /// again (still born; hiding is per-evaluation, not a state change).
+    #[test]
+    fn a_window_too_small_to_hold_him_hides_him() {
+        let base = t0();
+        let s = show(base);
+        // Too shallow: 2 rows of glass (40 px) against his 64 px body.
+        let mut shallow = sense();
+        shallow.geom.rows = 2;
+        shallow.cursor = (1, 40);
+        shallow.win_top = 0;
+        shallow.win_bot = 2 * 20;
+        assert!(s.frame(at(base, 5_000), &shallow).is_none());
+        // Too narrow: 4 columns (40 px) against his 47 px body + margin.
+        let mut narrow = sense();
+        narrow.geom.cols = 4;
+        narrow.cursor = (28, 1);
+        assert!(s.frame(at(base, 5_000), &narrow).is_none());
+        // The same instant against a window that fits: present.
+        assert!(s.born());
+        assert!(s.frame(at(base, 5_000), &sense()).is_some());
     }
 
     /// Every frame stays horizontally inside the grid, across two full cycles.

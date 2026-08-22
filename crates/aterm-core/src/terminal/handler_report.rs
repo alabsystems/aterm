@@ -171,7 +171,10 @@ impl TerminalHandler<'_> {
         // reset_sgr() deliberately preserves `protected` (correct for SGR 0),
         // so we must clear it explicitly here.
         self.style.protected = false;
-        self.sgr_style().update_style_id();
+        // Refresh the writer caches and re-arm the BCE cursor template from the
+        // now-default rendition (DECSTR must not leave the previous background
+        // armed for the next erase/scroll).
+        self.sgr_style().apply_style_change();
         self.transient.current_underline_color = None;
         // Clear active hyperlink — DECSTR resets all text attributes, and
         // leaving a stale hyperlink active after soft reset would cause
@@ -587,8 +590,9 @@ impl TerminalHandler<'_> {
                 self.style.update_cached_colors();
             }
             self.transient.update_has_transient_extras();
-            // Update the cached style ID
-            self.sgr_style().update_style_id();
+            // Re-arm the BCE cursor template from the popped rendition
+            // (`update_cached_colors` above already refreshed the writer caches).
+            self.sgr_style().apply_style_change();
         }
         // Empty stack = no-op (xterm behavior)
     }

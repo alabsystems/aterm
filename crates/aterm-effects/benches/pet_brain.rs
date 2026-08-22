@@ -1047,6 +1047,10 @@ impl RobiRig {
                 bar_y: -10,
                 handholds,
                 handhold_count: 8,
+                // Headroom past the bar and footroom past the grid, so the
+                // window clamp never bites in the timed path.
+                win_top: -60,
+                win_bot: i32::from(ROWS) * i32::from(CH) + 20,
             },
         }
     }

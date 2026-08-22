@@ -106,6 +106,14 @@ fontdue = "0.9"
 # atlas/caches so a subsequent render re-rasterizes at the new px. The host-side DPR
 # fix in the renderer depends on this engine invariant holding.
 proptest = { workspace = true }
+# IMG-1 pricing bench (benches/image_diff.rs): per-frame dirty-row diff cost
+# when an inline image is RE-TRANSMITTED (fresh Arc, byte-identical payload).
+# Same direct pin as aterm-gpu's benches (criterion is not a workspace dep).
+criterion = "0.5"
+
+[[bench]]
+name = "image_diff"
+harness = false
 
 [lints]
 workspace = true

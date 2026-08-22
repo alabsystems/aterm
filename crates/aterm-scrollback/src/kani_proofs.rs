@@ -550,6 +550,10 @@ struct StubColdTier {
     page_count: usize,
     line_count: usize,
     cumulative_lines: [usize; 4],
+    /// Models the real tier's `cumulative_base`: the absolute cumulative
+    /// value of everything dropped from the front. Live entries are ABSOLUTE
+    /// (base + prefix sums) and are never rewritten on drops.
+    cumulative_base: usize,
 }
 
 impl StubColdTier {
@@ -559,16 +563,18 @@ impl StubColdTier {
             page_count: 0,
             line_count: 0,
             cumulative_lines: [0; 4],
+            cumulative_base: 0,
         }
     }
 
-    /// Push a page with given line count (models push_block success path).
+    /// Push a page with given line count (models push_block success path:
+    /// `last().unwrap_or(base) + lines`, absolute values).
     fn push_page(&mut self, lines: usize) {
         if self.page_count >= 4 {
             return;
         }
         let cumulative = if self.page_count == 0 {
-            lines
+            self.cumulative_base + lines
         } else {
             self.cumulative_lines[self.page_count - 1] + lines
         };
@@ -578,24 +584,34 @@ impl StubColdTier {
         self.line_count += lines;
     }
 
-    /// Pop front page (models real ColdTier::pop_front exactly).
+    /// Pop front page (models real ColdTier::pop_front /
+    /// `drop_front_index_entries` exactly).
     ///
-    /// Real code: pages.pop_front(), line_count -= evicted,
-    /// cumulative_lines.remove(0), then subtract evicted from all remaining.
+    /// Real code: pages.pop_front(), line_count -= evicted, then the BASE
+    /// absorbs the dropped entry's absolute value — surviving entries are
+    /// never rewritten. The array shift here mirrors the live WINDOW (the
+    /// real code advances a cursor over an unchanged vector); values move,
+    /// but are not rebased. An emptied tier resets its base, matching the
+    /// real clear-on-empty arm.
     fn pop_front(&mut self) -> usize {
         if self.page_count == 0 {
             return 0;
         }
         let evicted = self.page_line_counts[0];
         self.line_count -= evicted;
+        // Base absorbs the dropped front page's absolute cumulative value.
+        self.cumulative_base = self.cumulative_lines[0];
 
-        // Shift arrays left (models VecDeque pop_front + Vec remove(0))
-        // and subtract evicted from cumulative (models the for-loop adjustment).
+        // Shift arrays left to mirror the live window; cumulative VALUES are
+        // untouched (absolute), unlike the old subtract-rewrite model.
         for i in 0..self.page_count - 1 {
             self.page_line_counts[i] = self.page_line_counts[i + 1];
-            self.cumulative_lines[i] = self.cumulative_lines[i + 1] - evicted;
+            self.cumulative_lines[i] = self.cumulative_lines[i + 1];
         }
         self.page_count -= 1;
+        if self.page_count == 0 {
+            self.cumulative_base = 0;
+        }
 
         evicted
     }
@@ -611,13 +627,14 @@ impl StubColdTier {
         self.line_count == sum
     }
 
-    /// cumulative_lines[i] == sum(page_line_counts[0..=i]) for all i
+    /// cumulative_lines[i] == base + sum(page_line_counts[0..=i]) for all i
+    /// (live entries are absolute; the base carries the dropped prefix).
     fn cumulative_consistent(&self) -> bool {
         let mut sum = 0usize;
         let mut i = 0;
         while i < self.page_count {
             sum += self.page_line_counts[i];
-            if self.cumulative_lines[i] != sum {
+            if self.cumulative_lines[i] != self.cumulative_base + sum {
                 return false;
             }
             i += 1;

@@ -359,7 +359,7 @@ const STARTER_CONFIG: &str = "\
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off
-# robi = true                      # Robi the helper robot lives on your terminal (walks your typed row, ladder up, tab-bar monkey bars, tips above his head); type robi to make him greet you (default ON)
+# robi = true                      # Robi the helper robot lives on your terminal (walks your typed row, ladder up, tab-bar monkey bars, tips above his head); type robi to make him greet you (default OFF)
 # motion = \"auto\"                 # auto (live Reduce Motion on macOS; sampled at Windows window attach; no OS query elsewhere) | full | reduced
 # load_adaptive_motion = true      # drop effects under sustained render overload; false = never shed (motion=\"full\" also forces effects on)
 # cursor_trail = true              # the cursor motion trail + light crown (default ON)
@@ -835,6 +835,11 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                     headless,
                 };
             }
+            // NOTE: verbs are NOT parsed here. `ship` briefly was, and that was the
+            // whole defect — this parser is reached only when the mode fork already
+            // chose the window, so a verb wired here is invisible at a terminal. The
+            // front door (`crates/aterm/src/main.rs`) owns every verb in
+            // `aterm_cli::Verb`, above the fork.
             other => {
                 eprintln!("aterm-gui: unknown option '{other}' (try --help)");
                 std::process::exit(2);

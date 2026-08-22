@@ -121,10 +121,8 @@ pub use flow::{
 pub use gate::{ApplyDecision, decide, is_yanked};
 pub use gc::{GcReport, reclaimable, run as run_gc};
 pub use install::{StageError, verify_and_stage};
-pub use linkmode::{
-    LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
-    linked_programs, linked_programs_checked, refresh, unlink,
-};
+pub use linkmode::{LinkError, LinkOutcome, is_linked, link, linked_checkout, linked_checkout_checked,
+    linked_programs, linked_programs_checked, linked_tool_names, refresh, unlink};
 pub use lock::{StoreLock, StoreLockError, try_lock_store};
 // `parse_index` is deliberately NOT re-exported (and is `pub(crate)`): outside this
 // crate, the only way to a parsed `Index` is `TrustedRoster::authorize_index`, which runs
@@ -133,7 +131,7 @@ pub use manifest::{
     Artifact, Channel, Cost, Index, PkgManifest, Program, SUPPORTED_SCHEMA, parse_pkg,
 };
 pub use net::{ChainFetcher, DirFetcher, GithubFetcher};
-pub use ops::{active_builds, list_installed, uninstall, which};
+pub use ops::{active_builds, installed_exposes, list_installed, uninstall, which};
 pub use select::{Candidate, Selected, Selection, select_index};
 pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,

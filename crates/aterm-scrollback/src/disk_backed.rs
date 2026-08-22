@@ -348,6 +348,51 @@ impl DiskBackedScrollback {
         }
     }
 
+    /// Bulk read for the streaming iterators (ST-6): owned lines from `idx`
+    /// through the end of its tier segment (cold page / warm block / one hot
+    /// line). Tier dispatch mirrors `get_line`; the disk-cold path decodes a
+    /// page ONCE without inserting it into the LRU cache, so a full-history
+    /// walk cannot evict the pages the viewport is reading.
+    // Skip: the tier-dispatch driver — routes into the per-tier bulk reads
+    // (each individually classified: guarded-index / decode class).
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn read_segment(&self, idx: usize) -> crate::iter::SegmentResult {
+        let cold_count = self.cold.line_count();
+        let warm_count = self.warm.line_count();
+
+        if idx < cold_count {
+            self.cold.take_lines_from(idx).map_err(|e| {
+                // Skip the rest of the undecodable page, clamped into the
+                // cold range; `max(1)` guarantees forward progress even
+                // against a degenerate segment length.
+                let skip = self
+                    .cold
+                    .segment_len_at(idx)
+                    .min(cold_count.saturating_sub(idx))
+                    .max(1);
+                (e, skip)
+            })
+        } else if idx < cold_count.saturating_add(warm_count) {
+            let warm_idx = idx.saturating_sub(cold_count);
+            self.warm.take_lines_from(warm_idx).map_err(|e| {
+                let skip = self
+                    .warm
+                    .segment_len_at(warm_idx)
+                    .min(warm_count.saturating_sub(warm_idx))
+                    .max(1);
+                (e, skip)
+            })
+        } else {
+            let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
+            match self.hot.get(hot_idx) {
+                Some(line) => Ok(vec![line.clone()]),
+                // In-range index with no hot line: stale aggregate count —
+                // surface as end-of-data exactly like the old `Ok(None)`.
+                None => Ok(Vec::new()),
+            }
+        }
+    }
+
     /// Get a line by reverse index (0 = newest).
     ///
     /// Returns `Ok(None)` for out-of-bounds, `Err` for I/O or decompression failures.

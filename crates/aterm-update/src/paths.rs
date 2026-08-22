@@ -94,6 +94,28 @@ impl Staging {
         self.root.join("failed.toml")
     }
 
+    /// The release-listing memo (`catalog.json`): the per-page `ETag`s of the last
+    /// COMPLETE listing plus the selection those exact bytes produced. See
+    /// `github::CatalogMemo` — it is a CACHE, not state: deleting it costs one full
+    /// listing, and nothing in it is trusted (every artifact it names is still fetched
+    /// and signature-verified).
+    ///
+    /// It lives in the `0700` Updates root beside `floor.toml` and `failed.toml` for the
+    /// same reason they do: it is per-user updater bookkeeping, owner-only.
+    pub fn catalog_memo(&self) -> PathBuf {
+        self.root.join("catalog.json")
+    }
+
+    /// Where curl dumps the release listing's RESPONSE HEADERS (`catalog.headers`), so
+    /// the `ETag` can be read back.
+    ///
+    /// A file, not `-D -`: the body is captured from curl's stdout with the status
+    /// trailer appended to it, so headers on the same stream would corrupt both. It is
+    /// overwritten by every request and read immediately; nothing durable lives here.
+    pub fn catalog_headers(&self) -> PathBuf {
+        self.root.join("catalog.headers")
+    }
+
     /// The "a toolchain install is reading this bundle" marker, holding the pid of
     /// the process whose child is extracting.
     ///

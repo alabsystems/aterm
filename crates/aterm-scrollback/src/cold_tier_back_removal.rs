@@ -179,8 +179,13 @@ impl ColdTier {
             self.front_offset = 0;
         }
 
-        // Rebuild cumulative index from pages.
+        // Rebuild cumulative index from pages — a full rebuild rebases to
+        // zero, so the front-drop cursor and absolute base reset with it
+        // (back removal is the rare path; O(P) here is the pre-existing
+        // cost, untouched by the front-drop redesign).
         self.cumulative_lines.clear();
+        self.cum_start = 0;
+        self.cumulative_base = 0;
         let mut total = 0;
         for page in &self.pages {
             total += page.line_count;

@@ -296,6 +296,19 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         identity: "SEARCH_SNAPSHOTS",
         def_file: "crates/aterm-gui/src/control_query.rs",
     },
+    GuardHelper {
+        // The isearch prefix-narrowing stacks (SA-1): a grown query verifies
+        // only the previous frame's lines, and the per-terminal frame stacks
+        // live in one static behind this helper. Structurally the twin of
+        // `search_cache_lock` above — same file, same shape, a bare static
+        // `Mutex` whose guard escapes to callers — so it registers the same
+        // way. Registration EXTENDS the census: every caller's held-acquire
+        // edges are now placed against NARROW_SESSIONS instead of being
+        // invisible at call sites that carry no `.lock()` token.
+        symbol: "narrow_sessions_lock",
+        identity: "NARROW_SESSIONS",
+        def_file: "crates/aterm-gui/src/control_query.rs",
+    },
 ];
 
 /// The INTERIOR of the acquisition vocabulary itself: a fn that IMPLEMENTS one
@@ -3019,11 +3032,15 @@ mod tests {
                 .to_string(),
         ));
         files.push((
-            // Mirrors the shipping helper and its plural ring identity; this
-            // fixture makes a stale singular registration fail closed.
+            // Mirrors the shipping helpers and their static ring identities;
+            // this fixture makes a stale singular registration fail closed.
+            // BOTH control_query.rs helpers live here — one file, one fixture
+            // entry — because the registry check reads the SCANNED corpus.
             "crates/aterm-gui/src/control_query.rs".to_string(),
             "fn search_cache_lock() -> MutexGuard<'static, VecDeque<SearchSnapshot>> {\n    \
-             SEARCH_SNAPSHOTS.lock().unwrap()\n}\n"
+             SEARCH_SNAPSHOTS.lock().unwrap()\n}\n\
+             fn narrow_sessions_lock() -> MutexGuard<'static, VecDeque<NarrowSession>> {\n    \
+             NARROW_SESSIONS.lock().unwrap_or_else(PoisonError::into_inner)\n}\n"
                 .to_string(),
         ));
         files.push((
@@ -3048,6 +3065,100 @@ mod tests {
                 .to_string(),
         ));
         files
+    }
+
+    /// The synthetic trees carry the registries' ground truth: EVERY
+    /// GUARD_HELPERS / VOCABULARY_INTERIORS entry must be defined in
+    /// [`synth_helper_files`], at its registered `def_file`, in a crate the
+    /// synthetic scan set actually reaches. Registering a helper without
+    /// mirroring it here leaves every synthetic tree failing OB-7 on the real
+    /// registry — which reds the whole self-test suite (30+ tests) with a
+    /// failure that has nothing to do with what each test measures. This test
+    /// names that chore directly, in one message, so the next registration
+    /// cannot hide behind the noise.
+    #[test]
+    fn every_registry_entry_is_mirrored_in_the_synthetic_fixture() {
+        let files = synth_helper_files();
+        let find = |rel: &str| -> Option<&String> {
+            files.iter().find(|(p, _)| p == rel).map(|(_, c)| c)
+        };
+        // The crates the synthetic workspace derives: the base fixture's two
+        // plus whatever SYNTH_HELPER_CRATES splices in.
+        let scanned_crate = |def_file: &str| -> bool {
+            let krate = def_file
+                .strip_prefix("crates/")
+                .and_then(|rest| rest.split('/').next());
+            krate.is_some_and(|k| {
+                k == "aterm-gui"
+                    || k == "aterm-types"
+                    || SYNTH_HELPER_CRATES.iter().any(|(name, _)| *name == k)
+            })
+        };
+        let acquires = |contents: &str, identity: &str| -> bool {
+            STANDARD_METHOD_NAMES.iter().any(|m| {
+                contents.contains(&format!("{identity}.{m}("))
+                    || contents.contains(&format!("{identity}().{m}("))
+            })
+        };
+        for h in GUARD_HELPERS {
+            assert!(
+                scanned_crate(h.def_file),
+                "GUARD_HELPERS entry `{}` is registered in {}, a crate the synthetic \
+                 workspace never scans — add its crate to SYNTH_HELPER_CRATES (the OB-7 \
+                 interior check reads the SCANNED corpus)",
+                h.symbol,
+                h.def_file
+            );
+            let contents = find(h.def_file).unwrap_or_else(|| {
+                panic!(
+                    "GUARD_HELPERS entry `{}` has no fixture file at its registered \
+                     def_file {} — add it to synth_helper_files() (one fixture entry per \
+                     def_file; helpers sharing a file share its contents), or every \
+                     synthetic tree fails OB-7 as a STALE registration",
+                    h.symbol, h.def_file
+                )
+            });
+            assert!(
+                contents.contains(&format!("fn {}(", h.symbol)),
+                "the fixture at {} does not define `fn {}` — the registry's forward \
+                 fail-closed check reds every synthetic tree until it does",
+                h.def_file,
+                h.symbol
+            );
+            assert!(
+                acquires(contents, h.identity),
+                "the fixture at {} defines `fn {}` but its body never acquires the \
+                 registered identity `{}` — the registry's interior check reads the \
+                 SCANNED corpus, so the mirror must acquire what the shipping helper does",
+                h.def_file,
+                h.symbol,
+                h.identity
+            );
+        }
+        for v in VOCABULARY_INTERIORS {
+            assert!(
+                scanned_crate(v.def_file),
+                "VOCABULARY_INTERIORS entry `{}` is registered in {}, a crate the \
+                 synthetic workspace never scans — add its crate to SYNTH_HELPER_CRATES",
+                v.symbol,
+                v.def_file
+            );
+            let contents = find(v.def_file).unwrap_or_else(|| {
+                panic!(
+                    "VOCABULARY_INTERIORS entry `{}` has no fixture file at its registered \
+                     def_file {} — add it to synth_helper_files()",
+                    v.symbol, v.def_file
+                )
+            });
+            assert!(
+                contents.contains(&format!("fn {}(", v.symbol))
+                    && acquires(contents, "self"),
+                "the fixture at {} must define `fn {}` WITH its bare-`self` acquisition — \
+                 both halves of the interior registry are fail-closed",
+                v.def_file,
+                v.symbol
+            );
+        }
     }
 
     /// Replace one synthetic file's contents (by exact repo-relative path).

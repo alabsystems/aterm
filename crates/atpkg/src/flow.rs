@@ -533,11 +533,21 @@ fn install_inner(
     // `fs::copy` truncates the shared inode. Both destroy a file inside the user's
     // signed app bundle. See `DirFetcher::download`.
     let _ = std::fs::remove_file(&dl);
+    // A resumable transfer KEEPS its own `<asset>.part` across attempts — that is the
+    // point — so the one thing that can leak here is a partial for an asset this program
+    // has since moved past. `gc` does reclaim these (its `staging/` sweep removes every
+    // regular file under `staging/<program>/`, `.part` included), but `gc` is a separate
+    // verb a user may never run, so reclaim every OTHER partial now: at most one partial
+    // per program survives between passes, and it is always the one the next attempt
+    // will finish.
+    sweep_foreign_partials(&dl);
     if let Err(e) = fetcher.download_for(program, &repo, &artifact.asset, &dl) {
-        // An aborted transfer leaves BYTES here: the production fetcher hands curl `-o <dl>`
-        // with no `--remove-on-error` and no `.part`+rename, so a timed-out multi-GB body is
-        // still on disk. It is never resumed (the retry re-fetches from zero), so it is pure
-        // strandage — reclaim it on this exit exactly as on the stage exit below.
+        // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
+        // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
+        // absent or complete. The part is deliberately LEFT for the next attempt to
+        // continue from (`aterm_update_core::download_to_resumable`); `dl` itself is
+        // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
+        // registry's copy lane writes there directly.
         let _ = std::fs::remove_file(&dl);
         return Err(FlowError::Download(e));
     }
@@ -807,6 +817,7 @@ pub fn apply_channel(
     channel: &str,
     triple: &str,
     installed: &BTreeMap<String, u64>,
+    excluded: &[String],
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
@@ -842,7 +853,7 @@ pub fn apply_channel(
             continue;
         }
         if let Some((acted, outcome, group_applied)) = apply_group(
-            fetcher, layout, &index, &ch, channel, triple, group, installed,
+            fetcher, layout, &index, &ch, channel, triple, group, installed, excluded,
         ) {
             applied.extend(group_applied);
             results.push((acted, outcome));
@@ -886,6 +897,7 @@ fn apply_group(
     triple: &str,
     group: &Group,
     installed: &BTreeMap<String, u64>,
+    excluded: &[String],
 ) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
     // `update` touches INSTALLED groups only: skip a group with no installed member (that
     // would be a fresh `install`, not an update). A coherence group with even ONE member
@@ -926,20 +938,25 @@ fn apply_group(
     // that declined the set is not asking for the set (2026-08-20 independent
     // derivation).
     let declined = layout.declined().is_file();
-    // NOTE — `[packages].exclude` is deliberately NOT read here, even though
-    // `uninstall` tells the user it is the way to "keep the set and drop just this
-    // one". I wired it in and took it out again: `config::cached()` is a process-global
-    // OnceLock over the INVOKING user's aterm.toml, and this layer decides against a
-    // caller-supplied `layout`. Reading it here made a synthetic-layout call apply some
-    // other prefix's exclusions and made this file's own unit tests depend on the
-    // developer's real config — in a module that refuses to touch the real `~/.aterm`
-    // for exactly that reason (2026-08-20 round-13 audit).
+    // `[packages].exclude` arrives as the `excluded` PARAMETER, the same way the
+    // layout's own records do — never via `config::cached()`. That distinction is
+    // load-bearing: the global is a process-wide OnceLock over the INVOKING user's
+    // aterm.toml, and this layer decides against a caller-supplied `layout`. An
+    // earlier wiring read the global here, which made a synthetic-layout call apply
+    // some other prefix's exclusions and made this file's own unit tests depend on
+    // the developer's real config — in a module that refuses to touch the real
+    // `~/.aterm` for exactly that reason (2026-08-20 round-13 audit; the gap it
+    // left documented is what this parameter closes). The CALLER (cli.rs) owns the
+    // decision of whose config speaks.
     //
-    // The two records consulted below both come from the layout, so they are honest for
-    // whatever store is being acted on. Honouring `exclude` needs it threaded in the
-    // same way; until then the gap is a documented one rather than hidden global state.
-    let deliberately_absent =
-        |m: &String| (declined || removed.contains(m)) && !installed.contains_key(m);
+    // The absence guard applies to exclusions exactly as it does to removals:
+    // exclude means "do not PULL THIS IN as a sibling", and `uninstall` names it
+    // as the way to drop one program while staying adopted. A member the user has
+    // since explicitly installed is present, so the ordinary update path keeps it
+    // current — an exclusion never freezes or drops what is deliberately here.
+    let deliberately_absent = |m: &String| {
+        (declined || removed.contains(m) || excluded.contains(m)) && !installed.contains_key(m)
+    };
     if group.members.iter().any(deliberately_absent) {
         let present = Group {
             members: group
@@ -1227,6 +1244,41 @@ fn apply_group_txn(
         }
     }
     (outcome, applied)
+}
+
+/// Reclaim every `*.part` in `dl`'s directory EXCEPT `dl`'s own.
+///
+/// A resumable artifact download keeps its partial across attempts, so the partial for
+/// the asset we are about to fetch must survive; one for an asset this program has moved
+/// past (a superseded build, a renamed artifact) never will be finished by anyone. The
+/// bound this establishes is "at most one stranded partial per program between passes",
+/// instead of one per abandoned build — `gc`'s `staging/` sweep is the other reclaimer,
+/// but it only runs when the user runs it.
+///
+/// Deliberately narrow: only regular files whose name ends in `.part`, only in `dl`'s own
+/// directory, never recursive. `dl` itself and any other file are untouched.
+fn sweep_foreign_partials(dl: &Path) {
+    let (Some(dir), Some(name)) = (dl.parent(), dl.file_name()) else {
+        return;
+    };
+    let mut keep = name.to_os_string();
+    keep.push(".part");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_name = entry.file_name();
+        if entry_name == keep {
+            continue;
+        }
+        if std::path::Path::new(&entry_name)
+            .extension()
+            .is_some_and(|ext| ext == "part")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Pure disk gate (§9): `Ok(())` unless `available` is a measured value that fails
@@ -1533,6 +1585,7 @@ pub fn apply_program(
     triple: &str,
     program: &str,
     installed: &BTreeMap<String, u64>,
+    excluded: &[String],
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<ChannelApplyReport, FlowError> {
@@ -1572,7 +1625,7 @@ pub fn apply_program(
     let mut results = Vec::new();
     let mut applied: BTreeMap<String, AppliedMember> = BTreeMap::new();
     if let Some((acted, o, group_applied)) = apply_group(
-        fetcher, layout, &index, &ch, channel, triple, &group, installed,
+        fetcher, layout, &index, &ch, channel, triple, &group, installed, excluded,
     ) {
         applied.extend(group_applied);
         results.push((acted, o));
@@ -2484,6 +2537,7 @@ mod tests {
             "stable",
             TRIPLE,
             &std::collections::BTreeMap::from([("ay".to_string(), 17u64)]),
+            &[],
             fl(0),
             0,
         )
@@ -2971,6 +3025,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3015,6 +3070,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3059,6 +3115,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3099,6 +3156,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3131,6 +3189,7 @@ mod tests {
             "stable",
             TRIPLE,
             &std::collections::BTreeMap::from([("trust".to_string(), 4820u64)]),
+            &[],
             fl(0),
             0,
         )
@@ -3261,8 +3320,20 @@ mod tests {
                         &["trust"][..],
                         &["ay", "trust"][..],
                     ] {
-                        let label =
-                            format!("{cname}-{ay:?}-t{trust_installed}-r{}", removed.len());
+                    // `[packages].exclude` rides the same deliberately-absent
+                    // predicate as the removal record, so it gets the same
+                    // exhaustive treatment — including the case where both
+                    // name the same member, and where an exclusion names a
+                    // PRESENT member (which must change nothing: exclude is
+                    // "do not pull in", never "drop what is here").
+                    for excluded in [&[][..], &["ay"][..], &["trust"][..]] {
+                        let excluded: Vec<String> =
+                            excluded.iter().map(|s| s.to_string()).collect();
+                        let label = format!(
+                            "{cname}-{ay:?}-t{trust_installed}-r{}-x{}",
+                            removed.len(),
+                            excluded.len()
+                        );
                         let dir = scratch(&format!("hold-{label}"));
                         let fake = make(&dir);
                         let layout = layout(&dir);
@@ -3296,6 +3367,7 @@ mod tests {
                             "stable",
                             TRIPLE,
                             &installed,
+                            &excluded,
                             fl(0),
                             0,
                         );
@@ -3315,6 +3387,51 @@ mod tests {
                                     "{label}: {program} was deleted on purpose and came back"
                                 );
                             }
+                        }
+
+                        // I1x: an EXCLUDED, absent member is never pulled in — the
+                        // promise `uninstall` makes when it names `[packages].exclude`
+                        // as the way to drop one program and stay adopted. Before the
+                        // exclude wire existed, the next unattended tick reinstalled
+                        // the excluded sibling (multi-GB, unannounced) via the
+                        // coherence pull-in.
+                        for program in &excluded {
+                            if !installed.contains_key(program) {
+                                assert!(
+                                    !after.contains_key(program),
+                                    "{label}: excluded {program} was pulled back in"
+                                );
+                            }
+                        }
+
+                        // I1x-present: an exclusion naming a PRESENT member is not
+                        // license to drop or freeze it — asserted where the channel
+                        // gives survival a right answer. In `clean` nothing
+                        // legitimately kills a present member; in `yank-installed`
+                        // the excluded-but-present member must still UPGRADE to the
+                        // valid pin (exclusion never freezes). `yank-pin` proves
+                        // nothing here: it tombstones ay@18 with or without the
+                        // exclusion, and this invariant's first draft asserting
+                        // survival there was refuted by its own enumeration.
+                        if cname == "clean" {
+                            for program in &excluded {
+                                if installed.contains_key(program) {
+                                    assert!(
+                                        after.contains_key(program),
+                                        "{label}: excluding present {program} dropped it"
+                                    );
+                                }
+                            }
+                        }
+                        if cname == "yank-installed"
+                            && matches!(ay, Ay::Revoked)
+                            && excluded.iter().any(|p| p == "ay")
+                        {
+                            assert_eq!(
+                                after.get("ay").copied(),
+                                Some(18),
+                                "{label}: excluding present ay froze its upgrade"
+                            );
                         }
 
                         // I2: a revoked installed build is never left runnable.
@@ -3393,10 +3510,11 @@ mod tests {
                         }
                         let _ = std::fs::remove_dir_all(&dir);
                     }
+                    }
                 }
             }
         }
-        assert!(checked >= 24, "the enumeration ran only {checked} cases");
+        assert!(checked >= 72, "the enumeration ran only {checked} cases");
     }
 
     fn group_fixture_yanking_ay18(dir: &Path) -> Fake {
@@ -3432,6 +3550,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3487,6 +3606,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3520,6 +3640,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3665,6 +3786,7 @@ mod tests {
             TRIPLE,
             "ay",
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -3970,6 +4092,7 @@ mod tests {
             "stable",
             TRIPLE,
             &installed,
+            &[],
             fl(0),
             0,
         )
@@ -4492,4 +4615,36 @@ mod tests {
 
 
 
+    /// The strandage bound a resumable download needs: OUR partial survives (the next
+    /// attempt continues it), every other program-staging partial is reclaimed, and
+    /// nothing else in the directory is touched.
+    ///
+    /// Without the sweep a resumable lane trades "re-fetch 630 MB on every retry" for
+    /// "leak a 600 MB prefix per abandoned build", which is not a trade worth making.
+    #[test]
+    fn a_resumable_download_strands_at_most_one_partial_per_program() {
+        let dir = std::env::temp_dir().join(format!(
+            "atpkg-sweep-part-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dl = dir.join("trust-5520.tar.zst");
+        let ours = dir.join("trust-5520.tar.zst.part");
+        let stale = dir.join("trust-5100.tar.zst.part");
+        let bystander = dir.join("notes.txt");
+        let finished = dir.join("trust-5100.tar.zst");
+        for p in [&ours, &stale, &bystander, &finished] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        sweep_foreign_partials(&dl);
+
+        assert!(ours.exists(), "OUR partial is what the next attempt resumes");
+        assert!(!stale.exists(), "a superseded build's partial is reclaimed");
+        assert!(bystander.exists(), "only `.part` files are swept");
+        assert!(finished.exists(), "a complete asset is not a partial");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

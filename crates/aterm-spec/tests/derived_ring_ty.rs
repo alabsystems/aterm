@@ -57,7 +57,7 @@ use aterm_spec::derive::{
     native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
     one_shot_peek_model, pad_absorption_model, pane_tree_model, path_feed_snapshot_model,
     per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
-    presentation_gate_model, presented_frame_tap_model, proxy_forward_model,
+    presentation_gate_model, presented_frame_tap_model, press_custody_model, proxy_forward_model,
     rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
@@ -5442,6 +5442,81 @@ fn derived_focus_modifier_cache_resets_only_at_focus_loss() {
     assert_eq!(stale["cached_ctrl"], 1);
     assert_eq!(stale["fresh_ctrl"], 0);
     assert!(!buggy.check_invariant("CachedCtrlRequiresAuthoritativeReport", &stale));
+}
+
+/// SELECTION CUSTODY: only a byte-producing typing press may take the user's
+/// reading position. A bare modifier, an auto-repeat tick and a key release must
+/// move neither the viewport nor the selection — and output must repin rather than
+/// snap the reader back to live.
+///
+/// The invariants are stated over the OBSERVABLE state against a shadow of the
+/// pre-action values, not over a self-reported "did this disturb anything" flag,
+/// so an implementation that moved the viewport silently cannot satisfy them.
+///
+/// `Buggy=1` is the regression family — inert press, repeat, release and output
+/// each disturbing — so `assert_proves_and_catches` fails unless the invariants
+/// genuinely catch it.
+#[test]
+fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
+    let model = press_custody_model();
+    assert_proves_and_catches(&model);
+
+    // The reported bug, replayed as a trace: read history, select, then press ⌘.
+    let mut reading = model.init_state();
+    for action in ["UserScroll", "UserSelect", "InertPress"] {
+        assert!(model.fire(action, &mut reading), "{action}: {reading:?}");
+    }
+    assert_eq!(
+        reading["offset"], 1,
+        "bare ⌘ left the viewport where it was"
+    );
+    assert_eq!(reading["selection"], 1, "…and left the selection alive");
+    assert_eq!(reading["owner"], 1, "…and the user still owns the viewport");
+
+    // A held key's repeat ticks are equally inert, and so is the key-up.
+    let mut held = model.init_state();
+    for action in [
+        "UserScroll",
+        "UserSelect",
+        "RepeatPress",
+        "RepeatPress",
+        "ReleaseEvent",
+    ] {
+        assert!(model.fire(action, &mut held), "{action}: {held:?}");
+    }
+    assert_eq!(held["selection"], 1, "repeat and release must not deselect");
+    assert_eq!(held["offset"], 1, "repeat and release must not snap");
+
+    // Output arriving while the user reads repins rather than sliding the view,
+    // and never touches the selection.
+    let mut flooded = model.init_state();
+    for action in ["UserScroll", "UserSelect", "OutputWhileReading"] {
+        assert!(model.fire(action, &mut flooded), "{action}: {flooded:?}");
+    }
+    assert_eq!(
+        flooded["owner"], 1,
+        "output does not take the viewport back"
+    );
+    assert_eq!(
+        flooded["offset"], 2,
+        "the repin keeps the content under the eye"
+    );
+    assert_eq!(
+        flooded["selection"], 1,
+        "output does not drop the selection"
+    );
+
+    // …and the one handover is intact: typing still lands at live and deselects.
+    let mut typed = model.init_state();
+    for action in ["UserScroll", "UserSelect", "TypingPress"] {
+        assert!(model.fire(action, &mut typed), "{action}: {typed:?}");
+    }
+    assert_eq!(typed["offset"], 0, "typing still snaps to live");
+    assert_eq!(typed["selection"], 0, "typing still deselects");
+    assert_eq!(
+        typed["owner"], 0,
+        "typing hands the viewport back to the tail"
+    );
 }
 
 /// Press-time disposition owns the entire key episode: consumed presses keep a

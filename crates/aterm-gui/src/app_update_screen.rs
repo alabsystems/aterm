@@ -733,6 +733,7 @@ mod tests {
                     failing_kind: String::new(),
                     failing_applies: 0,
                     installable: true,
+                    channel_unreadable: false,
                 },
             ),
             crate::native_updater_service::CheckCompletion::Reduced,

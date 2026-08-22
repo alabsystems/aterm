@@ -54,7 +54,7 @@ mod primer;
 /// Polished `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES.
 /// Mirrors `aterm-gui`'s `parse_cli()` help in tone and layout, scoped to what the
 /// daily-driver CLI actually does (transparent passthrough of `$SHELL`).
-const HELP: &str = concat!(
+const HELP_HEAD: &str = concat!(
     "aterm — a transparent, introspecting terminal\n",
     "\n",
     "Spawns your $SHELL in a PTY and passes I/O through unchanged, so it looks and\n",
@@ -104,15 +104,172 @@ const HELP: &str = concat!(
     "    show-face <family>        Show metrics for a font family.\n",
     "    list-themes               List the built-in colour schemes.\n",
     "\n",
-    "VERBS (the one command, its powers — run `aterm help` for the full manual):\n",
-    "    aterm ctl <args>          Introspect & drive any terminal: read the screen, send keys,\n",
-    "                              run a turn, subscribe to events, capture a real frame.\n",
-    "    aterm pkg <args>          Install / update / verify the toolchain (the package manager).\n",
-    "    aterm fleet <args>        Federate many sessions' events; dispatch commands back.\n",
-    "    aterm drive <args>        The agent drive CLI (await / send / turn helpers).\n",
-    "    aterm agents [<cmd>]      Make coding agents aterm-aware: manage the 3-line aterm\n",
-    "                              primer in their global context files (status | install |\n",
-    "                              remove | primer). Run once per machine.\n",
+);
+
+/// THE front-door verb roster — the ONE place a verb exists.
+///
+/// `aterm ship` is why this is a roster of variants and not four hand-written
+/// match arms. It shipped wired only into the WINDOW library's parser, and that
+/// single mistake opened THREE holes at once, because a verb's NAME, its HELP and
+/// its DISPATCH lived in three places nothing forced to agree:
+///   * it was advertised nowhere, so `--help` denied it existed;
+///   * it was routed nowhere at the front door, so at a terminal — where stdin is
+///     a TTY and the mode fork picks the SESSION — it died as an unknown option,
+///     working only when stdin happened to be a pipe;
+///   * and because [`is_tool_candidate`] derives its shadowing rule from this
+///     list, a co-distributed toolchain program named `ship` could have hijacked
+///     the verb outright.
+///
+/// They can no longer disagree:
+///   * name and help text live HERE, and `--help` renders this list, so an
+///     unadvertised verb is unrepresentable rather than merely tested for;
+///   * dispatch in `crates/aterm/src/main.rs` matches this enum EXHAUSTIVELY, so
+///     a new variant fails the BUILD until it is routed;
+///   * [`is_tool_candidate`] consults this list, so every verb is shielded from
+///     toolchain shadowing the moment it is added;
+///   * and `crates/aterm/tests/front_door_verbs.rs` drives every variant through
+///     the real binary under a real pty, so "routed" is proved to mean "reachable
+///     where an operator actually types it", not merely "reachable when piped".
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Verb {
+    /// `aterm ctl` — the introspection / control client.
+    Ctl,
+    /// `aterm pkg` — the toolchain package manager.
+    Pkg,
+    /// `aterm fleet` — fleet federation (events + exec).
+    Fleet,
+    /// `aterm drive` — the agent drive CLI (sugar over await/send).
+    Drive,
+    /// `aterm ship` — the release tool (publishing; source checkouts only).
+    Ship,
+    /// `aterm update` — the headless update lane (status/check, no window).
+    Update,
+    /// `aterm agents` — the coding-agent primer installer.
+    Agents,
+}
+
+impl Verb {
+    /// Every verb, in the order `--help` lists them.
+    pub const ALL: &'static [Verb] = &[
+        Verb::Ctl,
+        Verb::Pkg,
+        Verb::Fleet,
+        Verb::Drive,
+        Verb::Ship,
+        Verb::Update,
+        Verb::Agents,
+    ];
+
+    /// The operand that selects this verb.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Verb::Ctl => "ctl",
+            Verb::Pkg => "pkg",
+            Verb::Fleet => "fleet",
+            Verb::Drive => "drive",
+            Verb::Ship => "ship",
+            Verb::Update => "update",
+            Verb::Agents => "agents",
+        }
+    }
+
+    /// The argv0 compat alias this verb also answers to, for the verbs that have
+    /// one. The bundle ships these as symlinks onto the one binary, so every
+    /// pre-one-binary script keeps working. `ship` has none (the release tool is
+    /// a separate executable it execs) and neither does `agents` (it never was a
+    /// sibling binary).
+    pub const fn argv0_alias(self) -> Option<&'static str> {
+        match self {
+            Verb::Ctl => Some("aterm-ctl"),
+            Verb::Pkg => Some("atpkg"),
+            Verb::Fleet => Some("aterm-fleet"),
+            Verb::Drive => Some("aterm-drive"),
+            Verb::Ship | Verb::Update | Verb::Agents => None,
+        }
+    }
+
+    /// The `--help` synopsis column, e.g. `aterm ctl <args>`.
+    pub const fn usage(self) -> &'static str {
+        match self {
+            Verb::Ctl => "aterm ctl <args>",
+            Verb::Pkg => "aterm pkg <args>",
+            Verb::Fleet => "aterm fleet <args>",
+            Verb::Drive => "aterm drive <args>",
+            Verb::Ship => "aterm ship <args>",
+            Verb::Update => "aterm update [<cmd>]",
+            Verb::Agents => "aterm agents [<cmd>]",
+        }
+    }
+
+    /// The `--help` description, one entry per rendered line.
+    pub const fn blurb(self) -> &'static [&'static str] {
+        match self {
+            Verb::Ctl => &[
+                "Introspect & drive any terminal: read the screen, send keys,",
+                "run a turn, subscribe to events, capture a real frame.",
+            ],
+            Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
+            Verb::Fleet => &["Federate many sessions' events; dispatch commands back."],
+            Verb::Drive => &["The agent drive CLI (await / send / turn helpers)."],
+            Verb::Ship => &[
+                "Publish aterm: provision a signing machine, cut and",
+                "release a build. Needs a source checkout — the release",
+                "tool is not carried by an ordinary install.",
+            ],
+            Verb::Update => &[
+                "Check or report auto-update state headlessly (status | check).",
+                "Works with no window and no control socket — the lane a",
+                "terminal-only machine uses to learn it is stale.",
+            ],
+            Verb::Agents => &[
+                "Make coding agents aterm-aware: manage the 3-line aterm",
+                "primer in their global context files (status | install |",
+                "remove | primer). Run once per machine.",
+            ],
+        }
+    }
+
+    /// Resolve an `argv[1]` operand to a verb. The ONE recognizer: the front door
+    /// routes with it and [`is_tool_candidate`] shields with it.
+    pub fn from_operand(operand: &str) -> Option<Verb> {
+        Verb::ALL.iter().copied().find(|v| v.name() == operand)
+    }
+}
+
+/// The description column `--help` aligns verb blurbs to.
+const VERB_BLURB_COLUMN: usize = 30;
+
+/// Render one verb's `--help` entry: the synopsis, then its blurb lines aligned
+/// under a single column.
+fn verb_help_block(verb: Verb) -> String {
+    let mut out = String::new();
+    let mut lines = verb.blurb().iter();
+    let first = lines.next().unwrap_or(&"");
+    out.push_str(&format!(
+        "    {:<width$}{first}\n",
+        verb.usage(),
+        width = VERB_BLURB_COLUMN - 4
+    ));
+    for line in lines {
+        out.push_str(&format!("{:width$}{line}\n", "", width = VERB_BLURB_COLUMN));
+    }
+    out
+}
+
+/// `--help`, assembled. The VERBS section is RENDERED from [`Verb::ALL`] rather
+/// than written out, which is what makes "advertised" and "exists" the same fact.
+fn help_text() -> String {
+    let mut out = String::from(HELP_HEAD);
+    out.push_str("VERBS (the one command, its powers — run `aterm help` for the full manual):\n");
+    for verb in Verb::ALL {
+        out.push_str(&verb_help_block(*verb));
+    }
+    out.push_str(HELP_TAIL);
+    out
+}
+
+/// The remainder of `--help`, from TOOLCHAIN on.
+const HELP_TAIL: &str = concat!(
     "\n",
     "TOOLCHAIN (use aterm to run all our programs; see docs/ATERM-DISTRIBUTION-WEDGE.md):\n",
     "    aterm <tool> [args]       Run a pinned, installed tool, e.g. `aterm ay`, `aterm ty`,\n",
@@ -153,7 +310,7 @@ const HELP: &str = concat!(
 /// belong in aterm-gui, not a false affordance here.
 ///
 /// This is the SINGLE source of truth: [`diag_report`] must handle every entry
-/// AND [`HELP`] must advertise every entry — both enforced by the
+/// AND [`help_text`] must advertise every entry — both enforced by the
 /// `diag_commands_advertised_and_dispatchable` gate, so a subcommand can never
 /// ship undocumented or unimplemented.
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
@@ -439,7 +596,7 @@ fn doctor_checks(
 /// init funnel in `main()` will resolve.
 #[derive(Debug, PartialEq, Eq)]
 enum CliAction {
-    /// `-h`/`--help`: print [`HELP`] to stdout, exit 0.
+    /// `-h`/`--help`: print [`help_text`] to stdout, exit 0.
     Help,
     /// `-V`/`--version`: print the version to stdout, exit 0.
     Version,
@@ -587,7 +744,7 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
     // unknown option (clean exit-2 usage) — never an exit-101 abort.
     match decide_args(argv.into_iter().map(|a| a.to_string_lossy().into_owned())) {
         CliAction::Help => {
-            print!("{HELP}");
+            print!("{}", help_text());
             std::process::exit(0);
         }
         CliAction::Version => {
@@ -668,17 +825,6 @@ pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
     }
 }
 
-/// The `aterm <verb>` front-door verbs — served IN-PROCESS by the ONE binary (the second
-/// column names the argv0 compat alias each also answers to). This
-/// is what makes the whole platform ONE command: you learn `aterm`, and `aterm help` reveals the
-/// rest. The siblings stay lean and directly callable, but need not be names anyone remembers.
-pub const VERB_BINS: &[(&str, &str)] = &[
-    ("ctl", "aterm-ctl"),     // the introspection / control client
-    ("pkg", "atpkg"),         // the toolchain package manager
-    ("fleet", "aterm-fleet"), // fleet federation (events + exec)
-    ("drive", "aterm-drive"), // the agent drive CLI (sugar over await/send)
-];
-
 /// Pure PATH-prepend: the `("PATH", value)` pair that puts `dir` first on the child's
 /// PATH. `None` when `dir` is already present (idempotent for aterm-inside-aterm nesting),
 /// mirroring aterm-gui's `bundle_path_env`. The platform separator is `;` on Windows.
@@ -711,12 +857,16 @@ fn front_door_path_env() -> Option<(String, String)> {
 }
 
 /// Whether `first` (the `argv[1]` operand) should be CONSIDERED for toolchain dispatch.
-/// False for: no operand, an empty token, a flag (`-…`), any front-door verb ([`VERB_BINS`]:
-/// `ctl`/`pkg`/`fleet`/`drive`), the `help` manual, and any diagnostic subcommand name — those
-/// are aterm's own surface and must never be shadowed by a co-distributed tool (so a store tool
-/// named `help`/`ctl`/… can never hijack `aterm`'s verbs). A `true` here means only "candidate";
-/// whether it is actually an installed tool is decided by the co-located `atpkg` (so non-tools
-/// still fall through to the normal unknown-operand handling). Pure, so precedence is testable.
+/// False for: no operand, an empty token, a flag (`-…`), any front-door verb ([`Verb`]), the
+/// `help` manual, and any diagnostic subcommand name — those are aterm's own surface and must
+/// never be shadowed by a co-distributed tool (so a store tool named `help`/`ctl`/… can never
+/// hijack `aterm`'s verbs). A `true` here means only "candidate"; whether it is actually an
+/// installed tool is decided by the co-located `atpkg` (so non-tools still fall through to the
+/// normal unknown-operand handling). Pure, so precedence is testable.
+///
+/// The verb shield reads [`Verb::from_operand`], so a verb is protected the moment it joins the
+/// roster. `ship` spent its first release unshielded precisely because the old list was a
+/// hand-maintained second copy of the verb names that nobody updated.
 pub fn is_tool_candidate(first: Option<&str>) -> bool {
     match first {
         None => false,
@@ -724,8 +874,7 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
             !w.is_empty()
                 && !w.starts_with('-')
                 && w != "help"
-                && w != "agents"
-                && !VERB_BINS.iter().any(|(v, _)| *v == w)
+                && Verb::from_operand(w).is_none()
                 && !DIAG_COMMANDS.iter().any(|(name, _)| *name == w)
         }
     }
@@ -878,7 +1027,8 @@ pub fn session_main(quiet: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        CliAction, DIAG_COMMANDS, HELP, VERB_BINS, decide_args, diag_report, doctor_checks,
+        CliAction, DIAG_COMMANDS, VERB_BLURB_COLUMN, Verb, decide_args, diag_report, doctor_checks,
+        help_text, verb_help_block,
         explain_config_report, is_tool_candidate, list_fonts_report, list_themes_report,
         prepend_path, show_face_report, validate_containment_value,
     };
@@ -927,7 +1077,7 @@ mod tests {
             // loose substring — so a future name that is a substring of another
             // can't pass vacuously.
             assert!(
-                HELP.lines().any(|l| l.trim_start().starts_with(name)),
+                help_text().lines().any(|l| l.trim_start().starts_with(name)),
                 "subcommand {name:?} is not advertised as a --help line"
             );
             assert!(
@@ -955,7 +1105,8 @@ mod tests {
         assert_eq!(decide(&["-h"]), CliAction::Help);
         // Advertised as its own USAGE line so it never ships undocumented.
         assert!(
-            HELP.lines()
+            help_text()
+                .lines()
                 .any(|l| l.trim_start().starts_with("aterm help")),
             "`aterm help` is not advertised in --help"
         );
@@ -976,7 +1127,8 @@ mod tests {
         );
         // Advertised as its own VERB line so it never ships undocumented.
         assert!(
-            HELP.lines()
+            help_text()
+                .lines()
                 .any(|l| l.trim_start().starts_with("aterm agents")),
             "`aterm agents` is not advertised in --help"
         );
@@ -984,25 +1136,95 @@ mod tests {
         assert!(!is_tool_candidate(Some("agents")));
     }
 
+    /// THE front-door gate. Every property that `aterm ship` violated, asserted
+    /// over the WHOLE roster rather than over a list someone must remember to
+    /// extend.
+    ///
+    /// Dispatch is deliberately NOT checked here — it cannot be. The exhaustive
+    /// `match Verb` in `crates/aterm/src/main.rs` makes an unrouted verb a
+    /// COMPILE error, and `crates/aterm/tests/front_door_verbs.rs` proves each
+    /// one is reachable at a real terminal. This test owns the other three legs.
     #[test]
     fn front_door_verbs_are_the_one_command_surface() {
-        // The platform is ONE command: `ctl`/`pkg`/`fleet`/`drive` are verbs of `aterm`, each
-        // mapping to a co-located sibling — and every one is advertised in --help as its VERB line.
-        assert!(VERB_BINS.iter().any(|(v, _)| *v == "ctl"));
-        assert!(VERB_BINS.iter().any(|(v, _)| *v == "pkg"));
-        for (verb, _bin) in VERB_BINS {
+        assert!(!Verb::ALL.is_empty(), "roster must not be empty");
+        let help = help_text();
+        for verb in Verb::ALL {
+            // ADVERTISED — as its own VERB line, a leading token rather than a
+            // loose substring, so a name that happens to be a substring of
+            // another cannot pass vacuously.
             assert!(
-                HELP.lines()
-                    .any(|l| l.trim_start().starts_with(&format!("aterm {verb}"))),
-                "verb `aterm {verb}` is not advertised in --help"
+                help.lines()
+                    .any(|l| l.trim_start().starts_with(&format!("aterm {}", verb.name()))),
+                "verb `aterm {}` is not advertised in --help",
+                verb.name()
+            );
+            // SHIELDED — a co-distributed toolchain program of the same name can
+            // never shadow a verb of the one command.
+            assert!(
+                !is_tool_candidate(Some(verb.name())),
+                "verb {:?} can be shadowed by a store tool of the same name",
+                verb.name()
+            );
+            // RECOGNIZED — the one recognizer round-trips, so routing and
+            // shielding cannot disagree about what a verb is called.
+            assert_eq!(Verb::from_operand(verb.name()), Some(*verb));
+            // WELL-FORMED — a verb with no blurb would render a bare synopsis.
+            assert!(!verb.blurb().is_empty(), "verb {:?} has no help", verb.name());
+        }
+        // Names are distinct: `from_operand` must be unambiguous.
+        for (i, verb) in Verb::ALL.iter().enumerate() {
+            assert!(
+                !Verb::ALL[..i].iter().any(|u| u.name() == verb.name()),
+                "duplicate front-door verb {}",
+                verb.name()
             );
         }
-        // Verb names are distinct (the dispatch `find` must be unambiguous).
-        for (i, (v, _)) in VERB_BINS.iter().enumerate() {
+        // A non-verb resolves to nothing (the recognizer is not a prefix match).
+        assert_eq!(Verb::from_operand("definitely-not-a-verb"), None);
+        assert_eq!(Verb::from_operand("ct"), None);
+        assert_eq!(Verb::from_operand(""), None);
+    }
+
+    /// The argv0 compat aliases the bundle symlinks onto the one binary. Every
+    /// alias must be distinct and must not collide with a verb NAME, or argv0
+    /// dispatch and operand dispatch would disagree about the same string.
+    #[test]
+    fn verb_argv0_aliases_are_distinct_and_unambiguous() {
+        let aliases: Vec<&str> = Verb::ALL.iter().filter_map(|v| v.argv0_alias()).collect();
+        for (i, alias) in aliases.iter().enumerate() {
             assert!(
-                !VERB_BINS[..i].iter().any(|(u, _)| u == v),
-                "duplicate front-door verb {v}"
+                !aliases[..i].contains(alias),
+                "duplicate argv0 alias {alias}"
             );
+            assert!(
+                Verb::from_operand(alias).is_none(),
+                "argv0 alias {alias} is also a verb name"
+            );
+        }
+    }
+
+    /// `--help` is RENDERED from the roster, so this pins the rendering itself:
+    /// the alignment column and the continuation indent that make the VERBS block
+    /// read as one table.
+    #[test]
+    fn verb_help_blocks_align_to_one_column() {
+        for verb in Verb::ALL {
+            let block = verb_help_block(*verb);
+            let mut lines = block.lines();
+            let first = lines.next().expect("a verb renders at least one line");
+            assert!(first.starts_with("    "), "{first:?} is not indented");
+            assert_eq!(
+                first.find(verb.blurb()[0]),
+                Some(VERB_BLURB_COLUMN),
+                "verb {} blurb does not start at the shared column",
+                verb.name()
+            );
+            for cont in lines {
+                assert!(
+                    cont.starts_with(&" ".repeat(VERB_BLURB_COLUMN)),
+                    "continuation {cont:?} is not aligned under the blurb column"
+                );
+            }
         }
     }
 
@@ -1222,12 +1444,14 @@ mod tests {
                 "{flag} is a flag, not a tool"
             );
         }
-        // Every front-door verb (ctl/pkg/fleet/drive) and the `help` manual stay aterm's own —
-        // a store tool of the same name can never hijack `aterm ctl`/`aterm pkg`/etc.
-        for (verb, _) in VERB_BINS {
+        // Every front-door verb and the `help` manual stay aterm's own — a store tool of the
+        // same name can never hijack `aterm ctl`/`aterm ship`/etc. Driven off the roster, so a
+        // verb added tomorrow is covered here without anyone remembering to extend this list.
+        for verb in Verb::ALL {
             assert!(
-                !is_tool_candidate(Some(verb)),
-                "{verb} is a front-door verb"
+                !is_tool_candidate(Some(verb.name())),
+                "{} is a front-door verb",
+                verb.name()
             );
         }
         assert!(!is_tool_candidate(Some("help")));

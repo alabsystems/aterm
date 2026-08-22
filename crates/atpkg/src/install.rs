@@ -18,6 +18,10 @@
 //!    equals the signed `artifact.tree_root` (when the producer set one). An already-
 //!    extracted tree can't be re-checked against the compressed `sha256`, so this closes
 //!    the extract→activate window: a file swapped post-extraction moves the root.
+//!    The root is folded BY THE EXTRACTOR as it writes
+//!    ([`crate::extract::extract_tar_zst_rooted`]) instead of by re-reading the whole
+//!    payload back off disk — see [`verify_and_stage`] step 3 for exactly which bytes
+//!    that still proves and which window it gives up.
 //! 4. **Atomic swap, with rollback** — only a tree that passed every check above is renamed
 //!    into `build_dir`, and only then is the build marked complete.
 //!
@@ -27,9 +31,21 @@
 
 use std::path::Path;
 
-use crate::extract::{ExtractError, extract_tar_zst};
+use crate::extract::{ExtractError, extract_tar_zst_rooted};
 use crate::manifest::Artifact;
 use crate::tree::{file_sha256, tree_root};
+
+/// Opt-in belt-and-suspenders: when this is set to a non-empty value, [`verify_and_stage`]
+/// ALSO walks the staged tree with [`crate::tree::tree_root`] and refuses the stage unless
+/// the walk agrees with the root the extractor folded.
+///
+/// It exists so the fused digest's equivalence is checkable on a real fleet machine over
+/// real bundles — not only over the unit corpus in `extract.rs` — and so an operator
+/// chasing a suspected filesystem fault can re-arm the historical
+/// read-it-all-back-again pass without a rebuild. It is OFF by default because turning it
+/// on restores exactly the cost this module stopped paying: a second full pass over the
+/// uncompressed payload (3.44 GB for the shipped `trust` member).
+const DISK_REVERIFY_ENV: &str = "ATPKG_STAGE_DISK_REVERIFY";
 
 /// Why staging a downloaded bundle failed. Each aborts the stage fail-closed.
 #[derive(Debug)]
@@ -148,16 +164,47 @@ pub fn verify_and_stage(
         ))
     })?;
     std::fs::create_dir_all(&incoming).map_err(StageError::Io)?;
-    if let Err(e) = extract_tar_zst(archive, &incoming, size_cap(artifact), MAX_ENTRIES) {
-        let _ = std::fs::remove_dir_all(&incoming);
-        return Err(StageError::Extract(e));
-    }
+    //    The extraction hands back the `tree_root` of what it wrote, folded from the
+    //    bytes as they went past (see [`crate::extract::extract_tar_zst_rooted`]). This
+    //    is the ONE pass over the uncompressed payload: the digest step 3 compares is a
+    //    by-product of the writing, not a second reading of it.
+    let extracted_root =
+        match extract_tar_zst_rooted(archive, &incoming, size_cap(artifact), MAX_ENTRIES) {
+            Ok(root) => root,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&incoming);
+                return Err(StageError::Extract(e));
+            }
+        };
 
     // 3. Apply-time re-verify (TOCTOU): the extracted tree must match the signed tree_root
     //    (when the producer emitted one). A mismatch — tamper or partial extract — aborts,
     //    and the previously-installed build is still there, untouched.
+    //
+    //    WHAT THIS STILL PROVES, EXACTLY. The digest now describes the bytes the extractor
+    //    WROTE rather than the bytes a subsequent walk READ BACK. Both forms refuse:
+    //      * a substituted or corrupt archive — the compressed `sha256` gate in step 1
+    //        already ran, and this catches anything that survives it;
+    //      * a truncated, partial or aborted extraction (short files move the root);
+    //      * a bundle whose laid-down layout, modes or contents differ in any way from the
+    //        one the publisher signed — that is the whole point, and it is unchanged.
+    //    WHAT IT GIVES UP is one thing: a mutation landing in the window BETWEEN the write
+    //    and the read, inside the `0700` staging scratch, while this process holds the
+    //    store lock. That window was microseconds wide, it is not the threat the private
+    //    prefix is hardened against (see the module docs), and the price of keeping it was
+    //    re-reading the entire payload — 3.44 GB for the shipped `trust` member, issued
+    //    straight after 3.44 GB of dirty writeback.
+    //
+    //    The byte format is a CROSS-VERSION contract (signed manifests embed roots computed
+    //    by earlier releases), so the two producers share one formatter and one fold
+    //    (`tree::entry_line` / `tree::root_of_entry_lines`) and an exhaustive parity test
+    //    pins them together (`extract.rs`,
+    //    `fused_tree_root_is_byte_identical_to_the_on_disk_walk`). `ATPKG_STAGE_DISK_REVERIFY`
+    //    re-arms the on-disk walk as a cross-check on a real machine, and `atpkg verify`
+    //    — the surface whose claim really IS "what is on disk right now" — still walks the
+    //    tree, unchanged.
     if !artifact.tree_root.is_empty() {
-        let got = match tree_root(&incoming) {
+        let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed()) {
             Ok(r) => r,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&incoming);
@@ -209,6 +256,44 @@ pub fn verify_and_stage(
         crate::store::sync_dir(parent);
     }
     Ok(())
+}
+
+/// Whether [`DISK_REVERIFY_ENV`] arms the on-disk cross-check. Read here, passed DOWN as a
+/// bool, so the decision is one env lookup per stage and [`reverified_root`] stays a pure
+/// function two tests can drive both ways without mutating process-global state (which
+/// `std::env::set_var` is `unsafe` for in edition 2024, and is a data race under a
+/// multi-threaded test runner regardless).
+fn disk_reverify_armed() -> bool {
+    std::env::var_os(DISK_REVERIFY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// The root step 3 compares against the signed value: the one the extractor folded, or —
+/// when [`DISK_REVERIFY_ENV`] is armed — that root AND a full on-disk
+/// [`crate::tree::tree_root`] walk, which must agree.
+///
+/// Disagreement is an ERROR, never a silent preference for one of them: two producers of a
+/// cross-version byte contract that differ over the same tree is exactly the condition a
+/// fail-closed stage exists for, and the message names both so the drift is diagnosable
+/// rather than merely fatal.
+fn reverified_root(
+    incoming: &Path,
+    extracted_root: String,
+    armed: bool,
+) -> std::io::Result<String> {
+    if !armed {
+        return Ok(extracted_root);
+    }
+    let walked = tree_root(incoming)?;
+    if !walked.eq_ignore_ascii_case(&extracted_root) {
+        let mut msg = String::from(
+            "staged tree_root disagreement: the extraction folded ",
+        );
+        msg.push_str(&extracted_root);
+        msg.push_str(" but the on-disk walk read ");
+        msg.push_str(&walked);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg));
+    }
+    Ok(walked)
 }
 
 /// Move `incoming` onto `build_dir`, retiring whatever was there.
@@ -389,7 +474,13 @@ mod tests {
         let archive = make_archive(&dir);
         let sha = file_sha256(&archive).unwrap();
         let probe = dir.join("probe");
-        extract_tar_zst(&archive, &probe, 1 << 20, 1000).unwrap();
+        // NOTE — this fixture is a live DIFFERENTIAL, not just a fixture. The expected
+        // `tree_root` is learned by walking the extracted tree ON DISK, while
+        // `verify_and_stage` compares against the root the extractor FOLDS as it writes.
+        // Every staging test below therefore fails the moment the two producers of that
+        // cross-version byte contract disagree over this bundle — hardlinks, modes, empty
+        // files and all — on top of the exhaustive corpus in `extract.rs`.
+        crate::extract::extract_tar_zst(&archive, &probe, 1 << 20, 1000).unwrap();
         let root = tree_root(&probe).unwrap();
         std::fs::remove_dir_all(&probe).unwrap();
         assert_eq!(root.len(), 64, "the fixture must carry a real tree_root");
@@ -1044,5 +1135,75 @@ mod tests {
             "a rollback must never mark a build that was not complete before it"
         );
         let _ = std::fs::remove_dir_all(&b.dir);
+    }
+    /// The armed cross-check: with the on-disk walk re-armed, an agreeing pair is passed
+    /// through unchanged and a DISAGREEING pair fails the stage closed, naming both roots.
+    ///
+    /// Driven as a pure function rather than through the env var: `std::env::set_var` is
+    /// `unsafe` in edition 2024 and racy under a multi-threaded runner, and what needs
+    /// pinning is the DECISION, not the lookup.
+    #[test]
+    fn the_armed_disk_reverify_agrees_or_fails_closed() {
+        let b = bundle("armed-reverify");
+        let probe = b.dir.join("armed-probe");
+        let fused =
+            crate::extract::extract_tar_zst_rooted(&b.archive, &probe, 1 << 20, 1000).unwrap();
+        let walked = tree_root(&probe).unwrap();
+        // Reach guard: the corpus must be non-empty, or "they agree" is vacuous.
+        assert_eq!(fused.len(), 64);
+        assert_eq!(fused, walked, "the two producers must agree over this bundle");
+
+        // Disarmed: the fused root is returned verbatim, no walk.
+        assert_eq!(
+            reverified_root(&probe, fused.clone(), false).unwrap(),
+            fused
+        );
+        // Armed and agreeing: still the same 64 characters.
+        assert_eq!(reverified_root(&probe, fused.clone(), true).unwrap(), fused);
+        // Armed and DISAGREEING: fail closed, and say which two roots disagreed.
+        let bogus = "0".repeat(64);
+        let err = reverified_root(&probe, bogus.clone(), true).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&bogus), "the folded root must be named: {text}");
+        assert!(text.contains(&walked), "the walked root must be named: {text}");
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// A tree mutated AFTER extraction is still refused when the walk is armed — the
+    /// window the fused digest gives up is exactly this one, so the escape hatch has to
+    /// actually close it.
+    #[test]
+    fn the_armed_walk_still_catches_a_post_extraction_mutation() {
+        let b = bundle("armed-mutation");
+        let probe = b.dir.join("mut-probe");
+        let fused =
+            crate::extract::extract_tar_zst_rooted(&b.archive, &probe, 1 << 20, 1000).unwrap();
+        // Mutate one extracted file in place, exactly as a TOCTOU attacker would.
+        let victim = first_regular_file(&probe).expect("the fixture bundle has a file");
+        std::fs::write(&victim, b"swapped after extraction").unwrap();
+        assert!(
+            reverified_root(&probe, fused, true).is_err(),
+            "an armed re-verify must refuse a tree mutated after the write"
+        );
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    /// The first regular file under `dir`, in walk order — the mutation victim above.
+    fn first_regular_file(dir: &Path) -> Option<PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for e in entries {
+            let p = e.path();
+            let meta = std::fs::symlink_metadata(&p).ok()?;
+            if meta.is_file() {
+                return Some(p);
+            }
+            if meta.is_dir()
+                && let Some(found) = first_regular_file(&p)
+            {
+                return Some(found);
+            }
+        }
+        None
     }
 }

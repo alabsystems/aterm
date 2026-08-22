@@ -70,7 +70,7 @@ mod types;
 pub use bloom::BloomFilter;
 pub use budgeted::BudgetedSearch;
 pub use index::{
-    DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, SearchIndex, SearchOptionsError,
+    DEFAULT_MAX_CACHED_LINES, MAX_SEARCH_MATCHES, NarrowedSearch, SearchIndex, SearchOptionsError,
     max_cached_for_retained,
 };
 pub use lifecycle_driver::SearchLifecycleDriver;
@@ -264,6 +264,17 @@ impl TerminalSearch {
         self.bump_generation();
     }
 
+    /// Advance a cached index past rows the terminal no longer retains,
+    /// WITHOUT the eviction-honesty bookkeeping — the complete-retention twin
+    /// of [`retain_history_from`](Self::retain_history_from). See
+    /// [`SearchIndex::drop_history_below`] for the contract (the refreshed
+    /// index must stay observationally identical to a from-scratch rebuild
+    /// over the surviving rows).
+    pub fn drop_history_below(&mut self, first_retained_line: usize) {
+        self.index.drop_history_below(first_retained_line);
+        self.bump_generation();
+    }
+
     /// Notify the search index that grid content has been invalidated.
     ///
     /// Call this when lines are deleted, scrollback is evicted, or the grid
@@ -333,6 +344,30 @@ impl TerminalSearch {
     ) -> Result<SearchResults, SearchOptionsError> {
         self.index
             .search_results_opts_direction(query, case_sensitive, is_regex, direction)
+    }
+
+    /// Cheap upper bound on the engine's own candidate count for a literal
+    /// query — see [`SearchIndex::literal_candidate_bound`]. Narrowing policy
+    /// layers compare a frame's length against this and skip the frame when
+    /// the index would visit fewer lines.
+    #[must_use]
+    pub fn literal_candidate_bound(&self, query: &str, case_sensitive: bool) -> Option<u64> {
+        self.index.literal_candidate_bound(query, case_sensitive)
+    }
+
+    /// One incremental-search narrowing step — see
+    /// [`SearchIndex::search_literal_narrowed`] for the full contract
+    /// (results-identity with the batch path, the occurrence-frame subset
+    /// property, and the capped/backward fallback rules).
+    #[must_use]
+    pub fn search_literal_narrowed(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        prev_lines: Option<&[u32]>,
+    ) -> NarrowedSearch {
+        self.index
+            .search_literal_narrowed(query, case_sensitive, prev_lines)
     }
 
     /// Search in the specified direction.

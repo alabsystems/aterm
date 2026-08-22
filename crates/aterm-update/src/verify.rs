@@ -58,6 +58,108 @@ const HELPER_POLL: Duration = Duration::from_millis(25);
 /// genuinely slow child) exactly where it was.
 const HELPER_POLL_MIN: Duration = Duration::from_millis(1);
 
+/// The AGGREGATE ceiling on one apply's verification work — see [`ApplyBudget`].
+///
+/// [`HELPER_TIMEOUT`] bounds ONE helper. It does not bound an apply, and an apply
+/// is not one helper: a staged swap runs sixteen of them in series (three
+/// `verified_bundle_identity` calls at five each, plus the start probe), because
+/// the staged, the fixed and the installed bundle are each re-verified at the
+/// point of use. Every one of those is fail-closed, so timeouts cannot actually
+/// accumulate — the first one aborts the apply — but "cannot accumulate" is a
+/// property of the CALLERS, argued across four files, and nothing stated the
+/// ceiling as a single number a reader could check.
+///
+/// 8s is that number. Measured against the real signed bundle the whole sequence
+/// is ~1.1s wall (codesign -R 0.101s, codesign -d 0.050s, spctl 0.193s,
+/// PlistBuddy 0.004s, the start probe 0.026s), so 8s is ~7x headroom over a
+/// healthy machine and still short enough that a user who double-clicked does not
+/// conclude the app is broken. Expiry defers the apply: the window opens on the
+/// build already installed, and the next launch tries again.
+pub const APPLY_BUDGET: Duration = Duration::from_secs(8);
+
+thread_local! {
+    /// The wall-clock instant this thread's apply must be finished verifying by,
+    /// or `None` outside an apply. Thread-local rather than threaded through ten
+    /// call sites because an apply IS one thread — it runs at the top of `main`,
+    /// before any window or worker exists.
+    static APPLY_DEADLINE: std::cell::Cell<Option<Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Opens an aggregate verification budget for the current thread, restoring the
+/// previous one on drop.
+///
+/// While it is live every helper spawned by this module is bounded by whichever
+/// is SOONER: its own [`HELPER_TIMEOUT`], or what remains of the budget. That is
+/// what turns "each of sixteen helpers is individually bounded" into "the apply
+/// is bounded", which is the property the launch path actually needs — the apply
+/// runs before the window exists, so its total latency is time the user spends
+/// looking at a bouncing Dock icon.
+pub struct ApplyBudget(Option<Instant>);
+
+impl ApplyBudget {
+    /// Start a budget of `limit`, replacing any budget already in force.
+    pub fn start(limit: Duration) -> Self {
+        Self(APPLY_DEADLINE.with(|d| d.replace(Some(Instant::now() + limit))))
+    }
+
+    /// Push the deadline out by `elapsed`, for work that is legitimately slow and
+    /// separately bounded — a cross-volume `ditto` of a several-hundred-megabyte
+    /// bundle, whose duration is a property of the disk, not of a wedged helper.
+    /// Without this, one slow copy would spend the whole budget and fail the
+    /// verification that follows it on a machine that is behaving perfectly.
+    pub fn extend(elapsed: Duration) {
+        APPLY_DEADLINE.with(|d| {
+            if let Some(deadline) = d.get() {
+                d.set(Some(deadline + elapsed));
+            }
+        });
+    }
+}
+
+impl Drop for ApplyBudget {
+    fn drop(&mut self) {
+        APPLY_DEADLINE.with(|d| d.set(self.0));
+    }
+}
+
+/// Bounded status-only run of a child that produces no output worth collecting —
+/// today `ditto`, whose copy can legitimately run for minutes and therefore gets
+/// its own explicit `limit` rather than [`HELPER_TIMEOUT`] or the apply budget.
+///
+/// Fails CLOSED exactly like [`output_bounded`]: a timeout is an `Err`, the child
+/// is killed and reaped, and the caller unwinds the half-made swap.
+pub(crate) fn status_bounded(
+    cmd: &mut Command,
+    what: &str,
+    limit: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn {what}: {e}"))?;
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{what} did not finish within {}s; treating as a failure",
+                        limit.as_secs()
+                    ));
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(HELPER_POLL.min(remaining));
+            }
+            Err(e) => return Err(format!("wait for {what}: {e}")),
+        }
+    }
+}
+
 /// Run a verification helper with a bounded wall clock, killing it on timeout.
 ///
 /// Fails CLOSED like every other check here: a timeout is an `Err`, i.e. a
@@ -130,7 +232,15 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn {what}: {e}"))?;
-    let deadline = Instant::now() + HELPER_TIMEOUT;
+    // Whichever ceiling binds first: this helper's own, or what is left of the
+    // apply's aggregate budget. Outside an apply there is no budget and the
+    // helper timeout stands alone, exactly as before.
+    let own = Instant::now() + HELPER_TIMEOUT;
+    let budget = APPLY_DEADLINE.with(|d| d.get());
+    let (deadline, bound_by_budget) = match budget {
+        Some(b) if b < own => (b, true),
+        _ => (own, false),
+    };
     let mut poll = HELPER_POLL_MIN;
     loop {
         match child.try_wait() {
@@ -141,10 +251,17 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
                     // holding the bundle open across the swap.
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "{what} did not finish within {}s; treating as a rejection",
-                        HELPER_TIMEOUT.as_secs()
-                    ));
+                    return Err(if bound_by_budget {
+                        format!(
+                            "{what} ran past this apply's verification budget; \
+                             treating as a rejection"
+                        )
+                    } else {
+                        format!(
+                            "{what} did not finish within {}s; treating as a rejection",
+                            HELPER_TIMEOUT.as_secs()
+                        )
+                    });
                 }
                 // Clamp the sleep to the remaining budget so the 30s ceiling
                 // stays exact, then back off toward the steady-state tick.
@@ -395,6 +512,86 @@ fn spctl_assess(app: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The aggregate budget must bind BEFORE a helper's own ceiling, or sixteen
+    /// serial helpers are only bounded by an argument about their callers rather
+    /// than by a number.
+    #[cfg(unix)]
+    #[test]
+    fn the_apply_budget_binds_before_the_helper_timeout() {
+        let _budget = ApplyBudget::start(Duration::from_millis(150));
+        let started = Instant::now();
+        let outcome = output_bounded(
+            Command::new("/bin/sleep").arg("30"),
+            "a helper that never returns",
+        );
+        let waited = started.elapsed();
+        let error = outcome.expect_err("a helper past the budget must be a rejection");
+        assert!(
+            error.contains("verification budget"),
+            "the rejection must name the budget, not the per-helper ceiling: {error}"
+        );
+        // Bounded by the budget (150ms), nowhere near HELPER_TIMEOUT (30s).
+        assert!(
+            waited < Duration::from_secs(5),
+            "waited {waited:?}, so the budget did not bind"
+        );
+    }
+
+    /// Outside an apply there is no budget, and the per-helper ceiling stands
+    /// alone exactly as before — the budget must not leak into ordinary use.
+    #[cfg(unix)]
+    #[test]
+    fn without_a_budget_a_helper_keeps_its_own_ceiling() {
+        assert!(APPLY_DEADLINE.with(|d| d.get()).is_none());
+        let out = output_bounded(Command::new("/bin/echo").arg("hi"), "echo")
+            .expect("a fast helper still runs");
+        assert!(out.status.success());
+    }
+
+    /// The budget restores whatever was in force when it drops, so a nested or
+    /// sequential apply cannot inherit a spent deadline.
+    #[cfg(unix)]
+    #[test]
+    fn the_budget_guard_restores_the_previous_deadline() {
+        assert!(APPLY_DEADLINE.with(|d| d.get()).is_none());
+        {
+            let _outer = ApplyBudget::start(Duration::from_secs(60));
+            let outer = APPLY_DEADLINE.with(|d| d.get()).expect("outer budget");
+            {
+                let _inner = ApplyBudget::start(Duration::from_millis(10));
+                assert!(APPLY_DEADLINE.with(|d| d.get()).expect("inner") < outer);
+            }
+            assert_eq!(APPLY_DEADLINE.with(|d| d.get()), Some(outer));
+        }
+        assert!(APPLY_DEADLINE.with(|d| d.get()).is_none());
+    }
+
+    /// A slow-but-honest copy must not spend the budget the checks after it need.
+    #[cfg(unix)]
+    #[test]
+    fn extending_the_budget_pays_back_disk_time() {
+        let _budget = ApplyBudget::start(Duration::from_secs(1));
+        let before = APPLY_DEADLINE.with(|d| d.get()).expect("budget");
+        ApplyBudget::extend(Duration::from_secs(30));
+        let after = APPLY_DEADLINE.with(|d| d.get()).expect("budget");
+        assert!(after >= before + Duration::from_secs(29));
+    }
+
+    /// `ditto` was the one child on the apply path with no ceiling at all.
+    #[cfg(unix)]
+    #[test]
+    fn status_bounded_kills_a_child_that_overruns() {
+        let started = Instant::now();
+        let error = status_bounded(
+            Command::new("/bin/sleep").arg("30"),
+            "a copy that never finishes",
+            Duration::from_millis(150),
+        )
+        .expect_err("an overrunning copy must fail, not hang");
+        assert!(error.contains("did not finish"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn team_id_parsed_from_codesign_output() {

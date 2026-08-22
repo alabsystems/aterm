@@ -6,7 +6,7 @@
 //!
 //! Extracted from `mod.rs` to reduce file size (#4553).
 
-use crate::grid::{Grid, StyleId};
+use crate::grid::Grid;
 use crate::parser::Parser;
 use crate::platform::FontDescriptor;
 use crate::scrollback::Scrollback;
@@ -20,6 +20,14 @@ use super::grouped_state::{
 use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TerminalModes, TerminalSize};
 use super::{CharacterSetState, KittyKeyboardState, Terminal, XtermKeyboardState};
+
+/// Source of process-unique engine identities (DMG-1 damage carrier). Starts at
+/// 1 so `0` stays the "never engine-filled" sentinel a fresh
+/// [`RenderInput::empty`](crate::render::RenderInput::empty) carries — an
+/// unstamped scratch can therefore NEVER pass the damage-scoped continuity
+/// check by accident. `Relaxed` suffices: uniqueness needs only atomicity of
+/// `fetch_add`, no ordering with other memory.
+static EXTRACT_IDENTITY_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Terminal {
     /// Create a new terminal with the given dimensions.
@@ -44,7 +52,6 @@ impl Terminal {
             parser: Parser::new(),
             modes: TerminalModes::new(),
             style: CurrentStyle::default(),
-            current_style_id: StyleId::DEFAULT,
             charset: CharacterSetState::new(),
             alt_grid: None,
             cursor_save: CursorSaveState::new(),
@@ -88,8 +95,15 @@ impl Terminal {
             policy_engine: None,
             damage_epoch: 0,
             damage_epoch_counted: false,
+            extract_identity: EXTRACT_IDENTITY_SOURCE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            // Gen 1 (not 0): a fresh RenderInput's `extract_gen` is 0, so the
+            // very first scoped-extraction attempt on any scratch is forced to
+            // the full-refill arm — the baseline every later scoped fill builds on.
+            extract_gen: 1,
             search_index: None,
             search_index_rebuilds: 0,
+            search_index_refreshes: 0,
             budgeted_search: None,
             absolute_row_revision: 0,
             repaint_blink_epoch: 0,

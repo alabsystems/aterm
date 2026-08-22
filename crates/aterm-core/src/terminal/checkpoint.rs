@@ -45,9 +45,10 @@
 //   - serde: the checkpoint stores leaf engine types BY VALUE and relies on
 //     `PartialEq` for the round-trip gate; on-the-wire serialization (the
 //     `grid: Vec<u8>` bytes are already serde-ready) is a later concern.
-//   - current_style_id is intentionally NOT carried: it indexes a per-grid
-//     style interner. On restore we set `style` and call `update_style_id()` to
-//     re-intern against the rebuilt grid (see `from_checkpoint`).
+//   - there is no style-id to carry: `CurrentStyle`'s four semantic fields are
+//     the whole rendition, and the writers read colours inline. On restore we set
+//     `style` and call `apply_style_change()`, which refreshes the writer caches
+//     and re-arms the rebuilt grid's BCE cursor template (see `from_checkpoint`).
 // ===========================================================================
 
 use aterm_types::charset::CharacterSetState;
@@ -147,8 +148,8 @@ impl GridCursorRepr {
 /// semantically-meaningful inputs `(fg, bg, flags, protected)`, so we capture
 /// only those and rebuild via `CurrentStyle::new(...)` on restore. This both
 /// avoids depending on `PartialEq` for `CurrentStyle`'s private cache and keeps
-/// the round-trip honest (the rebuilt cache is recomputed, then `style` is
-/// re-interned by `update_style_id()`).
+/// the round-trip honest (the cache is recomputed from the four inputs, then
+/// `apply_style_change()` re-arms the rebuilt grid's BCE cursor template).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StyleRepr {
     /// Foreground color.
@@ -177,7 +178,8 @@ impl StyleRepr {
 }
 
 /// Wire-stable DECSC/DECRC slot. The style is stored as semantic raw fields so
-/// restore rebuilds `CurrentStyle` caches instead of carrying grid-local intern IDs.
+/// restore rebuilds `CurrentStyle` caches from them rather than carrying any
+/// grid-local index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(transparent))]
@@ -450,15 +452,16 @@ impl Terminal {
             .current_working_directory
             .clone_from(&c.current_working_directory);
 
-        // Style: set the semantic style, then RE-INTERN against the rebuilt
-        // grid's interner (do NOT carry current_style_id — it is a per-grid
-        // index). update_style_id() refreshes the cached colors + StyleId.
+        // Style: set the semantic style, then re-arm the REBUILT grid's BCE
+        // cursor template from it. `into_style()` already rebuilds the writer
+        // caches (`CurrentStyle::new`), but the fresh grid's cursor template is
+        // default, so a restored non-default background would otherwise be lost
+        // by the first scroll/erase that ran before the next SGR (#7522).
         terminal.style = c.style.into_style();
         {
-            // `sgr_style().update_style_id()` re-interns `style` against the
-            // grid's StyleTable. We reach it via the generated handler split.
+            // We reach the SGR view via the generated handler split.
             let (_parser, mut handler) = terminal.split_for_process();
-            handler.sgr_style().update_style_id();
+            handler.sgr_style().apply_style_change();
         }
 
         terminal
@@ -472,6 +475,16 @@ impl Terminal {
     /// bindings and auth state are untouched, so this composes with the spawn
     /// path's configure_* wiring instead of re-deriving it.
     pub fn restore_checkpoint(&mut self, c: &TerminalCheckpoint) {
+        // The grids are REPLACED below, so every generation stamp the cached
+        // search index (and any budgeted-search cursor) was keyed against —
+        // `content_gen`, `absolute_row_counter`, `history_renumber_epoch` —
+        // restarts from a fresh grid's values. Those stamps are only meaningful
+        // within one grid lineage; carrying the caches across a wholesale
+        // replacement would let a coincidental stamp collision serve results
+        // from the PRE-restore content (and would break the incremental
+        // refresh's "retention only advances" model). Drop them; the next
+        // search rebuilds from the restored buffer.
+        self.release_search_index();
         let on_alt = c.modes.alternate_screen;
         self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
         self.alt_grid = match (&c.alt_grid, &c.alt_cursor) {
@@ -490,11 +503,11 @@ impl Terminal {
         self.secure_keyboard_entry = c.secure_keyboard_entry;
         self.current_working_directory
             .clone_from(&c.current_working_directory);
-        // Style: semantic value, then re-intern against the REBUILT grid's
-        // interner (never carry current_style_id — it indexes per-grid state).
+        // Style: semantic value, then re-arm the REBUILT grid's BCE cursor
+        // template from it (see `from_checkpoint`).
         self.style = c.style.into_style();
         let (_parser, mut handler) = self.split_for_process();
-        handler.sgr_style().update_style_id();
+        handler.sgr_style().apply_style_change();
     }
 }
 
@@ -954,10 +967,10 @@ mod tests {
 
     #[test]
     fn checkpoint_post_hydration_styled_write_matches() {
-        // Proves current_style_id was correctly recomputed: a styled write on
+        // Proves the writer caches were correctly rebuilt: a styled write on
         // both the source and the hydrated terminal must produce identical
-        // cells. (If from_checkpoint had carried a stale StyleId, the hydrated
-        // write would intern against the wrong table and diverge.)
+        // cells. (If from_checkpoint had left the caches or the BCE cursor
+        // template unrebuilt, the hydrated write would diverge.)
         let (rows, cols) = (10u16, 30u16);
         let mut t = build_rich_terminal(rows, cols);
         let c0 = t.checkpoint();

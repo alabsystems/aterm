@@ -69,6 +69,33 @@ fn is_spacer(cells: &[Cell], idx: usize) -> bool {
         && cells[idx - 1].is_wide()
 }
 
+/// Whether any cell in `cells` carries something
+/// [`Grid::extract_row_extras_into`] could extract WITHOUT the extras map: a
+/// style id to resolve against the table, a complex-char codepoint, or an RGB
+/// overflow colour.
+///
+/// Deliberately does NOT test `Cell::has_extras()`. This is only ever consulted
+/// when the map is EMPTY, where `extras.get(coord)` returns `None` for every
+/// column no matter what that flag says — so ignoring it is exact, and it also
+/// means a STALE flag (bulk clears leave those behind by design, see
+/// `grid/proofs_kani_extras_invariants.rs`) cannot defeat the gate.
+///
+/// Branch-free fold (`|`, not `||`): the case this exists for is the row that
+/// has nothing, which visits every cell either way, so an unconditional
+/// accumulate beats a short-circuit whose branch is unpredictable. All four
+/// tests are bit tests on the 8-byte cell the loop is already streaming.
+#[inline]
+fn row_has_extractable_cells(cells: &[Cell]) -> bool {
+    let mut found = false;
+    for cell in cells {
+        found |= cell.uses_style_id()
+            | cell.is_complex()
+            | cell.fg_needs_overflow()
+            | cell.bg_needs_overflow();
+    }
+    found
+}
+
 /// Cell layout version guard. If the Cell layout changes, deferred lines
 /// created under the old layout must not be materialized as-is.
 /// Bump this when `Cell`'s `repr(C, packed)` layout changes.
@@ -898,6 +925,32 @@ impl Grid {
             return;
         }
 
+        // ROW-LOCAL GATE for the map-empty case.
+        //
+        // The grid-global gate above is STICKY: `has_any_data()` is
+        // `!data.is_empty() || complex_ring.is_some() || rgb_ring.is_some()`, and
+        // the two dense rings are allocated on the first truecolor / non-BMP
+        // write ANYWHERE in the grid and are never freed. One coloured shell
+        // prompt therefore signs every plain row that scrolls off for the rest of
+        // the session up to the two O(cols) passes below — the reserve count and
+        // the per-cell walk with its `is_spacer` neighbour peek and its
+        // `extras.get(coord)` probe — inside the PTY reader's `term_lock` hold.
+        //
+        // When the MAP is empty, that whole pass can produce nothing unless a
+        // cell says so: every remaining source is announced by the cell's own
+        // bits — USES_STYLE_ID (style table), COMPLEX (char ring), fg/bg RGB
+        // overflow modes (colour ring) — and those bits are written by the very
+        // operation that fills the ring, so the fold is EXACT. No new flag to
+        // keep in sync, and no dependency on the `HAS_EXTRAS` ⇔ entry invariant
+        // (which this branch does not need: an empty map answers `None` for
+        // every column regardless).
+        //
+        // If the map is NON-empty nothing changes — an entry can sit on any row
+        // and only the walk can find it, so that case runs exactly as before.
+        if extras.is_empty() && !row_has_extractable_cells(&row.as_slice()[..len]) {
+            return;
+        }
+
         // Pre-size the rgb vectors: RGB-overflow rows and style-id rows both
         // otherwise pay repeated growth reallocs (4 → 8 → …) per Vec on the
         // scroll hot path. Counting is one cheap pass over the L1-resident
@@ -1256,4 +1309,88 @@ fn coalesce_underline_spans(per_col: &[(u16, u32)]) -> Vec<UnderlineColorSpan> {
         spans.push(UnderlineColorSpan::new(col, col.saturating_add(1), color));
     }
     spans
+}
+
+#[cfg(test)]
+mod extract_gate_tests {
+    use super::*;
+    use crate::{CellFlags, PackedColor};
+
+    /// The map-empty gate must never produce a FALSE NEGATIVE: a row whose only
+    /// datum is an RGB colour in the dense ring still has to extract it.
+    ///
+    /// This is the shape `set_range_uniform`'s RGB-only fast path produces — the
+    /// value in the ring, the mode bit on the cell, nothing in the map — i.e.
+    /// exactly the state the new gate reasons about.
+    #[test]
+    fn map_empty_row_with_ring_rgb_still_extracts() {
+        let mut grid = Grid::new(3, 8);
+        assert!(
+            grid.row_mut(0).expect("row 0").write_char_styled(
+                0,
+                'X',
+                PackedColor::rgb(9, 8, 7),
+                PackedColor::DEFAULT_BG,
+                CellFlags::empty(),
+            ),
+            "precondition: the styled write must land"
+        );
+        grid.extras_mut()
+            .set_rgb_ring_range(0, 0, 1, Some([9, 8, 7]), None, 3, 8);
+        assert!(
+            grid.extras().is_empty(),
+            "precondition: RGB-only data belongs in the ring, not the map — \
+             otherwise this test does not exercise the map-empty gate"
+        );
+
+        let row = grid.storage.row(0).expect("row 0");
+        let extracted = Grid::extract_row_extras(row, grid.extras(), 0, grid.styles());
+        assert_eq!(
+            extracted.rgb_fg,
+            vec![(0u16, [9u8, 8, 7])],
+            "the gate dropped a truecolor cell that lives in the ring"
+        );
+    }
+
+    /// An armed ring somewhere else in the grid must not change WHAT a plain row
+    /// extracts — only what it costs. Before the gate, that armed ring put this
+    /// row through the full per-cell pass; after it, the row is decided from its
+    /// own cells. The extracted result is empty either way, and that identity is
+    /// the whole behaviour claim.
+    #[test]
+    fn armed_ring_does_not_change_a_plain_row() {
+        let mut grid = Grid::new(3, 8);
+        grid.set_cursor(0, 0);
+        for ch in "hello".chars() {
+            grid.write_char(ch);
+        }
+
+        let before = {
+            let row = grid.storage.row(0).expect("row 0");
+            Grid::extract_row_extras(row, grid.extras(), 0, grid.styles())
+        };
+        assert!(before.is_empty(), "a plain row extracts nothing");
+
+        // Arm the grid-global sticky gate on a DIFFERENT row, the way a
+        // truecolor prompt does.
+        grid.extras_mut()
+            .set_rgb_ring_range(2, 0, 4, Some([1, 2, 3]), None, 3, 8);
+        assert!(
+            grid.extras().has_any_data(),
+            "precondition: the sticky grid-global gate is now armed"
+        );
+        assert!(
+            grid.extras().is_empty(),
+            "precondition: the map is still empty — only the ring was armed"
+        );
+
+        let after = {
+            let row = grid.storage.row(0).expect("row 0");
+            Grid::extract_row_extras(row, grid.extras(), 0, grid.styles())
+        };
+        assert!(
+            after.is_empty(),
+            "an armed ring on another row changed what a plain row extracts"
+        );
+    }
 }

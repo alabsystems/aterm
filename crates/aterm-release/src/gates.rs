@@ -60,13 +60,33 @@ pub fn trust_stage2_bin() -> Result<PathBuf> {
             _ => tried.push(dir.display().to_string()),
         }
     }
+    // FAULT ONLY, plus the one fact the operator cannot derive: where it looked. The
+    // three remedies live in [`TRUST_TOOLCHAIN_REMEDIES`] so that the caller can lay them
+    // out under its own `fix:` / `or:` — `provision::toolchain_check` used to pass this
+    // whole message through as the FAULT and then add a fourth remedy beside it, which
+    // is how one fixable problem started looking like two.
     Err(Error::new(format!(
-        "no Trust toolchain found. Looked in: {}. Install one with `atpkg install trust`, \
-         build one with `python3 x.py build --stage 2` in $HOME/trust, or point \
-         TRUST_STAGE2_BIN at a stage2 bin dir",
+        "no Trust toolchain found\nlooked in: {}",
         tried.join(", ")
     )))
 }
+
+/// The two ways past a missing x86_64 slice, for a caller to append VERBATIM.
+///
+/// One remedy text, laid out by whichever grid is printing it. Hand-indented inside the
+/// probe's own error it arrived unlabelled and mis-aligned on the audit's two-column
+/// layout, directly above a `fix:` line saying the same two things again — one missing
+/// rustup target printed four lines and two remedy markers.
+pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-darwin\n\
+     or:   cut with --arm64-only — an explicit, thinner artifact";
+
+/// The three ways to get a Trust toolchain, for a caller to append VERBATIM.
+///
+/// One text, appended where the caller's layout wants it, because two spellings of one
+/// remedy is the drift this crate has already paid for once.
+pub const TRUST_TOOLCHAIN_REMEDIES: &str = "atpkg install trust\n\
+     or build one: python3 x.py build --stage 2, in $HOME/trust\n\
+     or point TRUST_STAGE2_BIN at an existing stage2 bin dir";
 
 /// The ordered places a Trust toolchain may live. Split out so the order is readable
 /// and testable without a filesystem.
@@ -176,7 +196,12 @@ pub fn run_all(git: &dyn GitRunner, repo: &Path, opts: &GateOpts) -> Result<Gate
     let universal = if opts.arm64_only {
         false
     } else {
-        x86_target_probe()?;
+        // The cut appends the remedies itself: the probe returns a fault, and this is
+        // the only caller that must STOP, so it is the only one that has to say what to
+        // do about it right here.
+        x86_target_probe().map_err(|e| {
+            Error::new(format!("{e}\nfix:  {}", X86_SLICE_REMEDIES.replace('\n', "\n      ")))
+        })?;
         true
     };
     let free_disk_gib = disk_gate(repo)?;
@@ -628,11 +653,12 @@ pub fn x86_target_probe() -> Result<()> {
     if installed.lines().any(|l| l.trim() == "x86_64-apple-darwin") {
         return Ok(());
     }
+    // FAULT only. The remedies are [`X86_SLICE_REMEDIES`], laid out by the caller: this
+    // string is read on two different grids (a cut step line and a provision audit line),
+    // and a hand-indented `fix:`/`or:` block gets one of them wrong by construction.
     Err(Error::new(
         "x86_64-apple-darwin target missing from the stable toolchain — a universal \
-         build is impossible.\n  \
-         fix:  rustup +stable target add x86_64-apple-darwin\n  \
-         or:   re-run with --arm64-only to deliberately ship a single-arch build"
+         build is impossible"
             .to_string(),
     ))
 }

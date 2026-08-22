@@ -55,6 +55,18 @@ const CASCADE_STEP_PTS: f64 = 26.0;
 /// the work area's origin: exactly on top of the window it was supposed to clear.
 const CASCADE_MIN_VISIBLE_PTS: f64 = 160.0;
 
+/// How long after an attach the [`crate::InitialFrameSettle`] may still correct
+/// the frame. Long enough for the map + first configure burst AND the
+/// activation-echo configure that trails it (observed well under 500 ms on
+/// GNOME); short enough that a real user gesture is essentially impossible to
+/// collide with — past it, the compositor's size is the user's truth.
+#[cfg(target_os = "linux")]
+const INITIAL_FRAME_SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+/// Corrective size requests one attach may spend (stale-echo + scale-change can
+/// each need one; see [`crate::InitialFrameSettle::corrections`]).
+#[cfg(target_os = "linux")]
+const INITIAL_FRAME_SETTLE_MAX_CORRECTIONS: u8 = 3;
+
 /// Where a freshly-created window goes so it does not eclipse `anchor` (the outer
 /// top-left, in points, of the window it was opened from).
 ///
@@ -665,6 +677,24 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("aterm")
             .with_inner_size(size);
+        // LINUX WINDOW IDENTITY + FLOOR. `with_name` is the Wayland `app_id`
+        // AND the X11 `WM_CLASS` (one shared attribute serves both backends):
+        // without it the compositor sees an EMPTY app id — GNOME shows the
+        // generic gear icon, refuses to group aterm windows, and can never
+        // match a future `aterm.desktop` (icon/pinning/dock identity all key on
+        // this string equalling the desktop-file basename). Keep it `"aterm"`
+        // and lowercase-stable across releases for exactly that reason. The min
+        // size is the smallest LEGAL grid — the 20-col × 5-row clamp floor at
+        // the 12 px base font plus strip row and padding, in LOGICAL px so
+        // HiDPI scales it — a floor `resize`/WM hints cannot collapse to a
+        // sub-cell sliver. macOS/Windows attrs are byte-identical to before.
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attrs
+                .with_name("aterm", "aterm")
+                .with_min_inner_size(winit::dpi::LogicalSize::new(164.0, 98.0))
+        };
         // a11y: AccessKit must attach BEFORE the window is first shown, so create it
         // hidden and reveal it right after the adapter is built (feature-gated; the
         // default build keeps winit's visible-by-default).
@@ -913,6 +943,23 @@ impl App {
         }
         size = self.window_frame_px(rows, cols);
         let _ = window.request_inner_size(size);
+        // LINUX INITIAL-FRAME SETTLE: the request above is pre-map on Wayland —
+        // no CSD frame exists yet and `scale_factor()` may still be the assumed
+        // 1.0 — so the compositor's first configure round can hand back a frame
+        // that is NOT `rows`×`cols` (GNOME subtracts the 35 px CSD header from a
+        // geometry echo; a HiDPI output re-derives the font under the same
+        // logical size). Arm one bounded post-map re-request of THIS grid; see
+        // [`crate::InitialFrameSettle`] / [`Self::settle_initial_frame`].
+        #[cfg(target_os = "linux")]
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.initial_frame_settle = Some(crate::InitialFrameSettle {
+                rows,
+                cols,
+                deadline: Instant::now() + INITIAL_FRAME_SETTLE_WINDOW,
+                corrections: INITIAL_FRAME_SETTLE_MAX_CORRECTIONS,
+                corrected: false,
+            });
+        }
         // W1 (kill the compositor stretch): hint the WM to resize in whole-cell
         // steps, so an interactive edge drag lands on an exact grid fit and the
         // remainder bands stay at the base pad. macOS honours this during live
@@ -1185,6 +1232,69 @@ impl App {
             crate::metrics::record_initial_attach_milestones(milestones);
         }
         attached
+    }
+
+    /// LINUX INITIAL-FRAME SETTLE (see [`crate::InitialFrameSettle`]): called on
+    /// every `WindowEvent::Resized` AFTER the normal reflow has applied `size`.
+    /// While armed and inside the deadline, a `size` that is NOT the attach's
+    /// intended `rows`×`cols` frame — re-derived at the window's CURRENT scale,
+    /// so a post-map `ScaleFactorChanged` folds into the same target — spends
+    /// one corrective `request_inner_size`. A matching `size` after a correction
+    /// disarms (settled); a matching `size` BEFORE any correction keeps the arm,
+    /// because GNOME's activation configure can echo the pre-CSD-frame geometry
+    /// (header subtracted, −35 px) AFTER an initially-correct resize. winit
+    /// itself drops the request under a non-stateless configure
+    /// (maximized/fullscreen/tiled), so a tiling compositor is never fought.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settle_initial_frame(&mut self, wid: WindowId, size: PhysicalSize<u32>) {
+        let Some(settle) = self.windows.get(&wid).and_then(|ws| ws.initial_frame_settle) else {
+            return;
+        };
+        if Instant::now() > settle.deadline || settle.corrections == 0 {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.initial_frame_settle = None;
+            }
+            return;
+        }
+        // Re-tune the shared backend to THIS window's live scale before deriving
+        // the target frame — a `ScaleFactorChanged` may have landed since attach
+        // and `window_frame_px` reads the backend's current cell metrics.
+        self.apply_window_scale(wid);
+        let intended = self.window_frame_px(settle.rows, settle.cols);
+        if size == intended {
+            if settle.corrected && let Some(ws) = self.windows.get_mut(&wid) {
+                ws.initial_frame_settle = None;
+            }
+            return;
+        }
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if let Some(s) = ws.initial_frame_settle.as_mut() {
+            s.corrections -= 1;
+            s.corrected = true;
+        }
+        let Some(w) = ws.os_window.clone() else {
+            return;
+        };
+        // winit's Wayland backend applies this request SYNCHRONOUSLY and
+        // returns `Some` — NO `Resized` event will follow (the event-driven
+        // shape the macOS/X11 backends have). Left unhandled, the app keeps
+        // the echo's size while the compositor holds the corrected one, and
+        // the two never reconverge (observed: a 24-row engine cropped into a
+        // 329 px surface). So feed the applied size through the same resize
+        // path an event would have taken, and cancel the throttled reflow of
+        // the very size being corrected away — its trailing settle would
+        // otherwise re-apply the stale grid on top of this resync. `None`
+        // (X11/async) keeps the event path authoritative.
+        if let Some(applied) = w.request_inner_size(intended) {
+            ws.pending_resize = None;
+            ws.next_resize_settle = None;
+            ws.win_px = Some(applied);
+            self.sync_surface_to_window(wid);
+            self.on_resize(wid, applied);
+            w.request_redraw();
+        }
     }
 
     /// LOGICAL window teardown (NO winit/`el`): close window `wid` — drop every one
@@ -2766,6 +2876,122 @@ mod tests {
             app.pool.views(0),
             Some(1),
             "negative control: the retired views==1 rule would miss this close"
+        );
+    }
+
+    /// Arm window 0's initial-frame settle with a far deadline and `budget`
+    /// corrections, returning the intended frame for the given grid.
+    #[cfg(target_os = "linux")]
+    fn arm_settle(app: &mut App, rows: u16, cols: u16, budget: u8) -> PhysicalSize<u32> {
+        let wid = WindowId(0);
+        app.windows
+            .get_mut(&wid)
+            .expect("headless window 0")
+            .initial_frame_settle = Some(crate::InitialFrameSettle {
+            rows,
+            cols,
+            deadline: Instant::now() + std::time::Duration::from_secs(60),
+            corrections: budget,
+            corrected: false,
+        });
+        app.window_frame_px(rows, cols)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn settle_state(app: &App) -> Option<crate::InitialFrameSettle> {
+        app.windows
+            .get(&WindowId(0))
+            .and_then(|ws| ws.initial_frame_settle)
+    }
+
+    /// The GNOME shape: the first configure lands the intended size (settle
+    /// must WAIT, not disarm — the lossy echo is still in flight), the
+    /// activation echo then hands back a CSD-header-short frame (settle spends
+    /// a correction), and the corrected size finally lands (settle disarms).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn initial_frame_settle_waits_out_the_csd_header_echo_then_disarms() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+
+        app.settle_initial_frame(wid, intended);
+        let s = settle_state(&app).expect("an initially-correct frame must stay armed");
+        assert!(!s.corrected, "no correction was needed yet");
+        assert_eq!(s.corrections, 3);
+
+        let stolen = PhysicalSize::new(intended.width, intended.height - 35);
+        app.settle_initial_frame(wid, stolen);
+        let s = settle_state(&app).expect("a spent correction stays armed for its own echo");
+        assert!(s.corrected);
+        assert_eq!(s.corrections, 2, "the mismatch spends exactly one correction");
+
+        app.settle_initial_frame(wid, intended);
+        assert!(
+            settle_state(&app).is_none(),
+            "intended size after a correction = settled: disarm"
+        );
+    }
+
+    /// An exhausted correction budget disarms WITHOUT another request — the
+    /// compositor that keeps insisting (tiling, an early maximize) wins.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn initial_frame_settle_budget_bounds_the_fight() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 1);
+        let insisted = PhysicalSize::new(1920, 1080);
+
+        app.settle_initial_frame(wid, insisted);
+        assert_eq!(settle_state(&app).expect("one correction spent").corrections, 0);
+
+        app.settle_initial_frame(wid, insisted);
+        assert!(
+            settle_state(&app).is_none(),
+            "budget exhausted: the insisted size is accepted for good"
+        );
+        assert_ne!(
+            intended, insisted,
+            "negative control: the fight was real, not a matching no-op"
+        );
+    }
+
+    /// Past the deadline the settle disarms untouched — whatever the window is
+    /// by then is the user's truth, never re-asserted.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn initial_frame_settle_deadline_expires_without_correcting() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .initial_frame_settle
+            .as_mut()
+            .unwrap()
+            .deadline = Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        app.settle_initial_frame(wid, PhysicalSize::new(intended.width, intended.height - 35));
+        assert!(
+            settle_state(&app).is_none(),
+            "expiry disarms instead of spending a correction"
+        );
+    }
+
+    /// A control-socket grid resize OWNS the geometry: it disarms the settle so
+    /// the attach grid is never re-asserted over a driven size.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_driven_grid_resize_disarms_the_initial_frame_settle() {
+        let mut app = App::headless_for_test();
+        arm_settle(&mut app, 24, 80, 3);
+        app.apply_grid_resize(30, 100);
+        assert!(
+            settle_state(&app).is_none(),
+            "apply_grid_resize must clear the settle before requesting its own size"
         );
     }
 }

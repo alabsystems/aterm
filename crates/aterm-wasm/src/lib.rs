@@ -221,6 +221,49 @@ pub struct AtermTerminal {
     // lie — those frames export one full band (audit E3, fractional-scroll
     // clause). pub(crate) for dirty_band_present_api.
     pub(crate) last_present_frac: i32,
+    // ---- WF-1 frame gate (the web twin of the native RepaintKey / D-1 design):
+    // `render()` skips the whole refill->diff->clone->raster pipeline when NOTHING
+    // observable changed since the last rendered frame. The engine half of that
+    // proof is `damage_epoch` (advances iff the grid changed since the last
+    // consumed session); the HOST half is the counter below, bumped by every
+    // wasm-API mutator of renderer-held or presentation state the epoch cannot
+    // see (selection, blink phase, hollow cursor, default cursor style, spill
+    // config, keystroke ignition, color scheme). The enumeration rule is
+    // conservative: any `&mut` method that can change pixels without marking
+    // grid damage either sets `force_full_repaint` (the existing appearance
+    // discipline) or bumps this counter.
+    host_visual_gen: u64,
+    // The (epoch, host gen, effects-active) triple of the last frame `render()`
+    // actually rendered. `None` until the first render; equality with the
+    // current triple — with effects idle, no pending frac shift, no pending
+    // reflow job, and no forced repaint — is the skip proof.
+    last_frame_key: Option<FrameGateKey>,
+    // Whether the last `render()` took the gate's skip path (present_bands
+    // cleared to ZERO bands, framebuffer + rgba untouched). Exposed via
+    // `last_render_skipped()` — the gate's two-sided reach witness for tests
+    // and benches.
+    last_render_gated: bool,
+    // Shadow of the last blink phase handed to the renderer, so a host timer
+    // that re-asserts the SAME phase (coarse timers do) does not force a
+    // render. `None` = never set (the first set always bumps).
+    blink_phase_shadow: Option<bool>,
+    // Shadow of the last hollow-cursor override — same de-dup contract.
+    hollow_shadow: Option<bool>,
+}
+
+/// The WF-1 frame-gate key: every input of a rendered frame that can change
+/// between two `render()` calls at stable dims/config. Grid content folds into
+/// `damage_epoch` (one u64 that advances iff a damage session existed — the
+/// same engine seam the native GUI's RepaintKey consumes); host visual state
+/// folds into `host_visual_gen`; an ACTIVE effects pipeline never skips (it
+/// animates by definition), and the active->idle transition renders exactly one
+/// more frame (the key differs on `effects_active`) so the settled/cleared
+/// overlay channels are painted before the gate closes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FrameGateKey {
+    damage_epoch: u64,
+    host_visual_gen: u64,
+    effects_active: bool,
 }
 
 /// The single-slot per-row display-cell cache backing `cell_text`/`cell_is_wide`.
@@ -380,6 +423,11 @@ impl AtermTerminal {
             reflow_grace: 0,
             reflow_budget: REFLOW_STEP_BUDGET_LINES,
             display_row_cache: std::cell::RefCell::new(DisplayRowCache::default()),
+            host_visual_gen: 0,
+            last_frame_key: None,
+            last_render_gated: false,
+            blink_phase_shadow: None,
+            hollow_shadow: None,
         })
     }
 
@@ -624,12 +672,24 @@ impl AtermTerminal {
     /// Set the cursor blink phase: `true` draws the cursor this frame, `false`
     /// hides it. The host drives a ~530ms blink timer; independent of DECSCUSR.
     pub fn set_cursor_blink_phase(&mut self, on: bool) {
+        // WF-1 gate: blink is renderer-held — the damage epoch can't see it.
+        // De-dup through the shadow so a coarse host timer re-asserting the
+        // same phase doesn't defeat the settled-frame skip.
+        if self.blink_phase_shadow != Some(on) {
+            self.blink_phase_shadow = Some(on);
+            self.note_host_visual_change();
+        }
         self.renderer.set_cursor_blink_phase(on);
     }
 
     /// Force a hollow (unfocused) cursor when `true`, or restore the terminal's
     /// DECSCUSR style when `false` — the standard focused/unfocused affordance.
     pub fn set_cursor_hollow(&mut self, hollow: bool) {
+        // WF-1 gate: renderer-held override, invisible to the damage epoch.
+        if self.hollow_shadow != Some(hollow) {
+            self.hollow_shadow = Some(hollow);
+            self.note_host_visual_change();
+        }
         self.renderer.set_cursor_style_override(if hollow {
             Some(CursorStyle::HollowBlock)
         } else {
@@ -774,6 +834,10 @@ impl AtermTerminal {
     /// position. Without this the engine keeps its construction default
     /// (`DEFAULT_LINE_LIMIT`, 100k total).
     pub fn set_scrollback_limit(&mut self, lines: u32) {
+        // WF-1 gate (defensive): a shrink can re-clamp a scrolled viewport;
+        // the engine marks damage for that, but one extra render is cheaper
+        // than coupling this gate to that guarantee.
+        self.note_host_visual_change();
         let limit = if lines == 0 {
             None
         } else {
@@ -895,7 +959,14 @@ impl AtermTerminal {
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small-history fast path: rewrap now (bounded by the inline cap).
-                self.term.finish_resize_offload(pending.reflow());
+                // A follow-up job (RFL-3 width convergence) cannot arise here —
+                // nothing can change the width mid-call on this single-threaded
+                // path — but dropping one would wedge the detach window, so
+                // route it to the pump, belt and suspenders.
+                if let Some(follow) = self.term.finish_resize_offload(pending.reflow()) {
+                    self.pending_reflow = Some(follow);
+                    self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
+                }
             } else {
                 // Stash for a later host turn. If a job is ALREADY stashed here,
                 // this overwrite drops it — that is only reachable when the grid
@@ -960,8 +1031,17 @@ impl AtermTerminal {
                 true
             }
             ReflowStep::Done(reflowed) => {
-                self.term.finish_resize_offload(reflowed);
-                false
+                // CONVERGENCE (RFL-3): a width change that landed while this
+                // job was stepping means the re-attach hands back a
+                // re-detached job at the settled width — keep pumping it; the
+                // `true` already means "schedule another pump".
+                match self.term.finish_resize_offload(reflowed) {
+                    Some(follow) => {
+                        self.pending_reflow = Some(follow);
+                        true
+                    }
+                    None => false,
+                }
             }
         }
     }
@@ -1026,6 +1106,51 @@ impl AtermTerminal {
         // global-budget share, then promote one bounded staged batch into the
         // LZ4 store — compression lives HERE, never on the ingest path.
         self.drain_compress_backlog_on_render();
+        // ---- WF-1 FRAME GATE ---------------------------------------------------
+        // Computed AFTER the pumps (a reflow re-attach marks full damage, so the
+        // epoch term sees it). When the key equals the last RENDERED frame's key
+        // and nothing present-time is pending, this frame is byte-identical by
+        // construction: skip the three full-grid passes (cell_frame_into resolve,
+        // compute_dirty_rows row diff, cache clone_from) AND the raster/expand
+        // entirely. The skip is observable only as ZERO present bands — exactly
+        // what an unchanged frame already exported through the GateHit arm — with
+        // `rgba` retaining the last frame's bytes (the host contract for band
+        // count 0 is "skip putImageData"; re-reading `rgba` stays valid).
+        //
+        // Gate terms and why each is sufficient:
+        // - `damage_epoch`: advances iff the grid changed since the session this
+        //   gate consumed below — writes, scrolls, erases, resizes, recolors
+        //   (OSC/DECSCNM mark full damage), display-offset moves.
+        // - `host_visual_gen`: every wasm-layer mutator of renderer-held state
+        //   (selection, blink, hollow, spill config, ...) bumps it.
+        // - `effects_active`: an active pipeline animates every frame — never
+        //   skip; the active->idle edge changes the key, buying the one settle
+        //   frame that paints the cleared overlay channels.
+        // - frac terms: a pending or just-released sub-row translate re-presents
+        //   the whole band even with zero damage (the E3 frac clause).
+        // - `pending_reflow`/`force_full_repaint`: belt-and-braces bails; both
+        //   already force their own repaint semantics.
+        let gate_cell_h = self.renderer.cell_size().1;
+        let gate_key = FrameGateKey {
+            damage_epoch: self.term.damage_epoch(),
+            host_visual_gen: self.host_visual_gen,
+            effects_active: self.effects.is_active(),
+        };
+        if !self.force_full_repaint
+            && !gate_key.effects_active
+            && self.pending_reflow.is_none()
+            && self.last_present_frac == 0
+            && self.scroll_input.frac_px(gate_cell_h) == 0
+            && self.last_frame_key == Some(gate_key)
+        {
+            // ZERO bands = "frame unchanged, skip RGBA reads and putImageData"
+            // (the documented present_band_count contract). Nothing else moves.
+            self.present_bands.clear();
+            self.last_render_gated = true;
+            return;
+        }
+        self.last_render_gated = false;
+        // ---- END WF-1 FRAME GATE ----------------------------------------------
         // An appearance-only change (theme/palette/font) doesn't move any cell, so
         // the row-diff wouldn't repaint it — drop the cache to force one full frame.
         if self.force_full_repaint {
@@ -1038,6 +1163,15 @@ impl AtermTerminal {
         // effects/stamp passes below re-fill the host-owned overlay channels, so
         // a reused scratch never carries a previous frame's state.
         self.refill_frame_scratch();
+        // WF-1: consume the damage session the snapshot above just captured, so
+        // the NEXT net-new grid change opens a fresh session and advances the
+        // epoch the frame gate compares. Before the gate existed nothing on the
+        // web path ever called take_damage, so the epoch advanced exactly once
+        // per instance lifetime and could never serve as a change detector.
+        // aterm-render never reads the tracker (it diffs snapshots), and this
+        // render loop is the engine's only damage consumer here, so consuming
+        // the session cannot starve any other reader.
+        self.term.take_damage();
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant. With every effect off this only clears the channels a reused
         // scratch may carry — byte-identical to the pre-effects render.
@@ -1084,6 +1218,55 @@ impl AtermTerminal {
         // this frame the moment `render` returns. Length-check no-op at 0/0
         // chrome and on frames whose band-relevant emissions are unchanged.
         self.spill.update(&self.renderer, &self.frame_scratch);
+        // WF-1: this frame RENDERED — record its key so an unchanged successor
+        // can skip. (The epoch in `gate_key` was latched before the take above,
+        // and `take_damage` never changes the epoch VALUE — only re-arms it —
+        // so an idle successor re-reads the same number and matches.)
+        self.last_frame_key = Some(gate_key);
+    }
+
+    /// `true` when the LAST [`render`](Self::render) call was elided by the
+    /// WF-1 frame gate: nothing observable had changed, so the framebuffer,
+    /// `rgba`, and spill exports all retained the previous frame's bytes and
+    /// `present_band_count()` reported 0. Hosts can use this (or the cheaper
+    /// [`needs_frame`](Self::needs_frame) BEFORE calling `render`) to idle
+    /// their loop; tests and benches use it as the gate's reach witness.
+    pub fn last_render_skipped(&self) -> bool {
+        self.last_render_gated
+    }
+
+    /// Whether the next [`render`](Self::render) would actually draw — the
+    /// exported form of the WF-1 frame gate, so a JS host can skip the wasm
+    /// call (and its own canvas work) entirely on settled frames.
+    ///
+    /// `&mut self` because reading [`Terminal::damage_epoch`] latches the
+    /// current damage session (idempotent; the same read `render` performs).
+    /// Advisory in one direction only: `true` may prove spurious (the render
+    /// may still gate) but `false` is authoritative — a `false` here and the
+    /// following `render()` is guaranteed to skip, because every term below is
+    /// exactly the gate's own.
+    pub fn needs_frame(&mut self) -> bool {
+        let cell_h = self.renderer.cell_size().1;
+        let key = FrameGateKey {
+            damage_epoch: self.term.damage_epoch(),
+            host_visual_gen: self.host_visual_gen,
+            effects_active: self.effects.is_active(),
+        };
+        self.force_full_repaint
+            || key.effects_active
+            || self.pending_reflow.is_some()
+            || self.last_present_frac != 0
+            || self.scroll_input.frac_px(cell_h) != 0
+            || self.last_frame_key != Some(key)
+    }
+
+    /// WF-1: record a host-visible visual change the engine's damage epoch
+    /// cannot see (renderer-held or presentation state), reopening the frame
+    /// gate for exactly one frame. Idempotence is the caller's choice: value
+    /// shadows (blink/hollow) de-dup before calling; unconditional callers
+    /// (selection ops) simply buy one render, never a stale skip.
+    pub(crate) fn note_host_visual_change(&mut self) {
+        self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
     /// Last-rendered framebuffer width in pixels.
@@ -1182,6 +1365,9 @@ impl AtermTerminal {
     /// intentionally diverges from the in-frame veil pixels at the clip line.
     /// Applies from the next `render()`.
     pub fn set_spill_include_veils(&mut self, on: bool) {
+        // WF-1 gate: spill config changes the exports `render` refreshes; a
+        // gated render would leave them stale against the new setting.
+        self.note_host_visual_change();
         self.spill.set_include_veils(on);
     }
 
@@ -1295,6 +1481,9 @@ impl AtermTerminal {
     /// 6=steady bar; out-of-range (0, 7+) is ignored. Unlike a render override this does
     /// NOT clobber an app's live DECSCUSR (e.g. vim insert-mode bar).
     pub fn set_default_cursor_style(&mut self, n: u8) {
+        // WF-1 gate: cursor-style presentation may repaint the cursor cell
+        // without a grid write; bump rather than audit the engine's marking.
+        self.note_host_visual_change();
         if let Some(style) = CursorStyle::from_param(u16::from(n)) {
             self.term.set_default_cursor_style(style);
         }
@@ -1306,6 +1495,10 @@ impl AtermTerminal {
     /// drain it via `take_response` and forward to the PTY so subscribed apps live-
     /// update their theme. A no-op when the scheme is unchanged.
     pub fn set_color_scheme(&mut self, dark: bool) {
+        // WF-1 gate (defensive): scheme changes can recolor engine-resolved
+        // dynamic colors; whether the engine marks damage for every arm is its
+        // business — one render buys certainty.
+        self.note_host_visual_change();
         let scheme = if dark {
             aterm_types::Appearance::Dark
         } else {
@@ -1409,6 +1602,11 @@ impl AtermTerminal {
 
     /// Begin a character selection at display `row`/`col` (clears any prior one).
     pub fn selection_start(&mut self, row: i32, col: u16) {
+        // WF-1 gate: selection is Terminal-held but marks NO grid damage (the
+        // native GUI folds it as its own RepaintKey term for the same reason).
+        // Every selection mutator below bumps unconditionally — idempotent
+        // inserts would need a fingerprint compare for zero benefit.
+        self.note_host_visual_change();
         let row = self.display_row_to_terminal(row);
         self.term.text_selection_mut().start_selection(
             row,
@@ -1424,6 +1622,7 @@ impl AtermTerminal {
     /// whitespace it falls back to the clicked cell. The selection stays active so
     /// the highlight paints.
     pub fn selection_word(&mut self, row: i32, col: u16) -> Option<String> {
+        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         // smart_word_at is display-offset-aware (takes the DISPLAY row); the
         // selection anchor must be terminal-relative.
         let (start, last) = match self
@@ -1445,6 +1644,7 @@ impl AtermTerminal {
     /// Mirrors aterm-gui's select_line: a Lines selection expanded to the full row
     /// width. `col` is accepted for a uniform host API but unused (whole row).
     pub fn selection_line(&mut self, row: i32, col: u16) -> Option<String> {
+        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         let _ = col;
         let row = self.display_row_to_terminal(row);
         let max_col = (self.cols as u16).saturating_sub(1);
@@ -1457,6 +1657,7 @@ impl AtermTerminal {
 
     /// Move the selection endpoint to `row`/`col` (during a drag).
     pub fn selection_extend(&mut self, row: i32, col: u16) {
+        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         let row = self.display_row_to_terminal(row);
         self.term
             .text_selection_mut()
@@ -1465,11 +1666,13 @@ impl AtermTerminal {
 
     /// Finalize the selection (mouse released).
     pub fn selection_finish(&mut self) {
+        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         self.term.text_selection_mut().complete_selection();
     }
 
     /// Drop the current selection so the highlight clears on the next render.
     pub fn selection_clear(&mut self) {
+        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         self.term.text_selection_mut().clear();
     }
 
@@ -2428,6 +2631,11 @@ impl AtermTerminal {
             reflow_grace: 0,
             reflow_budget: REFLOW_STEP_BUDGET_LINES,
             display_row_cache: std::cell::RefCell::new(DisplayRowCache::default()),
+            host_visual_gen: 0,
+            last_frame_key: None,
+            last_render_gated: false,
+            blink_phase_shadow: None,
+            hollow_shadow: None,
         })
     }
 }
@@ -4623,4 +4831,76 @@ mod tests {
         assert!(bad.complete() && bad.matches().is_empty());
         assert!(bad.reset() && bad.search_id().is_none());
     }
+
+    /// WF-1 frame gate, two-sided + byte parity. Side 1 (skip): a second
+    /// `render()` with nothing changed must take the gate (zero present bands,
+    /// `rgba` byte-identical). Side 2 (reopen): every class of change the gate
+    /// folds — grid damage, blink phase, selection, viewport scroll — must
+    /// defeat the skip and produce output byte-identical to a fresh instance
+    /// fed the same bytes (the gate can never be the thing that changes
+    /// pixels). This is the reach fence: if the gate silently stopped firing
+    /// (or fired always), one of the two sides fails.
+    #[test]
+    fn frame_gate_skips_settled_frames_and_reopens_on_every_change_class() {
+        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            eprintln!("no system font; skipping frame-gate test");
+            return;
+        };
+        t.process(b"hello gate");
+        t.render();
+        assert!(!t.last_render_skipped(), "first render must draw");
+        let baseline = t.rgba();
+
+        // SKIP side: settled frame -> gated, zero bands, bytes retained.
+        t.render();
+        assert!(t.last_render_skipped(), "settled frame must take the gate");
+        assert_eq!(t.present_band_count(), 0, "gated frame exports zero bands");
+        assert_eq!(t.rgba(), baseline, "gated frame retains the framebuffer");
+        assert!(!t.needs_frame(), "needs_frame must agree with the gate");
+
+        // REOPEN side 1: grid damage (echo).
+        t.process(b"!");
+        assert!(t.needs_frame(), "damage must reopen the gate");
+        t.render();
+        assert!(!t.last_render_skipped(), "an echo frame must draw");
+        // Byte parity with a fresh instance fed the same total byte stream:
+        // the gate must be unobservable in pixels.
+        let Some(mut fresh) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            return;
+        };
+        fresh.process(b"hello gate!");
+        fresh.render();
+        assert_eq!(t.rgba(), fresh.rgba(), "gate must be pixel-invisible");
+
+        // REOPEN side 2: renderer-held blink phase (no grid damage).
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled before blink");
+        t.set_cursor_blink_phase(false);
+        t.render();
+        assert!(!t.last_render_skipped(), "a blink flip must draw");
+        t.set_cursor_blink_phase(false); // same phase again: shadow de-dups
+        t.render();
+        assert!(t.last_render_skipped(), "an idempotent blink re-assert must gate");
+
+        // REOPEN side 3: selection (Terminal-held, no grid damage).
+        t.selection_start(2, 1);
+        t.selection_extend(2, 8);
+        t.render();
+        assert!(!t.last_render_skipped(), "a selection change must draw");
+
+        // REOPEN side 4: viewport scroll (display-offset damage).
+        for _ in 0..12 {
+            t.process(b"line\r\n");
+        }
+        t.render();
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled before scroll");
+        t.scroll_lines(3);
+        t.render();
+        assert!(
+            !t.last_render_skipped(),
+            "a viewport scroll must draw (display-offset damage -> epoch)"
+        );
+    }
 }
+

@@ -1758,6 +1758,101 @@ fn combining_marks_gpu_match_cpu() {
     );
 }
 
+/// W8 (g)/(h) CPU/GPU parity for the CONDENSED symbol-tier raster.
+///
+/// The bug this pins: U+27F5..U+27FC are one STIX Two Math design (advance
+/// 1.612 em, ink 1.499 em) that neither SF Mono nor Arial Unicode carries, so
+/// they land on the symbol fallback tier and used to paint ~2.9 CELLS wide
+/// while occupying exactly ONE cell in the grid — burying the two columns to
+/// their right and shearing any box-drawing table they appeared in. The fix
+/// condenses the coverage at RASTER time, before the `GlyphKey` cache insert,
+/// so the GPU inherits it for free: `Atlas::place` pulls the EXACT cached
+/// bytes and `slot.xmin` from the CPU renderer and places them through the
+/// SHARED `aterm_render::glyph_quad`. There is no GPU-side code in the fix —
+/// THIS TEST is what pins that, and what stops a future divergence.
+///
+/// The spill law is stated DIFFERENTIALLY (against the same row drawn with
+/// spaces) rather than against a background constant, because the frame the
+/// compositor hands back carries the theme's own ground treatment and a
+/// "blank cell" is not literally `Theme::bg`.
+#[test]
+fn condensed_symbol_fallback_gpu_matches_cpu() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    // The arrows come from a LAZILY parsed symbol face; block so neither
+    // renderer compares a provisional `.notdef` frame against a real glyph.
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    // One arrow every third column, so the two columns to its right — exactly
+    // the ones the pre-fix raster buried — are known-blank cells.
+    let (rows, cols) = (1usize, 12usize);
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut render = |cpu: &mut Renderer, gpu: &mut aterm_gpu::GpuRenderer, bytes: &[u8]| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(bytes);
+        let input = term.cell_frame(rows, cols);
+        (
+            cpu.render_input(&input),
+            gpu.render_input(&mut win, &input, None),
+        )
+    };
+    let (cpu_arrows, gpu_arrows) = render(
+        &mut cpu,
+        &mut gpu,
+        "\x1b[?25l\u{27F5}  \u{27F6}  \u{27F8}  \u{27F9}  ".as_bytes(),
+    );
+    let (cpu_blank, gpu_blank) = render(&mut cpu, &mut gpu, b"\x1b[?25l            ");
+
+    assert_eq!(
+        (gpu_arrows.width, gpu_arrows.height),
+        (cpu_arrows.width, cpu_arrows.height),
+        "dimensions differ"
+    );
+    let delta = max_channel_delta(&cpu_arrows, &gpu_arrows);
+    eprintln!("condensed symbol fallback GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "GPU/CPU condensed-fallback pixels diverge: max per-channel delta {delta} > 8"
+    );
+
+    let (cw, ch) = cpu.cell_size();
+    let mut drew = 0usize;
+    for arrow in [0usize, 3, 6, 9] {
+        for (who, ink_f, blank_f) in [
+            ("CPU", &cpu_arrows, &cpu_blank),
+            ("GPU", &gpu_arrows, &gpu_blank),
+        ] {
+            // Non-vacuity: the arrow cell itself must differ from blank, or
+            // the spill law below is trivially satisfied.
+            if cell_pixels(ink_f, cw, ch, 0, arrow) != cell_pixels(blank_f, cw, ch, 0, arrow) {
+                drew += 1;
+            }
+            // The two columns to the right must be pixel-identical to the
+            // same columns of the all-spaces frame: the arrow touched nothing.
+            for spill in [arrow + 1, arrow + 2] {
+                let got = cell_pixels(ink_f, cw, ch, 0, spill);
+                let want = cell_pixels(blank_f, cw, ch, 0, spill);
+                let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "{who}: the arrow at col {arrow} paints into col {spill} \
+                     ({differing}/{} pixels differ from a blank cell)",
+                    got.len()
+                );
+            }
+        }
+    }
+    assert!(
+        drew > 0,
+        "non-vacuity: no arrow drew any ink, so the spill law is trivially satisfied"
+    );
+}
+
 /// Every combining fixture above hangs its mark off a printable LETTER, so none
 /// of them reaches the case where the two backends express drawability
 /// differently: the CPU wraps the base glyph AND its marks in ONE guard

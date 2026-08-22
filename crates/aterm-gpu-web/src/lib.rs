@@ -269,6 +269,24 @@ pub struct AtermGpuTerminal {
     // boundaries. pub(crate) so scrollback_tiers_api reaches it. Mirrors
     // aterm-wasm.
     pub(crate) budget_share: aterm_core::terminal::scrollback_shared_budget::ScrollbackBudgetShare,
+    // ---- WF-1 twin readiness (aterm-wasm's settled-frame gate, mirrored here).
+    // The CPU twin's `render()` skips its whole refill->diff->raster pipeline
+    // when nothing observable changed, proving "nothing changed" from
+    // (damage_epoch, THIS counter, effects_active): the counter is the host
+    // half — every wasm-layer mutator of renderer-held/presentation state the
+    // engine's damage epoch cannot see bumps it.
+    //
+    // This crate has NO such gate yet: every `render`/`render_offscreen`
+    // presents, and aterm-gpu's own dirty-row diff is keyed off the WHOLE
+    // `RenderInput` snapshot (effects overlay channels included), so a missing
+    // bump cannot serve a stale frame here TODAY. The counter is maintained
+    // anyway because the `effects_api` module is a byte-for-byte mirror of the
+    // twin's (crates/aterm-effects/tests/web_binding_parity.rs enforces it):
+    // carrying the bumps for real — not as an empty stub — means the day this
+    // twin gets its own gate, the effects half of its 136-pub-fn mutator audit
+    // is already done and CORRECT, instead of looking wired while silently
+    // dropping every bump. Consumed by nothing until then.
+    host_visual_gen: u64,
 }
 
 /// The single-slot per-row display-cell cache backing `cell_text`/`cell_is_wide`.
@@ -328,6 +346,18 @@ impl AtermGpuTerminal {
     fn refill_frame_scratch(&mut self) {
         self.term
             .cell_frame_into(&mut self.frame_scratch, self.rows, self.cols);
+    }
+
+    /// WF-1 (twin readiness): record a host-visible visual change the engine's
+    /// damage epoch cannot see — renderer-held or presentation state.
+    ///
+    /// In aterm-wasm this reopens the settled-frame gate for exactly one frame.
+    /// Here there is no frame gate yet, so the bump is maintained but not read;
+    /// see the `host_visual_gen` field for why it is kept real rather than
+    /// stubbed out. Idempotence is the caller's choice: unconditional
+    /// callers (the mirrored `effects_api` mutators) simply buy one render.
+    pub(crate) fn note_host_visual_change(&mut self) {
+        self.host_visual_gen = self.host_visual_gen.wrapping_add(1);
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
@@ -450,6 +480,7 @@ impl AtermGpuTerminal {
             reflow_grace: 0,
             reflow_budget: REFLOW_STEP_BUDGET_LINES,
             display_row_cache: std::cell::RefCell::new(GpuDisplayRowCache::default()),
+            host_visual_gen: 0,
         })
     }
 
@@ -1142,7 +1173,14 @@ impl AtermGpuTerminal {
         if let Some(pending) = self.term.resize_offloading_scrollback(rows, cols) {
             if pending.line_count() <= INLINE_REFLOW_MAX_LINES {
                 // Small-history fast path: rewrap now (bounded by the inline cap).
-                self.term.finish_resize_offload(pending.reflow());
+                // A follow-up job (RFL-3 width convergence) cannot arise here —
+                // nothing can change the width mid-call on this single-threaded
+                // path — but dropping one would wedge the detach window, so
+                // route it to the pump, belt and suspenders.
+                if let Some(follow) = self.term.finish_resize_offload(pending.reflow()) {
+                    self.pending_reflow = Some(follow);
+                    self.reflow_grace = REFLOW_PUMP_GRACE_RENDERS;
+                }
             } else {
                 // Stash for a later host turn. Overwriting an already-stashed
                 // job is only reachable after a reset/erase re-created the
@@ -1202,8 +1240,17 @@ impl AtermGpuTerminal {
                 true
             }
             ReflowStep::Done(reflowed) => {
-                self.term.finish_resize_offload(reflowed);
-                false
+                // CONVERGENCE (RFL-3): a width change that landed while this
+                // job was stepping means the re-attach hands back a
+                // re-detached job at the settled width — keep pumping it; the
+                // `true` already means "schedule another pump".
+                match self.term.finish_resize_offload(reflowed) {
+                    Some(follow) => {
+                        self.pending_reflow = Some(follow);
+                        true
+                    }
+                    None => false,
+                }
             }
         }
     }
@@ -2547,6 +2594,7 @@ impl AtermGpuTerminal {
             reflow_grace: 0,
             reflow_budget: REFLOW_STEP_BUDGET_LINES,
             display_row_cache: std::cell::RefCell::new(GpuDisplayRowCache::default()),
+            host_visual_gen: 0,
         })
     }
 }
@@ -2554,6 +2602,69 @@ impl AtermGpuTerminal {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// The WF-1 twin bumps mirrored into `effects_api` must be LIVE, not a
+    /// stub. Parity with aterm-wasm is a text guard: it proves the call sites
+    /// exist, never that `note_host_visual_change` does anything here. If this
+    /// hook were an empty body, the mirrored module would look wired while
+    /// dropping every bump — and the day this crate grows aterm-wasm's
+    /// settled-frame gate, an effects config change would be served a STALE
+    /// frame (decorations/comets ignite inside `apply`, which a gated frame
+    /// never runs, while `is_active()` still reads false at gate time).
+    ///
+    /// Also pins the other half of the twin's contract: `advance_effects` must
+    /// NOT bump. Hosts pump it once per rAF tick, so bumping there would hold a
+    /// future gate open on every frame and delete the optimization outright.
+    #[test]
+    fn effects_config_mutators_bump_the_host_visual_generation() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(6, 40, 14.0) else {
+            eprintln!("no system font; skipping host-visual-gen smoke");
+            return;
+        };
+        let start = t.host_visual_gen;
+        t.advance_effects(16.0);
+        assert_eq!(
+            t.host_visual_gen, start,
+            "advance_effects must not bump — it runs every rAF tick"
+        );
+
+        // One representative per mutator family the mirror carries: focus/
+        // visibility gates, keystroke ignition, cursor wake, PHOSPHOR rain,
+        // and sparkle words.
+        let mut last = start;
+        for (label, mutate) in [
+            (
+                "set_effects_focused",
+                (|t: &mut AtermGpuTerminal| t.set_effects_focused(true))
+                    as fn(&mut AtermGpuTerminal),
+            ),
+            ("set_effects_visibility", |t| {
+                t.set_effects_visibility("hidden")
+            }),
+            ("note_keystroke", |t| t.note_keystroke()),
+            ("set_cursor_glow", |t| {
+                t.set_cursor_glow(true, "lumen", None, None, 300, 8, 1.0, 0.0, false)
+            }),
+            ("set_cursor_trail", |t| t.set_cursor_trail(true, 300, 8, None)),
+            ("set_matrix_rain_enabled", |t| {
+                t.set_matrix_rain_enabled(true)
+            }),
+            ("note_matrix_rain_bell", |t| t.note_matrix_rain_bell()),
+            ("set_sparkle_words_enabled", |t| {
+                t.set_sparkle_words_enabled(true)
+            }),
+            ("set_sparkle_reduced_motion", |t| {
+                t.set_sparkle_reduced_motion(true)
+            }),
+        ] {
+            mutate(&mut t);
+            assert!(
+                t.host_visual_gen > last,
+                "{label} must bump the host-visual generation (hook is a no-op?)"
+            );
+            last = t.host_visual_gen;
+        }
+    }
 
     #[test]
     fn host_theme_colors_are_the_dynamic_color_reset_baseline() {

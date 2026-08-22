@@ -3188,7 +3188,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         crate::prefs::EDIT_MOTION => crate::prefs::motion_auto_help(),
         crate::prefs::EDIT_ROBI => {
-            " · a permanent resident: typing robi or robot makes him greet you · hidden only under reduced motion or serious mode"
+            " · an invited guest: off until you turn him on · once enabled, typing robi or robot makes him greet you · hidden under reduced motion or serious mode"
         }
         crate::prefs::EDIT_NOTICE_SPARKLE => {
             " · decorative only: the post-update card wears a hue-cycling badge and a ring of twinkling sparkles · reduced motion keeps the colour and holds it still · no other notice is affected"

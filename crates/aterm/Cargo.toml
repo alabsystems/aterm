@@ -20,6 +20,17 @@ aterm-gui = { path = "../aterm-gui" }     # the WINDOW (winit/wgpu) + headless e
 aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket client
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
 aterm-agent = { path = "../aterm-agent" } # `aterm fleet` / `aterm drive`
+# The headless update lane: `aterm update status|check` and the session-mode
+# background check/stage loop (round-11 — a terminal-only Mac used to run NONE
+# of the updater, while install.sh promised automatic updates).
+aterm-update = { path = "../aterm-update" }
+aterm-log = { path = "../aterm-log" }    # stderr logger for the headless update lane
+
+[dev-dependencies]
+# The front-door verb-routing test drives the binary under a REAL pty: the
+# regression it pins (`aterm ship` reaching the session parser) is invisible
+# with piped stdio, because piped stdio takes the WINDOW route instead.
+libc = { workspace = true }
 
 [lints]
 workspace = true

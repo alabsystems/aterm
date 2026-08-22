@@ -260,6 +260,39 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+/// The GitHub release BODY: a standing newcomer preamble, then this release's
+/// changelog verbatim.
+///
+/// The changelog alone addresses people who already run aterm; the /releases
+/// page is also the front door for people who have never heard of it and land
+/// on a wall of unexplained assets (a 1.1 GB DMG next to a 26 MB zip next to
+/// TOML nobody should open). The preamble is part of the TEMPLATE, not prose
+/// written per cut, so every future release carries it without anyone
+/// remembering to.
+///
+/// Only the release body gets the preamble. The manifest's `changelog` and the
+/// in-app Software Update notes stay the rolled section verbatim (spec §3) —
+/// an installed copy already knows what aterm is.
+pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
+    format!(
+        "**aterm** is the batteries-included terminal for AI. New here? What each file is:\n\
+         \n\
+         - `aterm-{version}.dmg` — the full batteries-included install (~1.1 GB): the app \
+         plus the offline ALab toolchain seed, so first launch needs no network.\n\
+         - `aterm-{version}-mac.zip` — the same signed, notarized app alone (~26 MB); the \
+         toolchain installs on demand via `aterm pkg install --default-set`.\n\
+         - `.sha256` files verify a download: `shasum -a 256 -c <asset>.sha256`.\n\
+         - `aterm-appcast.toml` / `aterm-machines.toml` (and their `.sig`) are consumed by \
+         the in-app self-updater — not for humans.\n\
+         - Releases named `atpkg-index-N` are machine-readable package indexes, not app \
+         releases.\n\
+         \n\
+         ---\n\
+         \n\
+         {changelog_body}\n"
+    )
+}
+
 /// Today's date in America/Los_Angeles as `YYYY-MM-DD` — exact parity with
 /// prepare-release.sh (`TZ=America/Los_Angeles date +%Y-%m-%d`). Shelling out
 /// to `date(1)` is deliberate: the alternative is hand-rolling US DST rules
@@ -305,4 +338,27 @@ fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
         .position(|l| l.starts_with("## ["))
         .map_or(lines.len(), |p| start + 1 + p);
     Some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The release body opens for NEWCOMERS and still carries the changelog
+    /// VERBATIM below the rule — the "used once, verbatim" contract (spec §3)
+    /// is about the notes themselves, and the preamble must never edit them.
+    #[test]
+    fn the_release_body_is_preamble_then_the_changelog_verbatim() {
+        let body = "### Fixed\n- a thing\n- another";
+        let doc = release_notes_document("0.44.0", body);
+        // The preamble names THIS release's exact asset names, so a reader can
+        // match the guide against the asset list one screen below it.
+        assert!(doc.starts_with("**aterm** is the batteries-included terminal for AI."));
+        assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
+        assert!(doc.contains("`aterm-0.44.0-mac.zip`"), "{doc}");
+        assert!(doc.contains("shasum -a 256 -c"), "{doc}");
+        assert!(doc.contains("atpkg-index-N"), "{doc}");
+        // Changelog below the rule, byte-for-byte, newline-terminated.
+        assert!(doc.ends_with(&format!("\n---\n\n{body}\n")), "{doc}");
+    }
 }

@@ -590,7 +590,11 @@ impl crate::flow::Fetcher for GithubFetcher {
         let releases = self.releases(repo)?;
         for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
-                return aterm_update_core::download_to(
+                // RESUMABLE: this is the request that moves hundreds of megabytes, and a
+                // stall at 95 % used to discard everything. The sha256 gate over the
+                // complete file is unchanged and is still what makes the bytes
+                // acceptable — see `download_to_resumable`.
+                return aterm_update_core::download_to_resumable(
                     &a.url,
                     self.credential(),
                     dest,
@@ -627,15 +631,27 @@ impl crate::flow::Fetcher for GithubFetcher {
         // request that actually moves hundreds of megabytes, and routing it through the
         // CDN URL rather than the assets API is what takes a default-set install off the
         // 60/hour meter entirely.
+        //
+        // RESUMABLE on both legs. The two legs are two HOSTS for the SAME signed object,
+        // so a prefix left by a failed CDN attempt is a valid prefix for the API-URL
+        // attempt that follows it — and if it ever is not, the sha256 gate over the
+        // complete file refuses it, which costs exactly what a failed download costs
+        // today.
         if let Some(url) = direct_asset_url(&slug, asset)
-            && aterm_update_core::download_to(&url, self.credential(), dest, ARTIFACT_CAP).is_ok()
+            && aterm_update_core::download_to_resumable(
+                &url,
+                self.credential(),
+                dest,
+                ARTIFACT_CAP,
+            )
+            .is_ok()
         {
             return Ok(());
         }
         let releases = self.releases_at(&slug)?;
         for r in releases.iter() {
             if let Some(a) = r.assets.iter().find(|a| a.name == asset) {
-                return aterm_update_core::download_to(
+                return aterm_update_core::download_to_resumable(
                     &a.url,
                     self.credential(),
                     dest,

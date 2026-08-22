@@ -159,19 +159,20 @@ pub(crate) struct Config {
     /// melody to today's neutral constitution and stops the classifier from
     /// ever running.
     pub(crate) tone_melody: Option<bool>,
-    /// ROBI THE HELPER ROBOT (`robi`, default ON — user-facing features ship
-    /// enabled; this is an opt-OUT). A little white robot with a cyan visor
-    /// (ported from the user's Nitro Keyboard game) lives on the glass as a
-    /// PERMANENT RESIDENT, cycling forever through his rounds: he walks along
-    /// the row being typed, does jumping jacks while sharing a
+    /// ROBI THE HELPER ROBOT (`robi`, default OFF — owner directive: the
+    /// resident is opt-IN; `robi = true` in aterm.toml or the Settings toggle
+    /// invites him back). A little white robot with a cyan visor (ported from
+    /// the user's Nitro Keyboard game) lives on the glass as a PERMANENT
+    /// RESIDENT once invited, cycling forever through his rounds: he walks
+    /// along the row being typed, does jumping jacks while sharing a
     /// getting-started tip, extends a ladder up past the grid, climbs it,
     /// swings across the tab bar like monkey bars while sharing a deeper tip
     /// (aterm features, shell tricks, Claude Code tricks), drops, and rests —
     /// then goes around again. His tips render as a speech bubble above his
     /// head (the transient-notice pill, anchored to him). Typing `robi` or
     /// `robot` restarts his rounds at the greeting. His idle stands are
-    /// static, so a resting Robi costs zero repaints. Hidden only under
-    /// reduced motion, serious mode, or `false` — never by focus or time.
+    /// static, so a resting Robi costs zero repaints. Hidden under reduced
+    /// motion, serious mode, or the default OFF — never by focus or time.
     pub(crate) robi: Option<bool>,
     /// RAINBOW SPARKLE CELEBRATION (`notice_sparkle`, default ON — user-facing
     /// features ship enabled; this is an opt-OUT). The post-update notice — the
@@ -2643,9 +2644,10 @@ impl Config {
         self.tone_melody.unwrap_or(true)
     }
 
-    /// Robi the helper robot on/off (`robi`, default ON — see the field doc).
+    /// Robi the helper robot on/off (`robi`, default OFF — opt-in by owner
+    /// directive; see the field doc).
     pub(crate) fn robi_or_default(&self) -> bool {
-        self.robi.unwrap_or(true)
+        self.robi.unwrap_or(false)
     }
 
     /// Rainbow sparkles on the post-update celebration (default ON — opt-OUT).
@@ -9678,9 +9680,11 @@ mod cfg_engine_tests {
         assert!(!cfg("tone_melody = false").tone_melody_or_default());
     }
 
+    /// Robi is opt-IN (owner directive: disabled by default); `robi = true`
+    /// invites him back and `false` round-trips.
     #[test]
-    fn robi_defaults_on_and_round_trips() {
-        assert!(Config::default().robi_or_default());
+    fn robi_defaults_off_and_round_trips() {
+        assert!(!Config::default().robi_or_default());
         assert!(cfg("robi = true").robi_or_default());
         assert!(!cfg("robi = false").robi_or_default());
     }

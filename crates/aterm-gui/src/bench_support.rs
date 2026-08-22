@@ -297,7 +297,7 @@ impl BenchApp {
             .is_some()
     }
 
-    /// ONE headless single-pane presented frame, modeled exactly as the scout
+    /// ONE headless single-pane rastered frame, modeled exactly as the scout
     /// mapped `redraw_window`'s single-pane path (which bails headless at its
     /// present-target match, so it cannot be called directly):
     ///
@@ -305,18 +305,23 @@ impl BenchApp {
     ///      `take_damage` under the session lock (the compare-and-consume
     ///      damage contract).
     ///   2. EFFECTS: `tick_cursor_fx` — the extracted-verbatim shared driver.
-    ///   3. RASTER: `Renderer::render_input` over the refilled scratch on the
-    ///      fixture's REAL CPU backend — actual pixels, headless.
+    ///   3. RASTER: `Renderer::render_input_cached` over the refilled scratch
+    ///      through the window's PERSISTENT `WindowCpu` damage cache on the
+    ///      fixture's REAL CPU backend — the SHIPPING windowed CPU present's
+    ///      exact raster entry (`present_input_scratch` →
+    ///      `render_input_cached(&mut ws.cpu_cache, ..)`) — actual pixels,
+    ///      headless, row-scoped exactly like the product.
     ///
-    /// Returns an FNV fold of the rasterized pixels: the frame-identity
-    /// witness the echo guard asserts on (two frames that differ in one glyph
-    /// cannot collide by accident at this hash width for guard purposes).
+    /// The rastered pixels stay RESIDENT in the window's persistent
+    /// `cpu_cache`; each public wrapper picks its own witness over them:
+    /// [`Self::present_frame`] (the TIMED entry) black-boxes a pointer,
+    /// [`Self::present_frame_hashed`] (the guard entry) FNV-folds the frame.
     ///
     /// NOT modeled (needs glass): softbuffer/GPU presentation, pacing,
     /// scale/EDR binding, tab-strip + native chrome. Those are the same
     /// exclusions the crate's own headless capture (`splice_cursor_fx`) lives
     /// with.
-    pub fn present_frame(&mut self, now: Instant) -> u64 {
+    fn raster_frame(&mut self, now: Instant) -> (usize, usize) {
         const ROWS: usize = 24;
         const COLS: usize = 80;
         let term = self
@@ -354,20 +359,86 @@ impl BenchApp {
             .app
             .tick_cursor_fx(self.wid, fx)
             .expect("bench fixture window is alive");
-        let ws = self
-            .app
-            .windows
-            .get(&self.wid)
+        // Disjoint sub-borrows — the `present_input_scratch` idiom
+        // (app_render.rs): `backend` and `windows` are separate `App` fields,
+        // and within the window `cpu_cache` / `input_scratch` are separate
+        // `WindowState` fields, so the renderer, the persistent damage cache,
+        // and the input snapshot are borrowed at once with no aliasing.
+        let App {
+            backend, windows, ..
+        } = &mut self.app;
+        let ws = windows
+            .get_mut(&self.wid)
             .expect("bench fixture window");
-        let BackendSlot::Ready(Backend::Cpu(renderer)) = &mut self.app.backend else {
+        let BackendSlot::Ready(Backend::Cpu(renderer)) = backend else {
             unreachable!("headless_for_test always builds a ready CPU backend");
         };
-        let frame = renderer.render_input(&ws.input_scratch);
+        // THE MODEL FIX (RE-1): raster through the SHIPPING per-window damage
+        // cache. `render_input` builds a THROWAWAY `WindowCpu` per call, so
+        // its cache match is vacuously `None` → FullRepaint: the old model
+        // re-rastered all 24x80 cells every keystroke (plus a ~1.5 MB
+        // owned-`Frame` clone) while the product's windowed present repaints
+        // only the 1-2 dirty rows. Renderer blink/override state is untouched
+        // (the bench never toggles it); byte-parity of this entry against the
+        // full repaint is asserted by `verify_echo` via
+        // [`Self::parity_hashes`] on every verify frame.
+        let view = renderer.render_input_cached(&mut ws.cpu_cache, &ws.input_scratch);
+        (view.width(), view.height())
+    }
+
+    /// The TIMED present seam (RE-2): extract + effects + damage-tracked
+    /// raster (RE-1), NO pixel fold. The pre-fix entry FNV-folded EVERY
+    /// rastered pixel inside the timed span (a serial dependent chain,
+    /// measured ~331 us/frame at 24x80 — ~48% of the pre-fix keystroke_echo
+    /// reading) AND rastered through the always-full owned path; neither
+    /// cost is paid by any shipping frame. A pointer-read `black_box` keeps
+    /// the raster observable so the optimizer can never hollow the span.
+    pub fn present_frame(&mut self, now: Instant) -> (usize, usize) {
+        let dims = self.raster_frame(now);
+        std::hint::black_box(self.ws().cpu_cache.frame_pixels().as_ptr());
+        dims
+    }
+
+    /// [`Self::raster_frame`] + the frame-identity FNV fold — the UNTIMED
+    /// guard entry `verify_echo` asserts on (two frames that differ in one
+    /// glyph cannot collide by accident at this hash width for guard
+    /// purposes). The timed loop calls [`Self::present_frame`] and never pays
+    /// the fold.
+    pub fn present_frame_hashed(&mut self, now: Instant) -> u64 {
+        let _ = self.raster_frame(now);
         let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for &px in &frame.pixels {
+        for &px in self.ws().cpu_cache.frame_pixels() {
             h = (h ^ u64::from(px)).wrapping_mul(0x100_0000_01b3);
         }
         h
+    }
+
+    /// RE-1's PARITY WITNESS (the damage_differential idiom, in-bench): hash
+    /// the per-window damage cache's CURRENT pixels (the frame the model just
+    /// presented) against a from-scratch FULL repaint of the SAME scratch
+    /// through the SAME renderer (`render_input` — the owned entry, a full
+    /// repaint by construction; same fonts, theme, blink state). Equal hashes
+    /// prove the damage-tracked model byte-identical to the full raster; the
+    /// verify pass asserts this every frame, and the timed loop never pays
+    /// the witness.
+    #[must_use]
+    pub fn parity_hashes(&mut self) -> (u64, u64) {
+        fn fnv(pixels: &[u32]) -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for &px in pixels {
+                h = (h ^ u64::from(px)).wrapping_mul(0x100_0000_01b3);
+            }
+            h
+        }
+        let App {
+            backend, windows, ..
+        } = &mut self.app;
+        let ws = windows.get(&self.wid).expect("bench fixture window");
+        let BackendSlot::Ready(Backend::Cpu(renderer)) = backend else {
+            unreachable!("headless_for_test always builds a ready CPU backend");
+        };
+        let full = renderer.render_input(&ws.input_scratch);
+        (fnv(ws.cpu_cache.frame_pixels()), fnv(&full.pixels))
     }
 
     // -------------------------------------------------------------- probes --

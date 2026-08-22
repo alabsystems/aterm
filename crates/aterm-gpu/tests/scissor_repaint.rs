@@ -84,6 +84,13 @@ enum Path {
     Scissor,
     /// Must FALL BACK to a full Clear+all-rows repaint.
     Full,
+    /// Must take the E7 WHOLE-ROW SCROLL-BLIT RESCUE: `compute_dirty_rows` says
+    /// `FullRepaint` (display_offset AND the absolute anchor both moved), but
+    /// `scroll_blit_plan` recognises a rigid integer-row slide, so the offscreen's
+    /// grid band is shifted and only the newly-exposed strip re-encodes. Strictly
+    /// stronger than [`Path::Scissor`]: it asserts the scissor AND that the rescue
+    /// — not a lucky small dirty set — is what produced it.
+    ScrollRescue,
     /// Don't assert the path (e.g. the first frame, or a blink toggle whose
     /// hit/miss depends on the terminal's DECSCUSR default).
     Any,
@@ -256,23 +263,29 @@ fn gpu_scissor_repaint_byte_identical() {
             None,
             Path::Any,
         ),
-        // 27. Scroll back into history — display_offset changes ⇒ FULL fallback.
+        // 27. Scroll back into history. `display_offset` AND the absolute anchor
+        //     both move, so `compute_dirty_rows` returns `FullRepaint` — and the E7
+        //     rescue turns that verdict into a band shift plus an exposed-strip
+        //     scissor, exactly as the CPU backend has always done for this frame
+        //     class. Byte-identity is asserted for every step regardless, so this
+        //     line is about WHICH path pays for the frame, not whether it is right.
         step(
             "scroll back",
             |t| t.scroll_display(3),
             true,
             None,
-            Path::Full,
+            Path::ScrollRescue,
         ),
         // 28. Idle scrolled — offset unchanged ⇒ scissor.
         step("idle scrolled", |_| {}, true, None, Path::Scissor),
-        // 29. Scroll to bottom — offset changes ⇒ FULL.
+        // 29. Scroll to bottom — the same rigid slide in the OTHER direction (the
+        //     overshoot-apron side), so the same rescue.
         step(
             "scroll to bottom",
             |t| t.scroll_to_bottom(),
             true,
             None,
-            Path::Full,
+            Path::ScrollRescue,
         ),
         // 30. Full-screen TUI repaint (clear + redraw): MANY rows change at once.
         //     Reusable (same dims/offset/selection, no double-height) ⇒ scissor
@@ -305,6 +318,7 @@ fn gpu_scissor_repaint_byte_identical() {
 
     let mut scissor_seen = 0u64;
     let mut full_seen = 0u64;
+    let mut rescue_seen = 0u64;
 
     for (i, s) in steps.iter().enumerate() {
         (s.act)(&mut term);
@@ -315,12 +329,14 @@ fn gpu_scissor_repaint_byte_identical() {
 
         let scissor_before = gpu.scissor_taken();
         let full_before = gpu.full_repaints();
+        let rescues_before = gpu.scroll_rescues();
 
         // The scissored present-path encode + readback (the path under test).
         let got = gpu.present_input_readback(&mut win, &input).pixels;
 
         let took_scissor = gpu.scissor_taken() > scissor_before;
         let took_full = gpu.full_repaints() > full_before;
+        let took_rescue = gpu.scroll_rescues() > rescues_before;
         assert!(
             took_scissor ^ took_full,
             "step {i} ({}): exactly one of scissor/full must be taken",
@@ -361,6 +377,19 @@ fn gpu_scissor_repaint_byte_identical() {
                 "step {i} ({}): expected a FULL repaint but it took the scissor",
                 s.desc
             ),
+            Path::ScrollRescue => {
+                assert!(
+                    took_rescue,
+                    "step {i} ({}): expected the E7 scroll-blit rescue, but the \
+                     frame did not consult/accept the plan",
+                    s.desc
+                );
+                assert!(
+                    took_scissor,
+                    "step {i} ({}): a rescued frame must encode as a SCISSOR",
+                    s.desc
+                );
+            }
             Path::Any => {}
         }
 
@@ -368,6 +397,9 @@ fn gpu_scissor_repaint_byte_identical() {
             scissor_seen += 1;
         } else {
             full_seen += 1;
+        }
+        if took_rescue {
+            rescue_seen += 1;
         }
         eprintln!(
             "step {i:2} {:<20} path={} (scissor={}, full={})",
@@ -384,16 +416,27 @@ fn gpu_scissor_repaint_byte_identical() {
         scissor_seen >= 10,
         "scissor path barely fired ({scissor_seen}) — not exercised"
     );
+    // The full-repaint fallback is now reached by the first frame and by the
+    // DECDHL trio only: the two scroll steps that used to pad this count are the
+    // E7 rescue's whole point, and `rescue_seen` below is the guard that they did
+    // not silently fall back INTO this count instead.
     assert!(
         full_seen >= 4,
         "full-repaint fallback barely fired ({full_seen}) — not exercised"
+    );
+    assert!(
+        rescue_seen >= 2,
+        "the E7 scroll-blit rescue barely fired ({rescue_seen}) — not exercised"
     );
     assert_eq!(
         gpu.scissor_taken() + gpu.full_repaints(),
         steps.len() as u64,
         "every frame must be exactly one of scissor/full",
     );
-    eprintln!("scissor-repaint: {scissor_seen} scissor frames, {full_seen} full repaints");
+    eprintln!(
+        "scissor-repaint: {scissor_seen} scissor frames ({rescue_seen} of them \
+         scroll-blit rescues), {full_seen} full repaints"
+    );
 }
 
 /// A scissored frame immediately followed by a ONE-CELL change must repaint

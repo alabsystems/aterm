@@ -630,3 +630,70 @@ fn pop_front_preserves_cumulative_invariant() {
     }
     assert_eq!(idx, 40);
 }
+
+/// ST-3 rotation oracle (in-memory twin of the disk-tier test): interleaves
+/// front truncation, batch page eviction, and pushes across page boundaries,
+/// checking every surviving line by content at each base state — base
+/// advances, pushes over a non-zero base, amortized dead-prefix reclamation,
+/// and the drop-to-empty base reset.
+#[test]
+fn cold_tier_rotation_interleave_matches_oracle() {
+    fn push_page(
+        cold: &mut ColdTier,
+        oracle: &mut Vec<String>,
+        next_page: &mut usize,
+        lines: usize,
+    ) {
+        let prefix = format!("Pg{:03}", *next_page);
+        *next_page += 1;
+        let block_lines: Vec<Line> = (0..lines)
+            .map(|i| Line::from(&*format!("{prefix}-L{i}")))
+            .collect();
+        let block = WarmBlock::from_lines(&block_lines);
+        assert_eq!(cold.push_block(&block), lines);
+        for i in 0..lines {
+            oracle.push(format!("{prefix}-L{i}"));
+        }
+    }
+
+    let mut cold = ColdTier::new();
+    let mut oracle: Vec<String> = Vec::new();
+    let mut next_page = 0usize;
+
+    for k in 0..10 {
+        push_page(&mut cold, &mut oracle, &mut next_page, 2 + (k % 4));
+    }
+
+    for k in 0..30 {
+        let cut = (1 + (k % 5)).min(cold.line_count());
+        cold.truncate_front_lines(cut);
+        oracle.drain(..cut);
+        if k % 2 == 0 {
+            push_page(&mut cold, &mut oracle, &mut next_page, 1 + (k % 5));
+        }
+        if k % 5 == 0 {
+            // Batch page eviction rides the same cursor+base maintenance.
+            let evicted = cold.pop_front_batch(1.min(cold.page_count()));
+            oracle.drain(..evicted);
+        }
+        assert_eq!(cold.line_count(), oracle.len(), "count after round {k}");
+        for (i, want) in oracle.iter().enumerate() {
+            let got = cold.get_line(i).unwrap().unwrap().to_string();
+            assert_eq!(&got, want, "line {i} after round {k}");
+        }
+        assert!(cold.get_line(oracle.len()).unwrap().is_none());
+    }
+
+    // Drain to empty and refill: the base must reset with the cleared index.
+    let evicted = cold.pop_front_batch(cold.page_count());
+    oracle.drain(..evicted);
+    let rest = cold.line_count();
+    cold.truncate_front_lines(rest);
+    oracle.clear();
+    assert_eq!(cold.line_count(), 0);
+    push_page(&mut cold, &mut oracle, &mut next_page, 4);
+    for (i, want) in oracle.iter().enumerate() {
+        let got = cold.get_line(i).unwrap().unwrap().to_string();
+        assert_eq!(&got, want, "line {i} after refill");
+    }
+}

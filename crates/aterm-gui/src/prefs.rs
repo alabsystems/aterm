@@ -71,8 +71,8 @@ pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
 /// `aterm_effects::tone` classifier); OFF pins today's neutral melody and
 /// stops the classifier entirely.
 pub(crate) const EDIT_TONE_MELODY: &str = "tone_melody";
-/// Robi the helper robot (`Config::robi`, default ON): the chrome-walking
-/// tip-sharing robot show (see `app_config`'s field doc).
+/// Robi the helper robot (`Config::robi`, default OFF — opt-in): the
+/// chrome-walking tip-sharing robot show (see `app_config`'s field doc).
 pub(crate) const EDIT_ROBI: &str = "robi";
 /// Rainbow sparkles on the post-update celebration notice (`Config::notice_sparkle`,
 /// default ON — user-facing features ship enabled; this is an opt-OUT). The card that
@@ -2351,6 +2351,10 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_CURSOR_GLOW_SDR_BOOST
         | EDIT_MOTION
         | EDIT_SERIOUS_MODE
+        // The update-celebration sparkles ride the FX page beside serious
+        // mode — its "Effect policy" group is where "how much fun is this
+        // terminal allowed to have" questions already live.
+        | EDIT_NOTICE_SPARKLE
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
         // The rest of the trail/aurora surface (packs — the colour overrides
         // route via the early trail-colour return above) + the stream-fade
@@ -2458,7 +2462,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         // The terminal-tab backdrop image, its legibility dim, and the
         // backdrop-hue glyph tint.
         EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
-        EDIT_SERIOUS_MODE => ("Effect policy", 0),
+        // The celebration sparkles ride beside the process-wide effect switch:
+        // both answer "how much fun is this terminal allowed to have".
+        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE => ("Effect policy", 0),
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
@@ -2763,7 +2769,7 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
 /// Human label for a security opt-in row (keyed by its `SECURITY_BOOL_KEYS` entry).
 fn security_label(key: &str) -> &'static str {
     match key {
-        EDIT_ALLOW_OSC52_QUERY => "Allow clipboard queries (OSC 52; unanswered by GUI)",
+        EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard (OSC 52)",
         EDIT_ALLOW_WINDOW_OPS => "Allow title / text-grid-size queries (XTWINOPS)",
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
         EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
@@ -3111,6 +3117,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_MOTION => &["motion", "reduce", "animation", "accessibility", "a11y"],
         EDIT_ROBI => &[
             "robi", "robot", "helper", "tips", "monkey", "bars", "ladder", "show",
+        ],
+        EDIT_NOTICE_SPARKLE => &[
+            "sparkle",
+            "celebration",
+            "update",
+            "notice",
+            "rainbow",
+            "confetti",
+            "badge",
         ],
         EDIT_SERIOUS_MODE => &[
             "serious",
@@ -4511,12 +4526,29 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
         EditField {
             // Robi the helper robot: the chrome-walking, tip-sharing
             // RESIDENT (walks the typed row, jumping jacks, ladder, tab-bar
-            // monkey bars — forever). Default ON; reduced motion and serious
-            // mode hide him without touching this preference.
+            // monkey bars — forever). Default OFF (opt-in by owner
+            // directive); reduced motion and serious mode hide an invited
+            // Robi without touching this preference.
             label: "Robi the helper robot",
             key: EDIT_ROBI,
             kind: EditKind::Bool,
             seed: Some(cfg.robi_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // Rainbow sparkles on the post-update celebration card. Default
+            // ON (user-facing features ship enabled; this is an opt-OUT);
+            // decorative only — the wording, timing, and purpose of the
+            // notice never change, and reduced motion holds the colours
+            // still. Everything else about this key was already wired (the
+            // EditKind::Bool arm, the VISUAL_PREVIEW_EXEMPT_KEYS rationale,
+            // the renderer read) — this row is what makes it real: without
+            // it the setting existed everywhere except where a user could
+            // see it, and both registry-conformance tests failed.
+            label: "Update-celebration sparkles",
+            key: EDIT_NOTICE_SPARKLE,
+            kind: EditKind::Bool,
+            seed: Some(cfg.notice_sparkle_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -7534,6 +7566,7 @@ enabled = true
             super::EDIT_RESTORE_SESSION,
             super::EDIT_TEMPORAL_RECORDING,
             super::EDIT_TRAIL_SOUND_BED,
+            super::EDIT_NOTICE_SPARKLE,
         ] {
             assert!(
                 matches!(edit_kind(k), EditKind::Bool),

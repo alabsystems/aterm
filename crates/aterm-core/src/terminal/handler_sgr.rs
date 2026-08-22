@@ -13,192 +13,103 @@
 //!
 //! Extracted from handler.rs as part of #485 (large files refactor).
 
-use crate::grid::{CellFlags, PackedColor, StyleId};
+use crate::grid::{CellFlags, PackedColor};
 
 use super::handler::SgrStyleHandler;
 use super::sgr_color_u8;
 
 impl SgrStyleHandler<'_> {
-    /// Update the cached style ID from the current style state.
+    /// Apply an SGR rendition change: refresh the caches the cell writers read,
+    /// and re-arm the BCE cursor template from the new background.
     ///
-    /// This interns the current style (fg, bg, flags) into the grid's StyleTable
-    /// and caches the resulting StyleId. Should be called after any SGR change.
+    /// WHAT THIS USED TO BE, AND WHY IT SHRANK. This was `update_style_id`, and
+    /// its headline job was to intern the new rendition into the grid's
+    /// `StyleTable`: a 4-way linear L1 scan, a 256-entry direct-mapped L2 probe
+    /// (indexed) or L2b (RGB, keyed on `fg.r`), then an `FxHashMap` probe, then
+    /// on miss a push to `styles`/`ref_counts`/`extended`/`lookup` plus a
+    /// refcount bump at a near-random index of a Vec that grows to 65 535
+    /// entries. The `StyleId` it produced was written to
+    /// `Terminal::current_style_id` — and NOTHING read it. Putting a `StyleId`
+    /// into a cell requires `CellFlags::USES_STYLE_ID`, and every writer of that
+    /// bit is test-gated (`Row::write_char_with_style_id`, `Cell::with_style_id`,
+    /// `Cell::set_style_id`); the production write path (`write_char_core`)
+    /// reads `cached_colors()` and stores colours INLINE as `PackedColors`, with
+    /// 24-bit overflow in the extras RGB ring. `Terminal::current_style_id()`
+    /// was `#[cfg(test)]` and had no caller at all; checkpoint deliberately
+    /// refused to carry the id. So the ladder was pure dead work on the hottest
+    /// escape path, and the table it fed was a monotone leak in the bargain —
+    /// `StyleTable::release()` has no production caller, so `compact()` can
+    /// never reclaim, RIS does not clear the table, and it grew with distinct
+    /// styles EVER seen up to a silent 65 535 cliff. Deleting the intern deletes
+    /// both costs; nothing interns any more, so nothing grows.
     ///
-    /// This is the Ghostty pattern: intern styles once when they change,
-    /// then reuse the StyleId for all cells written with that style.
+    /// What survives is the part that was always load-bearing: the writer cache
+    /// refresh (`update_cached_colors`, which feeds `cached_colors()` /
+    /// `has_style_extras()` / `is_default()`) and the BCE cursor template
+    /// (#7522), which makes line feeds, autowrap and scrolls that happen before
+    /// the next explicit erase use the current background.
     #[inline]
-    pub(super) fn update_style_id(&mut self) {
-        // Fast path: SGR is now fully default (fg/bg/flags all default).
-        // Skip ExtendedStyle construction and intern_extended entirely.
-        if self.style.fg.is_default() && self.style.bg.is_default() && self.style.flags.is_empty() {
-            // Refresh cached_colors: this path is reached not only via SGR 0
-            // (reset_sgr, which already defaults the cache) but also when the
-            // GENERIC loop drives fg/bg/flags back to default with individual
-            // codes (e.g. `\x1b[39;49m`, `\x1b[31;42m\x1b[39;49m`). Those do NOT
-            // call reset_sgr, so cached_colors would otherwise retain the prior
-            // non-default colors and the next inline cell write (which reads
-            // `cached_colors`, not the StyleId) would paint stale fg/bg.
-            self.style.update_cached_colors();
-            *self.current_style_id = StyleId::DEFAULT;
-            // Reset BCE cursor template when SGR is fully default (#7522).
-            self.grid
-                .set_cursor_template(crate::grid::Cell::EMPTY, None);
-            return;
-        }
-
+    pub(super) fn apply_style_change(&mut self) {
+        // Refreshing unconditionally also fixes the case the old fast path
+        // documented: the GENERIC loop can drive fg/bg/flags back to default
+        // with individual codes (`\x1b[39;49m`, `\x1b[31;42m\x1b[39;49m`)
+        // without going through `reset_sgr`, and the next inline cell write
+        // reads `cached_colors`, not a StyleId — so a skipped refresh paints
+        // stale colours.
         self.style.update_cached_colors();
-        // Update BCE cursor template from current SGR background (#7522).
-        // This ensures line feeds, autowrap, and other scroll operations
-        // that happen before the next explicit erase use the correct bg.
+        // The old code split this into an "all default" arm that set
+        // `Cell::EMPTY` + `None` and a general arm that set
+        // `bce_blank(cached_colors)` + `bce_bg_rgb()`. The split existed only to
+        // skip the intern; the two arms are the SAME VALUES. `Cell::bce_blank`
+        // masks the bg out of the packed colours and returns `Cell::EMPTY`
+        // verbatim when that mask is zero (a default background), and
+        // `bce_bg_rgb()` is `None` unless `bg.is_rgb()` — which a default
+        // background is not. One arm, one branch fewer per SGR.
         self.grid.set_cursor_template(
             crate::grid::Cell::bce_blank(self.style.cached_colors()),
             self.style.bce_bg_rgb(),
         );
-        // L1 probe: check if the Style matches the last interned style before
-        // building the full ExtendedStyle. Avoids ExtendedStyle construction
-        // and the non-inline intern_extended call on consecutive repeats (#7351).
-        let style = self.style.build_style();
-        if let Some(id) = self.grid.try_intern_style_l1(&style) {
-            *self.current_style_id = id;
-            return;
-        }
-        let ext_style = self.style.build_extended_style();
-        *self.current_style_id = self.grid.intern_extended_style(ext_style);
     }
 
-    /// Specialized style ID update after only the fg color changed.
+    /// Apply a rendition change that CANNOT have touched the background.
     ///
-    /// Skips the `cell_flags_to_attrs` loop and bg `unpack_color` conversion
-    /// by reusing cached attrs and bg color from the previous style state.
+    /// Foreground-only and flags+foreground SGRs (`\x1b[31m`, `\x1b[38;5;Nm`,
+    /// `\x1b[1;38;5;Nm`): the BCE cursor template depends only on bg (#7522), so
+    /// the template set by the last bg-changing SGR is still correct and is left
+    /// alone. Replaces `update_style_id_fg_changed` /
+    /// `update_style_id_flags_and_fg_changed`, which differed from each other
+    /// only in WHICH intern-feeding caches they rebuilt — a distinction that
+    /// died with the interner.
     #[inline]
-    pub(super) fn update_style_id_fg_changed(&mut self) {
-        let ext_style = self.style.build_extended_style_fg_changed();
-        if self.style.is_default() {
-            *self.current_style_id = StyleId::DEFAULT;
-        } else if let Some(id) = self.grid.try_intern_style_l1(&ext_style.style) {
-            *self.current_style_id = id;
-        } else {
-            *self.current_style_id = self.grid.intern_extended_style(ext_style);
-        }
+    pub(super) fn apply_style_change_keep_bce(&mut self) {
+        self.style.update_cached_colors();
     }
 
-    /// Specialized style ID update after only attribute flag bits changed.
+    /// Apply a rendition change that may or may not have moved the background.
     ///
-    /// Reuses the already-interned/cached fg and bg colors (and their types and
-    /// palette indices) instead of rebuilding them via `build_extended_style()`,
-    /// and skips `set_cursor_template` entirely: a flags-only change cannot alter
-    /// the background, and the BCE cursor template depends only on bg (#7522), so
-    /// the template set by the last bg-changing SGR is still correct. Mirrors the
-    /// structure of `update_style_id_fg_changed` (#7351).
+    /// `old_bg` is the background before this SGR. When it is unchanged the BCE
+    /// cursor template is already correct and the store is skipped (#7522).
+    /// `PackedColor` compares the full RGB value, so RGB→RGB changes are caught.
     #[inline]
-    pub(super) fn update_style_id_flags_changed(&mut self) {
-        self.style.update_flags_cache();
-        if self.style.is_default() {
-            // bg is necessarily default here, so the BCE template is already
-            // EMPTY (set by whatever last made bg default) — nothing to reset.
-            *self.current_style_id = StyleId::DEFAULT;
-            return;
-        }
-        let style = self.style.build_style();
-        if let Some(id) = self.grid.try_intern_style_l1(&style) {
-            *self.current_style_id = id;
-            return;
-        }
-        let ext_style = self.style.build_extended_style();
-        *self.current_style_id = self.grid.intern_extended_style(ext_style);
-    }
-
-    /// Specialized style ID update after only the bg color changed.
-    ///
-    /// `old_bg` is the background color before this SGR was applied. When it is
-    /// unchanged, the BCE cursor template (which depends only on bg) is already
-    /// correct, so `set_cursor_template` is skipped (#7522).
-    #[inline]
-    pub(super) fn update_style_id_bg_changed(&mut self, old_bg: PackedColor) {
+    pub(super) fn apply_style_change_bg_maybe(&mut self, old_bg: PackedColor) {
         let bg_changed = self.style.bg != old_bg;
-        let ext_style = self.style.build_extended_style_bg_changed();
-        // Update BCE cursor template from new bg only when bg actually changed.
-        // PackedColor compares the full RGB value, so RGB→RGB changes are caught.
+        self.style.update_cached_colors();
         if bg_changed {
             self.grid.set_cursor_template(
                 crate::grid::Cell::bce_blank(self.style.cached_colors()),
                 self.style.bce_bg_rgb(),
             );
         }
-        if self.style.is_default() {
-            *self.current_style_id = StyleId::DEFAULT;
-        } else if let Some(id) = self.grid.try_intern_style_l1(&ext_style.style) {
-            *self.current_style_id = id;
-        } else {
-            *self.current_style_id = self.grid.intern_extended_style(ext_style);
-        }
     }
 
-    /// Specialized style ID update after both fg and bg colors changed.
-    #[inline]
-    pub(super) fn update_style_id_both_changed(&mut self) {
-        let ext_style = self.style.build_extended_style_both_changed();
-        // Update BCE cursor template from new bg (#7522).
-        self.grid.set_cursor_template(
-            crate::grid::Cell::bce_blank(self.style.cached_colors()),
-            self.style.bce_bg_rgb(),
-        );
-        if self.style.is_default() {
-            *self.current_style_id = StyleId::DEFAULT;
-        } else if let Some(id) = self.grid.try_intern_style_l1(&ext_style.style) {
-            *self.current_style_id = id;
-        } else {
-            *self.current_style_id = self.grid.intern_extended_style(ext_style);
-        }
-    }
-
-    /// Specialized style ID update after a leading attribute flag AND the fg
-    /// color changed (e.g. `\x1b[1;38;5;202m`), with bg unchanged.
+    /// Apply an attribute-flag-only rendition change (`\x1b[1m`, `\x1b[22m`, …).
     ///
-    /// Refreshes the attrs cache (flags changed) and the fg cache (fg changed)
-    /// but keeps the bg cache, and skips `set_cursor_template`: bg is untouched
-    /// so the BCE template from the last bg-changing SGR is still correct
-    /// (#7522). Combines the work of `update_style_id_flags_changed` and
-    /// `update_style_id_fg_changed` for the common `attr;38;5;N` TUI shape.
+    /// Flag bits cannot alter `cached_colors` (a pure function of fg/bg), so this
+    /// skips `convert_colors` and refreshes only the two flag-dependent booleans.
+    /// It cannot alter the background either, so the BCE template stands.
     #[inline]
-    pub(super) fn update_style_id_flags_and_fg_changed(&mut self) {
-        // Order matters: refresh cached_attrs first so build_extended_style_fg_changed
-        // (which reuses cached_attrs) sees the new flag bits.
+    pub(super) fn apply_flags_change(&mut self) {
         self.style.update_flags_cache();
-        let ext_style = self.style.build_extended_style_fg_changed();
-        if self.style.is_default() {
-            *self.current_style_id = StyleId::DEFAULT;
-        } else if let Some(id) = self.grid.try_intern_style_l1(&ext_style.style) {
-            *self.current_style_id = id;
-        } else {
-            *self.current_style_id = self.grid.intern_extended_style(ext_style);
-        }
-    }
-
-    /// Specialized style ID update after a leading attribute flag AND the bg
-    /// color changed (e.g. `\x1b[4;48;5;19m`), with fg unchanged.
-    ///
-    /// Refreshes the attrs cache (flags changed) and the bg cache (bg changed)
-    /// but keeps the fg cache. Updates the BCE cursor template only when bg
-    /// actually changed (#7522), mirroring `update_style_id_bg_changed`.
-    #[inline]
-    pub(super) fn update_style_id_flags_and_bg_changed(&mut self, old_bg: PackedColor) {
-        self.style.update_flags_cache();
-        let bg_changed = self.style.bg != old_bg;
-        let ext_style = self.style.build_extended_style_bg_changed();
-        if bg_changed {
-            self.grid.set_cursor_template(
-                crate::grid::Cell::bce_blank(self.style.cached_colors()),
-                self.style.bce_bg_rgb(),
-            );
-        }
-        if self.style.is_default() {
-            *self.current_style_id = StyleId::DEFAULT;
-        } else if let Some(id) = self.grid.try_intern_style_l1(&ext_style.style) {
-            *self.current_style_id = id;
-        } else {
-            *self.current_style_id = self.grid.intern_extended_style(ext_style);
-        }
     }
 
     /// Apply a single SGR parameter, returning the number of extra params consumed.
@@ -253,7 +164,7 @@ impl SgrStyleHandler<'_> {
                 // SUBSCRIPT; unconditional remove would clobber standalone
                 // superscript or subscript.
                 // Arm-local `if`, NOT a match guard: a `55 if .. =>` guard would
-                // fall through to the `_ => self.update_style_id()` default when
+                // fall through to the `_ => self.apply_style_change()` default when
                 // false — a real behaviour change, so the collapse is unsound.
                 #[allow(clippy::collapsible_match)]
                 if self.style.flags.contains(CellFlags::OVERLINE) {
@@ -277,7 +188,7 @@ impl SgrStyleHandler<'_> {
                 // OVERLINE is encoded as SUPERSCRIPT | SUBSCRIPT, so
                 // blindly removing both bits would clear overline too.
                 // Arm-local `if`, NOT a match guard: a `75 if .. =>` guard would
-                // fall through to the `_ => self.update_style_id()` default when
+                // fall through to the `_ => self.apply_style_change()` default when
                 // false — a real behaviour change, so the collapse is unsound.
                 #[allow(clippy::collapsible_match)]
                 if !self.style.flags.contains(CellFlags::OVERLINE) {
@@ -346,19 +257,18 @@ impl SgrStyleHandler<'_> {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
             self.transient.update_has_transient_extras();
-            *self.current_style_id = StyleId::DEFAULT;
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
             return;
         }
 
         // Fast path: CSI 0 m (SGR reset) — the most common SGR sequence.
-        // After reset_sgr, style is always default, so skip the HashMap intern.
+        // `reset_sgr` restores every cache to its default, so the template is
+        // the only thing left to re-arm.
         if params.len() == 1 && params[0] == 0 {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
             self.transient.update_has_transient_extras();
-            *self.current_style_id = StyleId::DEFAULT;
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
             return;
@@ -368,20 +278,20 @@ impl SgrStyleHandler<'_> {
         // Covers the common case of ESC[32m, ESC[1m, etc. without loop overhead.
         // Color-only params use specialized intern to skip flags→attrs conversion.
         if params.len() == 1 {
-            // Capture bg before apply so update_style_id_bg_changed can detect a
+            // Capture bg before apply so apply_style_change_bg_maybe can detect a
             // no-op bg change and skip set_cursor_template (#7522).
             let old_bg = self.style.bg;
             self.apply_sgr_param(params, 0);
             match params[0] {
-                30..=37 | 90..=97 | 39 => self.update_style_id_fg_changed(),
-                40..=47 | 100..=107 | 49 => self.update_style_id_bg_changed(old_bg),
+                30..=37 | 90..=97 | 39 => self.apply_style_change_keep_bce(),
+                40..=47 | 100..=107 | 49 => self.apply_style_change_bg_maybe(old_bg),
                 // Attribute flag-bit changes (bold/dim/italic/underline/blink/
                 // reverse/hidden/strike + their reset forms, super/sub/overline).
                 // These flip only flag bits, so reuse cached colors (#7351).
                 1..=9 | 21..=25 | 27..=29 | 53 | 55 | 73..=75 => {
-                    self.update_style_id_flags_changed();
+                    self.apply_flags_change();
                 }
-                _ => self.update_style_id(),
+                _ => self.apply_style_change(),
             }
             return;
         }
@@ -393,13 +303,13 @@ impl SgrStyleHandler<'_> {
             let index = sgr_color_u8(params[2]);
             if params[0] == 38 {
                 self.style.fg = PackedColor::indexed(index);
-                self.update_style_id_fg_changed();
+                self.apply_style_change_keep_bce();
                 return;
             }
             if params[0] == 48 {
                 let old_bg = self.style.bg;
                 self.style.bg = PackedColor::indexed(index);
-                self.update_style_id_bg_changed(old_bg);
+                self.apply_style_change_bg_maybe(old_bg);
                 return;
             }
         }
@@ -408,7 +318,7 @@ impl SgrStyleHandler<'_> {
         // `\x1b[4;48;5;19m`) — a leading attribute-flag SGR combined with a
         // 256-color fg/bg. This is the dominant shape in SGR-dense TUI output
         // yet falls through every existing fast path to the generic loop +
-        // full `update_style_id`. params[0] is restricted to pure flag-toggle
+        // full `apply_style_change`. params[0] is restricted to pure flag-toggle
         // SGRs (no color/reset/transient side effects), so exactly one colour
         // plus the flag bits change — routing to the combined specializations
         // avoids the loop dispatch and the redundant unchanged-colour rebuild.
@@ -419,14 +329,14 @@ impl SgrStyleHandler<'_> {
             if params[1] == 38 {
                 self.apply_sgr_param(params, 0); // apply the attribute flag
                 self.style.fg = PackedColor::indexed(sgr_color_u8(params[3]));
-                self.update_style_id_flags_and_fg_changed();
+                self.apply_style_change_keep_bce();
                 return;
             }
             if params[1] == 48 {
                 let old_bg = self.style.bg;
                 self.apply_sgr_param(params, 0); // apply the attribute flag
                 self.style.bg = PackedColor::indexed(sgr_color_u8(params[3]));
-                self.update_style_id_flags_and_bg_changed(old_bg);
+                self.apply_style_change_bg_maybe(old_bg);
                 return;
             }
         }
@@ -441,7 +351,7 @@ impl SgrStyleHandler<'_> {
                     params[3].min(255) as u8,
                     params[4].min(255) as u8,
                 );
-                self.update_style_id_fg_changed();
+                self.apply_style_change_keep_bce();
                 return;
             }
             if params[0] == 48 {
@@ -451,7 +361,7 @@ impl SgrStyleHandler<'_> {
                     params[3].min(255) as u8,
                     params[4].min(255) as u8,
                 );
-                self.update_style_id_bg_changed(old_bg);
+                self.apply_style_change_bg_maybe(old_bg);
                 return;
             }
         }
@@ -474,7 +384,7 @@ impl SgrStyleHandler<'_> {
                 params[8].min(255) as u8,
                 params[9].min(255) as u8,
             );
-            self.update_style_id_both_changed();
+            self.apply_style_change();
             return;
         }
 
@@ -484,7 +394,7 @@ impl SgrStyleHandler<'_> {
             i += 1;
         }
 
-        self.update_style_id();
+        self.apply_style_change();
     }
 
     /// Handle SGR (Select Graphic Rendition) with subparameter support.
@@ -499,7 +409,7 @@ impl SgrStyleHandler<'_> {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
             self.transient.update_has_transient_extras();
-            self.update_style_id();
+            self.apply_style_change();
             return;
         }
 
@@ -600,7 +510,7 @@ impl SgrStyleHandler<'_> {
             i += 1;
         }
 
-        self.update_style_id();
+        self.apply_style_change();
     }
 
     /// Parse extended color with colon subparameters (ISO 8613-3 format).

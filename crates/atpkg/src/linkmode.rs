@@ -346,6 +346,27 @@ pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> 
     Ok(out)
 }
 
+/// The tool NAMES a program's dev link currently owns, or `None` when it is not linked.
+///
+/// Exposed so `unlink` can restore exactly what the link took over — no more, and no fewer.
+/// Deriving that set any other way is unsafe: the installed build's `bin/` is NOT the answer
+/// for a sysroot bundle, because a toolchain ships backends belonging to OTHER atpkg
+/// programs (`trust`'s bin/ carries `ay`, `clean`, `ty`), and restoring from the directory
+/// listing repoints those programs' shims at the wrong build. Measured: doing exactly that
+/// clobbered `ay`, `clean` and `ty` onto `store/trust/6459`.
+///
+/// The marker is the only record that is both LOCAL and SCOPED to this program's link, which
+/// makes unlink's restoration symmetric with link's takeover by construction.
+pub fn linked_tool_names(layout: &Layout, program: &str) -> Option<Vec<String>> {
+    let marker = read_marker_for_program(layout, program).ok()?;
+    let names: Vec<String> = marker
+        .bins
+        .iter()
+        .filter_map(|rel| bin_tool_name(Path::new(rel)).map(str::to_string))
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
+}
+
 fn read_marker_for_program(layout: &Layout, program: &str) -> std::io::Result<LinkMarker> {
     let marker = read_marker(&layout.link_marker(program))?;
     if marker.program != program {

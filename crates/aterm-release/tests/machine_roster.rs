@@ -538,11 +538,15 @@ fn an_unattributed_release_carries_no_roster_assets() {
         mirror::required_asset_names("0.5.0", true, false),
         vec![
             "aterm-0.5.0-mac.zip".to_string(),
+            "aterm-0.5.0-mac.zip.sha256".to_string(),
             "aterm-0.5.0.dmg".to_string(),
+            "aterm-0.5.0.dmg.sha256".to_string(),
             "aterm-appcast.toml".to_string(),
             "aterm-appcast.toml.sig".to_string(),
+            "aterm.dmg".to_string(),
         ],
-        "the mirrored set must not grow while the master is unpinned"
+        "the mirrored set must not grow while the master is unpinned \
+         (the stable download twin is version-independent, not roster growth)"
     );
     let manifest = manifest_out::build(&inputs("0.5.0", 500));
     assert_eq!(manifest.machine_id, None, "precondition: unattributed");
@@ -755,7 +759,14 @@ fn a_rostered_key_outside_the_keyset_needs_the_operator_to_accept_stranding_old_
     assert!(err.contains("UPDATE_CHANNEL_PUBKEYS"), "{err}");
     assert!(err.contains(publish::PRE_ROSTER_STRANDING_FLAG), "{err}");
     assert!(err.contains("never update again"), "{err}");
-    assert!(err.contains("no ledger claim was made"), "{err}");
+    // The fact, and its POSITION: it answers the operator's first worry ("what did I
+    // just break?"), so it is hoisted into the headline rather than left in the tail
+    // where a 189-word paragraph buried it.
+    assert!(err.contains("No ledger claim was made"), "{err}");
+    assert!(
+        err.lines().next().is_some_and(|l| l.contains("No ledger claim was made")),
+        "the reassuring fact belongs in the headline: {err}"
+    );
 
     // (2) ACKNOWLEDGED — the same machine, the same roster, the same key, accepted with
     //     NOTHING added to any keyset. THIS is "adding a machine is a local act".
@@ -878,7 +889,14 @@ fn a_non_head_keyset_member_strands_pre_roster_clients_just_as_a_stranger_does()
         err.contains(pk(&M3).as_str()),
         "the remedy must name the head that WOULD have been safe: {err}"
     );
-    assert!(err.contains("no ledger claim was made"), "{err}");
+    // The fact, and its POSITION: it answers the operator's first worry ("what did I
+    // just break?"), so it is hoisted into the headline rather than left in the tail
+    // where a 189-word paragraph buried it.
+    assert!(err.contains("No ledger claim was made"), "{err}");
+    assert!(
+        err.lines().next().is_some_and(|l| l.contains("No ledger claim was made")),
+        "the reassuring fact belongs in the headline: {err}"
+    );
 
     // (2) ACKNOWLEDGED — the operator may still do it, exactly as for a stranger. The
     //     flag is the only thing that changes the verdict, which is what makes the
@@ -1460,10 +1478,12 @@ fn draft_names(manifest: &Manifest, signed: bool, extra: &[&str]) -> Vec<String>
     let mut names = vec![
         "aterm-appcast.toml".to_string(),
         manifest.dmg.clone(),
+        format!("{}.sha256", manifest.dmg),
         PROVENANCE.to_string(),
     ];
     if let Some(zip) = manifest.zip.as_deref() {
         names.push(zip.to_string());
+        names.push(format!("{zip}.sha256"));
     }
     if signed {
         names.push("aterm-appcast.toml.sig".to_string());

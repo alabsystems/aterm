@@ -141,7 +141,14 @@ fn main() {
     // Build timestamp (UTC, RFC3339). Honour SOURCE_DATE_EPOCH for reproducible
     // builds when set; otherwise stamp the current wall clock.
     let build_time = match std::env::var("SOURCE_DATE_EPOCH") {
-        Ok(epoch) if !epoch.is_empty() => run("date", &["-u", "-r", &epoch, "+%Y-%m-%dT%H:%M:%SZ"]),
+        // BSD date spells "format this epoch" `-r <epoch>`; GNU date spells it
+        // `-d @<epoch>` (its -r means "a file's mtime"). Try BSD first — on GNU
+        // the bare number is a missing file, a clean failure — then GNU.
+        Ok(epoch) if !epoch.is_empty() => {
+            run("date", &["-u", "-r", &epoch, "+%Y-%m-%dT%H:%M:%SZ"]).or_else(|| {
+                run("date", &["-u", "-d", &format!("@{epoch}"), "+%Y-%m-%dT%H:%M:%SZ"])
+            })
+        }
         _ => run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
     }
     .unwrap_or_else(|| "unknown".into());

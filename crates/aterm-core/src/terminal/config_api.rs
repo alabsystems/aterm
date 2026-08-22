@@ -518,7 +518,10 @@ mod tests {
         // RIS/host reset erases scrollback while the worker owns the old store.
         // It must neither resurrect old history nor discard host settings.
         term.reset();
-        term.finish_resize_offload(job.reflow());
+        assert!(
+            term.finish_resize_offload(job.reflow()).is_none(),
+            "the erase/replacement race never converges (RFL-3): nothing stale to rewrap"
+        );
 
         assert_eq!(term.main_grid().scrollback_lines(), 0);
         assert_eq!(term.scrollback_line_limit(), None);
@@ -571,7 +574,10 @@ mod tests {
         assert!(!changes.contains(&ConfigChange::MemoryBudget));
         assert!(!changes.contains(&ConfigChange::ScrollbackLimit));
 
-        term.finish_resize_offload(job.reflow());
+        assert!(
+            term.finish_resize_offload(job.reflow()).is_none(),
+            "widths agree — no convergence pass expected"
+        );
         assert_eq!(
             term.main_grid().scrollback_memory_budget(),
             Some(config.memory_budget)

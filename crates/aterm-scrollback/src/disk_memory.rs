@@ -73,96 +73,161 @@ impl DiskColdTier {
         cache.len()
     }
 
-    /// Decompress a page from disk via mmap.
+    /// Decompress a page — from the mapped view when it covers the page, else
+    /// by reading the file positionally ([`Self::read_page_bytes`]).
+    ///
+    /// Appends no longer re-map the file (disk_write.rs), so the view's
+    /// extent is a snapshot from load/compaction time and the NEWEST pages
+    /// normally live beyond it; they take the positional-read path. The map
+    /// keeps serving the (older, hotter for scroll) pages it covers with zero
+    /// syscalls.
     pub(super) fn decompress_page(
         &self,
         page_idx: usize,
     ) -> Result<Vec<Line>, crate::ScrollbackError> {
-        let Some(entry) = self.index.get(page_idx) else {
+        let Some(entry) = self.live_index().get(page_idx) else {
             return Err(crate::ScrollbackError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("page index {page_idx} out of range"),
             )));
         };
 
-        let compressed = if let Some(ref mmap) = self.mmap {
-            let offset_usize = usize::try_from(entry.offset).map_err(|_| {
-                crate::ScrollbackError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "page offset overflows usize",
-                ))
-            })?;
-            // Checked offset arithmetic: a malformed (attacker-influenced)
-            // `PageIndexEntry` could carry a huge offset/compressed_size, so
-            // every addition must reject overflow rather than wrap.
-            let compressed_len = len_u32_to_usize(entry.compressed_size);
-            let data_start = offset_usize.checked_add(PAGE_HEADER_SIZE).ok_or_else(|| {
-                crate::ScrollbackError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "page data_start overflow",
-                ))
-            })?;
-            let data_end = data_start.checked_add(compressed_len).ok_or_else(|| {
-                crate::ScrollbackError::Io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "page data_end overflow",
-                ))
-            })?;
+        let offset_usize = usize::try_from(entry.offset).map_err(|_| {
+            crate::ScrollbackError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "page offset overflows usize",
+            ))
+        })?;
+        // Checked offset arithmetic: a malformed (attacker-influenced)
+        // `PageIndexEntry` could carry a huge offset/compressed_size, so
+        // every addition must reject overflow rather than wrap.
+        let compressed_len = len_u32_to_usize(entry.compressed_size);
+        let data_start = offset_usize.checked_add(PAGE_HEADER_SIZE).ok_or_else(|| {
+            crate::ScrollbackError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "page data_start overflow",
+            ))
+        })?;
+        let data_end = data_start.checked_add(compressed_len).ok_or_else(|| {
+            crate::ScrollbackError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "page data_end overflow",
+            ))
+        })?;
 
-            // Defense-in-depth against another process truncating the backing
-            // file: the mmap length is fixed at map time, so a shrunk file
-            // leaves the tail of the mapping pointing past EOF (SIGBUS on
-            // deref). Re-read the live file length and reject reads that fall
-            // outside the current file before touching the mapping.
-            //
-            // This is best-effort: a truncation racing between this metadata
-            // read and the actual deref of the returned slice (during
-            // decompression, below) can still fault. Closing that window fully
-            // requires pread()/read_at or a scoped SIGBUS handler; the map_mut
-            // SAFETY contract already forbids concurrent external modification,
-            // so this check is hardening beyond contract, not the primary
-            // guarantee.
-            if let Some(meta) = self.file.as_ref().and_then(|f| f.metadata().ok()) {
-                // Fail CLOSED: if the live length can't be represented (cannot
-                // happen on 64-bit, where u64->usize is infallible), refuse the
-                // read rather than skipping the truncation check.
-                let live_len = usize::try_from(meta.len()).map_err(|_| {
-                    crate::ScrollbackError::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "live file length does not fit in usize",
-                    ))
-                })?;
-                if data_end > live_len {
-                    return Err(crate::ScrollbackError::Io(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "page {page_idx} range {data_start}..{data_end} exceeds live file len {live_len} (file truncated?)"
-                        ),
-                    )));
+        // Mapped fast path, behind two guards:
+        //  (1) the page must lie inside the view's recorded extent;
+        //  (2) defense-in-depth against another process truncating the
+        //      backing file: the mmap length is fixed at map time, so a
+        //      shrunk file leaves the view's tail past EOF (SIGBUS on deref).
+        //      Re-read the live length and refuse mapped reads outside it.
+        //      Best-effort as before (a racing truncation during the deref
+        //      can still fault; the map contract already forbids concurrent
+        //      external modification — hardening beyond contract).
+        // A page failing either guard falls to the positional read, which
+        // fails CLOSED (UnexpectedEof) instead of faulting — strictly more
+        // robust than the old hard error, identical on every honest path.
+        let mapped: Option<&[u8]> = match self.mmap {
+            Some(ref mmap) if data_end <= mmap.len() => {
+                let live_ok = match self.file.as_ref().and_then(|f| f.metadata().ok()) {
+                    Some(meta) => {
+                        // Fail closed on unrepresentable lengths (cannot
+                        // happen on 64-bit): treat as "not safely mapped".
+                        usize::try_from(meta.len()).is_ok_and(|live| data_end <= live)
+                    }
+                    // No handle to re-check against (cannot happen while a
+                    // map exists): fall back to the positional read.
+                    None => false,
+                };
+                if live_ok {
+                    // Checked accessor: never indexes past the recorded
+                    // mapping length (`slice` validates the range again).
+                    mmap.slice(data_start, compressed_len)
+                } else {
+                    None
                 }
             }
+            _ => None,
+        };
 
-            // Route through the checked accessor so the raw `from_raw_parts`
-            // is never indexed past the recorded mapping length. `slice`
-            // validates `data_start + compressed_len <= mmap.len()`.
-            mmap.slice(data_start, compressed_len).ok_or_else(|| {
-                crate::ScrollbackError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "page {page_idx} range {data_start}..{data_end} exceeds mmap len {}",
-                        mmap.len()
-                    ),
-                ))
-            })?
-        } else {
+        let owned;
+        let compressed: &[u8] = match mapped {
+            Some(slice) => slice,
+            None => {
+                owned = self.read_page_bytes(data_start as u64, compressed_len)?;
+                &owned
+            }
+        };
+
+        let decompressed = crate::decode_zstd_bounded(compressed)?;
+        Ok(deserialize_page_lines(&decompressed))
+    }
+
+    /// Read `len` bytes at `offset` from the backing file (positional read;
+    /// never moves a shared cursor).
+    ///
+    /// Serves pages beyond the mapped extent — the normal case for pages
+    /// appended since the last load/compaction now that appends never re-map
+    /// — and doubles as the fail-closed fallback whenever the mapped view
+    /// cannot safely serve a page. A short read (torn tail, concurrent
+    /// truncation) surfaces as `UnexpectedEof`, never a fault.
+    // Skip: positional-read loop over an OS handle — the io class the strict
+    // gate treats as absent-callee; bounds are carried by the buffer length.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn read_page_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>, crate::ScrollbackError> {
+        let Some(file) = self.file.as_ref() else {
+            // Keep the historical in-memory-mode error shape: metadata-only
+            // stores have no page bytes to read.
             return Err(crate::ScrollbackError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no memory map available for disk read",
             )));
         };
-
-        let decompressed = crate::decode_zstd_bounded(compressed)?;
-        Ok(deserialize_page_lines(&decompressed))
+        // Bound the allocation by the LIVE file length BEFORE allocating: a
+        // malformed PageIndexEntry (huge compressed_size) must fail closed
+        // here exactly as it did against the mapped extent — without first
+        // committing a multi-GiB zeroed buffer.
+        let live_len = file.metadata().map_err(crate::ScrollbackError::Io)?.len();
+        let end = offset.checked_add(len as u64).ok_or_else(|| {
+            crate::ScrollbackError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "page range overflow",
+            ))
+        })?;
+        if end > live_len {
+            return Err(crate::ScrollbackError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("page range {offset}..{end} exceeds live file len {live_len}"),
+            )));
+        }
+        let mut buf = vec![0u8; len];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.read_exact_at(&mut buf, offset)
+                .map_err(crate::ScrollbackError::Io)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            let mut done = 0usize;
+            while done < len {
+                let n = file
+                    .seek_read(&mut buf[done..], offset.saturating_add(done as u64))
+                    .map_err(crate::ScrollbackError::Io)?;
+                if n == 0 {
+                    return Err(crate::ScrollbackError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "positional read hit EOF inside a page",
+                    )));
+                }
+                // Bounded by `len`; saturating per crate idiom (discharges
+                // the strict gate's overflow counterexample, exact on every
+                // real path).
+                done = done.saturating_add(n);
+            }
+        }
+        Ok(buf)
     }
 
     /// Drop the whole decompressed-page cache AND zero its byte accounting in one
@@ -249,9 +314,10 @@ impl DiskColdTier {
     fn count_back_pages(&self, n: usize) -> (usize, usize) {
         let mut whole_pages = 0;
         let mut remaining = n;
-        for entry in self.index.iter().rev() {
+        let live = self.live_index();
+        for entry in live.iter().rev() {
             let page_lines = len_u32_to_usize(entry.line_count);
-            let actual_idx = self.index.len() - 1 - whole_pages;
+            let actual_idx = live.len() - 1 - whole_pages;
             let available = if actual_idx == 0 {
                 page_lines.saturating_sub(self.front_offset)
             } else {
@@ -276,8 +342,9 @@ impl DiskColdTier {
             return Ok(());
         }
         let (whole_pages, boundary_trim) = self.count_back_pages(n);
-        if boundary_trim > 0 && whole_pages < self.index.len() {
-            let boundary_idx = self.index.len() - 1 - whole_pages;
+        let live_len = self.live_index().len();
+        if boundary_trim > 0 && whole_pages < live_len {
+            let boundary_idx = live_len - 1 - whole_pages;
             self.decompress_page(boundary_idx)?;
         }
         Ok(())
@@ -315,7 +382,7 @@ impl DiskColdTier {
         // --- Phase 1: all fallible CPU work, no in-memory mutation. ---
         // Decompress + re-compress the boundary page (if any) up front.
         let boundary_data = if boundary_trim > 0 {
-            let boundary_idx = self.index.len() - 1 - whole_pages;
+            let boundary_idx = self.live_index().len() - 1 - whole_pages;
             let lines = self.decompress_page(boundary_idx)?;
             debug_assert!(
                 lines.len() >= boundary_trim,
@@ -338,10 +405,12 @@ impl DiskColdTier {
 
         // Compute the planned surviving layout WITHOUT mutating `self`, so an
         // I/O failure below leaves the in-memory index/cumulative_lines intact.
-        let surviving = self.index.len() - whole_pages;
+        // Built from the LIVE view: the replacement index adopts cursor 0 and
+        // the commit phase below resets the front-drop state accordingly.
+        let surviving = self.live_index().len() - whole_pages;
         let rewrite_boundary = boundary_trim > 0 && surviving > 0;
 
-        let mut new_index: Vec<PageIndexEntry> = self.index[..surviving].to_vec();
+        let mut new_index: Vec<PageIndexEntry> = self.live_index()[..surviving].to_vec();
         if rewrite_boundary {
             if let Some((ref compressed, line_count)) = boundary_data {
                 // Boundary page keeps its offset but shrinks in place.
@@ -382,7 +451,13 @@ impl DiskColdTier {
         self.write_back_truncation(boundary_write, &new_index, new_write_offset)?;
 
         // --- Phase 3: commit in-memory state (infallible). ---
+        // The replacement index holds only live pages, and the cumulative
+        // rebuild below rebases to zero — reset the front-drop cursor and
+        // absolute base with it (back removal is the rare path; O(P) here is
+        // the pre-existing cost, untouched by the front-drop redesign).
         self.index = new_index;
+        self.front_dropped = 0;
+        self.cumulative_base = 0;
         self.cumulative_lines.clear();
         self.cumulative_lines.reserve(self.index.len());
         let mut cumulative = 0usize;
@@ -502,6 +577,9 @@ impl DiskColdTier {
                 self.mmap = None;
             }
         }
+        // This path wrote the header counters and issued its own barriers, so
+        // any deferred-append debt is settled (see disk_write.rs).
+        self.mark_appends_synced();
         Ok(())
     }
 

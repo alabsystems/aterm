@@ -74,10 +74,35 @@ impl Terminal {
     /// Pure-LTR rows are skipped via a cheap first-RTL-block guard, so frames
     /// with no right-to-left content are byte-identical to the non-BiDi path.
     /// A no-op when BiDi is disabled.
-    pub(crate) fn apply_bidi_reorder(&mut self, frame: &mut crate::render::RenderInput) {
+    ///
+    /// `refill_mask` is the DMG-1 damage-scoped arm's row mask (`None` on the
+    /// full arm — every row is processed, the historical behaviour). Rows the
+    /// mask does not name are RETAINED rows, and the carrier only allows them
+    /// to be retained while [`RenderInput::engine_row_order`] was `Logical`
+    /// — i.e. the previous fill permuted nothing, so every retained channel is
+    /// still in LOGICAL order — and while a mode/direction change (each of
+    /// which calls `invalidate_bidi_all`, marking FULL damage) has not forced
+    /// the full arm. Under those two facts a retained row's reorder decision is
+    /// a pure function of unchanged inputs and re-derives as the identity, so
+    /// skipping it is exact rather than merely cheap. Skipping is also what
+    /// keeps the scoped arm's cost `O(damaged rows × cols)` in a `bidi` build:
+    /// the first-RTL-block guard would otherwise re-scan every retained cell.
+    ///
+    /// RETURNS whether any row was actually permuted — the value the fill
+    /// stamps into `engine_row_order`. A `true` costs the NEXT frame its
+    /// scoped arm (retained rows would be in visual order, and re-permuting
+    /// them would double-permute); it never makes THIS frame wrong, because
+    /// every row this fill permuted it permuted from logical order exactly
+    /// once.
+    pub(crate) fn apply_bidi_reorder(
+        &mut self,
+        frame: &mut crate::render::RenderInput,
+        refill_mask: Option<&[u64]>,
+    ) -> bool {
         if self.modes.bidi_mode == BiDiMode::Disabled {
-            return;
+            return false;
         }
+        let mut reordered_any = false;
         let dir = self.modes.bidi_direction;
         // Reusable scratch buffers (held on `bidi_state` so their capacity persists
         // across rows AND frames); cleared + refilled per row, never reallocated for
@@ -85,6 +110,13 @@ impl Terminal {
         // path.
         let scratch = &mut self.bidi_state.scratch;
         for r in 0..frame.cells.len() {
+            // Retained (unmasked) row on the damage-scoped arm: provably still
+            // the identity under the carrier's preconditions (see the doc).
+            if let Some(mask) = refill_mask
+                && mask.get(r / 64).is_none_or(|w| w & (1u64 << (r % 64)) == 0)
+            {
+                continue;
+            }
             // The cheap guard skips any row with no codepoint in or after the first
             // RTL block (U+0590); only such rows can reorder. Then compute the
             // per-cell BiDi classes + wide flags ONCE into the reused scratch.
@@ -161,7 +193,9 @@ impl Terminal {
             if frame.cursor_row == r && frame.cursor_col < scratch.inv.len() {
                 frame.cursor_col = scratch.inv[frame.cursor_col];
             }
+            reordered_any = true;
         }
+        reordered_any
     }
 }
 

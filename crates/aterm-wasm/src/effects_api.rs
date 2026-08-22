@@ -37,6 +37,15 @@ impl AtermTerminal {
     /// Advance the effects clock by `dt_ms` (the host's rAF delta). The
     /// engines never read a wall clock: same PTY bytes + same `dt` stream ⇒
     /// identical frames. Negative/NaN deltas are ignored.
+    // NOTE (WF-1 frame gate): `advance_effects` deliberately does NOT bump the
+    // host-visual generation. Hosts pump it once per rAF tick, so bumping here
+    // would reopen the gate every frame and delete the optimization entirely.
+    // Soundness without it: advancing the clock can only change pixels when
+    // some effect is LIVE, and a live effect is exactly what `is_active()` (a
+    // gate term) reports. The one case `is_active()` cannot see — an effect
+    // that has been configured/ignited but not yet seeded, because seeding
+    // happens inside `apply` — is covered by the config/ignition mutators
+    // below, each of which bumps.
     pub fn advance_effects(&mut self, dt_ms: f64) {
         self.effects.advance(dt_ms);
     }
@@ -57,12 +66,24 @@ impl AtermTerminal {
     /// Focus gate for the idle one-shots (`§5.6`): an unfocused pane fires no
     /// blink events (and freezes their fingerprints). Pass the pane focus.
     pub fn set_effects_focused(&mut self, focused: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_focused(focused);
     }
 
     /// Tri-state pane visibility for bounded rain draining:
     /// `focused|visible_unfocused|hidden`.
     pub fn set_effects_visibility(&mut self, state: &str) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_effects_visibility(state);
     }
 
@@ -75,6 +96,11 @@ impl AtermTerminal {
     /// freezes literal-rain sampling while a draft is unsent; on submit call
     /// `note_matrix_rain_signal(10, 4)` after this method.
     pub fn note_keystroke(&mut self) {
+        // WF-1 frame gate: cadence heat can ignite the comet on the NEXT
+        // render even though `is_active()` may still read false at gate time
+        // (ignition happens inside `apply`). One render per keystroke is
+        // semantically right — the echo damages the grid in the same beat.
+        self.note_host_visual_change();
         self.effects.note_keystroke();
     }
 
@@ -99,6 +125,12 @@ impl AtermTerminal {
         radius: f32,
         ring: bool,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_cursor_glow(
             enabled,
             style,
@@ -124,6 +156,12 @@ impl AtermTerminal {
         length: u32,
         color: Option<u32>,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_cursor_trail(
             enabled,
             u64::from(duration_ms),
@@ -137,6 +175,12 @@ impl AtermTerminal {
     /// pipeline samples supported literal codepoints outside the current
     /// cursor/composer protection band and emits only into empty default-bg cells.
     pub fn set_matrix_rain_enabled(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_matrix_rain_enabled(on);
     }
 
@@ -169,6 +213,12 @@ impl AtermTerminal {
         output_material: bool,
         seed: u64,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_matrix_rain(
             fps,
             density,
@@ -192,17 +242,35 @@ impl AtermTerminal {
 
     /// Accessibility motion gate for PHOSPHOR.
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_matrix_rain_reduced_motion(on);
     }
 
     /// Feed a terminal visual bell into PHOSPHOR's bounded alert tint.
     pub fn note_matrix_rain_bell(&mut self) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.note_bell();
     }
 
     /// Feed wheel/PgUp activity from an alternate-screen TUI so rain pauses
     /// while the user reads its transcript.
     pub fn note_matrix_rain_alt_scroll(&mut self) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.note_matrix_rain_alt_scroll();
     }
 
@@ -211,6 +279,12 @@ impl AtermTerminal {
     /// 8 failure, 9 interrupted, 10 turn-start`; weight clamps to `1..=8`.
     /// Turn-start also releases the unsent-composer material gate.
     pub fn note_matrix_rain_signal(&mut self, code: u32, weight: u32) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.note_matrix_rain_signal(code, weight);
     }
 
@@ -222,6 +296,12 @@ impl AtermTerminal {
     /// all four families on (profanity nova / feline cat / orca splash /
     /// emphasis ink), animated ink on.
     pub fn set_sparkle_words_enabled(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_enabled(on);
     }
 
@@ -241,6 +321,12 @@ impl AtermTerminal {
         orca: bool,
         emphasis: bool,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects
             .set_sparkle_classes(profanity, feline, orca, emphasis);
     }
@@ -250,6 +336,12 @@ impl AtermTerminal {
     /// `sweep_ms` clamps 350..=6000 (floor 600 while `loop_` — the WCAG flash
     /// margin, structural); `loop_` re-sweeps while the word stays visible.
     pub fn set_sparkle_ink(&mut self, enabled: bool, strength: f32, sweep_ms: u32, loop_: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects
             .set_sparkle_ink(enabled, strength, sweep_ms, loop_);
     }
@@ -258,6 +350,12 @@ impl AtermTerminal {
     /// collapse to a static glint) — the accessibility `reduced_motion`
     /// override. The engine's flash-limiter floors apply regardless.
     pub fn set_sparkle_reduced_motion(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_reduced_motion(on);
     }
 
@@ -265,6 +363,12 @@ impl AtermTerminal {
     /// default off): when on, full-screen apps render undecorated — the v1
     /// launch behavior. Off, the alternate screen sparkles like the main one.
     pub fn set_sparkle_alt_screen_suppression(&mut self, on: bool) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_alt_screen_suppression(on);
     }
 
@@ -280,6 +384,12 @@ impl AtermTerminal {
         allow_bare_cat: bool,
         cjk_single_char: bool,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects
             .set_sparkle_feline(style, magic, allow_bare_cat, cjk_single_char);
     }
@@ -304,6 +414,12 @@ impl AtermTerminal {
         magic: bool,
         supernova_chance: u32,
     ) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_profanity(
             style,
             density,
@@ -322,6 +438,12 @@ impl AtermTerminal {
     /// bypass per-class enable gates. Malformed TOML fails open to no
     /// customs; pass `undefined` to clear.
     pub fn set_sparkle_custom_specs(&mut self, toml: Option<String>) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_custom_specs(toml);
     }
 
@@ -332,6 +454,12 @@ impl AtermTerminal {
     /// dropped — the `set_sparkle_custom_specs` gap this closes); `Ok` returns
     /// `undefined`.
     pub fn set_cursor_trail_pack(&mut self, toml: Option<String>) -> Option<String> {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_cursor_trail_pack(toml)
     }
 
@@ -339,6 +467,12 @@ impl AtermTerminal {
     /// un-gate (native `languages`, default `"en"`; non-ambiguous forms load
     /// regardless; `"all"` un-gates everything). Rebuilds the lexicon.
     pub fn set_sparkle_languages(&mut self, languages_csv: &str) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         let langs: Vec<&str> = languages_csv
             .split(',')
             .map(str::trim)
@@ -352,6 +486,12 @@ impl AtermTerminal {
     /// Pass `undefined` to clear. A malformed override falls back to the
     /// builtin lexicon (the native fail-open posture).
     pub fn set_sparkle_lexicon_override(&mut self, toml: Option<String>) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         self.effects.set_sparkle_lexicon_override(toml);
     }
 
@@ -359,6 +499,12 @@ impl AtermTerminal {
     /// `deny` and `ignore_words` channel), replacing the current set. Entries
     /// are case/diacritic-folded with the scanner's own fold.
     pub fn set_sparkle_deny(&mut self, words_csv: &str) {
+        // WF-1 frame gate: an effects CONFIG/ignition change can light up
+        // pixels on the NEXT render while `is_active()` still reads false at
+        // gate time — decorations and comets ignite inside `apply`, which a
+        // gated frame never runs. Bump so the gate opens for one frame and
+        // lets the pipeline seed itself (same rule as `note_keystroke`).
+        self.note_host_visual_change();
         let words: Vec<&str> = words_csv
             .split(',')
             .map(str::trim)

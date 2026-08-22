@@ -135,3 +135,90 @@ fn help_spellings_dispatch_as_advertised() {
 
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Like [`run_with_deadline`], but hands back stderr. The flag-guard's non-regression
+/// cases turn on WHICH refusal a command gets, and asserting on their exit codes instead
+/// would be fragile: `install --default-set` legitimately exits 2 on an arch with no
+/// published build.
+fn run_capture(home: &Path, config_home: &Path, registry: &Path, args: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_atpkg"))
+        .args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("ATPKG_REGISTRY", format!("dir:{}", registry.display()))
+        .env_remove("ATPKG_DISABLE")
+        .output()
+        .expect("run dev atpkg child");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A FLAG IS NEVER A PROGRAM NAME — and, above all, never a DURABLE one.
+///
+/// `atpkg install --help` used to resolve `"--help"` against the signed index, fail, and
+/// write `[programs.--help]` into `status.toml`, where nothing removed it: `atpkg doctor`
+/// then reported a fully healthy ten-program toolset as incomplete for the life of the
+/// machine. Measured on a real install before the fix. `atpkg uninstall --version` was the
+/// worse half — it matched nothing, took the clean-success path, cleared adoption, printed
+/// "uninstalled --version" and exited 0.
+///
+/// The durable half is what this test really pins. An exit code is a moment; a poisoned
+/// record is forever, and it is read back by a diagnostic that other repos key on.
+#[test]
+fn subverb_flags_never_become_program_names() {
+    let root = std::env::temp_dir().join(format!("atpkg-flag-guard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let home = root.join("home");
+    let config_home = root.join("config");
+    let registry = root.join("registry");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&registry).unwrap();
+
+    let status_toml = home
+        .join("Library/Application Support/aterm/pkg/status.toml")
+        .to_path_buf();
+    let record = || std::fs::read_to_string(&status_toml).unwrap_or_default();
+
+    // A flag right after a name-taking verb is someone asking how the verb works.
+    for verb in ["install", "update", "uninstall", "link", "rollback", "which"] {
+        let status = run_with_deadline(&home, &config_home, &registry, &[verb, "--help"]);
+        assert!(
+            status.success(),
+            "atpkg {verb} --help answers with help and exits 0"
+        );
+    }
+
+    // An unrecognized flag is refused as a flag — never resolved as a program.
+    for verb in ["install", "update", "uninstall"] {
+        let (code, err) = run_capture(&home, &config_home, &registry, &[verb, "--nonsense"]);
+        assert_eq!(code, 2, "atpkg {verb} --nonsense exits 2");
+        assert!(
+            err.contains("is not a program name"),
+            "atpkg {verb} --nonsense says why, got: {err}"
+        );
+    }
+
+    // THE DURABLE ASSERTION: none of the above left a program row behind.
+    let recorded = record();
+    for ghost in ["--help", "--nonsense", "--version"] {
+        assert!(
+            !recorded.contains(ghost),
+            "{ghost:?} must never appear in status.toml, got:\n{recorded}"
+        );
+    }
+
+    // NON-REGRESSION. These two are real operands that merely look like flags: they name a
+    // SET where a program name would go, and the guard must let them through.
+    for legit in [["install", "--default-set"], ["uninstall", "--all"]] {
+        let (_, err) = run_capture(&home, &config_home, &registry, &legit);
+        assert!(
+            !err.contains("is not a program name"),
+            "atpkg {} is a real operand, not a flag; got: {err}",
+            legit.join(" ")
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}

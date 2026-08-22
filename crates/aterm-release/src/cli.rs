@@ -32,13 +32,14 @@ USAGE
         --abandon vX.Y.Z   delete that version's draft release + the local
                            journal (the claim commit stays; a later cut recuts)
         --retire-unmirrored vX.Y.Z
-                           the supported exit for a cut that flipped on the
-                           origin but whose mirror step the fleet's roster
-                           floor now refuses (a roster join landed between the
-                           origin flip and the public flip): release the lease,
-                           retire the journal, leave the origin release as it is
-                           — the public channel never saw it and the next cut,
-                           attributed under the current generation, supersedes it
+                           release the lease and retire the journal, leaving the
+                           origin release exactly as it is. The supported exit
+                           for a cut that flipped on the origin but whose mirror
+                           step the fleet's roster floor now refuses (a roster
+                           join landed between the origin flip and the public
+                           flip): the public channel never saw it, and the next
+                           cut, attributed under the current generation,
+                           supersedes it
         --set-version X.Y.Z
                            override the version derived from
                            [workspace.package] version (DEV → 0)
@@ -58,24 +59,27 @@ USAGE
                            never update again.
 
   cargo ship provision --id <machine-id> [--check]
-                           make THIS machine a publisher: seed the newest
+                           ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh
+                           FIRST — provision refuses without a Trust toolchain.
+                           Then: make THIS machine a publisher. Seeds the newest
                            master-signed roster pair from the channel release
-                           into dist/, audit the WHOLE publishing stack — the
-                           Trust stage2 toolchain (real smoke-compile), the
-                           targo/tippy/ty drivers, the rustup front door, the
-                           stable x86_64 slice, Apple identity + live-tested
-                           notary credential, the credentials profile, gh auth,
-                           channel token — each gap with its exact remedy, and
-                           only on a CLEAN pass mint this machine's key via the
-                           join ceremony (the paper phrase, typed once, is the
-                           only input; a roster id is irreversible and is never
+                           into dist/, audits the WHOLE publishing stack — Trust
+                           stage2 (real smoke-compile), the targo/tippy/ty
+                           drivers, the rustup front door, the stable x86_64
+                           slice, Apple identity + live-tested notary
+                           credential, the credentials profile, gh auth, channel
+                           token — each gap with its exact remedy, and only on a
+                           CLEAN pass mints this machine's key via the join
+                           ceremony (the paper phrase, typed once, is the only
+                           input; a roster id is irreversible and is never
                            consumed on a machine that cannot release).
                            Idempotent: a provisioned machine is audited and
                            bound through the real authorize_cut gate, never
                            re-minted. Ends in a READY TO CUT verdict.
-                           On a machine with no toolchain at all, start with
-                           tools/bootstrap-publisher.sh instead.
-        --check            audit only: no mint, no dist/ writes, exit 0
+        --check            audit only: no mint, no dist/ writes. Exits non-zero
+                           if anything is open, so a caller can gate on it. The
+                           mode to run when something is wrong and you do not
+                           yet want to touch the machine.
 
   cargo ship status        version · ledger tail · dangling claims · newest
                            published build
@@ -146,10 +150,29 @@ pub fn run() -> i32 {
             return 2;
         }
     };
-    match dispatch(cmd) {
+    let outcome = dispatch(cmd);
+    // The ONE flush in the binary, and it earns its place. Everything above prints to
+    // stdout; this prints to stderr. Under `… 2>&1 | tee provision.log` — the obvious
+    // thing to do with a run you may have to show someone — stdout block-buffers while
+    // stderr does not, so the summary landed ABOVE the evidence it summarises. Two lines
+    // of code and the log becomes the document the terminal showed.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    match outcome {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("aterm-release: FAILED — {e}");
+            // A message that names its own verdict word KEEPS it. `provision` ends in
+            // "NOT DONE — 1 waiting: the certificate errand is at Apple", whose remedy is
+            // to wait; printing FAILED in front of that is the tool contradicting itself
+            // in the one line the shell shows. `tally`'s own doc already conceded the
+            // point — the counting phrase was fixed and the sentence around it was not.
+            //
+            // The exit code stays 1 either way: a script must never read "waiting" as
+            // ready.
+            if e.to_string().starts_with("NOT DONE") {
+                eprintln!("aterm-release: {e}");
+            } else {
+                eprintln!("aterm-release: FAILED — {e}");
+            }
             1
         }
     }

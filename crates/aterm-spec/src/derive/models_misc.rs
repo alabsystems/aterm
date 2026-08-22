@@ -1021,6 +1021,195 @@ pub fn focus_modifier_cache_model() -> Model {
     }
 }
 
+/// SELECTION CUSTODY: which key events may take the user's reading position.
+///
+/// The viewport has two owners. The TAIL-FOLLOWER owns it while
+/// `display_offset == 0`; the USER owns it from the moment a scroll gesture lifts
+/// the view off the bottom. Ownership transfers back on exactly ONE event — a
+/// byte-producing key PRESS, which is what a user means by "start typing and jump
+/// back to the prompt". The selection has one owner, the user, and is dropped only
+/// by that same press or by a deliberate deselect.
+///
+/// Three event classes must NOT disturb either:
+///
+/// * a key RELEASE (a Kitty `REPORT_EVENT_TYPES` key-up is not typing),
+/// * an auto-REPEAT tick (the same held press continuing — re-running the snap at
+///   the ~30 Hz repeat rate destroyed any scroll or selection made mid-hold),
+/// * a bare MODIFIER or lock key (Shift/Control/Alt/Super/Caps…), which is the
+///   first half of ⌘-C and the Shift of a shift-click extend.
+///
+/// …and neither must OUTPUT: a program writing while the user reads must repin the
+/// offset so the SAME content stays under the eye, never slide the view or hand
+/// the viewport back to the tail-follower. That is the second half of the user's
+/// complaint.
+///
+/// The custody invariants are stated over the OBSERVABLE state — `offset`,
+/// `owner`, `selection` — against a shadow of the pre-action values
+/// (`prev_offset`, `prev_owner`, `prev_selection`) that every action writes from
+/// the pre-state. They deliberately do NOT read a self-reported "this press
+/// disturbed something" flag: such a flag is written by hand at every site, so an
+/// implementation that moved the viewport without setting it would satisfy the
+/// invariant while shipping the bug. Here, moving the viewport IS the violation.
+///
+/// `Buggy=1` reproduces the regression FAMILY. Two members are the literal
+/// shipping defect — an inert press and an auto-repeat tick each snap the viewport
+/// and clear the selection, which is what made ⌘-C copy nothing (the ⌘ keydown
+/// destroyed the selection before the `c` arrived). The other two are the
+/// neighbouring regressions the same invariants must catch: a release that
+/// disturbs, and output that snaps the reader back to live instead of repinning.
+///
+/// Scope: this is the PRESS-PATH half of custody (design Phase 1) plus the output
+/// repin it must not fight. The alt-screen round-trip, scrollback eviction and
+/// reflow anchoring are Phase 3 and are deliberately absent rather than asserted
+/// against code that does not yet implement them.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn press_custody_model() -> Model {
+    crate::ty_model! {
+        PressCustody {
+            const Buggy = 0;
+            const MaxOffset = 2;
+
+            // 0 = the tail-follower owns the viewport, 1 = the user does.
+            var owner = 0;
+            // Bounded projection of `Grid::display_offset`.
+            var offset = 0;
+            // A completed text selection exists.
+            var selection = 0;
+            // Shadow of the pre-action observable state. Every action writes all
+            // three from the PRE-state, so an invariant can compare what an event
+            // did against what was there before it.
+            var prev_owner = 0;
+            var prev_offset = 0;
+            var prev_selection = 0;
+            // What kind of event just fired: 0 a user gesture, 1 a typing press,
+            // 2 an auto-repeat tick, 3 a bare modifier, 4 a release, 5 output.
+            var last_event = 0;
+
+            action UserScroll when (offset <= MaxOffset - 1) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = offset + 1;
+                owner = 1;
+                last_event = 0;
+            }
+            action UserSelect {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                selection = 1;
+                last_event = 0;
+            }
+            // A plain click that deselects — a deliberate clear, always allowed.
+            action UserClear {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                selection = 0;
+                last_event = 0;
+            }
+            // Output while the user is reading: the repin keeps the same content
+            // under the eye, so the offset RISES with the new lines and ownership
+            // stays with the user.
+            action OutputWhileReading when (owner == 1 && offset <= MaxOffset - 1) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset + 1 };
+                owner = if Buggy == 1 { 0 } else { 1 };
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 5;
+            }
+            // Output while the tail-follower owns the viewport: stays at live.
+            action OutputAtLive when (owner == 0) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = 0;
+                last_event = 5;
+            }
+            // The ONE handover. Unchanged by this design.
+            action TypingPress {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = 0;
+                owner = 0;
+                selection = 0;
+                last_event = 1;
+            }
+            action RepeatPress {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 2;
+            }
+            action InertPress {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 3;
+            }
+            action ReleaseEvent {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 4;
+            }
+
+            invariant TailOwnerAtBottom:
+                if owner == 0 { offset == 0 } else { offset > 0 };
+            invariant InertPressIsInert:
+                if last_event == 3 {
+                    offset == prev_offset && owner == prev_owner &&
+                    selection == prev_selection
+                } else {
+                    last_event <= 5
+                };
+            invariant RepeatPressIsInert:
+                if last_event == 2 {
+                    offset == prev_offset && owner == prev_owner &&
+                    selection == prev_selection
+                } else {
+                    last_event <= 5
+                };
+            invariant ReleaseIsInert:
+                if last_event == 4 {
+                    offset == prev_offset && owner == prev_owner &&
+                    selection == prev_selection
+                } else {
+                    last_event <= 5
+                };
+            invariant OutputNeverTakesCustodyOrSelection:
+                if last_event == 5 {
+                    selection == prev_selection && owner == prev_owner
+                } else {
+                    last_event <= 5
+                };
+            invariant TypingLandsAtLive:
+                if last_event == 1 {
+                    offset == 0 && owner == 0 && selection == 0
+                } else {
+                    last_event <= 5
+                };
+            invariant StateBounds:
+                owner <= 1 && offset <= MaxOffset && selection <= 1 &&
+                prev_owner <= 1 && prev_offset <= MaxOffset && prev_selection <= 1 &&
+                last_event <= 5;
+        }
+    }
+}
+
 /// One-key press/repeat/release pairing at the GUI-to-PTY boundary.
 ///
 /// A press consumed by a physical-key GUI gate or by the engine-key overlay gate

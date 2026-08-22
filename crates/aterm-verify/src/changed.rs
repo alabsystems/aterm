@@ -1056,7 +1056,11 @@ winit v0.30.0 (/repo/vendor/winit)
 
     #[test]
     fn an_absent_targo_widens_before_anything_else_is_asked() {
-        let tools = Toolchain::discover(Some(Path::new("/nonexistent")), Path::new("/nonexistent"));
+        let tools = Toolchain::discover(
+            Some(Path::new("/nonexistent")),
+            Path::new("/nonexistent"),
+            std::ffi::OsStr::new(""),
+        );
         assert_eq!(
             resolve(Path::new("/"), &tools, OsStr::new(""), "main"),
             Selection::Widened(

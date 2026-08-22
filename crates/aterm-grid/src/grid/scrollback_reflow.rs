@@ -53,38 +53,60 @@ impl Grid {
 
         // Ring-buffer scrollback: the rows preceding the visible window. The
         // caller has already drained the lazy buffer (above), so all deferred
-        // lines are accounted for. Linearize so logical order == Vec order.
-        let ring_scrollback = self.storage.ring_buffer_scrollback();
-        if ring_scrollback > 0 {
-            let ring_head = self.storage.ring_head;
-            if ring_head != 0 {
-                self.storage.rows.rotate_left(ring_head);
-                self.storage.ring_head = 0;
-            }
-            lines.reserve(ring_scrollback);
-            // Borrow the stored extras instead of cloning them: the callee takes
-            // `&ScrolledRowExtras`, and `ring_extras` is a field disjoint from
-            // `rows`, so both reads are shared borrows of `self.storage`. Cloning
-            // meant up to six Vec mallocs + memcpys (plus `Arc<str>` refcount
-            // atomics) per ring row purely to hand over a reference — on a path
-            // that runs under the `term` lock on every width change. One empty
-            // default (no allocation) covers the `None` rows; same idiom as
-            // `try_get_history_line`. Declared AFTER the `rotate_left` above so
-            // the shared borrows never overlap the `&mut`.
-            let no_extras = super::ScrolledRowExtras::default();
-            for i in 0..ring_scrollback {
-                let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
-                lines.push(Self::row_to_line_with_stored_extras(
-                    &self.storage.rows[i],
-                    extras,
-                ));
-            }
-            // Drop the scrollback rows; keep only the visible window.
-            self.storage.rows.drain(..ring_scrollback);
-            self.storage.ring_extras.clear();
-            self.storage.total_lines = self.storage.rows.len();
-        }
+        // lines are accounted for.
+        lines.extend(self.take_ring_scrollback_lines());
 
+        lines
+    }
+
+    /// Extract ONLY the ring-buffer scrollback (the rows preceding the visible
+    /// window) as logical [`Line`]s (oldest first), removing those rows from
+    /// the ring. The ring history extras ride along inside the produced
+    /// [`Line`]s; `ring_extras` is cleared.
+    ///
+    /// Split out of [`take_scrollback_lines`](Self::take_scrollback_lines) so
+    /// the OFFLOADED width-change path (`resize_offloading_scrollback`) can
+    /// hand the ring history to the detached job (RFL-1): the synchronous
+    /// residue of a width change then shrinks from three ring-sized passes
+    /// (materialize + rewrap + row rebuild, all under the caller's lock) to
+    /// this one materialize pass — the rewrap runs off-thread in the job's
+    /// ring phase and the row rebuild happens at re-attach.
+    // COST: O(ring-scrollback-rows) — bounded by the ring capacity (a
+    // construction-time constant), NOT by session history; stays within the
+    // synchronous budget the bounded-cost obligation checks.
+    pub(super) fn take_ring_scrollback_lines(&mut self) -> Vec<Line> {
+        let ring_scrollback = self.storage.ring_buffer_scrollback();
+        if ring_scrollback == 0 {
+            return Vec::new();
+        }
+        // Linearize so logical order == Vec order.
+        let ring_head = self.storage.ring_head;
+        if ring_head != 0 {
+            self.storage.rows.rotate_left(ring_head);
+            self.storage.ring_head = 0;
+        }
+        let mut lines = Vec::with_capacity(ring_scrollback);
+        // Borrow the stored extras instead of cloning them: the callee takes
+        // `&ScrolledRowExtras`, and `ring_extras` is a field disjoint from
+        // `rows`, so both reads are shared borrows of `self.storage`. Cloning
+        // meant up to six Vec mallocs + memcpys (plus `Arc<str>` refcount
+        // atomics) per ring row purely to hand over a reference — on a path
+        // that runs under the `term` lock on every width change. One empty
+        // default (no allocation) covers the `None` rows; same idiom as
+        // `try_get_history_line`. Declared AFTER the `rotate_left` above so
+        // the shared borrows never overlap the `&mut`.
+        let no_extras = super::ScrolledRowExtras::default();
+        for i in 0..ring_scrollback {
+            let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
+            lines.push(Self::row_to_line_with_stored_extras(
+                &self.storage.rows[i],
+                extras,
+            ));
+        }
+        // Drop the scrollback rows; keep only the visible window.
+        self.storage.rows.drain(..ring_scrollback);
+        self.storage.ring_extras.clear();
+        self.storage.total_lines = self.storage.rows.len();
         lines
     }
 
@@ -126,7 +148,11 @@ impl Grid {
 
     /// Convert reflowed scrollback [`Line`]s into ring-buffer scrollback rows
     /// and prepend them ahead of the visible window, honoring `max_scrollback`.
-    fn prepend_ring_scrollback_lines(&mut self, lines: Vec<Line>, new_cols: u16) {
+    ///
+    /// `pub(super)` (not private) because the offload re-attach
+    /// (`Grid::reattach_ring_history`) rebuilds the job-carried ring history
+    /// through this exact path, so the two entry points cannot drift.
+    pub(super) fn prepend_ring_scrollback_lines(&mut self, lines: Vec<Line>, new_cols: u16) {
         // Cap to the ring's scrollback budget: only the newest lines fit when
         // history exceeds the configured limit (oldest evicted — correct).
         let cap = self.storage.max_scrollback;
@@ -220,8 +246,12 @@ struct Unit<'a> {
 /// Rewrap a sequence of scrollback [`Line`]s to `new_cols`, preserving logical
 /// line breaks (hard newlines) and content. Soft-wrapped runs (each line after
 /// the first in a run carries the wrapped flag) are joined, then re-split by
-/// display width. O(total cells); the display-cell scratch buffer is reused
-/// across logical lines, so it allocates once for the widest logical line.
+/// display width. O(total cells) worst case — but single-row logical lines
+/// whose wrap points provably cannot change at `new_cols` pass through as
+/// clones (RFL-4a, `rewrap_passthrough_eligible`), so typical mixed history
+/// (~90% short unwrapped lines) costs O(affected cells + passthrough clones).
+/// The display-cell scratch buffer is reused across logical lines, so the slow
+/// path allocates once for the widest logical line.
 // COST: UNBOUNDED(session-history-cells) — rewraps O(total cells) of history.
 // See `xtask gate mainloop` (MAIN-LOOP COMPLETENESS CENSUS): the 42s freeze sink;
 // must stay off the main thread (behind `resize_offloading_scrollback`/a worker).
@@ -241,9 +271,89 @@ pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line
         while i < lines.len() && lines[i].is_wrapped() {
             i += 1;
         }
+        let run = &lines[start..i];
+        // RFL-4a passthrough: a single-row logical line whose wrap points
+        // provably CANNOT change at `new_cols` re-emits as a clone, skipping
+        // unit decomposition and line rebuild entirely. The gate is
+        // deliberately conservative (see `rewrap_passthrough_eligible`); the
+        // `reflow_passthrough_*` differential tests are the parity oracle
+        // against the full path, and the counter keeps the fast path's REACH
+        // honest in both directions (fires on eligible corpora, never on a
+        // wrap-changing one).
+        if run.len() == 1 && rewrap_passthrough_eligible(&run[0], new_cols) {
+            #[cfg(any(test, feature = "testing"))]
+            super::count_reflow_passthrough_lines(1);
+            out.push(run[0].cloned_for_rewrap());
+            continue;
+        }
+        emit_logical_line(run, new_cols, &mut units, &mut out);
+    }
+    out
+}
+
+/// The full-decomposition rewrap, passthrough disabled — the RFL-4a parity
+/// reference. Kept compilable only under test so the differential oracle can
+/// never drift from the shipping slow path (both call `emit_logical_line`).
+#[cfg(test)]
+#[must_use]
+pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -> Vec<Line> {
+    let new_cols = new_cols.max(1);
+    let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+    let mut units: Vec<Unit<'_>> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let start = i;
+        i += 1;
+        while i < lines.len() && lines[i].is_wrapped() {
+            i += 1;
+        }
         emit_logical_line(&lines[start..i], new_cols, &mut units, &mut out);
     }
     out
+}
+
+/// Wrap-invariance gate for the RFL-4a clone-through fast path. TRUE only when
+/// every cell's display width is provably 1 and the total provably fits
+/// `new_cols`, and no span sidecar that the rebuild path re-derives is present:
+///
+///   * single-row unwrapped logical line (checked by the caller via run
+///     length; a leading orphaned continuation is fine — `cloned_for_rewrap`
+///     resets the flags exactly as `build_line` would),
+///   * content is printable ASCII (0x20..=0x7E): no combining marks, no
+///     VS15/VS16 presentation selectors, no zero-width or wide chars — every
+///     char is one display column, so byte length == display width,
+///   * that byte length fits `new_cols` (the wrap point cannot move),
+///   * no stored WIDE attr flag: the write-time wide authority
+///     (`stored_unit_is_wide`) can double a cell's width even when
+///     `char_width` says 1 — see
+///     `rewrap_preserves_stored_ambiguous_width_with_narrow_control`,
+///   * no hyperlink / SGR-58 underline-colour spans: rebuild re-derives and
+///     may re-coalesce span lists; keeping them out makes clone == rebuild
+///     cell-for-cell with no normalization questions.
+///
+/// Everything else takes the full decompose+rebuild path unchanged. Attribute
+/// CONTENT needs no gating: the rebuild copies per-cell attrs verbatim, so a
+/// clone is cell-for-cell identical whatever the attrs say (only the WIDE bit
+/// affects geometry, hence the one flag check).
+fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
+    if line.hyperlinks().is_some_and(|spans| !spans.is_empty())
+        || line.underline_colors().is_some_and(|spans| !spans.is_empty())
+    {
+        return false;
+    }
+    let Some(text) = line.as_str() else {
+        // Non-UTF-8 content: the rebuild path maps it to a blank line; never
+        // clone it through.
+        return false;
+    };
+    if text.len() > new_cols as usize || !text.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+        return false;
+    }
+    line.attrs().is_none_or(|rle| {
+        rle.runs().iter().all(|run| {
+            !crate::CellFlags::from_bits(run.value.flags).contains(crate::CellFlags::WIDE)
+        })
+    })
 }
 
 /// Flatten a logical-line run into display-cell units (accumulated in the
@@ -673,5 +783,160 @@ mod tests {
             "VS15 keeps the watch narrow despite WIDE attrs"
         );
         assert_eq!(out[0].as_str(), Some("\u{231A}\u{FE0E}Z"));
+    }
+
+    /// Cell-for-cell semantic equality: text, wrap flag, per-char attrs, and
+    /// per-column hyperlink / underline-colour answers. This is the identity
+    /// the RFL-4a passthrough must preserve — structural normalization (an
+    /// empty attrs RLE vs an explicit default run, span-list coalescing) is
+    /// deliberately NOT compared, because no reader distinguishes it.
+    fn assert_semantically_equal(fast: &[Line], reference: &[Line]) {
+        assert_eq!(fast.len(), reference.len(), "line counts diverge");
+        for (idx, (a, b)) in fast.iter().zip(reference).enumerate() {
+            assert_eq!(a.as_str(), b.as_str(), "text diverges at line {idx}");
+            assert_eq!(
+                a.is_wrapped(),
+                b.is_wrapped(),
+                "wrap flag diverges at line {idx}"
+            );
+            let chars = a.as_str().map_or(0, |t| t.chars().count());
+            for ci in 0..chars {
+                assert_eq!(
+                    a.get_attr(ci),
+                    b.get_attr(ci),
+                    "attrs diverge at line {idx} char {ci}"
+                );
+            }
+            // Sidecars answered per display column over a generous range (wide
+            // chars make columns exceed chars; both sides answer None past
+            // their spans).
+            for col in 0..64u16 {
+                assert_eq!(
+                    a.get_hyperlink_span(col)
+                        .map(|s| (s.url.clone(), s.id.clone())),
+                    b.get_hyperlink_span(col)
+                        .map(|s| (s.url.clone(), s.id.clone())),
+                    "hyperlink diverges at line {idx} col {col}"
+                );
+                assert_eq!(
+                    a.get_underline_color(col),
+                    b.get_underline_color(col),
+                    "underline colour diverges at line {idx} col {col}"
+                );
+            }
+        }
+    }
+
+    /// RFL-4a DIFFERENTIAL ORACLE: over a corpus that mixes every gate
+    /// dimension — eligible short ASCII (plain, attred, empty-RLE), blanks,
+    /// soft-wrapped runs, CJK, VS15, hyperlinks, underline colours, stored
+    /// WIDE attrs, and wrap-changing long lines — the passthrough-enabled path
+    /// must be cell-for-cell identical to the full-decomposition reference,
+    /// and the fast path must actually FIRE (one-sided green is vacuous).
+    #[test]
+    fn reflow_passthrough_matches_full_path_on_mixed_corpus() {
+        use std::sync::Arc;
+
+        let styled_attr = CellAttrs::new(0x01_11_22_33, CellAttrs::DEFAULT.bg, 0);
+        let wide_attr = CellAttrs::new(
+            CellAttrs::DEFAULT.fg,
+            CellAttrs::DEFAULT.bg,
+            crate::CellFlags::WIDE.bits(),
+        );
+        let mut corpus: Vec<Line> = Vec::new();
+        for i in 0..40 {
+            // Eligible: short plain ASCII (the ~90% shell-history shape).
+            corpus.push(styled(&format!("ls -la {i}"), false));
+            // Eligible: short ASCII with a real (non-WIDE) attr run.
+            corpus.push(Line::with_attrs(
+                "AB",
+                [styled_attr, CellAttrs::DEFAULT].into_iter().collect(),
+            ));
+            // Eligible: blank hard-newline row.
+            corpus.push(styled("", false));
+            // Ineligible: soft-wrapped run (rejoin + re-split).
+            corpus.push(styled("ABCDEFGH", false));
+            corpus.push(styled("IJKLMNOP", true));
+            // Ineligible: CJK (non-ASCII width-2 cells).
+            corpus.push(styled("世界世界", false));
+            // Ineligible: VS15-narrowed watch with stored WIDE attrs.
+            corpus.push(Line::with_attrs(
+                "\u{231A}\u{FE0E}Z",
+                [wide_attr, wide_attr, CellAttrs::DEFAULT]
+                    .into_iter()
+                    .collect(),
+            ));
+            // Ineligible: stored-WIDE ASCII-adjacent shape (write-time wide
+            // authority doubles the width, so byte len lies about columns).
+            corpus.push(Line::with_attrs(
+                "WZ",
+                [wide_attr, CellAttrs::DEFAULT].into_iter().collect(),
+            ));
+            // Ineligible: hyperlink spans (rebuild re-derives span lists).
+            corpus.push(Line::with_hyperlinks(
+                "ABCD",
+                Rle::new(),
+                vec![
+                    HyperlinkSpan::new(0, 2, Arc::from("u0")),
+                    HyperlinkSpan::new(2, 4, Arc::from("u1")),
+                ],
+            ));
+            // Ineligible: underline-colour spans.
+            let mut ul = Line::with_hyperlinks("ABCD", Rle::new(), Vec::new());
+            ul.set_underline_colors(vec![UnderlineColorSpan::new(0, 2, 0x01_FF_00_00)]);
+            corpus.push(ul);
+            // Ineligible: wrap-changing long ASCII.
+            corpus.push(styled(&format!("L{i}-{}", "x".repeat(50)), false));
+        }
+
+        for new_cols in [11u16, 23, 40, 200] {
+            let _ = crate::test_counters::take_reflow_passthrough_lines();
+            let fast = reflow_scrollback_lines(&corpus, new_cols);
+            let fired = crate::test_counters::take_reflow_passthrough_lines();
+            let reference = reflow_scrollback_lines_reference(&corpus, new_cols);
+            assert_semantically_equal(&fast, &reference);
+            // Every "ls -la {i}"/"AB"/blank fits the narrowest width tested
+            // (11 cols): the fast path must have fired (reach, side one).
+            assert!(
+                fired >= 80,
+                "passthrough must fire on the eligible majority at {new_cols} \
+                 cols (fired {fired})"
+            );
+        }
+    }
+
+    /// RFL-4a reach, side two: inputs whose wrap points CAN change — or whose
+    /// width the byte length cannot prove — must NEVER take the passthrough.
+    #[test]
+    fn reflow_passthrough_never_fires_on_wrap_changing_input() {
+        let _ = crate::test_counters::take_reflow_passthrough_lines();
+        // Longer than the target width: must re-split.
+        let long: Vec<Line> = (0..10)
+            .map(|i| styled(&format!("L{i}-{}", "x".repeat(60)), false))
+            .collect();
+        let out = reflow_scrollback_lines(&long, 40);
+        assert!(out.len() > 10, "sanity: the long lines actually wrapped");
+        assert_eq!(
+            crate::test_counters::take_reflow_passthrough_lines(),
+            0,
+            "no passthrough when the wrap points change"
+        );
+        // Non-ASCII single-row lines: widths unprovable by byte length.
+        let cjk = vec![styled("世界", false)];
+        let _ = reflow_scrollback_lines(&cjk, 40);
+        assert_eq!(
+            crate::test_counters::take_reflow_passthrough_lines(),
+            0,
+            "no passthrough for non-ASCII content"
+        );
+        // A soft-wrapped run of short lines: run length disqualifies it even
+        // though each row alone would pass the width gate.
+        let run = vec![styled("ABC", false), styled("DEF", true)];
+        let _ = reflow_scrollback_lines(&run, 40);
+        assert_eq!(
+            crate::test_counters::take_reflow_passthrough_lines(),
+            0,
+            "no passthrough for multi-row logical lines"
+        );
     }
 }

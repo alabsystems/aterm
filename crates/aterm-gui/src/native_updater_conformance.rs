@@ -50,6 +50,7 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         failing_kind: String::new(),
         failing_applies: 0,
         installable: true,
+        channel_unreadable: false,
     }
 }
 

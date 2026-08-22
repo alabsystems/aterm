@@ -245,39 +245,77 @@ fn aterm_grid_rlib() -> Option<std::path::PathBuf> {
     best.map(|(_, p)| p)
 }
 
-/// Resolve the probe's compiler: trustc from the Trust stage2 tool dir
-/// (`TRUST_STAGE2_BIN` overrides; default `$HOME/trust/build/host/stage2/bin`,
-/// canonicalized — protected Trust drivers refuse symlinked toolchain paths),
-/// else a PATH `rustc` (upstream boxes). A bare PATH `rustc` alone is not
-/// enough since the 2026-07-30 stock-name purge: the rustup shim exists but
-/// the repo's pinned toolchain no longer carries a stock-named compiler, so
-/// the shim exits nonzero and every negative probe would "pass" vacuously —
-/// exactly the failure mode the positive control below exists to catch.
+/// Resolve the probe's compiler — BY EVIDENCE, not by guess.
+///
+/// The one property that matters is agreement with the rlib: the probe must
+/// use a compiler that can CONSUME the `aterm_grid` metadata this very test
+/// binary was built against, or every result is about toolchain skew instead
+/// of aterm-grid. This used to be assumed positionally — "the stage2 dir
+/// first, PATH `rustc` second" — which was right exactly as long as the
+/// workspace was built by that stage2. The first machine that built with the
+/// atpkg-installed toolchain instead (PATH `trustc`, no rustup) broke the
+/// assumption: the probe found the six-weeks-stale dev stage2, E0514'd on the
+/// fresh rlib, and the positive control failed on a healthy tree.
+///
+/// So the DEFAULT candidates — PATH `trustc` (the atpkg lane; also the rustup
+/// shim on a dev box, which resolves to stage2 anyway), the conventional
+/// `$HOME/trust/build/host/stage2/bin` dev checkout (canonicalized — protected
+/// Trust drivers refuse symlinked toolchain paths), then PATH `rustc`
+/// (upstream boxes) — are each VETTED with a metadata-touch compile against
+/// the real rlib, and the first that passes wins. E0514 fires at metadata
+/// load, so the vet is precisely the skew check. If NONE vets, the first that
+/// merely runs is returned so the positive control can fail with the real
+/// compiler stderr instead of a bare "no compiler".
+///
+/// `TRUST_STAGE2_BIN` is different: an explicit operator override names THE
+/// compiler, so it is honored without vetting — silently falling back from an
+/// explicit choice would make the probe disagree with what the operator asked
+/// for (the same fail-closed rule Trust applies to `AY_PATH`). Skew under an
+/// override still surfaces loudly, through the positive control's diagnosis.
+///
 /// The bool is "this is trustc" — the caller adds the verification off-switch
 /// (a direct compiler invocation bypasses .cargo/config.toml's native-lane
 /// opt-out, and an unverified probe snippet is the point here).
-fn probe_compiler() -> Option<(std::path::PathBuf, bool)> {
-    let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
-    let stage2 = std::env::var_os("TRUST_STAGE2_BIN")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| std::path::Path::new(&home).join("trust/build/host/stage2/bin"))
-        });
-    if let Some(dir) = stage2
-        && let Ok(physical) = std::fs::canonicalize(&dir)
-    {
-        candidates.push((physical.join("trustc"), true));
-    }
-    candidates.push((std::path::PathBuf::from("rustc"), false));
-    candidates.into_iter().find(|(path, _)| {
+fn probe_compiler(
+    rlib: &std::path::Path,
+    deps: &std::path::Path,
+) -> Option<(std::path::PathBuf, bool)> {
+    let runs = |path: &std::path::Path| {
         std::process::Command::new(path)
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
-    })
+    };
+    if let Some(dir) = std::env::var_os("TRUST_STAGE2_BIN") {
+        let explicit = std::fs::canonicalize(std::path::PathBuf::from(dir))
+            .map(|physical| physical.join("trustc"))
+            .ok()?;
+        return runs(&explicit).then_some((explicit, true));
+    }
+    let mut candidates: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    candidates.push((std::path::PathBuf::from("trustc"), true));
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(physical) =
+            std::fs::canonicalize(std::path::Path::new(&home).join("trust/build/host/stage2/bin"))
+    {
+        candidates.push((physical.join("trustc"), true));
+    }
+    candidates.push((std::path::PathBuf::from("rustc"), false));
+    candidates.retain(|(path, _)| runs(path));
+    // The vet: `extern crate` alone forces the metadata load where an
+    // incompatible-compiler rlib is rejected, and asserts nothing about the
+    // crate's API — a vet that used a real snippet could never be told apart
+    // from the probes it exists to make meaningful.
+    let fallback = candidates.first().cloned();
+    candidates
+        .into_iter()
+        .find(|(path, is_trustc)| {
+            compile_probe(path, *is_trustc, rlib, deps, "extern crate aterm_grid;")
+                .is_some_and(|out| out.status.success())
+        })
+        .or(fallback)
 }
 
 /// Compile `src` against the real `aterm_grid` rlib. `Some(true)` = compiled,
@@ -310,14 +348,26 @@ fn trust_off_switch(compiler: &std::path::Path) -> &'static str {
     }
 }
 
-fn probe_compiles(src: &str) -> Option<bool> {
-    let rlib = aterm_grid_rlib()?;
-    let deps = deps_dir()?;
-    let out = std::env::temp_dir().join(format!("aterm_grid_probe_{}", std::process::id()));
-    let (compiler, is_trustc) = probe_compiler()?;
-    let mut cmd = std::process::Command::new(&compiler);
+/// One compile of `src` against the rlib under the given compiler — the ONE
+/// command shape shared by the candidate vet and every real probe, so the
+/// compiler that passed the vet is exercised in exactly the way it was vetted.
+fn compile_probe(
+    compiler: &std::path::Path,
+    is_trustc: bool,
+    rlib: &std::path::Path,
+    deps: &std::path::Path,
+    src: &str,
+) -> Option<std::process::Output> {
+    let out = std::env::temp_dir().join(format!(
+        "aterm_grid_probe_{}_{:x}",
+        std::process::id(),
+        // Distinct output per snippet: the vet and a probe may run back to
+        // back, and a shared path would let a stale artifact mask a failure.
+        src.len() ^ src.as_bytes().iter().map(|&b| b as usize).sum::<usize>()
+    ));
+    let mut cmd = std::process::Command::new(compiler);
     if is_trustc {
-        cmd.arg(trust_off_switch(&compiler));
+        cmd.arg(trust_off_switch(compiler));
     }
     let mut child = cmd
         .arg("--edition=2021")
@@ -331,13 +381,6 @@ fn probe_compiles(src: &str) -> Option<bool> {
         .arg("-")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        // KEPT, not discarded. A probe that fails for an environmental reason
-        // (a compiler that rejects the off-switch spelling, an rlib built by a
-        // different rustc) previously failed with a generic "the harness is
-        // broken", and the one line that said WHY was thrown away — so the
-        // positive control could not distinguish "aterm-grid regressed" from
-        // "this machine's toolchain is mixed". On a security suite that is the
-        // difference between a finding and a wild goose chase.
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
@@ -347,7 +390,22 @@ fn probe_compiles(src: &str) -> Option<bool> {
     }
     let probe_out = child.wait_with_output().ok()?;
     let _ = std::fs::remove_file(&out);
+    Some(probe_out)
+}
+
+fn probe_compiles(src: &str) -> Option<bool> {
+    let rlib = aterm_grid_rlib()?;
+    let deps = deps_dir()?;
+    let (compiler, is_trustc) = probe_compiler(&rlib, &deps)?;
+    let probe_out = compile_probe(&compiler, is_trustc, &rlib, &deps, src)?;
     if !probe_out.status.success() {
+        // KEPT, not discarded. A probe that fails for an environmental reason
+        // (a compiler that rejects the off-switch spelling, an rlib built by a
+        // different rustc) previously failed with a generic "the harness is
+        // broken", and the one line that said WHY was thrown away — so the
+        // positive control could not distinguish "aterm-grid regressed" from
+        // "this machine's toolchain is mixed". On a security suite that is the
+        // difference between a finding and a wild goose chase.
         *last_probe_stderr().lock().expect("probe stderr mutex") =
             String::from_utf8_lossy(&probe_out.stderr).into_owned();
     }

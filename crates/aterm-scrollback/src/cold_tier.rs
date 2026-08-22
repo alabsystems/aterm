@@ -95,9 +95,25 @@ pub(crate) struct ColdTier {
     pages: VecDeque<ColdPage>,
     /// Total available line count (excludes consumed lines from front_offset).
     line_count: usize,
-    /// Cumulative line counts: `cumulative[i]` = total *physical* lines in pages `0..=i`.
+    /// Cumulative *physical* line counts, kept ABSOLUTE since the last full
+    /// rebuild: live entry `i` (`cumulative_lines[cum_start + i]`, page `i` of
+    /// `pages`) holds `cumulative_base` + total physical lines in pages
+    /// `0..=i`. Front drops advance `cum_start`/`cumulative_base` in
+    /// O(dropped) instead of draining and rebasing every surviving entry —
+    /// the old path memmoved AND rewrote the whole vector, O(total pages) per
+    /// drop, on the push_line rotation hot path. Lookups add the base to the
+    /// search target instead of ever touching stored values.
     /// Unchanged by front_offset — get_line adjusts indices before lookup.
     cumulative_lines: Vec<usize>,
+    /// Dead-prefix length of `cumulative_lines` (entries of dropped pages).
+    /// Reclaimed by one amortized memmove when it outgrows the live half
+    /// (see `drop_front_index_entries`).
+    cum_start: usize,
+    /// Absolute cumulative value at the current front: total physical lines
+    /// in pages dropped since the last full rebuild. Monotonic between
+    /// rebuilds and bounded by lines ever stored in this process, so the
+    /// saturating bumps are exact on every real path (crate idiom).
+    cumulative_base: usize,
     /// Cache of recently decompressed pages: `(page_index, lines)` per slot,
     /// filled round-robin. See [`CACHE_SLOTS`] for why there is more than one.
     last_page_cache: PageCache,
@@ -118,6 +134,8 @@ impl ColdTier {
             pages: VecDeque::new(),
             line_count: 0,
             cumulative_lines: Vec::new(),
+            cum_start: 0,
+            cumulative_base: 0,
             last_page_cache: RefCell::new([const { None }; CACHE_SLOTS]),
             cache_next: Cell::new(0),
             bytes_used: 0,
@@ -154,11 +172,16 @@ impl ColdTier {
                 // data — exact on every real path.
                 self.bytes_used = self.bytes_used.saturating_add(page.compressed.len());
                 self.line_count = self.line_count.saturating_add(accepted);
+                // `last()` is the last LIVE entry (the dead prefix sits at
+                // the front); an empty vector means no pages survive, where
+                // the invariant `empty => cum_start == 0 && base == 0` holds
+                // (drop_front_index_entries/clear enforce it) — but the base
+                // is the correct absolute floor either way.
                 let cumulative = self
                     .cumulative_lines
                     .last()
                     .copied()
-                    .unwrap_or(0)
+                    .unwrap_or(self.cumulative_base)
                     .saturating_add(accepted);
                 self.cumulative_lines.push(cumulative);
                 self.pages.push_back(page);
@@ -192,7 +215,7 @@ impl ColdTier {
         // exact on every real path.
         let physical_idx = idx.saturating_add(self.front_offset);
 
-        let Some(page_idx) = self.find_page(physical_idx) else {
+        let Some((page_idx, line_in_page)) = self.locate(physical_idx) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -200,18 +223,6 @@ impl ColdTier {
                 ),
             )));
         };
-        // total `get` + saturating: `find_page` returned an in-range index and
-        // `page_start <= physical_idx` by construction; the verifier cannot
-        // chain either fact. The unreachable arms yield the same values.
-        let page_start = if page_idx == 0 {
-            0
-        } else {
-            self.cumulative_lines
-                .get(page_idx.saturating_sub(1))
-                .copied()
-                .unwrap_or(0)
-        };
-        let line_in_page = physical_idx.saturating_sub(page_start);
 
         // Check cache first — scan every slot; hit semantics are unchanged, a
         // straddling viewport just stops evicting the page it is about to read
@@ -255,6 +266,109 @@ impl ColdTier {
         Ok(Some(line))
     }
 
+    /// Resolve a PHYSICAL line index to `(page_idx, line_in_page)`.
+    ///
+    /// The single home for the cumulative-index geometry, shared by the
+    /// random-access read path (`get_line`) and the block-streaming bulk
+    /// path (`take_lines_from`/`segment_len_at`) so the two cannot drift.
+    // Skip: same guarded-index class as `get_line`, which this was factored
+    // from. total `get` + saturating: `find_page` returned an in-range index
+    // and `page_start <= physical_idx` by construction; the verifier cannot
+    // chain either fact. The unreachable arms yield the same values.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn locate(&self, physical_idx: usize) -> Option<(usize, usize)> {
+        let page_idx = self.find_page(physical_idx)?;
+        // ABSOLUTE page start (ST-3 base-offset index): the dropped-prefix
+        // base for live page 0, else the previous live entry's absolute
+        // value; the base rides the query instead of rebasing stored values.
+        let page_start = if page_idx == 0 {
+            self.cumulative_base
+        } else {
+            self.live_cumulative()
+                .get(page_idx.saturating_sub(1))
+                .copied()
+                .unwrap_or(self.cumulative_base)
+        };
+        Some((
+            page_idx,
+            physical_idx
+                .saturating_add(self.cumulative_base)
+                .saturating_sub(page_start),
+        ))
+    }
+
+    /// Decode the page containing logical line `idx` and return OWNED lines
+    /// from `idx` through the end of that page — the bulk-walk primitive
+    /// (ST-6). One decode + one `split_off` per page: no per-line binary
+    /// search, no per-line `Line` clone, and NO touch of the render-path
+    /// page cache (a full-history walk must not evict the viewport's two
+    /// hot slots).
+    ///
+    /// Returns an empty vec for an out-of-bounds `idx`.
+    // Skip: the page lookup + decode path — same class as `get_line`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn take_lines_from(
+        &self,
+        idx: usize,
+    ) -> Result<Vec<Line>, super::ScrollbackError> {
+        if idx >= self.line_count {
+            return Ok(Vec::new());
+        }
+        // Saturating: bounded by the tier's line totals — exact on every
+        // real path (see get_line).
+        let physical_idx = idx.saturating_add(self.front_offset);
+        let Some((page_idx, line_in_page)) = self.locate(physical_idx) else {
+            return Err(super::ScrollbackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "in-range line index {idx} (physical {physical_idx}) has no backing cold page"
+                ),
+            )));
+        };
+        let Some(page) = self.pages.get(page_idx) else {
+            return Err(super::ScrollbackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("cold page index {page_idx} out of range"),
+            )));
+        };
+        let mut lines = page.decompress()?;
+        // `min` keeps split_off total; a short decode yields a short
+        // (possibly empty) segment, which the streaming iterator treats as
+        // end-of-data — fail-closed, never a panic.
+        let split_at = line_in_page.min(lines.len());
+        Ok(lines.split_off(split_at))
+    }
+
+    /// Logical lines from `idx` through the end of its containing page —
+    /// how far a bulk walk skips when that page fails to decode. Zero when
+    /// out of bounds. Never decodes.
+    // Skip: same guarded-index class as `locate`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn segment_len_at(&self, idx: usize) -> usize {
+        if idx >= self.line_count {
+            return 0;
+        }
+        let physical_idx = idx.saturating_add(self.front_offset);
+        let Some((page_idx, _)) = self.locate(physical_idx) else {
+            return 0;
+        };
+        // ABSOLUTE live entry minus the dropped-prefix base (ST-3): the
+        // physical end relative to the live front, exactly what the
+        // pre-ST-3 relative entry held.
+        let page_end = self
+            .live_cumulative()
+            .get(page_idx)
+            .copied()
+            .unwrap_or(self.cumulative_base)
+            .saturating_sub(self.cumulative_base);
+        // Physical page end -> logical, clamped by the tier's logical count
+        // (the last page's physical end IS the logical end), minus `idx`.
+        page_end
+            .saturating_sub(self.front_offset)
+            .min(self.line_count)
+            .saturating_sub(idx)
+    }
+
     /// Insert a decompressed page into the next round-robin cache slot.
     fn cache_page(&self, page_idx: usize, lines: Vec<Line>) {
         let mut cache = self.last_page_cache.borrow_mut();
@@ -283,6 +397,55 @@ impl ColdTier {
         self.cache_next.set(0);
     }
 
+    /// Live (non-dropped) region of the cumulative index. Total `get` keeps
+    /// it panic-free; `cum_start <= len` is a maintained invariant.
+    #[inline]
+    fn live_cumulative(&self) -> &[usize] {
+        self.cumulative_lines.get(self.cum_start..).unwrap_or(&[])
+    }
+
+    /// Drop the first `k` LIVE cumulative entries in O(k) amortized: advance
+    /// `cum_start` and `cumulative_base`, leaving every surviving value
+    /// untouched (they are absolute). The dead prefix is reclaimed by a
+    /// single memmove only once it outgrows the live half — amortized O(1)
+    /// per dropped entry, single-call bound O(live) word-moves — replacing
+    /// the old unconditional drain-and-rebase, which cost O(total pages) of
+    /// memmove PLUS rewrite on every drop reached from the push_line
+    /// rotation path. Clears everything (and resets the base) when no live
+    /// entry survives, so `empty => base == 0` holds for push_block.
+    // Skip: `Vec::drain` under its guard — the BLANKET-unmodeled drain class
+    // (guards don't chain). Same audit as `truncate_front_lines`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn drop_front_index_entries(&mut self, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let live_len = self.live_cumulative().len();
+        if k >= live_len {
+            self.cumulative_lines.clear();
+            self.cum_start = 0;
+            self.cumulative_base = 0;
+            return;
+        }
+        // New base = absolute value of the LAST dropped entry. `get` keeps
+        // the lookup total; the None arm is unreachable (1 <= k < live_len
+        // just established, and `cum_start + k - 1 < len` follows) and falls
+        // back to the current base — it cannot execute on any real path.
+        let last_dropped = self.cum_start.saturating_add(k).saturating_sub(1);
+        self.cumulative_base = self
+            .cumulative_lines
+            .get(last_dropped)
+            .copied()
+            .unwrap_or(self.cumulative_base);
+        self.cum_start = self.cum_start.saturating_add(k);
+        // Amortized reclamation of the dead prefix.
+        if self.cum_start > self.cumulative_lines.len().saturating_sub(self.cum_start) {
+            let dead = self.cum_start;
+            self.cumulative_lines.drain(..dead);
+            self.cum_start = 0;
+        }
+    }
+
     /// Find the page containing the given line index via binary search.
     fn find_page(&self, line_idx: usize) -> Option<usize> {
         // Plain `&mut usize` step counter (was a `fn()`/closure callback): the
@@ -296,14 +459,21 @@ impl ColdTier {
         // the strict L0 gate's `usize::MAX` counterexample (and a saturated
         // target of `usize::MAX` would still compare greater than every
         // cumulative entry, i.e. "not found", same as the unreachable wrap).
-        let target = line_idx.saturating_add(1);
-        let result = super::binary_search_counted(&self.cumulative_lines, target, &mut steps);
+        // ABSOLUTE target: stored entries are never rebased on front drops,
+        // so the dropped-prefix base is added to the query instead. The
+        // search runs over the LIVE suffix, whose indices are exactly the
+        // live page indices.
+        let target = line_idx
+            .saturating_add(self.cumulative_base)
+            .saturating_add(1);
+        let live = self.live_cumulative();
+        let result = super::binary_search_counted(live, target, &mut steps);
         #[cfg(test)]
         count_cold_find_page_steps(steps);
         match result {
             Ok(idx) => Some(idx),
             Err(idx) => {
-                if idx < self.cumulative_lines.len() {
+                if idx < live.len() {
                     Some(idx)
                 } else {
                     None
@@ -328,11 +498,9 @@ impl ColdTier {
         self.line_count = self.line_count.saturating_sub(logical_lines);
         self.front_offset = 0; // New front page starts fresh.
 
-        // Remove first cumulative entry and adjust remaining values.
-        self.cumulative_lines.remove(0);
-        for c in &mut self.cumulative_lines {
-            *c = c.saturating_sub(physical_lines);
-        }
+        // O(1) amortized index maintenance: cursor + base advance; surviving
+        // entries stay absolute and untouched (see drop_front_index_entries).
+        self.drop_front_index_entries(1);
 
         // Invalidate cache — page indices shifted.
         self.clear_cache();
@@ -377,18 +545,9 @@ impl ColdTier {
         self.line_count = self.line_count.saturating_sub(evicted_lines);
         self.front_offset = 0; // New front page starts fresh.
 
-        // Rebuild cumulative_lines: drop first k entries, adjust remainder.
-        if k >= self.cumulative_lines.len() {
-            self.cumulative_lines.clear();
-        } else {
-            // k >= 1 here: k == 0 returned early above, so saturating_sub
-            // never saturates and is behavior-identical to `k - 1`.
-            let offset = self.cumulative_lines[k.saturating_sub(1)];
-            self.cumulative_lines.drain(..k);
-            for c in &mut self.cumulative_lines {
-                *c = c.saturating_sub(offset);
-            }
-        }
+        // O(k) amortized index maintenance: cursor + base advance; surviving
+        // entries stay absolute and untouched (see drop_front_index_entries).
+        self.drop_front_index_entries(k);
 
         // Invalidate cache — page indices shifted.
         self.clear_cache();
@@ -500,31 +659,12 @@ impl ColdTier {
         }
 
         if pages_dropped > 0 {
-            // Rebuild cumulative index: drop first `pages_dropped` entries, adjust remainder.
-            //
-            // `get` + match instead of `self.cumulative_lines[pages_dropped - 1]`:
-            // `pages_dropped >= 1` (outer guard) and the `Some` arm additionally
-            // requires `pages_dropped < len`, i.e. exactly the old else-branch —
-            // identical behavior, with the bounds proof the gate needs carried
-            // by the lookup (the `None`/over-length arm folds into the same
-            // `clear()` the old `>=` branch performed).
-            // wrapping_sub: `pages_dropped >= 1` on every real path; a wrapped
-            // index lands in the `get`'s None arm — exactly the release-mode
-            // behavior of the old expression. Identical observable result.
-            match self
-                .cumulative_lines
-                .get(pages_dropped.wrapping_sub(1))
-                .copied()
-            {
-                Some(physical_offset) if pages_dropped < self.cumulative_lines.len() => {
-                    self.cumulative_lines.drain(..pages_dropped);
-                    for c in &mut self.cumulative_lines {
-                        *c = c.saturating_sub(physical_offset);
-                    }
-                }
-                _ => self.cumulative_lines.clear(),
-            }
-            // Invalidate cache — page indices shifted.
+            // O(pages_dropped) amortized: cursor + base advance; no surviving
+            // entry is drained or rebased (see drop_front_index_entries — the
+            // old path here cost O(total pages) memmove + rewrite per drop,
+            // on the line-limit enforcement path of every push).
+            self.drop_front_index_entries(pages_dropped);
+            // Invalidate cache — live page indices shifted.
             self.clear_cache();
         }
     }
@@ -540,6 +680,8 @@ impl ColdTier {
         self.pages.clear();
         self.line_count = 0;
         self.cumulative_lines.clear();
+        self.cum_start = 0;
+        self.cumulative_base = 0;
         self.clear_cache();
         self.bytes_used = 0;
         self.front_offset = 0;

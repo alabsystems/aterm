@@ -89,6 +89,15 @@ pub mod bench_support;
 mod bench_knobs;
 mod build_badge;
 mod build_info;
+
+/// The running build number, for the front door's headless update lane
+/// (`aterm update …` and the session-mode background check in `crates/aterm`).
+/// `build_info` stays private; this is the one fact the one-binary dispatcher
+/// needs, and it is exactly the value the window entry hands `aterm_update`.
+#[must_use]
+pub fn running_build_number() -> u64 {
+    build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0)
+}
 mod cast;
 mod chrome_band;
 mod cli;
@@ -1130,6 +1139,65 @@ fn paste_needs_confirm(text: &str, bracketed: bool) -> bool {
     body.contains('\n') || body.contains('\r')
 }
 
+/// PURE gate for [`fatal_launch_error`]'s dialog: raise one only when there is
+/// plausibly a human to reach and no terminal already carrying the message.
+/// Both denials are load-bearing — a modal under `--headless` wedges a CI
+/// harness forever, and a modal on top of a visible stderr line punishes
+/// exactly the launch mode that already works.
+fn launch_alert_wanted(headless: bool, stderr_is_tty: bool) -> bool {
+    !headless && !stderr_is_tty
+}
+
+#[cfg(test)]
+mod launch_alert_tests {
+    /// The full 2×2: only the Finder-launch quadrant (windowed, no tty) gets a
+    /// dialog. The headless row is what keeps CI from wedging on a modal; the
+    /// tty column is what keeps a terminal launch single-voiced.
+    #[test]
+    fn only_a_windowed_launch_with_no_tty_gets_a_dialog() {
+        assert!(super::launch_alert_wanted(false, false), "Finder launch");
+        assert!(!super::launch_alert_wanted(false, true), "terminal launch");
+        assert!(!super::launch_alert_wanted(true, false), "headless CI");
+        assert!(!super::launch_alert_wanted(true, true), "headless in a tty");
+    }
+}
+
+/// Report a fatal LAUNCH failure and exit(1) — reaching the human even when no
+/// terminal shows stderr.
+///
+/// A Finder/Dock launch wires stderr to nowhere a person looks: the icon
+/// bounces once, the process exits, and the one line explaining why is gone —
+/// the worst possible first impression, delivered on a channel this codebase
+/// itself documents as invisible. Every pre-window fatal therefore also raises
+/// a native alert, gated on there being a human to reach:
+///
+///   * not `--headless` — a CI harness must never block on a modal;
+///   * stderr is NOT a tty — a terminal launch already shows the message, and
+///     doubling it with a modal would punish the readable path.
+///
+/// [`menu::notify`] is the blocking one-button NSAlert (a no-op off macOS and
+/// off the main thread). The backend-build thread's font failure is the one
+/// caller off the main thread, so it falls through to `/usr/bin/osascript`,
+/// which raises the same system alert from any thread — that thread is about
+/// to take the whole process down and must report first.
+fn fatal_launch_error(headless: bool, detail: &str) -> ! {
+    eprintln!("aterm-gui: {detail}");
+    if launch_alert_wanted(headless, std::io::IsTerminal::is_terminal(&std::io::stderr())) {
+        menu::notify("aterm could not start", detail);
+        #[cfg(target_os = "macos")]
+        if objc2_foundation::MainThreadMarker::new().is_none() {
+            let quoted = detail.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = std::process::Command::new("/usr/bin/osascript")
+                .arg("-e")
+                .arg(format!(
+                    "display alert \"aterm could not start\" message \"{quoted}\" as critical"
+                ))
+                .status();
+        }
+    }
+    std::process::exit(1);
+}
+
 /// Windows twin of the NSAlert above: a Yes/No `MessageBoxW`, owned by the pasting
 /// window when its HWND is reachable (task-modal + foreground otherwise). Yes ==
 /// proceed, mirroring the macOS "Paste" button.
@@ -1415,6 +1483,12 @@ struct RepaintKey {
     /// grid is unchanged. Always `0` when the pill is invisible — then the key is
     /// byte-identical to the pre-pill path (idle invariant).
     pill_fp: u64,
+    /// IME composition fingerprint (text + caret). The composition is a host-side
+    /// overlay on the presented snapshot — the grid never sees it, so no damage
+    /// epoch ever advances for it; without this term the settled-screen early-out
+    /// (FL-1) would swallow both the frame that draws it and the frame that
+    /// erases it. `0` when no composition is active.
+    preedit_fp: u64,
     /// M1b sub-row scroll: the banked fractional-pixel residual presented this
     /// frame (the grid-band translate amount). A frac-only change dirties NO cell
     /// (`RenderInput`'s `scroll_frac_px` is excluded from content equality), so
@@ -1449,6 +1523,39 @@ struct RepaintKey {
     /// the early-out would keep compositing the stale card until the next
     /// interaction. Idle invariant holds: the bit only changes on a real flip.
     system_dark: bool,
+}
+
+
+/// Fingerprint of an IME composition for [`RepaintKey`]: FNV-1a over the text,
+/// XOR-folded with the caret. `0` for the empty composition by construction, so
+/// an idle key is byte-identical to the pre-preedit shape.
+fn preedit_fingerprint(preedit: &str, caret: Option<usize>) -> u64 {
+    if preedit.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in preedit.bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^ caret.map_or(u64::MAX, |c| c as u64)
+}
+
+#[cfg(test)]
+mod preedit_fingerprint_tests {
+    /// The idle key must be byte-identical to the pre-preedit shape (0), and
+    /// every dimension the overlay renders from — text AND caret — must move
+    /// the fingerprint, or the settled-screen early-out swallows that change.
+    #[test]
+    fn empty_is_zero_and_text_and_caret_both_move_it() {
+        assert_eq!(super::preedit_fingerprint("", None), 0);
+        assert_eq!(super::preedit_fingerprint("", Some(3)), 0, "no text, no overlay");
+        let a = super::preedit_fingerprint("日本", None);
+        let b = super::preedit_fingerprint("日本語", None);
+        let c = super::preedit_fingerprint("日本", Some(3));
+        assert_ne!(a, 0);
+        assert_ne!(a, b, "text moves the key");
+        assert_ne!(a, c, "the caret alone moves the key");
+    }
 }
 
 /// Process-wide ownership of one physical key hold. Winit may deliver key-up to
@@ -5266,6 +5373,29 @@ impl PresentRetry {
         };
     }
 
+    /// The outstanding recovery redraw was DELIVERED and SERVICED: a composed
+    /// present ([`App::redraw_compose`]) committed a full recomposed frame for
+    /// this window (FL-1). The flag's meaning is "the redraw we requested may
+    /// have been suppressed by the window system" — the moment a compose
+    /// actually runs and commits, that request has demonstrably arrived, so
+    /// keeping the flag armed buys no recovery; it only forces the NEXT compose
+    /// past the RepaintKey early-out too. On the windowed path this
+    /// acknowledgement is redundant by construction: the present that follows
+    /// the same compose resets the whole ledger on BOTH outcomes
+    /// (`on_presented` → default; `on_drop*`'s first write clears this same bit
+    /// while arming the bounded retry). On a compose-only consumer (the
+    /// frame-latency bench, headless captures — any caller that never reaches
+    /// an OS present) the flag previously had NO clearing edge at all: one tab
+    /// switch / split sync (`sync_window`'s
+    /// `rearm_present_and_request(.., true, ..)`) latched it forever and every
+    /// settled compose "presented" — the FL-1 permanent recompose train. Only
+    /// the delivery acknowledgement moves here; the retry budget, deadline, and
+    /// parked state stay untouched (a real drop after this compose still owns
+    /// them, exactly as before).
+    fn on_recovery_redraw_serviced(&mut self) {
+        self.recovery_redraw_outstanding = false;
+    }
+
     /// A real external stimulus (resize, scale/focus/expose, user input, tab
     /// switch, or explicit font/theme rebuild) replenishes the bounded recovery
     /// episode. PTY content and animation redraws do not call this, so a
@@ -5357,6 +5487,35 @@ fn rearm_present_and_request(
 /// column width, whether the staged-update `↻` is showing, which tab the pointer is
 /// on (the hover-only `✕`), and the SOLO band's description.
 type StripCacheKey = (u64, usize, bool, Option<usize>, Option<String>);
+
+/// LINUX INITIAL-FRAME SETTLE (armed per attach in [`App::attach_os_window`],
+/// consumed by [`App::settle_initial_frame`] on `WindowEvent::Resized`). The
+/// Wayland attach cannot trust its own sizing round: the size request lands
+/// BEFORE the surface is mapped, when the CSD frame does not exist yet and the
+/// real display scale is unknowable (`scale_factor()` is 1 until an output
+/// enters). Once mapped, a compositor configure echoing the pre-frame geometry
+/// gets the CSD header subtracted (GNOME: exactly the 35 px sctk-adwaita band,
+/// shrinking a 24-row launch to 21 rows), and a HiDPI output re-scales the font
+/// out from under the frame. This record holds the grid the attach INTENDED —
+/// `App.rows/cols` are already reflowed by the bogus resize when the correction
+/// runs, so they cannot be the source — plus a deadline and a correction budget
+/// that bound the settle: past either, whatever size the compositor insists on
+/// is the user's truth (tiling, an early maximize, a real drag).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug)]
+struct InitialFrameSettle {
+    rows: u16,
+    cols: u16,
+    deadline: Instant,
+    /// Corrective `request_inner_size` calls still allowed (>0). Multiple, not
+    /// one: a stale pre-correction geometry echo can arrive AFTER a first
+    /// correction already landed, and a scale change mid-settle re-derives the
+    /// target once more. Bounded so a compositor that insists always wins.
+    corrections: u8,
+    /// A correction was issued and a later `Resized` matched the intended
+    /// frame — the settle is DONE (disarm) rather than parked until deadline.
+    corrected: bool,
+}
 
 struct WindowState {
     os_window: Option<Arc<Window>>,
@@ -6021,6 +6180,11 @@ struct WindowState {
     /// settle-only design existed to prevent. Licensing on "no `Resized` for at
     /// least one throttle window" grants exactly one, when the hand stops.
     last_resized_event_at: Option<Instant>,
+    /// See [`InitialFrameSettle`]: `Some` only between an attach's size request
+    /// and the frame settling (or its deadline/budget expiring). Never armed on
+    /// a programmatic grid resize — those own their geometry and disarm it.
+    #[cfg(target_os = "linux")]
+    initial_frame_settle: Option<InitialFrameSettle>,
     /// A live window-drag tick resized ONLY this window's ACTIVE tab (perf: a big
     /// drag would otherwise reflow every hidden tab's scrollback per throttle tick,
     /// cost scaling with tab count though only one tab is visible). `true` means a
@@ -6329,8 +6493,20 @@ struct WindowState {
     /// composed (CJK input, dead keys), or empty when no composition is active.
     /// While non-empty, direct key sends are SUPPRESSED so composing keystrokes
     /// don't ALSO emit raw bytes; the committed text arrives via `Ime::Commit`.
-    /// A minimal inline indicator is rendered (see `preedit_indicator`).
+    /// Rendered INLINE at the cursor (`RenderInput::overlay_ime_preedit`),
+    /// underlined per the platform convention, with the title indicator kept as
+    /// the accessibility-visible echo.
     preedit: String,
+    /// The platform-reported caret START within `preedit` (byte offset), from
+    /// winit `Ime::Preedit`'s cursor range — where the cursor draws inside the
+    /// composition. `None` (platform gave no range) parks it after the last
+    /// composed cell.
+    preedit_caret: Option<usize>,
+    /// Whether the LAST presented frame drew the inline composition — the
+    /// stream-fade `fade_shown` pattern: the frame that ERASES a composition
+    /// mutates cells relative to the cached snapshot too, and must bump
+    /// `snapshot_seq` past the render cache exactly like the frame that drew it.
+    preedit_shown: bool,
     /// Last fully-resolved window-pixel IME caret rectangle `(x, y, w, h)` sent via
     /// `set_ime_cursor_area`. Cell identity alone is insufficient: mixed-DPI metrics,
     /// asymmetric top padding, or a compositor remainder can move/resize the same
@@ -7206,6 +7382,8 @@ impl WindowState {
             pending_resize: None,
             next_resize_settle: None,
             last_resized_event_at: None,
+            #[cfg(target_os = "linux")]
+            initial_frame_settle: None,
             panes_stale: false,
             win_px: None,
             last_present_at: None,
@@ -7255,6 +7433,8 @@ impl WindowState {
             last_present: None,
             pending_reveal: None,
             preedit: String::new(),
+            preedit_caret: None,
+            preedit_shown: false,
             last_ime_rect: None,
             search: None,
             find_bar_hit: None,
@@ -9868,6 +10048,11 @@ impl App {
     /// tab or split still owns a live terminal session. A stale/unknown `wid` is a
     /// silent no-op.
     fn sync_window(&mut self, wid: WindowId) {
+        // SELECTION CUSTODY: settle any in-flight pointer drag against the
+        // content that is STILL frontmost, before the switch below drops
+        // `selecting`/`gesture` and leaves a zombie `InProgress` selection.
+        // Suppressed like the blur settle: a tab switch is not a completed drag.
+        self.settle_selection_gesture(wid);
         self.refresh_active_split_presentation(wid);
         // Disjoint borrows: the target WindowState is a different field from `pool`,
         // so destructuring lets us write the mirror while reading the pool.
@@ -10941,6 +11126,15 @@ impl App {
         )
     )]
     fn on_focus(&mut self, wid: WindowId, focused: bool) {
+        // SELECTION CUSTODY: settle any in-flight pointer drag BEFORE the state
+        // below drops `selecting`/`gesture`. Dropping them without finishing left
+        // a zombie `InProgress` selection: painted, but refused by
+        // `extend_selection` and never copy-on-selected. `suppress_copy_on_select`
+        // is TRUE — losing the window is not the user completing a drag, so the
+        // clipboard and PRIMARY must not be written from it.
+        if !focused {
+            self.settle_selection_gesture(wid);
+        }
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.focused = focused;
             // PHOSPHOR drain-on-unfocus (design §5): report visibility to the
@@ -14520,6 +14714,22 @@ impl ApplicationHandler<Wake> for App {
                 // ledger so Settings ▸ Software Update headlines the same verdict.
                 let text = format!("{title}: {body} — see Settings ▸ Software Update");
                 self.surface_nonmodal_update_status(&text);
+                // THE OS NOTIFICATION the updater's contract promises (no_token.rs:
+                // "the only surface the owner sees without going looking"): the
+                // 5.4-second pill above is visible only if a window is frontmost at
+                // that exact moment, which is not a surface for "this Mac has not
+                // updated in weeks". The check thread latches this event once per
+                // process per class, so a short-lived delivery thread is cheap —
+                // and `notify::deliver` blocks on a notifier subprocess, which must
+                // never happen on the UI thread. No focus suppression on purpose:
+                // updater health belongs to no session/tab.
+                #[cfg(target_os = "macos")]
+                {
+                    let (title, body) = (title.clone(), body.clone());
+                    std::thread::spawn(move || {
+                        crate::notify::deliver(Some(&title), &body, false);
+                    });
+                }
                 self.request_native_update_reconcile(
                     crate::app_native::NativeUpdateReconcilePurpose::Refresh,
                 );
@@ -15027,11 +15237,11 @@ impl ApplicationHandler<Wake> for App {
             // IME-1: composition events. Without this arm winit's IME was dropped
             // by the catch-all, so CJK/dead-key/Option composition never worked.
             WindowEvent::Ime(ime) => match ime {
-                Ime::Preedit(text, _cursor) => self.on_ime_preedit(wid, text),
+                Ime::Preedit(text, cursor) => self.on_ime_preedit(wid, text, cursor),
                 Ime::Commit(text) => self.on_ime_commit(wid, text),
                 // Enabled/Disabled: clear any stale composition so suppression
                 // can't get stuck on (e.g. focus loss mid-composition).
-                Ime::Enabled | Ime::Disabled => self.on_ime_preedit(wid, String::new()),
+                Ime::Enabled | Ime::Disabled => self.on_ime_preedit(wid, String::new(), None),
             },
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(wid, position.x, position.y);
@@ -15162,6 +15372,11 @@ impl ApplicationHandler<Wake> for App {
                     // the queued redraw that covered this before.
                     window.request_redraw();
                 }
+                // LINUX INITIAL-FRAME SETTLE — AFTER the normal reflow above, so
+                // the (possibly bogus) compositor size is applied deterministically
+                // and the correction rides the same event path as any other resize.
+                #[cfg(target_os = "linux")]
+                self.settle_initial_frame(wid, size);
             }
             // HiDPI follow-through: the window moved to a display with a different
             // scale factor (or its display's scale changed). Re-derive the auto-scaled
@@ -15432,10 +15647,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // WHILE the extraction runs; a user watching gigabytes appear in
             // Activity Monitor with a silent app is the complaint this avoids.
             // (stderr stays discarded — atpkg records its own status.toml.)
-            // Whether the seed pass actually laid anything down — the first update
-            // tick is skipped when it did, so the toolchain is not re-fetched
-            // seconds after being installed.
-            let mut seed_installed_something = false;
+            //
+            // (There was a `seed_installed_something` flag here that suppressed the
+            // first update tick. It is gone: the update pass moves bytes only for
+            // programs whose pin actually drifted, so suppressing it delayed
+            // exactly the fetches that were needed. See the update loop below.)
             // HOLD OFF THE SELF-UPDATER for as long as this child reads the seal.
             // It extracts gigabytes out of THIS bundle by path, and an automatic
             // apply mid-extraction swaps the bundle for one whose seal was stripped
@@ -15480,9 +15696,6 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                                 saw_start = true;
                             } else {
                                 saw_marker = true;
-                            }
-                            if matches!(event, Wake::PkgSeed { .. } | Wake::PkgSeedPartial { .. }) {
-                                seed_installed_something = true;
                             }
                             let _ = proxy.send_event(event);
                         }
@@ -15541,16 +15754,29 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // is all this thread was asked to do.
                 return;
             }
-            // DO NOT re-fetch what the seed just installed. The loop body runs with
-            // no initial delay, so a successful seed pass was immediately followed by
-            // an `atpkg update` that re-downloaded every program whose published pin
-            // had moved since the cut — and the cut gate REQUIRES >=30 days of
-            // remaining shelf life, so a DMG a few weeks old is stale by
-            // construction. (This flag was previously set and never read: the skip
-            // was dead code and the double-fetch happened on every install.)
-            if seed_installed_something && interval > 0 {
-                std::thread::sleep(Duration::from_secs(interval));
-            }
+            // RUN THE FIRST UPDATE IMMEDIATELY, INCLUDING AFTER A SEED.
+            //
+            // This used to sleep a whole interval (default 6h) whenever the seed
+            // installed anything, to avoid "re-downloading every program whose
+            // published pin had moved since the cut". That reasoning inverted the
+            // cost and the benefit. `atpkg update` re-fetches ONLY what actually
+            // drifted — a program still on its sealed pin reports "up to date"
+            // and no bytes move — so the pins that "had moved" are precisely the
+            // ones that are STALE, and skipping them is not a saving, it is the
+            // defect.
+            //
+            // Its own premise proves the harm: the cut gate requires >=30 days of
+            // remaining shelf life, so a DMG IS stale by construction, and the
+            // sleep made that staleness the user's problem for the first six
+            // hours of a brand-new install. Measured on v0.44.0: the seal is
+            // index build 8, atpkg-index-9 published 70 minutes BEFORE the cut,
+            // and four of ten programs (ay, clean, ny, ty) landed behind. The
+            // staging default now takes the newest index, which shrinks that
+            // window but cannot close it — an index published after staging is
+            // always possible, and this pass is what answers it.
+            //
+            // Cost of being wrong in this direction is one index fetch (~1 KB)
+            // on a machine that just downloaded a gigabyte.
             loop {
                 // STREAM this child too. It was spawned with stdout discarded, which
                 // meant the NETWORK provisioning lane reached the user through no
@@ -16427,8 +16653,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         let build_cpu = || -> Renderer {
             Renderer::from_system_with_family(family_for_build.as_deref(), font_px, theme)
                 .unwrap_or_else(|| {
-                    eprintln!("aterm-gui: no system monospace font found (set $ATERM_FONT)");
-                    std::process::exit(1);
+                    // Off the main thread: fatal_launch_error's osascript leg.
+                    fatal_launch_error(
+                        headless,
+                        "no system monospace font found (set $ATERM_FONT)",
+                    )
                 })
         };
         let (mut backend, use_gpu) = if want_gpu {
@@ -16479,8 +16708,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         })
         .is_err()
     {
-        eprintln!("aterm-gui: backend-build thread stopped before font admission");
-        std::process::exit(1);
+        fatal_launch_error(headless, "backend-build thread stopped before font admission");
     }
     // Sparkle lexicon compilation and path-feed fingerprinting share only the
     // immutable launch config. Start them beside backend construction so their
@@ -16661,11 +16889,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 other,
                 aterm_containment::SpawnDecision::Deny { .. }
             ));
-            eprintln!(
-                "aterm-gui: containment mode {mode} denies spawning a shell (fail-closed); \
-                 refusing to start an unconfined child"
+            fatal_launch_error(
+                headless,
+                &format!(
+                    "containment mode {mode} denies spawning a shell (fail-closed); \
+                     refusing to start an unconfined child"
+                ),
             );
-            std::process::exit(1);
         }
     };
     // The process minting authority is created ONCE here, in the trusted
@@ -16689,13 +16919,15 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     let event_loop = match EventLoop::<Wake>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
-            eprintln!(
-                "aterm-gui: cannot open a display ({e}).\n\
-                 Is a graphical session running, with $DISPLAY (X11) or \
-                 $WAYLAND_DISPLAY (Wayland) set correctly?\n\
-                 For a windowless run use --headless."
+            fatal_launch_error(
+                headless,
+                &format!(
+                    "cannot open a display ({e}).\n\
+                     Is a graphical session running, with $DISPLAY (X11) or \
+                     $WAYLAND_DISPLAY (Wayland) set correctly?\n\
+                     For a windowless run use --headless."
+                ),
             );
-            std::process::exit(1);
         }
     };
     let proxy: EventLoopProxy<Wake> = event_loop.create_proxy();
@@ -16908,10 +17140,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         restore_cwd0.as_deref(),
         adopt0,
     )
-    .unwrap_or_else(|e| {
-        eprintln!("aterm-gui: spawn failed: {e}");
-        std::process::exit(1);
-    });
+    .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
     if adopting {
         eprintln!(
             "aterm-gui: SEAMLESS update — re-adopted the running shell (pid {}); no relaunch of the session",
@@ -18945,6 +19174,73 @@ mod multi_window_tests {
         App, CloseOutcome, GestureOrigin, SelectionType, WindowId, stub_session, term_lock,
     };
     use std::time::Instant;
+
+    /// SELECTION CUSTODY: a copy must read the terminal the gesture was addressed
+    /// to, not whichever window happens to be `frontmost_window`.
+    ///
+    /// The two diverge in ordinary use — `insert_logical_window` repoints
+    /// `frontmost_window` at logical-create time while OS keyboard focus can still
+    /// lag on the previous window — so a copy resolved through `frontmost_window`
+    /// reads a terminal the user was not looking at. That is why the hardcoded ⌘-C
+    /// arm and `dispatch_action`'s `Action::Copy` arm (which is `ctrl+shift+c` /
+    /// `ctrl+insert`, the PRIMARY copy chord off macOS) both route through
+    /// `copy_selection_in(wid)`.
+    ///
+    /// Deliberately asserts only the paths that resolve to "nothing to copy":
+    /// `pbcopy` writes the REAL system pasteboard with no test seam
+    /// (`clipboard.rs:36`), so a test that copied successfully would clobber the
+    /// developer's clipboard. `copy_selection_in` short-circuits on
+    /// `selection_to_string() == None` before reaching it, which is exactly the
+    /// window-scoping this pins.
+    #[test]
+    fn a_copy_resolves_the_routed_window_not_the_frontmost_one() {
+        use aterm_core::selection::SelectionSide;
+
+        let mut app = App::headless_for_test();
+        let wid_a = WindowId(0);
+
+        // Select in window A.
+        let term_a = app.front_terminal(wid_a).expect("terminal A").term.clone();
+        {
+            let mut t = term_lock(&term_a);
+            t.process(b"hello world\r\n");
+            let sel = t.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 4, SelectionSide::Right);
+            sel.complete_selection();
+            assert!(t.selection_to_string().is_some_and(|s| !s.is_empty()));
+        }
+
+        // A second window arrives and becomes frontmost — the divergence.
+        let sid = app.next_session_id;
+        let wid_b = app.insert_logical_window(stub_session(sid), 24, 80);
+        assert_eq!(wid_b, WindowId(1));
+        assert_eq!(
+            app.frontmost_window,
+            Some(wid_b),
+            "the new window is frontmost while A still holds the selection"
+        );
+
+        // The frontmost-window form now reads the WRONG terminal and finds nothing.
+        // This is the defect, reproduced: it is what `Action::Copy` used to do.
+        assert!(
+            !app.copy_selection(),
+            "the frontmost form resolves window B, which has no selection"
+        );
+        // Window-scoped and honest about it: asked for B, it reports B.
+        assert!(
+            !app.copy_selection_in(wid_b),
+            "copy_selection_in must resolve the window it was asked for"
+        );
+        // …while A's selection is still right there, which is what a copy routed by
+        // the originating `wid` would have found.
+        assert!(
+            term_lock(&term_a)
+                .selection_to_string()
+                .is_some_and(|s| !s.is_empty()),
+            "window A's selection survived and is what the routed copy reads"
+        );
+    }
 
     /// Projection shared by the `FocusModifierCache` refinement anchors and its
     /// Tier-1 runner. `fresh_ctrl` records that an authoritative Ctrl snapshot
@@ -22561,6 +22857,9 @@ mod early_out_tests {
             // No scroll pill in these unit frames (host-driven fade) — the invisible
             // sentinel keeps the key byte-identical to the pre-pill path.
             pill_fp: 0,
+            // No composition in these unit frames — the 0 sentinel keeps the
+            // key byte-identical to the pre-preedit shape.
+            preedit_fp: 0,
             // Whole-row in these unit frames (no sub-row scroll) — the frac-0 sentinel
             // keeps the key byte-identical to the pre-M1b path.
             scroll_frac_px: 0,
@@ -26701,6 +27000,24 @@ mod spec_xref_gate {
     /// `xtask harness-manifest` node (TRUST_VACUITY_GATE §2.1 / finding 1a) — the SAME
     /// generator the build-graph node uses, so the gate and the xtask resolve proof
     /// names against an identical manifest. Returns the path to the written JSON.
+    /// The lane flag the given cargo-like driver needs before `run`, learned by
+    /// ASKING it. Targo has exactly two lanes and `run` exists only in the
+    /// UNVERIFIED one — a bare `targo run` refuses outright, and (per its own
+    /// startup warning) the outer test invocation's `--unverified` does not
+    /// propagate to nested `$CARGO` children on this platform, so this child
+    /// must select its lane itself. Stock cargo has no such flag and gets none.
+    /// The manifest generator is test infrastructure, not a proof artifact, so
+    /// the unverified lane is the honest one for it.
+    fn cargo_lane_args(driver: &std::ffi::OsStr) -> &'static [&'static str] {
+        let is_targo = Command::new(driver)
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| {
+                out.status.success() && String::from_utf8_lossy(&out.stdout).contains("targo")
+            });
+        if is_targo { &["--unverified"] } else { &[] }
+    }
+
     fn harness_manifest() -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent() // crates/
@@ -26709,6 +27026,7 @@ mod spec_xref_gate {
             .to_path_buf();
         let status = Command::new("cargo")
             .current_dir(&root)
+            .args(cargo_lane_args(std::ffi::OsStr::new("cargo")))
             .arg("run")
             .arg("-q")
             .arg("-p")
@@ -26731,19 +27049,31 @@ mod spec_xref_gate {
                  config?) — retrying from a config-neutral cwd via env CARGO"
             );
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let lane = cargo_lane_args(&cargo);
             // Why: the neutral cwd also loses the repo's .cargo/config.toml rustflags
-            // (cargo config discovery is cwd-based, not manifest-based), so the retry
-            // would verify strictly and fail; forward the SAME temporary opt-out.
+            // (cargo config discovery is cwd-based, not manifest-based), so under a
+            // STOCK cargo the retry would verify strictly and fail; forward the SAME
+            // temporary opt-out there. Under TARGO the opt-out must NOT be forwarded:
+            // `--unverified` already selects the lane, and the hardcoded spelling
+            // here is exactly the flag-spelling skew AGENTS.md documents — the
+            // shipped trustc rejects `-Zno-trust-verify` with "unknown unstable
+            // option", cargo's target-info probe dies on it, and `-q` swallowed the
+            // one line saying so, leaving a silent exit 1 this comment now prevents.
             let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
-            if !rustflags.contains("-Zno-trust-verify") {
+            if lane.is_empty() && !rustflags.contains("-Zno-trust-verify") {
                 if !rustflags.is_empty() {
                     rustflags.push(' ');
                 }
                 rustflags.push_str("-Zno-trust-verify=yes");
             }
-            Command::new(cargo)
+            // CAPTURED, not inherited: this rung's failure used to panic with a
+            // bare "xtask harness-manifest failed" while the child's one line
+            // saying WHY scrolled past unattributed (or nowhere, under -q) —
+            // the same throw-away-the-reason shape run_spec_link already fixed.
+            let out = Command::new(&cargo)
                 .current_dir(std::env::temp_dir())
                 .env("RUSTFLAGS", rustflags)
+                .args(lane)
                 .arg("run")
                 .arg("-q")
                 .arg("--manifest-path")
@@ -26752,8 +27082,32 @@ mod spec_xref_gate {
                 .arg("xtask")
                 .arg("--")
                 .arg("harness-manifest")
-                .status()
-                .expect("run `cargo run -p xtask -- harness-manifest` (neutral cwd)")
+                .output()
+                .expect("run `cargo run -p xtask -- harness-manifest` (neutral cwd)");
+            if !out.status.success() {
+                // The lane/toolchain env is what decides this spawn's fate (the
+                // silent-exit diagnosis above was made from exactly this dump),
+                // so quote it — minus the CARGO_PKG_* metadata spam, which never
+                // steers anything.
+                let markers: Vec<String> = std::env::vars()
+                    .filter(|(k, _)| {
+                        (k.starts_with("TARGO") || k.starts_with("TRUST") || k.starts_with("CARGO"))
+                            && !k.contains("_PKG_")
+                            || k == "RUSTFLAGS"
+                    })
+                    .map(|(k, v)| format!("  {k}={v}"))
+                    .collect();
+                panic!(
+                    "xtask harness-manifest failed on BOTH rungs (in-tree cargo, then env \
+                     CARGO {cargo:?} from a neutral cwd, exit {:?}). Retry-rung \
+                     stderr:\n{}\nstdout:\n{}\nenv markers:\n{}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr),
+                    String::from_utf8_lossy(&out.stdout),
+                    markers.join("\n")
+                );
+            }
+            out.status
         };
         assert!(status.success(), "xtask harness-manifest failed");
         let path = root
@@ -30520,5 +30874,53 @@ mod visible_content_route_tests {
             vec![wid]
         );
         assert!(app.is_visible_session(hidden));
+    }
+}
+
+/// Locate and exec the release tool for `aterm ship …`.
+///
+/// `aterm-release` is deliberately NOT in the app bundle — it is a publishing tool, not
+/// something every user should carry — so this resolves it from the repository a publishing
+/// machine already has, in a fixed order, and says plainly when the machine simply is not
+/// set up to publish. It never invokes a build tool: the whole point of the verb is that the
+/// operator does not have to know one is involved, let alone answer its questions.
+pub fn run_ship(rest: &[String]) -> i32 {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    // Beside this binary first: a publishing machine that has installed the tool wins over
+    // any repo that merely happens to be the working directory.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("aterm-release"));
+    }
+    // Then the repo, walking up from the cwd so it works from any subdirectory.
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            if dir.join("Cargo.toml").is_file() {
+                candidates.push(dir.join("target/release/aterm-release"));
+                candidates.push(dir.join("target/debug/aterm-release"));
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    let Some(tool) = candidates.into_iter().find(|p| p.is_file()) else {
+        eprintln!("aterm ship: this machine is not set up to publish aterm.");
+        eprintln!(
+            "aterm ship:   the release tool (`aterm-release`) ships with the SOURCE, not the \
+             app — it is not something every install carries."
+        );
+        eprintln!(
+            "aterm ship:   from a checkout, build it once:  cargo build --release -p aterm-release"
+        );
+        return 1;
+    };
+    match std::process::Command::new(&tool).args(rest).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("aterm ship: could not run {}: {e}", tool.display());
+            1
+        }
     }
 }

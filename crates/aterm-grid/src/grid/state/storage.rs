@@ -110,6 +110,21 @@ pub struct GridStorage {
     /// re-checked on re-attach: if it advanced, the reflowed (pre-erase) store is
     /// dropped rather than resurrecting history the user explicitly cleared.
     pub(crate) scrollback_clear_gen: u64,
+    /// Monotonic generation bumped whenever retained HISTORY rows are
+    /// RENUMBERED in the absolute-row space with no
+    /// [`AbsoluteRowUpdate`](crate::AbsoluteRowUpdate) emitted — today exactly
+    /// the Kitty CSI +T unscroll path (`unscroll_from_scrollback`), which
+    /// removes the NEWEST scrollback lines: every OLDER retained history row
+    /// keeps its line but its `oldest_absolute_row() + i` key shifts by the
+    /// removed count, while `absolute_row_counter`, `base_y()` and the
+    /// protected-footer revision all stay put. Ordinary retention eviction
+    /// drops the OLDEST lines and preserves every survivor's absolute key, so
+    /// it deliberately does NOT bump this. Consumers that incrementally
+    /// maintain absolute-row-keyed caches over history (the terminal's cached
+    /// search index) treat any advance as "history renumbered: rebuild" —
+    /// closing the one retained-window mutation that is invisible to the
+    /// `(content_gen, absolute_row_revision, geometry)` key set.
+    pub(crate) history_renumber_epoch: u64,
     /// Preserved extras for ring buffer scrollback rows.
     ///
     /// When rows scroll from the visible area into ring buffer scrollback,
@@ -201,6 +216,7 @@ impl GridStorage {
             flood_truncated_lines: 0,
             ring_byte_watermark: None,
             scrollback_clear_gen: 0,
+            history_renumber_epoch: 0,
             ring_extras: VecDeque::new(),
             generations: GenerationTracker::new(),
             absolute_row_counter: u64::from(visible_rows),

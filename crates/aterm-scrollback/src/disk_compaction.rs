@@ -56,14 +56,20 @@ impl DiskColdTier {
         tmp.write_all(&header)?;
 
         let mut new_offset = HEADER_SIZE as u64;
-        let mut new_index = Vec::with_capacity(self.index.len());
+        // LIVE entries only: dead-prefix entries describe already-dropped
+        // pages and must not be resurrected into the compacted file. Direct
+        // field slicing (not the live_index() method) keeps the borrow
+        // disjoint from the `self.file` mutable borrow below.
+        let live_from = self.front_dropped;
+        let live_entries = self.index.get(live_from..).unwrap_or(&[]);
+        let mut new_index = Vec::with_capacity(live_entries.len());
         let trim_front = self.front_offset;
         let file = self
             .file
             .as_mut()
             .expect("invariant: file exists after is_some guard");
 
-        for (i, entry) in self.index.iter().enumerate() {
+        for (i, entry) in live_entries.iter().enumerate() {
             let (idx_entry, size) = if i == 0 && trim_front > 0 {
                 Self::compact_page_trimmed(file, entry, trim_front, new_offset, &mut tmp)?
             } else {
@@ -180,6 +186,10 @@ impl DiskColdTier {
         // failed, self.file stays None (closed pre-rename) and reads fail closed
         // ("no memory map available") rather than serving old offsets.
         self.index = new_index;
+        // Fresh, all-live index: reset the front-drop cursor and absolute
+        // base along with the zero-based cumulative rebuild below.
+        self.front_dropped = 0;
+        self.cumulative_base = 0;
         self.write_offset = new_offset;
 
         if had_front_trim {
@@ -197,6 +207,9 @@ impl DiskColdTier {
 
         self.clear_page_cache();
         self.reset_bytes_used();
+        // The compacted file carries freshly written, synced header counters
+        // (write_compact_header): settle any deferred-append debt.
+        self.mark_appends_synced();
 
         let file = opened?;
         // Map LAST, and treat a mapping failure as NON-fatal: file/index/path are
@@ -216,6 +229,8 @@ impl DiskColdTier {
     pub fn clear(&mut self) -> io::Result<()> {
         self.index.clear();
         self.cumulative_lines.clear();
+        self.front_dropped = 0;
+        self.cumulative_base = 0;
         self.line_count = 0;
         self.front_offset = 0;
         self.clear_page_cache();
@@ -234,6 +249,9 @@ impl DiskColdTier {
             file.write_all(&0u64.to_le_bytes())?; // line_count
             file.sync_data()?;
         }
+        // Header written + synced above: settle any deferred-append debt
+        // (see disk_write.rs).
+        self.mark_appends_synced();
 
         self.reset_bytes_used();
 
@@ -243,6 +261,9 @@ impl DiskColdTier {
     /// Sync changes to disk.
     #[cfg(test)]
     pub fn sync(&mut self) -> io::Result<()> {
+        // Catch the deferred append header up first so an explicit sync()
+        // leaves the on-disk header consistent with the in-memory index.
+        self.sync_appends()?;
         if let Some(ref mmap) = self.mmap {
             mmap.flush()?;
         }

@@ -1407,17 +1407,43 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
     });
     let mut t = term_lock(term);
     t.authorize_clipboard_access(ClipboardAccess::Write);
-    t.set_clipboard_callback(move |op| {
-        match op {
-            ClipboardOperation::Set { content, .. } => {
-                let _ = clip_tx.send(content);
-            }
-            ClipboardOperation::Clear { .. } => {
-                let _ = clip_tx.send(String::new());
-            }
-            ClipboardOperation::Query { .. } => {}
+    t.set_clipboard_callback(move |op| match op {
+        ClipboardOperation::Set { content, .. } => {
+            let _ = clip_tx.send(content);
+            None
         }
-        None
+        ClipboardOperation::Clear { .. } => {
+            let _ = clip_tx.send(String::new());
+            None
+        }
+        // The engine reaches this arm ONLY through a minted
+        // ClipboardQueryCapability: `allow_osc52_query = true` (default FALSE)
+        // or an installed policy rule decided ALLOW, and the response still
+        // rides the response-capability/rate/budget gates. This arm returning
+        // `None` was the last inch nobody wrote: the knob existed, was
+        // documented, threaded into the engine, authorized the mint — and the
+        // authorized query then answered NOTHING, so `allow_osc52_query = true`
+        // was a false promise and every OSC 52 reader (remote vim/tmux
+        // clipboard sync) hung exactly as if the knob did not exist.
+        //
+        // An AUTHORIZED query always gets an ANSWER: an empty clipboard maps
+        // to an empty reply (a valid "clipboard is empty" response), never to
+        // silence — silence is indistinguishable from denial, and the host
+        // already decided this session is allowed to know.
+        ClipboardOperation::Query { .. } => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                Some(crate::control::pbpaste().unwrap_or_default())
+            }
+            #[cfg(target_os = "linux")]
+            {
+                // X11: only the non-blocking own-selection read — a foreign
+                // owner means a blocking round-trip inside the terminal lock,
+                // which is worse than no answer. Partial by design; the
+                // blocking-read offload is the Linux daily-driver lane's work.
+                crate::control::pbpaste_owned()
+            }
+        }
     });
 }
 

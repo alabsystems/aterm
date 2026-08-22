@@ -372,18 +372,39 @@ fn await_then_install(
     dir: &Path,
     invalid: usize,
 ) -> Outcome {
-    let blocked = |why: String| Outcome::Blocked {
-        what: format!("could not look for the issued certificate: {why}"),
-        fix: format!(
-            "put the downloaded .cer somewhere readable ({}) and re-run",
-            dir.display()
-        ),
-    };
-    let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
-        what: waiting_text(id, invalid, rejected),
-        // Printed in full below, once, before the wait — so the verdict after a timeout
-        // points at it instead of repeating all eighty words.
-        next: format!("upload {} at developer.apple.com — see above", csr.display()),
+    // Two causes, two remedies, and they are NOT interchangeable. `find_matching_cert`
+    // fails either because a directory it must read is unreadable, or because this
+    // machine's OWN request key could not be read — and the second is not a certificate
+    // problem at all. One shared remedy ("put the .cer somewhere readable") sent the
+    // second operator to go move a certificate file, in a loop, past a private key that
+    // may be corrupt and whose slot may already be spent. Split them.
+    let blocked = |why: String| {
+        let about_our_key = why.contains("could not read the public half");
+        if about_our_key {
+            Outcome::Blocked {
+                what: format!(
+                    "this machine's own certificate request key cannot be read, so nothing \
+                     can be matched against it: {why}",
+                    ),
+                fix: format!(
+                    "prove it first: openssl rsa -in {} -noout -check\n\
+                     if that fails the key is damaged. A NEW request costs another of team \
+                     {}'s five permanent Developer ID slots, so recover the file before \
+                     minting one — from a backup of ~/.aterm/apple, or from the machine \
+                     that made it.",
+                    key.display(),
+                    pins::APPLE_TEAM_ID
+                ),
+            }
+        } else {
+            Outcome::Blocked {
+                what: format!("could not look for the issued certificate: {why}"),
+                fix: format!(
+                    "make the directory readable, then re-run: ls -ld {}",
+                    dir.display()
+                ),
+            }
+        }
     };
     let rejected = match find_matching_cert(key) {
         Ok((Some(cer), _)) => return install(&cer, key, id),
@@ -395,8 +416,15 @@ fn await_then_install(
     // nothing is the one thing worse than saying it twice.
     if !has_terminal() {
         return Outcome::Waiting {
-            what: waiting_text(id, invalid, &rejected),
-            next: errand(csr),
+            what: waiting_text(id, invalid, &rejected, None),
+            // The SAME errand, from the SAME function, minus the paragraph about a wait
+            // that does not happen here. There used to be a second, hand-maintained
+            // paragraph for this path, and the two had already drifted: the paragraph
+            // said the Account Holder rule is about CREATING a certificate and that the
+            // download is matched by public key; the numbered form had truncated the
+            // first into an ambiguity and dropped the second entirely. Two spellings of
+            // one fact is how a tool tells an operator two different things.
+            next: errand_lines(csr, false).join("\n"),
         };
     }
     // Said BEFORE the errand and before the wait, because it is the difference between
@@ -406,20 +434,45 @@ fn await_then_install(
     //
     // The errand opens with `upload {csr}`, so it IS the "request ready" line: printing
     // that path on a line of its own first said the same thing one line earlier.
-    let mut label = APPLE_LABEL;
-    if let Some(note) = rejected_note(&rejected) {
-        step(label, &note);
-        label = "";
-    }
     // Surface the request in ~/Downloads and reveal it in Finder before the errand
     // names it: the operator's next act is an upload dialog, and a path under hidden
     // ~/.aterm is invisible to one. The errand then names the copy the dialog can see.
+    // Done BEFORE the refusal note too, so that note can name the visible copy as the
+    // thing to upload — a note that points at hidden ~/.aterm cannot be acted on.
     let visible = surface_csr(csr, id);
-    step(label, &errand(visible.as_deref().unwrap_or(csr)));
-    step(
-        "",
-        "waiting for the certificate to appear… (Ctrl-C is safe — re-running resumes here)",
-    );
+    let upload = visible.as_deref().unwrap_or(csr);
+    // Built HERE, not at the top of the function, and that is the whole fix: it captures
+    // `upload` — the copy in ~/Downloads that an upload dialog can actually see — rather
+    // than `csr` under hidden ~/.aterm, which this module's own comment above says
+    // "cannot be acted on". The timeout verdict is the last line on the screen when the
+    // command exits, so it is the one place a path has to be one the operator can use.
+    let waiting = |rejected: &[PathBuf]| Outcome::Waiting {
+        what: waiting_text(id, invalid, rejected, Some(upload)),
+        next: format!(
+            "upload {} at https://developer.apple.com/account/resources/certificates and \
+             download the certificate THAT produces.\n\
+             do NOT create a second certificate — that spends another of team {}'s five \
+             permanent Developer ID Application slots, and it will not help: a second \
+             certificate made from a second request has a second key, and this machine \
+             only matches the request above.",
+            upload.display(),
+            pins::APPLE_TEAM_ID
+        ),
+    };
+    let mut label = APPLE_LABEL;
+    if let Some(note) = rejected_note(&rejected, Some(upload)) {
+        step(label, &note);
+        label = "";
+    }
+    // Nothing is printed after this loop. The errand ends with the trap, and the trap
+    // has to be the last thing on the screen: it used to be followed by "waiting for the
+    // certificate to appear…", which is exactly the sentence that reads as permission to
+    // go to the portal and take whatever is already in the list. The wait's own facts now
+    // live INSIDE the errand, above the trap, where they belong.
+    for line in errand_lines(upload, true) {
+        step(label, &line);
+        label = "";
+    }
     let started = std::time::Instant::now();
     let mut announced = 0u64;
     let mut rejected = rejected;
@@ -433,15 +486,54 @@ fn await_then_install(
             Err(why) => return blocked(why),
             // Kept current, so the verdict after a 30-minute wait names whatever is on
             // disk NOW — a .cer downloaded during the wait is the likeliest of all.
-            Ok((None, seen)) => rejected = seen,
+            //
+            // And SAID, the moment it appears. Keeping it silently was the whole bug:
+            // the note above is printed once, BEFORE the wait, so it can only describe
+            // files that were already on disk. The overwhelmingly common case is the
+            // operator downloading a .cer DURING the wait — and if that file is the
+            // wrong one (an existing certificate from the portal's list rather than one
+            // issued for THIS request), every subsequent heartbeat said "still waiting"
+            // while meaning "the file you just downloaded is not this one". That is
+            // precisely the confusion the comment above this loop says must never
+            // happen, and it ends exactly as predicted: the operator concludes the tool
+            // is stuck and spends a second slot to fix a download.
+            Ok((None, seen)) => {
+                let fresh: Vec<PathBuf> = seen
+                    .iter()
+                    .filter(|p| !rejected.contains(p))
+                    .cloned()
+                    .collect();
+                if let Some(note) = rejected_note(&fresh, Some(upload)) {
+                    // A header, because this arrives in the middle of a wait whose last
+                    // line said "watching ~/Downloads". Without an opening that names the
+                    // verdict, a note beginning "examined, not this request's" reads as
+                    // progress — the tool looking at files — rather than as a refusal of
+                    // the file the operator downloaded four seconds ago.
+                    step(APPLE_LABEL, "⚠ THE .cer THAT JUST ARRIVED IS NOT THIS REQUEST'S");
+                    step("", &note);
+                }
+                rejected = seen;
+            }
         }
-        // A quiet heartbeat, so a long wait never looks like a hang.
+        // A quiet heartbeat, so a long wait never looks like a hang — and it names its
+        // HORIZON, because "3 min" alone answers the wrong question. The operator who
+        // steps away to complete a 2FA sign-in comes back to a scrolled terminal and
+        // needs to know whether this is still running, not how long ago it started.
         let mins = started.elapsed().as_secs() / 60;
         if mins > announced {
             announced = mins;
-            step("", &format!("still waiting… ({mins} min)"));
+            let of = WAIT_FOR_CERT.as_secs() / 60;
+            step("", &format!("still waiting for the .cer… {mins} min of {of}"));
         }
     }
+    // Said out loud rather than left implied by a verdict that could equally be a crash.
+    step(
+        APPLE_LABEL,
+        &format!(
+            "{} min elapsed — stopping the wait. Nothing was lost and nothing was spent.",
+            WAIT_FOR_CERT.as_secs() / 60
+        ),
+    );
     waiting(&rejected)
 }
 
@@ -712,9 +804,19 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-fn waiting_text(id: &str, invalid: usize, rejected: &[PathBuf]) -> String {
+/// The verdict when no certificate has arrived.
+///
+/// `csr` is `Some` wherever a request has been SURFACED to a path the operator can act
+/// on, and it selects the strong half of [`rejected_note`]: "this is not a download
+/// problem: upload <path>". Passing `None` there — which the timeout used to do — chose
+/// the weak half, "if the browser saved the .cer elsewhere, move it into ~/Downloads",
+/// which tells the operator their file is fine and merely misplaced. That reading is
+/// precisely what sends them back to the portal to create a second certificate. The
+/// non-interactive path keeps `None` on purpose: nothing has been surfaced there, so the
+/// search-location fact is the true one.
+fn waiting_text(id: &str, invalid: usize, rejected: &[PathBuf], csr: Option<&Path>) -> String {
     let mut s = format!("a certificate request for '{id}' is out for signature and no matching certificate has arrived yet");
-    if let Some(note) = rejected_note(rejected) {
+    if let Some(note) = rejected_note(rejected, csr) {
         s.push_str("; ");
         s.push_str(&note);
     }
@@ -749,45 +851,77 @@ fn tty_line(prompt: &str, max: usize) -> Result<String, String> {
     tty.flush().ok();
     let mut line = String::new();
     let mut byte = [0u8; 1];
+    // ALWAYS drain to the newline. `max` bounds what is KEPT, never where reading stops —
+    // breaking out early leaves the tail of the answer in the terminal queue, which is
+    // the exact defect this function's doc comment forbids one line up. It was reachable:
+    // the slot prompt reads with `max = 16`, so "yes please, go ahead" truncated, failed
+    // `== "y"`, silently returned "no", and left `, go ahead` sitting in the queue for the
+    // next `/dev/tty` read — which on this path is the ECHO-OFF 52-character master
+    // phrase, where the operator cannot see that their phrase began with someone else's
+    // words, and the only symptom is a fingerprint mismatch they cannot explain.
     loop {
         match tty.read(&mut byte) {
             Ok(0) => break,
             Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0] as char),
+            Ok(_) => {
+                if line.len() < max {
+                    line.push(byte[0] as char);
+                }
+            }
             Err(e) => return Err(format!("cannot read from /dev/tty: {e}")),
-        }
-        if line.len() >= max {
-            break;
         }
     }
     Ok(line.trim().to_string())
 }
 
-/// The one irreversible question, asked in the audit's own two-column layout: `publish::step`
-/// prints `"  {label:<11}{msg}"`, so the label is [`APPLE_LABEL`] — the name every other line
-/// about this certificate carries — and continuations are indented to the same 13th column.
-/// A prompt that arrives under a different label and a different gutter reads as a different
-/// subject, which is not what a permanent choice should look like.
+/// The one irreversible question, asked in the audit's own layout.
+///
+/// It goes through [`crate::publish::grid_block`] — the same primitive every line above it
+/// is printed by — so the label is [`APPLE_LABEL`], the name every other line about this
+/// certificate carries, and the continuations land in the same column. A question that
+/// arrives under a different gutter reads as a different subject, which is not what a
+/// permanent choice should look like. This used to count its own thirteen spaces by hand.
+///
+/// # Both answers state their cost
+///
+/// `y` spends one of five slots forever. `N` costs nothing, and SAYING so is not padding:
+/// an operator who cannot tell whether declining aborts the whole provisioning run will
+/// take the irreversible path rather than lose twenty minutes of work. The tool knows the
+/// answer — nothing else in this phase spends anything, and the question comes back on
+/// the next run — so it says it.
 fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
-    let gutter = " ".repeat(13);
-    let mut prompt = format!(
-        "\n  {APPLE_LABEL:<11}generating a CSR for '{id}' spends one of team {}'s five Developer\n\
-         {gutter}ID Application slots, permanently. Revoking one later stops every app\n\
-         {gutter}it already signed from launching.",
+    let mut msg = format!(
+        "generating a CSR for '{id}' spends one of team {}'s five Developer ID Application \
+         slots, permanently. Revoking one later stops every app it already signed from \
+         launching.",
         pins::APPLE_TEAM_ID
     );
     if invalid > 0 {
-        prompt.push_str(&format!(
-            "\n{gutter}NOTE: this keychain already holds {invalid} Developer ID certificate{}\n\
-             {gutter}for this team that {} not valid (expired, or missing their private\n\
-             {gutter}key). Those slots are already spent.",
+        msg.push_str(&format!(
+            "\nNOTE: this keychain already holds {invalid} Developer ID certificate{} for \
+             this team that {} not valid (expired, or missing their private key). Those \
+             slots are already spent.",
             plural(invalid),
             if invalid == 1 { "is" } else { "are" },
         ));
     }
-    prompt.push_str(&format!("\n{gutter}Continue? [y/N] "));
-    let answer = tty_line(&prompt, 16)?.to_ascii_lowercase();
-    Ok(answer == "y" || answer == "yes")
+    msg.push_str(
+        "\nN is safe: the rest of the audit still runs, nothing else here spends anything, \
+         and this question comes back on the next run.\nContinue? [y/N] ",
+    );
+    let prompt = format!("\n{}", crate::publish::grid_block(APPLE_LABEL, &msg));
+    let answer = tty_line(&prompt, 64)?.to_ascii_lowercase();
+    let yes = answer == "y" || answer == "yes";
+    // A silent "no" for an answer that plainly MEANT yes is a twenty-minute detour: the
+    // run continues, the certificate step reports itself unfinished, and nothing on the
+    // screen connects that to the word the operator typed.
+    if !yes && !answer.is_empty() && answer != "n" && answer != "no" {
+        step(
+            APPLE_LABEL,
+            &format!("'{answer}' is not 'y' — taking that as no; no slot spent"),
+        );
+    }
+    Ok(yes)
 }
 
 /// The keychain profile name the notarytool credential is stored under — the SAME on
@@ -825,15 +959,38 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     // credential in this ceremony that exists nowhere until the operator MINTS it —
     // and an ordinary Apple ID password pasted there fails only after a round-trip
     // to Apple, twenty words into the errand this line replaces.
+    // Structurally the same hazard as the certificate errand, and the same shape fixes
+    // it: a browser errand printed as a paragraph immediately above a blocking prompt.
+    // The failure here is worse in one way — the operator pastes their Apple ID PASSWORD,
+    // which fails only after a round trip to Apple — and better in another: nothing
+    // permanent is spent. Numbered, with the shown-once fact hoisted to where it is read
+    // BEFORE the browser tab is closed.
     step(
         "notary",
-        "the password asked for below is an APP-SPECIFIC password, not your Apple ID \
-         password — mint one at https://account.apple.com → Sign-In and Security → \
-         App-Specific Passwords → + (2FA required; the xxxx-xxxx-xxxx-xxxx string is \
-         shown exactly once), then paste it at the prompt",
+        "the password this step asks for is an APP-SPECIFIC password, NOT your Apple ID \
+         password. Mint one first — Apple shows it once:\n\
+         1. https://account.apple.com → Sign-In and Security\n\
+         2. App-Specific Passwords → +   (2FA required)\n\
+         3. copy the xxxx-xxxx-xxxx-xxxx string\n\
+         then paste it at the password prompt below.",
     );
+    // Through the grid, like every other line: this used to be a hand-counted
+    // `"\n  notary   "` — column 11 against a column-13 grid — printed directly under a
+    // `notary` step line, so the one prompt and the line explaining it did not align.
+    //
+    // And "blank to skip" names its CONSEQUENCE. A blank answer returns `Waiting`, which
+    // is a `Check::Todo`, which defers the mint — so on a first run "skip" does not skip
+    // an optional extra, it mints no roster id at all. "Skip" is the vocabulary of
+    // something you can come back to; this is not that until the machine is minted.
     let apple_id = match tty_line(
-        "\n  notary   Apple ID for notarization (blank to skip): ",
+        &format!(
+            "\n{}",
+            crate::publish::grid_block(
+                "notary",
+                "Apple ID for notarization\n(blank skips it — but a cut is refused without \
+                 notarization, and on a first run no roster id is minted either): "
+            )
+        ),
         128,
     ) {
         Ok(v) => v,
@@ -979,25 +1136,126 @@ fn write_csr(key: &Path, csr: &Path) -> Result<PathBuf, String> {
     Ok(csr.to_path_buf())
 }
 
-/// The one unavoidable human step, written out so nobody has to guess the click path.
+/// The one unavoidable human step, one instruction per line — and the ONLY spelling of
+/// it anywhere in the crate.
 ///
-/// It does NOT end in "then re-run the same command". On the interactive path it is
-/// printed immediately above "waiting for the certificate to appear…", so the errand was
-/// telling the operator to re-run a command that was at that moment sitting in a wait
-/// loop; and on the non-interactive path `provision`'s own summary line already ends with
-/// `re-run cargo ship provision --id <id>`. What survives is the only part they cannot
-/// derive: where the download has to land.
-fn errand(csr: &Path) -> String {
-    format!(
-        "upload {} at https://developer.apple.com/account/resources/certificates (sign in \
-         as the Account Holder — Apple permits nobody else to create a Developer ID \
-         certificate) → + → Software → 'Developer ID Application' → Profile Type 'G2 \
-         Sub-CA' (NOT 'Previous Sub-CA': its intermediate expires 2027-02-01) → upload \
-         the request → Download into ~/Downloads, where it is matched by public key. If \
-         the list ALREADY has a certificate for this request, download that one — \
-         creating a second spends a second slot.",
-        csr.display()
-    )
+/// # Why it is numbered lines and not a paragraph
+///
+/// It was one five-sentence paragraph, and the paragraph failed in the field exactly the
+/// way a paragraph does: the operator skimmed it, went to the portal, saw a Developer ID
+/// certificate already in the list, and downloaded THAT — a certificate issued days
+/// earlier from a different request, holding a different key, whose private half was on
+/// another machine entirely. The tool then refused it in silence while the heartbeat said
+/// "still waiting", and the operator reasonably concluded the tool had hung. One of team
+/// A66A9P66Z7's five PERMANENT Developer ID slots was spent to fix a download.
+///
+/// Two sentences of that paragraph would have prevented it. Neither was reachable by
+/// skimming, because both sat mid-paragraph among three others. So: numbered lines, the
+/// upload target on a line of its own, and the trap stated LAST — the position a reader's
+/// eye actually lands on.
+///
+/// # Why there is no second spelling
+///
+/// There used to be a `errand()` paragraph beside this list for the non-interactive path,
+/// and within one revision the two disagreed: the paragraph said the Account Holder rule
+/// is specifically about CREATING a Developer ID certificate (it is — a delegate can sign
+/// in and see the list, which is why "nobody else" alone stops a legitimate role account
+/// for the wrong reason), and that the download is matched by PUBLIC KEY (which is the
+/// mechanism that makes the trap below credible rather than a rule to be argued with).
+/// The list had truncated the first and dropped the second. Both are restored here, and
+/// the other path now joins these same lines.
+///
+/// `waiting` is the one thing that legitimately differs between the two callers: only the
+/// interactive path then sits in a loop, so only it may promise one.
+pub(crate) fn errand_lines(csr: &Path, waiting: bool) -> Vec<String> {
+    let mut out = vec![
+        // The FILE first, on its own line, because "which file" is what the paragraph
+        // form lost. It is named again at the step that uploads it, so the reader who
+        // scans and the reader who follows along both get it at the moment they need it.
+        "you will upload THIS file (and only this one):".to_string(),
+        format!("     {}", csr.display()),
+        String::new(),
+        "at https://developer.apple.com/account/resources/certificates".to_string(),
+        "     signed in as the Account Holder — Apple lets nobody else create a Developer \
+         ID certificate"
+            .to_string(),
+        String::new(),
+        // The portal's OWN click order. Numbering the upload first read better on the
+        // page and matched nothing on the screen: at developer.apple.com the request is
+        // uploaded near the END, after the type and profile are chosen. A numbered list
+        // that disagrees with the site it describes is worse than a paragraph.
+        "1. + → Software → 'Developer ID Application'".to_string(),
+        "2. Profile Type 'G2 Sub-CA'".to_string(),
+        "     NOT 'Previous Sub-CA' — its intermediate expires 2027-02-01".to_string(),
+        "3. upload the request named above".to_string(),
+        "4. Download the result into ~/Downloads".to_string(),
+        "     the filename does not matter — it is matched against this request by public key"
+            .to_string(),
+    ];
+    if waiting {
+        // The wait's facts belong HERE, above the trap, not after it. Printed after, the
+        // last line on the screen was "waiting for the certificate to appear" — which
+        // reads as permission to go to the portal and collect whatever is there, i.e.
+        // precisely the act the trap exists to prevent.
+        out.push(String::new());
+        out.push(format!(
+            "watching ~/Downloads and ~/.aterm/apple: this step finishes the instant the \
+             matching .cer lands, and gives up after {} min. Ctrl-C is safe — nothing is \
+             lost and this step resumes exactly here.",
+            WAIT_FOR_CERT.as_secs() / 60
+        ));
+    }
+    out.push(String::new());
+    // THE TRAP, and it must state BOTH halves. An earlier rewrite kept only the
+    // prohibition ("do not download one you did not create") and lost the two facts that
+    // make it actionable: that a certificate issued FROM THIS REQUEST is the right one
+    // and costs nothing, and that creating another spends one of five permanent slots.
+    // Losing them turned a complete instruction into a bare "don't", and the corrective
+    // that replaced them — "delete it and start over" — routed every reader, including
+    // the one whose certificate was already correct, into spending a slot to fix nothing.
+    //
+    // `⚠` is reserved in this crate for an act that destroys or wedges something
+    // permanently. Spending a Developer ID slot is exactly that: five exist per team,
+    // ever, and revoking one stops every app it already signed from launching.
+    out.push(
+        "⚠ THE TRAP: the portal's list may ALREADY show a Developer ID certificate."
+            .to_string(),
+    );
+    out.push(
+        "  Download it ONLY if YOU created it from the request named above — then it \
+         matches, and costs nothing."
+            .to_string(),
+    );
+    out.push(
+        "  Any other one holds a different key, will be refused here, and its private \
+         half is on whichever machine made it."
+            .to_string(),
+    );
+    out.push(
+        "  Creating a new one instead spends one of this team's five Developer ID slots, \
+         permanently — the right move ONLY when the list has nothing issued from the \
+         request above."
+            .to_string(),
+    );
+    // The FIELD CASE, which is the one that actually happens: a wrong .cer is already in
+    // ~/Downloads. It needs an act, or the prohibition above is advice with no exit.
+    //
+    // The act is NOT "delete it and start over". An earlier draft said that, and it was
+    // the harmful answer: deleting is pointless (a non-matching .cer is ignored, not in
+    // the way) and "start over" means step 1, which mints a SECOND certificate — the very
+    // slot this block exists to protect. The correct act is to look again, because the
+    // certificate that matches may already be sitting in the portal unnoticed.
+    out.push(
+        "  Already downloaded one? Nothing to undo — a .cer that does not match is \
+         ignored, never installed."
+            .to_string(),
+    );
+    out.push(
+        "  Check the list once more for one issued from the request above; create a new \
+         certificate only if there is none."
+            .to_string(),
+    );
+    out
 }
 
 /// Copy the request somewhere a file picker can actually see. The canonical copy lives
@@ -1080,7 +1338,7 @@ fn find_matching_cert(key: &Path) -> Result<(Option<MatchedCert>, Vec<PathBuf>),
 /// file, why it was refused, and where the right one has to land. Named files, because
 /// "no matching certificate" about a directory the operator can see a certificate in is
 /// the sentence that sends them to spend another slot.
-fn rejected_note(rejected: &[PathBuf]) -> Option<String> {
+fn rejected_note(rejected: &[PathBuf], csr: Option<&Path>) -> Option<String> {
     // Three is enough to recognise the one you just downloaded; a full ~/Downloads dump
     // would be a paragraph nobody reads.
     const SHOWN: usize = 3;
@@ -1102,9 +1360,21 @@ fn rejected_note(rejected: &[PathBuf]) -> Option<String> {
         0 => String::new(),
         n => format!(" +{n} more"),
     };
+    // Naming the file and the reason is half the sentence; the operator still has to be
+    // told WHICH ACT fixes it. Without that, "a different public key" reads as "something
+    // is wrong with my download" and the next move is to download it again — or, worse,
+    // to create a second certificate, spending one of five permanent slots to fix a
+    // problem that was never about the certificate.
+    let fix = match csr {
+        Some(csr) => format!(
+            " — this is not a download problem: upload {} at the portal and download the \
+             certificate THAT produces",
+            csr.display()
+        ),
+        None => " — if the browser saved the .cer elsewhere, move it into ~/Downloads".to_string(),
+    };
     Some(format!(
-        "examined, not this request's: {}{more} — if the browser saved the .cer elsewhere, \
-         move it into ~/Downloads",
+        "examined, not this request's: {}{more}{fix}",
         named.join(", ")
     ))
 }
@@ -1202,7 +1472,15 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     ]) {
         return Outcome::Blocked {
             what: format!("could not import {}: {e}", cer.path.display()),
-            fix: "import it by double-clicking in Finder, then re-run".into(),
+            // The argv that just failed, so it can be run by hand and its own error
+            // read. "Double-click it in Finder" is unperformable over SSH, which is how
+            // a second publishing machine is usually provisioned.
+            fix: format!(
+                "run it yourself and read the error: security import {} -k {kc} -T \
+                 /usr/bin/codesign\n\
+                 or import it by double-clicking in Finder, then re-run",
+                cer.path.display()
+            ),
         };
     }
     if let Err(e) = import_idempotent(&[
@@ -1221,7 +1499,19 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
     ]) {
         return Outcome::Blocked {
             what: format!("could not import the private key: {e}"),
-            fix: format!("import {} by hand, then re-run", key.display()),
+            // NEVER "import it by hand". A private key imported without the -T flags
+            // produces an identity that looks installed and then cannot sign unattended:
+            // securityd raises a modal dialog the first time codesign touches the key,
+            // and the operator lands in the partition-list failure two steps later with
+            // no way to connect it to this instruction. So: the exact command, with the
+            // load-bearing part called out.
+            fix: format!(
+                "run it yourself and read the error: security import {} -k {kc} -t priv -f \
+                 openssl -T /usr/bin/codesign -T /usr/bin/security\n\
+                 the two -T flags are load-bearing — a key imported without them yields an \
+                 identity that looks installed and then cannot sign unattended.",
+                key.display()
+            ),
         };
     }
 
@@ -1247,10 +1537,17 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                          installed: {e}",
                         cer.path.display()
                     ),
-                    fix: "install the issuer named by `openssl x509 -inform DER -in \
-                          <cer> -noout -issuer` from https://www.apple.com/certificateauthority/ \
-                          and re-run"
-                        .into(),
+                    // The form is KNOWN (`find_matching_cert` proved it by matching in
+                    // that encoding), and this module's own comment says an `-inform DER`
+                    // guess about a PEM file "reads as 'a different issuer', which would
+                    // send the operator after the wrong thing entirely".
+                    fix: format!(
+                        "name it: openssl x509 -inform {} -in {} -noout -issuer\n\
+                         then install that intermediate from \
+                         https://www.apple.com/certificateauthority/ and re-run",
+                        cer.form,
+                        cer.path.display()
+                    ),
                 }
             }
         }
@@ -1262,9 +1559,18 @@ fn install(cer: &MatchedCert, key: &Path, id: &str) -> Outcome {
                  issuing intermediate present",
                 cer.path.display()
             ),
-            fix: "check the certificate has not expired (`openssl x509 -inform DER -in \
-                  <cer> -noout -dates`) and that its private key is in the same keychain"
-                .into(),
+            // Both halves get a command. The second half — "its private key is in the
+            // same keychain" — is the likelier cause and was the only half with nothing
+            // to run, which is what made it the half that got skipped.
+            fix: format!(
+                "check the dates:  openssl x509 -inform {} -in {} -noout -dates\n\
+                 list what this keychain can actually sign with:  security find-identity \
+                 -v -p codesigning {kc}\n\
+                 an identity needs BOTH halves in ONE keychain — the certificate above is \
+                 imported, so an empty list here means its private key is not in {kc}",
+                cer.form,
+                cer.path.display()
+            ),
         };
     }
 
@@ -1826,16 +2132,125 @@ mod tests {
     /// the upload land on the first try.
     ///
     /// And it must NOT end in "then re-run": on the interactive path it is printed
-    /// directly above "waiting for the certificate to appear…", so that sentence told the
-    /// operator to re-run a command that was at that moment sitting in a wait loop.
+    /// directly above a wait loop, so that sentence told the operator to re-run a command
+    /// that was at that moment sitting in one.
+    ///
+    /// Both paths are asserted against the SAME function. There used to be two texts, and
+    /// the non-interactive one is the one nobody re-reads, so it is the one that rots.
     #[test]
     fn the_errand_names_the_request_the_role_and_the_sub_ca() {
-        let text = errand(Path::new("/tmp/devid-m9.certSigningRequest"));
+        let text = errand_lines(Path::new("/tmp/devid-m9.certSigningRequest"), false).join("\n");
         assert!(text.contains("/tmp/devid-m9.certSigningRequest"));
-        assert!(text.contains("Account Holder"));
+        assert!(text.contains("nobody else create"), "{text}");
         assert!(text.contains("G2 Sub-CA"));
         assert!(text.contains("~/Downloads"), "the download has to land somewhere: {text}");
         assert!(!text.contains("re-run"), "{text}");
+        // The path that does NOT wait may not promise one.
+        assert!(!text.contains("watching ~/Downloads"), "{text}");
+        assert!(errand_lines(Path::new("/tmp/x.csr"), true).iter().any(|l| l.contains("watching ~/Downloads")));
+    }
+
+    /// The interactive errand must be SCANNABLE, and the trap must be the last thing
+    /// said. The paragraph form was skimmed past in the field and cost an operator a
+    /// wasted certificate slot; these assertions pin the shape that replaced it.
+    #[test]
+    fn the_errand_lines_put_the_upload_target_and_the_trap_where_they_are_seen() {
+        let lines = errand_lines(Path::new("/Users//x/Downloads/devid-m9.certSigningRequest"), true);
+        // The file to upload gets a line to ITSELF — not buried mid-sentence.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.trim() == "/Users//x/Downloads/devid-m9.certSigningRequest"),
+            "the request must stand alone on its own line: {lines:#?}"
+        );
+        // Every hand-authored line is one instruction. Length is NOT measured here any
+        // more: the old guard was `line.len() <= 76`, bytes against a rendered column
+        // budget measured from the wrong origin (the printed line is `13 + len`, so 76
+        // permitted 89 columns) in the wrong unit (an em-dash costs 3 bytes for one
+        // column). It was simultaneously too loose and too tight, and it passed while the
+        // defect shipped. `tests/transcript_grid.rs` measures RENDERED columns at width
+        // 80, through the same primitive that prints them.
+        //
+        // What IS pinned here is that no element hand-breaks its own prose: the wrapper
+        // owns the breaks, so a line frozen at the author's window is the defect.
+        for line in &lines {
+            assert!(!line.contains('\n'), "the wrapper owns the breaks: {line:?}");
+        }
+        let joined = lines.join("\n");
+        assert!(joined.contains("nobody else create"), "the Account Holder rule is about \
+            CREATING a certificate — truncated to \"nobody else\" it reads as \"nobody else \
+            may sign in\", which is false and stops a legitimate role account: {joined}");
+        assert!(
+            joined.contains("matched against this request by public key"),
+            "the matching mechanism is what makes the trap credible rather than a rule to \
+             argue with: {joined}"
+        );
+        assert!(joined.contains("G2 Sub-CA"));
+        assert!(joined.contains("~/Downloads"));
+        assert!(!joined.contains("re-run"), "{joined}");
+        // The trap is stated, and stated LAST — including after the wait paragraph.
+        // Nothing may be printed below it: the line the eye lands on is the line that
+        // decides what the operator does next, and "waiting for the certificate to
+        // appear" in that position reads as permission to go take one from the portal.
+        let trap = lines
+            .iter()
+            .position(|l| l.contains("THE TRAP"))
+            .expect("the trap must be stated");
+        assert!(
+            lines[trap..].iter().any(|l| l.contains("different key")),
+            "the trap must say WHY: {lines:#?}"
+        );
+        assert!(
+            lines[trap..].iter().any(|l| l.contains("Already downloaded one?")),
+            "a prohibition with no corrective act leaves the field case — the operator who \
+             ALREADY downloaded the wrong one — with nothing to do: {lines:#?}"
+        );
+        // …and the corrective must not be the HARMFUL one. "delete it and start over"
+        // sends the reader to step 1, which mints a second certificate and spends one of
+        // five permanent slots — the exact loss the trap exists to prevent.
+        assert!(
+            !lines[trap..]
+                .iter()
+                .any(|l| l.contains("Delete it") || l.contains("delete it")),
+            "the corrective must not route the operator into spending a slot: {lines:#?}"
+        );
+        assert!(
+            lines[trap..].iter().any(|l| l.contains("spends one of")),
+            "the trap must keep the CONSEQUENCE that makes it matter — a permanent slot: \
+             {lines:#?}"
+        );
+        assert!(
+            !lines[trap..].iter().any(|l| l.contains("watching")),
+            "the wait paragraph must sit ABOVE the trap: {lines:#?}"
+        );
+        assert!(
+            trap > lines.len() / 2,
+            "the trap must come last, not mid-paragraph: {lines:#?}"
+        );
+    }
+
+    /// A refused certificate must name the ACT that fixes it. "a different public key"
+    /// alone reads as a bad download, and the operator's next move is to download it
+    /// again — or to create a second certificate, spending one of five permanent slots
+    /// on a problem that was never about the certificate.
+    #[test]
+    fn a_refused_certificate_names_the_upload_that_fixes_it() {
+        let rejected = vec![PathBuf::from("/Users//x/Downloads/developerID_application.cer")];
+        let csr = PathBuf::from("/Users//x/Downloads/devid-m9.certSigningRequest");
+        let note = rejected_note(&rejected, Some(&csr)).expect("a refusal must be explained");
+        assert!(note.contains("developerID_application.cer"), "{note}");
+        assert!(note.contains("devid-m9.certSigningRequest"), "{note}");
+        assert!(
+            note.contains("not a download problem"),
+            "the note must correct the operator's likeliest reading: {note}"
+        );
+        // Without a request to point at (the non-interactive path prints the errand
+        // separately), it falls back to the location hint rather than inventing one.
+        let generic = rejected_note(&rejected, None).expect("still explained");
+        assert!(generic.contains("~/Downloads"), "{generic}");
+        assert!(!generic.contains("not a download problem"), "{generic}");
+        // Nothing refused, nothing to say.
+        assert!(rejected_note(&[], Some(&csr)).is_none());
     }
 
     /// Two overlapping Developer ID certificates is what a RENEWAL looks like, and the

@@ -81,6 +81,15 @@ impl Screen {
         let Some(cell) = grid.cell(r, c) else {
             return 0;
         };
+        // DEAD-BRANCH PROBE: nothing in production sets `USES_STYLE_ID` (every
+        // writer of the bit is test-gated) and the SGR path no longer interns a
+        // `StyleId` at all, so the rehydration below is unreachable here. The
+        // oracle keeps it for encoding completeness; the assert makes the
+        // conformance suite prove the premise instead of assuming it.
+        debug_assert!(
+            !cell.uses_style_id(),
+            "cell_flags_bits: a live cell carries USES_STYLE_ID, but nothing interns styles"
+        );
         if cell.uses_style_id() {
             let extra = cell.flags().difference(CellFlags::USES_STYLE_ID);
             grid.resolve_style_to_colors(cell.style_id(), extra)

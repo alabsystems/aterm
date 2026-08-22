@@ -7,9 +7,9 @@
 //! connectors here, on the exact stream that will carry terminal context.
 
 use super::description::{is_generic_description, normalize_description};
-use super::managed_ollama::{
-    ManagedOllama, ManagedOllamaController, ManagedProcessIdentity, attest_managed_server_stream,
-};
+#[cfg(target_os = "macos")]
+use super::managed_ollama::attest_managed_server_stream;
+use super::managed_ollama::{ManagedOllama, ManagedOllamaController, ManagedProcessIdentity};
 use super::redaction::{contains_sensitive_text, redact_context_line};
 use super::{
     ActivityState, EffectiveTransport, EndpointOrigin, Job, MAX_RESPONSE_BYTES, ProviderSettings,

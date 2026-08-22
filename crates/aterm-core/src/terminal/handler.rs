@@ -24,7 +24,7 @@
 //! - **Side-effects** (inline in protocol handlers): callbacks and external
 //!   service activation (bell, buffer switch).
 
-use crate::grid::{Grid, StyleId};
+use crate::grid::Grid;
 
 use super::{
     BufferActivationCallback, CurrentStyle, DcsState, MAX_RESPONSE_BUFFER_SIZE, TerminalModes,
@@ -124,7 +124,6 @@ define_terminal_handler! {
     grid: Grid => grid,
     modes: TerminalModes => modes,
     style: CurrentStyle => style,
-    current_style_id: StyleId => current_style_id,
     charset: CharacterSetState => charset,
     alt_grid: Option<Grid> => alt_grid,
     cursor_save: super::CursorSaveState => cursor_save,
@@ -220,7 +219,6 @@ define_terminal_handler! {
 pub(super) struct SgrStyleHandler<'a> {
     pub(super) grid: &'a mut Grid,
     pub(super) style: &'a mut CurrentStyle,
-    pub(super) current_style_id: &'a mut StyleId,
     pub(super) transient: &'a mut TransientState,
 }
 
@@ -267,7 +265,6 @@ impl TerminalHandler<'_> {
         SgrStyleHandler {
             grid: &mut *self.grid,
             style: &mut *self.style,
-            current_style_id: &mut *self.current_style_id,
             transient: &mut *self.transient,
         }
     }

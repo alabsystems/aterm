@@ -326,8 +326,25 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // possess an identity. It does gate READY TO CUT, because the cut's own
     // pre-claim gate refuses without it — so it is reported here, counted
     // separately, and folded into the verdict below.
-    let seed = seed_source_check(repo);
-    print_check("seed source", &seed);
+    // `seed`, not `seed source`: the word "source" was already carried by the value
+    // ("staged at <path>"), and at eleven characters the label ate its own separator —
+    // `{:<11}` pads only a SHORTER label, so this one printed `seed source10 program(s)
+    // staged at …`. It is also the label `publish.rs` uses for the same subject on the
+    // cut side, so the two lanes now spell one thing one way.
+    //
+    // The BAND is what makes that argument visible for the first time. Under the
+    // `[5/5] credentials` header the seed read as the seventh credential, which is the
+    // one thing the paragraph above says it is not.
+    band("SEED");
+    let (seed, seed_warnings) = seed_source_check(repo);
+    print_check("seed", &seed);
+    // Placed by the CALLER, under the `seed` label, so the warning has a subject above
+    // it. It used to be printed from inside `seedpack::validate` at a hardcoded
+    // four-space indent, which put a 120-word orphan paragraph under the `[5/5]
+    // credentials` header — a phase this file argues at length the seed is not part of.
+    for w in &seed_warnings {
+        step("", w);
+    }
     let seed_blocks_cut = matches!(seed, Check::Fail { .. });
 
     // ---- 3. mint LAST -------------------------------------------------------------
@@ -339,8 +356,8 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // written", four lines above a terminal error saying: fix N, re-run, nothing written.
     // The mint's absence is exactly what that error means, and the error is the line the
     // shell shows and the exit code carries.
-    let minted = if already || check_only || blocking > 0 {
-        false
+    let report = if already || check_only || blocking > 0 {
+        None
     } else if let Some(why) = channel_unreadable.as_ref() {
         return Err(Error::new(format!(
             "refusing to mint a roster id while the public channel cannot be read ({why}): a \
@@ -348,9 +365,25 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
              minting the same one (a lineage fork). Retry when the channel answers"
         )));
     } else {
-        mint(repo, id, &roster_path)?;
-        true
+        // A band, not a `[6/6]` phase: the mint is skipped on `--check` and on an already
+        // provisioned machine, so a sixth fraction would promise a phase that often never
+        // arrives. `phase()`'s `[n/5]` carries a promise; a band carries a heading.
+        band("MINT");
+        // The word "irreversible" appears seven times in this file and every one of them
+        // is a CODE COMMENT. The tool's most irreversible act was also its quietest —
+        // quieter than the Apple slot, which at least has four siblings and a [y/N] gate.
+        // Ctrl-C here really is free: `write_pins` is two statements after the prompt.
+        step(
+            "mint",
+            &format!(
+                "typing the phrase mints '{id}' an IRREVERSIBLE roster id: an id is never \
+                 re-issued and never re-used, and a machine never re-mints under a second \
+                 one. Ctrl-C now costs nothing — nothing has been written yet."
+            ),
+        );
+        Some(mint(repo, id, &roster_path)?)
     };
+    let minted = report.is_some();
 
     // Re-resolved after a mint, because `resolved` was read before the key existed. This
     // is the key a cut would sign with, so it is the one the profile below is held to.
@@ -383,32 +416,17 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
             },
             None => profile_check(&home, id, apple_sha1.as_deref(), derived_pubkey.as_deref()),
         };
-        record("profile", check, &mut checks);
+        // RECORDED, not printed here. `profile` and `authority` are results of phase 5,
+        // and they used to print AFTER the mint's own closing report — which ends with a
+        // `=== NEXT ===` list — so they read as further next steps. `roster kept at
+        // ~/.aterm/roster/...` landing directly under "copy dist/aterm-machines.toml to
+        // every publishing machine" reads as a third instruction naming a DIFFERENT
+        // roster path, and an operator following NEXT literally copies the wrong file.
+        // Nothing was flushing out of order; the order was the bug. They belong in the
+        // DONE band, which is emitted once, below, at the end.
+        checks.push(("profile", check));
     }
     let (fails, waiting) = tally(&checks);
-
-    if !key_path.exists() {
-        println!();
-        if check_only {
-            let open = gaps(fails, waiting);
-            println!(
-                "CHECK ONLY — unminted; {}",
-                if open.is_empty() {
-                    format!("a real `cargo ship provision --id {id}` would mint")
-                } else {
-                    format!("{open} before a real run mints")
-                }
-            );
-            return Ok(());
-        }
-        // Mint deferred: there is no identity to bind, and the machine is not
-        // provisioned — say so through the exit code too.
-        return Err(Error::new(format!(
-            "{} above — nothing was written and no roster id was spent; re-run `cargo ship \
-             provision --id {id}` once fixed",
-            gaps(fails, waiting)
-        )));
-    }
 
     // ---- bind the DERIVED key through the real cut gate ---------------------------
     // `machines::authorize_cut` is the same admission a cut runs: master signature,
@@ -421,72 +439,408 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     // Reaching this arm means the mint just ran, and the mint RE-SIGNS the roster into
     // dist/ with this machine added: the pair phase 1 chose is the previous generation and
     // does not name this key. So this one case reads what the join wrote.
-    let attribution = match attributed {
-        Some(a) => a,
-        None => {
-            let pubkey = derived_pubkey.ok_or_else(|| {
-                Error::new("the join reported success but the minted key did not resolve")
-            })?;
-            let doc = machines::RosterDocument::read(&roster_path)?;
-            authorize(doc.bytes, &doc.signature, &pubkey)?
-        }
-    };
-    step(
-        "authority",
-        &format!(
+    let authority = if key_path.exists() {
+        let attribution = match attributed {
+            Some(a) => a,
+            None => {
+                let pubkey = derived_pubkey.ok_or_else(|| {
+                    Error::new("the join reported success but the minted key did not resolve")
+                })?;
+                let doc = machines::RosterDocument::read(&roster_path)?;
+                authorize(doc.bytes, &doc.signature, &pubkey)?
+            }
+        };
+        Some(format!(
             "authorize_cut passes: '{}' signs under roster seq {}",
             attribution.machine_id, attribution.roster_seq,
-        ),
-    );
+        ))
+    } else {
+        None
+    };
 
     // Keep this machine's own copy of the generation that just authorized it — written
     // only now, so what is kept is a pair `authorize_cut` accepted, never a guess. Step 1
     // restores dist/ from it, which is what makes a swept dist/ self-healing rather than
     // the one state this verb has no remedy for. Not under `--check`: it is a write.
-    if !check_only {
+    let roster_kept = if key_path.exists() && !check_only {
         match keep_roster_pair(&roster_path, &kept_path) {
-            Ok(true) => step(
-                "roster",
-                &format!("kept this generation at {} (dist/ is sweepable)", kept_path.display()),
+            Ok(true) => Some(format!(
+                "kept at {} — dist/ is sweepable",
+                kept_path.display()
+            )),
+            Ok(false) => None,
+            Err(e) => Some(format!("could not keep a copy: {e}")),
+        }
+    } else {
+        None
+    };
+
+    close(Closing {
+        id,
+        home: &home,
+        check_only,
+        report: report.as_ref(),
+        profile: checks.iter().find(|(l, _)| *l == "profile").map(|(_, c)| c),
+        open: checks
+            .iter()
+            .filter_map(|(l, c)| match c {
+                Check::Fail { .. } => Some(format!("{l} (gap)")),
+                Check::Todo { .. } => Some(format!("{l} (waiting)")),
+                _ => None,
+            })
+            .collect(),
+        authority,
+        roster_kept,
+        key_exists: key_path.exists(),
+        fails,
+        waiting,
+        host_cannot_cut,
+        seed_blocks_cut,
+    })
+}
+
+/// Everything the closing structure needs, gathered rather than printed as it is learned.
+///
+/// The gathering IS the fix. These lines are results, and results have to arrive together:
+/// printed as each became true, three of them landed underneath a `=== NEXT ===` heading
+/// written by the mint, where they read as instructions.
+#[cfg(unix)]
+struct Closing<'a> {
+    id: &'a str,
+    home: &'a str,
+    check_only: bool,
+    /// The mint's own report, when this run minted. `None` on `--check` and on every
+    /// re-run of an already-provisioned machine.
+    report: Option<&'a atpkg_keys::provision::Report>,
+    profile: Option<&'a Check>,
+    authority: Option<String>,
+    roster_kept: Option<String>,
+    key_exists: bool,
+    fails: usize,
+    waiting: usize,
+    /// The labels of every open item, with the word each is counted under. "once fixed"
+    /// pointed at no item, no file and no act; `checks` has held the answer all along.
+    open: Vec<String>,
+    host_cannot_cut: bool,
+    seed_blocks_cut: bool,
+}
+
+/// The mint's DONE facts, re-rendered on THIS transcript's grid as `(label, value)`.
+///
+/// Pure, and separate from [`close`], so `tests/transcript_grid.rs` can construct a
+/// `Report` with every conditional set and assert that every load-bearing clause survives.
+/// That test is what licenses re-rendering locally instead of splicing `render_report`'s
+/// own lines in on their narrower gutter: the fact-loss risk is handled by a test, not by
+/// keeping a layout that reads as output from a different program.
+#[cfg(unix)]
+pub(crate) fn report_done(r: &atpkg_keys::provision::Report) -> Vec<(String, String)> {
+    use atpkg_keys::provision::Verb;
+    let mut out = Vec::new();
+    if r.verb == Verb::Setup {
+        out.push((
+            "anchor".to_string(),
+            format!(
+                "pins::PAPER_MASTER_PUBKEYS = {}  fingerprint {}",
+                r.master_pubkey, r.master_fingerprint
             ),
-            Ok(false) => {}
-            Err(e) => step("roster", &format!("could not keep a copy: {e}")),
+        ));
+    } else {
+        out.push((
+            "anchor".to_string(),
+            format!(
+                "phrase verified against the committed master ({})",
+                r.master_fingerprint
+            ),
+        ));
+    }
+    out.push((
+        "key".to_string(),
+        format!(
+            "{}  0600, stays on this machine  (pub {})",
+            r.paths.key, r.machine_pubkey
+        ),
+    ));
+    let mut roster = format!(
+        "{} + .sig  seq {}  ({})",
+        r.paths.roster,
+        r.roster_seq,
+        r.roster_machines.join(", ")
+    );
+    // A sentinel expiry is not news. A real one is, so it still gets its clause.
+    if r.roster_valid_until != atpkg_keys::roster_ops::VALID_UNTIL_FOREVER {
+        roster.push_str(&format!("  valid until {}", r.roster_valid_until));
+    }
+    if r.roster_was_fresh {
+        roster.push_str(
+            " — the ONLY roster this master signs; a second at the same seq forks it and \
+             de-authorizes machines silently",
+        );
+    }
+    out.push(("roster".to_string(), roster));
+    if let Some((head_id, head_key)) = &r.seeded_head {
+        out.push((
+            String::new(),
+            format!(
+                "'{head_id}' = the incumbent keyset head ({head_key}); rename only now, via \
+                 --head-id — roster ids are revoke-only later"
+            ),
+        ));
+    }
+    out.push((
+        "keyset".to_string(),
+        format!(
+            "pins::UPDATE_CHANNEL_PUBKEYS unchanged ({}) — the roster authorizes '{}'",
+            r.channel_after.len(),
+            r.id
+        ),
+    ));
+    out
+}
+
+/// The mint's NEXT steps that must happen BEFORE a cut — a working-tree edit and its
+/// commit. They exist only when there IS one: printing them on a join sends the operator
+/// to an empty diff and a no-op commit.
+#[cfg(unix)]
+pub(crate) fn report_next_before_cut(r: &atpkg_keys::provision::Report) -> Vec<String> {
+    use atpkg_keys::provision::Verb;
+    let mut out = Vec::new();
+    if r.pins_changed {
+        out.push(format!("review: git diff -- {}", r.paths.pins));
+    }
+    if r.verb == Verb::Setup {
+        out.push(
+            "delete the tripwire tests that assert an empty anchor:\n  \
+             crates/aterm-update-core/src/pins.rs::tests::\
+             the_paper_master_is_unset_so_the_roster_tier_is_inert\n  \
+             crates/atpkg-keys/tests/paper_master_to_client.rs::\
+             the_shipped_master_anchor_is_still_empty"
+                .to_string(),
+        );
+    }
+    if r.pins_changed {
+        out.push("commit — durable from here".to_string());
+    }
+    out
+}
+
+/// The mint's NEXT steps that follow the dry run: distribute the roster, and who may sign
+/// a REAL cut.
+///
+/// The head-key requirement sits directly under the copy step so the two read as one
+/// escalation. It used to be `render_report`'s step 1 while the last line on the screen —
+/// `READY TO CUT — next: cargo ship cut --dry-run …` — named neither the head key nor the
+/// flag. Both were true and they looked like a disagreement, and the last one is the one a
+/// stressed operator copies.
+#[cfg(unix)]
+pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<String> {
+    let mut out = vec![format!(
+        "copy {} + .sig to every other publishing machine — a cut from an older roster is \
+         refused",
+        r.paths.roster
+    )];
+    if r.machine_is_committed_head {
+        out.push(format!(
+            "a REAL cut may be signed here — '{}' holds the committed keyset head, the one \
+             key pre-roster clients verify",
+            r.id
+        ));
+    } else if let Some(head) = r.channel_after.first() {
+        // V5: the caveat rides the step it guards, indented under it, rather than
+        // floating in a paragraph five lines from the command it qualifies.
+        let mut line = format!(
+            "a REAL cut must be signed by the head key {head}:\n  \
+             run it on that machine, or from '{}' with --strand-pre-roster-clients (asserts \
+             no pre-roster client is left to strand)",
+            r.id
+        );
+        if let Some((head_id, _)) = &r.seeded_head {
+            line.push_str(&format!(
+                "\n  that machine's roster id is '{head_id}', and its profile must set \
+                 machine_id = \"{head_id}\" — a declared id that contradicts the roster \
+                 refuses the cut"
+            ));
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// One band header: a heading and NOTHING else on the line.
+///
+/// Column 2, not column 0. Column 0 now belongs to the single closing verdict and to
+/// nothing else in the whole run — that is the entire reason the verdict is findable by
+/// an operator scrolling back through a hundred lines. Everything under a band is on the
+/// same 13-column grid as everything above it: two grids that never interleave read as
+/// two sections, two grids that alternate read as damage.
+#[cfg(unix)]
+fn band(name: &str) {
+    println!();
+    println!("  === {name} ===");
+}
+
+/// The closing structure, and the ONLY place this verb ends.
+///
+/// # Why it is unconditional
+///
+/// `=== DONE ===` / `=== NEXT ===` used to exist only on the once-per-machine mint run —
+/// emitted from inside `atpkg-keys`, on its own 10-column gutter, in the middle of a run
+/// that then kept printing for another 140 lines. The run an operator actually REPEATS —
+/// a re-check before a release, or `--check` — ended with seven unheaded lines in which
+/// `authority`, the single line proving this machine may sign, was indistinguishable from
+/// the seventh chore in a list. The shape that answers "is this machine still good?" was
+/// present only on the run that needs it least.
+///
+/// # Why the mint's report is re-rendered here rather than passed through
+///
+/// `render_report` returns its lines on `atpkg-keys`' own gutter, three columns narrower
+/// than this transcript's. Splicing them in preserves that gutter, and four mint facts on
+/// a different grid look like output from a different program — which is exactly what lets
+/// an operator's eye skip them. Every field it reads is `pub`, so this re-renders from the
+/// `Report` itself; `tests/transcript_grid.rs` pins every load-bearing clause so a field
+/// added there cannot be silently dropped here.
+#[cfg(unix)]
+fn close(c: Closing<'_>) -> Result<()> {
+    let done = match (c.check_only, c.report.map(|r| r.pins_changed)) {
+        (true, _) => "DONE (--check: nothing written)".to_string(),
+        (false, Some(true)) => "DONE (working tree only — a commit makes it durable)".to_string(),
+        _ => "DONE".to_string(),
+    };
+    // Gather BEFORE printing the header. `band(&done)` was unconditional, so a run with
+    // nothing to report — every payload here is gated on a mint having happened or on the
+    // key existing — printed a bare `=== DONE ===` immediately above the verdict
+    // `NOT DONE`. A heading that contradicts the line under it is worse than no heading.
+    let mut done_lines: Vec<(String, String)> = Vec::new();
+    if let Some(r) = c.report {
+        done_lines.extend(report_done(r));
+    }
+    if let Some(kept) = &c.roster_kept {
+        done_lines.push(("roster".to_string(), kept.clone()));
+    }
+    if let Some(a) = &c.authority {
+        done_lines.push(("authority".to_string(), a.clone()));
+    }
+    if !done_lines.is_empty() || c.profile.is_some() {
+        band(&done);
+        for (label, msg) in &done_lines {
+            step(label, msg);
+        }
+        if let Some(check) = c.profile {
+            print_check("profile", check);
         }
     }
 
+    // ---- NEXT -------------------------------------------------------------------
+    // One list, because there used to be two answers to "how do I cut?" five lines apart:
+    // the mint's own step 1 named the head key and `--strand-pre-roster-clients`, and the
+    // last line on the screen said `READY TO CUT — next: cargo ship cut --dry-run …` with
+    // neither. Both were true and they looked like a disagreement — and the LAST one is
+    // the one a stressed operator copies, which makes dropping `--dry-run` from it the
+    // obvious next move. So: the dry run is step 1, printed once; the head-key
+    // requirement is step 3, adjacent, so the two read as one escalation; and the verdict
+    // banner is the bare word.
+    let mut next: Vec<String> = Vec::new();
+    if let Some(r) = c.report {
+        next.extend(report_next_before_cut(r));
+    }
+    let profile_path = Path::new(c.home).join(".aterm/release-credentials.toml");
+    // `c.fails + c.waiting == 0` is the whole point: this list used to print
+    // `cargo ship cut --dry-run …` on a run whose own verdict, four lines later, was
+    // `NOT DONE`. An operator who copies the last runnable command on the screen — which
+    // is what a stressed operator does — was handed the one command the machine was not
+    // yet allowed to run.
+    if c.key_exists && !c.host_cannot_cut && c.fails + c.waiting == 0 {
+        if c.seed_blocks_cut {
+            // The act, not a scolding: a cut refuses pre-claim without a validated seed,
+            // so this is the step between here and a release.
+            next.push(
+                "stage the toolchain seed: tools/atpkg-seed-from-published.sh\n\
+                 or cut deliberately seedless: ATERM_SEEDLESS=1"
+                    .to_string(),
+            );
+        }
+        // The command as printed RUNS. It used to spell the profile `<profile>` even
+        // though the audit had printed its real path two lines up, so the one thing the
+        // operator came here to copy had to be assembled by hand.
+        next.push(format!(
+            "cargo ship cut --dry-run --release-credentials {}",
+            profile_path.display()
+        ));
+    }
+    if let Some(r) = c.report {
+        next.extend(report_next_after_cut(r));
+    }
+    if !next.is_empty() {
+        band("NEXT");
+        for (n, line) in next.iter().enumerate() {
+            step(&format!("{}.", n + 1), line);
+        }
+    }
+
+    // ---- the verdict, and the ONLY thing in this run at column 0 -----------------
     println!();
-    if fails + waiting > 0 {
+    if !c.key_exists {
+        if c.check_only {
+            let open = gaps(c.fails, c.waiting);
+            println!(
+                "CHECK ONLY — unminted; {}",
+                if open.is_empty() {
+                    format!("a real `cargo ship provision --id {}` would mint", c.id)
+                } else {
+                    format!("{open} before a real run mints")
+                }
+            );
+            return Ok(());
+        }
+        // Mint deferred: there is no identity to bind, and the machine is not provisioned
+        // — say so through the exit code too.
         return Err(Error::new(format!(
-            "{} above — re-run `cargo ship provision --id {id}` once fixed",
-            gaps(fails, waiting)
+            "NOT DONE — {}: {}.\nNothing was written and no roster id was spent. Re-run \
+             `cargo ship provision --id {}` once those are settled — it resumes exactly \
+             there.",
+            gaps(c.fails, c.waiting),
+            c.open.join(", "),
+            c.id
         )));
     }
-    if host_cannot_cut {
+    // `--check` answers BEFORE the generic failure arm, because that arm's remedy —
+    // "re-run `cargo ship provision`" — is wrong here twice over: this run wrote nothing,
+    // and re-running the audit changes nothing. An audit reports; it does not prescribe
+    // its own repetition. It still exits non-zero when something is open, so a caller can
+    // gate on it.
+    if c.check_only {
+        if c.fails + c.waiting > 0 {
+            return Err(Error::new(format!(
+                "CHECK ONLY — nothing was written. {}: {}.",
+                gaps(c.fails, c.waiting),
+                c.open.join(", ")
+            )));
+        }
+        println!("CHECK ONLY — nothing was written; every item above is proven");
+        return Ok(());
+    }
+    if c.fails + c.waiting > 0 {
+        return Err(Error::new(format!(
+            "NOT DONE — {}: {}.\nRe-run `cargo ship provision --id {}` once those are \
+             settled — it resumes exactly there.",
+            gaps(c.fails, c.waiting),
+            c.open.join(", "),
+            c.id
+        )));
+    }
+    if c.host_cannot_cut {
         // Non-macOS: the roster half is proven, the Apple half cannot exist here.
         println!(
-            "ROSTERED — but cuts run on macOS (Tier APPLE): this machine can sign the \
-             atpkg index, and can never say READY TO CUT"
+            "ROSTERED — but cuts run on macOS (Tier APPLE): this machine can sign the atpkg \
+             index, and can never say READY TO CUT"
         );
-    } else if seed_blocks_cut {
+    } else if c.seed_blocks_cut {
         // Every CAPABILITY passed — this machine is provisioned and minted — but
-        // `cargo ship cut` refuses pre-claim without a validated seed, so saying
-        // "READY TO CUT: yes" here would be the label out-running the proof.
-        println!(
-            "READY TO CUT: not yet — this machine is fully provisioned, but the \
-             batteries-included seed is not staged (see the seed source line above). \
-             Stage it with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
-             deliberately seedless with ATERM_SEEDLESS=1"
-        );
+        // `cargo ship cut` refuses pre-claim without a validated seed, so saying "READY TO
+        // CUT" here would be the label out-running the proof. The remedy is NEXT step 1;
+        // the verdict names the state, once.
+        println!("ROSTERED — but no toolchain seed is staged, so a cut is refused (NEXT 1)");
     } else {
-        // One line, and the command as printed RUNS: the old text spelled the profile
-        // `<profile>` even though the audit had just printed its real path two lines up,
-        // so the one thing the operator came here to copy had to be assembled by hand.
-        // The parenthetical went with it — it explained a flag and then said the cut
-        // names that flag itself.
-        println!(
-            "READY TO CUT — next: cargo ship cut --dry-run --release-credentials {}",
-            Path::new(&home).join(".aterm/release-credentials.toml").display()
-        );
+        println!("READY TO CUT");
     }
     Ok(())
 }
@@ -498,7 +852,7 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
 /// unchanged. RELEASE-KEYS.md's "signing is in-process" rule extends to minting: no
 /// second binary, no key path on any command line.
 #[cfg(unix)]
-fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<()> {
+fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<atpkg_keys::provision::Report> {
     use atpkg_keys::{master, provision as prov};
 
     // Before anything sensitive exists in this process.
@@ -514,10 +868,7 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<()> {
     };
     let pre = prov::preflight(prov::Verb::Join, id, prov::DEFAULT_HEAD_ID, &paths)
         .map_err(Error::new)?;
-    let phrase = master::prompt_for_master(
-        "master phrase (52 characters, echo off; spaces, case, and o/i/l are forgiven): ",
-    )
-    .map_err(Error::new)?;
+    let phrase = prompt_master_with_retries()?;
     let seed = phrase.seed();
     // The fingerprint is printed HERE and nowhere else. It used to be printed on the way
     // in, as `master fingerprint: <fp>  (compare with the paper)` — a manual comparison
@@ -537,11 +888,86 @@ fn mint(repo: &Path, id: &str, roster_path: &Path) -> Result<()> {
     })?;
     let planned = prov::plan(pre, &seed, now_unix()?).map_err(Error::new)?;
     prov::write_pins(&planned).map_err(Error::new)?;
-    let report = prov::write_rest(planned).map_err(Error::new)?;
-    for line in prov::render_report(&report) {
-        println!("{line}");
+    // RETURNED, never printed. `render_report` is a TERMINAL-final report — its own doc
+    // calls it "the closing output: DONE, then NEXT" — and this call sits in the middle
+    // of a run that keeps printing results for another 140 lines. Printing it here put
+    // `profile`, `authority` and `roster kept` underneath a heading that says NEXT, and
+    // `roster kept at ~/.aterm/roster/aterm-machines.toml` directly under "copy
+    // dist/aterm-machines.toml to every publishing machine" reads as a third instruction
+    // naming a different roster path. An operator following NEXT literally copies the
+    // wrong file. `close()` re-renders these facts on THIS transcript's grid, once,
+    // at the end.
+    prov::write_rest(planned).map_err(Error::new)
+}
+
+/// Ask for the paper master on the transcript's own grid, and give a mistype another go.
+///
+/// # The prompt
+///
+/// It used to start at column 0, breaking the two-space grid every other line of the run
+/// uses, with no blank line above it. `prompt_master_attempt` writes the string verbatim,
+/// so putting it through [`crate::publish::grid_block`] is a one-string change here.
+///
+/// "hyphens" is in the forgiveness list because `parse_master` strips them (it strips
+/// whitespace and `b'-'`), and its own doc says the rule exists "because the owner
+/// grouped the characters". The operator is reading a hyphenated paper master, typing
+/// blind, against a list that presents itself as complete and omitted the one character
+/// they are looking at.
+///
+/// # The retries
+///
+/// `prompt_for_master`'s own doc names its assumption: "a typo is a final error… The
+/// right shape for `join` and `master-check`, where the command is cheap to re-run."
+/// In `provision` the command is not cheap. By this point a PERMANENT Apple certificate
+/// slot has been spent, an Account-Holder browser errand is done, and a notary credential
+/// is stored. Fifty-two characters copied from paper with echo off — a mistype is the
+/// expected case, not the exceptional one.
+///
+/// A retry is exactly equivalent to re-running the command: nothing is written until
+/// `write_pins`, which is two statements after the caller's `verify_master`. Three
+/// attempts, then an error that says so.
+#[cfg(unix)]
+fn prompt_master_with_retries() -> Result<atpkg_keys::master::MasterPhrase> {
+    use atpkg_keys::master;
+    const TRIES: usize = 3;
+    let prompt = format!(
+        "\n{}",
+        crate::publish::grid_block(
+            "master",
+            "master phrase (52 characters, echo off; spaces, hyphens, case, and o/i/l are \
+             forgiven): "
+        )
+    );
+    // The prompt goes to /dev/tty, which is unbuffered, while everything above it went to
+    // a block-buffered stdout under `| tee`. Without this the operator is asked for the
+    // master phrase on an otherwise blank screen, with the MINT band explaining what they
+    // are about to spend still sitting in a buffer.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    for left in (0..TRIES).rev() {
+        // The outer Result is an I/O failure — no terminal, a read error — and retrying
+        // that would just loop. Only the inner one is a typo.
+        match master::prompt_master_attempt(&prompt).map_err(Error::new)? {
+            Ok(phrase) => return Ok(phrase),
+            Err(typo) if left > 0 => {
+                step("master", &typo.message());
+                step(
+                    "",
+                    &format!(
+                        "nothing written — try again ({left} left)"
+                    ),
+                );
+            }
+            Err(typo) => {
+                return Err(Error::new(format!(
+                    "{} — {TRIES} attempts, and nothing was written: no key, no roster, no \
+                     roster id spent. Re-run `cargo ship provision` and it resumes exactly \
+                     here.",
+                    typo.message()
+                )));
+            }
+        }
     }
-    Ok(())
+    unreachable!("the loop returns on every arm")
 }
 
 /// A roster pair that verified under the committed paper master and parsed.
@@ -881,16 +1307,26 @@ enum Check {
 }
 
 #[cfg(unix)]
+/// One marker vocabulary, and it matches the word the SUMMARY counts in.
+///
+/// `gaps()` says "gap" and "waiting", so the lines say `GAP —` and `WAITING —`. "MISSING"
+/// was false of five of this file's `Fail` messages — a token that exists but is
+/// group-readable, a profile that declares the wrong `machine_id`, an identity that is
+/// installed but cannot sign — and it disagreed with the summary that counts it.
+///
+/// An unmarked `Todo` was worse: it opened exactly like a `Pass`, so the one line holding
+/// up the entire run read green until the eye reached its second line.
+#[cfg(unix)]
 fn print_check(label: &str, c: &Check) {
     match c {
         Check::Pass(msg) => step(label, msg),
         Check::Skip(msg) => step(label, &format!("impossible here — {msg}")),
         Check::Fail { what, fix } => {
-            step(label, &format!("MISSING — {what}"));
+            step(label, &format!("GAP — {what}"));
             step("", &format!("fix: {fix}"));
         }
         Check::Todo { what, next } => {
-            step(label, what);
+            step(label, &format!("WAITING — {what}"));
             step("", &format!("next: {next}"));
         }
     }
@@ -916,13 +1352,18 @@ fn toolchain_check(repo: &Path) -> (Check, Option<PathBuf>) {
                 bin,
             )
         }
-        // `trustc_probe`'s own error already lists every way to get a toolchain
-        // (gates.rs:64). Repeating them here printed the same three remedies twice in
-        // two consecutive lines, which is how a fixable problem starts looking like two.
+        // `trustc_probe` returns a FAULT (plus, for the missing-toolchain branch, the
+        // one fact the operator cannot derive: where it looked). The remedies are laid
+        // out HERE, on this transcript's grid, script first and the three manual routes
+        // under `or:` — one act to try, three to fall back on, in one place.
         Err(e) => (
             Check::Fail {
                 what: e.to_string(),
-                fix: "tools/bootstrap-publisher.sh does it for you".into(),
+                fix: format!(
+                    "tools/bootstrap-publisher.sh — it does the whole stack\n\
+                     or, by hand:\n  {}",
+                    gates::TRUST_TOOLCHAIN_REMEDIES.replace('\n', "\n  ")
+                ),
             },
             None,
         ),
@@ -945,8 +1386,12 @@ fn verifiers_check(bin: &Path) -> Check {
         // be replaced or rebuilt.
         Check::Fail {
             what: format!("{} missing from {}", missing.join(" + "), bin.display()),
-            fix: "`atpkg install trust`, or rebuild with `[build] tools` carrying clean \
-                  + ty"
+            // The config key had no FILE and named a tool that is not in the missing
+            // list, so neither half of this remedy could be acted on. Name the file and
+            // the command.
+            fix: "atpkg install trust\n\
+                  or rebuild: set `tools` in $HOME/trust/bootstrap.toml to include every \
+                  driver above, then `python3 x.py build --stage 2` in $HOME/trust"
                 .into(),
         }
     }
@@ -984,9 +1429,15 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
                 "{} is a working doc driver, but its directory is not on PATH",
                 farm.display()
             ),
+            // PERSISTENTLY. "add <dir> to PATH" gets done with an `export` that dies
+            // with the shell, so the next run reports the identical gap and the operator
+            // concludes the tool is wrong about the machine. Say the durable form, and
+            // say why it has to be durable.
             fix: format!(
-                "add {} to PATH",
-                farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
+                "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
+                 it has to persist: a plain `cargo test`'s doctest lane resolves \
+                 `trustdoc` from PATH, in whatever shell it runs in",
+                d = farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
             ),
         };
     }
@@ -1038,9 +1489,15 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
                 farm.display(),
                 target.display()
             ),
+            // PERSISTENTLY. "add <dir> to PATH" gets done with an `export` that dies
+            // with the shell, so the next run reports the identical gap and the operator
+            // concludes the tool is wrong about the machine. Say the durable form, and
+            // say why it has to be durable.
             fix: format!(
-                "add {} to PATH",
-                farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
+                "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
+                 it has to persist: a plain `cargo test`'s doctest lane resolves \
+                 `trustdoc` from PATH, in whatever shell it runs in",
+                d = farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
             ),
         }
     }
@@ -1136,33 +1593,45 @@ fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
 /// only — materializing one downloads the published artifacts (~600 MB), which
 /// is the named remedy's job, never a silent side effect of an audit.
 #[cfg(unix)]
-fn seed_source_check(repo: &Path) -> Check {
+fn seed_source_check(repo: &Path) -> (Check, Vec<String>) {
     let dist = repo.join("dist");
     match crate::seedpack::resolve(&dist) {
         Some(dir) => match crate::seedpack::validate(&dir) {
-            Ok(stat) => Check::Pass(format!(
-                "{} program(s) staged at {} (index_build {}, valid_until {})",
-                stat.programs.len(),
-                dir.display(),
-                stat.index_build,
-                stat.valid_until
-            )),
-            Err(e) => Check::Fail {
-                what: format!("{} does not validate: {e}", dir.display()),
-                fix: "restage it: tools/atpkg-seed-from-published.sh (downloads + verifies \
-                      the published index and artifacts, lays them flat into \
-                      dist/toolchain-seed)"
+            Ok(stat) => (
+                Check::Pass(format!(
+                    "{} program(s) staged at {}\n\
+                     index_build {}, valid_until {} — not a credential and does not gate the \
+                     mint; it gates READY TO CUT, because the cut's own pre-claim gate \
+                     refuses without it",
+                    stat.programs.len(),
+                    dir.display(),
+                    stat.index_build,
+                    stat.valid_until
+                )),
+                stat.warnings,
+            ),
+            Err(e) => (
+                Check::Fail {
+                    what: format!("{} does not validate: {e}", dir.display()),
+                    fix: "restage it: tools/atpkg-seed-from-published.sh (downloads + \
+                          verifies the published index and artifacts, lays them flat into \
+                          dist/toolchain-seed)"
+                        .into(),
+                },
+                Vec::new(),
+            ),
+        },
+        None => (
+            Check::Fail {
+                what: "no toolchain seed staged — `cargo ship cut` will refuse\n\
+                       looked at: dist/toolchain-seed, and ATERM_SEED_DIR (unset)"
+                    .into(),
+                fix: "stage one: tools/atpkg-seed-from-published.sh\nor cut deliberately \
+                      seedless: ATERM_SEEDLESS=1"
                     .into(),
             },
-        },
-        None => Check::Fail {
-            what: "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
-                   `cargo ship cut` will refuse"
-                .into(),
-            fix: "stage one: tools/atpkg-seed-from-published.sh, or cut deliberately seedless \
-                  with ATERM_SEEDLESS=1"
-                .into(),
-        },
+            Vec::new(),
+        ),
     }
 }
 
@@ -1220,22 +1689,14 @@ fn x86_slice_check() -> Check {
     }
     match gates::x86_target_probe() {
         Ok(()) => Check::Pass("stable x86_64-apple-darwin target installed (universal slice)".into()),
-        // Only the first LINE of the probe's error. It ends with its own two-line
-        // `fix:`/`or:` remedy, and `step` prints one line — so those arrived unlabelled and
-        // mis-indented, breaking the two-column layout, directly above a `fix:` saying the
-        // same two things again. One missing rustup target printed four lines and two
-        // remedy markers.
+        // The WHOLE fault, and the shared remedy text. The probe no longer carries a
+        // hand-indented `fix:`/`or:` block of its own, so nothing has to be truncated to
+        // keep this line on the grid — and truncating it used to throw away the rustup
+        // branch's real explanation (that this is a choice about what to ship, not a
+        // broken setup) on exactly the machine that needed it.
         Err(e) => Check::Fail {
-            what: e
-                .to_string()
-                .lines()
-                .next()
-                .unwrap_or("no x86_64-apple-darwin target")
-                .trim()
-                .to_string(),
-            fix: "`rustup +stable target add x86_64-apple-darwin` — or cut with \
-                  --arm64-only (an explicit, thinner artifact)"
-                .into(),
+            what: e.to_string(),
+            fix: gates::X86_SLICE_REMEDIES.to_string(),
         },
     }
 }
@@ -1388,6 +1849,13 @@ fn phase(n: usize, name: &str, what: &str) {
 fn notary_acquire(may_change: bool) -> Check {
     match notary_check() {
         live @ (Check::Pass(_) | Check::Skip(_)) => live,
+        // `--check` keeps the LIVE verdict. Routing it into `ensure_notary` returned a
+        // blind "no notarytool credential in the keychain" — a statement that is FALSE
+        // about the machine when a credential exists and Apple refused it — and threw
+        // away both Apple's own error text and the pasteable `store-credentials` command.
+        // `--check` is the mode an operator runs to find out what is wrong BEFORE
+        // touching anything; it is the last place to substitute a guess for a measurement.
+        live if !may_change => live,
         _ => match crate::apple::ensure_notary(may_change) {
             // Re-run the live check rather than trusting store-credentials' exit status:
             // the thing a cut needs is a credential Apple answers to.
@@ -1475,6 +1943,20 @@ fn profile_check(
         path.display()
     );
     if !path.exists() {
+        // The profile is written only when `apple_sha1.is_some()`, so on the run that
+        // reaches this arm with no certificate the prescribed re-run writes NOTHING. The
+        // operator would follow the tool's own advice into a loop, and the run would
+        // invent a phantom second item to fix. Report the DEPENDENCY, and count it as
+        // waiting rather than as a gap — it still blocks, and the mint gate is unchanged.
+        if apple_sha1.is_none() {
+            return Check::Todo {
+                what: "not written yet: it pins the Developer ID certificate, and the \
+                       apple id line above has not produced one"
+                    .into(),
+                next: "nothing to do here — settle the apple id line and this writes itself"
+                    .into(),
+            };
+        }
         return Check::Fail {
             what: format!("no credentials profile at {}", path.display()),
             fix: format!("re-run `cargo ship provision --id {id}` — provision writes it"),
@@ -1602,9 +2084,16 @@ fn channel_token_check(slug: &str, may_change: bool) -> Check {
     // "mint", not "copy": a per-machine token revokes per-machine, the same reason the
     // signing key never travels. That is the design's reason, not the operator's next
     // action, so it is a comment here and not a second sentence on the remedy line.
+    // The URL matters more here than anywhere else in the crate: the CLASSIC-token page
+    // is the easy wrong turn from a bare "mint a PAT", and it produces the wrong scopes
+    // for a fine-grained-only org — a token that exists, reads as done, and fails at the
+    // upload step of a real cut. Every other credential remedy in this file gives a full
+    // click path; this one gave none.
     let fix = format!(
-        "mint a fine-grained PAT (Contents: read/write on {slug}, short expiry) and \
-         write it to {where_it_lives}, mode 600"
+        "1. https://github.com/settings/personal-access-tokens/new  (FINE-GRAINED, not \
+         the classic-token page)\n\
+         2. Contents: read/write on {slug}, short expiry\n\
+         3. (umask 077; cat > {where_it_lives})   (then paste it and press ^D)"
     );
     match publish::channel_token() {
         None => Check::Fail {
@@ -1622,14 +2111,18 @@ fn channel_token_check(slug: &str, may_change: bool) -> Check {
                 .map(|m| m.permissions().mode() & 0o077 != 0)
                 .unwrap_or(false);
             if !open {
-                return Check::Pass("channel token present, owner-only".into());
+                // Names the FILE. "channel token present" spent its first two words
+                // restating the label and never said WHERE, so an operator with a stale
+                // token in one location and a fresh one in another could not tell which
+                // the cut would use without reading `publish::channel_token_path`.
+                return Check::Pass(format!("{where_it_lives}  0600, owner-only"));
             }
             let tightened = may_change
                 && path.is_some_and(|p| {
                     std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).is_ok()
                 });
             if tightened {
-                Check::Pass("channel token present (tightened to 0600)".into())
+                Check::Pass(format!("{where_it_lives}  tightened to 0600"))
             } else {
                 Check::Fail {
                     what: format!("{where_it_lives} is group/other-accessible"),

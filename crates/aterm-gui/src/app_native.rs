@@ -838,6 +838,7 @@ pub(crate) fn durable_update_status(status: aterm_update::UpdateStatus) -> Durab
         failing_kind: status.failing_kind,
         failing_applies: status.failing_applies,
         installable: status.installable,
+        channel_unreadable: status.channel_unreadable,
     }
 }
 
@@ -858,6 +859,8 @@ fn failed_update_status(build: u64, message: String) -> DurableUpdateStatus {
         // A worker failure says nothing about the bundle; the installable claim is
         // only ever made by a real observation.
         installable: true,
+        // Likewise: only a completed check can pronounce the channel unreadable.
+        channel_unreadable: false,
     }
 }
 
@@ -4368,8 +4371,8 @@ impl App {
                     // words.
                     Ok(status) if status.code() == Some(2) => PackagesCommandOutcome::Failed {
                         operation: busy,
-                        message: "No ALab build is published for this Mac's architecture yet, \
-                                  so nothing was installed. This is not a temporary error — \
+                        message: "Nothing was installed: the registry served no package \
+                                  this Mac can run. This is not a temporary error — \
                                   retrying will not change it."
                             .to_string(),
                     },
@@ -8136,6 +8139,7 @@ mod tests {
             failing_kind: String::new(),
             failing_applies: 0,
             installable: true,
+            channel_unreadable: false,
         }
     }
 
@@ -8265,6 +8269,7 @@ mod tests {
                 failing_kind: String::new(),
                 failing_applies: 0,
                 installable: true,
+                channel_unreadable: false,
             }),
             Some(InstalledUpdate {
                 build,
@@ -8317,6 +8322,7 @@ mod tests {
                     failing_kind: String::new(),
                     failing_applies: 0,
                     installable: true,
+                    channel_unreadable: false,
                 }),
                 Some(installed_update(running)),
             )
@@ -9541,6 +9547,7 @@ mod tests {
                     failing_kind: String::new(),
                     failing_applies: 0,
                     installable: true,
+                    channel_unreadable: false,
                 },
             ),
             CheckCompletion::Reduced,
@@ -9609,6 +9616,7 @@ mod tests {
                         failing_kind: String::new(),
                         failing_applies: 0,
                         installable: true,
+                        channel_unreadable: false,
                     }),
                     Some(InstalledUpdate {
                         build,
@@ -10414,6 +10422,7 @@ mod tests {
                 failing_kind: String::new(),
                 failing_applies: 0,
                 installable: true,
+                channel_unreadable: false,
             }),
             Some(InstalledUpdate {
                 build,

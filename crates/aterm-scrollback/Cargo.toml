@@ -63,7 +63,18 @@ harness = false
 required-features = ["disk-tier"]
 
 [[bench]]
+name = "disk_push_line"
+harness = false
+# Prices the disk cold tier's append path (ST-1): fsync policy + remap
+# elimination under steady growth and capped-session rotation.
+required-features = ["disk-tier"]
+
+[[bench]]
 name = "push_line"
+harness = false
+
+[[bench]]
+name = "iterate"
 harness = false
 
 [[bench]]

@@ -781,6 +781,7 @@ pub fn begin_toolchain_install() {
 /// carrying our pid went stale the instant we exited, and the next launch's boot
 /// apply — the one this guard exists for — then swapped the bundle out from under a
 /// live extraction (2026-08-20 round-10 audit).
+#[cfg(target_os = "macos")]
 pub fn note_toolchain_install_pid(pid: u32) {
     let Some(staging) = paths::Staging::resolve() else {
         return;
@@ -808,7 +809,12 @@ pub fn note_toolchain_install_pid(pid: u32) {
     let _ = std::fs::write(&marker, pid.to_string());
 }
 
+/// Non-macOS: no staging dir, no durable marker — the in-process flag is the guard.
+#[cfg(not(target_os = "macos"))]
+pub fn note_toolchain_install_pid(_pid: u32) {}
+
 /// The install is over: drop both the in-process flag and the durable marker.
+#[cfg(target_os = "macos")]
 pub fn end_toolchain_install(pid: Option<u32>) {
     TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     let Some(staging) = paths::Staging::resolve() else {
@@ -836,11 +842,18 @@ pub fn end_toolchain_install(pid: Option<u32>) {
     let _ = std::fs::remove_file(&marker);
 }
 
+/// Non-macOS: no durable marker to tear down — drop the in-process flag only.
+#[cfg(not(target_os = "macos"))]
+pub fn end_toolchain_install(_pid: Option<u32>) {
+    TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Whether a toolchain install is reading this bundle's sealed payload right now.
 ///
 /// True when this process set the flag, OR when a LIVE process left the durable
 /// marker. A marker whose pid is gone — the installer was killed — is stale and is
 /// removed here rather than blocking updates forever.
+#[cfg(target_os = "macos")]
 #[must_use]
 pub fn is_toolchain_install_active() -> bool {
     if TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
@@ -863,6 +876,14 @@ pub fn is_toolchain_install_active() -> bool {
         let _ = std::fs::remove_file(&marker);
     }
     alive
+}
+
+/// Non-macOS: no durable marker — only this process's own flag can say an install
+/// is live.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn is_toolchain_install_active() -> bool {
+    TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Mark this process an uncommitted handoff candidate (`true` at boot when the
@@ -1053,10 +1074,12 @@ pub fn spawn_background_check(
             // immediate" directive). In practice this cadence buys a fast STAGE and
             // the swap happens at the next launch (see the module docs' delivery
             // model for what the seamless handoff does and does not deliver).
-            // Cost honesty: a check spends a couple of requests per cycle. WITH a
-            // token that is ~100/h against the 5000/h budget; WITHOUT one (the public
-            // channel, no credential provisioned) the budget is ~60/h PER IP and the
-            // cadence has to be far slower or every check is rate-limited — hence the
+            // Cost honesty: a steady-state check on the armed tier spends 5 requests
+            // (list + manifest + roster + both signatures; 6 with a container). WITH
+            // a token that is ~240/h against the 5000/h budget; WITHOUT one (the
+            // public channel, no credential provisioned) the budget is ~60/h PER IP
+            // and the cadence has to be far slower or every check is rate-limited —
+            // hence the
             // per-lane interval below, adopted as soon as a check reveals which lane
             // this machine is on. `ATERM_UPDATE_INTERVAL_SECS` overrides BOTH (and is
             // then never second-guessed); 0 means check once and stop.
@@ -1157,6 +1180,45 @@ pub fn spawn_background_check(
                 }
                 match check_lane().try_lock() {
                     Ok(_lane) => {
+                        // CROSS-PROCESS DEDUP. The lane mutex above is process-local
+                        // (the module docs say so), and since the one-binary era every
+                        // terminal SESSION runs this same loop — round-11 found that
+                        // sessions used to run NONE of it, so terminal-only Macs never
+                        // updated at all. N aterm processes must cost the shared
+                        // GitHub budget ~one check per interval, not N: the flock
+                        // serializes checkers machine-wide (the holder is bounded by
+                        // the network timeouts), and the ledger re-read under it turns
+                        // "another process just completed this interval's check" into
+                        // a quiet skip. The freshness window is 70% of the base —
+                        // strictly below the jittered minimum wait (80%), so a
+                        // process can never mistake its OWN previous stamp for
+                        // another checker's and starve itself.
+                        let checker_staging = paths::Staging::resolve();
+                        let _checker_gate = checker_staging.as_ref().and_then(|s| {
+                            aterm_update_core::FileLock::acquire(
+                                &s.status.with_file_name("checker.lock"),
+                            )
+                            .ok()
+                        });
+                        if checker_staging
+                            .as_ref()
+                            .is_some_and(|s| another_process_checked(s, schedule.base()))
+                        {
+                            log("another aterm process completed this interval's update check");
+                            // Release the flock BEFORE sleeping — holding it through
+                            // the wait would serialize every other process on OUR
+                            // timer — then take the same jittered wait the loop tail
+                            // takes (a bare `continue` would skip the tail's sleep
+                            // and spin hot). The wake subtleties (settle window,
+                            // still-failing suppression) only matter ahead of a
+                            // network check, which this cycle deliberately isn't.
+                            drop(_checker_gate);
+                            let (_delay, waited) = cadence::wait(&schedule);
+                            if matches!(waited, cadence::Waited::Woke(_)) {
+                                schedule.woke();
+                            }
+                            continue;
+                        }
                         // Stamped BEFORE the check so the ledger can be asked, after
                         // it, whether THIS check recorded a failure (see the `Ok(None)`
                         // arm). RFC3339 strings compare chronologically.
@@ -1469,6 +1531,22 @@ pub struct UpdateStatus {
     /// line (`aterm-ctl update status` prints `rescues=`) and its consumers stay
     /// byte-stable through the bridge release; it goes with the Phase-2 diet.
     pub rescues: u64,
+    /// The class of the STANDING acquisition streak — the one [`Self::failing_checks`]
+    /// counts — or `""` when every acquisition streak is clear. Distinct from
+    /// [`Self::failing_kind`] (the most recent failure of ANY class, apply included)
+    /// on purpose: rendering `failing=<n>:<kind>` from the pair spliced an
+    /// acquisition COUNT with an apply LABEL whenever an apply failure landed last,
+    /// sending a reader after an acquisition fault that did not exist.
+    pub failing_checks_kind: String,
+    /// The STRANDED verdict: the last completed check proved this machine cannot
+    /// READ its release channel (401/403/404 with nothing to try, or a renamed
+    /// repo) and will NEVER update until an operator acts. Deliberately records
+    /// ZERO health-ledger failures — a configuration state is not a transient
+    /// fault — which is exactly why [`Self::failing_persistent`] can never say it
+    /// and surfaces keyed on that field alone headlined "You're up to date." at
+    /// permanently stranded machines (round-11 audit). The full explanation, with
+    /// the remedy, rides in [`Self::outcome`].
+    pub channel_unreadable: bool,
 }
 
 impl UpdateStatus {
@@ -1517,6 +1595,8 @@ impl UpdateStatus {
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,
+            failing_checks_kind: String::new(),
+            channel_unreadable: false,
         }
     }
 }
@@ -1702,6 +1782,29 @@ fn reconcile_status_outcome(
     }
 }
 
+/// Whether the shared ledger records a check completed WITHIN the freshness
+/// window — i.e. another aterm process (the window, or a sibling session) has
+/// already spent this interval's network budget. The window is 70% of the base
+/// interval: strictly below the jittered minimum wait (80% of nominal), so a
+/// process can never mistake its OWN previous cycle's stamp for another
+/// checker's and starve itself. Deferrals (rate limit, stranded) also stamp the
+/// ledger, so a machine that was just told to slow down is not immediately
+/// re-poked by a sibling.
+#[cfg(target_os = "macos")]
+fn another_process_checked(staging: &paths::Staging, base: std::time::Duration) -> bool {
+    let Some(text) = read_ledger_text(&staging.status) else {
+        return false;
+    };
+    let Ok(v) = text.parse::<toml::Value>() else {
+        return false;
+    };
+    let Some(updated) = v.get("updated_at").and_then(toml::Value::as_str) else {
+        return false;
+    };
+    let fresh_window = base.as_secs().saturating_mul(7) / 10;
+    !updated.is_empty() && !rfc3339_older_than(updated, fresh_window)
+}
+
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn status(current_build: u64) -> Option<UpdateStatus> {
@@ -1759,11 +1862,16 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         updated_at,
         failing_checks: h.acquisition_failures(),
         failing_persistent: h.is_persistent(),
+        failing_checks_kind: h
+            .standing_acquisition_class()
+            .unwrap_or_default()
+            .to_string(),
         failing_kind: h.kind,
         failing_applies: h.apply_failures,
         failing_since: h.failing_since,
         // The rescue lane is gone (v0.26); the protocol field stays, pinned to 0.
         rescues: 0,
+        channel_unreadable: no_token::is_stranded(),
     })
 }
 
@@ -1772,6 +1880,28 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
 #[must_use]
 pub fn status(_current_build: u64) -> Option<UpdateStatus> {
     None
+}
+
+/// Whether `stamp` — an RFC3339 UTC timestamp as this crate writes them
+/// ([`UpdateStatus::updated_at`], the health ledger) — is older than `secs` ago.
+///
+/// The ledger's fixed-shape UTC strings compare chronologically as strings, so
+/// this is one lexical comparison against `now - secs` rendered the same way —
+/// the idiom `health.rs` already leans on. An empty or oddly-shaped stamp is NOT
+/// stale (a never-checked ledger has its own signals, and a malformed one must
+/// not raise a scary flag over a formatting difference): anything not starting
+/// with an ASCII digit is refused outright.
+#[must_use]
+pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
+    if !stamp.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let threshold = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(secs));
+    !threshold.is_empty() && *stamp < *threshold
 }
 
 /// Run ONE update check + stage synchronously and return the resulting [`UpdateStatus`]
@@ -1847,6 +1977,26 @@ pub(crate) fn log(msg: &str) {
 #[cfg(target_os = "macos")]
 pub(crate) fn warn(msg: &str) {
     aterm_log::warn!("aterm-update: {msg}");
+}
+
+#[cfg(test)]
+mod rfc3339_age_tests {
+    use super::rfc3339_older_than;
+
+    #[test]
+    fn empty_and_malformed_stamps_are_never_stale() {
+        // "never checked" and "someone hand-edited the ledger" both have their own
+        // signals; a scary staleness flag must not be one formatting slip away.
+        assert!(!rfc3339_older_than("", 60));
+        assert!(!rfc3339_older_than("never", 60));
+        assert!(!rfc3339_older_than("-", 60));
+    }
+
+    #[test]
+    fn ancient_stamps_are_stale_and_future_stamps_are_not() {
+        assert!(rfc3339_older_than("2001-01-01T00:00:00Z", 60));
+        assert!(!rfc3339_older_than("2999-01-01T00:00:00Z", 60));
+    }
 }
 
 #[cfg(test)]

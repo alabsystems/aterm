@@ -16,7 +16,7 @@
 //! - **State transitions** (`handler_state.rs`): grid/mode mutations from typed operations
 //! - **Side-effects**: callbacks and external service activation (inline in handler files)
 
-use crate::grid::{CellFlags, Color, PackedColor, Style, StyleId};
+use crate::grid::{CellFlags, PackedColor};
 use crate::parser::ActionSink;
 use aterm_provenance::{Provenance, Pty};
 use aterm_types::charset::{GlMapping, SingleShift};
@@ -574,11 +574,50 @@ impl TerminalHandler<'_> {
         self.handle_complete_kitty_command(cmd);
     }
 
+    /// Clear every VISIBLE placement whose backing image `selected` accepts,
+    /// damaging each cleared cell so the repaint erases it.
+    ///
+    /// Placements are `ImageRef` Arcs stamped into cell extras, so "delete a
+    /// placement" is a visible-grid sweep matching on the shared `Arc` — ptr
+    /// identity, because [`aterm_grid::ImageData`] carries no kitty id (the
+    /// store map owns that association). The read side uses the non-allocating
+    /// [`aterm_grid::Grid::cell_extra`]; `cell_extra_mut` is touched only for
+    /// cells that actually match, so a sweep over a grid with no images
+    /// allocates nothing. Rows already scrolled into scrollback keep their
+    /// pixels — kitty deletion addresses the screen, and scrolled-away
+    /// placements age out with their rows.
+    fn clear_kitty_placements(
+        &mut self,
+        selected: &dyn Fn(&std::sync::Arc<aterm_grid::ImageData>) -> bool,
+    ) {
+        for row in 0..self.grid.rows() {
+            for col in 0..self.grid.cols() {
+                let hit = self
+                    .grid
+                    .cell_extra(row, col)
+                    .and_then(|extra| extra.image())
+                    .is_some_and(|placed| selected(&placed.image));
+                if hit {
+                    self.grid.cell_extra_mut(row, col).set_image(None);
+                    self.grid.damage_mut().mark_cell(row, col);
+                }
+            }
+        }
+    }
+
     /// Handle one COMPLETE (chunk-assembled) Kitty graphics command:
-    /// delete (clear / by-id), put/display (place a stored image), or transmit /
-    /// transmit-and-display (decode, store by id, optionally place). Query,
-    /// animation, and non-direct mediums are deferred — so `kitty_graphics` stays
-    /// advertised FALSE until those land (no false advertise).
+    /// delete (placements per selector, data under uppercase selectors),
+    /// put/display (place a stored image), transmit / transmit-and-display
+    /// (decode, store by id, optionally place), query (answered per medium
+    /// availability), animation frames (`a=f`, appended per id), and — when the
+    /// host installs the opt-in resolver — the non-direct file/temp/shm
+    /// mediums.
+    ///
+    /// `kitty_graphics` stays advertised FALSE (no false advertise) for the
+    /// pieces still missing, which are no longer the ones an earlier version of
+    /// this comment named: placement ids (`p=`) and delete-by-point/number
+    /// (`x=`/`y=` are not even parsed), animation CONTROL (`a=a`), source
+    /// cropping, z-index compositing between images, and Unicode placeholders.
     #[allow(
         clippy::too_many_lines,
         reason = "single per-action dispatch (transmit/frame/display/delete) with inline global-byte-budget accounting per arm"
@@ -590,36 +629,112 @@ impl TerminalHandler<'_> {
         use crate::terminal::kitty_graphics::KittyAction;
         match cmd.action {
             KittyAction::Delete => {
-                // d=i / d=I with i=<id>: delete that one image; otherwise (d=a/A or
-                // no d=) clear the whole store.
+                // Kitty delete semantics, on aterm's placement model (an image is
+                // PLACED by stamping `ImageRef` Arcs into cell extras; the store
+                // maps id -> Arc for later re-display). Two invariants the spec
+                // sets and this arm now honors:
+                //
+                //   * a LOWERCASE selector deletes placements and KEEPS the
+                //     transmitted data (the id stays placeable); UPPERCASE also
+                //     frees the data. Preview cyclers (yazi, icat) lean on
+                //     lowercase keeping data.
+                //   * a selector addresses SPECIFIC placements — it is never
+                //     license to clear the whole store.
+                //
+                // Neither held before: every selector except i/I nuked the entire
+                // store, lowercase i destroyed data — and NOTHING ever cleared a
+                // placed cell, so the "deleted" image stayed on screen while the
+                // terminal forgot it had it. Delete was thus simultaneously too
+                // destructive (all data gone) and not destructive enough (all
+                // pixels kept).
                 match cmd.delete_target {
-                    Some('i' | 'I') => {
-                        if let Some(id) = cmd.id {
-                            // Decrement the global byte budget by the bytes held in
-                            // BOTH slots for this id (counted independently above).
-                            let freed = self
-                                .transient
-                                .kitty_images
-                                .get(&id)
-                                .map(|img| img.bytes.len())
-                                .unwrap_or(0)
-                                + self
-                                    .transient
-                                    .kitty_frames
-                                    .get(&id)
-                                    .map(|fs| fs.iter().map(|f| f.bytes.len()).sum::<usize>())
-                                    .unwrap_or(0);
-                            self.transient.kitty_images.remove(&id);
-                            self.transient.kitty_frames.remove(&id);
-                            self.transient.kitty_total_bytes =
-                                self.transient.kitty_total_bytes.saturating_sub(freed);
+                    // No d=, d=a, d=A: every visible placement; 'A' also frees
+                    // the whole store.
+                    None | Some('a' | 'A') => {
+                        self.clear_kitty_placements(&|_| true);
+                        if cmd.delete_target == Some('A') {
+                            self.transient.kitty_images.clear();
+                            self.transient.kitty_frames.clear();
+                            self.transient.kitty_total_bytes = 0;
                         }
                     }
-                    _ => {
-                        self.transient.kitty_images.clear();
-                        self.transient.kitty_frames.clear();
-                        self.transient.kitty_total_bytes = 0;
+                    Some('i' | 'I') => {
+                        if let Some(id) = cmd.id {
+                            if let Some(img) = self.transient.kitty_images.get(&id).cloned() {
+                                self.clear_kitty_placements(&|placed| {
+                                    std::sync::Arc::ptr_eq(placed, &img)
+                                });
+                            }
+                            if cmd.delete_target == Some('I') {
+                                // Decrement the global byte budget by the bytes held
+                                // in BOTH slots for this id (counted independently
+                                // above).
+                                let freed = self
+                                    .transient
+                                    .kitty_images
+                                    .get(&id)
+                                    .map(|img| img.bytes.len())
+                                    .unwrap_or(0)
+                                    + self
+                                        .transient
+                                        .kitty_frames
+                                        .get(&id)
+                                        .map(|fs| fs.iter().map(|f| f.bytes.len()).sum::<usize>())
+                                        .unwrap_or(0);
+                                self.transient.kitty_images.remove(&id);
+                                self.transient.kitty_frames.remove(&id);
+                                self.transient.kitty_total_bytes =
+                                    self.transient.kitty_total_bytes.saturating_sub(freed);
+                            }
+                        }
                     }
+                    // At the cursor: whichever image covers the cursor cell is
+                    // cleared in full (ptr identity — one placement, all its
+                    // cells); 'C' also frees that image's store entry.
+                    Some('c' | 'C') => {
+                        let at = self
+                            .grid
+                            .cell_extra(self.grid.cursor_row(), self.grid.cursor_col())
+                            .and_then(|extra| extra.image())
+                            .map(|placed| std::sync::Arc::clone(&placed.image));
+                        if let Some(img) = at {
+                            self.clear_kitty_placements(&|placed| {
+                                std::sync::Arc::ptr_eq(placed, &img)
+                            });
+                            if cmd.delete_target == Some('C') {
+                                let id = self
+                                    .transient
+                                    .kitty_images
+                                    .iter()
+                                    .find(|(_, stored)| std::sync::Arc::ptr_eq(stored, &img))
+                                    .map(|(id, _)| *id);
+                                if let Some(id) = id {
+                                    let freed = img.bytes.len()
+                                        + self
+                                            .transient
+                                            .kitty_frames
+                                            .get(&id)
+                                            .map(|fs| {
+                                                fs.iter().map(|f| f.bytes.len()).sum::<usize>()
+                                            })
+                                            .unwrap_or(0);
+                                    self.transient.kitty_images.remove(&id);
+                                    self.transient.kitty_frames.remove(&id);
+                                    self.transient.kitty_total_bytes =
+                                        self.transient.kitty_total_bytes.saturating_sub(freed);
+                                }
+                            }
+                        }
+                    }
+                    // Selectors this engine cannot address yet: by point (p/P —
+                    // the parser reads no x=/y= keys), by number (n/N — numbers
+                    // are not mapped to ids at transmit), by placement id (q/Q),
+                    // by column/row/z (x/y/z). Deleting NOTHING is the honest
+                    // fallback: it is recoverable, matches the advertised
+                    // `kitty_graphics = false` posture, and is strictly closer to
+                    // the spec than the previous behavior — which answered every
+                    // one of these by destroying the entire store.
+                    Some(_) => {}
                 }
             }
             KittyAction::Display => {
@@ -686,13 +801,31 @@ impl TerminalHandler<'_> {
             // `_` arm (no response). Echo the id (i=) or number (I=) the client used.
             KittyAction::Query if cmd.quiet == 0 => {
                 use core::fmt::Write as _;
-                let mut r = crate::terminal::stack_response::StackResponse::<32>::new();
-                if let Some(id) = cmd.id {
-                    let _ = write!(r, "\x1b_Gi={id};OK\x1b\\");
-                } else if let Some(n) = cmd.number {
-                    let _ = write!(r, "\x1b_GI={n};OK\x1b\\");
+                // Answer the probe HONESTLY per the queried medium. Clients ask
+                // `a=q` before committing to a transmission strategy (kitty's
+                // icat probes `t=f` and falls back to direct on an error
+                // reply), and this arm used to say OK unconditionally — so on
+                // a session where the non-direct resolver was never installed
+                // (`allow_kitty_file_transfer` is opt-in, default off) the
+                // prober was told file/shm transfer works, and its real
+                // transmits then failed as a SILENT fail-closed skip: an
+                // advertised capability that drops every payload. Direct is
+                // always real; the rest are exactly as real as the resolver.
+                let medium_works = cmd.medium
+                    == crate::terminal::kitty_graphics::KittyMedium::Direct
+                    || self.kitty_file_resolver.is_some();
+                let verdict = if medium_works {
+                    "OK"
                 } else {
-                    let _ = write!(r, "\x1b_G;OK\x1b\\");
+                    "ENOTSUPPORTED:medium disabled (allow_kitty_file_transfer)"
+                };
+                let mut r = crate::terminal::stack_response::StackResponse::<96>::new();
+                if let Some(id) = cmd.id {
+                    let _ = write!(r, "\x1b_Gi={id};{verdict}\x1b\\");
+                } else if let Some(n) = cmd.number {
+                    let _ = write!(r, "\x1b_GI={n};{verdict}\x1b\\");
+                } else {
+                    let _ = write!(r, "\x1b_G;{verdict}\x1b\\");
                 }
                 // Route the reply through the single response sink (like every
                 // other PTY reply — handler.rs::send_response) so the capability /
@@ -967,7 +1100,6 @@ impl TerminalHandler<'_> {
             self.style.reset_sgr();
             self.transient.current_underline_color = None;
             self.transient.update_has_transient_extras();
-            *self.current_style_id = StyleId::DEFAULT;
             // Reset BCE cursor template when SGR is fully default (#7522).
             self.grid
                 .set_cursor_template(crate::grid::Cell::EMPTY, None);
@@ -981,33 +1113,23 @@ impl TerminalHandler<'_> {
                     let index =
                         crate::terminal::sgr_color_u8(if p >= 90 { p - 90 + 8 } else { p - 30 });
                     self.style.fg = PackedColor::indexed(index);
-                    let probe = Style {
-                        fg: Color::from_ansi_256(index),
-                        bg: self.style.cached_bg_color(),
-                        attrs: self.style.cached_attrs(),
-                    };
-                    if let Some(id) = self.grid.try_intern_style_l1(&probe) {
-                        self.style.update_fg_cache_indexed(index);
-                        *self.current_style_id = id;
-                    } else if let Some(id) = self.grid.try_intern_style_l2_indexed(&probe, index) {
-                        self.style.update_fg_cache_indexed(index);
-                        *self.current_style_id = id;
-                    } else {
-                        let ext = self.style.build_extended_style_fg_changed();
-                        *self.current_style_id = self.grid.intern_extended_style(ext);
-                    }
+                    // Was: build an L1 probe `Style`, scan the 4-way L1, then the
+                    // 256-entry indexed L2, then intern on miss — all to compute a
+                    // `StyleId` no production reader consumes (see
+                    // `SgrStyleHandler::apply_style_change`). What the writers
+                    // actually need is the colour cache, and they need it on EVERY
+                    // path: the old cache-hit branches called
+                    // `update_fg_cache_indexed`, which does NOT refresh
+                    // `cached_has_style_extras`, so an RGB→indexed fg change that
+                    // happened to hit L1/L2 left that flag stale-true and the next
+                    // write set HAS_EXTRAS on a cell with no extras. One
+                    // unconditional refresh removes the divergence.
+                    self.style.update_cached_colors();
                     return;
                 }
                 39 => {
                     self.style.fg = PackedColor::DEFAULT_FG;
                     self.style.update_cached_colors();
-                    let style = self.style.build_style();
-                    if let Some(id) = self.grid.try_intern_style_l1(&style) {
-                        *self.current_style_id = id;
-                    } else {
-                        let ext = self.style.build_extended_style();
-                        *self.current_style_id = self.grid.intern_extended_style(ext);
-                    }
                     return;
                 }
                 40..=47 | 100..=107 => {
@@ -1017,12 +1139,7 @@ impl TerminalHandler<'_> {
                         } else {
                             p - 40
                         }));
-                    let ext = self.style.build_extended_style_bg_changed();
-                    if let Some(id) = self.grid.try_intern_style_l1(&ext.style) {
-                        *self.current_style_id = id;
-                    } else {
-                        *self.current_style_id = self.grid.intern_extended_style(ext);
-                    }
+                    self.style.update_cached_colors();
                     // Update BCE cursor template for background change (#7522).
                     self.grid.set_cursor_template(
                         crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -1033,13 +1150,6 @@ impl TerminalHandler<'_> {
                 49 => {
                     self.style.bg = PackedColor::DEFAULT_BG;
                     self.style.update_cached_colors();
-                    let style = self.style.build_style();
-                    if let Some(id) = self.grid.try_intern_style_l1(&style) {
-                        *self.current_style_id = id;
-                    } else {
-                        let ext = self.style.build_extended_style();
-                        *self.current_style_id = self.grid.intern_extended_style(ext);
-                    }
                     // Reset BCE cursor template when bg returns to default (#7522).
                     self.grid.set_cursor_template(
                         crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -1063,12 +1173,7 @@ impl TerminalHandler<'_> {
                     params[3].min(255) as u8,
                     params[4].min(255) as u8,
                 );
-                let ext = self.style.build_extended_style_fg_changed();
-                if let Some(id) = self.grid.try_intern_style_l1(&ext.style) {
-                    *self.current_style_id = id;
-                } else {
-                    *self.current_style_id = self.grid.intern_extended_style(ext);
-                }
+                self.style.update_cached_colors();
                 return;
             }
             if params[0] == 48 {
@@ -1077,12 +1182,7 @@ impl TerminalHandler<'_> {
                     params[3].min(255) as u8,
                     params[4].min(255) as u8,
                 );
-                let ext = self.style.build_extended_style_bg_changed();
-                if let Some(id) = self.grid.try_intern_style_l1(&ext.style) {
-                    *self.current_style_id = id;
-                } else {
-                    *self.current_style_id = self.grid.intern_extended_style(ext);
-                }
+                self.style.update_cached_colors();
                 // Update BCE cursor template for truecolor bg change (#7522).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -1096,31 +1196,14 @@ impl TerminalHandler<'_> {
             let index = crate::terminal::sgr_color_u8(params[2]);
             if params[0] == 38 {
                 self.style.fg = PackedColor::indexed(index);
-                let probe = Style {
-                    fg: Color::from_ansi_256(index),
-                    bg: self.style.cached_bg_color(),
-                    attrs: self.style.cached_attrs(),
-                };
-                if let Some(id) = self.grid.try_intern_style_l1(&probe) {
-                    self.style.update_fg_cache_indexed(index);
-                    *self.current_style_id = id;
-                } else if let Some(id) = self.grid.try_intern_style_l2_indexed(&probe, index) {
-                    self.style.update_fg_cache_indexed(index);
-                    *self.current_style_id = id;
-                } else {
-                    let ext = self.style.build_extended_style_fg_changed();
-                    *self.current_style_id = self.grid.intern_extended_style(ext);
-                }
+                // See the ANSI-fg arm above: one unconditional cache refresh
+                // replaces the L1/L2/intern ladder AND its stale-flag divergence.
+                self.style.update_cached_colors();
                 return;
             }
             if params[0] == 48 {
                 self.style.bg = PackedColor::indexed(index);
-                let ext = self.style.build_extended_style_bg_changed();
-                if let Some(id) = self.grid.try_intern_style_l1(&ext.style) {
-                    *self.current_style_id = id;
-                } else {
-                    *self.current_style_id = self.grid.intern_extended_style(ext);
-                }
+                self.style.update_cached_colors();
                 // Update BCE cursor template for 256-color bg change (#7522).
                 self.grid.set_cursor_template(
                     crate::grid::Cell::bce_blank(self.style.cached_colors()),
@@ -1430,16 +1513,27 @@ mod kitty_display_tests {
         );
     }
 
+    /// Bare `a=d` clears visible placements but KEEPS the store (spec: only an
+    /// UPPERCASE selector frees data), so `a=p` still displays; `d=A` is the
+    /// form that empties the store and makes `a=p` a no-op. (This test used to
+    /// pin the opposite — bare delete nuking the store — which is exactly the
+    /// defect that broke preview cyclers.)
     #[test]
-    fn delete_clears_store_so_put_is_noop() {
+    fn bare_delete_keeps_store_but_uppercase_all_frees_it() {
         let mut term = Terminal::new(24, 80);
         term.set_cell_pixel_size(10, 20);
         term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
         term.process(&apc_g("a=d", b""));
-        term.process(&apc_g("a=p,i=5", b"")); // store cleared -> nothing to place
+        term.process(&apc_g("a=p,i=5", b"")); // store kept -> still placeable
+        assert!(
+            !term.cell_frame(24, 80).images[0].is_empty(),
+            "bare a=d keeps the store; a=p still displays"
+        );
+        term.process(&apc_g("a=d,d=A", b""));
+        term.process(&apc_g("a=p,i=5", b"")); // store freed -> nothing to place
         assert!(
             term.cell_frame(24, 80).images[0].is_empty(),
-            "a=d cleared the store; a=p cannot display"
+            "d=A freed the store; a=p cannot display"
         );
     }
 
@@ -1449,8 +1543,10 @@ mod kitty_display_tests {
         term.set_cell_pixel_size(10, 20);
         term.process(&apc_g("a=t,f=32,s=10,v=20,i=5", &one_cell_rgba()));
         term.process(&apc_g("a=t,f=32,s=10,v=20,i=6", &one_cell_rgba()));
-        // d=i,i=5 deletes only image 5; image 6 still displays.
-        term.process(&apc_g("a=d,d=i,i=5", b""));
+        // d=I,i=5 (UPPERCASE: placements + data) deletes only image 5; image 6
+        // still displays. Lowercase d=i keeps the data by spec — covered by
+        // tests/kitty_graphics_delete.rs.
+        term.process(&apc_g("a=d,d=I,i=5", b""));
         assert!(
             term.cell_frame(24, 80).images[0].is_empty(),
             "deleted id 5 cannot be put"
@@ -1713,6 +1809,37 @@ mod kitty_display_tests {
         );
     }
 
+    /// The probe answers per MEDIUM: a `t=f` query on a session with no
+    /// non-direct resolver installed (the default — `allow_kitty_file_transfer`
+    /// is opt-in) must ERROR so the prober falls back to direct, instead of the
+    /// old unconditional OK that promised a capability whose every transmit was
+    /// then dropped by the fail-closed skip. Installing the resolver flips the
+    /// same probe to OK; direct stays OK throughout.
+    #[test]
+    fn query_answers_per_medium_availability() {
+        let mut term = Terminal::new(24, 80);
+        term.process(&apc_g("a=q,i=3,t=f", b""));
+        let reply = term.take_response().unwrap_or_default();
+        let reply = String::from_utf8_lossy(&reply).into_owned();
+        assert!(
+            reply.starts_with("\x1b_Gi=3;ENOTSUPPORTED"),
+            "no resolver -> t=f errors: {reply:?}"
+        );
+        term.process(&apc_g("a=q,i=3,t=d", b""));
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b_Gi=3;OK\x1b\\",
+            "direct is always real"
+        );
+        term.set_kitty_file_resolver(|_, _| None);
+        term.process(&apc_g("a=q,i=3,t=f", b""));
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b_Gi=3;OK\x1b\\",
+            "with the resolver installed the same probe is OK"
+        );
+    }
+
     #[test]
     fn malformed_raw_buffer_is_rejected() {
         let mut term = Terminal::new(24, 80);
@@ -1933,16 +2060,18 @@ mod kitty_display_tests {
         term.process(&apc_g("a=t,f=32,s=4,v=4,i=2", &img));
         assert_eq!(term.transient.kitty_total_bytes, 5 * n);
 
-        // Delete just id 1 (its image + its 2 frames = 3 slots freed).
-        term.process(&apc_g("a=d,d=i,i=1", b""));
+        // Data-freeing deletes are the UPPERCASE selectors; lowercase keeps the
+        // store (and therefore the budget) by spec. Delete just id 1's DATA
+        // (its image + its 2 frames = 3 slots freed).
+        term.process(&apc_g("a=d,d=I,i=1", b""));
         assert_eq!(
             term.transient.kitty_total_bytes,
             2 * n,
             "delete id 1 frees 3 slots"
         );
 
-        // Delete-all clears the counter to zero.
-        term.process(&apc_g("a=d,d=a", b""));
+        // Uppercase delete-all clears the counter to zero.
+        term.process(&apc_g("a=d,d=A", b""));
         assert_eq!(
             term.transient.kitty_total_bytes, 0,
             "delete-all resets the budget"

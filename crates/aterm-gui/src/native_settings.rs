@@ -3173,12 +3173,11 @@ enum AdvancedEffectPath {
 fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
     use AdvancedEffectPath as Effect;
 
-    // These parsed settings have no shipping host-side effect. Keep authored
-    // values visible in Modified and editable in Manual, but do not manufacture
-    // an ordinary native switch that claims the feature works.
-    if key == prefs::EDIT_ALLOW_OSC52_QUERY {
-        return None;
-    }
+    // A parsed setting with no shipping host-side effect keeps its authored
+    // value visible in Modified and editable in Manual, but gets no ordinary
+    // native switch that claims the feature works. (allow_osc52_query LEFT this
+    // set when the GUI's clipboard callback learned to answer authorized
+    // queries — it rides the ordinary SecurityPolicy switch now.)
     if key == prefs::EDIT_ALLOW_NOTIFICATIONS && !crate::notify::delivery_available() {
         return None;
     }
@@ -11225,11 +11224,6 @@ fn platform_unavailability(
         EffectDisclosure::new(EffectNoteKind::Unavailable, semantic, visual, feedback)
     };
     match key {
-        prefs::EDIT_ALLOW_OSC52_QUERY => Some(unavailable(
-            "The GUI does not implement OSC 52 clipboard-query replies. This compatibility value is preserved but has no effect in this build",
-            "Unavailable · OSC 52 query replies not implemented",
-            "Unavailable; OSC 52 clipboard queries are not implemented",
-        )),
         prefs::EDIT_ALLOW_NOTIFICATIONS if !availability.notifications => Some(unavailable(
             "Desktop-notification delivery is unavailable on this platform. The saved value is preserved for portability",
             "Unavailable on this platform",
@@ -14020,6 +14014,10 @@ fn compact_update_headline(update: &UpdateProjection) -> String {
         // Not "Current": nothing was compared, and this copy could not take a newer
         // build if one existed (2026-08-19 round-6 audit).
         "Can\u{2019}t update".to_string()
+    } else if update.channel_unreadable {
+        // The stranded verdict: not "Current" — the channel cannot be read, so no
+        // comparison ever happened and none ever will until an operator acts.
+        "Can\u{2019}t check".to_string()
     } else if update.enabled {
         "Current".to_string()
     } else {
@@ -14040,6 +14038,8 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
         "Updates are failing.".to_string()
     } else if !update.installable {
         "This copy cannot be replaced in place.".to_string()
+    } else if update.channel_unreadable {
+        "The release channel can\u{2019}t be read.".to_string()
     } else if update.enabled {
         "No update staged.".to_string()
     } else {
@@ -17912,6 +17912,8 @@ mod tests {
             failing_since: String::new(),
             failing_persistent: false,
             rescues: 0,
+            failing_checks_kind: String::new(),
+            channel_unreadable: false,
         }
     }
 
@@ -24851,34 +24853,27 @@ mod tests {
             .unwrap()
             .compile(cx.viewport)
             .unwrap();
+        // "clipboard" lands two LIVE native switches on one page, each under
+        // its own category heading — allow_osc52_query joined the ordinary
+        // security policies when the GUI's clipboard callback learned to
+        // answer authorized queries, so the Manual-handoff row this search
+        // used to produce for it (and the results-window paging that
+        // followed) no longer exists for this term.
         assert!(
             first
-                .semantic(&UiKey::new("settings/search/manual-result"))
+                .semantic(&UiKey::new("settings/control/allow_osc52_query"))
                 .is_some(),
-            "the hidden OSC 52 query setting is handed off to Manual first"
+            "the OSC 52 read policy is a live, searchable native switch"
         );
-        let next = first
-            .hits
-            .iter()
-            .find(|hit| hit.key.as_str() == "settings/results-window/next")
-            .expect("native clipboard matches follow the Manual result")
-            .action
-            .clone();
-        runtime
-            .dispatch(
-                instance,
-                view,
-                AppEvent::Action(ActionInvocation {
-                    id: next,
-                    value: None,
-                }),
-            )
-            .unwrap();
-        let compiled = runtime
-            .render(instance, view, &cx)
-            .unwrap()
-            .compile(cx.viewport)
-            .unwrap();
+        assert!(
+            first
+                .semantic(&UiKey::new(
+                    "settings/group-heading/security---permissions/allow-osc52-query"
+                ))
+                .is_some(),
+            "…grouped under its Security · Permissions heading"
+        );
+        let compiled = first;
         assert!(
             compiled
                 .semantic(&UiKey::new("settings/control/copy_on_select"))
@@ -29805,16 +29800,13 @@ enabled = true
             );
         }
         assert!(
-            !settings_field_is_visible(prefs::EDIT_ALLOW_OSC52_QUERY, false, false),
-            "OSC 52 query has no GUI clipboard-response host"
-        );
-        assert!(
-            !settings_field_is_visible(prefs::EDIT_ALLOW_OSC52_QUERY, false, true),
-            "global search must hand the inert key to Manual"
+            settings_field_is_visible(prefs::EDIT_ALLOW_OSC52_QUERY, false, false),
+            "OSC 52 query has a live host: the GUI clipboard callback answers \
+             authorized queries, so the switch is an ordinary security policy"
         );
         assert!(
             settings_field_is_visible(prefs::EDIT_ALLOW_OSC52_QUERY, true, false),
-            "Modified preserves the authored compatibility value"
+            "Modified still lists the authored value"
         );
         for (key, supported) in [
             (
@@ -29934,12 +29926,16 @@ enabled = true
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                52
+                53
             } else if cfg!(windows) {
-                50
+                51
             } else {
-                47
+                48
             },
+            // +1 on every platform (2026-08-21): allow_osc52_query became an
+            // ordinary Advanced switch when the GUI's clipboard callback
+            // learned to answer authorized queries — a LIVE policy joins the
+            // audited surface; anything still inert belongs in Manual.
             "the audited Advanced surface changed; new expert keys belong in Manual"
         );
         let ordinary_groups = fields
@@ -30659,7 +30655,9 @@ enabled = true
             .iter()
             .any(|note| note.kind == EffectNoteKind::Unavailable)
         };
-        assert!(unavailable(prefs::EDIT_ALLOW_OSC52_QUERY));
+        // allow_osc52_query is a LIVE policy now (the GUI answers authorized
+        // queries), so it must NOT read as unavailable anywhere.
+        assert!(!unavailable(prefs::EDIT_ALLOW_OSC52_QUERY));
         assert_eq!(
             !unavailable(prefs::EDIT_ALLOW_NOTIFICATIONS),
             crate::notify::delivery_available()
@@ -30701,11 +30699,9 @@ enabled = true
                 "true",
                 "Audio unavailable on this platform; saved for portability",
             ),
-            (
-                prefs::EDIT_ALLOW_OSC52_QUERY,
-                "true",
-                "Unavailable; OSC 52 clipboard queries are not implemented",
-            ),
+            // (allow_osc52_query left this table when the GUI's clipboard
+            // callback learned to answer authorized queries — it is a live
+            // security policy now, covered by the SecurityPolicy arm.)
         ] {
             let projection = config_application_projection(
                 &state,

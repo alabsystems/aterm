@@ -13,7 +13,7 @@ use super::grouped_state::{
 use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TaskbarProgress, TerminalModes};
 
-use crate::grid::{Grid, StyleId};
+use crate::grid::Grid;
 use crate::parser::Parser;
 use crate::platform::FontDescriptor;
 
@@ -32,12 +32,6 @@ pub struct Terminal {
     pub(super) modes: TerminalModes,
     /// Current text style.
     pub(super) style: CurrentStyle,
-    /// Cached style ID for the current style (Ghostty pattern).
-    ///
-    /// This is updated when SGR sequences change the style, allowing
-    /// us to intern styles once and reuse the ID for all cells written
-    /// with that style. Updated via `update_style_id()`.
-    pub(super) current_style_id: StyleId,
     /// Character set state (G0-G3, GL, single shift).
     pub(super) charset: CharacterSetState,
     /// Alternate screen grid (for applications like vim).
@@ -235,6 +229,24 @@ pub struct Terminal {
     /// what makes the epoch advance on a real write but NOT on a no-op (a write
     /// that leaves the grid undamaged never flips this).
     pub(super) damage_epoch_counted: bool,
+    /// Process-unique identity of THIS engine instance, stamped into every
+    /// render snapshot (DMG-1 damage carrier). Damage-scoped re-extraction
+    /// must never treat a scratch filled from a DIFFERENT terminal as a valid
+    /// baseline: two same-dims panes sharing one reused scratch pass every
+    /// dims/anchor check while holding each other's cells, and per-terminal
+    /// `damage_epoch` values collide numerically (both count from 0). A
+    /// process-global nonce (never 0, so an `empty()` scratch can never match)
+    /// makes that aliasing structurally detectable instead of "unlikely".
+    pub(super) extract_identity: u64,
+    /// Extraction-continuity generation (DMG-1 damage carrier): bumped on every
+    /// [`take_damage`](Terminal::take_damage). The grid's damage tracker holds
+    /// "rows changed since the last take"; a scratch refilled at generation G is
+    /// a sound damage-scoped baseline ONLY while no OTHER consumer has taken
+    /// damage since (still G) — otherwise the tracker was reset mid-window and
+    /// its bits UNDERCOUNT the rows that changed since the scratch's fill, which
+    /// is exactly the silent-stale-row failure the carrier exists to prevent.
+    /// Starts at 1 so a never-filled scratch (gen 0) always fails the check.
+    pub(super) extract_gen: u64,
     /// Cached full-content search index (P1.0b).
     ///
     /// `indexed_search` rebuilds a [`TerminalSearch`] over the entire retained
@@ -257,6 +269,15 @@ pub struct Terminal {
     /// (and tests) can confirm a repeat query reused the cache rather than
     /// rebuilt — the O(1) win. A plain counter, no behavioral effect.
     pub(super) search_index_rebuilds: u64,
+    /// Count of INCREMENTAL refreshes (churn-bounded re-feeds of the stale
+    /// cached index: evicted prefix dropped, previous visible rows + appended
+    /// rows re-fed) performed by [`Terminal::indexed_search`]. Every refresh
+    /// is also counted in `search_index_rebuilds` (it serves a cache miss);
+    /// `search_index_rebuilds - search_index_refreshes` is therefore the
+    /// number of FULL O(total-retained) rebuilds. A plain counter, no
+    /// behavioral effect — it is the observable that pins "the churn path
+    /// engaged" in tests and the churn bench.
+    pub(super) search_index_refreshes: u64,
     /// Monotonic revision of top-anchored protected-footer row insertions.
     ///
     /// Ordinary full-screen output advances every live row uniformly and does
@@ -369,6 +390,13 @@ impl Terminal {
     pub fn take_damage(&mut self) {
         self.grid.clear_damage();
         self.damage_epoch_counted = false;
+        // DMG-1 carrier: consuming the damage session invalidates every OTHER
+        // scratch's damage-scoped continuity (their "changed since my last
+        // fill" superset just got reset under them). Bumping the generation
+        // here — the single choke point every consumer already calls — is what
+        // lets `cell_frame_damage_scoped_into` prove, in O(1), that its bits
+        // still cover everything since the scratch's own fill.
+        self.extract_gen = self.extract_gen.wrapping_add(1);
     }
 
     /// A monotonic counter that advances on net-new grid damage (D-1).
@@ -434,20 +462,6 @@ impl Terminal {
     }
 
     // Vi mode accessors in state_accessors.rs.
-
-    /// Get the current interned style ID.
-    ///
-    /// This returns the StyleId for the current SGR attributes. The style is
-    /// interned in the grid's StyleTable, so cells written with the same style
-    /// share the same ID (Ghostty pattern for memory savings).
-    ///
-    /// The style ID is updated automatically when SGR sequences change the style.
-    #[cfg(test)]
-    #[must_use]
-    #[inline]
-    pub(crate) fn current_style_id(&self) -> StyleId {
-        self.current_style_id
-    }
 
     // Scrollback, memory, and clear methods in buffer_api.rs.
 

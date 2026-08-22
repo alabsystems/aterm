@@ -291,7 +291,7 @@ fn test_bash_urlencode_handles_special_and_unicode_paths() {
     assert_urlencode_cases(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
     );
 }
@@ -318,7 +318,7 @@ fn test_bash_report_cwd_emits_percent_encoded_osc_7() {
     let actual = run_report_cwd_via_shell(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
         &cwd,
     );
@@ -329,6 +329,69 @@ fn test_bash_report_cwd_emits_percent_encoded_osc_7() {
     assert_eq!(
         actual, expected,
         "bash should emit a percent-encoded OSC 7 file URI for the live cwd"
+    );
+}
+
+/// REGRESSION (stock Ubuntu bash): PROMPT_COMMAND as an ARRAY runs every element
+/// as its own top-level command AFTER `__aterm_prompt_command` returned — the
+/// in-prompt guard flag is already clear, and the old scalar compare saw only
+/// element 0. A SIBLING integration's precmd (`__vte_prompt_command`, starship,
+/// systemd's precmdline, ...) was then captured as the user's command: its 133;C
+/// fired at the prompt (out of phase, dropped by the A→B→C→D machine) and
+/// `__aterm_last_command` stayed occupied, so the REAL command never emitted
+/// 633;E/133;C — no block ever reached Executing, and a driver's verified submit
+/// (`turn`) could never attribute a press. The preexec must skip EVERY
+/// PROMPT_COMMAND element and still capture the real command that follows.
+#[cfg(unix)]
+#[test]
+fn test_bash_preexec_skips_prompt_command_array_siblings() {
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.bash",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    // One prompt cycle exactly as bash runs an array PROMPT_COMMAND: each element
+    // is a top-level DEBUG-trapped command, ours first, the sibling after ours
+    // returned. The marker rides an `__aterm_`-prefixed function so the guard
+    // skips it identically before and after the fix.
+    let command = "\
+__fake_vte_precmd() { :; }\n\
+PROMPT_COMMAND=(__fake_vte_precmd)\n\
+source \"$ATERM_TEST_SCRIPT\"\n\
+__aterm_prompt_command\n\
+__fake_vte_precmd\n\
+__aterm_test_marker() { printf '===CYCLE-DONE==='; }\n\
+__aterm_test_marker\n\
+echo real-command\n";
+    let output = shell_command(bash_shell())
+        .args(["--noprofile", "--norc", "-i", "-c", command])
+        .env("ATERM_TEST_SCRIPT", &script)
+        .output()
+        .unwrap_or_else(|error| panic!("spawn bash for preexec array test: {error}"));
+    assert!(
+        output.status.success(),
+        "bash preexec array cycle should succeed; stdout: {:?}; stderr: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let (prompt_cycle, after) = stdout
+        .split_once("===CYCLE-DONE===")
+        .expect("marker should appear in stdout");
+    assert!(
+        !prompt_cycle.contains("633;E"),
+        "a sibling PROMPT_COMMAND element must not be captured as a user command: {prompt_cycle:?}"
+    );
+    assert!(
+        !prompt_cycle.contains("\u{1b}]133;C"),
+        "no command-start mark may fire during the prompt cycle: {prompt_cycle:?}"
+    );
+    assert!(
+        after.contains("\u{1b}]633;E;echo\\x20real-command\u{7}"),
+        "the real command must still be captured (633;E): {after:?}"
+    );
+    assert!(
+        after.contains("\u{1b}]133;C\u{7}"),
+        "the real command must emit the 133;C command start: {after:?}"
     );
 }
 
@@ -718,7 +781,7 @@ fn test_bash_osc_frame_writer_preserves_payload_escapes() {
     let wire = run_osc_wire_probe(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
     );
     assert_osc_wire_is_escape_transparent("bash", &wire);
@@ -1235,7 +1298,7 @@ fn test_bash_id_suffix_emits_hex_when_nonce_set() {
     let actual = run_id_suffix_via_shell(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
         Some(nonce),
     );
@@ -1252,7 +1315,7 @@ fn test_bash_id_suffix_empty_when_nonce_unset() {
     let actual = run_id_suffix_via_shell(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
         None,
     );
@@ -1448,7 +1511,7 @@ fn test_bash_unsets_shell_nonce_env_after_source() {
     let (env, suffix) = run_env_check_after_source(
         bash_shell(),
         &["--noprofile", "--norc", "-i"],
-        "trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
+        "__aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=",
         "aterm_shell_integration.bash",
         nonce,
     );
@@ -1555,7 +1618,7 @@ fn test_bash_fallback_unnonced_when_env_missing() {
     // returning nothing, NOT from an undefined __aterm_id_suffix (which would
     // also print "suffix=[]"). `command -v` forces a hard exit if it never loaded.
     let command = "source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; \
-                   trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
+                   __aterm_in_prompt_cmd=1; trap - DEBUG 2>/dev/null || true; PROMPT_COMMAND=; \
                    command -v __aterm_id_suffix >/dev/null || exit 97; \
                    printf 'suffix=[%s]' \"$(__aterm_id_suffix)\"";
     let output = shell_command(bash_shell())

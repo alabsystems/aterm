@@ -32,6 +32,7 @@ use crate::flow::now_unix;
 /// trusted to track a match arm; a test can.
 const VERBS: &[&str] = &[
     "doctor",
+    "status",
     "which",
     "list",
     "uninstall",
@@ -77,6 +78,30 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     if matches!(verb, Some("help" | "-h" | "--help")) {
         return cmd_help();
     }
+    // A FLAG IS NEVER A PROGRAM NAME. The verbs below read `args[1]` as a program and hand
+    // it to the signed index, so `atpkg install --help` used to RESOLVE `"--help"`, fail,
+    // and persist `[programs.--help] state = "error: --help is not named in the signed
+    // index"` into `status.toml` — where nothing ever removed it, so `atpkg doctor` called
+    // the toolset incomplete for the life of the machine while all ten real programs sat
+    // there `active`. `atpkg uninstall --version` was worse than noisy: it matched nothing,
+    // took the clean-success path, cleared the program's adoption, printed "uninstalled
+    // --version" and exited 0. Gated at the ONE dispatch edge, and BEFORE the store lock, so
+    // a typo never contends for `store.lock` (2026-08-20 round-10 audit).
+    if let Some(v) = verb
+        && let Some(operand) = args.get(1)
+        && operand.starts_with('-')
+        && let Some((_, allowed)) = NAME_TAKING_VERBS.iter().find(|(name, _)| *name == v)
+        && !allowed.contains(&operand.as_str())
+    {
+        // A flag straight after a verb is nearly always someone asking how the verb works.
+        // Answering is strictly better than refusing the one spelling they guessed.
+        if matches!(operand.as_str(), "-h" | "--help") {
+            return cmd_help();
+        }
+        eprintln!("atpkg {v}: {operand:?} is not a program name — it is a flag");
+        eprintln!("atpkg:   `atpkg {v} --help` shows what {v} accepts");
+        return ExitCode::from(2);
+    }
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
         match mutator_store_lock() {
             Ok(guard) => guard,
@@ -86,7 +111,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         None
     };
     match verb {
+        // `status` is the name people reach for first — it is what every other package
+        // manager calls this — and it answered "unknown verb" while `doctor` sat two lines
+        // away. An alias costs nothing and removes a guess from the first minute of use.
         Some("doctor") => return doctor(),
+        Some("status") => return doctor(),
         Some("which") => return cmd_which(args.get(1)),
         Some("list") => cmd_list(),
         Some("uninstall") => return cmd_uninstall(args.get(1)),
@@ -162,6 +191,32 @@ fn layout() -> Option<crate::store::Layout> {
 /// the same lock. Everything else (`doctor`, `which`, `list`, `run`, `verify`,
 /// `tree-root`, `verify-index`, `relocate`, bare status) reads only — lock-free,
 /// and `run` in particular may exec a long-lived tool that must never hold it.
+/// The verbs whose FIRST positional is a program name, each paired with the flag-shaped
+/// literals it legitimately accepts in that slot.
+///
+/// Exactly two such literals exist across the whole surface — `install --default-set` and
+/// `uninstall --all` — and both are real operands, not flags: they name a SET where a
+/// program name would go. Everything else beginning with `-` is a mistyped flag.
+///
+/// `run` is deliberately absent. `aterm <tool>` synthesizes `["run", <tool>, "--", …]`, so
+/// `cmd_run` owns its own `--` handling, and its failure mode is already non-durable (exit
+/// 127, no `status.toml` write) — there is nothing here to protect and a dispatcher to
+/// avoid disturbing.
+const NAME_TAKING_VERBS: &[(&str, &[&str])] = &[
+    ("install", &["--default-set"]),
+    ("uninstall", &["--all"]),
+    ("update", &[]),
+    ("rollback", &[]),
+    ("which", &[]),
+    ("tree-root", &[]),
+    ("verify", &[]),
+    ("pin", &[]),
+    ("unpin", &[]),
+    ("link", &[]),
+    ("unlink", &[]),
+    ("refresh", &[]),
+];
+
 fn verb_mutates_store(verb: &str) -> bool {
     matches!(
         verb,
@@ -352,12 +407,78 @@ fn cmd_list() {
         println!("atpkg: no programs installed");
         return;
     }
+    // WHAT AM I ACTUALLY RUNNING. `list` used to print `<program>\t<build>` and nothing
+    // else, which cannot answer that — the store legitimately holds MORE THAN ONE build per
+    // program (retention is live + 1 rollback), so the output showed e.g. `ay 7987` and
+    // `ay 8174` with no way to tell which one `ay` on PATH resolves to. Worse, a dev-linked
+    // program looked completely ordinary: the store rows were still there while the shims
+    // pointed at a checkout, so `list` positively implied the registry build was in use.
+    //
+    // The three facts a user needs are the three that change what runs: which build is LIVE,
+    // whether a dev link has taken the program over, and whether a pin is holding it back.
+    // Each comes from the authority that owns it — `active_builds` reads the shims,
+    // `is_linked`/`linked_checkout` read the marker, `is_pinned` reads the pin state — so
+    // this reports the store's real posture rather than a second opinion about it.
+    let live = crate::active_builds(&layout);
+    let mut shown_link = std::collections::BTreeSet::new();
     for (program, build) in installed {
-        println!("{program}\t{build}");
+        let mut notes: Vec<String> = Vec::new();
+        if crate::linkmode::is_linked(&layout, &program) {
+            // A dev link supersedes EVERY store build, so the note belongs on the program,
+            // not on one row; print it once and never call a store build "live" while it is
+            // shadowed — that was the misleading part.
+            if shown_link.insert(program.clone()) {
+                match crate::linkmode::linked_checkout(&layout, &program) {
+                    Some(path) => notes.push(format!("DEV-LINKED -> {}", path.display())),
+                    None => notes.push("DEV-LINKED".to_string()),
+                }
+            } else {
+                notes.push("(shadowed by the dev link)".to_string());
+            }
+        } else if live.get(&program) == Some(&build) {
+            notes.push("live".to_string());
+        } else {
+            notes.push("superseded (kept for rollback)".to_string());
+        }
+        if crate::pin::is_pinned(&layout, &program) {
+            notes.push("pinned".to_string());
+        }
+        println!("{program}\t{build}\t{}", notes.join("  "));
     }
 }
 
 /// `atpkg uninstall <program>` — remove its shims + store builds (fail-closed inside the prefix).
+/// Remove `program` from the store and retire everything this machine recorded about it.
+///
+/// Split out of [`cmd_uninstall`] so the bookkeeping is exercisable without a process — the
+/// CLI arm keeps only its printing and its exit code. Both steps are part of "uninstalled",
+/// and neither happened before:
+///
+/// * THE STATUS ROW. `active_builds` reads shims, so `doctor` went quiet after a removal —
+///   but Settings ▸ Packages reads the RECORD, and listed a deleted program as `active` at
+///   its last build forever. The stale-row reconciler cannot help and correctly declines
+///   to: the signed index still names this program, it is this MACHINE that no longer
+///   carries it.
+/// * THE REMOVED MARKER, which already worked: without it the resumable seed lane
+///   reinstalls the program on the next launch — the manager undoing a deliberate act.
+fn uninstall_and_retire(layout: &crate::store::Layout, program: &str) -> std::io::Result<()> {
+    // ROW DELETION IS A NEW CAPABILITY, so it gets the name gate the old code never needed.
+    // `ops::uninstall`'s shape rule rejects only empty/`.`/`..`/separators/NUL, so without
+    // this `atpkg uninstall '*toolset*'` returned Ok and DELETED a bookkeeping row that has
+    // its own owner and its own reaper, and `atpkg uninstall --help` appended a flag to the
+    // removed-markers file. Neither is a program; neither may be retired through here.
+    if (program.starts_with('*') && program.ends_with('*')) || program.starts_with('-') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{program:?} is not a program name"),
+        ));
+    }
+    crate::uninstall(layout, program)?;
+    clear_status_row(layout, program);
+    record_removed(layout, program);
+    Ok(())
+}
+
 fn cmd_uninstall(program: Option<&String>) -> ExitCode {
     let Some(program) = program else {
         eprintln!("usage: atpkg uninstall <program> | --all");
@@ -369,12 +490,9 @@ fn cmd_uninstall(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    match crate::uninstall(&layout, program) {
+    match uninstall_and_retire(&layout, program) {
         Ok(()) => {
             println!("atpkg: uninstalled {program}");
-            // Remember it, or the resumable seed lane reinstalls it on the next
-            // launch — the manager undoing a deliberate act.
-            record_removed(&layout, program);
             // Removing a managed program is an EXPLICIT act, so this machine stops being
             // one that keeps the whole set complete — otherwise the next unattended pass
             // would reinstall what the user just removed, which is the manager fighting
@@ -415,7 +533,22 @@ fn cmd_uninstall_all() -> ExitCode {
         return ExitCode::from(1);
     };
     let installed = crate::active_builds(&layout);
-    if installed.is_empty() {
+    // THE SWEEP IS THE UNION OF WHAT IS LIVE AND WHAT THE RECORD STILL CLAIMS. A TOMBSTONED
+    // program is invisible to `active_builds` — its shims were replaced by failing stubs —
+    // so walking the live set alone stepped straight past it, leaving its build tree on disk
+    // and its row in the record after an explicit whole-set removal. That is the exact class
+    // this verb exists to clear. Sentinel bookkeeping rows and stray flag rows are excluded:
+    // neither is a program, and neither is this verb's to retire.
+    let mut targets: std::collections::BTreeSet<String> = installed.keys().cloned().collect();
+    if let Some(s) = crate::status::read(&layout) {
+        targets.extend(
+            s.programs
+                .keys()
+                .filter(|k| !(k.starts_with('*') && k.ends_with('*')) && !k.starts_with('-'))
+                .cloned(),
+        );
+    }
+    if targets.is_empty() {
         // RECORD THE DECLINE ANYWAY. "Remove the ALab toolset" states an INTENT —
         // "I do not want this on my machine" — and that intent is independent of
         // whether anything happens to be installed at this instant. Returning early
@@ -435,9 +568,20 @@ fn cmd_uninstall_all() -> ExitCode {
     }
     let mut failures = 0u32;
     let mut removed: Vec<String> = Vec::new();
-    for program in installed.keys() {
+    for program in &targets {
         match crate::uninstall(&layout, program) {
-            Ok(()) => removed.push(program.clone()),
+            Ok(()) => {
+                // Same retirement as the single-program verb: a row that outlives its
+                // program is a claim about a machine state that no longer exists.
+                //
+                // Only on success — but note what an `Err` here actually means. `uninstall`
+                // removes the shims FIRST and unconditionally; its only fallible step is the
+                // final `remove_dir_all`. So a failure leaves the program already OFF PATH
+                // with its build tree behind, and keeping the row is the conservative choice
+                // precisely because the machine is now in a half-state worth reporting.
+                clear_status_row(&layout, program);
+                removed.push(program.clone());
+            }
             Err(e) => {
                 failures += 1;
                 eprintln!("atpkg: uninstall {program} failed: {e}");
@@ -659,7 +803,9 @@ fn recover_missing_roots(layout: &crate::store::Layout, fetcher: &dyn crate::flo
     if live.is_empty() {
         return;
     }
-    let recorded = crate::status::read(layout).map(|s| s.programs).unwrap_or_default();
+    let recorded = crate::status::read(layout)
+        .map(|s| s.programs)
+        .unwrap_or_default();
     let unattested: Vec<(String, u64)> = live
         .iter()
         .filter(|(program, _)| {
@@ -669,7 +815,13 @@ fn recover_missing_roots(layout: &crate::store::Layout, fetcher: &dyn crate::flo
         })
         .map(|(program, build)| (program.clone(), *build))
         .collect();
-    if unattested.is_empty() {
+    // Cheap pre-filter for the SECOND job below: is there any row that could turn out to
+    // be stale? Deciding this before the index resolve keeps the common case — a healthy
+    // store with nothing to do — exactly as free as it was.
+    let maybe_stale = recorded
+        .keys()
+        .any(|k| !(k.starts_with('*') && k.ends_with('*')) && !live.contains_key(k.as_str()));
+    if unattested.is_empty() && !maybe_stale {
         return;
     }
     let Ok(index) = crate::resolve_verified_index(
@@ -681,10 +833,23 @@ fn recover_missing_roots(layout: &crate::store::Layout, fetcher: &dyn crate::flo
     ) else {
         return;
     };
+    // RECONCILE THE MEMO AGAINST ITS AUTHORITY. A row naming something the verified index
+    // does not name and the store does not carry is a stray: a mistyped `atpkg install`
+    // used to mint one permanently, and doctor then reported a healthy toolset as
+    // incomplete for the life of the machine. Announced rather than silent — a manager
+    // that quietly edits its own record is the thing this crate exists not to be.
+    for stale in prunable_status_rows(&recorded, &live, &|n| index.is_program(n)) {
+        println!("atpkg: cleared a stale record for {stale:?} — the signed index does not name it");
+        clear_status_row(layout, &stale);
+    }
     for (program, build) in unattested {
-        let Some(root) =
-            crate::flow::signed_root_for_installed(fetcher, &index, &program, build, current_triple())
-        else {
+        let Some(root) = crate::flow::signed_root_for_installed(
+            fetcher,
+            &index,
+            &program,
+            build,
+            current_triple(),
+        ) else {
             continue;
         };
         println!("atpkg: {program} was installed without its signed attestation — recorded");
@@ -701,18 +866,99 @@ fn recover_missing_roots(layout: &crate::store::Layout, fetcher: &dyn crate::flo
     }
 }
 
+/// The durable `state` to record for a failed install — or `None` when the failure is a
+/// fact about the REQUEST rather than about this machine's store.
+///
+/// [`crate::FlowError::NotReachable`] means the signed index resolved, verified, and does
+/// not name the token. Nothing was ever installed under that name and nothing ever will
+/// be, so there is nothing for `status.toml` to remember: writing a row there INVENTS a
+/// program, and every later `atpkg doctor` reads it back as a missing member of the
+/// toolset. The attempt still reaches the aggregate outcome sentence and `cmd_install`
+/// still prints it and still exits 1 — the failure is not swallowed, it is just not
+/// promoted to a permanent resident of the store's record.
+///
+/// The OFFLINE FAMILY is suppressed for the same reason, and it is the larger leak of the
+/// two. `NoIndex`, `Unreachable` and `Stale` are all raised inside `resolve_verified_index`
+/// (flow.rs:1327/1330/1430) — strictly BEFORE the program lookup at flow.rs:384 — so the
+/// run never reached a question about this program and learned nothing about it. Recording
+/// "error: no signature-valid index" against `ay` says the program is broken; what actually
+/// happened is that a laptop was on a plane.
+///
+/// The damage was durable and asymmetric. A default-set member heals on the next update
+/// (§11 reinstalls it), but a program the user asked for BY NAME while offline is not
+/// swept by anything: it is not live, so `update` skips it, and it IS named by the index,
+/// so the stale-row reconciler correctly declines to prune it. Its row sat there reading
+/// `error:` forever, on a machine that had been online and healthy for months.
+///
+/// Nothing is lost by suppressing it. The reason still reaches the aggregate outcome
+/// sentence (which Settings ▸ Packages prints and `doctor` now falls back to), `cmd_install`
+/// still prints it live and still exits 1, and the environmental condition itself is
+/// doctor's own business — it independently reports index age and days-since-update, which
+/// is where "this machine cannot reach the channel" belongs. What is removed is only the
+/// false claim that a specific program is at fault.
+fn failed_install_state(e: &crate::FlowError) -> Option<String> {
+    match e {
+        // A dev-linked program is a benign HARD-SKIP (§13), not an error state.
+        crate::FlowError::Linked(_) => Some(String::from("dev-linked (skipped)")),
+        // Verdicts about the REQUEST or the NETWORK — never about this program.
+        crate::FlowError::NotReachable(_)
+        | crate::FlowError::NoIndex
+        | crate::FlowError::Unreachable(_)
+        | crate::FlowError::Stale => None,
+        _ => Some(format!("error: {e}")),
+    }
+}
+
+/// The recorded rows naming nothing the signed index knows — the ones safe to drop.
+///
+/// `status.toml` is a DERIVED memo and the signed index is the authority on what programs
+/// exist, so reconciling the memo against its authority at the moment that authority
+/// speaks is the memo doing its job, not a destructive edit. Four conditions, all
+/// required:
+///
+/// * the caller holds a VERIFIED index — never prune on a network error, because
+///   inventing an absence is the same class of mistake as inventing a fault;
+/// * the key is not a `*sentinel*` bookkeeping row (`*index*`, `*toolset*`, `*seed*` have
+///   their own owners and their own reapers);
+/// * the index does not name it;
+/// * it is not LIVE. A program dropped upstream while still installed keeps its row:
+///   [`crate::verify`] fails closed on an empty recorded root, so deleting a live
+///   program's row would erase the attestation `atpkg verify` needs.
+fn prunable_status_rows(
+    recorded: &std::collections::BTreeMap<String, crate::ProgramStatus>,
+    live: &std::collections::BTreeMap<String, u64>,
+    known: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    recorded
+        .keys()
+        .filter(|k| !(k.starts_with('*') && k.ends_with('*')))
+        .filter(|k| !live.contains_key(k.as_str()))
+        .filter(|k| !known(k))
+        .cloned()
+        .collect()
+}
+
 /// Replace the aggregate `status.outcome` sentence without touching per-program rows.
 ///
 /// The counterpart to [`clear_status_row`] for the line Settings ▸ Packages actually
 /// shows: retiring a failure row while leaving its sentence behind just makes the
 /// staleness quieter (2026-08-20 round-8 audit).
 fn record_outcome(layout: &crate::store::Layout, outcome: String) {
-    let Some(existing) = crate::status::read(layout) else {
-        return;
-    };
+    // CREATE the record if it does not exist yet, rather than returning silently. This
+    // used to early-return on a virgin store, which was harmless while every failure also
+    // wrote a per-program row — but the environmental failures now route HERE and nowhere
+    // else, so a first-run offline `atpkg install` left no witness of any kind. That is
+    // precisely the failed-seed machine `tools/install.sh` hands `pkg doctor` to, and it
+    // made doctor's own fallback to this sentence dead code in the case that motivated it.
+    // Fields are stamped exactly as `record_status` stamps them: `enabled` and
+    // `index_source` are CURRENT facts, so recomputing beats carrying a stale pair.
+    let existing = crate::status::read(layout).unwrap_or_default();
     let _ = crate::status::write(
         layout,
         &crate::Status {
+            schema: 1,
+            enabled: manager_enabled(),
+            index_source: crate::resolve_account(crate::config::cached().account()).slug(),
             outcome,
             // The TIMESTAMP moves with the sentence. Refreshing one and not the other
             // paired a fresh verdict with the moment of the last failure, which is
@@ -739,7 +985,13 @@ fn clear_status_row(layout: &crate::store::Layout, program: &str) {
     if programs.remove(program).is_none() {
         return;
     }
-    let _ = crate::status::write(layout, &crate::Status { programs, ..existing });
+    let _ = crate::status::write(
+        layout,
+        &crate::Status {
+            programs,
+            ..existing
+        },
+    );
 }
 
 /// The signed `tree_root` to persist for `program`: the freshly-applied one when
@@ -755,6 +1007,54 @@ fn effective_tree_root(layout: &crate::store::Layout, program: &str, new_root: &
     crate::status::read(layout)
         .and_then(|s| s.programs.get(program).map(|p| p.tree_root.clone()))
         .unwrap_or_default()
+}
+
+/// The row to record when an install FAILS for a program that may already be live.
+///
+/// A FAILED INSTALL UNINSTALLS NOTHING. An upgrade that dies at download, stage, activate
+/// or manifest-fetch leaves the previous build exactly where it was — still activated,
+/// still shimmed, still working — and every failure arm nonetheless recorded
+/// `installed_build: None, tree_root: ""`, which says the program is gone AND unattested.
+/// Both false, and the second is destructive rather than merely wrong: `crate::verify`
+/// fails closed on an empty recorded root, so one failed upgrade turned `atpkg verify` into
+/// a permanent "cannot verify" for a program whose bytes were never touched, recoverable
+/// only by reinstalling gigabytes to re-record a root that had been correct all along.
+///
+/// The live build comes from `active_builds` — the shims, i.e. ground truth — rather than
+/// from the record being overwritten, so a machine whose record disagrees with its store
+/// gets the store's answer.
+///
+/// THE ATTESTATION BELONGS TO THE BUILD IT WAS CAPTURED FOR, and that is why the two fields
+/// cannot simply be read from two different places. Taking the build from the store and the
+/// root from the record with no agreement check stitches together a row saying "live build
+/// 20, attested by a root signed for build 18" — and `crate::verify` is ordered
+/// `NotInstalled → NoSignedRoot → BuildMismatch → compare`, so writing the live build into
+/// `installed_build` DISARMS the `BuildMismatch` guard that exists to catch exactly this.
+/// Execution then reaches the tree comparison, where differing bytes report `Drift` — a
+/// tampering accusation against bytes nobody touched — and identical bytes report `Match`,
+/// affirming a build no signature ever covered. The second is a fail-OPEN on authenticity,
+/// which is the one direction this crate may never fail.
+///
+/// So the root is kept only when it still means something: when record and store name the
+/// SAME build, or when the store names none at all. That second case is not an edge — it is
+/// a TOMBSTONED program, whose shims were replaced by failing stubs while its bytes and
+/// their attestation sit untouched in the store. Dropping the root there would erase a good
+/// attestation on the strength of a yanked pin.
+fn failure_row(
+    layout: &crate::store::Layout,
+    program: &str,
+    state: String,
+) -> crate::ProgramStatus {
+    let live = crate::active_builds(layout).get(program).copied();
+    let recorded = crate::status::read(layout).and_then(|s| s.programs.get(program).cloned());
+    crate::ProgramStatus {
+        installed_build: live,
+        state,
+        tree_root: match &recorded {
+            Some(r) if live.is_none() || r.installed_build == live => r.tree_root.clone(),
+            _ => String::new(),
+        },
+    }
 }
 
 /// Record the install outcome to `status.toml` (the silent manager's observability
@@ -1313,23 +1613,16 @@ fn do_install(
                 crate::hooks::refresh(layout);
             }
         }
-        Err(e) => {
-            // A dev-linked program is a benign HARD-SKIP (§13), not an error state.
-            let state = match e {
-                crate::FlowError::Linked(_) => "dev-linked (skipped)".to_string(),
-                _ => format!("error: {e}"),
-            };
-            record_status(
+        Err(e) => match failed_install_state(e) {
+            Some(state) => record_status(
                 layout,
                 program,
-                crate::ProgramStatus {
-                    installed_build: None,
-                    state,
-                    tree_root: String::new(),
-                },
+                failure_row(layout, program, state),
                 format!("install {program}: {e}"),
-            );
-        }
+            ),
+            // The attempt is still WITNESSED — it just is not witnessed as a program.
+            None => record_outcome(layout, format!("install {program}: {e}")),
+        },
     }
     result
 }
@@ -1341,7 +1634,13 @@ fn do_install(
 /// ([`cmd_install_default_set`]).
 fn cmd_install(program: Option<&String>) -> ExitCode {
     let Some(program) = program else {
+        // A bare `install` is nearly always someone asking for the toolset, and the product
+        // default IS the whole set — so say the spelling that grants it rather than a usage
+        // line that leaves them to guess which of the two forms they wanted.
         eprintln!("usage: atpkg install <program> | atpkg install --default-set");
+        eprintln!(
+            "atpkg:   for the whole ALab toolset (the usual answer): atpkg install --default-set"
+        );
         return ExitCode::from(2);
     };
     if program == "--default-set" {
@@ -1461,12 +1760,22 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
                 crate::ProgramStatus {
                     installed_build: Some(r.to_build),
                     state: "active".into(),
-                    // The rolled-back build's signed tree_root is not carried in the rollback
-                    // report; `atpkg update`/reinstall re-records it (verify reports it unset).
+                    // The rolled-back build's signed root is not carried in the rollback
+                    // report, so it is written unset here and re-derived immediately below.
+                    // Carrying the PREVIOUS build's root instead would be far worse than
+                    // leaving it empty: it would attest bytes that are no longer there.
                     tree_root: String::new(),
                 },
                 format!("rolled back {program} {} -> {}", r.from_build, r.to_build),
             );
+            // CLOSE THE WINDOW WHERE IT OPENS. This used to be left for "a later `atpkg
+            // update`", but `recover_missing_roots` has exactly ONE call site and it is
+            // `cmd_update_all` — so `atpkg update <program>`, the verb a user most naturally
+            // reaches for right after rolling that program back, never repaired it, and
+            // `atpkg verify` failed closed on a perfectly good rollback until an unrelated
+            // whole-set pass happened to run. The fetcher is already in hand and the index
+            // it just trusted is the right authority to ask.
+            recover_missing_roots(&layout, &*fetcher);
             if let Some(g) = &r.coherence_group {
                 eprintln!(
                     "atpkg: warning — {program} is in coherence group '{g}'; rolling back one \
@@ -1579,7 +1888,8 @@ fn cmd_update_all() -> ExitCode {
     // because this is the pass the 6-hour loop runs: honouring a removal on the
     // local lane while the network lane quietly reinstalled the whole set on the
     // next tick made the decline look like it worked for exactly one launch.
-    let complete_the_set = should_complete_set(cfg.auto_install(), adopted(&layout), declined(&layout));
+    let complete_the_set =
+        should_complete_set(cfg.auto_install(), adopted(&layout), declined(&layout));
     if installed.is_empty() && !complete_the_set {
         println!("atpkg: nothing installed to update");
         return ExitCode::SUCCESS;
@@ -1595,6 +1905,13 @@ fn cmd_update_all() -> ExitCode {
             cfg.channel(),
             current_triple(),
             &installed,
+            // The invoking user's `[packages].exclude` — read HERE, at the CLI
+            // edge that owns "whose config speaks", and handed down as data so
+            // flow.rs stays hermetic (round-13 audit). This is the wire that
+            // makes `uninstall`'s "keep the set, drop just this one" advice
+            // true on the unattended tick instead of a promise the next pass
+            // reversed with a multi-GB reinstall.
+            cfg.exclude(),
             floor,
             now_unix(),
         ) {
@@ -1633,7 +1950,10 @@ fn cmd_update_all() -> ExitCode {
         // …and the SENTENCE that row left behind. `status.outcome` is what Settings
         // ▸ Packages prints as its detail line, so clearing the row while leaving
         // "update failed: …" in place swaps one stale verdict for a quieter one.
-        record_outcome(&layout, format!("up to date (index build {})", report.index_build));
+        record_outcome(
+            &layout,
+            format!("up to date (index build {})", report.index_build),
+        );
         failures = report_channel_apply(&layout, &installed, &report);
         for p in &report.skipped_linked {
             println!("atpkg: {p} dev-linked — skipped");
@@ -1645,7 +1965,7 @@ fn cmd_update_all() -> ExitCode {
     // as the suite grows, and what an `auto_install` machine uses to bootstrap from empty.
     if complete_the_set {
         // ANNOUNCE BEFORE ACTING, exactly as the local seed lane does. This pass can
-        // pull GIGABYTES over the network — an Intel Mac the day x86_64 publishes, a
+        // pull GIGABYTES over the network — an Intel Mac taking the x86_64 set, a
         // seedless cut, a seal past its horizon, an app updated before it ever
         // provisioned — and it ran completely silently: the GUI spawns it with
         // stdout discarded, so a user could watch multiple GB arrive with nothing on
@@ -1653,7 +1973,13 @@ fn cmd_update_all() -> ExitCode {
         // contract exists to prevent, on the lane that is MORE surprising because
         // nothing local prompted it.
         let before_net = crate::active_builds(&layout);
-        failures += install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
+        failures += install_default_set(
+            &layout,
+            &*fetcher,
+            &effective_anchor(&layout),
+            cfg,
+            now_unix(),
+        );
         let mut arrived: Vec<String> = crate::active_builds(&layout)
             .keys()
             .filter(|k| !before_net.contains_key(k.as_str()))
@@ -1728,8 +2054,8 @@ fn cmd_update_all() -> ExitCode {
             } else {
                 (
                     format!(
-                        "nothing is installed and nothing was installable — the index \
-                         publishes no build for this Mac's architecture ({})",
+                        "nothing is installed and nothing was installable — no published \
+                         build was found for this Mac's architecture ({})",
                         current_triple()
                     ),
                     "unavailable: no build for this architecture",
@@ -2008,13 +2334,19 @@ fn bootstrap_group(
             record_status(
                 layout,
                 &failed,
-                crate::ProgramStatus {
-                    // An already-installed member keeps its honest build; a
-                    // fresh member records none.
-                    installed_build: installed.get(&failed).copied(),
-                    state: format!("error: coherence group '{g}' bootstrap aborted"),
-                    tree_root: String::new(),
-                },
+                // An already-installed member keeps its honest build AND its honest
+                // attestation; a fresh member records neither. An all-or-nothing
+                // transaction that aborted changed no member's bytes, so erasing the signed
+                // root here made `atpkg verify` fail closed on a program the abort had
+                // explicitly protected — the one site the round-8 "keep the recorded root"
+                // sweep missed, on the very line below a field already making that argument.
+                // Same primitive as every other failure arm: the store, not the caller's
+                // snapshot, is asked what survived.
+                failure_row(
+                    layout,
+                    &failed,
+                    format!("error: coherence group '{g}' bootstrap aborted"),
+                ),
                 format!("bootstrap group '{g}' aborted at {failed}"),
             );
             1
@@ -2099,11 +2431,7 @@ fn record_bootstrap_error(layout: &crate::store::Layout, program: &str, e: &crat
     record_status(
         layout,
         program,
-        crate::ProgramStatus {
-            installed_build: None,
-            state: format!("error: {e}"),
-            tree_root: String::new(),
-        },
+        failure_row(layout, program, format!("error: {e}")),
         format!("bootstrap install {program}: {e}"),
     );
 }
@@ -2124,7 +2452,13 @@ fn cmd_install_default_set() -> ExitCode {
     reconcile_links(&layout, cfg);
     let fetcher = resolve_fetcher(&layout);
     let before = crate::active_builds(&layout);
-    let failures = install_default_set(&layout, &*fetcher, &effective_anchor(&layout), cfg, now_unix());
+    let failures = install_default_set(
+        &layout,
+        &*fetcher,
+        &effective_anchor(&layout),
+        cfg,
+        now_unix(),
+    );
     let activated = crate::active_builds(&layout)
         .keys()
         .filter(|k| !before.contains_key(k.as_str()))
@@ -2167,8 +2501,8 @@ fn cmd_install_default_set() -> ExitCode {
         }
         println!(
             "atpkg: nothing was installed — the signed index pins no program with a build \
-             for this machine ({}). This is not a failure to retry; there is no ALab build \
-             for this architecture yet.",
+             for this machine ({}). This is not a failure to retry; nothing lands here \
+             until an artifact for this architecture is published.",
             current_triple()
         );
         // Exit 2, not 0 and not 1: the GUI maps 0 to "Succeeded" (which would be the
@@ -2246,7 +2580,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // was never adopted, so `cmd_update_all` short-circuited on
     // `installed.is_empty() && !complete_the_set` and printed "nothing installed to
     // update" — forever. That user could never receive the ALab toolchain, not even
-    // once x86_64 artifacts were published, unless they hand-edited
+    // now that x86_64 artifacts publish, unless they hand-edited
     // `[packages].auto_install = true` into a config file that does not exist until
     // the app has already run. "Installing aterm installs the packages" has to be
     // true on every Mac, not only the ones the seal happens to serve.
@@ -2269,9 +2603,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
             let fetcher = crate::DirFetcher::new(seed_dir.clone());
             announce_pending_seed(&layout, &fetcher, cfg, &seed_dir);
         } else {
-            println!(
-                "atpkg: [packages].seed_install = false — not installing the ALab toolset"
-            );
+            println!("atpkg: [packages].seed_install = false — not installing the ALab toolset");
         }
         return ExitCode::SUCCESS;
     }
@@ -2334,10 +2666,13 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     //    Bootstrap-only-ness is not weakened: it is enforced by the seed being a
     //    bare local `DirFetcher` outranked by any newer network index, not by the
     //    store happening to be empty.
-    //  * Can it serve THIS triple at all? On an Intel Mac against today's
-    //    aarch64-only registry the honest answer is no, and saying "installing…"
-    //    first and discovering that afterwards is how a user ends up watching a
-    //    progress notice that never resolves.
+    //  * Can it serve THIS triple at all? A seal carrying no artifact for this Mac's
+    //    architecture answers no. Coverage is per program, not per catalogue: the
+    //    standalone programs publish x86_64-apple-darwin beside aarch64-apple-darwin,
+    //    while the rustc coherence tuple is aarch64-only, so a seal can serve an Intel
+    //    Mac in part or not at all. Saying "installing…" first and discovering the
+    //    answer afterwards is how a user ends up watching a progress notice that never
+    //    resolves.
     let wanted = seed_serviceable(&layout, &fetcher, &index, cfg);
     if wanted.is_empty() {
         return finish_unusable_seed(&layout, &seed_dir, &fetcher, &index, cfg);
@@ -2486,11 +2821,14 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
 /// The channel-pinned members this SEAL can still install on THIS machine: wanted by
 /// config, not already active, and carrying an artifact for this triple.
 ///
-/// The triple test is the one that matters for honesty. Every published artifact today
-/// is `aarch64-apple-darwin`, so on an Intel Mac this returns empty and the caller can
-/// say so BEFORE announcing an install — rather than printing "installing…", clean-
-/// skipping every member inside `install_default_set`, and leaving a progress notice
-/// that never resolves.
+/// The triple test is the one that matters for honesty. Artifact coverage is per
+/// program, not per catalogue: the standalone programs publish `x86_64-apple-darwin`
+/// beside `aarch64-apple-darwin`, while the rustc coherence tuple (`trust`, `trust-ir`,
+/// `trust-cg`, `trust-vc`) is `aarch64-apple-darwin` only. So this returns the part of
+/// the seal that can be served here — possibly nothing — and the caller can say which
+/// BEFORE announcing an install, rather than printing "installing…", clean-skipping
+/// every member inside `install_default_set`, and leaving a progress notice that never
+/// resolves.
 ///
 /// Group granularity matches the installer's: a coherence tuple is all-or-nothing, so a
 /// tuple with any member lacking this triple contributes nothing (the same rule
@@ -2523,7 +2861,11 @@ fn seed_serviceable(
             })
             .cloned()
             .collect();
-        if missing.is_empty() || group.members.iter().any(|m| crate::linkmode::is_linked(layout, m))
+        if missing.is_empty()
+            || group
+                .members
+                .iter()
+                .any(|m| crate::linkmode::is_linked(layout, m))
         {
             continue;
         }
@@ -2586,8 +2928,8 @@ fn seed_install_bytes(
 /// the network will make up the difference.
 ///
 /// That claim would usually be false. The seal is staged from the published index, so
-/// a triple the seal cannot serve is overwhelmingly a triple the registry does not
-/// publish at all — an Intel Mac today. Telling that user "the toolchain will come
+/// a program the seal cannot serve for this triple is overwhelmingly one the registry
+/// does not publish for that triple either. Telling that user "the toolchain will come
 /// from the network instead" sends them to wait for something that is not coming.
 ///
 /// Emits the `seed-unusable:` marker so the GUI can retire the in-progress notice with
@@ -2682,8 +3024,7 @@ fn finish_unusable_seed(
             permanent = true;
             println!(
                 "atpkg: seed-unusable: the bundled toolchain has no build for this Mac's \
-                 architecture ({}) — no ALab programs were installed, and none are \
-                 available for it yet",
+                 architecture ({}) — no ALab programs were installed from it",
                 current_triple()
             );
             // AND LEAVE A DURABLE TRACE. Without this the whole first session had no
@@ -2700,7 +3041,10 @@ fn finish_unusable_seed(
                     state: String::from("unavailable: no build for this architecture"),
                     tree_root: String::new(),
                 },
-                format!("no ALab build is published for {} yet", current_triple()),
+                format!(
+                    "the bundled toolchain carries no build for {}",
+                    current_triple()
+                ),
             );
         }
     } else {
@@ -2797,9 +3141,9 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     });
     if serves_us == Some(false) {
         println!(
-            "atpkg: {SEED_UNUSABLE_MARKER}no ALab build is published for this Mac's \
-             architecture ({triple}) yet — nothing was installed, and nothing arrives \
-             until one is"
+            "atpkg: {SEED_UNUSABLE_MARKER}the signed index publishes no artifact for this \
+             Mac's architecture ({triple}) — nothing was installed, and nothing arrives \
+             until one is published"
         );
         record_status(
             layout,
@@ -2809,7 +3153,7 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
                 state: String::from("unavailable: no build for this architecture"),
                 tree_root: String::new(),
             },
-            format!("no ALab build is published for {triple} yet"),
+            format!("the signed index publishes no artifact for {triple}"),
         );
     } else {
         println!(
@@ -3144,6 +3488,69 @@ fn default_link_bins(program: &str) -> Vec<std::path::PathBuf> {
     ))]
 }
 
+/// The checkout-relative bins to dev-link when `checkout` is a SYSROOT rather than a cargo
+/// project — every name the installed build exposes, under `bin/`.
+///
+/// WHY A SYSROOT NEEDS ITS OWN ANSWER. `default_link_bins` returns
+/// `target/release/<program>`, which is right for a single-binary program and wrong for a
+/// toolchain: `trust` publishes ONE program that exposes fifteen commands, and those commands
+/// find their own `lib/rustlib` by walking up from the binary they were invoked as (`targo`
+/// authenticates its frontend and derives the sysroot from `frontend.parent()`). Linking
+/// `target/release/trust` would therefore shim a path that does not exist, and linking a lone
+/// `bin/targo` out of a sysroot would shim a binary whose parent has no sibling `lib/` — a
+/// toolchain that resolves and then cannot compile. Both failures are silent at link time.
+///
+/// So the unit for a sysroot is the ROOT: shim every exposed name to `<root>/bin/<name>`, so
+/// each one keeps its real neighbours. The exposed set is read from the INSTALLED manifest
+/// rather than from `<root>/bin`'s listing, because the manifest is the signed record of what
+/// this program is supposed to put on PATH; a dev build with an extra binary lying in `bin/`
+/// must not silently gain a shim, and one MISSING an exposed name must fail rather than
+/// quietly shim fewer commands than the registry build did.
+///
+/// Returns `None` when this is not a sysroot link, so the caller falls back unchanged.
+fn sysroot_link_bins(
+    layout: &crate::store::Layout,
+    program: &str,
+    checkout: &std::path::Path,
+) -> Option<Result<Vec<std::path::PathBuf>, Vec<String>>> {
+    // A sysroot is bin/ + lib/rustlib. Requiring BOTH is what keeps an ordinary cargo
+    // checkout that happens to have a `bin/` directory on the single-binary path.
+    if !checkout.join("bin").is_dir() || !checkout.join("lib").join("rustlib").is_dir() {
+        return None;
+    }
+    let exposes = crate::installed_exposes(layout, program)?;
+    if exposes.is_empty() {
+        return None;
+    }
+    // COMPLETENESS IS THE WHOLE POINT, and partial is worse than refused. Linking only the
+    // names a dev build happens to carry leaves the REST pointing at the registry build, so
+    // `trustc` would be the dev compiler while `trust-wp` stayed on the shipped one — two
+    // toolchains with different sysroots, mixed on one PATH, silently. Measured: a stage2
+    // built without the trust-wp tools linked 10 of 15 and left 5 shims on build 6459.
+    //
+    // So a missing exposed name aborts the LINK rather than shrinking it. The user then
+    // either builds the missing tools or names an explicit rel-bin list to say they meant a
+    // partial link.
+    let mut bins = Vec::with_capacity(exposes.len());
+    let mut missing = Vec::new();
+    for name in &exposes {
+        let rel =
+            std::path::PathBuf::from("bin").join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if checkout.join(&rel).is_file() {
+            bins.push(rel);
+        } else {
+            missing.push(name.clone());
+        }
+    }
+    if missing.is_empty() {
+        missing.sort();
+        Some(Ok(bins))
+    } else {
+        missing.sort();
+        Some(Err(missing))
+    }
+}
+
 /// `atpkg update <program>` — update ONE program (§11 tuple-split fix). A coherence-GROUP
 /// member is routed through the transactional [`crate::flow::apply_program`] so its whole
 /// tuple stages/flips/rolls-back atomically and can never move alone; an ungrouped program
@@ -3196,6 +3603,9 @@ fn cmd_update_one(program: &String) -> ExitCode {
             current_triple(),
             program,
             &installed,
+            // Same wire as cmd_update_all: an excluded ABSENT sibling must not
+            // ride back in on this program's coherence tuple.
+            cfg.exclude(),
             floor,
             now_unix(),
         ) {
@@ -3549,8 +3959,39 @@ fn cmd_link(rest: &[String]) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    let checkout_path = std::path::Path::new(checkout);
     let bins: Vec<std::path::PathBuf> = if rest.len() > 2 {
         rest[2..].iter().map(std::path::PathBuf::from).collect()
+    } else if let Some(sysroot) = sysroot_link_bins(&layout, program, checkout_path) {
+        // A TOOLCHAIN, not a cargo project: shim every exposed name out of `<root>/bin` so
+        // each keeps its sibling `lib/` (see `sysroot_link_bins`). An explicit rel-bin list
+        // still wins — this only replaces the DEFAULT.
+        match sysroot {
+            Ok(bins) => {
+                println!(
+                    "atpkg: {checkout} is a sysroot — linking {} exposed command(s) from bin/",
+                    bins.len()
+                );
+                bins
+            }
+            Err(missing) => {
+                eprintln!(
+                    "atpkg: refusing to dev-link {program}: {} of its exposed command(s) are \
+                     missing from {checkout}/bin — {}",
+                    missing.len(),
+                    missing.join(", ")
+                );
+                eprintln!(
+                    "atpkg:   linking the rest would leave those commands on the INSTALLED \
+                     build while the others moved to your checkout — one PATH, two toolchains,"
+                );
+                eprintln!(
+                    "atpkg:   different sysroots. Build the missing tools, or pass an explicit \
+                     rel-bin list to say you meant a partial link."
+                );
+                return ExitCode::from(1);
+            }
+        }
     } else {
         // Default to the conventional cargo release bin, WITH the platform executable
         // extension (`target/release/<program>.exe` on Windows) — else `src.is_file()`
@@ -3558,7 +3999,7 @@ fn cmd_link(rest: &[String]) -> ExitCode {
         // the `[packages.links]` reconciliation.
         default_link_bins(program)
     };
-    match crate::link(&layout, program, std::path::Path::new(checkout), &bins) {
+    match crate::link(&layout, program, checkout_path, &bins) {
         Ok(out) => {
             println!(
                 "atpkg: dev-linked {program} ({}); `atpkg unlink {program}` to release it",
@@ -3580,8 +4021,24 @@ fn cmd_link(rest: &[String]) -> ExitCode {
     }
 }
 
-/// `atpkg unlink <program>` (§13) — remove a program's dev links (leaving any re-installed
-/// store shim intact) and its marker. A pin is preserved across the cycle.
+/// `atpkg unlink <program>` (§13) — remove a program's dev links and its marker, then PUT
+/// THE INSTALLED BUILD BACK ON PATH. A pin is preserved across the cycle.
+///
+/// RESTORATION IS PART OF UNLINK, not a follow-up the user is expected to remember. Removing
+/// the dev shims alone leaves every command the link covered simply ABSENT: measured on a
+/// 15-command toolchain, a link/unlink cycle took `targo`, `trustc` and `tippy` off PATH
+/// entirely while leaving the commands the dev build had not carried still pointing at the
+/// installed build. "Your compiler disappeared" is not an acceptable resting state for a
+/// verb whose whole job is to undo something, and a partial PATH is the same split-toolchain
+/// hazard `link` now refuses to create.
+///
+/// The store build is guaranteed to still be there: gc's claim union counts the per-program
+/// `current` link, so a dev-linked program's build is never reclaimable (measured — gc
+/// reports "nothing to reclaim" while linked). Restoration is therefore just re-asserting
+/// shims that already have a target, never a download.
+///
+/// Best-effort by design: a program that was never installed (dev-linked from the start) has
+/// nothing to restore, and that is reported rather than treated as failure.
 fn cmd_unlink(program: Option<&String>) -> ExitCode {
     let Some(program) = program else {
         eprintln!("usage: atpkg unlink <program>");
@@ -3590,9 +4047,23 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
+    // Read the marker BEFORE `unlink` removes it: it is the only record of which names this
+    // link took over, and restoring anything else would touch programs that were never linked.
+    let owned = crate::linked_tool_names(&layout, program);
     match crate::unlink(&layout, program) {
         Ok(()) => {
             println!("atpkg: unlinked {program} (any pin is preserved)");
+            match restore_installed_shims(&layout, program, owned.as_deref()) {
+                Ok(0) => println!(
+                    "atpkg:   no installed build to restore — {program} is off PATH until \
+                     `atpkg install {program}`"
+                ),
+                Ok(n) => println!("atpkg:   restored {n} command(s) from the installed build"),
+                Err(e) => eprintln!(
+                    "atpkg:   WARNING: could not restore the installed build's shims ({e}); \
+                     run `atpkg install {program}` to put it back on PATH"
+                ),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -3600,6 +4071,56 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Re-assert `program`'s shims from its CURRENT store build. Returns how many were written,
+/// or 0 when the program has no installed build.
+///
+/// `owned` is the set the link took over (from its marker), and restoration is confined to
+/// it — see the note inside on why the build's `bin/` listing is NOT a safe substitute. Each
+/// name must also exist in the installed build, and still passes the same admission the
+/// install path uses (`ToolName::new` — the sensitive-name deny-list), so a restore can no
+/// more shadow `git`/`sudo` than an install can.
+fn restore_installed_shims(
+    layout: &crate::store::Layout,
+    program: &str,
+    owned: Option<&[String]>,
+) -> std::io::Result<usize> {
+    let current = layout.program_current(program);
+    if !current.exists() {
+        return Ok(0);
+    }
+    let build_dir = std::fs::canonicalize(&current)?;
+    let bin = build_dir.join("bin");
+    if !bin.is_dir() {
+        return Ok(0);
+    }
+    // ONLY the names the link owned. A sysroot bundle's `bin/` carries backends belonging to
+    // OTHER atpkg programs — `trust`'s carries `ay`, `clean`, `ty` — so restoring from the
+    // directory listing repoints those programs' shims at this build. Measured: it clobbered
+    // all three onto `store/trust/6459`. The marker's set is scoped to this link, which makes
+    // the restore symmetric with the takeover.
+    let Some(owned) = owned else {
+        return Ok(0);
+    };
+    let mut tools = Vec::new();
+    for name in owned {
+        // Still require the binary to exist in the installed build: the dev checkout and the
+        // registry build need not expose the same set, and a shim with nothing behind it is
+        // worse than an absent one.
+        let file = bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        if !file.is_file() {
+            continue;
+        }
+        if let Some(tool) = crate::store::ToolName::new(name) {
+            tools.push(tool);
+        }
+    }
+    if tools.is_empty() {
+        return Ok(0);
+    }
+    crate::activate::install_tools(layout, &build_dir, &tools)?;
+    Ok(tools.len())
 }
 
 /// `atpkg refresh [program…]` (§13) — re-assert dev links from their markers (picking up
@@ -3688,7 +4209,10 @@ mod tests {
         let layout = crate::store::resolve(Some(&root)).expect("layout");
         std::fs::write(layout.removed(), "# deliberate\ntrust\n\n").unwrap();
         let removed = layout.removed_programs();
-        assert!(removed.contains("trust"), "the durable record is the answer");
+        assert!(
+            removed.contains("trust"),
+            "the durable record is the answer"
+        );
         assert_eq!(removed.len(), 1, "comments and blanks are not programs");
         // The CLI reader and the flow reader must be the same answer, or the
         // unattended lane disagrees with the verb the user ran.
@@ -3776,6 +4300,348 @@ mod tests {
         crate::store::Layout { prefix: p }
     }
 
+    /// A verdict the AUTHORITY never gave must not become a resident of the record.
+    ///
+    /// `NotReachable` means the signed index resolved, verified, and does not name the
+    /// token — a fact about the request, not about this store. Recording it as a program
+    /// state invents a program, and `atpkg doctor` reads every such row back as a missing
+    /// member of the toolset.
+    #[test]
+    fn a_name_the_index_does_not_name_is_never_recorded() {
+        assert_eq!(
+            failed_install_state(&crate::FlowError::NotReachable("--help".into())),
+            None,
+            "the index does not name it, so there is no program to remember"
+        );
+        assert_eq!(
+            failed_install_state(&crate::FlowError::Linked("ay".into())),
+            Some(String::from("dev-linked (skipped)")),
+            "a dev-linked program is a benign hard-skip (§13), and still says so"
+        );
+        // THE OFFLINE FAMILY, all raised before the program lookup ever happens. Recording
+        // any of these against a program says the program is broken; what happened is that
+        // the machine could not reach the channel.
+        for env in [
+            crate::FlowError::NoIndex,
+            crate::FlowError::Unreachable("dns".into()),
+            crate::FlowError::Stale,
+        ] {
+            assert_eq!(
+                failed_install_state(&env),
+                None,
+                "{env} is a fact about the network, not about any program"
+            );
+        }
+        // …while a genuine per-program fact about THIS machine still lands on the record.
+        assert_eq!(
+            failed_install_state(&crate::FlowError::NoArtifact("aarch64".into())),
+            Some(format!(
+                "error: {}",
+                crate::FlowError::NoArtifact("aarch64".into())
+            )),
+            "no build for this Mac's triple is a real, durable fact about the program"
+        );
+        assert_eq!(
+            failed_install_state(&crate::FlowError::PkgVerify),
+            Some(format!("error: {}", crate::FlowError::PkgVerify)),
+            "a manifest that failed its signature check is a fault worth remembering"
+        );
+    }
+
+    /// Put `program` genuinely LIVE in `layout` at `build` — real build tree, real shims,
+    /// real channel pointer — so `active_builds` reports it the way it does on a machine.
+    /// A stubbed record would not exercise the thing under test.
+    fn make_live(layout: &crate::store::Layout, program: &str, build: u64) {
+        let dir = layout.build_dir(program, build);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let t = crate::store::ToolName::new(program).unwrap();
+        std::fs::write(dir.join("bin").join(t.exe_file()), b"#!/bin/true\n").unwrap();
+        crate::activate::install_shims(layout, &dir, &[program.to_string()]).unwrap();
+        crate::activate::activate_channel(layout, "stable", &dir).unwrap();
+        crate::store::mark_build_ready(&dir).unwrap();
+    }
+
+    /// A FAILED INSTALL UNINSTALLS NOTHING — so it must not report that it did.
+    ///
+    /// An upgrade that dies at download/stage/activate leaves the previous build activated,
+    /// shimmed and working. Every failure arm nonetheless wrote `installed_build: None` and
+    /// `tree_root: ""`, which says the program is gone AND unattested. The second is
+    /// destructive: `crate::verify` fails closed on an empty root, so ONE failed upgrade
+    /// turned `atpkg verify` into a permanent "cannot verify" for bytes that were never
+    /// touched — recoverable only by reinstalling gigabytes to re-record a root that had
+    /// been correct the whole time.
+    #[test]
+    fn a_failed_install_keeps_the_live_build_and_its_attestation() {
+        let layout = temp_layout("failure-row");
+        make_live(&layout, "ay", 18);
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: "active".into(),
+                tree_root: "0fda8eaefbfae96ac95ffb83afce208e".into(),
+            },
+            "up to date".into(),
+        );
+
+        // An upgrade to 20 dies mid-flight.
+        let row = failure_row(&layout, "ay", String::from("error: download failed"));
+        assert_eq!(
+            row.installed_build,
+            Some(18),
+            "build 18 is still activated and shimmed; the record must not claim otherwise"
+        );
+        assert_eq!(
+            row.tree_root, "0fda8eaefbfae96ac95ffb83afce208e",
+            "the signed attestation for untouched bytes survives a failed upgrade"
+        );
+        assert_eq!(
+            row.state, "error: download failed",
+            "the failure is still reported"
+        );
+
+        // …while a program that was never installed still records nothing to preserve.
+        let fresh = failure_row(&layout, "clean", String::from("error: download failed"));
+        assert_eq!(fresh.installed_build, None);
+        assert!(fresh.tree_root.is_empty());
+
+        // THE RECORD DISAGREES WITH THE STORE — the case the two fields are read from
+        // different sources, and the one that makes stapling them together dangerous. The
+        // store is now live at 20 while the record still says 18/root18. Taking the build
+        // from the store and the root from the record would produce "build 20, attested by
+        // build 18's signature", which DISARMS verify's `BuildMismatch` guard and lands in
+        // the tree comparison: `Drift` (a tampering accusation against untouched bytes) or,
+        // worse, `Match` — affirming a build no signature ever covered.
+        make_live(&layout, "ay", 20);
+        assert_eq!(
+            crate::active_builds(&layout).get("ay").copied(),
+            Some(20),
+            "precondition: the store moved on and the record has not caught up"
+        );
+        let stitched = failure_row(&layout, "ay", String::from("error: download failed"));
+        assert_eq!(
+            stitched.installed_build,
+            Some(20),
+            "the store is ground truth for what is live"
+        );
+        assert!(
+            stitched.tree_root.is_empty(),
+            "an attestation captured for build 18 must NOT be stapled onto build 20 — an \
+             honest `NoSignedRoot` beats a false `Drift`, and beats a false `Match` by \
+             considerably more"
+        );
+
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A TOMBSTONED PROGRAM KEEPS ITS ATTESTATION. Its shims were replaced by failing stubs
+    /// so `active_builds` goes silent, but its bytes and their signed root sit untouched in
+    /// the store — and the build-agreement rule above must not read that silence as
+    /// disagreement and throw the root away on the strength of a yanked pin.
+    #[test]
+    fn a_tombstoned_program_does_not_lose_its_signed_root() {
+        let layout = temp_layout("tombstone-root");
+        record_status(
+            &layout,
+            "trust",
+            crate::ProgramStatus {
+                installed_build: Some(6459),
+                state: "active".into(),
+                tree_root: "abc123".into(),
+            },
+            "up to date".into(),
+        );
+        // No shims at all: exactly what `active_builds` sees for a tombstoned program.
+        assert_eq!(crate::active_builds(&layout).get("trust").copied(), None);
+
+        let row = failure_row(&layout, "trust", String::from("tombstoned: pin yanked"));
+        assert_eq!(
+            row.tree_root, "abc123",
+            "nothing contradicts the recorded root, so it survives"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// A ROW MUST NOT OUTLIVE ITS PROGRAM.
+    ///
+    /// `active_builds` reads shims, so doctor went quiet after an uninstall — but Settings ▸
+    /// Packages reads the RECORD, and listed a deleted program as `active` at its last build
+    /// forever. The stale-row reconciler cannot fix this and correctly declines to: the
+    /// signed index still names the program, it is this MACHINE that no longer carries it.
+    #[test]
+    fn uninstalling_retires_the_program_row() {
+        let layout = temp_layout("retire-row");
+        make_live(&layout, "ay", 18);
+        make_live(&layout, "clean", 7);
+        record_status(
+            &layout,
+            "ay",
+            crate::ProgramStatus {
+                installed_build: Some(18),
+                state: "active".into(),
+                tree_root: "deadbeef".into(),
+            },
+            "up to date".into(),
+        );
+        record_status(
+            &layout,
+            "clean",
+            crate::ProgramStatus {
+                installed_build: Some(7),
+                state: "active".into(),
+                tree_root: "cafe".into(),
+            },
+            "up to date".into(),
+        );
+        assert!(
+            crate::active_builds(&layout).contains_key("ay"),
+            "precondition: ay is genuinely live"
+        );
+
+        // THE REAL PATH the CLI arm runs — not the primitive it happens to call.
+        uninstall_and_retire(&layout, "ay").expect("uninstall succeeds");
+
+        assert!(
+            !crate::active_builds(&layout).contains_key("ay"),
+            "the program really came off"
+        );
+        assert!(
+            removed_programs(&layout).contains("ay"),
+            "and the seed lane is told not to put it back"
+        );
+        let s = crate::status::read(&layout).expect("record present");
+        assert!(
+            !s.programs.contains_key("ay"),
+            "the removed program's row is retired, not left reading `active`"
+        );
+        assert!(
+            s.programs.contains_key("clean"),
+            "and retiring one program does not disturb the others"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// ROW DELETION IS A NEW CAPABILITY, so the names it accepts are gated.
+    ///
+    /// `ops::uninstall`'s shape rule rejects only empty/`.`/`..`/separators/NUL, so before
+    /// the gate `atpkg uninstall '*toolset*'` returned Ok and DELETED a bookkeeping row that
+    /// has its own owner and its own reaper, and `atpkg uninstall --help` appended a flag to
+    /// the removed-markers file — which would then suppress a program named `--help` forever,
+    /// a fittingly absurd end for the bug that started this.
+    #[test]
+    fn retirement_refuses_names_that_are_not_programs() {
+        let layout = temp_layout("retire-gate");
+        record_status(
+            &layout,
+            "*toolset*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: "unavailable: no build for this architecture".into(),
+                tree_root: String::new(),
+            },
+            "no build published".into(),
+        );
+
+        assert!(
+            uninstall_and_retire(&layout, "*toolset*").is_err(),
+            "a sentinel bookkeeping row is not a program and is not this verb's to retire"
+        );
+        assert!(
+            crate::status::read(&layout)
+                .expect("record present")
+                .programs
+                .contains_key("*toolset*"),
+            "…and it is still there"
+        );
+        assert!(
+            uninstall_and_retire(&layout, "--help").is_err(),
+            "a flag is not a program name here either"
+        );
+        assert!(
+            !removed_programs(&layout).contains("--help"),
+            "no removed-marker is minted for a flag"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// AN OFFLINE FIRST RUN MUST STILL LEAVE A WITNESS.
+    ///
+    /// Suppressing the environmental failures' per-program rows routes their reason to the
+    /// outcome sentence and NOWHERE else — so the sentence has to survive a virgin store.
+    /// While `record_outcome` early-returned when no record existed, a first-run offline
+    /// install recorded nothing at all: exactly the failed-seed machine that gets pointed
+    /// at `pkg doctor`, and the one case doctor's fallback to this sentence exists for.
+    #[test]
+    fn the_outcome_sentence_creates_the_record_it_needs() {
+        let layout = temp_layout("virgin-outcome");
+        assert!(
+            crate::status::read(&layout).is_none(),
+            "precondition: this store has never been written to"
+        );
+        record_outcome(
+            &layout,
+            String::from("install ay: no signature-valid index"),
+        );
+        let s = crate::status::read(&layout).expect("a first-run failure still leaves a witness");
+        assert_eq!(s.outcome, "install ay: no signature-valid index");
+        assert!(
+            s.programs.is_empty(),
+            "the witness records what happened without blaming a program for the network"
+        );
+        assert_eq!(s.schema, 1, "a created record is a well-formed one");
+    }
+
+    /// The record is a DERIVED memo; the signed index is the authority on what exists.
+    ///
+    /// Pins the four conditions together, because each one alone is a different bug: prune
+    /// a sentinel and the bookkeeping rows lose their reapers; prune a live-but-dropped
+    /// program and `atpkg verify` fails closed forever on an erased attestation.
+    #[test]
+    fn the_record_reconciles_against_the_signed_index() {
+        let row = |state: &str| crate::ProgramStatus {
+            installed_build: None,
+            state: state.into(),
+            tree_root: String::new(),
+        };
+        let recorded = std::collections::BTreeMap::from([
+            (
+                "--help".to_string(),
+                row("error: --help is not named in the signed index"),
+            ),
+            (
+                "ayy".to_string(),
+                row("error: ayy is not named in the signed index"),
+            ),
+            ("ay".to_string(), row("active")),
+            (
+                "*toolset*".to_string(),
+                row("unavailable: no build for this Mac"),
+            ),
+            ("retired".to_string(), row("active")),
+        ]);
+        let live = std::collections::BTreeMap::from([
+            ("ay".to_string(), 18_u64),
+            ("retired".to_string(), 5_u64),
+        ]);
+        let pruned = prunable_status_rows(&recorded, &live, &|n| n == "ay");
+
+        assert_eq!(
+            pruned,
+            vec!["--help".to_string(), "ayy".to_string()],
+            "only the rows naming nothing the index knows and nothing the store carries"
+        );
+        assert!(
+            !pruned.contains(&"*toolset*".to_string()),
+            "sentinel bookkeeping rows have their own owners and their own reapers"
+        );
+        assert!(
+            !pruned.contains(&"retired".to_string()),
+            "a program dropped upstream while still LIVE keeps its row — deleting it would \
+             erase the attestation `atpkg verify` fails closed without"
+        );
+    }
+
     /// The silent update loop calls `record_status` once PER program; recording one
     /// must not wipe the others' last-known state (regression for the clobber bug).
     #[test]
@@ -3849,6 +4715,8 @@ mod tests {
         }
         for read_only in [
             "doctor",
+            // `status` is the same read-only report under the name people reach for.
+            "status",
             "which",
             "list",
             "run",
@@ -3885,7 +4753,8 @@ mod tests {
     /// twice with no test.
     #[test]
     fn the_seed_leg_joins_only_on_an_empty_store() {
-        let seed = std::path::PathBuf::from("/Applications/aterm.app/Contents/Resources/toolchain-seed");
+        let seed =
+            std::path::PathBuf::from("/Applications/aterm.app/Contents/Resources/toolchain-seed");
         assert_eq!(
             seed_bootstrap_leg(Some(seed.clone()), true),
             Some(seed.clone()),
@@ -3968,7 +4837,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atpkg-rm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let layout = crate::store::Layout { prefix: dir.clone() };
+        let layout = crate::store::Layout {
+            prefix: dir.clone(),
+        };
 
         assert!(removed_programs(&layout).is_empty());
         record_removed(&layout, "ny");
@@ -3982,7 +4853,10 @@ mod tests {
 
         clear_removed(&layout, &["ny".to_string()]);
         let rm = removed_programs(&layout);
-        assert!(!rm.contains("ny"), "an explicit install lifts just that one");
+        assert!(
+            !rm.contains("ny"),
+            "an explicit install lifts just that one"
+        );
         assert!(rm.contains("clean"), "and leaves the others alone");
 
         clear_removed(&layout, &["clean".to_string()]);

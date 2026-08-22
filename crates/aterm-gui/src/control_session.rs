@@ -750,8 +750,16 @@ pub(crate) struct TurnIo<'a> {
 /// bare `content_seq` advance. The DEFAULT is AUTO: `block` when the target is at a
 /// shell prompt (a submit will start a command — the sound choice), else `seq` (a
 /// full-screen TUI or a session with no shell integration has no press-attributable
-/// signal). So a shell drive is sound by default. The whole exchange is one request
-/// line — no client-side timing enters the protocol.
+/// signal). So a shell drive is sound by default. AUTO additionally DEGRADES
+/// honestly: when the window expires with content having moved after the press but
+/// no command block started, the prompt-shaped block AUTO keyed on has proven
+/// STALE (a desynced 133 stream — e.g. a distro integration whose C mark never
+/// lands), so AUTO takes the seq verdict (`submitted=1`) instead of re-pressing —
+/// a press whose echo moved the screen was consumed, and another Enter would land
+/// in the running command. Re-press is reserved for a press after which NOTHING
+/// moved (the true swallowed case). Explicit `submit_verify=block` never degrades.
+/// The whole exchange is one request line — no client-side timing enters the
+/// protocol.
 ///
 /// The gesture vocabulary is app-agnostic on purpose: nothing here knows what
 /// program is driven. Claude Code, codex, a shell, emacs (`submit=none` types
@@ -1005,6 +1013,12 @@ pub(crate) fn cmd_turn(
         // EFFECTIVE verification mode. Explicit `submit_verify=` wins; otherwise AUTO:
         // `block` when the target is at a shell prompt (a submit will start a command,
         // so the OSC-133 signal exists and is ambient-repaint-immune), else `seq`.
+        // AUTO retains the right to DEGRADE below: a prompt-shaped block may be a
+        // STALE one from a desynced 133 stream (a distro-side integration whose C
+        // mark never lands — stock Ubuntu bash sources vte.sh twice and its PS0
+        // 133;C is clobbered), where block verification can never succeed even
+        // though every press lands. Explicit `block` stays strict.
+        let auto_mode = submit_verify.is_none();
         let submit_verify_block = submit_verify.unwrap_or_else(|| {
             matches!(
                 term_lock(term).all_blocks().last().map(|b| b.state),
@@ -1037,10 +1051,15 @@ pub(crate) fn cmd_turn(
             // `seq`: the first content advance verifies. `block`: only a NEW command
             // block does — re-arm past ambient repaints until the window expires, so a
             // periodically-repainting TUI cannot false-verify a swallowed Enter.
+            // `advanced` records whether THIS press's window saw ANY content advance:
+            // it separates a swallowed press (nothing moved — press again) from a
+            // press the app consumed without starting a command block.
+            let mut advanced = false;
             loop {
                 match wait(id, window) {
                     Phase::Exited => return "ERR exited\n".to_string(),
                     Phase::Latched => {
+                        advanced = true;
                         if !submit_verify_block || commands_started(&term_lock(term)) > base_block {
                             submitted = true;
                             break;
@@ -1057,6 +1076,24 @@ pub(crate) fn cmd_turn(
                     }
                     Phase::Deadline => break,
                 }
+            }
+            // AUTO degrade: the window expired with content moving after the press
+            // but no command block starting — and the session has NEVER started
+            // one (`base_block == 0`). A stream that has never once fired 133;C
+            // has proven the block signal unavailable (dead or desynced
+            // integration), so fall back to the verdict AUTO would have chosen
+            // without it — the seq advance. The press provably reached the app;
+            // re-pressing here would type a REAL extra Enter into a target that
+            // already consumed the first (and a driver told submitted=0 would
+            // re-type the whole turn — the double-type this closes). A session
+            // whose stream HAS started blocks before keeps the strict re-press:
+            // there, no-block-plus-ambient-movement is exactly what a swallowed
+            // Enter beside a spinner looks like, and claiming submitted=1 on it
+            // would break this fn's "a press VERIFIABLY landed" contract.
+            // Explicit `submit_verify=block` stays strict unconditionally:
+            // soundness was asked for by name.
+            if !submitted && advanced && auto_mode && base_block == 0 {
+                submitted = true;
             }
             if submitted || Instant::now() >= deadline {
                 break; // verified, or the overall deadline: report honestly

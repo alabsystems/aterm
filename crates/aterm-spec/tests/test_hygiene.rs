@@ -62,16 +62,21 @@ fn empty_test_body(lines: &[&str], fn_line: usize) -> bool {
         // Multi-line signature: find the line opening the body.
         return false;
     }
-    let mut depth = 1usize;
+    // NO BRACE ARITHMETIC. Counting `{`/`}` per line cannot tell a delimiter from a
+    // brace inside a STRING LITERAL, and it ran BEFORE the is-this-real-code test, so
+    // the count decided the verdict first. A test whose opening line was
+    // `let banned = [":<11}", …];` drove the depth to zero on that very line and was
+    // reported as an empty body — a fully implemented test, failed for containing a
+    // `}` in a string. Format strings make that spelling ordinary.
+    //
+    // None of it was needed. The question is only "does anything but blanks and
+    // comments appear before the close", and that is answered by looking at the lines
+    // themselves: the first real line proves the body is not empty, and a bare `}`
+    // reached before one proves it is.
     for line in lines.iter().skip(fn_line + 1) {
         let trimmed = line.trim();
-        if trimmed == "}" && depth == 1 {
+        if trimmed == "}" {
             return true; // reached the close having seen only blanks/comments
-        }
-        depth += line.matches('{').count();
-        depth = depth.saturating_sub(line.matches('}').count());
-        if depth == 0 {
-            return true;
         }
         if !trimmed.is_empty() && !trimmed.starts_with("//") {
             return false;

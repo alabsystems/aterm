@@ -52,9 +52,10 @@ pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
 /// shared by every machine behind one NAT) was the one lane with no backoff at all,
 /// and the same silent no-op applied to any operator interval at or above the cap.
 /// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
-/// retreat (15 min → 30 → 60) while bounding the worst case at 4× a cadence the lane
-/// or the operator has already accepted — and a wake, or one healthy check, still
-/// snaps all the way back to the base, so recovery is never rate-limited by the cap.
+/// retreat (30 min → 60 → 120 on today's anonymous lane) while bounding the worst
+/// case at 4× a cadence the lane or the operator has already accepted — and a wake,
+/// or one healthy check, still snaps all the way back to the base, so recovery is
+/// never rate-limited by the cap.
 pub(crate) const MAX_BACKOFF_INTERVALS: u32 = 4;
 
 /// Jitter applied to every wait, as a percentage either side of the nominal delay.
@@ -74,20 +75,26 @@ pub(crate) const WAKE_SETTLE: Duration = Duration::from_secs(20);
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// The base interval for a check on the AUTHENTICATED lane: a token buys 5000 GitHub
-/// requests/hour, and ~3 requests per check (list + manifest + signature) is ~150/hour
-/// — comfortably inside it, so the cadence can be the fast one the owner asked for.
+/// requests/hour, and ~5 requests per steady-state check on the armed tier (list +
+/// manifest + roster + roster.sig + appcast.sig — 6 with a container download) is
+/// ~240/hour — comfortably inside it, so the cadence can be the fast one the owner
+/// asked for.
 pub(crate) const AUTHENTICATED_INTERVAL_SECS: u64 = 75;
 
 /// The base interval for a check on the ANONYMOUS lane.
 ///
 /// Unauthenticated GitHub allows ~60 requests/hour PER IP — shared by every machine
 /// behind one NAT, and by anything else on that address using the API. At 75 s a
-/// single machine would spend ~150 requests/hour and live permanently rate-limited: it
-/// would not update FASTER, it would not update at all. Four checks an hour costs ~12
-/// requests/hour, leaving room for several machines and for the retry budget, while
-/// still picking a release up well inside the "one launch behind" bound the crate docs
-/// promise. Provisioning a token restores the 75 s cadence automatically.
-pub(crate) const ANONYMOUS_INTERVAL_SECS: u64 = 15 * 60;
+/// single machine would spend ~240 requests/hour and live permanently rate-limited: it
+/// would not update FASTER, it would not update at all. Since PAPER_MASTER_PUBKEYS
+/// armed (2026-08-15) every production check costs 5 requests, not the pre-armed 3
+/// this comment used to count — at 15 minutes that was 20/hour per machine, and
+/// three or four Macs behind one NAT (the exact fleet the budget test protects)
+/// blew the whole allowance and lived in rate-limit deferrals. Two checks an hour
+/// costs ~10 requests/hour, leaving room for several machines and the retry budget,
+/// while still picking a release up well inside the "one launch behind" bound the
+/// crate docs promise. Provisioning a token restores the 75 s cadence automatically.
+pub(crate) const ANONYMOUS_INTERVAL_SECS: u64 = 30 * 60;
 
 /// The interval schedule: a base cadence plus the current consecutive-failure count.
 #[derive(Debug, Clone, Copy)]
@@ -107,6 +114,12 @@ impl Cadence {
     /// it). Leaves the failure count — and therefore any backoff in progress — alone.
     pub(crate) fn set_base(&mut self, base: Duration) {
         self.base = base;
+    }
+
+    /// The current base interval — the cross-process checker gate sizes its
+    /// freshness window from it (see the check loop in `lib.rs`).
+    pub(crate) fn base(&self) -> Duration {
+        self.base
     }
 
     /// Note a failed check (lengthens the next wait).
@@ -357,9 +370,13 @@ mod tests {
     /// check. Adopting the lane's interval must not disturb a backoff in progress.
     #[test]
     fn the_anonymous_lane_fits_inside_githubs_unauthenticated_budget() {
-        // 3 requests per check (list + manifest + signature) is the realistic worst
-        // case for a check that finds something to fetch.
-        const REQUESTS_PER_CHECK: u64 = 3;
+        // 5 requests per steady-state check on the ARMED tier (releases list +
+        // manifest + roster + roster.sig + appcast.sig — authorize_by_roster runs
+        // before the downgrade gate on every production check since
+        // PAPER_MASTER_PUBKEYS armed, 2026-08-15). A check that also fetches a
+        // container spends 6, but that is the rare stage, not the steady state
+        // this budget must sustain.
+        const REQUESTS_PER_CHECK: u64 = 5;
         const ANON_BUDGET_PER_HOUR: u64 = 60;
         let anon_per_hour = (3600 / ANONYMOUS_INTERVAL_SECS) * REQUESTS_PER_CHECK;
         assert!(
@@ -424,7 +441,7 @@ mod tests {
     }
 
     /// Regression, and the reason the ceiling is now relative: [`MAX_BACKOFF`] and
-    /// [`ANONYMOUS_INTERVAL_SECS`] are BOTH 15 minutes, so the old
+    /// [`ANONYMOUS_INTERVAL_SECS`] were BOTH 15 minutes at the time, so the old
     /// `min(MAX_BACKOFF.max(base))` clamp returned the base for every failure count —
     /// a tokenless client that could not reach GitHub retried at full speed forever,
     /// against the very ~60 requests/hour per-IP budget the slow lane exists to

@@ -112,6 +112,30 @@ pub struct RenderCell {
     pub underline_color: Option<[u8; 3]>,
 }
 
+/// A blank cell in the DOCUMENTED empty shape — `ch` is `' '`, not the `'\0'`
+/// a derived Default would produce (the struct doc promises `' '` for empty /
+/// NUL cells, and the renderers blit `ch` unconditionally). Colors are black
+/// on black: a `Default` cell is a structural placeholder, and every real
+/// frame path resolves colors through the live palette before a renderer sees
+/// them.
+impl Default for RenderCell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: [0, 0, 0],
+            bg: [0, 0, 0],
+            wide: false,
+            emoji_presentation: false,
+            bold: false,
+            italic: false,
+            underline: UnderlineStyle::None,
+            strikethrough: false,
+            overline: false,
+            underline_color: None,
+        }
+    }
+}
+
 impl Terminal {
     /// Resolve the render-ready cell represented by an UNMATERIALIZED grid
     /// column.
@@ -268,6 +292,20 @@ impl Terminal {
             // raw `colors()` of the cell is a StyleId payload. Rehydrate it to
             // an inline-colored cell (+ explicit RGB) before resolving, so the
             // resolver sees real packed colors. Inline cells take the fast path.
+            // DEAD-BRANCH PROBE (see `SgrStyleHandler::apply_style_change`): no
+            // production path sets `CellFlags::USES_STYLE_ID`. Every writer of that
+            // bit — `Row::write_char_with_style_id`, `Cell::with_style_id`,
+            // `Cell::set_style_id` — is `#[cfg(test)]`/`feature = "testing"`, and
+            // the SGR path no longer interns anything for them to reference. The
+            // rehydration below is kept because the CELL ENCODING still reserves
+            // the bit (and a future "route non-`PackedColors` renditions through
+            // the table" design would use it), but the whole suite now PROVES the
+            // branch is unreachable in production instead of assuming it.
+            debug_assert!(
+                !cell.uses_style_id(),
+                "render_row: a live cell carries USES_STYLE_ID, but nothing interns \
+                 styles any more — reviving style-id cells means reviving the intern"
+            );
             let (eff_cell, fg_rgb, bg_rgb) = if cell.uses_style_id() {
                 let extra_flags = cell.flags().difference(CellFlags::USES_STYLE_ID);
                 let (fg, bg, flags) = grid.resolve_style_to_colors(cell.style_id(), extra_flags);
@@ -757,17 +795,183 @@ impl Terminal {
     /// staleness. This builds on the EXISTING epoch (O(1); already read for the
     /// frontend's coarse present early-out) — no new counter and no extra damage
     /// scan.
+    pub fn cell_frame_into(
+        &mut self,
+        scratch: &mut crate::render::RenderInput,
+        rows: usize,
+        cols: usize,
+    ) {
+        self.cell_frame_fill(scratch, rows, cols, None);
+    }
+
+    /// Damage-scoped variant of [`cell_frame_into`](Self::cell_frame_into) that
+    /// also CONSUMES the damage session (DMG-1: the damage carrier crossing the
+    /// engine boundary).
+    ///
+    /// The grid's `DamageTracker` already knows, cell-granularly, which rows
+    /// changed since the last [`take_damage`](Self::take_damage) — but the
+    /// historical pipeline discarded that at this boundary and re-resolved
+    /// EVERY visible cell per frame. This entry point refills ONLY the
+    /// tracker's damaged rows into the caller-persistent `scratch` when — and
+    /// only when — the scratch is provably a byte-identical baseline for the
+    /// undamaged rows, and falls back to the full refill otherwise. Either way
+    /// it then calls `take_damage()` (fill-and-consume, replacing the caller's
+    /// historical `cell_frame_into(..); take_damage();` pair) and restamps the
+    /// scratch's continuity tokens, so the next frame can chain.
+    ///
+    /// The continuity proof, clause by clause (each one closes a documented
+    /// unsoundness from the raster audit's RE-3 skip):
+    /// - `terminal_id` match (nonzero): the scratch was last engine-filled by
+    ///   THIS terminal — a compositor's scratch shared across same-dims panes
+    ///   can never leak one pane's retained rows into another (per-terminal
+    ///   `damage_epoch` values collide numerically; the identity nonce cannot).
+    /// - `extract_gen` match: no consumer took damage since the scratch's fill,
+    ///   so the tracker's bits are a SUPERSET of the rows that changed under
+    ///   this scratch (a reset-then-accumulate window would undercount).
+    /// - `snapshot_seq == engine_fill_seq`: no post-extraction HOST mutator
+    ///   (stream fade, prediction ghosts, strip splice — all of which follow
+    ///   the existing bump-`snapshot_seq` discipline) wrote content channels
+    ///   since the engine filled the scratch.
+    /// - dims + `cells.len()` match: resize-in-place preserved every row.
+    /// - `display_offset == 0` on BOTH sides: tracker rows are LIVE-grid rows;
+    ///   at offset 0 they coincide with viewport rows. A scrolled-back
+    ///   viewport (or a transition) re-maps rows and takes the full arm.
+    /// - `base_y` / `absolute_row_revision` match: no scroll or protected-
+    ///   footer insertion shifted retained rows out from under their indices
+    ///   (scroll damage marks only the EXPOSED strip — #6072 — so bits alone
+    ///   cannot describe a shift).
+    /// - alt bit match, and `!Damage::Full`.
+    /// - `engine_row_order == RowOrder::Logical`: the reorder pass permutes rows in
+    ///   place and is not idempotent, so a partial refill may only retain rows
+    ///   that are still in LOGICAL order — i.e. rows the previous fill did not
+    ///   permute. A frame that really did reorder an RTL row costs the NEXT
+    ///   frame its scoped arm; a pure-LTR frame (every row identity, the
+    ///   overwhelming majority even in a `bidi` build) keeps it. Mode/direction
+    ///   changes need no clause of their own: each setter calls
+    ///   `invalidate_bidi_all`, which marks FULL damage.
+    ///
+    /// Row granularity ONLY: the per-row column bounds the tracker maintains
+    /// are deliberately not consulted — ligatures and clusters couple columns
+    /// within a row, so column-scoped extraction is a correctness project, not
+    /// an optimization (raster-audit hazard #2).
+    ///
+    /// Cost: `O(damaged rows × cols + rows)` instead of `O(rows × cols)` per
+    /// frame — the `O(rows)` floor is the unconditional scalar/metadata restamp
+    /// (cursor, selection, colors, `line_sizes`) plus the mask scan; the images
+    /// pass stays a full extras-map walk (O(placed images), already cheap, and
+    /// image placement need not mark row damage to stay fresh).
+    ///
+    /// Equality with the full path is pinned by the in-crate differential
+    /// oracle `damage_scoped_extraction_matches_full_extract_over_mutation_corpus`
+    /// (content-only `PartialEq` — the exact comparison the CPU renderer's
+    /// damage cache uses).
+    pub fn cell_frame_damage_scoped_into(
+        &mut self,
+        scratch: &mut crate::render::RenderInput,
+        rows: usize,
+        cols: usize,
+    ) -> crate::render::FrameRefill {
+        if self.damage_scoped_refill_valid(scratch, rows, cols) {
+            // Copy the tracker's row bits into an owned mask BEFORE the fill:
+            // the tracker read borrows `&self`, the fill needs `&mut self`.
+            // O(rows/64) words; `damaged_rows` skips clear words via
+            // trailing_zeros, so an idle-grid frame costs the iterator setup.
+            let mut mask = vec![0u64; rows.div_ceil(64)];
+            let mut rows_refilled = 0usize;
+            for r in self.grid().damage().damaged_rows(self.rows()) {
+                let r = usize::from(r);
+                if r < rows {
+                    mask[r / 64] |= 1u64 << (r % 64);
+                    rows_refilled += 1;
+                }
+            }
+            self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            self.take_damage();
+            // The fill stamped the PRE-take generation; `take_damage` just
+            // bumped it. Restamp: THIS scratch is the consumer that closed the
+            // session, so it remains the valid baseline for the next frame.
+            scratch.extract_gen = self.extract_gen;
+            crate::render::FrameRefill::Scoped { rows_refilled }
+        } else {
+            // Any continuity break lands here: always sound, costs exactly the
+            // pre-carrier status quo, and re-establishes a valid baseline.
+            self.cell_frame_fill(scratch, rows, cols, None);
+            self.take_damage();
+            scratch.extract_gen = self.extract_gen;
+            crate::render::FrameRefill::Full
+        }
+    }
+
+    /// The damage-scoped continuity check — every clause is justified on
+    /// [`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into).
+    /// Pure read; conservative by construction (any `false` merely buys the
+    /// full refill).
+    fn damage_scoped_refill_valid(
+        &self,
+        scratch: &crate::render::RenderInput,
+        rows: usize,
+        cols: usize,
+    ) -> bool {
+        // BiDi reorder is an in-place, non-idempotent row permutation applied
+        // at fill time, so retained rows may only be kept while they are still
+        // in LOGICAL order. That is precisely what the carrier's
+        // `engine_row_order` records about the LAST engine fill — not
+        // whether the feature is compiled in, and not whether the runtime mode
+        // is on.
+        //
+        // The clause this replaces vetoed on `bidi_mode != Disabled`. It read
+        // as conservative, but `BiDiMode`'s `#[default]` is `Implicit` and
+        // `aterm-gui` enables the `bidi` feature, so it vetoed EVERY frame of
+        // the shipping app: the damage-scoped arm could never fire where it
+        // matters, and only the workspace-unified feature build of the oracle's
+        // reach guards ("an echo on a settled scratch must take the scoped
+        // arm") could see it. A mode/direction change cannot slip past this
+        // token either — every setter calls `invalidate_bidi_all`, which marks
+        // FULL damage and is caught by the `!is_full()` clause below.
+        if scratch.engine_row_order != crate::render::RowOrder::Logical {
+            return false;
+        }
+        let grid = self.grid();
+        // Same conversion the fill stamps, so the comparison can never differ
+        // by conversion policy alone.
+        let base_y = i64::try_from(grid.base_y()).unwrap_or(i64::MAX);
+        scratch.terminal_id != 0
+            && scratch.terminal_id == self.extract_identity
+            && scratch.extract_gen == self.extract_gen
+            && scratch.snapshot_seq == scratch.engine_fill_seq
+            && scratch.engine_alt == self.is_alternate_screen()
+            && scratch.rows == rows
+            && scratch.cols == cols
+            && scratch.cells.len() == rows
+            && rows == usize::from(self.rows())
+            && cols == usize::from(self.cols())
+            && grid.display_offset() == 0
+            && scratch.display_offset == 0
+            && scratch.base_y == base_y
+            && scratch.absolute_row_revision == self.absolute_row_revision()
+            && !grid.damage().is_full()
+    }
+
+    /// The one shared fill body behind [`cell_frame_into`](Self::cell_frame_into)
+    /// (`refill_mask: None` — the historical unconditional walk, byte-identical)
+    /// and the damage-scoped arm (`Some(mask)` — only marked rows re-resolve;
+    /// the caller has already proven every unmarked row byte-identical in the
+    /// scratch). EVERYTHING except the per-row cell loop runs identically on
+    /// both arms: images, `line_sizes`, span hygiene, cursor/selection/color
+    /// scalars, seq + carrier stamps, BiDi — so the scoped arm can never skew a
+    /// scalar or a non-cell channel.
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
         reason = "display_offset is a scrollback row count that fits i32 in practice; \
                   the snapshot field is i32 (viewport row = r - display_offset)"
     )]
-    pub fn cell_frame_into(
+    fn cell_frame_fill(
         &mut self,
         scratch: &mut crate::render::RenderInput,
         rows: usize,
         cols: usize,
+        refill_mask: Option<&[u64]>,
     ) {
         scratch.rows = rows;
         scratch.cols = cols;
@@ -787,6 +991,16 @@ impl Terminal {
         scratch.clusters.resize_with(rows, Vec::new);
         scratch.combining.resize_with(rows, Vec::new);
         for r in 0..rows {
+            // Damage-scoped arm (DMG-1): rows the tracker did not mark are
+            // byte-identical in the scratch (the caller's continuity proof),
+            // so their re-resolve is skipped — including the cluster/combining
+            // refill, whose per-row Vecs likewise still hold this row's data.
+            // Row granularity only; the col bounds are deliberately unused.
+            if let Some(mask) = refill_mask
+                && mask.get(r / 64).is_none_or(|w| w & (1u64 << (r % 64)) == 0)
+            {
+                continue;
+            }
             self.render_row_into_impl(
                 r,
                 &mut scratch.cells[r],
@@ -918,12 +1132,38 @@ impl Terminal {
         // even when the frontend also reads it for its present early-out.
         scratch.snapshot_seq = self.damage_epoch();
 
+        // DMG-1 damage carrier: extraction-continuity tokens. Stamped by EVERY
+        // engine fill (full or scoped) so any scratch can later prove — or
+        // fail — scoped-refill eligibility. `engine_fill_seq` snapshots the
+        // seq the ENGINE stamped; a host mutator that bumps `snapshot_seq`
+        // afterwards (the established fade/ghost/splice discipline) thereby
+        // self-reports and forces the next fill to the full arm.
+        scratch.terminal_id = self.extract_identity;
+        scratch.extract_gen = self.extract_gen;
+        scratch.engine_alt = self.is_alternate_screen();
+        scratch.engine_fill_seq = scratch.snapshot_seq;
+
         // BiDi visual reordering (feature `bidi`): permute each row into visual
         // order so RTL runs display correctly on BOTH renderers and in the
         // `image` capture. No-op for pure-LTR frames and when the feature is off
         // (byte-identical). See terminal/bidi_reorder.rs::apply_bidi_reorder.
+        // DMG-1: the reorder pass is mask-aware (retained rows are provably
+        // still the identity permutation — see `apply_bidi_reorder`), and it
+        // REPORTS whether it permuted anything so the next refill's continuity
+        // check can require logical order. Feature-off builds stamp `false`,
+        // which is exactly true: no permutation exists to undo.
         #[cfg(feature = "bidi")]
-        self.apply_bidi_reorder(scratch);
+        {
+            scratch.engine_row_order = if self.apply_bidi_reorder(scratch, refill_mask) {
+                crate::render::RowOrder::BidiVisual
+            } else {
+                crate::render::RowOrder::Logical
+            };
+        }
+        #[cfg(not(feature = "bidi"))]
+        {
+            scratch.engine_row_order = crate::render::RowOrder::Logical;
+        }
     }
 }
 
@@ -1748,6 +1988,584 @@ mod tests {
         assert!(
             !frame.combining[0].is_empty(),
             "test content must produce at least one combining-mark overlay"
+        );
+    }
+
+    /// DMG-1 differential oracle: the damage-scoped extraction must be
+    /// CONTENT-identical to a fresh full extract after every step of a
+    /// mutation corpus that covers each continuity clause — echo writes, SGR,
+    /// cursor-only moves, wide/emoji/combining cells, scroll (base_y), viewport
+    /// scroll (display_offset), DECSCNM + OSC-4 recolors (full-damage marks),
+    /// alt-screen swaps, host splices (the bump-`snapshot_seq` discipline),
+    /// foreign `take_damage`, and resize. Content equality uses `RenderInput`'s
+    /// hand-written `PartialEq` — the EXACT comparison the CPU renderer's
+    /// damage cache trusts, with carrier metadata excluded by design.
+    ///
+    /// TWO-SIDED REACH: the corpus must exercise BOTH arms — a run in which the
+    /// scoped arm never fired (silent degradation to `Full` every frame) or the
+    /// full arm never fired (a gate that cannot say no) fails the counters at
+    /// the bottom, so this test also fences the fast path's existence, not just
+    /// its correctness.
+    #[test]
+    fn damage_scoped_extraction_matches_full_extract_over_mutation_corpus() {
+        use crate::render::FrameRefill;
+        let (rows, cols) = (8usize, 40usize);
+        let mut term = Terminal::new(8, 40);
+        let mut scoped = crate::render::RenderInput::empty();
+        let mut n_scoped = 0usize;
+        let mut n_full = 0usize;
+
+        // One corpus step: fresh-full oracle first (allocation-per-call, no
+        // continuity, no damage consume), then the scoped fill (which consumes
+        // the session), then content equality.
+        let step = |term: &mut Terminal,
+                    scoped: &mut crate::render::RenderInput,
+                    n_scoped: &mut usize,
+                    n_full: &mut usize,
+                    what: &str|
+         -> FrameRefill {
+            let reference = term.cell_frame(rows, cols);
+            let refill = term.cell_frame_damage_scoped_into(scoped, rows, cols);
+            match refill {
+                FrameRefill::Full => *n_full += 1,
+                FrameRefill::Scoped { .. } => *n_scoped += 1,
+            }
+            assert!(
+                *scoped == reference,
+                "scoped extraction diverged from the full extract after: {what}"
+            );
+            refill
+        };
+
+        // 1) First fill: gen 0 scratch -> Full by construction.
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "first fill",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a never-filled scratch must take the full arm"
+        );
+
+        // 2) Keystroke echo: one damaged row -> the scoped arm, refilling only it.
+        term.process(b"hello");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "echo write",
+        );
+        assert!(
+            matches!(r, FrameRefill::Scoped { rows_refilled } if rows_refilled >= 1),
+            "an echo on a settled scratch must take the scoped arm, got {r:?}"
+        );
+
+        // 3) SGR + positioned write.
+        term.process(b"\x1b[3;10H\x1b[1;35mZ\x1b[0m");
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "SGR write",
+        );
+
+        // 4) Cursor-only move: no damage -> Scoped with zero rows, scalars restamped.
+        term.process(b"\x1b[5;5H");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "cursor-only move",
+        );
+        // A pure cursor move must stay on the scoped arm (the content equality
+        // above already proved the restamped cursor scalars match the oracle).
+        // Deliberately NOT pinned to `rows_refilled: 0`: whether a CUP marks
+        // the cursor cell's row damaged is the engine's business — either way
+        // the arm and the bytes are what this oracle guarantees.
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "a pure cursor move must stay on the scoped arm, got {r:?}"
+        );
+
+        // 5) Wide + emoji cluster + combining mark (cluster/combining channels).
+        term.process("\u{6f22} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} e\u{0301}".as_bytes());
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "wide/emoji/combining",
+        );
+
+        // 6) Scroll: newlines advance base_y -> anchor mismatch -> Full.
+        term.process(b"\r\n".repeat(10).as_slice());
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "scroll (base_y)",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a base_y advance must force the full arm"
+        );
+
+        // 7) Viewport scroll: display_offset != 0 -> Full on entry AND while held.
+        term.scroll_display(3);
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "scrolled back",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a scrolled-back viewport must force the full arm"
+        );
+        term.process(b"x"); // live-grid write while scrolled: bits are live rows, not viewport rows
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "write while scrolled",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "offset != 0 must keep forcing the full arm"
+        );
+        term.scroll_to_bottom();
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "back to bottom",
+        );
+
+        // 8) Continuity recovers after the offset round-trip.
+        term.process(b"y");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "echo after recover",
+        );
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "continuity must recover once anchors settle, got {r:?}"
+        );
+
+        // 9) DECSCNM: full-screen recolor marks Damage::Full -> Full arm.
+        term.process(b"\x1b[?5h");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "DECSCNM",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "DECSCNM marks full damage; scoped must yield"
+        );
+        term.process(b"\x1b[?5l");
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "DECSCNM off",
+        );
+
+        // 10) OSC 4 palette recolor: repaints painted cells -> full damage -> Full.
+        //
+        // `RenderCell::fg`/`bg` are FINAL RESOLVED RGB (resolved against the
+        // live palette at extraction time), so a recolor of an index that
+        // painted cells reference changes their extracted BYTES while writing
+        // no glyph — the exact "content changed without a grid write" shape the
+        // scoped arm must never retain rows through. Two things this step needs
+        // to actually test that, both of which the corpus originally missed:
+        //
+        //  a) OSC 4 palette reconfigure is FAIL-CLOSED by default (#7937
+        //     F01-3: `allow_palette_reconfigure`). Without the opt-in the
+        //     escape returns before touching the palette OR marking damage, so
+        //     the step was a silent no-op that proved nothing.
+        //  b) Nothing in the corpus was painted with the recolored index, so
+        //     even a genuinely-missed recolor could not have diverged the
+        //     oracle. Paint with index 2 FIRST, and settle the scratch, so the
+        //     recolor below is a real byte-changing event on retained rows.
+        term.set_allow_palette_reconfigure(true);
+        term.process(b"\x1b[7;1H\x1b[32mgreen-on-2\x1b[0m");
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "paint with palette index 2",
+        );
+        term.process(b"\x1b]4;2;rgb:12/34/56\x07");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "OSC 4 recolor",
+        );
+        assert_eq!(r, FrameRefill::Full, "a palette recolor marks full damage");
+
+        // 11) Alt screen: swap -> Full; write inside -> Scoped; swap back -> Full.
+        term.process(b"\x1b[?1049h");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "alt enter",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "an alt-screen swap must force the full arm"
+        );
+        term.process(b"alt!");
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "alt write",
+        );
+        term.process(b"\x1b[?1049l");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "alt leave",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "leaving the alt screen must force the full arm"
+        );
+
+        // 12) HOST SPLICE: mutate a content channel + bump snapshot_seq (the
+        // shipping fade/ghost/splice discipline). The next scoped attempt MUST
+        // detect the bump and take the full arm — this is the RE-3 "host
+        // splices leave scoped rows stale" hazard, closed.
+        scoped.cells[0].clear();
+        scoped.snapshot_seq = scoped.snapshot_seq.wrapping_add(1);
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "host splice",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a seq-bumped host mutation must force the full arm (RE-3 hazard #1)"
+        );
+
+        // 13) FOREIGN CONSUMER: another take_damage resets the tracker under us;
+        // the generation bump must force the full arm (bits would undercount).
+        term.process(b"z");
+        term.take_damage();
+        term.process(b"w");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "foreign take_damage",
+        );
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a foreign take_damage must break continuity (undercounting bits)"
+        );
+
+        // 14) BIDI VISUAL REORDER (feature `bidi` — which the shipping GUI
+        // compiles in, and `BiDiMode`'s `#[default]` is `Implicit`, so this is
+        // the app's real configuration). `apply_bidi_reorder` is an IN-PLACE,
+        // NON-IDEMPOTENT row permutation, so the carrier may only retain rows
+        // that are still in LOGICAL order. The fill reports whether it permuted
+        // anything (`engine_row_order`) and the next refill's continuity
+        // check requires that report to be false.
+        //
+        // Content equality is asserted on every frame below in BOTH feature
+        // configurations (the `step` closure does it); only the ARM assertions
+        // are feature-gated, because with the feature off no permutation exists
+        // to undo. This leg exists because the clause it replaced — a blanket
+        // `bidi_mode != Disabled` veto — was sound but DEAD: in a `bidi` build
+        // it vetoed every frame, and the reach guards at the bottom of this test
+        // were the only thing that could see it.
+        term.process("\x1b[2;1H\u{05d0}\u{05d1}\u{05d2} abc\x1b[7;1H".as_bytes());
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "RTL row write",
+        );
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "frame after an RTL reorder",
+        );
+        #[cfg(feature = "bidi")]
+        assert_eq!(
+            r,
+            FrameRefill::Full,
+            "a fill that permuted a row into visual order must cost the NEXT fill \
+             its scoped arm (retained rows would be double-permuted)"
+        );
+        #[cfg(not(feature = "bidi"))]
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "with the bidi feature off nothing permutes, so continuity must hold: {r:?}"
+        );
+
+        // ...and the scoped arm must COME BACK once no row reorders any more.
+        // Pinned so a future "once RTL, always full" regression is visible: the
+        // price of an RTL row is paid while it is on screen, not for the rest of
+        // the session.
+        term.process(b"\x1b[2;1H\x1b[2K");
+        step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "RTL row erased",
+        );
+        term.process(b"\x1b[7;1Hx");
+        let r = step(
+            &mut term,
+            &mut scoped,
+            &mut n_scoped,
+            &mut n_full,
+            "echo after the RTL row is gone",
+        );
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "continuity must recover once no row reorders, got {r:?}"
+        );
+
+        // 15) Resize: dims mismatch -> Full; then continuity re-forms at the new dims.
+        term.resize(10, 40);
+        let reference = term.cell_frame(10, 40);
+        let r = term.cell_frame_damage_scoped_into(&mut scoped, 10, 40);
+        assert_eq!(r, FrameRefill::Full, "a resize must force the full arm");
+        assert!(
+            scoped == reference,
+            "post-resize full refill must match the oracle"
+        );
+        n_full += 1;
+        term.process(b"post-resize");
+        let reference = term.cell_frame(10, 40);
+        let r = term.cell_frame_damage_scoped_into(&mut scoped, 10, 40);
+        assert!(
+            matches!(r, FrameRefill::Scoped { .. }),
+            "continuity must re-form at the new dims, got {r:?}"
+        );
+        assert!(
+            scoped == reference,
+            "scoped refill at new dims must match the oracle"
+        );
+        n_scoped += 1;
+
+        // TWO-SIDED REACH GUARDS: both arms must have really run.
+        assert!(n_scoped >= 5, "scoped arm under-exercised: {n_scoped}");
+        assert!(n_full >= 8, "full arm under-exercised: {n_full}");
+    }
+
+    /// DMG-1 ADVERSARIAL PROBE (campaign): randomized differential fuzz over a
+    /// mutation alphabet chosen to attack the continuity proof, not to exercise
+    /// it. Every step compares the scoped scratch against a FRESH full extract
+    /// under the content-only `PartialEq` the CPU renderer's damage cache uses.
+    /// Any stale retained row shows up as a divergence with a printable seed.
+    #[test]
+    fn dmg1_fuzz_scoped_vs_full_over_random_mutation_streams() {
+        use crate::render::FrameRefill;
+        // xorshift64*: deterministic, no dev-dependency.
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                self.0 = x;
+                x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next() % n
+            }
+        }
+
+        let (rows, cols) = (10usize, 32usize);
+        let mut total_scoped = 0usize;
+        let mut total_full = 0usize;
+
+        for seed in 1u64..=60 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let mut term = Terminal::new(rows as u16, cols as u16);
+            term.set_allow_palette_reconfigure(true);
+            let mut scoped = crate::render::RenderInput::empty();
+
+            for step_i in 0..40 {
+                // 1-4 mutations BETWEEN extractions. This is what makes the
+                // probe able to build the killer interleaving the continuity
+                // proof exists for: write(row A) -> foreign take_damage
+                // (clears the bits) -> write(row B) -> extract. The tracker
+                // now names only row B, while row A ALSO changed under the
+                // scratch — a one-op-per-extract loop can never produce it.
+                let burst = 1 + rng.below(4);
+                let mut what = 0u64;
+                for _ in 0..burst {
+                    what = rng.below(19);
+                    match what {
+                        0 => term.process(b"a"),
+                        1 => term.process(b"hello world"),
+                        2 => {
+                            let r = 1 + rng.below(rows as u64);
+                            let c = 1 + rng.below(cols as u64);
+                            term.process(format!("\x1b[{r};{c}H").as_bytes());
+                        }
+                        3 => term.process(b"\x1b[1;31mred\x1b[0m"),
+                        4 => term.process(b"\r\n"),
+                        5 => term.process(b"\x1b[2J"),
+                        6 => term.process(b"\x1b[K"),
+                        7 => term.process("\u{6f22}\u{5b57}".as_bytes()),
+                        8 => term.process("e\u{0301}o\u{0308}".as_bytes()),
+                        9 => term.process("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".as_bytes()),
+                        10 => term.process(b"\x1b[?5h"),
+                        11 => term.process(b"\x1b[?5l"),
+                        // Palette recolor: changes RESOLVED rgb of painted cells
+                        // with NO glyph write — the sharpest attack on the proof.
+                        12 => {
+                            let idx = rng.below(8);
+                            let v = rng.below(255);
+                            term.process(
+                                format!("\x1b]4;{idx};rgb:{v:02x}/{v:02x}/{v:02x}\x07").as_bytes(),
+                            );
+                        }
+                        // Default fg/bg recolor (OSC 10/11), likewise glyph-free.
+                        13 => term.process(b"\x1b]11;rgb:00/00/40\x07"),
+                        14 => term.process(b"\x1b[?1049h"),
+                        15 => term.process(b"\x1b[?1049l"),
+                        // Foreign damage consumer: resets the tracker under us.
+                        16 => term.take_damage(),
+                        // RTL text: the ONE op whose extraction ends in an
+                        // in-place, non-idempotent row permutation. Randomized
+                        // against every other op so the interleavings that
+                        // attack `engine_row_order` (reorder -> foreign
+                        // take_damage -> write -> extract; reorder -> erase ->
+                        // extract) are actually built. Inert with the `bidi`
+                        // feature off; live in the workspace build, which is
+                        // where aterm-gui unions the feature in.
+                        17 => term.process("\u{05d0}\u{05d1}\u{05d2} x".as_bytes()),
+                        // Viewport scroll in/out.
+                        _ => {
+                            if rng.below(2) == 0 {
+                                term.scroll_display(1 + rng.below(3) as i32);
+                            } else {
+                                term.scroll_to_bottom();
+                            }
+                        }
+                    }
+                }
+
+                let reference = term.cell_frame(rows, cols);
+                let refill = term.cell_frame_damage_scoped_into(&mut scoped, rows, cols);
+                match refill {
+                    FrameRefill::Full => total_full += 1,
+                    FrameRefill::Scoped { .. } => total_scoped += 1,
+                }
+                assert!(
+                    scoped == reference,
+                    "DIVERGENCE seed={seed} step={step_i} op={what} refill={refill:?}"
+                );
+            }
+        }
+        // Reach: the fuzz must really have driven both arms.
+        assert!(
+            total_scoped > 200,
+            "fuzz under-exercised the scoped arm: {total_scoped}"
+        );
+        assert!(
+            total_full > 200,
+            "fuzz under-exercised the full arm: {total_full}"
+        );
+        eprintln!("DMG1-FUZZ arms: scoped={total_scoped} full={total_full}");
+    }
+
+    /// DMG-1 ALIASING PROBE (campaign): the split compositor's SHARED
+    /// `pane_scratch` — two SAME-DIMS terminals alternately refilling ONE
+    /// scratch. Every other continuity token (dims, anchors, offset, alt bit,
+    /// seq) matches across the two panes, and their per-terminal
+    /// `damage_epoch`/generation counters collide NUMERICALLY (both count from
+    /// the same origin), so the process-unique `terminal_id` nonce is the ONLY
+    /// thing standing between this workload and one pane serving the other's
+    /// retained rows. Asserted by content, not by arm: a leak shows up as
+    /// pane A's text appearing in pane B's frame.
+    #[test]
+    fn dmg1_shared_scratch_across_two_terminals_never_leaks_rows() {
+        use crate::render::FrameRefill;
+        let (rows, cols) = (6usize, 24usize);
+        let mut a = Terminal::new(rows as u16, cols as u16);
+        let mut b = Terminal::new(rows as u16, cols as u16);
+        a.process(b"AAAA pane one\r\nsecond A row");
+        b.process(b"BBBB pane two\r\nsecond B row");
+
+        // ONE scratch, alternating owners — the aliasing shape exactly.
+        let mut shared = crate::render::RenderInput::empty();
+        let mut leaked_full = 0usize;
+        for round in 0..12 {
+            a.process(format!("\x1b[1;1Ha{round}").as_bytes());
+            let ref_a = a.cell_frame(rows, cols);
+            let ra = a.cell_frame_damage_scoped_into(&mut shared, rows, cols);
+            assert!(
+                shared == ref_a,
+                "round {round}: pane A frame diverged (leak from B?) refill={ra:?}"
+            );
+
+            b.process(format!("\x1b[1;1Hb{round}").as_bytes());
+            let ref_b = b.cell_frame(rows, cols);
+            let rb = b.cell_frame_damage_scoped_into(&mut shared, rows, cols);
+            assert!(
+                shared == ref_b,
+                "round {round}: pane B frame diverged (leak from A?) refill={rb:?}"
+            );
+            if matches!(ra, FrameRefill::Full) && matches!(rb, FrameRefill::Full) {
+                leaked_full += 1;
+            }
+        }
+        // Reach: an ALTERNATING shared scratch must take the FULL arm every
+        // time (the identity nonce flips on every handoff). If this ever reads
+        // as scoped, the nonce stopped discriminating and the assertions above
+        // are the only thing left — fail loudly here instead.
+        assert_eq!(
+            leaked_full, 12,
+            "a scratch alternating between two terminals must full-refill every frame"
         );
     }
 }

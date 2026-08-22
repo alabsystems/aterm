@@ -39,8 +39,11 @@
 //     lives on it.
 //   * `present_frame` — the single-pane present modeled as the scout mapped
 //     it: LOCK-A extract (`cell_frame_into` + `take_damage` under one lock),
-//     `tick_cursor_fx`, then a REAL CPU raster (`Renderer::render_input`) —
-//     actual pixels, headless.
+//     `tick_cursor_fx`, then a REAL CPU raster through the SHIPPING
+//     damage-tracked entry (`Renderer::render_input_cached` over the window's
+//     persistent `WindowCpu` — RE-1): actual pixels, headless, row-scoped
+//     exactly like the product's windowed present. `verify_echo` asserts the
+//     model's byte-parity against a full repaint on every verify frame.
 //
 // WHAT IS OUT OF REACH (cut honestly, not stubbed): the OS present itself —
 // softbuffer damage-rect blit / GPU swapchain present, frame pacing, EDR/scale
@@ -69,17 +72,25 @@
 //   5. many_tabs_idle/N   — N resident tabs, nothing changing: the
 //      steady-state cost of the settled compose frame as state scales.
 //
-// ONE FINDING THIS BENCH MADE WHILE BEING BUILT (FL-1), recorded because it
-// changes how the settled-frame numbers must be read: a SETTLED composed
-// window never takes the RepaintKey early-out. With decorations dead, nothing
-// typed, and `has_damage()` false on every pane both before and after the
-// frame, consecutive keys still differ — a temporary field-by-field key diff
-// showed `damage_epoch` as the ONLY moving term, advancing once per composed
-// frame, so the advance happens inside the compose itself. Every scheduled
-// compose of unchanged content therefore repaints the full window. The
-// `pet_invisible_frame` and `many_tabs_idle/N` guards PIN that measured
-// reality two-sided (presented == 100%); if the early-out is ever repaired,
-// those pins flip to 0 and the flip is the fix's own measured proof.
+// ONE FINDING THIS BENCH MADE ON ITS FIRST RUN (FL-1), now FIXED: a SETTLED
+// composed window never took the RepaintKey early-out — every scheduled
+// compose of unchanged content repainted the full window. The first-run note
+// blamed a per-frame `damage_epoch` advance; the root-cause trace showed the
+// keys were byte-equal on settled frames (the epoch is latched and cannot
+// move without grid damage) and the real driver was the per-window
+// `recovery_redraw_outstanding` flag: both fixtures' setup crosses
+// `sync_window`'s `rearm_present_and_request(.., request_even_if_ready =
+// true, ..)` (tab switch / split sync), which latches the flag, and the
+// composed path consulted it in `should_repaint_or_recover` without ever
+// acknowledging it — only the WINDOWED present's outcome handlers clear it,
+// and a compose-only consumer (this bench, headless captures) never reaches
+// one, so the early-out was bypassed on every frame forever. Fixed by
+// acknowledging the delivered edge at the compose commit
+// (`PresentRetry::on_recovery_redraw_serviced`): one latched edge buys
+// exactly one recomposed present. The `pet_invisible_frame` and
+// `many_tabs_idle/N` guards PIN the fixed behaviour two-sided (settled
+// presented == 0, fed controls still present); if a pin ever reads nonzero
+// again, the early-out has regressed.
 //
 // EVERY WORKLOAD IS VERIFIED BEFORE IT IS TIMED, template: the aterm-effects
 // cursor_glow_tick bench. Two-sided guards prove the workload reaches the
@@ -418,8 +429,8 @@ fn verify_effects_off() -> (BenchApp, Instant) {
 
 /// PROVE the PET-03 workload's state: pet configured, pet invisible, the ink
 /// map REAL (sized to the grid, mostly inked, live edge present), and the
-/// settled-recompose steady state pinned (FL-1). Returns the warmed fixture +
-/// clock + the ink-map counts for the volume group.
+/// settled early-out steady state pinned (FL-1, fixed). Returns the warmed
+/// fixture + clock + the ink-map counts for the volume group.
 fn verify_pet_invisible() -> (BenchApp, Instant, usize, usize) {
     let (mut b, t0) = f_pet_invisible();
     let mut now = t0;
@@ -459,19 +470,21 @@ fn verify_pet_invisible() -> (BenchApp, Instant, usize, usize) {
     }
     report(
         "pet_invisible.settled",
-        &format!("presented {presented}/{SAMPLE_FRAMES} (settled content still recomposes — FL-1)"),
+        &format!(
+            "presented {presented}/{SAMPLE_FRAMES} (settled compose takes the early-out — FL-1 fixed)"
+        ),
     );
-    // MEASURED REALITY, pinned two-sided (bench finding FL-1, full story in
-    // the file header): a SETTLED composed window still repaints on EVERY
-    // frame, so this workload prices the FULL settled recompose — which is
-    // precisely the per-frame fixed overhead PET-03's unconditional pet feed
-    // belongs to. If a fix ever lets settled composes early-out, this pin
-    // flips to 0 and the workload becomes the early-out price; both states
-    // are meaningful, and the flip itself is the fix's measured proof.
+    // FIXED REALITY, pinned two-sided (bench finding FL-1, full story in the
+    // file header): a SETTLED composed window takes the RepaintKey early-out
+    // on EVERY frame, so this workload prices the settled early-out frame —
+    // pass 1's extraction + the key build + the skip. The fed control below
+    // keeps the pin two-sided (fresh bytes must still present). If this pin
+    // ever reads nonzero again, the early-out has regressed (a re-latched
+    // recovery edge or a churning RepaintKey term) — re-read the FL-1 note.
     assert_eq!(
-        presented, SAMPLE_FRAMES,
-        "pet_invisible_frame: the settled-compose behavior changed (frames now \
-         early-out) — re-pin this guard and re-read the FL-1 note"
+        presented, 0,
+        "pet_invisible_frame: a settled compose presented — the RepaintKey \
+         early-out regressed (FL-1) — re-read the FL-1 note"
     );
     // The fed CONTROL: fresh bytes must also present (the trivial direction,
     // kept so a future early-out fix cannot silently kill presentation).
@@ -532,7 +545,20 @@ fn verify_echo() -> (BenchApp, Instant, u32) {
     let mut checked = 0usize;
     for i in 0..(WARM_FRAMES + SAMPLE_FRAMES) {
         let c = echo_arm(&mut b, &mut now, &mut k);
-        let sum = b.present_frame(now);
+        // UNTIMED verify pass: the HASHED entry — the guards keep the exact
+        // frame-identity fold while the timed loop (which calls the fold-free
+        // `present_frame`) never pays it (RE-2).
+        let sum = b.present_frame_hashed(now);
+        // RE-1 PARITY GUARD (the damage_differential idiom, in-bench): the
+        // damage-tracked raster the timed loop prices must be byte-identical
+        // to a full repaint of the same scratch — asserted on EVERY verify
+        // frame, so the timed loop inherits a proven-parity model without
+        // ever paying the witness.
+        let (cached_fnv, full_fnv) = b.parity_hashes();
+        assert_eq!(
+            cached_fnv, full_fnv,
+            "keystroke_echo: damage-tracked raster diverged from the full repaint"
+        );
         if i >= WARM_FRAMES {
             assert_ne!(
                 sum, prev,
@@ -581,7 +607,7 @@ fn echo_arm(b: &mut BenchApp, now: &mut Instant, k: &mut u32) -> Option<char> {
 }
 
 /// PROVE the many-tabs workload's state: N tabs resident, the settled
-/// recompose steady state pinned (FL-1), the fed control presenting.
+/// early-out steady state pinned (FL-1, fixed), the fed control presenting.
 fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
     let (mut b, active_sid, t0) = f_many_tabs(n);
     let mut now = t0;
@@ -601,16 +627,19 @@ fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
     }
     report(
         &format!("many_tabs_idle/{n}"),
-        &format!("tabs {n} | presented {presented}/{SAMPLE_FRAMES} (settled recompose — FL-1)"),
+        &format!(
+            "tabs {n} | presented {presented}/{SAMPLE_FRAMES} (settled early-out — FL-1 fixed)"
+        ),
     );
-    // Same FL-1 pin as pet_invisible_frame: a settled window recomposes every
-    // frame, so this workload prices the steady-state frame as tab count
-    // scales. Two-sided on purpose — a future early-out fix flips it to 0,
-    // and that flip is the fix's own measured proof.
+    // Same FL-1 pin as pet_invisible_frame: a settled window takes the
+    // early-out every frame, so this workload prices the steady-state
+    // early-out frame as tab count scales. Two-sided on purpose — the fed
+    // control below must still present; a nonzero settled count means the
+    // early-out regressed.
     assert_eq!(
-        presented, SAMPLE_FRAMES,
-        "many_tabs_idle: the settled-compose behavior changed (frames now \
-         early-out) — re-pin this guard and re-read the FL-1 note"
+        presented, 0,
+        "many_tabs_idle: a settled compose presented — the RepaintKey \
+         early-out regressed (FL-1) — re-read the FL-1 note"
     );
     b.feed(active_sid, b"y");
     now += FRAME_DT;
@@ -707,9 +736,10 @@ fn frame_latency(c: &mut Criterion) {
             });
         });
         // 2. PET-03: a SETTLED composed frame with the pet configured but
-        // invisible — the steady per-frame recompose (see the FL-1 pin in its
-        // verify fn) whose fixed overhead includes the unconditional pet feed
-        // the finding's hoist would delete.
+        // invisible — post-FL-1-fix this is the settled EARLY-OUT frame (see
+        // the pin in its verify fn): pass-1 extraction + key build + skip.
+        // The unconditional pet feed the finding's hoist would delete still
+        // runs inside it.
         group.bench_function("pet_invisible_frame", |b| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
@@ -814,6 +844,14 @@ fn frame_latency(c: &mut Criterion) {
         // echo), priced under a name that cannot be mistaken for the frame.
         group.bench_function("keystroke_arm", |b| {
             b.iter(|| echo_arm(&mut echo, &mut echo_now, &mut echo_k));
+        });
+        // RE-2's evicted witness, kept priced: the SAME modeled present PLUS
+        // the full-frame frame-identity FNV fold the timed workload no longer
+        // pays. `present_hashed` minus the group's `keystroke_echo` is ~the
+        // price of the fold alone (measured 331 us/frame at 24x80 on this
+        // campaign's machine when it still sat inside the timed span).
+        group.bench_function("present_hashed", |b| {
+            b.iter(|| black_box(echo.present_frame_hashed(echo_now)));
         });
         // The flood workload's untimed arm: 8 KiB through `Terminal::process`
         // under the session lock. Add it to `flood_present` and subtract the

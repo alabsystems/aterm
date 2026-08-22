@@ -207,9 +207,21 @@ __aterm_preexec() {
     # returns, so pre-existing handlers (starship, pyenv, etc.) always run.
     [[ -n "$__aterm_prev_debug_handler" ]] && eval "$__aterm_prev_debug_handler"
 
-    # Skip if this is from PROMPT_COMMAND (ours or the user's original)
+    # Skip if this is from PROMPT_COMMAND (ours or the user's original).
+    # PROMPT_COMMAND may be an ARRAY (bash 5.1+): bash runs EVERY element as
+    # its own top-level command AFTER ours returned — the in-prompt flag is
+    # already clear by then, and a scalar compare sees only element 0. A
+    # sibling integration's precmd (__vte_prompt_command, starship, ...)
+    # would then be captured as the user's command: its 133;C fires at the
+    # prompt (out of phase, dropped) and __aterm_last_command stays occupied,
+    # so the REAL command never emits 633;E/133;C — no block ever reaches
+    # Executing and a driver's verified submit can never attribute a press.
+    # Match ALL elements; a scalar expands as one element, covering both.
     (( __aterm_in_prompt_cmd )) && return
-    [[ "$BASH_COMMAND" == "$PROMPT_COMMAND" ]] && return
+    local __aterm_pc_elem
+    for __aterm_pc_elem in "${PROMPT_COMMAND[@]}"; do
+        [[ "$BASH_COMMAND" == "$__aterm_pc_elem" ]] && return
+    done
     [[ "$BASH_COMMAND" == "__aterm_"* ]] && return
 
     # Only capture the first command (not subshells)
@@ -421,10 +433,14 @@ if [[ "$__aterm_tmp" == trap\ --\ * ]]; then
 fi
 unset __aterm_tmp
 
-# Install the integration
-trap '__aterm_preexec' DEBUG
+# Install the integration. The trap goes LAST: the DEBUG trap is live from the
+# very next top-level command, and inside a sourced script that next command is
+# the remainder of THIS file — with the trap first, the PROMPT_COMMAND wiring
+# below was captured as a "user command" at load (a bogus 633;E + 133;C + tab
+# title, and __aterm_last_command left occupied before the first real prompt).
 if (( __aterm_prompt_cmd_is_array )); then
     PROMPT_COMMAND=("__aterm_prompt_command" "${PROMPT_COMMAND[@]}")
 else
     PROMPT_COMMAND="__aterm_prompt_command"
 fi
+trap '__aterm_preexec' DEBUG

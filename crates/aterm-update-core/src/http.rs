@@ -372,6 +372,177 @@ fn api_get_args() -> [&'static str; 11] {
 // Audited (update-atpkg); droppable with the byte-exact contract lane.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, HttpError> {
+    // The unconditional lane, spelled as the degenerate conditional one: no validator,
+    // no header sink, therefore an argv that is EXACTLY `api_get_args()` (asserted in
+    // `the_unconditional_lane_argv_is_unchanged`). Every existing caller's bytes,
+    // errors, retries and wording are the historical ones.
+    match api_get_conditional(url, token, None, None)? {
+        ApiResponse::Body { bytes, .. } => Ok(bytes),
+        // Unreachable: a 304 is only ever honoured when we SENT a validator, and this
+        // lane never does. Fail closed on a proxy that invents one rather than handing
+        // the caller an empty body it would parse as an empty release list.
+        ApiResponse::NotModified => Err(HttpError::Malformed(format!(
+            "GitHub API returned HTTP 304 for {url} without a conditional request"
+        ))),
+    }
+}
+
+/// What a conditional API GET came back with.
+///
+/// The 304 arm is the whole point: it is the SERVER asserting that the representation
+/// the caller already holds is current, which is the only kind of freshness this layer
+/// will ever act on — there is no TTL, no heuristic expiry, and no offline path that
+/// serves a cached answer without a fresh 304 for it on THIS request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiResponse {
+    /// HTTP 304: unchanged since the validator the caller supplied. No body was
+    /// transferred and none is returned.
+    NotModified,
+    /// A fresh 2xx body, plus the response's `ETag` when the server offered one and it
+    /// is safe to echo back ([`validator_safe`]).
+    Body {
+        bytes: Vec<u8>,
+        etag: Option<String>,
+    },
+}
+
+/// Whether a server-supplied `ETag` may be echoed back on a later request.
+///
+/// This value is fully SERVER-CONTROLLED and, unlike a response body, it goes back out
+/// on curl's ARGV as an `If-None-Match:` header value — so it gets the same treatment
+/// the token and the asset URL get elsewhere in this module. The grammar (RFC 9110
+/// §8.8.3) is an optional `W/` prefix then a quoted string of visible ASCII; anything
+/// carrying a control character, a space, a newline, or an interior quote is refused,
+/// which makes header injection through this channel structurally impossible.
+///
+/// Refusal is not a failure: an unusable validator simply means the next request goes
+/// out unconditionally, i.e. exactly what the caller did before this existed.
+#[must_use]
+pub fn validator_safe(validator: &str) -> bool {
+    let body = validator.strip_prefix("W/").unwrap_or(validator);
+    if validator.len() > 128 || body.len() < 2 {
+        return false;
+    }
+    if !(body.starts_with('"') && body.ends_with('"')) {
+        return false;
+    }
+    // Every byte visible ASCII (no CTL, no space, no DEL) — checked over the whole
+    // value, prefix included.
+    if !validator.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return false;
+    }
+    // …and no interior quote, which would close the header value early.
+    body.get(1..body.len().saturating_sub(1))
+        .is_some_and(|inner| !inner.contains('"'))
+}
+
+/// Whether an HTTP status is the "you already have it" answer — and ONLY when we asked.
+///
+/// The `sent_validator` half is load-bearing, not defensive dressing: a captive portal
+/// or a broken proxy that answers 304 to an UNCONDITIONAL request would otherwise be
+/// telling this client "nothing changed" about a resource it never described, which is
+/// precisely the shape of "a stale cache hides a real update". Without a validator on
+/// the wire there is nothing for a 304 to be relative to, so it is a malformed answer
+/// and falls through to the fail-closed classification below.
+fn is_not_modified(code: &str, sent_validator: bool) -> bool {
+    code == "304" && sent_validator
+}
+
+/// The extra curl options a conditional GET adds to [`api_get_args`], in order.
+///
+/// Kept as its own function so a unit test can assert BOTH sides: with neither a
+/// validator nor a sink the list is byte-identical to the historical `api_get_args()`,
+/// and with them the two flags appear exactly once each and still BEFORE the `--`
+/// end-of-options marker `curl_argv` appends (a caller-side `--` is the v0.5.10
+/// auto-update-bricking regression).
+fn conditional_args<'a>(
+    inm_header: Option<&'a str>,
+    header_dump: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args: Vec<&str> = api_get_args().to_vec();
+    if let Some(header) = inm_header {
+        args.push("-H");
+        args.push(header);
+    }
+    if let Some(dump) = header_dump {
+        // `--dump-header`, not `-D -`: the body is captured from stdout and the status
+        // trailer is appended to it, so response headers must land in a FILE or they
+        // would corrupt both. The sink is a caller-owned path inside its own `0700`
+        // directory.
+        args.push("--dump-header");
+        args.push(dump);
+    }
+    args
+}
+
+/// The last `ETag` in a curl `--dump-header` capture, if it is safe to echo back.
+///
+/// LAST rather than first: a redirect chain writes one header block per hop, and the
+/// validator that matters is the one belonging to the response whose body we kept.
+/// A missing, malformed or unsafe value yields `None`, which degrades the next check to
+/// an unconditional GET — never to a wrong answer.
+fn etag_from_header_dump(path: &Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut found: Option<String> = None;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("etag") {
+            found = Some(value.trim().to_string());
+        }
+    }
+    found.filter(|e| validator_safe(e))
+}
+
+/// [`api_get_classified`], made CONDITIONAL: when `validator` is a stored `ETag`, the
+/// request carries `If-None-Match` and the server may answer 304 with no body at all.
+///
+/// # Why this exists
+///
+/// The app updater's check re-downloaded and re-parsed the ENTIRE GitHub release
+/// history to learn one tag, every 75 s, forever. MEASURED 2026-08-20 against the real
+/// channel (`alabsystems/aterm`, anonymous lane): page 1 = **594,708 bytes** for 42
+/// releases / 200 assets — ~14.2 KB per release, because each asset object embeds a full
+/// uploader user block — i.e. ~28.5 MB/hour ≈ 685 MB/day per running instance, growing
+/// with every cut and by a whole page per 100. The same probe with `If-None-Match`
+/// returned **HTTP 304 with `size_download=0`**: no body, nothing to parse.
+///
+/// The saving is BYTES and CPU, not requests. The same probe showed the 304 still
+/// consuming one unit of `x-ratelimit-used`, so the request budget the cadence constant
+/// was chosen against is unchanged — do not claim otherwise.
+///
+/// # Freshness is the SERVER's word, never ours
+///
+/// There is no TTL and no offline reuse. `NotModified` can only be returned when this
+/// very request carried the caller's validator and this very response said 304
+/// ([`is_not_modified`]). A server that ignores `If-None-Match`, a proxy that strips
+/// the header, a validator we refuse as unsafe, an absent memo — every one of those
+/// lands on a 200 and therefore on the byte-for-byte historical path. The failure
+/// direction is "no saving", never "stale answer".
+///
+/// `header_sink` is where curl dumps the response headers so the `ETag` can be read
+/// back; pass `None` (and no validator) for the unconditional lane, which then spawns
+/// the exact historical argv.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn api_get_conditional(
+    url: &str,
+    token: Option<&str>,
+    validator: Option<&str>,
+    header_sink: Option<&Path>,
+) -> Result<ApiResponse, HttpError> {
+    // An unusable validator is dropped HERE, so everything below sees a single truth
+    // about whether a conditional request went out.
+    let validator = validator.filter(|v| validator_safe(v));
+    let inm = validator.map(|v| {
+        let mut header = String::from("If-None-Match: ");
+        header.push_str(v);
+        header
+    });
+    let sink = header_sink.and_then(|p| p.to_str());
+    let args = conditional_args(inm.as_deref(), sink);
     // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns
     // there, so the loop cannot run more than `CURL_ATTEMPTS` times.
     let mut attempt: u32 = 0;
@@ -382,9 +553,19 @@ pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, Htt
             std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
         }
         let last = attempt >= CURL_ATTEMPTS;
+        if let Some(sink) = header_sink {
+            // Never let a PREVIOUS response's headers be read as THIS one's. curl
+            // truncates the dump file on open, so this is belt-and-suspenders — but the
+            // validator it yields is what a later 304 is relative to, and a validator
+            // describing a response we did not receive is the one way a conditional
+            // request could be told "unchanged" about the wrong bytes. Owning the
+            // invariant here costs one `unlink` per request; a failure to remove is
+            // harmless (worst case: no validator, i.e. an unconditional next check).
+            let _ = std::fs::remove_file(sink);
+        }
         // The token is passed in unchanged on every attempt — never re-read or
         // re-validated per attempt, so a rotation mid-loop cannot split the lanes.
-        let out = curl_fetch(&api_get_args(), url, token).map_err(HttpError::Transport)?;
+        let out = curl_fetch(&args, url, token).map_err(HttpError::Transport)?;
         if !out.status.success() {
             if !last {
                 continue;
@@ -405,7 +586,19 @@ pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, Htt
             None => ("", text.trim()),
         };
         if code.starts_with('2') {
-            return Ok(body.as_bytes().to_vec());
+            return Ok(ApiResponse::Body {
+                bytes: body.as_bytes().to_vec(),
+                // Only read back when we asked for a dump; a caller on the
+                // unconditional lane spawns no `--dump-header` and touches no file.
+                etag: header_sink.and_then(etag_from_header_dump),
+            });
+        }
+        // The steady state this function exists for: no body was transferred, no JSON
+        // will be parsed, and the caller keeps what it already had. Placed AFTER the
+        // 2xx arm and BEFORE every failure arm, and gated on having actually sent a
+        // validator (see [`is_not_modified`]).
+        if is_not_modified(code, validator.is_some()) {
+            return Ok(ApiResponse::NotModified);
         }
         if !last && transient_api_status(code) {
             // Discard this attempt's bytes ENTIRELY — that discarding is the whole
@@ -654,10 +847,16 @@ fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a 
 ///
 /// The TIME bound is derived from that same cap (`download_max_time_secs`) and paired
 /// with a stall detector, so a slow link finishes instead of dying at a fixed wall it
-/// can never beat. There is no `-C -` resume: a ranged request would make
-/// `--max-filesize` bound only the REMAINING range rather than total bytes written,
-/// which is the stated anti-disk-fill guard, and it would need the caller's `.part`
-/// lifecycle to change too.
+/// can never beat.
+///
+/// THIS lane does not resume. That used to be argued as an absolute — "a ranged request
+/// would make `--max-filesize` bound only the REMAINING range rather than total bytes
+/// written" — and the accounting half of that is real, but it is arithmetic, not a
+/// barrier: [`download_to_resumable`] subtracts the offset from the cap and keeps the
+/// total bound exactly. What remains true is that resuming needs a `.part` lifecycle the
+/// CALLER owns, and this lane's caller (the app-container download, 26–29 MB, whose
+/// scratch dir is swept wholesale before every attempt by design) neither has one nor
+/// has much to gain. The 630 MB toolchain artifact does, and uses the resumable form.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to(
@@ -687,6 +886,173 @@ pub fn download_to(
     Ok(())
 }
 
+/// The `.part` sibling a resumable download writes into: the destination file name with
+/// `.part` APPENDED — never `Path::with_extension`, which would turn
+/// `trust-5520.tar.zst` into `trust-5520.tar.part` and collide across builds.
+///
+/// The name therefore still carries the asset name (which carries the build number), so
+/// a partial can never be confused with another build's.
+fn part_path(dest: &Path) -> Option<std::path::PathBuf> {
+    let name = dest.file_name()?;
+    let mut part = name.to_os_string();
+    part.push(".part");
+    Some(dest.with_file_name(part))
+}
+
+/// How a resumable attempt should be issued, given what is already on disk.
+///
+/// Kept pure so the ONE thing that must not be got wrong — the size accounting — is
+/// assertable without a network: `--max-filesize` is compared against the response's
+/// `Content-Length`, and a ranged response carries only the REMAINDER, so the cap handed
+/// to curl must be `max_filesize - offset` for the TOTAL bytes written to stay bounded by
+/// `max_filesize`. That total accounting is the anti-disk-fill guard `download_to`'s doc
+/// names as the reason resume was left out; subtracting the offset is what restores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumePlan {
+    /// Byte offset to continue from. `0` means "no range at all" — a fresh transfer,
+    /// with no `--continue-at` on the argv.
+    offset: u64,
+    /// What to pass as `--max-filesize`: the REMAINING allowance.
+    remaining_cap: u64,
+    /// Whether the existing prefix must be discarded first (it is already at or past the
+    /// total cap, so it can never become a valid artifact — and it would leave a
+    /// zero/negative allowance).
+    discard: bool,
+}
+
+fn resume_plan(existing: u64, max_filesize: u64) -> ResumePlan {
+    if existing >= max_filesize {
+        return ResumePlan {
+            offset: 0,
+            remaining_cap: max_filesize,
+            discard: true,
+        };
+    }
+    ResumePlan {
+        offset: existing,
+        remaining_cap: max_filesize.saturating_sub(existing),
+        discard: false,
+    }
+}
+
+/// Whether a FAILED attempt's prefix is worth keeping: only if this attempt actually
+/// moved the file forward.
+///
+/// This is the anti-wedge rule. A prefix that cannot be extended — the upstream object
+/// was clobbered and is now shorter (curl 416), a server that refuses ranges (curl 33), a
+/// corrupt local file — would otherwise be retried from the same dead offset forever, six
+/// hours apart, for the life of the machine. One attempt that makes no progress discards
+/// it and the next starts clean, which is exactly today's cost and no worse.
+fn keep_partial(before: u64, after: u64) -> bool {
+    after > before
+}
+
+/// [`download_to_args`] plus the resume flags. `offset == 0` adds NOTHING — a fresh
+/// transfer must go out as the byte-for-byte historical request, with no `Range` header
+/// for a server to mishandle.
+fn download_resume_args<'a>(
+    cap: &'a str,
+    max_time: &'a str,
+    dest: &'a str,
+    offset: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args: Vec<&str> = download_to_args(cap, max_time, dest).to_vec();
+    if let Some(offset) = offset {
+        // An EXPLICIT offset, not `-C -`: `-` asks curl to size the local file itself,
+        // which is a second source of truth for a number we already hold and have already
+        // used to compute the cap above.
+        args.push("--continue-at");
+        args.push(offset);
+    }
+    args
+}
+
+/// Download an asset to `dest`, RESUMABLY: bytes land in a sibling `<dest>.part` that
+/// SURVIVES a failed attempt, and the next call continues from where the last one
+/// stopped. On success the part is renamed onto `dest`, so `dest` only ever exists
+/// complete.
+///
+/// # Why this exists
+///
+/// Without it, the cost of a transient stall is O(artifact size) × attempts. The
+/// scaling variable is the signed artifact size, and the dominant shipped toolchain
+/// member is 629,817,785 B — ~8.4 minutes at 10 Mbit/s. curl's stall detector fires at
+/// under 4 KiB/s for 120 s, so a single Wi-Fi hiccup at 95 % discarded ~600 MB and the
+/// next pass started at zero. That is the same failure shape `download_max_time_secs`
+/// was written to fix, left half-fixed: the wall clock scales with the payload, but the
+/// retry did not.
+///
+/// # Correctness is the signed digest's job, exactly as before
+///
+/// A resumed body is not trusted for being resumed. The caller's `sha256` gate over the
+/// COMPLETE file (`atpkg`'s `verify_and_stage`, step 1) runs unchanged, so a prefix from
+/// a clobbered upstream object, a mis-resumed range, or a server that ignored the range
+/// and appended a whole second copy all fail there and are discarded — which costs
+/// exactly what a failed download costs today, not a new failure mode. What resume can
+/// never do is make a WRONG artifact acceptable.
+///
+/// The total-bytes cap is preserved by subtracting the offset ([`resume_plan`]); a
+/// failed attempt that made no progress discards its prefix ([`keep_partial`]) so a dead
+/// offset can never wedge the lane.
+// Skip: same audited display-lossy Err-path class as `api_get`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_to_resumable(
+    asset_url: &str,
+    token: Option<&str>,
+    dest: &Path,
+    max_filesize: u64,
+) -> Result<(), String> {
+    require_https_url(asset_url)?;
+    let Some(part) = part_path(dest) else {
+        return Err("destination has no file name".to_string());
+    };
+    let part_s = part.to_str().ok_or("non-UTF-8 destination path")?;
+    let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let plan = resume_plan(existing, max_filesize);
+    let existing = if plan.discard {
+        let _ = std::fs::remove_file(&part);
+        0
+    } else {
+        existing
+    };
+    // Both must outlive the argv, which borrows them as `&str`.
+    let cap = plan.remaining_cap.to_string();
+    // The wall clock stays derived from the FULL cap, not the remainder: it is a backstop
+    // against a transfer that trickles forever, and shrinking it for a resumed attempt
+    // would re-introduce the fixed-wall stranding it exists to prevent.
+    let max_time = download_max_time_secs(max_filesize).to_string();
+    let offset_text = plan.offset.to_string();
+    // `None` at offset 0: a fresh transfer must carry no range at all.
+    let offset = (plan.offset > 0).then_some(offset_text.as_str());
+    let out = curl_fetch(
+        &download_resume_args(&cap, &max_time, part_s, offset),
+        asset_url,
+        token,
+    )?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        if !keep_partial(existing, after) {
+            let _ = std::fs::remove_file(&part);
+        }
+        // Same classification as `download_to`: a 429/403 on the asset lane is named as a
+        // rate limit so the check lane can defer instead of booking a broken pipeline.
+        if let Some(code) = curl_http_error_code(&stderr)
+            && (code == 429 || code == 403)
+        {
+            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+        }
+        return Err(format!("curl download failed ({}): {}", out.status, stderr.trim()));
+    }
+    // ONLY a curl success promotes the part. `dest` therefore never holds a prefix, and
+    // every existing caller's "the file at `dest` is the whole asset" assumption is
+    // untouched.
+    std::fs::rename(&part, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        format!("finalize download: {e}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -712,9 +1078,11 @@ mod tests {
     }
 
     use super::{
-        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, curl_argv, curl_bin, curl_fetch,
-        curl_prepared, download_bytes_args, download_max_time_secs, download_to_args,
-        token_config_safe, transient_api_status,
+        HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, conditional_args, curl_argv,
+        curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
+        download_resume_args, download_to_args, download_to_resumable, etag_from_header_dump,
+        is_not_modified, keep_partial, part_path, resume_plan, token_config_safe,
+        transient_api_status, validator_safe,
     };
     use std::process::Command;
 
@@ -1105,5 +1473,305 @@ mod tests {
                 "{code} is a verdict, not a blip — retrying it is wrong"
             );
         }
+    }
+    /// The historical lane must be BYTE-IDENTICAL. `api_get_classified` now delegates to
+    /// the conditional form, so the one thing that could regress every existing caller is
+    /// the argv growing a flag; with no validator and no sink it must be exactly the list
+    /// it always was.
+    #[test]
+    fn the_unconditional_lane_argv_is_unchanged() {
+        assert_eq!(
+            conditional_args(None, None),
+            api_get_args().to_vec(),
+            "an unconditional GET must spawn the historical option list, unchanged"
+        );
+    }
+
+    /// …and a conditional one adds EXACTLY two flag pairs, in front of the `--` marker
+    /// `curl_argv` appends (callers must never place their own — the v0.5.10 bricking
+    /// regression).
+    #[test]
+    fn a_conditional_request_adds_exactly_the_validator_and_the_sink() {
+        let args = conditional_args(
+            Some("If-None-Match: W/\"deadbeef\""),
+            Some("/tmp/aterm-updates/catalog.headers"),
+        );
+        let base = api_get_args().len();
+        assert_eq!(args.len(), base + 4, "two flag pairs and nothing else: {args:?}");
+        assert_eq!(args[base], "-H");
+        assert_eq!(args[base + 1], "If-None-Match: W/\"deadbeef\"");
+        assert_eq!(args[base + 2], "--dump-header");
+        assert_eq!(args[base + 3], "/tmp/aterm-updates/catalog.headers");
+        assert!(!args.contains(&"--"), "no caller-side end-of-options marker: {args:?}");
+        // The base list survives verbatim underneath.
+        assert_eq!(&args[..base], &api_get_args()[..]);
+        // Each half is independently optional.
+        assert_eq!(conditional_args(Some("If-None-Match: \"x\""), None).len(), base + 2);
+        assert_eq!(conditional_args(None, Some("/tmp/h")).len(), base + 2);
+    }
+
+    /// A 304 may ONLY be believed when this request carried a validator. A captive
+    /// portal or proxy answering 304 to an unconditional GET would otherwise be telling
+    /// the updater "nothing changed" about a resource it never described — the exact
+    /// shape of "a stale cache hides a real update".
+    #[test]
+    fn only_a_request_that_sent_a_validator_may_be_told_nothing_changed() {
+        assert!(is_not_modified("304", true));
+        assert!(!is_not_modified("304", false), "unsolicited 304 must not be honoured");
+        for code in ["200", "301", "403", "404", "500", "3040", "", "30"] {
+            assert!(!is_not_modified(code, true), "{code} is not a 304");
+        }
+    }
+
+    /// The validator goes back out on ARGV as a header value, so it gets the token's
+    /// treatment: a strict grammar, and refusal degrades to an unconditional request
+    /// rather than to anything unsafe.
+    #[test]
+    fn only_well_formed_validators_are_echoed_back() {
+        for good in [
+            "\"6f1c8b1e5f0a\"",
+            "W/\"6f1c8b1e5f0a\"",
+            "W/\"gzip-4d2-8ab\"",
+        ] {
+            assert!(validator_safe(good), "real ETag rejected: {good:?}");
+        }
+        for bad in [
+            "",                        // absent
+            "6f1c8b1e",                // unquoted
+            "\"a",                     // unterminated
+            "\"a\"\r\nX-Evil: 1",      // CRLF header injection
+            "\"a\nb\"",                // newline
+            "\"a b\"",                 // space (would split the header)
+            "\"a\"b\"",                // interior quote closes the value early
+            "\"a\tb\"",                // control character
+            "W/",                      // prefix only
+        ] {
+            assert!(!validator_safe(bad), "injection-shaped validator accepted: {bad:?}");
+        }
+        // Absurdly long values are refused too (bounded argv).
+        let long = format!("\"{}\"", "a".repeat(200));
+        assert!(!validator_safe(&long));
+    }
+
+    /// The header dump is parsed for the LAST `ETag` (a redirect chain writes one block
+    /// per hop) and an unsafe value is dropped rather than echoed.
+    #[test]
+    fn the_last_safe_etag_is_read_back_from_the_dump() {
+        let dir = std::env::temp_dir().join(format!("aterm-http-etag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("headers");
+
+        std::fs::write(
+            &p,
+            "HTTP/2 301\r\nETag: \"first-hop\"\r\n\r\nHTTP/2 200\r\netag: W/\"final\"\r\n\
+             Content-Type: application/json\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            etag_from_header_dump(&p).as_deref(),
+            Some("W/\"final\""),
+            "the LAST block's validator is the one describing the body we kept"
+        );
+
+        std::fs::write(&p, "HTTP/2 200\r\nContent-Type: application/json\r\n\r\n").unwrap();
+        assert_eq!(etag_from_header_dump(&p), None, "no ETag ⇒ no conditional next time");
+
+        std::fs::write(&p, "HTTP/2 200\r\nETag: not-quoted\r\n\r\n").unwrap();
+        assert_eq!(etag_from_header_dump(&p), None, "an unsafe validator is dropped");
+
+        assert_eq!(etag_from_header_dump(&dir.join("absent")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // -----------------------------------------------------------------------------
+    // RESUMABLE ARTIFACT DOWNLOAD (aup-3)
+    //
+    // The win is measured in BYTES RE-FETCHED PER FAILED ATTEMPT, which needs a real
+    // transfer to observe; `resume_cost_over_the_network` below is that measurement and
+    // runs when `ATERM_RESUME_TEST_URL` names a real https asset. Everything a network
+    // cannot be asked about — the size accounting, the request shape, the `.part` state
+    // machine — is pinned here, unconditionally.
+    // -----------------------------------------------------------------------------
+
+    /// The part sibling must APPEND, never replace an extension: `with_extension` turns
+    /// `trust-5520.tar.zst` into `trust-5520.tar.part`, which collides across builds and
+    /// would let one build resume another's prefix into a digest failure.
+    #[test]
+    fn the_part_sibling_appends_and_keeps_the_build_bearing_name() {
+        let p = part_path(std::path::Path::new("/s/trust-5520.tar.zst")).unwrap();
+        assert_eq!(p, std::path::Path::new("/s/trust-5520.tar.zst.part"));
+        assert!(
+            p.to_string_lossy().contains("5520"),
+            "the part name must still carry the build number: {p:?}"
+        );
+        assert_eq!(part_path(std::path::Path::new("/")), None);
+    }
+
+    /// THE accounting invariant: `--max-filesize` bounds the response body, and a ranged
+    /// response carries only the remainder — so `offset + cap` must always equal the
+    /// caller's TOTAL bound. That is the anti-disk-fill guard the no-resume doc was
+    /// protecting, restored by arithmetic instead of by refusing to resume.
+    #[test]
+    fn the_total_byte_bound_survives_every_resume_offset() {
+        const TOTAL: u64 = 8 << 30;
+        for existing in [0u64, 1, 4096, 629_817_785, TOTAL - 1] {
+            let plan = resume_plan(existing, TOTAL);
+            assert!(!plan.discard);
+            assert_eq!(plan.offset, existing);
+            assert_eq!(
+                plan.offset + plan.remaining_cap,
+                TOTAL,
+                "offset + remaining cap must equal the total bound (existing={existing})"
+            );
+        }
+        // A prefix at or past the total bound can never become a valid artifact, and
+        // would leave a zero allowance: discard and start clean.
+        for existing in [TOTAL, TOTAL + 1] {
+            let plan = resume_plan(existing, TOTAL);
+            assert!(plan.discard, "existing={existing}");
+            assert_eq!(plan.offset, 0);
+            assert_eq!(plan.remaining_cap, TOTAL);
+        }
+    }
+
+    /// A FRESH transfer must be the byte-for-byte historical request — no `--continue-at`,
+    /// no `Range` for a server to mishandle — and a resumed one adds exactly the offset.
+    #[test]
+    fn only_a_resumed_attempt_carries_a_range() {
+        let fresh = download_resume_args("100", "600", "/s/a.tar.zst.part", None);
+        assert_eq!(
+            fresh,
+            download_to_args("100", "600", "/s/a.tar.zst.part").to_vec(),
+            "a fresh attempt must spawn the historical option list, unchanged"
+        );
+        let resumed = download_resume_args("60", "600", "/s/a.tar.zst.part", Some("40"));
+        assert_eq!(resumed.len(), fresh.len() + 2);
+        assert_eq!(resumed[fresh.len()], "--continue-at");
+        assert_eq!(resumed[fresh.len() + 1], "40", "an EXPLICIT offset, never `-`");
+        // The sink is the PART, never the destination: `dest` only ever exists complete.
+        let sink = resumed[resumed.iter().position(|a| *a == "-o").unwrap() + 1];
+        assert!(sink.ends_with(".part"), "{resumed:?}");
+        // The stall detector and the derived wall clock are untouched by resuming.
+        for flag in ["--speed-limit", "--speed-time", "--connect-timeout", "--retry"] {
+            assert!(resumed.contains(&flag), "{flag} must survive: {resumed:?}");
+        }
+        assert!(!resumed.contains(&"--"), "no caller-side end-of-options marker");
+    }
+
+    /// The anti-wedge rule: a failed attempt keeps its prefix only if it MOVED. A 416
+    /// (the upstream object shrank), a curl 33 (server refuses ranges) or a corrupt local
+    /// file would otherwise be retried from the same dead offset forever.
+    #[test]
+    fn a_failed_attempt_that_made_no_progress_discards_its_prefix() {
+        assert!(keep_partial(0, 1));
+        assert!(keep_partial(600_000_000, 629_000_000));
+        assert!(!keep_partial(0, 0), "nothing arrived");
+        assert!(!keep_partial(600_000_000, 600_000_000), "a dead offset");
+        assert!(!keep_partial(600_000_000, 4), "a truncated/clobbered prefix");
+    }
+
+    /// A refused URL fails before anything is created, and leaves no part behind — the
+    /// scheme guard runs first on this lane too.
+    #[test]
+    fn the_resumable_lane_keeps_the_scheme_guard() {
+        let dir = std::env::temp_dir().join(format!("aterm-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("a.tar.zst");
+        let err = download_to_resumable("file:///etc/passwd", None, &dest, 1 << 20)
+            .expect_err("a non-https asset URL must be refused");
+        assert!(err.contains("non-https"), "{err}");
+        assert!(!dest.exists() && !dir.join("a.tar.zst.part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE MEASUREMENT — bytes actually re-fetched on a retry.
+    ///
+    /// Needs a real https asset, so it is env-gated rather than skipped silently:
+    ///
+    /// ```text
+    ///   ATERM_RESUME_TEST_URL=https://…/some-release-asset \
+    ///     cargo test -p aterm-update-core resume_cost_over_the_network -- --nocapture --ignored
+    ///   -> {"total_bytes":N,"seeded_prefix":N/2,"bytes_fetched_on_retry":~N/2,"ratio":~0.5}
+    /// ```
+    ///
+    /// Two-sided reach guards: the asset must be big enough for a half to be meaningful,
+    /// the seeded prefix must be a real prefix of it (the run downloads the whole thing
+    /// once first, so the resumed file is compared against the whole one — a resume that
+    /// produced DIFFERENT bytes fails here), and the retry must fetch strictly less than
+    /// the whole asset or the saving is imaginary.
+    ///
+    /// # The saving is OBSERVED, not asserted
+    ///
+    /// `total - seeded` is arithmetic: it is what we ASKED for, and a server that ignored
+    /// the range and re-sent everything would produce the same number while saving
+    /// nothing. So the run does it twice. The second pass seeds a prefix of the RIGHT
+    /// LENGTH but the WRONG BYTES; if the remainder alone came over the wire, the result
+    /// must still carry that poison, and if the whole object was re-sent it cannot. The
+    /// two passes together bracket the answer: pass one proves a resume reconstructs the
+    /// artifact exactly, pass two proves the prefix was genuinely not transferred.
+    #[test]
+    #[ignore = "needs ATERM_RESUME_TEST_URL to name a real https release asset"]
+    fn resume_cost_over_the_network() {
+        let Ok(url) = std::env::var("ATERM_RESUME_TEST_URL") else {
+            panic!("set ATERM_RESUME_TEST_URL to a real https asset URL");
+        };
+        let dir = std::env::temp_dir().join(format!("aterm-resume-net-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let whole = dir.join("whole.bin");
+        super::download_to(&url, None, &whole, RELEASE_ASSET_DOWNLOAD_BOUND).expect("baseline");
+        let reference = std::fs::read(&whole).expect("baseline bytes");
+        let total = reference.len() as u64;
+        assert!(
+            total > 1 << 20,
+            "reach guard: a {total}-byte asset is too small to price a resume"
+        );
+
+        // Seed a genuine half-prefix and resume onto it.
+        let dest = dir.join("resumed.bin");
+        let part = part_path(&dest).unwrap();
+        let seeded = total / 2;
+        std::fs::write(&part, &reference[..seeded as usize]).unwrap();
+        download_to_resumable(&url, None, &dest, RELEASE_ASSET_DOWNLOAD_BOUND).expect("resume");
+        let resumed = std::fs::read(&dest).expect("resumed bytes");
+
+        assert_eq!(
+            resumed, reference,
+            "a resumed download must reconstruct the SAME bytes"
+        );
+        let fetched = total - seeded;
+        println!(
+            "{{\"total_bytes\":{total},\"seeded_prefix\":{seeded},\
+             \"bytes_fetched_on_retry\":{fetched},\"ratio\":{:.3}}}",
+            fetched as f64 / total as f64
+        );
+        assert!(
+            fetched < total,
+            "the retry must not re-fetch the whole artifact"
+        );
+
+        // …and the observation. Same offset, POISONED prefix.
+        let poisoned_dest = dir.join("poisoned.bin");
+        let poisoned_part = part_path(&poisoned_dest).unwrap();
+        let mut poison = reference[..seeded as usize].to_vec();
+        for b in poison.iter_mut() {
+            *b = !*b;
+        }
+        std::fs::write(&poisoned_part, &poison).unwrap();
+        download_to_resumable(&url, None, &poisoned_dest, RELEASE_ASSET_DOWNLOAD_BOUND)
+            .expect("resume onto a poisoned prefix");
+        let got = std::fs::read(&poisoned_dest).expect("poisoned bytes");
+        assert_eq!(got.len(), reference.len(), "the total length is unchanged");
+        assert_eq!(
+            &got[seeded as usize..],
+            &reference[seeded as usize..],
+            "the REMAINDER really was transferred"
+        );
+        assert_eq!(
+            &got[..seeded as usize],
+            &poison[..],
+            "the prefix was NOT re-fetched — the bytes we planted survived, which is the \
+             saving, observed rather than computed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

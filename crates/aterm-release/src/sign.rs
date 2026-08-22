@@ -80,7 +80,7 @@ const ID_TOOL: &str = "/usr/bin/id";
 /// resume because the lease never comes back. Forty minutes is far beyond the
 /// minutes a healthy submission takes and far short of "overnight"; past it, the
 /// honest answer is to fail, release the lease, and resume later.
-const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
+pub const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);
 
 /// Bound for the short notarization tools (`stapler staple` / `stapler
 /// validate`). These are a ticket fetch and a local check; if either is still

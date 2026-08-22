@@ -17,6 +17,7 @@
 use crate::grid::LineSize;
 use crate::selection::TextSelection;
 use crate::terminal::{CursorStyle, RenderCell};
+use aterm_hash::FxHashMap;
 
 /// One faded cell of the cursor MOTION TRAIL (the "streaming trailer" effect): a
 /// cell the cursor recently swept through, painted in the trail colour at `alpha`
@@ -1104,6 +1105,101 @@ pub struct RenderInput {
     /// consumed at PRESENT time only, so it is EXCLUDED from `PartialEq`/`Eq`: it
     /// must never dirty a cell or force a repaint. The CPU backend ignores it.
     pub input_hot: bool,
+    /// Identity of the engine instance that last engine-filled this snapshot
+    /// (DMG-1 damage carrier), or 0 for a never-engine-filled scratch. Stamped
+    /// by `cell_frame_into`/`cell_frame_damage_scoped_into`; consumed by the
+    /// damage-scoped refill's continuity check so a scratch reused across
+    /// DIFFERENT terminals (the split compositor's shared `pane_scratch`) can
+    /// never serve one pane's retained rows as another's. Pure metadata:
+    /// EXCLUDED from `PartialEq`/`Eq` like `snapshot_seq`.
+    pub terminal_id: u64,
+    /// The stamping terminal's extraction generation at fill time (DMG-1
+    /// carrier; see `Terminal::take_damage`). A damage-scoped refill is sound
+    /// only while this equals the terminal's CURRENT generation — i.e. no
+    /// consumer has taken (and thereby reset) the damage tracker since this
+    /// scratch was filled, so the tracker's bits are a superset of the rows
+    /// that changed under this scratch. 0 = never engine-filled. Metadata,
+    /// EXCLUDED from `PartialEq`/`Eq`.
+    pub extract_gen: u64,
+    /// `snapshot_seq` as stamped by the LAST ENGINE fill (DMG-1 carrier).
+    /// Post-extraction host mutators (stream fade, prediction ghosts, the
+    /// tab-strip splice) follow the existing discipline of bumping
+    /// `snapshot_seq` after touching content channels; `snapshot_seq !=
+    /// engine_fill_seq` therefore means "a host wrote cells since the engine
+    /// filled this scratch", and the damage-scoped refill falls back to a full
+    /// refill instead of preserving rows the engine no longer vouches for.
+    /// Metadata, EXCLUDED from `PartialEq`/`Eq`.
+    pub engine_fill_seq: u64,
+    /// Whether the stamping terminal's ALTERNATE screen was active at fill time
+    /// (DMG-1 carrier). Primary and alt grids keep independent damage/content
+    /// state, so a swap between fills invalidates row continuity even when
+    /// every other token happens to match; the scoped refill compares this bit
+    /// against the live terminal and full-refills on mismatch. Metadata,
+    /// EXCLUDED from `PartialEq`/`Eq`.
+    pub engine_alt: bool,
+    /// Which column order the LAST ENGINE fill left this snapshot's rows in
+    /// (DMG-1 carrier). Always [`RowOrder::Logical`] in builds without the
+    /// `bidi` feature, where the reorder pass does not exist.
+    ///
+    /// This is the carrier's BiDi continuity token, and it exists because
+    /// `apply_bidi_reorder` is an in-place, NON-idempotent row permutation:
+    /// retained rows may only be kept while they are still in LOGICAL order,
+    /// which is exactly what [`RowOrder::Logical`] records.
+    /// [`RowOrder::BidiVisual`] therefore forces the next refill to the full
+    /// arm — the permutation is re-derived from scratch — while the
+    /// overwhelmingly common pure-LTR frame (no row permuted, so logical ==
+    /// visual everywhere) keeps the scoped arm.
+    ///
+    /// The predecessor of this token was a blanket `bidi_mode != Disabled`
+    /// veto, which read as conservative but was a LIVENESS bug: `BiDiMode`'s
+    /// `#[default]` is `Implicit`, and `aterm-gui` compiles the `bidi` feature
+    /// in, so the veto fired on every frame of the shipping app and the whole
+    /// damage-scoped path was dead code there. Metadata, EXCLUDED from
+    /// `PartialEq`/`Eq`.
+    pub engine_row_order: RowOrder,
+}
+
+/// The column order a [`RenderInput`]'s rows are in, as left by the last ENGINE
+/// fill (DMG-1 carrier; see [`RenderInput::engine_row_order`]).
+///
+/// A two-variant state rather than a bool on purpose: it names the PROPERTY the
+/// damage-scoped refill's continuity proof needs — "these retained rows are
+/// still in the order a fresh logical fill would produce" — instead of a
+/// yes/no about an implementation detail of the BiDi pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowOrder {
+    /// No row was permuted: logical order and visual order coincide, for every
+    /// row and every column-indexed channel (cells, clusters, combining marks,
+    /// images, and the cursor column). This is every frame of a pure-LTR
+    /// session, and every frame at all in a build without the `bidi` feature.
+    #[default]
+    Logical,
+    /// At least one row was permuted into BiDi VISUAL order by
+    /// `apply_bidi_reorder`. Rows in this state may not be retained by a
+    /// damage-scoped refill: the permutation is not idempotent, so re-applying
+    /// it to an already-visual row would double-permute it.
+    BidiVisual,
+}
+
+/// How [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into)
+/// refilled a scratch: the full-viewport fallback, or the damage-scoped arm
+/// that re-resolved only the tracker's damaged rows. Returned (rather than
+/// logged) so callers, benches, and the differential oracle can assert REACH —
+/// a damage-scoped workload that silently degrades to `Full` every frame is a
+/// perf regression the type makes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameRefill {
+    /// The whole viewport was re-extracted (continuity break, full damage, or
+    /// first fill). Always sound; the cost is the pre-carrier status quo.
+    Full,
+    /// Only the damage tracker's rows were re-extracted; every other row was
+    /// left as-is in the scratch (byte-identical by the continuity invariant).
+    Scoped {
+        /// Number of viewport rows re-resolved (== the tracker's damaged-row
+        /// count clamped to the viewport). 0 is legal: a cursor-only move
+        /// damages nothing yet still restamps cursor/selection scalars.
+        rows_refilled: usize,
+    },
 }
 
 impl Clone for RenderInput {
@@ -1160,6 +1256,11 @@ impl Clone for RenderInput {
             cursor_color: self.cursor_color,
             snapshot_seq: self.snapshot_seq,
             input_hot: self.input_hot,
+            terminal_id: self.terminal_id,
+            extract_gen: self.extract_gen,
+            engine_fill_seq: self.engine_fill_seq,
+            engine_alt: self.engine_alt,
+            engine_row_order: self.engine_row_order,
         }
     }
 
@@ -1227,7 +1328,71 @@ impl Clone for RenderInput {
         self.cursor_color = source.cursor_color;
         self.snapshot_seq = source.snapshot_seq;
         self.input_hot = source.input_hot;
+        self.terminal_id = source.terminal_id;
+        self.extract_gen = source.extract_gen;
+        self.engine_fill_seq = source.engine_fill_seq;
+        self.engine_alt = source.engine_alt;
+        self.engine_row_order = source.engine_row_order;
     }
+}
+
+/// Content equality for the per-row inline-image placements (the `images`
+/// clause of [`RenderInput`]'s `PartialEq`), with cross-`Arc` payload verdicts
+/// memoized per CALL (IMG-1).
+///
+/// WHY: `ImageRef`'s derived `Eq` deep-compares `ImageData` — `bytes` included
+/// — whenever the two `Arc`s are pointer-DISTINCT (std's `Arc` eq only
+/// short-circuits on pointer-EQUAL), and a re-transmitting client allocates a
+/// FRESH `Arc` per transmit. The derived `Vec` equality therefore restarted
+/// that memcmp at EVERY covered cell: O(covered_cells × payload_bytes) per
+/// whole-input compare (e.g. ~10k covered cells × ~8 MB byte-identical kitty
+/// video payloads ≈ 86 GB of memcmp for ONE equality check). The verdict for
+/// a (left-Arc, right-Arc) PAIR is constant within one call, so it is
+/// memoized: each distinct pair deep-compares ONCE — same verdict, the cost
+/// scales with distinct images instead of covered cells × bytes. (The per-row
+/// dirty diff in `aterm-render` carries the identical memo — `ImageEqMemo` —
+/// for the identical reason.)
+///
+/// SOUNDNESS of the raw-pointer key: the memo lives only for this call, and
+/// the two borrowed inputs keep every referenced `Arc` alive throughout — an
+/// address can never be freed and reused by a DIFFERENT image while its
+/// verdict is cached. That ABA hazard is why the map must never be persisted
+/// across calls. `FxHashMap` allocates nothing until the first insert, so
+/// image-free and same-`Arc` (steady) inputs pay nothing here.
+fn images_eq(
+    a: &[Vec<(usize, aterm_grid::ImageRef)>],
+    b: &[Vec<(usize, aterm_grid::ImageRef)>],
+) -> bool {
+    let mut verdicts: FxHashMap<(usize, usize), bool> = FxHashMap::default();
+    let mut image_eq = |x: &std::sync::Arc<aterm_grid::ImageData>,
+                        y: &std::sync::Arc<aterm_grid::ImageData>|
+     -> bool {
+        if std::sync::Arc::ptr_eq(x, y) {
+            return true;
+        }
+        let key = (
+            std::sync::Arc::as_ptr(x) as usize,
+            std::sync::Arc::as_ptr(y) as usize,
+        );
+        if let Some(&verdict) = verdicts.get(&key) {
+            return verdict;
+        }
+        // The one deep compare this pair pays — the UNCHANGED derived
+        // `ImageData` equality (bytes + format + cols + rows + z).
+        let verdict = **x == **y;
+        verdicts.insert(key, verdict);
+        verdict
+    };
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(ra, rb)| {
+            ra.len() == rb.len()
+                && ra.iter().zip(rb).all(|((ca, ia), (cb, ib))| {
+                    ca == cb
+                        && ia.cell_row == ib.cell_row
+                        && ia.cell_col == ib.cell_col
+                        && image_eq(&ia.image, &ib.image)
+                })
+        })
 }
 
 // Hand-written equality: compare rendered CONTENT only, NOT `snapshot_seq`.
@@ -1285,7 +1450,10 @@ impl PartialEq for RenderInput {
             && self.line_sizes == other.line_sizes
             && self.line_size_spans == other.line_size_spans
             && self.default_bg_spans == other.default_bg_spans
-            && self.images == other.images
+            // Images: memoized cross-`Arc` content equality — same verdict as
+            // the derived compare, priced per DISTINCT image pair instead of
+            // per covered cell (see `images_eq`).
+            && images_eq(&self.images, &other.images)
             && self.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
                 == other.wallpaper.as_ref().map(std::sync::Arc::as_ptr)
             && self.default_bg == other.default_bg
@@ -1304,6 +1472,11 @@ impl PartialEq for RenderInput {
         // `base_y` and `absolute_row_revision` are NOT compared either: they are
         // host-consumed re-anchor metadata (like `snapshot_seq`) that do not affect
         // rendered pixels, so metadata-only changes must not force a raster repaint.
+        // `terminal_id` / `extract_gen` / `engine_fill_seq` / `engine_alt` /
+        // `engine_row_order` (DMG-1
+        // damage carrier) are extraction-continuity tokens, not rendered content:
+        // comparing them would make every scoped refill compare unequal and defeat
+        // the very dirty-gate they exist to feed — same law as `snapshot_seq`.
     }
 }
 
@@ -1375,6 +1548,11 @@ impl RenderInput {
             cursor_color: COLOR_UNSET,
             snapshot_seq: 0,
             input_hot: false,
+            terminal_id: 0,
+            extract_gen: 0,
+            engine_fill_seq: 0,
+            engine_alt: false,
+            engine_row_order: RowOrder::Logical,
         }
     }
 
@@ -1649,6 +1827,186 @@ impl RenderInput {
         self.image_at(row, col)
             .is_some_and(|r| r.image.z_index >= 0)
     }
+
+    /// Composite an IME PREEDIT (the in-flight composition text) into this
+    /// frame at the cursor — the standard inline-at-the-caret presentation
+    /// every native macOS text surface gives CJK and dead-key input, which
+    /// aterm previously approximated with a `title [‹preedit›]` indicator in
+    /// the WINDOW TITLE, a corner of the screen nobody composing text is
+    /// looking at.
+    ///
+    /// PURE FRAME COMPOSITING. `cells` is a per-frame PROJECTION of the grid,
+    /// so overwriting cells here touches no terminal state: the composition is
+    /// visible exactly while the host keeps passing it, and vanishes the frame
+    /// after commit/cancel with nothing to undo. (The committed text then
+    /// arrives through the ordinary PTY echo path like any typed input.)
+    ///
+    /// Presentation rules:
+    /// * drawn from the cursor cell, in the cursor cell's colors, single
+    ///   UNDERLINE (the IME convention for uncommitted text), no bold/italic
+    ///   inheritance — composition text is its own thing, not a continuation
+    ///   of whatever SGR state the prompt happened to leave;
+    /// * wide characters (the common case — CJK) occupy a lead cell plus a
+    ///   `wide` continuation, same contract the renderers already honor;
+    /// * TRUNCATED at the right edge (no wrap): a v1 honesty choice — the
+    ///   composition popover shows the full text, and wrapping would need the
+    ///   next row's ownership story;
+    /// * zero-width characters (combining marks fresh off a dead key) merge
+    ///   into the preceding cell like the write path would — they advance
+    ///   nothing and draw nothing of their own here;
+    /// * the CURSOR moves to the caret — `caret_byte` is the byte offset the
+    ///   platform reported (winit `Ime::Preedit`'s cursor start); `None` (or
+    ///   past-the-end) parks it after the last composed cell, clamped to the
+    ///   final column.
+    ///
+    /// `cjk` selects East-Asian-Ambiguous width, mirroring the write path's
+    /// `char_width` so the composition occupies exactly the columns the
+    /// committed text will.
+    pub fn overlay_ime_preedit(&mut self, preedit: &str, caret_byte: Option<usize>, cjk: bool) {
+        if preedit.is_empty() || self.cursor_row >= self.rows {
+            return;
+        }
+        let row = self.cursor_row;
+        let cols = self.cols;
+        let Some(cells) = self.cells.get_mut(row) else {
+            return;
+        };
+        // The style seed: the cursor cell's resolved colors (theme-correct by
+        // construction — they went through the same palette/DECSCNM resolution
+        // as every other cell this frame).
+        let seed = cells.get(self.cursor_col).copied().unwrap_or_default();
+        let mut col = self.cursor_col;
+        let mut caret_col: Option<usize> = None;
+        let caret = caret_byte.unwrap_or(preedit.len());
+        for (byte, ch) in preedit.char_indices() {
+            if caret_col.is_none() && byte >= caret {
+                caret_col = Some(col);
+            }
+            let width = if cjk {
+                aterm_grapheme::char_width_cjk(ch)
+            } else {
+                aterm_grapheme::char_width(ch)
+            };
+            if width == 0 {
+                continue;
+            }
+            if col + width > cols {
+                break; // truncate: a wide char never straddles the edge
+            }
+            let lead = crate::terminal::RenderCell {
+                ch,
+                fg: seed.fg,
+                bg: seed.bg,
+                wide: false,
+                emoji_presentation: false,
+                bold: false,
+                italic: false,
+                underline: crate::terminal::UnderlineStyle::Single,
+                strikethrough: false,
+                overline: false,
+                underline_color: None,
+            };
+            if let Some(cell) = cells.get_mut(col) {
+                *cell = lead;
+            }
+            if width == 2
+                && let Some(cont) = cells.get_mut(col + 1)
+            {
+                *cont = crate::terminal::RenderCell {
+                    ch: ' ',
+                    wide: true,
+                    underline: crate::terminal::UnderlineStyle::Single,
+                    ..lead
+                };
+            }
+            col += width;
+        }
+        self.cursor_col = caret_col.unwrap_or(col).min(cols.saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod ime_preedit_tests {
+    use super::RenderInput;
+    use crate::terminal::{RenderCell, UnderlineStyle};
+
+    fn frame(rows: usize, cols: usize, cursor: (usize, usize)) -> RenderInput {
+        let blank = RenderCell {
+            ch: ' ',
+            fg: [200, 200, 200],
+            bg: [10, 10, 10],
+            ..Default::default()
+        };
+        RenderInput {
+            rows,
+            cols,
+            cells: vec![vec![blank; cols]; rows],
+            cursor_row: cursor.0,
+            cursor_col: cursor.1,
+            cursor_visible: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ascii_preedit_lands_underlined_at_the_cursor_and_the_caret_trails() {
+        let mut f = frame(4, 10, (1, 3));
+        f.overlay_ime_preedit("ab", None, false);
+        assert_eq!(f.cells[1][3].ch, 'a');
+        assert_eq!(f.cells[1][4].ch, 'b');
+        assert_eq!(f.cells[1][3].underline, UnderlineStyle::Single);
+        assert_eq!(f.cells[1][3].fg, [200, 200, 200], "cursor cell's colors seed the style");
+        assert_eq!(f.cursor_col, 5, "caret parks after the composition");
+        assert_eq!(f.cells[1][2].ch, ' ', "nothing left of the cursor is touched");
+    }
+
+    #[test]
+    fn cjk_preedit_occupies_lead_plus_wide_continuation() {
+        let mut f = frame(4, 10, (0, 2));
+        f.overlay_ime_preedit("日本", None, false);
+        assert_eq!(f.cells[0][2].ch, '日');
+        assert!(f.cells[0][3].wide, "continuation column carries the wide flag");
+        assert_eq!(f.cells[0][4].ch, '本');
+        assert!(f.cells[0][5].wide);
+        assert_eq!(f.cells[0][3].underline, UnderlineStyle::Single, "the underline spans the continuation");
+        assert_eq!(f.cursor_col, 6);
+    }
+
+    #[test]
+    fn preedit_truncates_at_the_edge_and_a_wide_char_never_straddles_it() {
+        let mut f = frame(2, 5, (0, 2));
+        // '日' is width 2: cols 2-3 fit, the second '本' (cols 4-5) would
+        // straddle the edge and must not be half-drawn.
+        f.overlay_ime_preedit("日本", None, false);
+        assert_eq!(f.cells[0][2].ch, '日');
+        assert_eq!(f.cells[0][4].ch, ' ', "the straddling char is truncated whole");
+        assert_eq!(f.cursor_col, 4, "caret clamps inside the row");
+    }
+
+    #[test]
+    fn the_platform_caret_offset_places_the_cursor_mid_composition() {
+        let mut f = frame(2, 10, (0, 0));
+        // Caret between 'a' and 'b' (byte offset 1).
+        f.overlay_ime_preedit("ab", Some(1), false);
+        assert_eq!(f.cursor_col, 1);
+    }
+
+    #[test]
+    fn an_empty_preedit_is_byte_identical() {
+        let mut f = frame(2, 10, (0, 4));
+        let before = f.clone();
+        f.overlay_ime_preedit("", None, false);
+        assert_eq!(f, before);
+    }
+
+    #[test]
+    fn zero_width_combining_marks_advance_nothing() {
+        let mut f = frame(2, 10, (0, 0));
+        // 'e' + COMBINING ACUTE (U+0301, width 0): one visible column.
+        f.overlay_ime_preedit("e\u{0301}", None, false);
+        assert_eq!(f.cells[0][0].ch, 'e');
+        assert_eq!(f.cursor_col, 1);
+    }
 }
 
 #[cfg(test)]
@@ -1776,6 +2134,82 @@ mod z_index_tests {
     use super::RenderInput;
     use aterm_grid::{ImageData, ImageFormat, ImageRef};
     use std::sync::Arc;
+
+    /// IMG-1 DIFFERENTIAL ORACLE for [`super::images_eq`]: the memoized
+    /// whole-field compare must agree with the derived `Vec<Vec<…>>` equality
+    /// on every shape — and the two load-bearing directions are pinned at the
+    /// `RenderInput` level: a re-transmit (fresh `Arc`s, identical bytes)
+    /// still compares EQUAL (repaint suppression preserved), while a one-byte
+    /// payload change still compares UNEQUAL (the deep compare is priced per
+    /// distinct Arc pair, never dropped).
+    #[test]
+    fn images_eq_memo_matches_derived_equality() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+        let mk = |bytes: Vec<u8>, z: i32| {
+            Arc::new(ImageData {
+                bytes,
+                format: ImageFormat::Png,
+                cols: 3,
+                rows: 2,
+                z_index: z,
+            })
+        };
+        let fill = |img: &Arc<ImageData>| -> Vec<Vec<(usize, ImageRef)>> {
+            (0..2u16)
+                .map(|r| {
+                    (0..3u16)
+                        .map(|c| {
+                            (
+                                usize::from(c),
+                                ImageRef {
+                                    image: img.clone(),
+                                    cell_row: r,
+                                    cell_col: c,
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let base = mk(payload.clone(), 0);
+        let a = fill(&base);
+        let mut flipped = payload.clone();
+        flipped[17] ^= 0x80;
+        let cases = [
+            Vec::new(),                     // empty vs covered
+            a.clone(),                      // same Arcs (ptr_eq path)
+            fill(&mk(payload.clone(), 0)),  // re-transmit: distinct Arc, equal bytes
+            fill(&mk(flipped, 0)),          // one payload byte differs
+            fill(&mk(payload.clone(), -1)), // z-only difference
+            a[..1].to_vec(),                // row-count mismatch
+        ];
+        for (i, b) in cases.iter().enumerate() {
+            assert_eq!(
+                super::images_eq(&a, b),
+                a == *b,
+                "case {i}: memoized equality must match the derived equality"
+            );
+        }
+
+        // RenderInput-level pin of both directions.
+        let mut left = RenderInput::empty();
+        left.images = a.clone();
+        let mut right = RenderInput::empty();
+        right.images = fill(&mk(payload.clone(), 0));
+        assert_eq!(
+            left, right,
+            "a byte-identical re-transmit (fresh Arcs) must compare EQUAL"
+        );
+        let mut changed = payload;
+        changed[4095] ^= 1;
+        let mut unequal = RenderInput::empty();
+        unequal.images = fill(&mk(changed, 0));
+        assert_ne!(
+            left, unequal,
+            "a last-byte payload change must still compare UNEQUAL"
+        );
+    }
 
     fn image_ref(z: i32) -> ImageRef {
         ImageRef {

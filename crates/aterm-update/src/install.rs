@@ -32,6 +32,23 @@ use crate::{ApplyOutcome, bundle, verify};
 /// so this only bites a build that never reaches the health checkpoint.
 const MAX_BOOT_ATTEMPTS: u32 = 3;
 
+/// How long a LAUNCH waits for the apply lock before giving up and starting on
+/// the installed build.
+///
+/// Deliberately short. Every legitimate holder either returns in milliseconds or
+/// is itself bounded, so reaching this means the holder is wedged — and a wedged
+/// holder must not be able to stop a terminal from opening. Deferring costs one
+/// launch's update; hanging costs the application.
+const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ceiling on the cross-volume `ditto` of the candidate bundle.
+///
+/// Generous, because unlike the verification helpers this one's honest duration
+/// is a property of the hardware: a several-hundred-megabyte bundle onto a slow
+/// external disk. It exists to bound the pathological case — a volume that has
+/// gone away mid-copy — not to hurry a real one.
+const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 const EXPECTED_BUILD_ENV: &str = "ATERM_UPDATE_EXPECTED_BUILD";
 const EXPECTED_COMMIT_ENV: &str = "ATERM_UPDATE_EXPECTED_COMMIT";
 const EXPECTED_DIGEST_ENV: &str = "ATERM_UPDATE_EXPECTED_DMG_SHA256";
@@ -515,9 +532,35 @@ fn recover_abandoned_preswap_trial_if_exact(
     if ready.as_ref().is_some_and(|ready| {
         ready_matches_verified_identity(ready, candidate_build, &candidate_commit)
     }) {
-        let _ = remove_path_no_follow(&staging.staged_app);
-        if std::fs::rename(&fixed, &staging.staged_app).is_err() {
-            return false;
+        // Cross-volume staging COPIES staged_app -> fixed and leaves the staged
+        // copy intact, so when the staged bundle already carries the exact
+        // candidate identity the fixed twin is the redundant copy — reclaim it
+        // and keep the publication. Deleting the staged copy first just to fail
+        // the rename back (EXDEV whenever the install volume differs from HOME,
+        // i.e. every external-volume install) destroyed the one copy the
+        // published authority still pointed at.
+        if verified_bundle_identity(&staging.staged_app).is_ok_and(|(build, commit)| {
+            build == candidate_build && commit == candidate_commit
+        }) {
+            let _ = remove_path_no_follow(&fixed);
+        } else {
+            let _ = remove_path_no_follow(&staging.staged_app);
+            if std::fs::rename(&fixed, &staging.staged_app).is_err() {
+                // EXDEV (or any restore failure): the bytes cannot reach the
+                // staging path from here. Retire the publication and reclaim the
+                // fixed candidate so THIS launch settles at NoUpdate and the next
+                // check re-stages cleanly — instead of returning an unrecovered
+                // trial that defers every launch behind a marker naming bytes
+                // nothing can restore. Pre-swap the fixed path is NEW, never a
+                // rollback source, so reclaiming it is safe.
+                crate::warn(&format!(
+                    "cannot restore the fixed candidate (build {candidate_build}) to the \
+                     staging path (cross-volume?); retiring the publication so the next \
+                     check re-stages"
+                ));
+                staging.retire_published();
+                let _ = remove_path_no_follow(&fixed);
+            }
         }
     } else {
         let _ = remove_path_no_follow(&fixed);
@@ -742,8 +785,21 @@ fn recover_orphaned_prepared_candidate(
         staging.retire_published();
         return Ok(());
     }
-    std::fs::rename(&fixed, &staging.staged_app)
-        .map_err(|error| format!("restore orphaned fixed candidate to staged app: {error}"))
+    if let Err(error) = std::fs::rename(&fixed, &staging.staged_app) {
+        // EXDEV on an external-volume install (fixed sits beside the bundle on
+        // the install volume; staging lives under HOME), or any other restore
+        // failure: an Err here made every launch defer behind a marker whose
+        // bytes can never reach the staging path. Same remedy as the
+        // nothing-to-adopt branch above — retire the marker, report success, and
+        // let the next check re-stage; the fixed path is deliberately LEFT ALONE
+        // (it may double as the rollback-shaped source a later recovery reads).
+        crate::warn(&format!(
+            "cannot restore the orphaned fixed candidate to the staging path ({error}); \
+             retiring the dangling marker so the next check re-stages"
+        ));
+        staging.retire_published();
+    }
+    Ok(())
 }
 
 /// Materialize and verify NEW at the fixed destination-volume rollback name before
@@ -797,6 +853,7 @@ fn prepare_fixed_swap_candidate(
     installed: &Path,
     ready: &Ready,
     current_build: u64,
+    staged_identity: (u64, &str),
 ) -> Result<PreparedSwapCandidate, String> {
     let staged = &staging.staged_app;
     let fixed = rollback_path(installed);
@@ -812,15 +869,27 @@ fn prepare_fixed_swap_candidate(
         std::fs::rename(staged, &fixed)
             .map_err(|error| format!("move verified stage to fixed swap path: {error}"))?;
     } else {
-        let status = Command::new("/usr/bin/ditto")
-            .arg(staged)
-            .arg(&fixed)
-            .status()
-            .map_err(|error| format!("spawn ditto to fixed swap path: {error}"))?;
+        // The one genuinely slow step on this path: a several-hundred-megabyte
+        // copy between volumes, run while the apply lock is held and before the
+        // window exists. It was the ONLY child on the apply path with no ceiling
+        // at all — an unplugged or wedged external volume meant a launch that
+        // never finished and a lock every other launch queued behind.
+        let copy_started = std::time::Instant::now();
+        let status = crate::verify::status_bounded(
+            Command::new("/usr/bin/ditto").arg(staged).arg(&fixed),
+            "ditto to fixed swap path",
+            CROSS_VOLUME_COPY_TIMEOUT,
+        )
+        .inspect_err(|_| {
+            let _ = remove_path_no_follow(&fixed);
+        })?;
         if !status.success() {
             let _ = remove_path_no_follow(&fixed);
             return Err(format!("ditto to fixed swap path failed ({status})"));
         }
+        // Disk time, not helper time: a slow volume must not spend the
+        // verification budget that the checks after this copy still need.
+        crate::verify::ApplyBudget::extend(copy_started.elapsed());
     }
     let prepared = PreparedSwapCandidate {
         fixed: fixed.clone(),
@@ -830,11 +899,26 @@ fn prepare_fixed_swap_candidate(
         recover_prepared_candidate(&prepared, staging);
         return Err("fixed swap candidate is not on the installed volume".to_string());
     }
-    let (fixed_build, sealed_commit) = match verified_bundle_identity(&fixed) {
-        Ok(identity) => identity,
-        Err(error) => {
-            recover_prepared_candidate(&prepared, staging);
-            return Err(format!("fixed swap candidate failed verification: {error}"));
+    // The candidate's sealed identity. On the same-volume path this is the
+    // identity the CALLER just read, because `rename(2)` moved the very inode it
+    // read it from: same bytes, same signature, same plist. Re-running the five
+    // codesign/spctl/PlistBuddy helpers over it would re-answer a question
+    // nothing could have changed the answer to — the apply lock is held, the
+    // parent is a private directory, and `checked_bundle_exchange` revalidates
+    // the no-follow shape again at the point of no return. That redundant pass
+    // was five of the sixteen helper spawns on the launch path.
+    //
+    // The cross-volume path DOES re-verify: `ditto` produced new bytes at a new
+    // path, so its identity is genuinely unestablished.
+    let (fixed_build, sealed_commit) = if moved_from_stage {
+        (staged_identity.0, staged_identity.1.to_string())
+    } else {
+        match verified_bundle_identity(&fixed) {
+            Ok(identity) => identity,
+            Err(error) => {
+                recover_prepared_candidate(&prepared, staging);
+                return Err(format!("fixed swap candidate failed verification: {error}"));
+            }
         }
     };
     if fixed_build != ready.build_number || fixed_build <= current_build {
@@ -2298,10 +2382,21 @@ fn apply_staged_if_ready_inner(
     }
 
     // 4. Serialize the swap across concurrent launches.
-    let _lock = match FileLock::acquire(&staging.apply_lock) {
+    //
+    // BOUNDED, unlike every other taker of this lock: we are before the window,
+    // so waiting here is a terminal that has not appeared. Every legitimate
+    // holder returns in millis (publish is remove+rename+write) or is itself
+    // bounded (verification by the apply budget, a cross-volume copy by its own
+    // ceiling). A holder that outlasts this one is wedged — SIGSTOPped, paused
+    // under a debugger, stuck on a dead volume — and the right answer then is to
+    // start on the build we already have, not to hang with nothing on screen.
+    let _lock = match FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT) {
         Ok(l) => l,
         Err(e) => return ApplyOutcome::Deferred(format!("lock: {e}")),
     };
+    // Everything from here to the swap is verification work on the launch path.
+    // One ceiling over all of it (the guard restores any outer budget on drop).
+    let _budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
     if !recover_abandoned_preswap_trial_if_exact(
         &staging,
         &b.app_root,
@@ -2487,8 +2582,13 @@ fn apply_staged_if_ready_inner(
     // 7. Prepare/verify NEW at the fixed destination-volume recovery path BEFORE
     // the point of no return. One atomic exchange then puts NEW at installed and
     // OLD directly at that fixed path; every process-crash cut is discoverable.
-    let prepared = match prepare_fixed_swap_candidate(&staging, &b.app_root, &ready, current_build)
-    {
+    let prepared = match prepare_fixed_swap_candidate(
+        &staging,
+        &b.app_root,
+        &ready,
+        current_build,
+        (staged_build, &sealed_commit),
+    ) {
         Ok(prepared) => prepared,
         Err(error) => return ApplyOutcome::Deferred(error),
     };

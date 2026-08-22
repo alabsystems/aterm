@@ -34,9 +34,10 @@
 //! Dropping auth is NOT a trust downgrade: artifact trust is the pinned Ed25519 key,
 //! the pinned Team ID and the manifest sha256 — none of which this lane touches.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use aterm_update_core::tag::{TagError, TagKind};
 use aterm_update_core::{HttpError, token};
@@ -100,6 +101,14 @@ fn rate_limit_still_deferrable(streak: &std::sync::atomic::AtomicU32) -> bool {
 /// per process: it is a standing condition, not an event.
 static ANNOUNCED_ANONYMOUS: AtomicBool = AtomicBool::new(false);
 
+/// Whether the anonymous lane was entered because a PROVISIONED token was
+/// rejected by GitHub (the one-shot `RetryAnonymous` path) rather than because no
+/// token exists. The healthy-status lane note must tell those apart: "provision a
+/// token" is exactly wrong advice for a machine whose problem is a stale token
+/// that needs ROTATING. Cleared by an authenticated read (a working token is the
+/// end of the story either way).
+static TOKEN_REJECTED: AtomicBool = AtomicBool::new(false);
+
 /// The lane the last completed check used.
 #[must_use]
 pub fn lane() -> Lane {
@@ -122,6 +131,9 @@ pub fn rate_limited() -> bool {
 fn note_readable(authenticated: bool, source: &Source) {
     LANE.store(if authenticated { 1 } else { 2 }, Ordering::Relaxed);
     RATE_LIMITED.store(false, Ordering::Relaxed);
+    if authenticated {
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
+    }
     crate::no_token::clear();
     if !authenticated && !ANNOUNCED_ANONYMOUS.swap(true, Ordering::Relaxed) {
         crate::log(&format!(
@@ -138,13 +150,43 @@ fn note_readable(authenticated: bool, source: &Source) {
 ///
 /// Empty on the authenticated lane (the default, and the one the 75-second cadence
 /// documents), so no existing status wording changes for a provisioned machine.
-fn lane_note() -> &'static str {
-    if lane() == Lane::Anonymous {
-        " — checking anonymously on a 15-minute interval (no update token provisioned; \
-         the unauthenticated GitHub budget is ~60 requests/hour per IP)"
-    } else {
-        ""
+///
+/// The anonymous wording is per-channel because the token chain is per-channel
+/// (the walk in `aterm_update_core::token`): the compiled-in PUBLIC channel reads only
+/// `$ATERM_UPDATE_TOKEN` and never the `update-token` file — so a status that
+/// said "no update token provisioned" NEXT TO a file the installer wrote read
+/// as a contradiction, and the file-writing "fix" it suggested is a no-op
+/// there. A REPOINTED channel walks the whole chain, so for it the missing
+/// token stays the named, remediable cause. Two round-11 additions: the note
+/// reports the interval ACTUALLY in effect (an operator's
+/// `ATERM_UPDATE_INTERVAL_SECS` wins over the lane default and must not be
+/// misreported as it), and a REJECTED provisioned token names rotation — the
+/// opposite remedy from provisioning — via the `TOKEN_REJECTED` latch.
+fn lane_note(source: &Source) -> String {
+    if lane() != Lane::Anonymous {
+        return String::new();
     }
+    let secs = std::env::var("ATERM_UPDATE_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(crate::cadence::ANONYMOUS_INTERVAL_SECS);
+    let every = if secs >= 120 && secs.is_multiple_of(60) {
+        format!("{}-minute", secs / 60)
+    } else {
+        format!("{secs}-second")
+    };
+    let why = if TOKEN_REJECTED.load(Ordering::Relaxed) {
+        "a provisioned update token was rejected by GitHub — rotate it"
+    } else if source.owner == crate::DEFAULT_OWNER && source.repo == crate::DEFAULT_REPO {
+        "the public channel reads no token file — a provisioned update-token file \
+         serves only a repointed updater"
+    } else {
+        "no update token provisioned"
+    };
+    format!(
+        " — checking anonymously on a {every} interval ({why}; the unauthenticated \
+         GitHub budget is ~60 requests/hour per IP)"
+    )
 }
 
 /// What the releases-LIST response says the check should do. Split out as a pure
@@ -213,6 +255,25 @@ pub(crate) fn classify_list_error(
         // is public: the ambient `gh auth token` the chain may have picked up can be
         // stale, scoped elsewhere, or revoked. One anonymous retry, then give up.
         HttpError::Unauthorized { .. } if !already_retried => ListDecision::RetryAnonymous,
+        // A renamed/transferred repository: the REST API answers a permanent
+        // redirect on the OLD slug forever (git-level redirects keep clones
+        // working, so nothing else on the machine breaks visibly), and api_get
+        // follows no redirects on purpose — the URL embeds the trusted slug.
+        // This is a STANDING configuration state, not weather: filing it as a
+        // `network` failure parked it in the one class the health ledger
+        // deliberately never escalates, so a whole fleet could stall silently
+        // (round-11 audit). Blocked is the honest classification — announced
+        // once, with the remedy.
+        HttpError::Status {
+            code: 301 | 308, ..
+        } => ListDecision::Blocked(format!(
+            "aterm's release channel github.com/{}/{} answers HTTP 301 (moved \
+             permanently): the repository was renamed or transferred, and this machine \
+             will keep asking the OLD name — and never receive an update — until an \
+             operator repoints it: set `[update] owner`/`repo` in aterm's config, or \
+             $ATERM_UPDATE_OWNER / $ATERM_UPDATE_REPO, to the repository's new location.",
+            source.owner, source.repo
+        )),
         // Everything else — including 404 WITH a token (a token that cannot see the
         // repo is a real, actionable auth problem) — is today's failure path.
         _ => ListDecision::Failed(error.to_string()),
@@ -263,7 +324,12 @@ fn unreadable_explanation(
 }
 
 /// A GitHub Release (subset). Unknown fields are ignored.
-#[derive(Clone, Debug, Deserialize)]
+///
+/// `Serialize` is here for ONE consumer: [`CatalogMemo`], which persists the SELECTED
+/// release so a steady-state check can skip re-listing and re-parsing the whole history.
+/// Round-tripping is lossless with respect to everything downstream reads, because these
+/// three fields are everything this crate ever reads out of a release.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Release {
     /// Release-list order is not a GitHub REST contract. The canonical tag is
     /// therefore the updater's explicit ordering key.
@@ -276,8 +342,8 @@ struct Release {
     assets: Vec<Asset>,
 }
 
-/// A release asset (subset).
-#[derive(Clone, Debug, Deserialize)]
+/// A release asset (subset). `Serialize` for [`CatalogMemo`] — see [`Release`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Asset {
     name: String,
     /// The asset's API URL (`…/releases/assets/<id>`), used for the octet download.
@@ -1297,71 +1363,358 @@ fn stage_backoff(
     })
 }
 
-/// Enumerate the complete bounded release-metadata set. GitHub documents no
-/// ordering contract for List Releases, so the caller chooses the greatest
-/// canonical numeric vMAJOR.MINOR.PATCH tag carrying the exact appcast name
-/// (retired two-component tags are skipped, never ordered), and only after that
-/// decision fetches one manifest (+ one signature under Tier SIG) — row order
-/// cannot select an older release and broken historical assets add no download
-/// latency.
+/// One release-listing page (GitHub's maximum) and the page-walk safety cap. Hoisted to
+/// module scope from inside [`fetch_release_catalog`] so [`CatalogMemo`] can key on them:
+/// a memo written under a different page size describes different page boundaries and
+/// must never be revalidated against the current ones.
+const PER_PAGE: u32 = 100;
+// 30 pages = 3000 releases — parity with tools/install.sh's anonymous walk, whose
+// comment calls a catalog past that "not a real state". The old cap of 10 was
+// reachable years out (the channel repo also accumulates non-app releases, e.g.
+// the atpkg index), and a cap-hit burned every list request per check while
+// failing forever (round-11 audit).
+const MAX_PAGES: u32 = 30;
+
+/// The listing URL for one page — the exact string the walk has always built.
+fn releases_page_url(source: &Source, page: u32) -> String {
+    format!(
+        "https://api.github.com/repos/{}/{}/releases?per_page={PER_PAGE}&page={page}",
+        source.owner, source.repo
+    )
+}
+
+/// The exact appcast asset names a candidate release must carry, restated here so a
+/// tampered or corrupted [`CatalogMemo`] cannot smuggle in an index pointing at some
+/// other asset: a memo whose recorded indices do not land on these names is discarded and
+/// the catalog is re-listed from scratch.
+const APPCAST_ASSET: &str = "aterm-appcast.toml";
+const APPCAST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
+
+/// The memo's format version. Bump on ANY shape change: an older/newer memo is discarded
+/// rather than reinterpreted, which costs one full listing and nothing else.
+const CATALOG_MEMO_SCHEMA: u32 = 1;
+
+/// The selection [`select_authoritative_release`] computed, in a form that survives a
+/// process restart.
 ///
-/// Runs the credential ladder: `tok` is cleared in place when a rejected token
-/// falls back to anonymous, so the caller's later asset fetches ride the same
-/// lane. Returns `Ok(None)` for the two non-failure ends of a check — channel
-/// unreadable (announced) or rate limited (status recorded); `Err` is a real
-/// failure, already recorded in the health ledger.
-fn fetch_release_catalog(
-    staging: &Staging,
+/// It holds the OUTPUT of the selection, not the input catalog, because the selection is
+/// a pure function of (catalog bytes, pinned keyset) and both are pinned by the memo's
+/// own keys: the bytes by a per-page `ETag` the server itself revalidates, the keyset by
+/// `client_build` (the pinned keyset is compiled in, so a different keyset is a different
+/// build). Nothing about TRUST is memoized — the appcast, its signature, the roster and
+/// the roster's signature are still fetched and verified on every single check.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MemoSelection {
+    version: String,
+    tag: Vec<u64>,
+    release: Release,
+    manifest_index: usize,
+    signature_index: Option<usize>,
+}
+
+impl MemoSelection {
+    /// Everything about a memoized selection that can be re-derived and re-checked
+    /// locally, checked. A memo that fails ANY of these is discarded (→ full listing),
+    /// never repaired: the point is that a corrupted, truncated, hand-edited or
+    /// substituted memo file cannot steer the check anywhere the fresh path would not go.
+    ///
+    /// This is defence in depth, not the trust boundary — the memo lives in the same
+    /// `0700` owner-only Updates directory as the staged bundle and the ready marker, and
+    /// every artifact it names is still signature-verified downstream. It is cheap, so it
+    /// is done.
+    fn is_coherent(&self, pinned_update_pubkeys: &[&str]) -> bool {
+        if self.release.draft || self.version.is_empty() || self.tag.is_empty() {
+            return false;
+        }
+        // The tag grammar and the canonical SPELLING, re-derived — so a memo naming
+        // `v01.2.3` (or a tag that is not a candidate at all) cannot be admitted beside
+        // `v1.2.3`.
+        let Ok(TagKind::Candidate(tag)) = aterm_update_core::tag::parse_release_tag(&self.release.tag_name)
+        else {
+            return false;
+        };
+        if tag != self.tag
+            || aterm_update_core::tag::canonical_version(&self.release.tag_name, &tag).as_deref()
+                != Some(self.version.as_str())
+        {
+            return false;
+        }
+        // The recorded indices must still land on the EXACT appcast asset names, unique
+        // in the release — the same two properties `select_authoritative_release` proved.
+        if unique_asset_index(&self.release, APPCAST_ASSET) != Ok(Some(self.manifest_index)) {
+            return false;
+        }
+        let expected_sig = if pinned_update_pubkeys.is_empty() {
+            None
+        } else {
+            match unique_asset_index(&self.release, APPCAST_SIG_ASSET) {
+                Ok(Some(index)) => Some(index),
+                _ => return false,
+            }
+        };
+        self.signature_index == expected_sig
+    }
+
+    /// Back into the shape the rest of the check consumes. Only ever called on a
+    /// selection that passed [`Self::is_coherent`].
+    fn into_authoritative(self) -> AuthoritativeRelease {
+        AuthoritativeRelease {
+            tag: self.tag,
+            version: self.version,
+            release: self.release,
+            manifest_index: self.manifest_index,
+            signature_index: self.signature_index,
+        }
+    }
+
+    fn from_authoritative(candidate: &AuthoritativeRelease) -> Self {
+        Self {
+            version: candidate.version.clone(),
+            tag: candidate.tag.clone(),
+            release: candidate.release.clone(),
+            manifest_index: candidate.manifest_index,
+            signature_index: candidate.signature_index,
+        }
+    }
+}
+
+/// What the last COMPLETE release listing looked like, and what it selected.
+///
+/// # The cost this deletes
+///
+/// The background check ticks every 75 s on the authenticated lane (`cadence.rs`), and
+/// every tick used to re-download and re-parse the ENTIRE release history to learn one
+/// tag. MEASURED 2026-08-20 against the shipped channel: page 1 = **594,708 bytes** for
+/// 42 releases / 200 assets (every asset object embeds a full uploader user block, so
+/// ~14.2 KB per release), i.e. ~28.5 MB/hour ≈ 685 MB/day per running instance, growing
+/// ~14 KB per cut and one whole page per 100 cuts. The catalog only moves when something
+/// is published, so the steady state is answerable with a conditional request: the same
+/// probe with `If-None-Match` answered HTTP 304 with `size_download=0` — no body, no
+/// `serde` parse, no `Vec<Release>`.
+///
+/// It buys BYTES and CPU, not requests: the measured 304 still consumed one unit of
+/// `x-ratelimit-used`, so the per-check request budget is unchanged.
+///
+/// # Everything that could make these bytes mean something else is a KEY
+///
+/// * `owner`/`repo` — a reconfigured channel is a different catalog.
+/// * `authenticated` — a credentialed client and an anonymous one can see DIFFERENT
+///   release sets (drafts), so the two lanes never share a memo, and a lane that FLIPS
+///   mid-walk (a rejected token falling back to anonymous) refuses to memoize at all.
+/// * `client_build` — the pinned keyset and the selection rules are compiled in.
+/// * `per_page` — page boundaries.
+/// * `etags` — one per page, and EVERY one must revalidate 304 on the current check
+///   before the selection is reused. There is no TTL and no offline reuse.
+///
+/// # Why a torn snapshot is impossible
+///
+/// A memo is only written when the walk ended on a SHORT page (so there is no page N+1
+/// that could appear unseen) and when EVERY page offered an `ETag`. On revalidation, the
+/// first page that answers 200 abandons the memo entirely and the whole listing is
+/// re-walked unconditionally from page 1 — pages are never stitched across generations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CatalogMemo {
+    schema: u32,
+    owner: String,
+    repo: String,
+    authenticated: bool,
+    client_build: u64,
+    per_page: u32,
+    etags: Vec<String>,
+    selection: Option<MemoSelection>,
+}
+
+impl CatalogMemo {
+    /// Read the memo, if there is one that is USABLE for this exact check. Every failure
+    /// — absent, unreadable, wrong schema, wrong channel, wrong lane, wrong build, an
+    /// unsafe validator, an incoherent selection — returns `None`, which means "list the
+    /// catalog the way we always did".
+    fn read(
+        path: &Path,
+        source: &Source,
+        authenticated: bool,
+        client_build: u64,
+        pinned_update_pubkeys: &[&str],
+    ) -> Option<Self> {
+        let raw = std::fs::read(path).ok()?;
+        let memo: Self = serde_json::from_slice(&raw).ok()?;
+        if memo.schema != CATALOG_MEMO_SCHEMA
+            || memo.owner != source.owner
+            || memo.repo != source.repo
+            || memo.authenticated != authenticated
+            || memo.client_build != client_build
+            || memo.per_page != PER_PAGE
+        {
+            return None;
+        }
+        if memo.etags.is_empty() || memo.etags.len() > MAX_PAGES as usize {
+            return None;
+        }
+        // Every validator must be echo-safe — this value goes back out as a curl header.
+        if !memo
+            .etags
+            .iter()
+            .all(|etag| aterm_update_core::validator_safe(etag))
+        {
+            return None;
+        }
+        if memo
+            .selection
+            .as_ref()
+            .is_some_and(|selection| !selection.is_coherent(pinned_update_pubkeys))
+        {
+            return None;
+        }
+        Some(memo)
+    }
+
+    /// Persist the memo (temp + rename, so a torn file is never read).
+    ///
+    /// Best-effort by construction: a memo that cannot be written costs the next check a
+    /// full listing, which is exactly what every check used to cost. Failures are silent
+    /// for that reason — this is a cache, and a cache that shouts is a new failure mode.
+    fn write(
+        path: &Path,
+        source: &Source,
+        authenticated: bool,
+        client_build: u64,
+        etags: Vec<String>,
+        selection: Option<&AuthoritativeRelease>,
+    ) {
+        let memo = Self {
+            schema: CATALOG_MEMO_SCHEMA,
+            owner: source.owner.clone(),
+            repo: source.repo.clone(),
+            authenticated,
+            client_build,
+            per_page: PER_PAGE,
+            etags,
+            selection: selection.map(MemoSelection::from_authoritative),
+        };
+        let Ok(text) = serde_json::to_vec(&memo) else {
+            return;
+        };
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+            return;
+        }
+        // Sweep on EVERY failing path — a failing rename is precisely the case that
+        // repeats forever (a full disk, a read-only remount), and one leaked
+        // `catalog.json.<pid>.tmp` per check is how the floor file once littered the
+        // 0700 dir.
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Drop a memo that this check proved wrong (a page moved, or the lane flipped).
+    /// Removing it is not required for correctness — a stale memo simply fails to
+    /// revalidate — but it stops a permanently-unusable file from being re-read forever.
+    fn discard(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The outcome of learning what the channel currently offers.
+enum Catalog {
+    /// EVERY listing page revalidated 304 against the memo's stored validators on THIS
+    /// check, so the catalog is byte-identical to the one the memoized selection was
+    /// computed from — and the selection is therefore the same answer the full walk
+    /// would have produced, for a few hundred header bytes instead of ~685 KB.
+    Unchanged(Option<AuthoritativeRelease>),
+    /// Freshly listed. `validators` is `Some` only when the walk is memoizable: every
+    /// page offered an `ETag`, the walk ended on a SHORT page, and the credential lane
+    /// never flipped mid-walk.
+    Fresh {
+        releases: Vec<Release>,
+        validators: Option<Vec<String>>,
+    },
+}
+
+/// The injected page fetcher. Production passes
+/// [`aterm_update_core::api_get_conditional`]; tests pass a counting fake, which is what
+/// makes "bytes and requests per check" measurable at all (there is no other seam — the
+/// walk used to call the HTTP layer directly).
+///
+/// Arguments: `(url, validator, token)`. The token is a PARAMETER rather than a capture
+/// because the credential ladder may clear it mid-walk, and the fetcher must ride
+/// whatever lane the walk has settled on.
+type CatalogFetch<'a> = &'a mut dyn FnMut(
+    &str,
+    Option<&str>,
+    Option<&str>,
+) -> Result<aterm_update_core::ApiResponse, HttpError>;
+
+/// Everything one listing-page GET needs beside the URL: the staging surfaces it reports
+/// into, the credential ladder's mutable state, and the injected fetcher. Bundled so the
+/// page helper takes three arguments rather than ten.
+struct ListContext<'a> {
+    staging: &'a Staging,
     current_build: u64,
-    source: &Source,
-    tok: &mut Option<String>,
-    diagnosis: Option<token::Diagnosis>,
-) -> Result<Option<Vec<Release>>, String> {
-    let had_token = tok.is_some();
-    const PER_PAGE: u32 = 100;
-    const MAX_PAGES: u32 = 10;
-    let mut release_catalog = Vec::new();
-    // At most one anonymous retry per check, and only after a token was REJECTED.
-    let mut already_retried = false;
-    for page in 1..=MAX_PAGES {
-        let url = format!(
-            "https://api.github.com/repos/{}/{}/releases?per_page={PER_PAGE}&page={page}",
-            source.owner, source.repo
-        );
-        // A failed releases LIST is `network`-class: GitHub unreachable / auth broken.
-        // (The transient/persistent distinction the ledger needs lives in the CLASS
-        // split — an asset that provably exists but can't be fetched is `pipeline`,
-        // recorded below — so a broken download build can't hide behind "transient".)
-        // The two states that are NOT failures — "cannot read the channel at all" and
-        // "rate limited" — leave the ledger alone and say so instead.
-        //
-        // The inner loop runs at most twice: `already_retried` latches, so
-        // `RetryAnonymous` can be taken only once for the whole check.
-        let body = loop {
-            let error = match aterm_update_core::api_get_classified(&url, tok.as_deref()) {
-                Ok(body) => {
-                    note_readable(tok.is_some(), source);
+    source: &'a Source,
+    tok: &'a mut Option<String>,
+    diagnosis: Option<&'a token::Diagnosis>,
+    had_token: bool,
+    /// At most one anonymous retry per check, and only after a token was REJECTED.
+    /// Latches, so `RetryAnonymous` can be taken only once for the whole check — and
+    /// once it has latched the walk is no longer memoizable (the pages either side of
+    /// the flip were listed on different lanes).
+    already_retried: bool,
+    fetch: CatalogFetch<'a>,
+}
+
+impl ListContext<'_> {
+    /// GET one listing page, running the credential ladder exactly as the walk always
+    /// has. `Ok(None)` is one of the two NON-failure ends of a check — channel unreadable
+    /// (announced) or rate limited (status recorded); `Err` is a real failure, already
+    /// recorded in the health ledger.
+    ///
+    /// The inner loop runs at most twice: `already_retried` latches, so `RetryAnonymous`
+    /// can be taken only once.
+    fn page(
+        &mut self,
+        url: &str,
+        validator: Option<&str>,
+    ) -> Result<Option<aterm_update_core::ApiResponse>, String> {
+        loop {
+            // A failed releases LIST is `network`-class: GitHub unreachable / auth broken.
+            // (The transient/persistent distinction the ledger needs lives in the CLASS
+            // split — an asset that provably exists but can't be fetched is `pipeline`,
+            // recorded by the caller — so a broken download build can't hide behind
+            // "transient".) The two states that are NOT failures — "cannot read the
+            // channel at all" and "rate limited" — leave the ledger alone and say so.
+            // The token borrow is SCOPED to the call: the credential ladder below may
+            // clear `*self.tok` in place, and a live shared borrow of it would be a
+            // borrow-check conflict rather than a subtle bug.
+            let outcome = {
+                let token = self.tok.as_deref();
+                (self.fetch)(url, validator, token)
+            };
+            let error = match outcome {
+                Ok(response) => {
+                    note_readable(self.tok.is_some(), self.source);
                     // A token that our own chain refused (a chmod 644 file, a mangled
                     // paste) still costs this machine the 5000/hour budget even though
                     // the public channel works. Say so, throttled, once in a while.
-                    if let Some(diagnosis) = diagnosis.as_ref() {
-                        crate::no_token::note_unusable_token(source, diagnosis);
+                    if let Some(diagnosis) = self.diagnosis {
+                        crate::no_token::note_unusable_token(self.source, diagnosis);
                     }
-                    break body;
+                    return Ok(Some(response));
                 }
                 Err(error) => error,
             };
             let decision = classify_list_error(
                 &error,
-                had_token,
-                already_retried,
-                source,
-                diagnosis.as_ref(),
+                self.had_token,
+                self.already_retried,
+                self.source,
+                self.diagnosis,
             );
             match decision {
                 ListDecision::RetryAnonymous => {
-                    already_retried = true;
-                    *tok = None;
+                    self.already_retried = true;
+                    *self.tok = None;
+                    // The lane note must say "rotate the token", not "provision
+                    // one" — a credential exists; GitHub refused it.
+                    TOKEN_REJECTED.store(true, Ordering::Relaxed);
                     // Throttled: this is a STANDING condition (a stale token stays
                     // stale), re-observed on every check, so an unthrottled warning
                     // would be ~48 identical lines an hour.
@@ -1369,13 +1722,17 @@ fn fetch_release_catalog(
                         "the configured update token was rejected ({error}); continuing \
                          unauthenticated against github.com/{}/{} — updates still work \
                          while the channel is public, but rotate the token with: {}",
-                        source.owner,
-                        source.repo,
-                        token::provision_remedy(&source.owner, &source.repo)
+                        self.source.owner,
+                        self.source.repo,
+                        token::provision_remedy(&self.source.owner, &self.source.repo)
                     ));
                 }
                 ListDecision::Blocked(explanation) => {
-                    crate::no_token::announce_unreadable(staging, current_build, &explanation);
+                    crate::no_token::announce_unreadable(
+                        self.staging,
+                        self.current_build,
+                        &explanation,
+                    );
                     return Ok(None);
                 }
                 ListDecision::RateLimited(message) => {
@@ -1385,42 +1742,199 @@ fn fetch_release_catalog(
                     // that simply checked too often. The latch lengthens the wait.
                     RATE_LIMITED.store(true, Ordering::Relaxed);
                     crate::status::record(
-                        staging,
-                        current_build,
+                        self.staging,
+                        self.current_build,
                         &format!("update check deferred: {message}"),
                     );
                     return Ok(None);
                 }
                 ListDecision::Failed(message) => {
-                    crate::health::Health::record_failure(&staging.health(), "network", &message);
+                    crate::health::Health::record_failure(
+                        &self.staging.health(),
+                        "network",
+                        &message,
+                    );
                     return Err(message);
                 }
             }
+        }
+    }
+}
+
+/// Ask the server whether the memoized listing still describes the channel.
+///
+/// `Ok(Some(true))` — every page answered 304, so the catalog is unchanged and the
+/// memoized selection is reusable. `Ok(Some(false))` — something moved (a page returned a
+/// body, or the credential lane flipped mid-revalidation); the caller must re-walk the
+/// WHOLE listing unconditionally from page 1, never stitch. `Ok(None)`/`Err` are the
+/// ordinary non-failure/failure ends, already reported by [`ListContext::page`].
+fn revalidate_catalog(ctx: &mut ListContext<'_>, memo: &CatalogMemo) -> Result<Option<bool>, String> {
+    let lane = ctx.tok.is_some();
+    for (index, validator) in memo.etags.iter().enumerate() {
+        // `index` is 0-based, pages are 1-based; saturating so the arithmetic carries no
+        // panic obligation (the cast is exact — `etags.len() <= MAX_PAGES` is checked on
+        // read).
+        let page = u32::try_from(index).unwrap_or(MAX_PAGES).saturating_add(1);
+        let url = releases_page_url(ctx.source, page);
+        let Some(response) = ctx.page(&url, Some(validator))? else {
+            return Ok(None);
         };
+        if !matches!(response, aterm_update_core::ApiResponse::NotModified) {
+            // A body came back: this page is NOT what the memo describes. Discard the
+            // whole memo — the pages already revalidated belong to the old generation and
+            // must not be combined with this one.
+            return Ok(Some(false));
+        }
+        if ctx.tok.is_some() != lane {
+            // The credential ladder flipped lanes mid-revalidation. A memo is keyed by
+            // its lane, so half of this revalidation was against the wrong one.
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+/// Enumerate the complete bounded release-metadata set, unconditionally — the historical
+/// walk, now also capturing each page's `ETag` so the NEXT check can ask instead of
+/// re-download.
+///
+/// GitHub documents no ordering contract for List Releases, so the caller chooses the
+/// greatest canonical numeric vMAJOR.MINOR.PATCH tag carrying the exact appcast name
+/// (retired two-component tags are skipped, never ordered), and only after that decision
+/// fetches one manifest (+ one signature under Tier SIG) — row order cannot select an
+/// older release and broken historical assets add no download latency.
+fn walk_catalog(ctx: &mut ListContext<'_>) -> Result<Option<Catalog>, String> {
+    let mut release_catalog = Vec::new();
+    let mut validators: Vec<String> = Vec::new();
+    // A walk is memoizable only if EVERY page hands us a validator. One missing `ETag`
+    // and the memo could not be fully revalidated later, so none is written.
+    let mut memoizable = true;
+    for page in 1..=MAX_PAGES {
+        let url = releases_page_url(ctx.source, page);
+        let Some(response) = ctx.page(&url, None)? else {
+            return Ok(None);
+        };
+        let (body, etag) = match response {
+            aterm_update_core::ApiResponse::Body { bytes, etag } => (bytes, etag),
+            // Unreachable: this pass sends no validator and the HTTP layer refuses to
+            // honour an unsolicited 304. Fail closed rather than treat "no body" as "no
+            // releases", which would read as an empty channel.
+            aterm_update_core::ApiResponse::NotModified => {
+                let msg = String::from(
+                    "GitHub answered 304 to an unconditional release listing request",
+                );
+                crate::health::Health::record_failure(&ctx.staging.health(), "network", &msg);
+                return Err(msg);
+            }
+        };
+        match etag {
+            Some(etag) => validators.push(etag),
+            None => memoizable = false,
+        }
         // Unparseable list JSON is the same `network` class (the LIST layer failed —
         // a proxy/portal mangling the response looks exactly like this).
         let releases: Vec<Release> = match serde_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("parse releases JSON: {e}");
-                crate::health::Health::record_failure(&staging.health(), "network", &msg);
+                crate::health::Health::record_failure(&ctx.staging.health(), "network", &msg);
                 return Err(msg);
             }
         };
         let page_len = releases.len();
         release_catalog.extend(releases);
         if page_len < PER_PAGE as usize {
-            break;
+            // THE terminal-short-page condition. A memo may only be written here: the
+            // listing is exhausted, so there is no page N+1 whose later appearance a
+            // revalidation of these pages could miss.
+            //
+            // …and never across a lane flip: `already_retried` means some pages were
+            // listed with a credential and the rest without.
+            let memoizable = memoizable && !ctx.already_retried;
+            return Ok(Some(Catalog::Fresh {
+                releases: release_catalog,
+                validators: memoizable.then_some(validators),
+            }));
         }
         if page == MAX_PAGES {
             let msg = format!(
                 "release listing reached the {MAX_PAGES}-page safety cap before exhaustion"
             );
-            crate::health::Health::record_failure(&staging.health(), "network", &msg);
+            // `pipeline`, not `network`: a catalog past the cap is a PERMANENT
+            // publishing state — it will still be past the cap next check — so it
+            // must accrue toward the persistent-failure escalation instead of
+            // hiding in the one class the ledger treats as transient weather
+            // (round-11 audit).
+            crate::health::Health::record_failure(&ctx.staging.health(), "pipeline", &msg);
             return Err(msg);
         }
     }
-    Ok(Some(release_catalog))
+    // Unreachable: the loop returns on the short page and errors at MAX_PAGES.
+    Ok(Some(Catalog::Fresh {
+        releases: release_catalog,
+        validators: None,
+    }))
+}
+
+/// Learn what the channel currently offers, at a cost that scales with CHANGE rather
+/// than with history.
+///
+/// Runs the credential ladder: `tok` is cleared in place when a rejected token falls back
+/// to anonymous, so the caller's later asset fetches ride the same lane. Returns
+/// `Ok(None)` for the two non-failure ends of a check — channel unreadable (announced) or
+/// rate limited (status recorded); `Err` is a real failure, already recorded in the health
+/// ledger.
+///
+/// # Freshness is the server's word
+///
+/// The fast path is taken ONLY when every stored validator earns a 304 on THIS check.
+/// There is no TTL, no offline reuse, and no local staleness heuristic; a server that
+/// ignores `If-None-Match`, a stripped header, an unsafe validator or an absent memo all
+/// land on the historical full walk. The failure direction is "no saving", never "stale
+/// answer" — and a memo that IS reused still has its appcast, signature, roster and
+/// roster signature fetched and verified afterwards, exactly as before, because the memo
+/// holds a TAG and asset URLs, never trust.
+fn fetch_release_catalog(
+    staging: &Staging,
+    current_build: u64,
+    source: &Source,
+    tok: &mut Option<String>,
+    diagnosis: Option<token::Diagnosis>,
+    fetch: CatalogFetch<'_>,
+) -> Result<Option<Catalog>, String> {
+    let had_token = tok.is_some();
+    let memo_path = staging.catalog_memo();
+    let memo = CatalogMemo::read(
+        &memo_path,
+        source,
+        had_token,
+        current_build,
+        crate::PINNED_UPDATE_PUBKEYS,
+    );
+    let mut ctx = ListContext {
+        staging,
+        current_build,
+        source,
+        tok,
+        diagnosis: diagnosis.as_ref(),
+        had_token,
+        already_retried: false,
+        fetch,
+    };
+    if let Some(memo) = &memo {
+        match revalidate_catalog(&mut ctx, memo)? {
+            Some(true) => {
+                return Ok(Some(Catalog::Unchanged(
+                    memo.selection.clone().map(MemoSelection::into_authoritative),
+                )));
+            }
+            // Something moved. Fall through to the unconditional walk from page 1 — and
+            // drop the memo, so a permanently-unusable one is not re-read every check.
+            Some(false) => CatalogMemo::discard(&memo_path),
+            None => return Ok(None),
+        }
+    }
+    walk_catalog(&mut ctx)
 }
 
 /// Background check + stage. Returns `Some(version)` when a strictly-newer
@@ -1501,16 +2015,60 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     let floor = crate::manifest::Floor::read(&staging.floor());
 
     // List first, decide after: [`fetch_release_catalog`] documents the ordering
-    // contract and the credential ladder (it may clear `tok` in place).
-    let Some(release_catalog) =
-        fetch_release_catalog(&staging, current_build, source, &mut tok, diagnosis)?
+    // contract, the credential ladder (it may clear `tok` in place) and the conditional
+    // fast path that makes a steady-state check cost a 304 instead of the whole history.
+    //
+    // The page fetcher is INJECTED rather than called directly, so the check's request
+    // and byte cost is measurable in a test (`aterm-update`'s catalog-cost harness) —
+    // there was no other seam. The header sink is a file in the same `0700` Updates
+    // directory as the rest of the staging state; curl dumps response headers there so
+    // the `ETag` can be read back without corrupting the body it also writes to stdout.
+    let header_sink = staging.catalog_headers();
+    let mut fetch = |url: &str, validator: Option<&str>, token: Option<&str>| {
+        aterm_update_core::api_get_conditional(url, token, validator, Some(header_sink.as_path()))
+    };
+    let Some(catalog) = fetch_release_catalog(
+        &staging,
+        current_build,
+        source,
+        &mut tok,
+        diagnosis,
+        &mut fetch,
+    )?
     else {
         return Ok(None);
     };
 
+    // A revalidated catalog reuses the selection computed from those exact bytes; a fresh
+    // one selects now and — only if the selection SUCCEEDED and the walk was memoizable —
+    // records both for the next check. An ERROR is never memoized: an untrustworthy
+    // authoritative release must be re-derived every check, so republishing fixes it on
+    // the next tick rather than after a cache expires (there being no expiry).
+    let (selection, validators) = match catalog {
+        Catalog::Unchanged(selected) => (Ok(selected), None),
+        Catalog::Fresh {
+            releases,
+            validators,
+        } => (
+            select_authoritative_release(releases, crate::PINNED_UPDATE_PUBKEYS),
+            validators,
+        ),
+    };
     let authoritative =
-        match select_authoritative_release(release_catalog, crate::PINNED_UPDATE_PUBKEYS) {
-            Ok(candidate) => candidate,
+        match selection {
+            Ok(candidate) => {
+                if let Some(validators) = validators {
+                    CatalogMemo::write(
+                        &staging.catalog_memo(),
+                        source,
+                        tok.is_some(),
+                        current_build,
+                        validators,
+                        candidate.as_ref(),
+                    );
+                }
+                candidate
+            }
             Err(error) => {
                 crate::warn(&error);
                 let h =
@@ -1755,7 +2313,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             // The check itself ran fine (list fetched, nothing carries a manifest):
             // clear any stale failure streak so health reflects THIS check.
             crate::health::Health::record_success(&staging.health());
-            format!("no release carries an update manifest{}", lane_note())
+            format!("no release carries an update manifest{}", lane_note(source))
         };
         crate::status::record(&staging, current_build, &msg);
         return Ok(None);
@@ -1783,7 +2341,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             &format!(
                 "up to date (latest release build {}){}",
                 manifest.build_number,
-                lane_note()
+                lane_note(source)
             ),
         );
         return Ok(None);
@@ -2425,6 +2983,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let source = test_source();
         RATE_LIMITED.store(true, Ordering::Relaxed);
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
         note_readable(false, &source);
         assert_eq!(lane(), Lane::Anonymous);
         assert!(
@@ -2434,20 +2993,54 @@ mod tests {
         assert!(!crate::no_token::is_stranded());
         // …and the healthy status says WHICH lane, so `aterm-ctl update status` can
         // answer "why is this Mac slow to update?" without anyone reading the log.
-        let note = lane_note();
+        let note = lane_note(&source);
         assert!(
-            note.contains("anonymously") && note.contains("15-minute"),
+            note.contains("anonymously") && note.contains("30-minute"),
             "{note}"
         );
+        // On the PUBLIC channel the status must NOT claim "no update token
+        // provisioned" — the installer may have written the update-token file,
+        // and this channel never reads it (token::walk consults only
+        // $ATERM_UPDATE_TOKEN for the compiled-in source). Name the channel
+        // and the file's irrelevance instead.
         assert!(
-            note.contains("no update token provisioned"),
-            "the healthy-but-slow status must name the remediable cause: {note}"
+            note.contains("public channel reads no") && note.contains("token file"),
+            "the public-channel status names the channel and the file's irrelevance: {note}"
         );
+        assert!(
+            note.contains("repointed"),
+            "…and says who a provisioned file WOULD serve: {note}"
+        );
+        assert!(
+            !note.contains("no update token provisioned"),
+            "the contradiction next to an installer-written token file: {note}"
+        );
+        // A REPOINTED channel walks the whole token chain, so for it the
+        // missing token stays the named, remediable cause.
+        let repointed = Source {
+            owner: "example".into(),
+            repo: "mirror".into(),
+        };
+        let rnote = lane_note(&repointed);
+        assert!(
+            rnote.contains("no update token provisioned"),
+            "a repointed channel's remediable cause is still named: {rnote}"
+        );
+        // A rejected PROVISIONED token is the third way onto this lane, and it asks
+        // for the opposite remedy from both wordings above: rotation, never
+        // provisioning (round-11 audit).
+        TOKEN_REJECTED.store(true, Ordering::Relaxed);
+        let rejected_note = lane_note(&source);
+        assert!(
+            rejected_note.contains("rejected by GitHub") && rejected_note.contains("rotate"),
+            "a rejected token must not be reported as an unprovisioned one: {rejected_note}"
+        );
+        TOKEN_REJECTED.store(false, Ordering::Relaxed);
 
         note_readable(true, &source);
         assert_eq!(lane(), Lane::Authenticated);
         assert_eq!(
-            lane_note(),
+            lane_note(&source),
             "",
             "a provisioned machine's existing status wording must not change"
         );
@@ -5349,5 +5942,401 @@ mod tests {
         let (fetched, urls) = run_chain(&good, &[], &[], 0, ROSTER_NOW);
         assert!(fetched.selected.is_some());
         assert_eq!(urls, ["m-url"]);
+    }
+    // ---------------------------------------------------------------------------
+    // THE CATALOG COST HARNESS (aup-1)
+    //
+    // The win here is REQUESTS and BYTES, both structurally determined, so the honest
+    // instrument is a counter over a fake server rather than a timer: the page fetcher
+    // is injected, the fake records every URL, every validator and every body byte it
+    // hands back, and the tests assert the per-check cost in each regime.
+    //
+    //   cargo test -p aterm-update catalog -- --nocapture
+    //   -> {"regime":"cold","requests":1,"body_bytes":685123,...}
+    //      {"regime":"warm_304","requests":1,"body_bytes":0,...}
+    // ---------------------------------------------------------------------------
+
+    /// A `Staging` rooted at a fresh temp dir. Built field-by-field rather than through
+    /// `Staging::resolve()` + `$ATERM_UPDATE_ROOT`, because `std::env::set_var` is
+    /// `unsafe` in edition 2024 and a data race under a multi-threaded test runner — and
+    /// because these tests must never be able to touch the real per-user ledgers.
+    fn scratch_staging(label: &str) -> Staging {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-catalog-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("download")).unwrap();
+        Staging {
+            apply_lock: root.join("apply.lock"),
+            stage_lock: root.join("stage.lock"),
+            download: root.join("download"),
+            staged_app: root.join("staged").join("aterm.app"),
+            ready: root.join("ready.toml"),
+            status: root.join("status.toml"),
+            root,
+        }
+    }
+
+    /// A GitHub-SHAPED listing page: real structure (`tag_name`, `draft`, `assets[]` with
+    /// `name`/`url`/`size`) plus the bulk our subset `Release`/`Asset` deliberately
+    /// ignores — the per-release `author` and per-asset `uploader` user blocks that make
+    /// the real page ~14.2 KB per release (measured 2026-08-20 against the shipped
+    /// channel: 594,708 bytes for 42 releases / 200 assets).
+    ///
+    /// The padding is explicit and lands the fixture inside that measured band, so the
+    /// byte figures these tests print describe the real cost rather than a toy one — and
+    /// the parse the warm path skips is a parse of REPRESENTATIVE bytes.
+    fn github_shaped_page(tags: &[&str]) -> Vec<u8> {
+        /// Measured bytes per release on the shipped channel (594,708 / 42, 2026-08-20).
+        const BYTES_PER_RELEASE: usize = 14_160;
+        let mut out = String::from("[");
+        for (i, tag) in tags.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let mut release = format!(
+                "{{\"id\":{i},\"tag_name\":\"{tag}\",\"draft\":false,\"prerelease\":false,\
+                 \"assets\":[\
+                 {{\"name\":\"aterm-appcast.toml\",\"url\":\"https://api.github.com/a/{i}/1\",\"size\":512}},\
+                 {{\"name\":\"aterm-appcast.toml.sig\",\"url\":\"https://api.github.com/a/{i}/2\",\"size\":64}},\
+                 {{\"name\":\"aterm-{tag}-mac.zip\",\"url\":\"https://api.github.com/a/{i}/3\",\"size\":26417423}}\
+                 ]"
+            );
+            // Stand-in for the author/uploader user blocks and the release body: bulk the
+            // parser must walk and discard, which is most of what the wire carries.
+            let pad = BYTES_PER_RELEASE.saturating_sub(release.len() + 12);
+            release.push_str(",\"body\":\"");
+            release.push_str(&"x".repeat(pad));
+            release.push_str("\"}");
+            out.push_str(&release);
+        }
+        out.push(']');
+        out.into_bytes()
+    }
+
+    /// A fake page server that records what each check actually costs.
+    struct FakeChannel {
+        /// Page bodies, page 1 first.
+        pages: Vec<Vec<u8>>,
+        /// The `ETag` each page offers (`None` = the server offers none).
+        etags: Vec<Option<String>>,
+        /// Validators the server will HONOUR with a 304. Anything else gets a body.
+        honours: std::collections::BTreeSet<String>,
+        requests: std::cell::Cell<u32>,
+        body_bytes: std::cell::Cell<u64>,
+        conditional: std::cell::Cell<u32>,
+    }
+
+    impl FakeChannel {
+        fn new(pages: Vec<Vec<u8>>, etags: Vec<Option<String>>) -> Self {
+            let honours = etags.iter().flatten().cloned().collect();
+            Self {
+                pages,
+                etags,
+                honours,
+                requests: std::cell::Cell::new(0),
+                body_bytes: std::cell::Cell::new(0),
+                conditional: std::cell::Cell::new(0),
+            }
+        }
+
+        /// Stop honouring every validator — what a published release does.
+        fn moved(&mut self) {
+            self.honours.clear();
+        }
+
+        fn serve(
+            &self,
+            url: &str,
+            validator: Option<&str>,
+        ) -> Result<aterm_update_core::ApiResponse, HttpError> {
+            self.requests.set(self.requests.get() + 1);
+            if validator.is_some() {
+                self.conditional.set(self.conditional.get() + 1);
+            }
+            let page = url
+                .rsplit("&page=")
+                .next()
+                .and_then(|p| p.parse::<usize>().ok())
+                .expect("the walk must ask for a numbered page");
+            if let Some(v) = validator
+                && self.honours.contains(v)
+            {
+                return Ok(aterm_update_core::ApiResponse::NotModified);
+            }
+            let body = self.pages.get(page - 1).cloned().unwrap_or_else(|| b"[]".to_vec());
+            self.body_bytes.set(self.body_bytes.get() + body.len() as u64);
+            Ok(aterm_update_core::ApiResponse::Body {
+                bytes: body,
+                etag: self.etags.get(page - 1).cloned().flatten(),
+            })
+        }
+
+        fn report(&self, regime: &str) {
+            println!(
+                "{{\"regime\":\"{regime}\",\"requests\":{},\"conditional_requests\":{},\
+                 \"body_bytes\":{}}}",
+                self.requests.get(),
+                self.conditional.get(),
+                self.body_bytes.get()
+            );
+        }
+    }
+
+    /// Run one whole check's listing leg against `channel`.
+    fn run_check(staging: &Staging, channel: &FakeChannel) -> Option<Catalog> {
+        let source = test_source();
+        let mut tok = None;
+        let mut fetch = |url: &str,
+                         validator: Option<&str>,
+                         _token: Option<&str>|
+         -> Result<aterm_update_core::ApiResponse, HttpError> {
+            channel.serve(url, validator)
+        };
+        match fetch_release_catalog(staging, 100, &source, &mut tok, None, &mut fetch) {
+            Ok(catalog) => catalog,
+            Err(error) => panic!("the fake channel never fails: {error}"),
+        }
+    }
+
+    /// Take the check all the way through selection + memo write, exactly as
+    /// `check_and_stage_inner` does, and return the chosen version.
+    fn run_check_and_memoize(staging: &Staging, channel: &FakeChannel) -> Option<String> {
+        let catalog = run_check(staging, channel).expect("the listing succeeded");
+        let (selection, validators) = match catalog {
+            Catalog::Unchanged(selected) => (Ok(selected), None),
+            Catalog::Fresh {
+                releases,
+                validators,
+            } => (
+                select_authoritative_release(releases, crate::PINNED_UPDATE_PUBKEYS),
+                validators,
+            ),
+        };
+        let candidate = selection.expect("the fixture catalog selects cleanly");
+        if let Some(validators) = validators {
+            CatalogMemo::write(
+                &staging.catalog_memo(),
+                &test_source(),
+                false,
+                100,
+                validators,
+                candidate.as_ref(),
+            );
+        }
+        candidate.map(|c| c.version)
+    }
+
+    /// THE measurement. A steady-state check must cost ONE conditional request and ZERO
+    /// body bytes, and must reach the SAME answer the full walk reached.
+    ///
+    /// Two-sided reach guards, so neither half can pass vacuously:
+    ///   * the cold regime must really transfer a representative page (the fixture's
+    ///     bytes-per-release is asserted to sit in the measured ~14.2 KB band, and the
+    ///     transferred total must be non-trivial);
+    ///   * the warm regime must really have SENT a validator (a check that skipped the
+    ///     request entirely would also show zero bytes, and would be wrong);
+    ///   * both regimes must select the same version — a "saving" that changes the
+    ///     answer is not a saving.
+    #[test]
+    fn a_steady_state_catalog_check_costs_a_304_and_no_body_bytes() {
+        let staging = scratch_staging("steady");
+        let page = github_shaped_page(&["v0.19.0", "v0.21.0", "v0.20.0"]);
+        // Fixture reach guard: representative of the real wire, not a toy.
+        let per_release = page.len() / 3;
+        assert!(
+            (12_000..17_000).contains(&per_release),
+            "the fixture page must be ~14.2 KB per release like the real one, got \
+             {per_release} B"
+        );
+        let channel = FakeChannel::new(vec![page.clone()], vec![Some("\"gen-1\"".into())]);
+
+        // COLD: no memo. The historical walk — one request, the whole page.
+        let cold = run_check_and_memoize(&staging, &channel);
+        channel.report("cold");
+        assert_eq!(cold.as_deref(), Some("0.21.0"), "max arbitration, not row order");
+        assert_eq!(channel.requests.get(), 1);
+        assert_eq!(channel.conditional.get(), 0, "nothing to revalidate yet");
+        assert_eq!(channel.body_bytes.get(), page.len() as u64);
+        assert!(staging.catalog_memo().exists(), "a memoizable walk must memoize");
+
+        // WARM: the memo revalidates. One CONDITIONAL request, zero body bytes.
+        let before = channel.body_bytes.get();
+        let warm = run_check_and_memoize(&staging, &channel);
+        channel.report("warm_304");
+        assert_eq!(warm, cold, "the fast path must reach the SAME answer");
+        assert_eq!(channel.requests.get(), 2, "one more request, not zero");
+        assert_eq!(
+            channel.conditional.get(),
+            1,
+            "the saving must come from ASKING with a validator, not from skipping the ask"
+        );
+        assert_eq!(
+            channel.body_bytes.get(),
+            before,
+            "a revalidated catalog must transfer NO body bytes"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// When the channel MOVES, the memo is abandoned and the whole listing is re-walked
+    /// unconditionally from page 1 — never stitched across generations — and the new
+    /// answer is the one that wins.
+    #[test]
+    fn a_published_release_invalidates_the_memo_and_is_seen_immediately() {
+        let staging = scratch_staging("moved");
+        let first = github_shaped_page(&["v0.20.0"]);
+        let channel = FakeChannel::new(vec![first], vec![Some("\"gen-1\"".into())]);
+        assert_eq!(
+            run_check_and_memoize(&staging, &channel).as_deref(),
+            Some("0.20.0")
+        );
+
+        // A cut lands: new bytes, new validator, and the old one is no longer honoured.
+        let mut channel = FakeChannel::new(
+            vec![github_shaped_page(&["v0.20.0", "v0.21.0"])],
+            vec![Some("\"gen-2\"".into())],
+        );
+        channel.moved();
+        let seen = run_check_and_memoize(&staging, &channel);
+        channel.report("moved");
+        assert_eq!(
+            seen.as_deref(),
+            Some("0.21.0"),
+            "a real update must NEVER be hidden by the memo"
+        );
+        // The revalidation attempt plus the full unconditional re-walk of page 1.
+        assert_eq!(channel.requests.get(), 2);
+        assert_eq!(channel.conditional.get(), 1);
+        // …and the refreshed memo now carries the new generation.
+        let memo = CatalogMemo::read(
+            &staging.catalog_memo(),
+            &test_source(),
+            false,
+            100,
+            crate::PINNED_UPDATE_PUBKEYS,
+        )
+        .expect("the re-walk memoized the new generation");
+        assert_eq!(memo.etags, vec!["\"gen-2\"".to_string()]);
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// A page that offers no `ETag` makes the whole walk unmemoizable: a memo that could
+    /// not be fully revalidated later must never be written, because a partially
+    /// revalidated listing is exactly the torn snapshot this design refuses.
+    #[test]
+    fn a_page_without_a_validator_is_never_memoized() {
+        let staging = scratch_staging("novalidator");
+        let channel = FakeChannel::new(vec![github_shaped_page(&["v0.21.0"])], vec![None]);
+        assert_eq!(
+            run_check_and_memoize(&staging, &channel).as_deref(),
+            Some("0.21.0")
+        );
+        assert!(
+            !staging.catalog_memo().exists(),
+            "no validator ⇒ no memo ⇒ the next check pays the full listing, as before"
+        );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// An UNSOLICITED 304 (nothing was asked) is refused rather than read as "no
+    /// releases". The HTTP layer already refuses to produce one; this pins the walk's own
+    /// fail-closed arm, because "the channel is empty" and "the channel is unchanged" must
+    /// never be confusable.
+    #[test]
+    fn an_unsolicited_not_modified_fails_the_listing_closed() {
+        let staging = scratch_staging("unsolicited");
+        let source = test_source();
+        let mut tok = None;
+        let mut fetch = |_url: &str,
+                         _validator: Option<&str>,
+                         _token: Option<&str>|
+         -> Result<aterm_update_core::ApiResponse, HttpError> {
+            Ok(aterm_update_core::ApiResponse::NotModified)
+        };
+        // `Catalog` is deliberately not `Debug` (it carries a whole release), so this
+        // destructures rather than `expect_err`s.
+        let Err(error) = fetch_release_catalog(&staging, 100, &source, &mut tok, None, &mut fetch)
+        else {
+            panic!("an unconditional 304 is not an empty catalog");
+        };
+        assert!(error.contains("304"), "{error}");
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// Everything that could make the memoized bytes mean something else is a KEY, and a
+    /// mismatch on ANY of them discards the memo (→ the historical full listing). This is
+    /// the whole staleness surface, enumerated.
+    #[test]
+    fn a_memo_is_refused_whenever_anything_it_is_keyed_on_differs() {
+        let staging = scratch_staging("keys");
+        let channel = FakeChannel::new(
+            vec![github_shaped_page(&["v0.21.0"])],
+            vec![Some("\"gen-1\"".into())],
+        );
+        assert!(run_check_and_memoize(&staging, &channel).is_some());
+        let path = staging.catalog_memo();
+        let source = test_source();
+        let good = CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS);
+        assert!(good.is_some(), "PRECONDITION: the memo we just wrote is usable");
+
+        // The credential lane: a token and an anonymous client can see different sets.
+        assert!(CatalogMemo::read(&path, &source, true, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        // The running build: the pinned keyset and the selection rules are compiled in.
+        assert!(CatalogMemo::read(&path, &source, false, 101, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        // The channel.
+        let elsewhere = Source {
+            owner: "someone-else".into(),
+            repo: "aterm".into(),
+        };
+        assert!(
+            CatalogMemo::read(&path, &elsewhere, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none()
+        );
+
+        // A mangled file, a wrong schema, an unsafe validator, an out-of-range index and
+        // a renamed appcast asset are each fatal to the memo.
+        let mut memo = good.unwrap();
+        let write = |memo: &CatalogMemo| {
+            std::fs::write(&path, serde_json::to_vec(memo).unwrap()).unwrap();
+        };
+        memo.schema = CATALOG_MEMO_SCHEMA + 1;
+        write(&memo);
+        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        memo.schema = CATALOG_MEMO_SCHEMA;
+
+        memo.etags = vec!["\"a\"\r\nX-Evil: 1".to_string()];
+        write(&memo);
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
+            "a validator that could inject a header must never be echoed back"
+        );
+        memo.etags = vec!["\"gen-1\"".to_string()];
+
+        let mut broken = memo.clone();
+        broken.selection.as_mut().unwrap().manifest_index = 99;
+        write(&broken);
+        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+
+        let mut renamed = memo.clone();
+        renamed.selection.as_mut().unwrap().release.assets[0].name = "not-the-appcast".into();
+        write(&renamed);
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
+            "the recorded index must still land on the exact appcast name"
+        );
+
+        let mut retagged = memo.clone();
+        retagged.selection.as_mut().unwrap().release.tag_name = "v01.21.0".into();
+        write(&retagged);
+        assert!(
+            CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none(),
+            "a non-canonical tag spelling must not be admitted beside the canonical one"
+        );
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(CatalogMemo::read(&path, &source, false, 100, crate::PINNED_UPDATE_PUBKEYS).is_none());
+        let _ = std::fs::remove_dir_all(&staging.root);
     }
 }

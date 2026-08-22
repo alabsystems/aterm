@@ -611,6 +611,34 @@ impl App {
         true
     }
 
+    /// SELECTION CUSTODY: settle an in-flight TEXT SELECTION drag only, for the
+    /// paths that are about to drop `selecting`/`gesture` — window blur and a
+    /// tab/pane switch.
+    ///
+    /// Those paths used to drop the gesture WITHOUT finishing it, leaving a
+    /// zombie `InProgress` selection: still painted, but `extend_selection`
+    /// refuses anything outside `Complete` and copy-on-select never fired, so the
+    /// highlight on screen could neither be extended nor copied. Completing it
+    /// turns it into a selection the user can actually act on.
+    ///
+    /// Deliberately NARROWER than [`Self::settle_pointer_drags`] in two ways,
+    /// both load-bearing:
+    ///
+    /// - copy-on-select and PRIMARY are SUPPRESSED. Losing the window is not the
+    ///   user lifting the button; auto-copying then would overwrite the clipboard
+    ///   from an event the user did not cause.
+    /// - the physical/mouse-tracking mirrors (`held_mouse_button`,
+    ///   `reported_buttons`) are left ALONE. Unlike a modal — which swallows the
+    ///   release outright — a focus flicker with the button still held returns
+    ///   the eventual release to this window, where it must still pair and still
+    ///   report to a mouse-tracking app. The divider drag is likewise left to the
+    ///   caller, which drops it with the rest of its gesture state.
+    pub(crate) fn settle_selection_gesture(&mut self, wid: WindowId) {
+        if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
+            self.finish_selection(wid, true);
+        }
+    }
+
     /// Settle any in-flight pointer drag on `wid` — divider resize and/or text
     /// selection — exactly as their left-release paths in [`Self::on_mouse_input`]
     /// would. Called when a modal overlay opens (it steals the mouse, so the drag's
@@ -655,13 +683,21 @@ impl App {
         }
     }
 
-    /// Cmd-C: copy the selected text to the macOS system clipboard (`pbcopy`).
+    /// Cmd-C: copy the selected text to the system clipboard (`pbcopy`).
     /// Returns whether anything was copied; the selection is NOT cleared (so a
     /// highlight survives the copy, and repeated copies work).
-    pub(crate) fn copy_selection(&self) -> bool {
-        let Some(wid) = self.frontmost_window else {
-            return false;
-        };
+    ///
+    /// Window-scoped. EVERY path that has an originating window MUST use this
+    /// form rather than [`Self::copy_selection`]: a press is routed by its own
+    /// `wid`, which can differ from `frontmost_window`, and a copy has to read the
+    /// terminal the keystroke was addressed to. That is the hardcoded ⌘-C arm, the
+    /// `Action::Copy` keybinding arm of `dispatch_action` (which is `ctrl+shift+c`
+    /// / `ctrl+insert` — the PRIMARY copy chord off macOS), and the native-view
+    /// path's `copy_native_selection(wid)`.
+    ///
+    /// Only `MenuAction::Copy` keeps the frontmost-window form, because a menu
+    /// item genuinely carries no window of its own.
+    pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
         let Some(terminal) = self.front_terminal(wid) else {
             return false;
         };
@@ -669,6 +705,13 @@ impl App {
             return false;
         };
         !text.is_empty() && control::pbcopy(&text)
+    }
+
+    /// [`Self::copy_selection_in`] against the frontmost window — the menu and
+    /// command-registry entry point, which carries no window of its own.
+    pub(crate) fn copy_selection(&self) -> bool {
+        self.frontmost_window
+            .is_some_and(|wid| self.copy_selection_in(wid))
     }
 
     /// Map a pixel position to a 0-based (row, col) TERMINAL grid cell of window
@@ -2244,9 +2287,15 @@ impl App {
         // and only for a real selection — a plain click that cleared never copies.
         // A scoped-edge gesture (`suppress_copy_on_select`) NEVER auto-copies: the
         // selection is made but the clipboard side-effect (the exfil) is fenced.
+        //
+        // Window-routed (`copy_selection_in(wid)`), NOT the frontmost-window form:
+        // this function already resolved `term` from `wid`, and the PRIMARY branch
+        // below stringifies that same `term`. Using `frontmost_window` for the
+        // CLIPBOARD half made ONE completed gesture write its two channels from TWO
+        // different terminals whenever the two diverge.
         let fired = completed && self.copy_on_select && !suppress_copy_on_select;
         if fired {
-            self.copy_selection();
+            self.copy_selection_in(wid);
         }
         // X11 convention: a completed selection ALWAYS owns the PRIMARY selection
         // (independent of copy-on-select), so middle-click-paste works in other apps
@@ -4859,6 +4908,10 @@ mod tests {
         use crate::{App, RobiDismissal};
 
         let mut app = App::headless_for_test();
+        // The latch's precondition: a clicked Robi was an ENABLED Robi (the
+        // shipped default is off, so the enable is explicit here — without
+        // it `poll` reads `robi_or_default() == false` and releases early).
+        app.config.robi = Some(true);
         // Failure completion (the OCC-conflict shape): banner + release.
         let (tx, rx) = std::sync::mpsc::channel();
         app.robi_dismissal = Some(RobiDismissal::InFlight(rx));

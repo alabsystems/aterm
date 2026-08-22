@@ -143,9 +143,19 @@ fn fold_numpad_key(key: &Key) -> Option<Key> {
 /// reports events for these ONLY under REPORT_ALL_KEYS_AS_ESC ("Additionally,
 /// with this mode, events for pressing modifier keys are reported"). kitty
 /// also gates ISO_LEVEL3/5_SHIFT here; add them if NamedKey ever grows those.
+///
+/// SELECTION CUSTODY (R1) shares this ONE list. A key in it expresses no
+/// typing intent — holding Command to reach ⌘-C, or Shift to extend a click,
+/// is not "the user asked to be taken to the prompt" — so the GUI's press path
+/// runs no viewport snap and no selection clear for it. Keeping the Kitty
+/// report gate and the inert-press gate on the same predicate means "keys only
+/// Kitty reports" and "keys that do not disturb reading" cannot drift apart.
+/// The encoding is UNAFFECTED: a modifier still reports under
+/// REPORT_ALL_KEYS_AS_ESC exactly as before.
 // Skip: slice `contains`/iterator absent std bodies.
 #[cfg_attr(trust_verify, trust::skip)]
-fn is_modifier_or_lock_key(key: &Key) -> bool {
+#[must_use]
+pub fn is_modifier_or_lock_key(key: &Key) -> bool {
     matches!(
         key,
         Key::Named(

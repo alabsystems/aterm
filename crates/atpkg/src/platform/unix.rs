@@ -26,8 +26,11 @@ pub const EXE_SUFFIX: &str = "";
 /// [`crate::store::ToolName::from_shim_file`].
 pub const SHIM_SUFFIX: &str = "";
 
-/// The default install prefix under `home`: `…/Library/Application Support/aterm/pkg`,
-/// a sibling of the updater's `Updates` dir (so the two share the hardened support root).
+/// The default install prefix under `home`. On macOS
+/// `…/Library/Application Support/aterm/pkg`, a sibling of the updater's
+/// `Updates` dir (so the two share the hardened support root); on every other
+/// Unix `…/.local/share/aterm/pkg` — the XDG data-dir default, because
+/// `~/Library` is an Apple convention a Linux home has no business growing.
 ///
 /// MIRRORED (deliberately, not depended on) by
 /// `aterm-spec::verify::unix_store_bin_dir` — the verification tier's
@@ -35,10 +38,17 @@ pub const SHIM_SUFFIX: &str = "";
 /// conformance consumer. Moving this prefix means updating that mirror too.
 #[must_use]
 pub fn default_prefix(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("aterm")
-        .join("pkg")
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("aterm")
+            .join("pkg")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local").join("share").join("aterm").join("pkg")
+    }
 }
 
 /// Our effective uid.

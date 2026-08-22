@@ -6,7 +6,8 @@
 <p align="center">
   <strong>The batteries-included terminal for AI.</strong><br>
   A real GPU terminal for people, an authenticated control surface for agents,
-  the ALab verification toolchain one command away — and a cat.
+  the <a href="https://alab.systems">ALab</a> verification toolchain one
+  command away — and a cat.
 </p>
 
 <p align="center">
@@ -35,28 +36,101 @@
 ## Install
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
-and Intel) from the public release channel at
+and Intel) — and, from v0.44.0, for Linux x86_64 as a tarball on the same
+releases — from the public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
-Either download the newest `vX.Y.0` DMG and drag `aterm.app` into
-Applications, or let the installer do it:
+Every macOS release is the same app in two containers:
+
+- **`aterm-X.Y.0.dmg` (~1.1 GB) — batteries included.** The app with the
+  whole published ALab toolchain sealed inside it, so the first launch
+  installs the compilers, solvers, and provers with no network at all. The
+  DMG is big for exactly one reason: about a gigabyte of it is that toolchain
+  seed, riding inside the signed app.
+- **`aterm-X.Y.0-mac.zip` (~26 MB) — the same signed, notarized app alone.**
+  The toolchain installs on demand instead: `aterm pkg install --default-set`.
+
+Download either and drag `aterm.app` into Applications, or let the installer
+do it:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash
 ```
 
-The script picks the newest release, checks the DMG's SHA-256 against the
+The script picks the newest release, checks the download's SHA-256 against the
 release manifest, verifies the app's Developer ID signature and notarization,
 puts `aterm.app` in `/Applications` (or `~/Applications`), and links one
-`aterm` command into `~/.local/bin`. If `gh` is logged in it also stashes that
-token for the updater's private-repo lane (`--no-token` skips this; the public
-channel needs no token). Run it again with `--uninstall` to reverse everything
-it installed.
+`aterm` command into `~/.local/bin`. On Apple silicon it installs batteries
+included and says so before any bytes move (the toolset unpacks to ~4.2 GB);
+pass `--no-toolchain` for the lean install — the app alone, toolchain on
+demand. If `gh` is logged in it also stashes that token for the updater's
+private-repo lane (`--no-token` skips this; the public channel needs no
+token), and `--no-path` leaves your shell profile untouched. Run it again with
+`--uninstall` to reverse everything it installed.
 
-Installing by hand does the same checks manually: compare the DMG's SHA-256
-with the digest in that release's `aterm-appcast.toml`, then, with the app in
-place, run `codesign --verify --strict --verbose=2 /Applications/aterm.app` and
-`spctl -a -t exec -vv /Applications/aterm.app` — the second must report
-`source=Notarized Developer ID`.
+On Linux x86_64 the same command installs from the release's
+`aterm-<version>-linux-x86_64.tar.gz`, checked against its `.sha256` digest
+asset before anything is unpacked. The Linux asset sits outside the release
+manifest (the appcast is macOS-only for now) and has no Developer
+ID/notarization counterpart, so its trust is TLS plus that digest — a weaker
+chain than the macOS one. The tarball is built from the release commit (plus
+four Linux cherry-picks) on upstream stable Rust. There is no self-updater on
+Linux: re-run the installer to update.
+
+### Homebrew
+
+The cask route installs the same signed, notarized app from the release's
+`mac.zip`, via ALab's tap:
+
+```sh
+brew install --cask alabsystems/tap/aterm
+```
+
+The cask declares `auto_updates`, because the installed app keeps itself
+current through its own verified updater (see
+[Staying current](#staying-current)); `brew upgrade --cask --greedy aterm`
+makes Homebrew do it instead. `brew install --cask alabsystems/tap/alab`
+lands the same app under the toolchain's name — install one or the other,
+not both.
+
+### Verify a download
+
+Every downloadable container — the DMG, the mac.zip, the Linux tarball — has a
+`.sha256` sidecar. With the asset and its sidecar in the same directory:
+
+```sh
+shasum -a 256 -c aterm-0.44.0.dmg.sha256
+```
+
+(the same works for `aterm-0.44.0-mac.zip.sha256`, and the digest also appears
+in that release's `aterm-appcast.toml`). Then, with the app in place, ask
+Apple's chain about it:
+
+```sh
+codesign --verify --strict --verbose=2 /Applications/aterm.app
+spctl -a -t exec -vv /Applications/aterm.app
+```
+
+The second must report `source=Notarized Developer ID`.
+
+### Release signing
+
+The 64-byte `.sig` assets on each release are detached Ed25519 signatures over
+the release manifests — `aterm-appcast.toml.sig` over the update manifest,
+`aterm-machines.toml.sig` over the machine roster — consumed by the
+self-updater: the roster verifies under the paper master key, and the manifest
+under the rostered, unrevoked machine key that signed that release (see
+[Security model](#security-model)). The root is a committed constant
+(`PAPER_MASTER_PUBKEYS` in `crates/aterm-update-core/src/pins.rs`), reproduced
+here so it can be checked from more than one place:
+
+```text
+paper master public key (Ed25519, base64):
+DtiLfpk0iUSrK1/LkyIVf+4C2eGjD2Myf4Sr/FCoMPQ=
+```
+
+Bootstrap trust is tiered: the installer roots trust in the Apple Developer ID
+chain (Team `A66A9P66Z7`), and the installed updater additionally verifies
+this Ed25519 chain, whose anchors are compiled into the binary it updates.
 
 ### Staying current
 
@@ -68,7 +142,8 @@ what is staged plus the release notes; `aterm ctl update status` says the same
 on the command line. `ATERM_NO_AUTO_UPDATE=1` turns the updater off;
 `[update] auto_apply = false` in `aterm.toml` stages the build and leaves
 applying it to you (Software Update, `aterm ctl update apply`, or the next
-launch).
+launch). This lane is macOS-only; a Linux install stays current by re-running
+the installer.
 
 ### Build from source
 
@@ -84,12 +159,21 @@ cargo build --locked -p aterm
 ```
 
 `./target/debug/aterm --version` should agree with `[workspace.package]
-version` in the root `Cargo.toml`. Build from the workspace: aterm's crates are not on crates.io,
-and the crates.io package named `aterm` is an unrelated project, so do not
-`cargo install aterm`. Linux and Windows build from source too and have
-in-tree build lanes and tests, but only macOS has released binaries, an
-installer, and the self-updater; a source build is a real aterm, not the
-byte-identical notarized release.
+version` in the root `Cargo.toml`. Build from the workspace — aterm's crates
+are not on crates.io, so there is nothing to `cargo install`. Linux and
+Windows build from source too and have in-tree build lanes and tests; Linux
+x86_64 also has a released tarball behind the same installer, but only macOS
+has signed, notarized binaries and the self-updater; a source build is a real
+aterm, not the byte-identical notarized release.
+
+The name has neighbours, so aim carefully: the crates.io package named
+`aterm` is an unrelated project (do not `cargo install aterm`); the `aterm`
+in MacPorts — and in old `brew install aterm` guides — is an unrelated X11
+terminal from 2007, an AfterStep descendant of rxvt; and the aterm.ai and
+aterm.io domains belong to other unrelated projects. This aterm is
+[ALab](https://alab.systems)'s terminal: the code lives here, and the
+releases live on this repository's
+[Releases](https://github.com/alabsystems/aterm/releases) page.
 
 ## Why aterm?
 
@@ -278,9 +362,10 @@ on screen — or leave it on `auto` to follow the trail.
 The rest of the roster:
 
 - **Robi**, a tip-sharing helper robot, walks your typed row, does jumping
-  jacks while showing tips, and swings across the tab bar. Type `robi` and he
-  hustles over with a fresh tip; click him to retire him (he stays gone until
-  you re-enable `robi` in Settings).
+  jacks while showing tips, and swings across the tab bar. Off by default —
+  invite him with `robi = true` in `aterm.toml` (or the Settings toggle). Once
+  invited, type `robi` and he hustles over with a fresh tip; click him to
+  retire him again.
 - **Sparkle Words** give typed words animated ink. Profanity gets rainbow ink
   with a bonk (and sometimes escalates to a nova); dozens of animal words — in
   English, Chinese, Japanese, Korean, and more — show their animal on the word;
@@ -356,9 +441,13 @@ aterm trustc --help
 aterm pkg list
 ```
 
-The app itself is universal, but the public package index currently carries
-Apple-silicon macOS builds on one channel, so `aterm pkg` has nothing to
-install on an Intel Mac yet.
+The app is universal, and so is most of the toolchain: the public package index
+carries Apple-silicon macOS, Intel macOS, and x86_64 Linux builds under the same
+build numbers. On an Intel Mac `aterm pkg` installs the solvers and tools — `ay`,
+`clean`, `nn`, `ny`, `ty`, `trust-mc` — from the network; the `trust` compiler
+and the rest of its coherence group have no Intel-Mac build yet and are skipped
+there until one publishes. The Linux `trust` bundle is a genesis-lineage build
+(stock stage0 Rust), not Trust-from-Trust.
 
 `aterm <tool>` resolves against the managed store — never `$PATH` — so aterm's
 own verbs cannot be shadowed. Settings ▸ Packages ▸ Install ALab Toolset (or
@@ -442,10 +531,11 @@ it as privileged:
   fingerprint and channel-bound tokens, never the default control path.
 - Capture paths are confined to server-managed runtime directories.
 - Terminal-side powers that other programs could abuse — window operations,
-  notifications, palette reconfiguration, kitty-graphics reads of host files —
-  are all opt-in and off by default; OSC 52 clipboard reads are never answered;
-  and a multi-line paste into a shell without bracketed paste asks first (macOS
-  and Windows).
+  notifications, palette reconfiguration, kitty-graphics reads of host files,
+  OSC 52 clipboard reads — are all opt-in and off by default (clipboard reads
+  answer only under `allow_osc52_query = true`, and an authorized query is
+  always answered rather than left hanging); and a multi-line paste into a
+  shell without bracketed paste asks first (macOS and Windows).
 
 **Release trust** — for the macOS app updater and the toolchain package index —
 is anchored by a **paper master key** that exists on no computer. It signs only

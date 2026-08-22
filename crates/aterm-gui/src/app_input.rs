@@ -886,6 +886,24 @@ struct PressClass<'ev> {
     /// the cosmetic feeds' BREAK boundary — a word assembled across an
     /// editing boundary was never typed as a word.
     brk: bool,
+    /// SELECTION CUSTODY (R1): a bare MODIFIER or LOCK key — Shift, Control,
+    /// Alt/Option, Super/Command, Hyper, Meta, Caps/Num/Scroll Lock — pressed
+    /// on its own. Such a press expresses no typing intent: it is the first
+    /// half of ⌘-C, or the Shift of a shift-click extend. It must move neither
+    /// the viewport nor the selection.
+    ///
+    /// Classified off the KEY IDENTITY, never off a modifier-state snapshot:
+    /// on macOS winit queues the bare modifier's `KeyboardInput` BEFORE the
+    /// matching `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1026` vs
+    /// `:1045`), so `ws.mods` is still stale when the ⌘ keydown is processed
+    /// and `mods.super_key()` reads `false`. Any gate spelled in terms of the
+    /// modifier snapshot is therefore wrong on the exact press it must catch.
+    ///
+    /// Inertness is about SIDE EFFECTS only — the event still encodes, so the
+    /// Kitty `REPORT_ALL_KEYS_AS_ESC` modifier reports are untouched.
+    /// `Text` (a committed IME run) and `KeySequence` (raw controller bytes)
+    /// are never inert.
+    inert_modifier: bool,
 }
 
 fn classify_press(ev: &InputEvent) -> PressClass<'_> {
@@ -1037,6 +1055,13 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         InputEvent::KeySequence(_) => brk = true,
         _ => {}
     }
+    // SELECTION CUSTODY (R1). One shared authority with the Kitty report gate
+    // (`aterm_types::keyboard::is_modifier_or_lock_key`) so the two lists cannot
+    // drift. Pure over the event — no `ws.mods`, no platform test.
+    let inert_modifier = matches!(
+        ev,
+        InputEvent::Key { key, .. } if aterm_types::keyboard::is_modifier_or_lock_key(key)
+    );
     PressClass {
         predict_candidate,
         typed_forward,
@@ -1049,7 +1074,33 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         ime,
         backspace,
         brk,
+        inert_modifier,
     }
+}
+
+/// SELECTION CUSTODY (R1) — the ONE implementation of "what a disturbing press
+/// does to the terminal's reading position", shared by the seam's consolidated
+/// press scope and [`App::input_to_hidden_session`] so the two can never drift
+/// again. (They had already drifted: the hidden-session path snapped
+/// UNCONDITIONALLY, with no `display_offset() != 0` guard, so a key held over a
+/// window whose tab had since changed reset a BACKGROUND session's viewport.)
+///
+/// Returns `(scrolled, cleared)` for the caller's change-gated repaint. Both
+/// are `false` when `disturbs` is false, and the `&&` short-circuits before the
+/// reads, so an inert press pays nothing inside a lock it already holds.
+///
+/// Takes `&mut Terminal` rather than the guard so the caller owns the lock
+/// scope — this must never acquire one of its own.
+fn apply_press_custody(t: &mut Terminal, disturbs: bool) -> (bool, bool) {
+    let scrolled = disturbs && t.grid().display_offset() != 0 && {
+        t.scroll_to_bottom();
+        true
+    };
+    let cleared = disturbs && t.text_selection().has_selection() && {
+        t.text_selection_mut().clear();
+        true
+    };
+    (scrolled, cleared)
 }
 
 /// The shared brk → backspace → typed+ime dispatch cascade of one classified
@@ -1102,8 +1153,15 @@ impl App {
     /// `self.sink.write_frame`, the 0e floor). This
     /// method wraps it with the viewport/gesture/clipboard/geometry side-effects
     /// that need the renderer + window + gesture state: it is the ONLY caller of
-    /// `seam_egress` / `scroll_display` / `clear_selection` / `snap_to_bottom` /
-    /// `reset_blink` / `apply_term_resize`.
+    /// `seam_egress` / `scroll_display` / `reset_blink` / `apply_term_resize`,
+    /// and of the press-path viewport snap + selection clear
+    /// ([`apply_press_custody`], inlined into its one term-lock scope).
+    ///
+    /// It is NOT the only caller of `snap_to_bottom`, and there is no
+    /// `fn clear_selection` in the workspace at all — see the corrected list in
+    /// [`crate::input`]'s module doc. After SELECTION CUSTODY the non-seam
+    /// snappers are exactly the paste-or-echo arms that end a press before the
+    /// seam, plus `select_all`.
     ///
     /// `src` is recorded for audit and NEVER branched on: `seam_egress` takes no
     /// `Source`, so the bytes a Human and a Controller produce for the SAME
@@ -1497,17 +1555,27 @@ impl App {
             return InputOutcome::Ok;
         };
         let (term, sink) = (session.term.clone(), session.ctx.sink.clone());
+        // SELECTION CUSTODY (R1): the SAME gate the seam applies, through the
+        // same helper. A hidden session is reached only by a held key whose
+        // press already established session ownership, so in practice every
+        // event arriving here is a Repeat — which is precisely what must no
+        // longer disturb the reading position. The `display_offset() != 0`
+        // guard inside the helper also closes this path's missing-guard bug.
+        let PressClass { inert_modifier, .. } = classify_press(&ev);
         let is_release = matches!(
             &ev,
             InputEvent::Key { event_type, .. }
                 if matches!(event_type, aterm_types::keyboard::KeyEventType::Release)
         );
-        if !is_release {
+        let is_repeat = matches!(
+            &ev,
+            InputEvent::Key { event_type, .. }
+                if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
+        );
+        let press_disturbs = !is_release && !is_repeat && !inert_modifier;
+        if press_disturbs {
             let mut terminal = term_lock(&term);
-            terminal.scroll_to_bottom();
-            if terminal.text_selection().has_selection() {
-                terminal.text_selection_mut().clear();
-            }
+            let _ = apply_press_custody(&mut terminal, true);
         }
         let (egress, _) =
             paste_order::ordered_or_inline(&term, &sink, &ev, input::EgressMode::Interactive);
@@ -1759,9 +1827,14 @@ impl App {
                 // (sole keyboard-mode read + encoder call) is `seam_egress`.
                 // A key RELEASE report (Kitty REPORT_EVENT_TYPES) is NOT a press/typing
                 // event, so it must not reset the blink, snap the viewport, or clear the
-                // selection — only encode. (A Repeat IS press-like and keeps them.) The
-                // encoder emits nothing for a release outside Kitty mode, so legacy
-                // output is unaffected whether or not this side-effect gate runs.
+                // selection — only encode. The encoder emits nothing for a release
+                // outside Kitty mode, so legacy output is unaffected whether or not
+                // this side-effect gate runs.
+                //
+                // A Repeat used to be treated as press-like and KEEP the snap+clear.
+                // SELECTION CUSTODY reverses that: see `press_disturbs` below. The
+                // blink reset stays on the `!is_release` gate (a held key is still a
+                // key you are holding), so only the viewport/selection half moved.
                 let is_release = matches!(
                     &ev,
                     InputEvent::Key { event_type, .. }
@@ -1789,7 +1862,32 @@ impl App {
                     ime,
                     backspace,
                     brk,
+                    inert_modifier,
                 } = classify_press(&ev);
+                // SELECTION CUSTODY (R1): which presses may DISTURB the user's
+                // reading position — the viewport snap and the "typing deselects"
+                // clear below. Three exclusions, each for its own reason:
+                //
+                //   RELEASE  — a Kitty REPORT_EVENT_TYPES key-up is not a typing
+                //              event (the long-standing rule).
+                //   REPEAT   — an auto-repeat tick is the SAME press continuing.
+                //              Re-running the snap+clear at the ~30 Hz repeat rate
+                //              destroyed any wheel-scroll or selection the user
+                //              made mid-hold. The press already took custody when
+                //              it landed; a tick of the same hold cannot take it
+                //              twice. (This reverses the shipped decision recorded
+                //              in the comment above — see below.)
+                //   INERT    — a bare modifier/lock key expresses no intent.
+                //
+                // Everything else — the encode, the predictor, the cosmetic feeds,
+                // the release-relevance publication — is untouched: this gates
+                // SIDE EFFECTS only and never a byte.
+                let is_repeat = matches!(
+                    &ev,
+                    InputEvent::Key { event_type, .. }
+                        if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
+                );
+                let press_disturbs = !is_release && !is_repeat && !inert_modifier;
                 if let Some(input_now) = input_now {
                     self.reset_blink(wid);
                     // Predictive local echo (mosh-style): register the classified
@@ -1866,18 +1964,12 @@ impl App {
                     // guard drops — never window calls under the term lock.
                     let (scrolled, cleared, sample, is_alt, kitty_owns_keyboard, term_cols) = {
                         let mut t = term_lock(&term);
-                        let scrolled = if t.grid().display_offset() != 0 {
-                            t.scroll_to_bottom();
-                            true
-                        } else {
-                            false
-                        };
-                        let cleared = if t.text_selection().has_selection() {
-                            t.text_selection_mut().clear();
-                            true
-                        } else {
-                            false
-                        };
+                        // SELECTION CUSTODY (R1). `press_disturbs` short-circuits
+                        // BEFORE the two reads, so an inert modifier / repeat /
+                        // release costs nothing extra inside a lock it is already
+                        // holding for the predictor sample. Shared with
+                        // `input_to_hidden_session` so the two cannot drift.
+                        let (scrolled, cleared) = apply_press_custody(&mut t, press_disturbs);
                         // The NARROW `REPORT_EVENT_TYPES | REPORT_ALL_KEYS_AS_ESC`
                         // projection, read ONCE here (it feeds both the predictor's
                         // no-echo gate below and the release-relevance publication
@@ -3311,15 +3403,37 @@ impl App {
         }
         // The control verb follows the front window, matching `apply_grid_resize`.
         let target = self.frontmost_window.unwrap_or(wid);
+        // A driven resize OWNS the geometry from here: the launch-time initial
+        // frame settle must not re-assert the attach grid over it.
+        #[cfg(target_os = "linux")]
+        if let Some(ws) = self.windows.get_mut(&target) {
+            ws.initial_frame_settle = None;
+        }
         if let Some(w) = self
             .windows
             .get(&target)
-            .and_then(|ws| ws.os_window.as_ref())
+            .and_then(|ws| ws.os_window.clone())
         {
             // Best-effort by contract: the WM may clamp or ignore it. Deliberately
             // NOT followed by any local geometry write — believing our own request
             // is exactly the pre-application this variant exists to avoid.
-            let _ = w.request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+            //
+            // EXCEPT when the backend answers `Some`: winit's Wayland contract is
+            // "applied synchronously, no `Resized` event follows" — that return IS
+            // the platform's resize answer, not a belief. Feed it through the same
+            // path the event would have taken (macOS/X11/Windows return `None` and
+            // stay fully event-driven; without this the verb was a silent no-op on
+            // Wayland — the window never moved and no event ever came).
+            if let Some(applied) =
+                w.request_inner_size(winit::dpi::PhysicalSize::new(width, height))
+            {
+                if let Some(ws) = self.windows.get_mut(&target) {
+                    ws.win_px = Some(applied);
+                }
+                self.sync_surface_to_window(target);
+                self.on_resize(target, applied);
+                w.request_redraw();
+            }
         }
         InputOutcome::Ok
     }
@@ -4381,9 +4495,22 @@ impl App {
         }
         // The current modifier state for this window (a `Copy` snapshot, so the
         // borrow does not outlive the read). No such window ⇒ nothing to do.
+        //
+        // CAUTION (SELECTION CUSTODY): this snapshot is STALE for the press that
+        // establishes a modifier. On macOS winit queues the bare modifier's
+        // `KeyboardInput` before the matching `ModifiersChanged`
+        // (`vendor/winit/.../macos/view.rs:1026` vs `:1045`, dispatched in order
+        // by `app_state.rs:344`), so on the ⌘ keydown `mods.super_key()` is
+        // `false`. Never gate "is this a modifier press" on it — use
+        // `keymap::press_is_inert` below, which reads the key identity.
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
             return;
         };
+        // SELECTION CUSTODY (R1): a bare modifier/lock press is INERT — it must
+        // not cancel scroll motion, snap the viewport, or clear the selection.
+        // Resolved once here off the key identity; the seam re-derives the same
+        // answer from the engine key for the presses that reach it.
+        let inert = keymap::press_is_inert(&ev);
         // Typing makes the cursor solid and restarts the blink period.
         self.reset_blink(wid);
         // While the Settings overlay is open it OWNS the keyboard: swallow every key —
@@ -4602,36 +4729,66 @@ impl App {
             );
             return;
         }
-        // Cmd-C -> copy the selection to the system clipboard (before the
-        // snap-to-bottom: copying must neither clear the selection nor move
-        // the viewport). With no selection it falls through to normal handling.
+        // Cmd-C -> copy the selection to the system clipboard. Copying must
+        // neither clear the selection nor move the viewport.
+        //
+        // SELECTION CUSTODY: the copy's SUCCESS no longer gates whether the press
+        // is consumed. It used to (`&& self.copy_selection()`), so an empty
+        // selection, a failed `pbcopy`, a non-mac/linux target, or a `wid` that
+        // had drifted from `frontmost_window` short-circuited the `&&` and let
+        // the press fall through to the bare-Cmd swallow — which snapped the
+        // viewport. A clipboard write that fails is not licence to move the
+        // user's view. ⌘-C is an app-reserved chord on every real terminal, so
+        // it is swallowed either way; the only question was the side effect.
+        //
+        // Routed by the press's own `wid` rather than `self.frontmost_window`:
+        // the two diverge (see `lib.rs`'s window routing), and a copy must read
+        // the terminal the keystroke was addressed to.
         if mods.super_key()
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("c")
-            && self.copy_selection()
         {
+            self.copy_selection_in(wid);
             self.note_consumed_press(wid, &ev);
             return;
         }
-        // Any key press past this point jumps the viewport back to the live view
-        // if scrolled into history. The TERMINAL half of that snap is deliberately
-        // NOT taken here for keys that continue into the seam: `self.input` /
-        // `forward_literal_press` reach the consolidated "ONE term-lock scope for
-        // every press-path terminal touch", which performs byte-for-byte the same
-        // `display_offset() != 0` test under a lock it has to take anyway — a
-        // `snap_to_bottom` here would cost a plain keystroke a whole extra
-        // terminal-mutex acquisition, queued behind the PTY reader's `process()`
-        // holds during an output flood. The arms that END the press here (Cmd-V,
-        // font zoom, IME suppression, the bare-Cmd swallow, the un-encodable tail)
-        // never reach the seam and so keep an explicit `snap_to_bottom`, each
-        // placed relative to its own side-effects.
+        // A BYTE-PRODUCING key press past this point jumps the viewport back to the
+        // live view if scrolled into history — "start typing and jump to the
+        // prompt". SELECTION CUSTODY (R1) narrowed this from "any key press": a
+        // press that writes nothing to the PTY expresses no typing intent and may
+        // not take the user's reading position.
         //
-        // The WINDOW half stays unconditional and needs NO terminal lock: M1's
-        // "typing snaps INSTANTLY" cancels any in-flight wheel glide, elastic
-        // overscroll bounce, and banked sub-row residual, so an eased momentum tail
-        // cannot scroll the viewport back off the prompt a moment after the key
-        // landed. The seam only touches the terminal, so this half must stay here.
-        self.cancel_press_scroll_motion(wid);
+        // The TERMINAL half of that snap is deliberately NOT taken here for keys
+        // that continue into the seam: `self.input` / `forward_literal_press` reach
+        // the consolidated "ONE term-lock scope for every press-path terminal
+        // touch", which performs the same `display_offset() != 0` test under a lock
+        // it has to take anyway (now behind that scope's own `press_disturbs`
+        // gate) — a `snap_to_bottom` here would cost a plain keystroke a whole extra
+        // terminal-mutex acquisition, queued behind the PTY reader's `process()`
+        // holds during an output flood.
+        //
+        // Of the five arms that END a press here, only TWO still snap for
+        // themselves, and both write bytes or echo:
+        //
+        //   * ⌘-V  — a paste types into the PTY.
+        //   * IME  — a composing key IS typing, and its preedit paints at the
+        //            cursor, so a scrolled-back composer would type off-screen.
+        //
+        // The other three — font zoom, the bare-Cmd swallow, and the un-encodable
+        // tail — had their `snap_to_bottom` DELETED. None of them reaches the PTY.
+        //
+        // The WINDOW half below is likewise gated (`!inert`) rather than
+        // unconditional: M1's "typing snaps INSTANTLY" cancels any in-flight wheel
+        // glide, elastic overscroll bounce, and banked sub-row residual so an eased
+        // momentum tail cannot scroll the viewport back off the prompt a moment
+        // after the key landed — but merely resting a finger on Shift is not typing
+        // and must not kill a glide the user started. The seam only touches the
+        // terminal, so this half must stay here; it needs NO terminal lock, which is
+        // why it answers "is this inert?" through `keymap::press_is_inert` instead
+        // of the seam's `PressClass`.
+        if !inert {
+            self.cancel_press_scroll_motion(wid);
+        }
         //
         // Cmd-V -> paste the system clipboard (bracketed when the app enabled
         // it). Pasting does not clear the selection. (The `Paste` seam arm snaps
@@ -4647,11 +4804,15 @@ impl App {
             return;
         }
         let zoom_repeat = font_zoom_repeat_action(mods, &ev);
-        // Snapped off the SAME classifier `on_key_font_zoom` matches on, not off
-        // its return value: the snap has to precede the zoom's re-grid.
-        if zoom_repeat.is_some() {
-            self.snap_to_bottom(wid);
-        }
+        // SELECTION CUSTODY (R1): the font-zoom snap is GONE. ⌘-+ / ⌘-- produce
+        // no PTY bytes, so under R1 they may not move the viewport — zooming
+        // while reading history must leave you where you were reading. It used
+        // to snap "because the snap has to precede the zoom's re-grid"; the
+        // re-grid does not require it (`Grid::reflow` captures and clamps the
+        // pre-resize offset for every other resize path — window resize, divider
+        // drag — none of which snap). Until the anchored restore lands the
+        // rows-only case can still slide the view by the row-count delta, which
+        // is strictly better than discarding the position outright.
         if self.on_key_font_zoom(mods, &ev) {
             self.note_press_disposition(
                 wid,
@@ -4700,12 +4861,16 @@ impl App {
         // or a hardcoded shortcut above, so it is an app-level chord the OS reserves
         // for the application — real macOS terminals never forward Cmd combos to the
         // PTY. Encoding it would leak a stray byte (Cmd-K → "k") or a spurious
-        // `ESC[1;9D` into the shell/TUI with no beep and no escape hatch. Swallow it
-        // — snapping the viewport first, since a swallowed chord never reaches the
-        // seam that would otherwise do it. The text-fallback below is already
-        // Super-guarded; this closes the build_key_input encode path too.
+        // `ESC[1;9D` into the shell/TUI with no beep and no escape hatch. Swallow it.
+        // The text-fallback below is already Super-guarded; this closes the
+        // build_key_input encode path too.
+        //
+        // SELECTION CUSTODY (R1): the snap that used to precede the swallow is
+        // GONE. A swallowed chord writes nothing to the PTY, so it expresses no
+        // typing intent. (⌘-K was never a documented jump-to-live; it reached the
+        // live view only as a side effect of being unclaimed. ⌘↓ is the honest
+        // spelling of that intent — Phase 2.)
         if mods.super_key() {
-            self.snap_to_bottom(wid);
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -4713,8 +4878,8 @@ impl App {
         // (no hop, no latency cost). The seam is the sole byte-producing reader of
         // keyboard_mode() (the predictor's kitty_suppresses_predictive_echo()
         // sample is a read-only display gate) and the sole caller of the encoder +
-        // reset_blink/snap_to_bottom/clear_selection — so a human key and the
-        // `key`/`ctrl` verbs that build the
+        // reset_blink + the press-path custody gate (`apply_press_custody`) — so a
+        // human key and the `key`/`ctrl` verbs that build the
         // SAME (Key, mods, base_layout) triple produce byte-identical PTY output
         // (kills divergences f/h; uniform g/k side-effects). The keymap is demoted
         // to a BUILDER (`build_key_input`) that fills `base_layout` from the
@@ -4762,11 +4927,24 @@ impl App {
         }
         // No byte-producing press was observed, so a later CSI-u release has
         // no valid peer and must be swallowed even if its release-time logical
-        // mapping differs. This tail is REACHED by every bare modifier press
-        // (winit reports Shift/Ctrl/… as key events and `build_key_input` maps
-        // them to nothing), which never reaches the seam — so it must snap here:
-        // the human parity is "any key press jumps to live".
-        self.snap_to_bottom(wid);
+        // mapping differs.
+        //
+        // CORRECTION: this tail is NOT reached by bare modifier presses. Bare
+        // modifiers DO map — `keymap::build_key_input` says so in its own doc
+        // ("Bare modifiers DO map"), and `aterm-types`' winit key table
+        // canonicalizes winit's sideless `Shift`/`Control`/`Alt`/`Super` to the
+        // engine's `ShiftLeft`/`ControlLeft`/… — so they take the `build_key_input`
+        // branch above and reach the seam. The real population here is the keys
+        // with NO engine mapping at all: `Key::Dead`, `Key::Unidentified`,
+        // multi-codepoint `Character`, and the unmapped `NamedKey` long tail
+        // (media/browser/launch keys, which the winit map returns `None` for).
+        //
+        // SELECTION CUSTODY (R1): none of those produce PTY bytes, so the snap
+        // that used to run here is GONE. The old comment's "the human parity is
+        // 'any key press jumps to live'" overstated a rule that was only ever
+        // meant to cover TYPING; it is preserved exactly for every byte-producing
+        // press, which is what a user means by "start typing and jump to the
+        // prompt".
         self.note_consumed_press(wid, &ev);
     }
 
@@ -6026,9 +6204,17 @@ impl App {
             Action::FocusPaneUp => self.focus_pane(pane::FocusDir::Up),
             Action::FocusPaneDown => self.focus_pane(pane::FocusDir::Down),
             Action::TogglePaneZoom => self.toggle_pane_zoom(),
-            // Copy is a no-op with no selection (matches the hardcoded fall-through).
+            // Copy is a no-op with no selection. Window-routed like `Action::Paste`
+            // below, and for the same reason the hardcoded ⌘-C arm is: `wid` is the
+            // window the chord was pressed in, and it can diverge from
+            // `frontmost_window`. This matters most OFF macOS, where
+            // `Keybindings::platform_defaults` seeds `ctrl+shift+c` / `ctrl+insert`
+            // to `copy` — so this IS the primary copy chord on Linux and Windows,
+            // not a rarely-taken alias. The native-view path already routes by `wid`
+            // (`copy_native_selection(wid)`), and `command_registry` declares
+            // `K::Copy` as `CommandScope::View`; this arm was the odd one out.
             Action::Copy => {
-                self.copy_selection();
+                self.copy_selection_in(wid);
             }
             Action::Paste => {
                 // A paste, like the hardcoded Cmd-V, jumps the viewport to live.
@@ -6128,15 +6314,22 @@ impl App {
     /// preedit indicator can render and direct key sends stay suppressed while
     /// composing. An empty preedit ends the composition. Requests a repaint so
     /// the (minimal) on-screen indicator follows the composition.
-    pub(crate) fn on_ime_preedit(&mut self, wid: WindowId, text: String) {
+    pub(crate) fn on_ime_preedit(
+        &mut self,
+        wid: WindowId,
+        text: String,
+        cursor: Option<(usize, usize)>,
+    ) {
         // Track the composition on the WINDOW before any native-tab routing:
         // `ws.preedit` feeds `on_key`'s suppress_direct_send gate, so a preedit
         // that resolves while a native tab is frontmost must still update it —
         // left stale, the gate would swallow every later terminal key press.
         let mut changed = false;
         if let Some(ws) = self.windows.get_mut(&wid) {
-            changed = ws.preedit != text;
+            let caret = cursor.map(|(start, _end)| start);
+            changed = ws.preedit != text || ws.preedit_caret != caret;
             ws.preedit.clone_from(&text);
+            ws.preedit_caret = caret;
         }
         if self.active_native_view(wid).is_some() {
             let _ = self.dispatch_native_event(
@@ -6490,7 +6683,15 @@ impl App {
             }
             // Edit ------------------------------------------------------------
             // Copy with no selection is a harmless no-op (the bool is ignored here,
-            // exactly like the Cmd-C fall-through in on_key).
+            // exactly as the hardcoded ⌘-C arm in `on_key` ignores it). A menu item
+            // carries no originating window, so this genuinely IS a
+            // `frontmost_window` path — unlike `Action::Copy`, which has a routed
+            // `wid` and uses it.
+            //
+            // (There is no longer a "Cmd-C fall-through": since SELECTION CUSTODY
+            // the ⌘-C arm consumes the press on the key match alone, because a
+            // failed clipboard write must not let the press fall through to an arm
+            // that moves the viewport.)
             MenuAction::Copy => {
                 let _ = self.copy_selection();
             }
@@ -9762,7 +9963,7 @@ mod keystroke_press_side_effect_tests {
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_core::selection::{SelectionSide, SelectionType};
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey as TNamed};
 
     fn key(event_type: KeyEventType) -> InputEvent {
         InputEvent::Key {
@@ -9773,13 +9974,31 @@ mod keystroke_press_side_effect_tests {
         }
     }
 
-    /// The press path's snap + deselect + predictor sample run under ONE term
-    /// lock. This pins their semantics: a key PRESS at the seam snaps a
-    /// history-scrolled viewport back to the live bottom AND clears an active
-    /// selection ("typing deselects"); a key RELEASE (Kitty REPORT_EVENT_TYPES)
-    /// is not a typing event and must do neither — only encode.
+    /// A bare modifier / lock key press at the seam.
+    fn modifier_press(key: Key) -> InputEvent {
+        InputEvent::Key {
+            key,
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    /// SELECTION CUSTODY (R1) at the seam. Exactly one class of press may take
+    /// the user's reading position: a byte-producing PRESS — "start typing and
+    /// jump to the prompt". Three classes may not:
+    ///
+    ///   RELEASE — a Kitty REPORT_EVENT_TYPES key-up is not typing.
+    ///   REPEAT  — an auto-repeat tick is the same press continuing, and used to
+    ///             re-run the snap+clear at ~30 Hz, destroying any scroll or
+    ///             selection the user made mid-hold.
+    ///   INERT   — a bare modifier/lock key expresses no typing intent. This is
+    ///             the first half of ⌘-C.
+    ///
+    /// The typing case is asserted LAST and unchanged, which is the point: the
+    /// narrowing is surgical, not a removal of "typing snaps".
     #[test]
-    fn press_snaps_and_deselects_release_does_not() {
+    fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let term = app
@@ -9815,7 +10034,45 @@ mod keystroke_press_side_effect_tests {
                 "release must not deselect"
             );
         }
+        // REPEAT: the same held press continuing. Must do neither.
+        let _ = app.input(wid, key(KeyEventType::Repeat), Source::Human);
+        {
+            let t = term_lock(&term);
+            assert_ne!(t.grid().display_offset(), 0, "repeat must not snap");
+            assert!(
+                t.text_selection().has_selection(),
+                "repeat must not deselect"
+            );
+        }
+        // INERT: every bare modifier and lock key, each on its own. None of them
+        // may move the viewport or drop the highlight — this is what made ⌘-C
+        // copy nothing.
+        for k in [
+            Key::Named(TNamed::SuperLeft),
+            Key::Named(TNamed::SuperRight),
+            Key::Named(TNamed::ShiftLeft),
+            Key::Named(TNamed::ControlLeft),
+            Key::Named(TNamed::AltLeft),
+            Key::Named(TNamed::MetaLeft),
+            Key::Named(TNamed::HyperLeft),
+            Key::Named(TNamed::CapsLock),
+            Key::Named(TNamed::NumLock),
+            Key::Named(TNamed::ScrollLock),
+        ] {
+            let _ = app.input(wid, modifier_press(k.clone()), Source::Human);
+            let t = term_lock(&term);
+            assert_ne!(
+                t.grid().display_offset(),
+                0,
+                "bare {k:?} must not snap the viewport"
+            );
+            assert!(
+                t.text_selection().has_selection(),
+                "bare {k:?} must not clear the selection"
+            );
+        }
         // PRESS: snaps to the live bottom and clears the selection in one pass.
+        // UNCHANGED — the one handover from user to tail-follower.
         let _ = app.input(wid, key(KeyEventType::Press), Source::Human);
         let t = term_lock(&term);
         assert_eq!(t.grid().display_offset(), 0, "press snaps to bottom");
@@ -9893,6 +10150,212 @@ mod press_path_lock_elision_tests {
         bytes[..read as usize].to_vec()
     }
 
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::selection::SelectionType;
+    use aterm_core::terminal::Terminal;
+    use winit::keyboard::ModifiersState;
+
+    /// A bare MODIFIER or LOCK key as winit really delivers it.
+    fn modifier_event(
+        named: winit::keyboard::NamedKey,
+        code: KeyCode,
+        state: ElementState,
+    ) -> winit::event::KeyEvent {
+        winit::event::KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(code),
+            winit::keyboard::Key::Named(named),
+            None,
+            winit::keyboard::KeyLocation::Standard,
+            state,
+            false,
+        )
+    }
+
+    /// A terminal scrolled into history with a completed selection on screen —
+    /// the state the user is in the instant before they reach for ⌘-C.
+    fn scrolled_back_with_a_selection(app: &mut App, wid: WindowId) -> Arc<Mutex<Terminal>> {
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        let mut t = term_lock(&term);
+        t.process("hello world\r\n".repeat(64).as_bytes());
+        t.scroll_to_top();
+        assert_ne!(t.grid().display_offset(), 0, "viewport is in history");
+        let sel = t.text_selection_mut();
+        sel.start_selection(
+            0,
+            0,
+            aterm_core::selection::SelectionSide::Left,
+            SelectionType::Simple,
+        );
+        sel.update_selection(0, 4, aterm_core::selection::SelectionSide::Right);
+        sel.complete_selection();
+        assert!(t.text_selection().has_selection());
+        drop(t);
+        term
+    }
+
+    /// SELECTION CUSTODY (R1) for the modifier keys the ENGINE has no `NamedKey`
+    /// for — AltGr on every European layout, and laptop/macOS `Fn`.
+    ///
+    /// These take a different route than Shift/Control/Alt/Command:
+    /// `map_logical_key` returns `None`, so `build_key_input` yields nothing, the
+    /// press never reaches the seam, and it ends at `on_key`'s un-encodable tail.
+    /// The terminal half is therefore safe for them for free. The WINDOW half is
+    /// not — `cancel_press_scroll_motion` runs off `keymap::press_is_inert`, which
+    /// answers from the winit key — so without an explicit arm for them, resting a
+    /// finger on AltGr would kill an in-flight momentum scroll while Shift left it
+    /// running. Asserted on `scroll_frac_px`, the banked sub-row residual that
+    /// cancel drops.
+    #[test]
+    fn unmapped_modifier_keys_are_inert_too() {
+        use winit::keyboard::NamedKey as WNamed;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = scrolled_back_with_a_selection(&mut app, wid);
+        let offset_before = term_lock(&term).grid().display_offset();
+
+        for named in [WNamed::AltGraph, WNamed::Fn, WNamed::FnLock] {
+            // Bank a sub-row scroll residual, as an in-flight wheel glide would.
+            app.windows.get_mut(&wid).expect("window").scroll_frac_px = 7;
+            app.on_key(
+                wid,
+                modifier_event(named, KeyCode::AltRight, ElementState::Pressed),
+            );
+            assert_eq!(
+                app.windows[&wid].scroll_frac_px, 7,
+                "bare {named:?} must not cancel an in-flight scroll"
+            );
+            let t = term_lock(&term);
+            assert_eq!(
+                t.grid().display_offset(),
+                offset_before,
+                "bare {named:?} must not move the viewport"
+            );
+            assert!(
+                t.text_selection().has_selection(),
+                "bare {named:?} must not clear the selection"
+            );
+        }
+        // Control: a real typing press still cancels the glide and snaps.
+        app.on_key(wid, character_event('a', ElementState::Pressed));
+        assert_eq!(
+            app.windows[&wid].scroll_frac_px, 0,
+            "typing still drops the banked residual"
+        );
+        assert_eq!(term_lock(&term).grid().display_offset(), 0);
+    }
+
+    /// SELECTION CUSTODY (R1), driven through the SHIPPING `App::on_key` in the
+    /// exact event order macOS produces — the order that made the bug invisible
+    /// to every gate spelled in terms of `ws.mods`.
+    ///
+    /// winit queues the bare modifier's `KeyboardInput` BEFORE the matching
+    /// `ModifiersChanged` (`vendor/winit/.../macos/view.rs:1026` vs `:1045`,
+    /// dispatched in order by `app_state.rs:344`), so on the ⌘ keydown
+    /// `ws.mods.super_key()` is still `false`: the bare-Cmd swallow does not
+    /// fire, the press reaches the seam, and the seam used to snap the viewport
+    /// and clear the selection. By the time `c` arrived there was nothing left
+    /// to copy.
+    ///
+    /// Asserted at EVERY step, and for BOTH orderings — a fix that only worked
+    /// once `ModifiersChanged` had landed would still lose the selection on the
+    /// press that matters.
+    #[test]
+    fn bare_command_keydown_is_inert_in_either_modifier_order() {
+        for settled_first in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let term = scrolled_back_with_a_selection(&mut app, wid);
+            let offset_before = term_lock(&term).grid().display_offset();
+
+            if settled_first {
+                app.windows.get_mut(&wid).expect("window").mods = ModifiersState::SUPER;
+            }
+            app.on_key(
+                wid,
+                modifier_event(
+                    winit::keyboard::NamedKey::Super,
+                    KeyCode::SuperLeft,
+                    ElementState::Pressed,
+                ),
+            );
+            {
+                let t = term_lock(&term);
+                assert_eq!(
+                    t.grid().display_offset(),
+                    offset_before,
+                    "bare Command must not move the viewport (settled_first={settled_first})"
+                );
+                assert!(
+                    t.text_selection().has_selection(),
+                    "bare Command must not clear the selection (settled_first={settled_first})"
+                );
+            }
+
+            // …and now the ModifiersChanged winit queued second finally lands.
+            app.windows.get_mut(&wid).expect("window").mods = ModifiersState::SUPER;
+            {
+                let t = term_lock(&term);
+                assert_eq!(t.grid().display_offset(), offset_before);
+                assert!(t.text_selection().has_selection());
+                // What ⌘-C will read. Asserted instead of driving the real
+                // `c` press, because that would shell out to `pbcopy` and
+                // clobber the developer's clipboard from a unit test.
+                let text = t.selection_to_string().expect("selection resolves to text");
+                assert!(
+                    !text.is_empty(),
+                    "the copy has something to copy (settled_first={settled_first})"
+                );
+            }
+        }
+    }
+
+    /// Every OTHER bare modifier and lock key is inert too. Shift is the one that
+    /// matters beyond ⌘-C: its keydown used to clear the selection, so
+    /// `extend_selection_to` found nothing to extend and shift-click-to-extend
+    /// was impossible on macOS.
+    #[test]
+    fn every_bare_modifier_and_lock_key_is_inert() {
+        use winit::keyboard::NamedKey as WNamed;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = scrolled_back_with_a_selection(&mut app, wid);
+        let offset_before = term_lock(&term).grid().display_offset();
+        for (named, code) in [
+            (WNamed::Shift, KeyCode::ShiftLeft),
+            (WNamed::Control, KeyCode::ControlLeft),
+            (WNamed::Alt, KeyCode::AltLeft),
+            (WNamed::Super, KeyCode::SuperRight),
+            (WNamed::CapsLock, KeyCode::CapsLock),
+            (WNamed::NumLock, KeyCode::NumLock),
+            (WNamed::ScrollLock, KeyCode::ScrollLock),
+        ] {
+            app.on_key(
+                wid,
+                modifier_event(named, code, ElementState::Pressed),
+            );
+            let t = term_lock(&term);
+            assert_eq!(
+                t.grid().display_offset(),
+                offset_before,
+                "bare {named:?} must not move the viewport"
+            );
+            assert!(
+                t.text_selection().has_selection(),
+                "bare {named:?} must not clear the selection"
+            );
+        }
+        // The narrowing is surgical: an ordinary character still snaps and
+        // deselects, which is what a user means by "start typing and jump back".
+        app.on_key(wid, character_event('a', ElementState::Pressed));
+        let t = term_lock(&term);
+        assert_eq!(t.grid().display_offset(), 0, "typing still snaps");
+        assert!(
+            !t.text_selection().has_selection(),
+            "typing still deselects"
+        );
+    }
+
     /// A seam-bound keystroke must land the WHOLE press-path snap without any
     /// caller-side `snap_to_bottom` (which would be a third terminal-mutex
     /// acquisition per key): the seam's consolidated lock scope pulls the viewport back to the
@@ -9930,22 +10393,36 @@ mod press_path_lock_elision_tests {
         }
     }
 
-    /// The arms that END a press before the seam keep their own snap. A bare Cmd
-    /// chord no shortcut claims is swallowed (real terminals never forward Cmd
-    /// combos), and swallowing it must still jump the viewport back to live — the
-    /// human parity "any key press jumps to live".
+    /// SELECTION CUSTODY (R1): a bare Cmd chord no shortcut claims is swallowed
+    /// (real terminals never forward Cmd combos) — and swallowing it must NOT
+    /// move the viewport.
+    ///
+    /// This test previously pinned the OPPOSITE ("a swallowed Cmd chord still
+    /// snaps", under the human parity "any key press jumps to live"). That rule
+    /// was too broad: a swallowed chord writes nothing to the PTY, so it
+    /// expresses no typing intent, and ⌘-K silently discarding the user's place
+    /// in the scrollback was a side effect of the chord being unclaimed rather
+    /// than anything anyone chose. Typing — the case the parity was actually
+    /// about — is unchanged and pinned by
+    /// `a_seam_bound_press_snaps_the_viewport_and_kills_the_glide_residual`.
+    ///
+    /// The WINDOW half still runs: `j` is not a modifier, so the press is not
+    /// inert and the banked glide residual is still dropped. Only the terminal
+    /// half — the thing that loses the user's place — is gone.
     #[cfg(unix)]
     #[test]
-    fn a_swallowed_cmd_chord_still_snaps_the_viewport() {
+    fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
         let (mut app, pipe) = app_observing_pty();
         let wid = WindowId(0);
         let term = app.front_terminal(wid).expect("terminal").term.clone();
-        {
+        let offset_before = {
             let mut t = term_lock(&term);
             t.process("x\r\n".repeat(64).as_bytes());
             t.scroll_to_top();
-            assert_ne!(t.grid().display_offset(), 0, "viewport is in history");
-        }
+            let off = t.grid().display_offset();
+            assert_ne!(off, 0, "viewport is in history");
+            off
+        };
         app.windows.get_mut(&wid).expect("window").scroll_frac_px = 7;
         app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SUPER);
 
@@ -9953,10 +10430,13 @@ mod press_path_lock_elision_tests {
 
         assert_eq!(
             term_lock(&term).grid().display_offset(),
-            0,
-            "a swallowed Cmd chord still snaps"
+            offset_before,
+            "a swallowed Cmd chord must leave the reading position alone"
         );
-        assert_eq!(app.windows[&wid].scroll_frac_px, 0);
+        assert_eq!(
+            app.windows[&wid].scroll_frac_px, 0,
+            "the window half still drops the banked glide residual"
+        );
         assert_eq!(
             drain(pipe),
             Vec::<u8>::new(),

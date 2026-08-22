@@ -683,6 +683,55 @@ pub(crate) fn config_host_semantic_warnings_with_backend_and_assets(
         }
     }
 
+    // W5i: `shell` names the execve TARGET, used VERBATIM by the spawn
+    // (crates/aterm-pty `spawn_shell_with_pid`: "a bare name relies on it being
+    // absolute" — there is NO PATH search). A typo here is the config error
+    // with the worst failure mode in the product: every new session dies at
+    // exec, and before the launch-alert work the app just bounced and
+    // vanished. Validate the authored value so `--validate-config` (and
+    // Manual) says so BEFORE a session has to fail. `$ATERM_SHELL` precedence
+    // is already surfaced by the env-override warning above; this checks the
+    // saved key, which is what survives a restart.
+    if let Some(shell) = config.shell.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !shell.contains('/') {
+            warnings.push(ConfigSemanticWarning {
+                key: "shell",
+                message: format!(
+                    "shell: {shell:?} is a bare name, and the spawn execs it verbatim \
+                     (no PATH search) — new sessions will fail. Use an absolute path \
+                     (e.g. /bin/zsh)"
+                ),
+            });
+        } else {
+            match std::fs::metadata(shell) {
+                Err(_) => warnings.push(ConfigSemanticWarning {
+                    key: "shell",
+                    message: format!(
+                        "shell: {shell:?} does not exist — new sessions will fail to spawn"
+                    ),
+                }),
+                Ok(md) => {
+                    #[cfg(unix)]
+                    let executable = {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        md.is_file() && md.permissions().mode() & 0o111 != 0
+                    };
+                    #[cfg(not(unix))]
+                    let executable = md.is_file();
+                    if !executable {
+                        warnings.push(ConfigSemanticWarning {
+                            key: "shell",
+                            message: format!(
+                                "shell: {shell:?} is not an executable file — new sessions \
+                                 will fail to spawn"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     if config.font_family.is_some()
         && let Some(message) = crate::app_config::Config::font_family_warning(
             crate::effective_font_family(config.font_family_request().as_deref()).as_deref(),
@@ -2215,6 +2264,35 @@ ink = "rainbow"
         );
         // Malformed TOML syntax is reported.
         assert!(validate_config_text("font_px = = 1").is_err());
+    }
+
+    /// W5i: the `shell` key names the execve target VERBATIM (no PATH search),
+    /// so `--validate-config` must catch the three shapes that make every new
+    /// session die at exec — a bare name, a nonexistent path, and (the healthy
+    /// control) an absolute existing shell warns nothing.
+    #[test]
+    fn validate_flags_a_shell_the_spawn_cannot_exec() {
+        let shell_warns = |toml: &str| -> Vec<String> {
+            validate_config_text(toml)
+                .expect("parses")
+                .into_iter()
+                .filter(|w| w.starts_with("shell:"))
+                .collect()
+        };
+        let bare = shell_warns("shell = \"zsh\"");
+        assert!(
+            bare.iter().any(|w| w.contains("bare name")),
+            "a bare name must warn (execve does no PATH search): {bare:?}"
+        );
+        let missing = shell_warns("shell = \"/nonexistent/definitely-not-a-shell\"");
+        assert!(
+            missing.iter().any(|w| w.contains("does not exist")),
+            "a nonexistent path must warn: {missing:?}"
+        );
+        assert!(
+            shell_warns("shell = \"/bin/sh\"").is_empty(),
+            "an absolute existing shell is clean"
+        );
     }
 
     #[test]

@@ -327,14 +327,25 @@ pub fn wide_center_model() -> Model {
     }
 }
 
-/// W8 FALLBACK ROW-BAND CLIP — the abstract twin of
-/// `aterm_render::clamp_to_row_band` (the real code seam:
-/// `Renderer::harmonize_fallback_raster`, which trims a fallback glyph's
-/// coverage rows so no fallback blit can paint outside its cell row band —
-/// on the CPU blit and the GPU atlas quad alike, since they share the
-/// trimmed bytes + placement). Tier-1 lives in
+/// W8 FALLBACK BAND CLIP — the abstract twin of BOTH shipped band clamps,
+/// `aterm_render::clamp_to_row_band` (rows, band = the cell height) and
+/// `aterm_render::clamp_to_col_band` (columns, band = the cell box widened by
+/// a half-cell bleed). The two are one-line wrappers over one shared core,
+/// `aterm_render::clamp_to_band`, and this model's arithmetic is AXIS-FREE,
+/// so it twins both without cloning: the axis is the only thing that differs.
+///
+/// The real code seam is `Renderer::harmonize_fallback_raster` — stage (f)
+/// trims a fallback glyph's coverage ROWS so no fallback blit can paint
+/// outside its cell row band, and stage (h) trims its COLUMNS as the backstop
+/// under the (g) condense, so a symbol-tier glyph designed far wider than a
+/// terminal cell (STIX Two Math's 1.499 em long arrows, U+27F5..U+27FC, which
+/// used to paint ~2.9 cells inside a 1-cell grid box) cannot bury its
+/// neighbours. Both apply on the CPU blit and the GPU atlas quad alike, since
+/// they share the trimmed bytes + placement. Tier-1 lives in
 /// `aterm-render/tests/fallback_harmony.rs` (exhaustive lattice over
-/// top/height/band including all-negative and overflow-past-band shapes).
+/// pos/len/band including all-negative and overflow-past-band shapes, plus a
+/// pointwise agreement sweep pinning that the two wrappers really are one
+/// core, and the anti-fight law binding (g) to (h)).
 ///
 /// `Pick` chooses an arbitrary ink placement — cell-relative `top` (may be
 /// negative: ascender overshoot), bitmap `h`, band height `band`; `Fire`

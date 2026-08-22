@@ -344,12 +344,15 @@ fn front_offset_bounded_after_truncation() {
 
     cold.truncate_front_lines(n);
 
-    // Post-condition: if pages remain, front_offset < first page line_count.
-    if !cold.index.is_empty() {
-        let first_lc = len_u32_to_usize(cold.index[0].line_count);
+    // Post-condition: if LIVE pages remain, front_offset < the first live
+    // page's line_count. Front drops advance a cursor + absolute base; the
+    // dead-prefix entries are no longer part of the live index.
+    let live = cold.live_index();
+    if !live.is_empty() {
+        let first_lc = len_u32_to_usize(live[0].line_count);
         kani::assert(
             cold.front_offset < first_lc,
-            "front_offset must be < first page line_count after truncation",
+            "front_offset must be < first live page line_count after truncation",
         );
     }
 }

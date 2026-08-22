@@ -189,11 +189,55 @@ fn bench_push_truncate_cycle(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: deep-history push + truncate cycle (ST-3 pricing instrument).
+///
+/// Same steady-state rotation as `push_truncate_cycle`, but at depths where
+/// the cold tier holds thousands of pages (~15.5k at 1M lines with the 64-line
+/// block size). Before the base-offset redesign, every 100-line block rotation
+/// drained AND rebased the whole cold cumulative index — an O(total pages)
+/// memmove + rewrite per drop that the 50k-line shallow fence cannot see. The
+/// flat-throughput claim of `push_line` is the fence: throughput here must
+/// stay level from 200k to 1M prefill, not degrade with depth.
+///
+/// The store is built ONCE per depth and reused across sampling iterations:
+/// the workload is a steady-state rotation (mutation between samples is the
+/// point), and a per-batch million-line rebuild would dominate wall time.
+fn bench_push_truncate_cycle_deep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("push_truncate_cycle_deep");
+    let pushes_per_iter = 500_usize;
+    group.throughput(Throughput::Elements(pushes_per_iter as u64));
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(3));
+    group.warm_up_time(Duration::from_secs(1));
+
+    let payload = "x".repeat(PAYLOAD_LEN);
+
+    for prefill in [200_000_usize, 1_000_000] {
+        let mut sb = build_scrollback(prefill);
+        sb.set_line_limit(Some(prefill));
+        assert!(
+            sb.cold_line_count() > 0,
+            "deep rotation must reach the cold tier or it prices nothing"
+        );
+        group.bench_with_input(BenchmarkId::from_parameter(prefill), &prefill, |b, _| {
+            b.iter(|| {
+                for i in 0..pushes_per_iter {
+                    sb.push_str(&format!("P{i:04}-{}", payload));
+                }
+                black_box(sb.line_count())
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_truncate_cold_only,
     bench_truncate_cross_tier,
     bench_truncate_scaling,
     bench_push_truncate_cycle,
+    bench_push_truncate_cycle_deep,
 );
 criterion_main!(benches);

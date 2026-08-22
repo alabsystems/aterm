@@ -518,21 +518,17 @@ impl Floor {
             return Ok(());
         }
         let text = toml::to_string(&next).map_err(|error| format!("encode floor: {error}"))?;
-        let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
-        // The temp is swept on EVERY failing path, not just a failed write. The rename
-        // arm used to leak it, and a failing rename is precisely the case that repeats
-        // forever (a full disk, a read-only remount): one `floor.toml.<pid>.tmp` per
-        // failing cycle piling up in the 0700 Updates root, which nothing sweeps.
-        let committed = std::fs::write(&tmp, text)
-            .map_err(|error| format!("write {}: {error}", tmp.display()))
-            .and_then(|()| {
-                std::fs::rename(&tmp, path)
-                    .map_err(|error| format!("commit {}: {error}", path.display()))
-            });
-        if committed.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        committed
+        // DURABLE, like every other trust record in this module (receipt, marker,
+        // quarantine). A plain write+rename left the ratchet inside APFS's data
+        // writeback window: a panic/power cut after an advance could surface a
+        // zero-length floor.toml, which deserializes (#[serde(default)]) into the
+        // permissive all-zero Floor — silently discarding roster_seq/min_build/
+        // high_water, the exact replay/rollback window the ratchet closes. Writes
+        // only happen when a coordinate advances (the `next == cur` early return
+        // above), so the F_FULLFSYNC cost is one fsync per real ratchet bump, and
+        // write_durable already sweeps its temp on every failing path and
+        // degrades gracefully on volumes that refuse full sync.
+        write_durable(path, &text, "update floor")
     }
 }
 

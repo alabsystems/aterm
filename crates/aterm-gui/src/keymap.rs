@@ -259,6 +259,54 @@ pub fn encode_key_event(
     if bytes.is_empty() { None } else { Some(bytes) }
 }
 
+/// SELECTION CUSTODY (R1): whether this winit press is a bare MODIFIER or LOCK
+/// key — Shift, Control, Alt/Option, Super/Command, Hyper, Meta, Caps/Num/Scroll
+/// Lock — and so expresses no typing intent.
+///
+/// The window half of the press-path snap (`cancel_press_scroll_motion`) is
+/// deliberately lock-free and therefore lives OUTSIDE the seam, so it needs its
+/// own call site answering the question the seam answers with
+/// `PressClass::inert_modifier`. Both resolve to the same authority —
+/// `aterm_types::keyboard::is_modifier_or_lock_key` — so a key cannot be inert
+/// on one side of the seam and disturbing on the other.
+///
+/// Reads `logical_key`, NOT `key_without_modifiers()`: the modifier identity is
+/// what `logical_key` carries, and the answer must not depend on the platform's
+/// modifier-state snapshot (on macOS that snapshot is still stale when the bare
+/// modifier's `KeyboardInput` is delivered).
+#[must_use]
+pub fn press_is_inert(ev: &KeyEvent) -> bool {
+    if keyboard::map_logical_key(&ev.logical_key)
+        .as_ref()
+        .is_some_and(keyboard::is_modifier_or_lock_key)
+    {
+        return true;
+    }
+    // The modifier and lock keys winit reports that the ENGINE has no `NamedKey`
+    // variant for, so `map_logical_key` returns `None` for them: `AltGraph` (the
+    // AltGr of every European layout), macOS/laptop `Fn`/`FnLock`, and
+    // `Symbol`/`SymbolLock`. They are modifiers by any honest reading — you hold
+    // them to reach another key — and they produce no PTY bytes.
+    //
+    // The TERMINAL half is already safe for them without this arm: unmapped keys
+    // return `None` from `build_key_input`, fall to `on_key`'s un-encodable tail,
+    // and never reach the seam at all. The WINDOW half is not, and that is the
+    // whole reason this arm exists — without it, resting a finger on AltGr kills
+    // an in-flight momentum scroll while Shift (which IS engine-mapped) leaves it
+    // running. Same key class, opposite behaviour, for no reason a user could
+    // ever infer.
+    matches!(
+        &ev.logical_key,
+        WinitKey::Named(
+            winit::keyboard::NamedKey::AltGraph
+                | winit::keyboard::NamedKey::Fn
+                | winit::keyboard::NamedKey::FnLock
+                | winit::keyboard::NamedKey::Symbol
+                | winit::keyboard::NamedKey::SymbolLock
+        )
+    )
+}
+
 /// IME-1: whether a direct key send must be SUPPRESSED because an IME
 /// composition (CJK / dead key) is currently active.
 ///

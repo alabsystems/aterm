@@ -4124,13 +4124,6 @@ impl WordDecorations {
         }
         self.robi_baker.begin_frame(geom.cell_w, geom.cell_h);
 
-        let ch = f32::from(geom.cell_h);
-        // THE sizing law — window-scaled, shared with the brain and the host's
-        // bubble anchor (see `crate::robi::art_rows`).
-        let art_rows = crate::robi::art_rows(&geom);
-        // His ladder keeps its authored proportion against his body, so it
-        // grows with him instead of thinning into a wire beside a big robot.
-        let ladder_w_rows = crate::robi::LADDER_W_ROWS * art_rows / crate::robi::ART_ROWS;
         let mut fp = 0xCBF2_9CE4_8422_2325u64;
         let mut emitted = false;
 
@@ -4138,8 +4131,10 @@ impl WordDecorations {
         if let Some(ladder) = frame.ladder
             && ladder.bot_y > ladder.top_y
         {
-            let lw = (ladder_w_rows * ch).round().max(2.0) as u16;
-            let lh = ((f32::from(lw) / crate::robi::LADDER_ASPECT).round()).max(2.0) as u16;
+            // ONE copy of the segment law (`crate::robi::ladder_tile_px`):
+            // the brain's window clamp reads the same numbers, so the stack's
+            // quarter-tile overshoot below can never poke past a window edge.
+            let (lw, lh) = crate::robi::ladder_tile_px(&geom);
             let key = crate::robi_baker::RobiBakeKey {
                 pose: crate::robi_glyphs_gen::RobiGlyphId::RobiLadder,
                 w: lw,

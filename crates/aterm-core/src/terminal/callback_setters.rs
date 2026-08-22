@@ -83,15 +83,26 @@ impl Terminal {
     /// the primary-content grid (active primary, or the saved primary while an
     /// alt screen is up). A no-op if that grid re-acquired a tiered store while
     /// the reflow ran (see [`Grid::reattach_reflowed_scrollback`]).
-    pub fn finish_resize_offload(&mut self, reflowed: aterm_grid::ReflowedScrollback) {
+    ///
+    /// CONVERGENCE (RFL-3): if the grid's width changed while the reflow ran
+    /// (a superseding drag step, throttled to detach nothing at the time), the
+    /// just-attached store is wrapped at a stale width; it is immediately
+    /// re-detached at the CURRENT width and returned. Drive the returned job
+    /// exactly like the original (`reflow`/`reflow_step`, then this method
+    /// again) — at most one extra pass per settled drag. Dropping it without
+    /// [`Self::abort_resize_offload`] would wedge the detach window — hence
+    /// the `must_use`.
+    #[must_use = "drive the returned convergence job and re-attach it (or abort), or the detach window wedges"]
+    pub fn finish_resize_offload(
+        &mut self,
+        reflowed: aterm_grid::ReflowedScrollback,
+    ) -> Option<aterm_grid::PendingScrollbackReflow> {
         let target = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
         } else {
             Some(&mut self.grid)
         };
-        if let Some(grid) = target {
-            grid.reattach_reflowed_scrollback(reflowed);
-        }
+        target.and_then(|grid| grid.reattach_reflowed_scrollback_or_redetach(reflowed))
     }
 
     /// Abort an in-flight offloaded resize whose reflow will NEVER re-attach — the
@@ -690,7 +701,10 @@ mod offload_tests {
 
         // The expensive rewrap — off-thread in production, inline here.
         let reflowed = pending.reflow();
-        t.finish_resize_offload(reflowed);
+        assert!(
+            t.finish_resize_offload(reflowed).is_none(),
+            "widths agree — no convergence pass expected"
+        );
 
         let after = t.grid.scrollback_lines();
         assert!(
@@ -713,7 +727,10 @@ mod offload_tests {
             .resize_offloading_scrollback(24, 40)
             .expect("alt-screen width change offloads the saved primary's history");
         let reflowed = pending.reflow();
-        t.finish_resize_offload(reflowed);
+        assert!(
+            t.finish_resize_offload(reflowed).is_none(),
+            "widths agree — no convergence pass expected"
+        );
 
         t.process(b"\x1b[?1049l"); // exit alt → saved primary is active again
         let after = t.grid.scrollback_lines();

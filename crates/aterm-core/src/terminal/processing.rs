@@ -394,7 +394,6 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         grid: _,
         modes: _,
         style: _,
-        current_style_id: _,
         charset: _,
         alt_grid: _,
         cursor_save: _,
@@ -442,9 +441,17 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         policy_engine: _,
         damage_epoch: _,
         damage_epoch_counted: _,
+        // DMG-1 damage carrier: extraction-continuity tokens (engine identity
+        // nonce + take-generation). Session-only — they describe who last
+        // extracted a render snapshot and whether the damage session has been
+        // consumed since, never any VT protocol state, so the handler must not
+        // see them.
+        extract_identity: _,
+        extract_gen: _,
         // Cached search index + rebuild counter: session-only, not VT state.
         search_index: _,
         search_index_rebuilds: _,
+        search_index_refreshes: _,
         // In-flight budgeted search: session-only, not VT state.
         budgeted_search: _,
         // Observation Kernel: ephemeral observation-only state, not VT state and

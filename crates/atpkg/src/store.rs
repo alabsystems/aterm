@@ -358,14 +358,113 @@ fn ready_marker_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(marker))
 }
 
-/// Whether `build_dir` holds a COMPLETE install (its sibling completeness marker exists).
+/// The key under which the readiness marker records WHICH SLICE installed the build.
+/// Its spelling is a compatibility surface, not a detail — see [`ready_text_accepts`].
+const READY_PLATFORM_KEY: &str = "platform=";
+
+/// `<arch>-<os>` for the atpkg slice that is RUNNING: `aarch64-macos`, `x86_64-macos`,
+/// `x86_64-linux`, …
+///
+/// **THE HAZARD THIS EXISTS FOR, concretely.** The store path carries no architecture: a
+/// build lives at `store/<program>/<build>/` and is vouched for by the sibling
+/// `<build>.ready`, while `cli::current_triple()` — which decides WHICH artifact row to
+/// download — is a compile-time `cfg(target_arch)`. The shipped atpkg is a UNIVERSAL
+/// binary, so both of its slices can run on the same Apple Silicon Mac: `arch -x86_64`,
+/// an x86_64 parent shell, or Finder ▸ Get Info ▸ "Open using Rosetta" each start the
+/// x86_64 slice, which selects `x86_64-apple-darwin` rows. Without a record of who wrote
+/// it, that slice installs INTEL compilers and provers into the very same
+/// `store/<program>/<build>/` and writes the very same `<build>.ready` — and every later
+/// NATIVE arm64 run reads that marker as "build <n> is installed", skips it, and leaves
+/// the machine on Rosetta-translated solvers forever, silently, with `atpkg status`
+/// reporting a correct and up-to-date toolchain. Unreachable until 2026-08-21, because no
+/// `x86_64-apple-darwin` row had ever been published; reachable the moment index build 12
+/// gave six programs both rows.
+///
+/// So the marker records this value and [`build_is_complete`] refuses one that does not
+/// match: a store populated by the other slice reads as NOT installed and is re-staged
+/// natively. That is a re-download, never an error — the direction that repairs itself.
+///
+/// Deliberately `std::env::consts` and NOT the artifact triple (`aarch64-apple-darwin`):
+/// std exposes no target triple, so spelling one here means duplicating
+/// `cli::current_triple`'s `cfg` ladder in a file that cannot see it, and any later drift
+/// between the two copies would read as a mismatch on EVERY machine — re-downloading a
+/// ~3.2 GB toolchain because of a cosmetic edit. Both consts are per-slice at compile
+/// time (a universal binary is two separately compiled binaries stitched together, so
+/// each slice reports its own), which is the only property the comparison needs.
+fn running_platform() -> String {
+    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
+    let mut s = String::new();
+    s.push_str(std::env::consts::ARCH);
+    s.push('-');
+    s.push_str(std::env::consts::OS);
+    s
+}
+
+/// The platform a marker's text records, or `None` when it records none — which covers
+/// BOTH "written before this field existed" (a bare `ok\n`) and any key this version does
+/// not recognise. An empty value is no record either.
+fn recorded_platform(text: &str) -> Option<&str> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix(READY_PLATFORM_KEY))
+        .map(str::trim)
+        .find(|p| !p.is_empty())
+}
+
+/// Whether a readiness marker with this text vouches for its build to a `running` slice.
+///
+/// **BACKWARD COMPATIBILITY, decided here and only here: an absent platform record means
+/// ACCEPT.** Every marker written before this field existed is a bare `ok\n`, and reading
+/// those as a mismatch would make the first run of this version re-download every
+/// installed program on every existing machine — a multi-GB reinstall storm, to close a
+/// hazard none of those stores can be in (nothing published an `x86_64-apple-darwin` row
+/// before index build 12, so no marker already on disk can be the Intel-under-Rosetta
+/// case). The record is acquired LAZILY instead: the next ordinary install or update of a
+/// program stamps it, and that build is protected from then on. An absent record is
+/// therefore "unknown, and old enough to be safe" — never "corrupt", and never a reason
+/// to reinstall.
+///
+/// The same rule is what makes [`READY_PLATFORM_KEY`]'s spelling a compatibility surface:
+/// re-spelling it silently demotes every marker this version wrote back to "no record"
+/// (harmless — they are accepted) but also unprotects them, so a re-spelling has to keep
+/// reading the old key rather than simply replacing it.
+fn ready_text_accepts(text: &str, running: &str) -> bool {
+    match recorded_platform(text) {
+        None => true,
+        Some(recorded) => recorded == running,
+    }
+}
+
+/// Whether `build_dir` holds a COMPLETE install **for the running slice**: its sibling
+/// completeness marker exists, and the platform that marker records (if any) is ours.
+///
+/// A marker naming the OTHER slice of the universal binary reads as not-complete rather
+/// than as an error, so the build is re-staged from the row `cli::current_triple()`
+/// selects — see [`running_platform`] for the Rosetta hazard that motivates it.
 #[must_use]
 pub fn build_is_complete(build_dir: &Path) -> bool {
-    ready_marker_path(build_dir).is_some_and(|p| p.exists())
+    let Some(marker) = ready_marker_path(build_dir) else {
+        return false;
+    };
+    match std::fs::read_to_string(&marker) {
+        Ok(text) => ready_text_accepts(&text, &running_platform()),
+        // Present, but not readable AS TEXT: a directory planted at the marker path, a
+        // permissions oddity, a filesystem handing back non-UTF-8. `exists()` — the whole
+        // of this predicate before the platform record — answered `true` for all of those,
+        // so keep that answer. This check must not start reporting long-installed builds
+        // as missing because of a byte it never used to read.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 /// Atomically mark `build_dir` complete (temp + rename, so a crash during the write
 /// leaves NO marker rather than a half-written one). Call as the LAST staging step.
+///
+/// The text also records WHICH SLICE of the universal binary installed the build
+/// ([`running_platform`]), so the other slice cannot silently inherit the verdict. Line 1
+/// stays the historical `ok`, so a marker written here still reads — to a human, to
+/// `cat`, and to anything that only asks whether the file is there — exactly like the
+/// ones every earlier version wrote.
 pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     let dest = ready_marker_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
@@ -376,8 +475,13 @@ pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     let mut tmp_name = String::from(".ready.tmp-");
     tmp_name.push_str(&crate::dec_u64(u64::from(std::process::id())));
     let tmp = parent.join(tmp_name);
+    // Manual concat (no `format!`): Trust-gate lowering workaround — see `lib.rs::dec_u64`.
+    let mut body = String::from("ok\n");
+    body.push_str(READY_PLATFORM_KEY);
+    body.push_str(&running_platform());
+    body.push('\n');
     // `fs::write` via `call2`: Trust-gate name-matching workaround — see `lib.rs::call2`.
-    crate::call2(std::fs::write, &tmp, b"ok\n".as_slice())?;
+    crate::call2(std::fs::write, &tmp, body.as_bytes())?;
     std::fs::rename(&tmp, &dest)
 }
 
@@ -603,10 +707,10 @@ pub(crate) fn discard_build(build_dir: &Path) {
     }
 }
 
-/// The default prefix under `home`. On Unix `…/Library/Application Support/aterm/pkg`
+/// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
 /// (a sibling of the updater's `Updates` dir, sharing the hardened support root); on
-/// Windows `%LOCALAPPDATA%\aterm\pkg`. The OS-specific base lives in
-/// [`crate::platform::default_prefix`].
+/// other Unix `…/.local/share/aterm/pkg`; on Windows `%LOCALAPPDATA%\aterm\pkg`. The
+/// OS-specific base lives in [`crate::platform::default_prefix`].
 #[must_use]
 pub fn default_prefix(home: &Path) -> PathBuf {
     crate::platform::default_prefix(home)
@@ -1200,6 +1304,93 @@ mod tests {
         );
         // Refusals are reported with the name the manifest actually asked for.
         assert_eq!(refused, vec!["sudo".to_string()]);
+    }
+
+    /// The Rosetta hazard, end to end: a readiness marker written by the OTHER slice of
+    /// the universal binary must not vouch for the build to this one, and an ordinary
+    /// native re-install must make it vouch again (the store repairs, it does not wedge).
+    #[test]
+    fn a_marker_from_the_other_slice_reads_as_not_installed() {
+        let home = temp_home("readyslice");
+        let build = home.join("store").join("ay").join("18");
+        std::fs::create_dir_all(&build).unwrap();
+        mark_build_ready(&build).unwrap();
+        assert!(build_is_complete(&build));
+
+        let marker = ready_marker_path(&build).unwrap();
+        let text = std::fs::read_to_string(&marker).unwrap();
+        // Non-vacuity: the record is really written, so the assertions below mean something.
+        assert!(
+            text.starts_with("ok\n"),
+            "line 1 stays what every earlier version wrote: {text:?}"
+        );
+        assert_eq!(recorded_platform(&text), Some(running_platform().as_str()));
+
+        // Forge the marker the x86_64 slice would have left behind on this machine.
+        let mut foreign = String::from("ok\n");
+        foreign.push_str(READY_PLATFORM_KEY);
+        foreign.push_str("some-other-arch-macos\n");
+        std::fs::write(&marker, foreign).unwrap();
+        assert!(
+            !build_is_complete(&build),
+            "a build installed by the other architecture is not installed for us"
+        );
+
+        mark_build_ready(&build).unwrap();
+        assert!(
+            build_is_complete(&build),
+            "re-staging natively must clear the mismatch, not leave the build unusable"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// BACKWARD COMPATIBILITY: a store written before the platform record existed holds a
+    /// bare `ok\n`. It must keep reading as installed — treating it as a mismatch would
+    /// re-download the whole toolchain on every machine that already has one.
+    #[test]
+    fn a_legacy_marker_without_a_platform_record_still_reads_as_installed() {
+        let home = temp_home("readylegacy");
+        let build = home.join("store").join("ay").join("18");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(ready_marker_path(&build).unwrap(), b"ok\n").unwrap();
+        assert!(build_is_complete(&build));
+        // And an absent marker is still the "partial install" answer it always was.
+        let _ = std::fs::remove_file(ready_marker_path(&build).unwrap());
+        assert!(!build_is_complete(&build));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The accept rule itself, driven directly: the two tests above can only ever see the
+    /// ONE platform this test binary was compiled for, so on any single runner they would
+    /// hold for an implementation that never compared anything.
+    #[test]
+    fn ready_text_accepts_only_an_absent_or_matching_record() {
+        assert!(ready_text_accepts("ok\n", "aarch64-macos"));
+        assert!(ready_text_accepts("", "aarch64-macos"));
+        assert!(ready_text_accepts(
+            "ok\nplatform=aarch64-macos\n",
+            "aarch64-macos"
+        ));
+        // THE hazard case: the Intel slice's marker, read by the native arm64 slice.
+        assert!(!ready_text_accepts(
+            "ok\nplatform=x86_64-macos\n",
+            "aarch64-macos"
+        ));
+        // …and symmetrically, so neither direction inherits the other's install.
+        assert!(!ready_text_accepts(
+            "ok\nplatform=aarch64-macos\n",
+            "x86_64-macos"
+        ));
+        // A stray `\r` (a marker copied through a Windows-y tool) is whitespace, not a
+        // different architecture.
+        assert!(ready_text_accepts(
+            "ok\r\nplatform=aarch64-macos\r\n",
+            "aarch64-macos"
+        ));
+        // An empty value carries no information, and an unrecognised key is not a record:
+        // both are "absent", which is accept — never a reinstall.
+        assert!(ready_text_accepts("ok\nplatform=\n", "aarch64-macos"));
+        assert!(ready_text_accepts("ok\narch=x86_64-macos\n", "aarch64-macos"));
     }
 
     #[test]

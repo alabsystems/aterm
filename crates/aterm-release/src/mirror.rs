@@ -36,8 +36,9 @@
 //!
 //! ## What is deliberately NOT mirrored
 //!
-//! Exactly the client-required set crosses over: the manifest, the DMG, the
-//! updater zip, and the detached signature when the cut is signed. The provenance
+//! Exactly the client-required set plus the human-required `.sha256` sidecars
+//! crosses over: the manifest, the DMG, the updater zip, both containers'
+//! sidecars, and the detached signature when the cut is signed. The provenance
 //! text and the dSYM archive stay private — they are debugging aids for the owner,
 //! the client never reads them, and a public channel should carry the smallest
 //! surface that still satisfies the updater. Keeping the set exact also makes
@@ -194,6 +195,17 @@ pub fn dmg_asset_name(version: &str) -> String {
     format!("aterm-{version}.dmg")
 }
 
+/// The stable, version-independent twin of the DMG every release also carries,
+/// so `releases/latest/download/aterm.dmg` is a permanent direct-download URL
+/// (the alab.systems Download button points at it). Byte-identical to the
+/// [`dmg_asset_name`] asset of the same cut. NO client elects this name:
+/// install.sh and the in-app updater bind to the manifest's version-bound
+/// `dmg` field, so the twin exists purely for the browser download lane.
+#[must_use]
+pub fn stable_dmg_asset_name() -> String {
+    "aterm.dmg".to_string()
+}
+
 /// The canonical updater-container (zip) asset name for a release version. Same
 /// contract as [`dmg_asset_name`]: the client re-derives this string from the TAG
 /// and refuses a manifest whose `zip` field disagrees.
@@ -202,14 +214,38 @@ pub fn zip_asset_name(version: &str) -> String {
     format!("aterm-{version}-mac.zip")
 }
 
+/// The `.sha256` sidecar name for a container asset — the same `<asset>.sha256`
+/// shape the Linux tarball already ships, so one verification instruction covers
+/// every download on the release.
+#[must_use]
+pub fn sha256_sidecar_name(asset: &str) -> String {
+    format!("{asset}.sha256")
+}
+
+/// The `.sha256` sidecar's entire content: `<hash>  <filename>` — TWO spaces,
+/// newline-terminated — the exact record `shasum -a 256 -c` accepts. The digest
+/// is the in-process one computed at packaging time (dmg.rs), so the sidecar can
+/// never state anything the manifest does not.
+#[must_use]
+pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
+    format!("{sha256}  {asset}\n")
+}
+
 /// The EXACT asset set a mirrored release must carry, sorted, as the deployed
 /// updater requires it: the appcast, the version-bound DMG, the version-bound
-/// updater zip, and — only when the cut is signed — the detached signature the
-/// pinned client demands.
+/// updater zip, the stable `aterm.dmg` download twin, the two `.sha256`
+/// sidecars a human verifies those containers with, and — only when the cut is
+/// signed — the detached signature the pinned client demands.
 ///
 /// The zip is unconditional because every manifest this cutter emits names one,
 /// and a manifest naming an asset the channel does not carry is exactly the
-/// live-but-unelectable state this module exists to prevent.
+/// live-but-unelectable state this module exists to prevent. The stable twin is
+/// unconditional for the inverse reason: the website's
+/// `releases/latest/download/aterm.dmg` button 404s on any release that drops
+/// it. The sidecars are unconditional for the humans, not the updater: the DMG
+/// is the manual download, its digest lives only inside the appcast TOML nobody
+/// opens, and a download nobody can check is a funnel that trains people not to
+/// check.
 ///
 /// `rostered` adds the master-signed machine roster and its signature. It belongs in
 /// the CLIENT-REQUIRED set rather than the private-debugging set for a blunt reason:
@@ -226,6 +262,9 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
         manifest_out::MANIFEST_ASSET.to_string(),
         dmg_asset_name(version),
         zip_asset_name(version),
+        stable_dmg_asset_name(),
+        sha256_sidecar_name(&dmg_asset_name(version)),
+        sha256_sidecar_name(&zip_asset_name(version)),
     ];
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());
@@ -506,13 +545,18 @@ update_channel = \"someone/else\"
     #[test]
     fn required_asset_set_is_exactly_what_the_updater_elects() {
         // Unsigned (Tier REPO, the default): appcast + version-bound DMG + the
-        // version-bound zip the in-app updater actually stages from.
+        // version-bound zip the in-app updater actually stages from + the
+        // stable download twin the website button points at + the two
+        // `.sha256` sidecars a human verifies those containers with.
         assert_eq!(
             required_asset_names("0.5.0", false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
+                "aterm-0.5.0-mac.zip.sha256".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
-                "aterm-appcast.toml".to_string()
+                "aterm-0.5.0.dmg.sha256".to_string(),
+                "aterm-appcast.toml".to_string(),
+                "aterm.dmg".to_string(),
             ]
         );
         // Signed (Tier SIG): a pinned client REFUSES a head with no .sig.
@@ -520,9 +564,12 @@ update_channel = \"someone/else\"
             required_asset_names("0.5.0", true, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
+                "aterm-0.5.0-mac.zip.sha256".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
+                "aterm-0.5.0.dmg.sha256".to_string(),
                 "aterm-appcast.toml".to_string(),
                 "aterm-appcast.toml.sig".to_string(),
+                "aterm.dmg".to_string(),
             ]
         );
         // The names are the client's literals, not a lookalike.
@@ -530,6 +577,22 @@ update_channel = \"someone/else\"
         assert_eq!(manifest_out::MANIFEST_SIG_ASSET, "aterm-appcast.toml.sig");
         assert_eq!(dmg_asset_name("1.2.3"), "aterm-1.2.3.dmg");
         assert_eq!(zip_asset_name("1.2.3"), "aterm-1.2.3-mac.zip");
+        assert_eq!(
+            sha256_sidecar_name(&dmg_asset_name("1.2.3")),
+            "aterm-1.2.3.dmg.sha256"
+        );
+        assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
+    }
+
+    /// The sidecar is only worth publishing if `shasum -a 256 -c` accepts it:
+    /// hex digest, TWO spaces, exact asset name, one trailing newline.
+    #[test]
+    fn sidecar_contents_are_shasum_check_records() {
+        let hash = "c6".repeat(32);
+        assert_eq!(
+            sha256_sidecar_contents(&hash, "aterm-0.5.0.dmg"),
+            format!("{hash}  aterm-0.5.0.dmg\n")
+        );
     }
 
     #[test]
@@ -537,12 +600,18 @@ update_channel = \"someone/else\"
         let ok = vec![
             "aterm-appcast.toml".to_string(),
             "aterm-0.5.0.dmg".to_string(),
+            "aterm-0.5.0.dmg.sha256".to_string(),
             "aterm-0.5.0-mac.zip".to_string(),
+            "aterm-0.5.0-mac.zip.sha256".to_string(),
+            "aterm.dmg".to_string(),
         ];
         validate_mirror_asset_set(&ok, "0.5.0", false, false).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
             "aterm-0.5.0-mac.zip".to_string(),
+            "aterm-0.5.0-mac.zip.sha256".to_string(),
+            "aterm-0.5.0.dmg.sha256".to_string(),
+            "aterm.dmg".to_string(),
             "aterm-0.5.0.dmg".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
@@ -552,7 +621,13 @@ update_channel = \"someone/else\"
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
             // no appcast at all -> the release is skipped by selection
             (
-                vec!["aterm-0.5.0.dmg", "aterm-0.5.0-mac.zip"],
+                vec![
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
+                    "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
+                ],
                 "0.5.0",
                 false,
                 "aterm-appcast.toml",
@@ -563,7 +638,10 @@ update_channel = \"someone/else\"
                     "aterm-appcast.toml",
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
                 ],
                 "0.5.0",
                 false,
@@ -574,23 +652,51 @@ update_channel = \"someone/else\"
                 vec![
                     "aterm-appcast.toml",
                     "aterm-0.61.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
                 ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0.dmg",
             ),
-            // generic DMG name -> no asset matches manifest.dmg
+            // the stable twin alone cannot substitute for the version-bound
+            // name the manifest elects -> the canonical DMG is still missing
             (
-                vec!["aterm-appcast.toml", "aterm.dmg", "aterm-0.5.0-mac.zip"],
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm.dmg",
+                    "aterm-0.5.0.dmg.sha256",
+                    "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0.dmg",
             ),
+            // the stable download twin never crossed -> the website's
+            // releases/latest/download/aterm.dmg button 404s on this head
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0-mac.zip",
+                ],
+                "0.5.0",
+                false,
+                "aterm.dmg",
+            ),
             // the updater container never crossed -> the manifest names a zip the
             // channel does not carry, and every in-app stage 404s
             (
-                vec!["aterm-appcast.toml", "aterm-0.5.0.dmg"],
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
+                ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0-mac.zip",
@@ -600,18 +706,38 @@ update_channel = \"someone/else\"
                 vec![
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
                     "aterm-0.61.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
                 ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0-mac.zip",
+            ),
+            // a container without its sidecar -> the human download the release
+            // page advertises cannot be verified the way the notes instruct
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
+                ],
+                "0.5.0",
+                false,
+                "aterm-0.5.0.dmg.sha256",
             ),
             // signed cut whose signature never crossed -> pinned clients refuse
             (
                 vec![
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
                 ],
                 "0.5.0",
                 true,
@@ -622,7 +748,10 @@ update_channel = \"someone/else\"
                 vec![
                     "aterm-appcast.toml",
                     "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
                     "aterm-0.5.0-dSYM.zip",
                 ],
                 "0.5.0",

@@ -28,6 +28,11 @@ termwiz = { version = "0.23", default-features = false }
 # Differential oracle (tests/differential.rs): property-based byte-stream
 # generation, aterm vs alacritty on identical input.
 proptest = { workspace = true }
+# The wasm renderer substrate, built for the HOST here: `wasm_frame_gate` prices
+# the WF-1 settled-frame skip against the same crate's ungated render loop. It
+# is an rlib as well as a cdylib, and its closure is platform-free, so it links
+# natively without a wasm32 toolchain.
+aterm-wasm = { path = "../aterm-wasm" }
 
 [[bench]]
 name = "engine_throughput"
@@ -42,11 +47,19 @@ name = "extras_erase"
 harness = false
 
 [[bench]]
+name = "scrolloff_extract"
+harness = false
+
+[[bench]]
 name = "comparative"
 harness = false
 
 [[bench]]
 name = "end_to_end"
+harness = false
+
+[[bench]]
+name = "wasm_frame_gate"
 harness = false
 
 [lints]

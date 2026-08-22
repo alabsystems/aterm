@@ -20,6 +20,13 @@ pub struct FileLock {
     _file: File,
 }
 
+/// How often [`FileLock::acquire_within`] re-tests a held lock. Matches the
+/// Windows branch's cadence: short enough that the common "holder finishes in
+/// millis" case costs one tick, long enough that a full wait is ~20 syscalls a
+/// second rather than a spin.
+#[cfg(unix)]
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 impl FileLock {
     /// Acquire `LOCK_EX` on `path` (created `0600` if absent), blocking until the
     /// lock is available. Blocking is fine: this runs before the window exists and
@@ -30,9 +37,9 @@ impl FileLock {
     // by design (a raced path costs a retry, never corruption). Audited
     // (update-atpkg).
     #[cfg_attr(trust_verify, trust::skip)]
-    pub fn acquire(path: &Path) -> io::Result<Self> {
+    fn open_lock_file(path: &Path) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -43,13 +50,68 @@ impl FileLock {
             // release the transaction lock atomically with successful image
             // replacement, while an exec error leaves it held for rollback.
             .custom_flags(libc::O_CLOEXEC)
-            .open(path)?;
+            .open(path)
+    }
+
+    #[cfg(unix)]
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        let file = Self::open_lock_file(path)?;
         // std's `File::lock` IS `flock(fd, LOCK_EX)` on unix — the same syscall with
         // the same blocking semantics, released on close/drop exactly as a direct
         // `libc::flock` call, and failures map to the same `io::Error`. Using the
         // safe std wrapper keeps this crate free of direct FFI here.
         file.lock()?;
         Ok(Self { _file: file })
+    }
+
+    /// Acquire the lock, giving up after `limit` instead of waiting forever.
+    ///
+    /// The blocking [`acquire`](Self::acquire) is correct wherever an indefinite
+    /// wait is merely a delay — a background stage, a durable counter, a
+    /// publication transaction that returns in millis. It is NOT correct on the
+    /// LAUNCH path. The apply lock is taken at the top of `main`, before the
+    /// window exists, so a holder that is SIGSTOPped, paused under a debugger, or
+    /// wedged on an unplugged volume turns "aterm starts a moment later" into
+    /// "aterm never starts", with no window to say why and nothing to click.
+    ///
+    /// Windows has had a bounded wait since it was written, for exactly this
+    /// reason (see the branch below); unix had none, purely because `flock`
+    /// offers blocking as its default. Callers map the timeout to a normal launch
+    /// on the build already installed, which is always a safe outcome.
+    #[cfg(unix)]
+    pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
+        let file = Self::open_lock_file(path)?;
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                // Held by someone else: the ONLY retryable outcome.
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "another process has held the update lock for more than {}s",
+                                limit.as_secs()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(LOCK_POLL);
+                }
+                // A real error (EBADF, ENOLCK, an unsupported filesystem) is
+                // PERMANENT — retrying it just burns the budget before surfacing
+                // the same failure, exactly as the Windows branch reasons.
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
+    }
+
+    /// Windows: the lock is already a bounded retry loop, so the bounded and
+    /// blocking spellings are the same operation. `limit` is accepted for a
+    /// single call shape across platforms.
+    #[cfg(windows)]
+    pub fn acquire_within(path: &Path, _limit: std::time::Duration) -> io::Result<Self> {
+        Self::acquire(path)
     }
 
     /// Windows approximation of the advisory lock: open the file with
@@ -144,6 +206,54 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
     match (a.components().next(), b.components().next()) {
         (Some(Component::Prefix(pa)), Some(Component::Prefix(pb))) => pa == pb,
         _ => false,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_lock_tests {
+    use super::FileLock;
+    use std::time::{Duration, Instant};
+
+    /// THE FIX. A held lock must surface as a timeout, not as a launch that never
+    /// finishes. `flock` is per open-file-description, so a second handle in this
+    /// same process contends exactly as another process would.
+    #[test]
+    fn acquire_within_times_out_while_another_holder_has_it() {
+        let dir = std::env::temp_dir().join(format!("aterm-bounded-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("apply.lock");
+
+        let held = FileLock::acquire(&path).expect("first holder takes the lock");
+        let started = Instant::now();
+        let error = match FileLock::acquire_within(&path, Duration::from_millis(200)) {
+            Ok(_) => panic!("a held lock must not be acquirable"),
+            Err(error) => error,
+        };
+        let waited = started.elapsed();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+        assert!(waited >= Duration::from_millis(150), "gave up too early: {waited:?}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}: it blocked");
+
+        // And once the holder goes, the same call succeeds immediately.
+        drop(held);
+        let reacquired = Instant::now();
+        FileLock::acquire_within(&path, Duration::from_secs(5)).expect("free lock is takeable");
+        assert!(reacquired.elapsed() < Duration::from_secs(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An UNCONTENDED lock must cost essentially nothing — the bounded path must
+    /// not introduce a poll-interval floor on the common case.
+    #[test]
+    fn acquire_within_is_immediate_when_the_lock_is_free() {
+        let dir = std::env::temp_dir().join(format!("aterm-bounded-lock-free-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("apply.lock");
+        let started = Instant::now();
+        let _lock = FileLock::acquire_within(&path, Duration::from_secs(10)).expect("free lock");
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

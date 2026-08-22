@@ -5,12 +5,14 @@
 
 //! Core trigram search index with bloom filter acceleration.
 
-use aterm_hash::{FxBuildHasher, FxHashMap};
+use aterm_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::bitmap::SparseBitmap;
 
 use super::bloom::BloomFilter;
-use super::iterators::{CandidateSource, SearchMatchIterator, SearchMatchReverseIterator};
+use super::iterators::{
+    CandidateSource, SearchMatchIterator, SearchMatchReverseIterator, next_literal_match,
+};
 use super::types::{DirectedFind, SearchDirection, SearchMatch, SearchResult, SearchResults};
 use crate::grapheme::{
     ColumnMap, LowerByteMap, LowerNeed, lower_fold, lower_fold_char, lower_fold_into, lower_need,
@@ -342,6 +344,42 @@ impl CaseInsensitiveMatcher {
         }
         true
     }
+
+    /// Fold-level occurrence: does `text` contain the folded query AT ALL —
+    /// including occurrences whose original span resolves to ZERO display
+    /// columns, which [`visit_matches`](Self::visit_matches) deliberately
+    /// drops from results (`start_col == end_col`)?
+    ///
+    /// Incremental narrowing frames (isearch, SA-1) must be built from
+    /// OCCURRENCES, not reported matches. A line can hold a genuine
+    /// occurrence of `q` and report NO match, while `q + c` reports one:
+    /// inside a prepend cluster (U+0600 + digit) or across a zero-width
+    /// character (U+200B) or a combining mark, the short query spans no
+    /// display column and the one-char-longer query crosses the boundary and
+    /// does — so a reported-match frame would silently lose that line.
+    /// Fold-level containment carries the exact prefix property narrowing
+    /// rests on (`lower_fold(q + c) == lower_fold(q) + lower_fold(c)`,
+    /// per-char by construction of [`lower_fold_into`]), with no
+    /// width/column semantics in the argument at all.
+    pub(crate) fn has_occurrence(&mut self, text: &str) -> bool {
+        if self.lower_query.is_empty() {
+            return false;
+        }
+        if text.is_ascii() && self.lower_query.is_ascii() {
+            // Allocation-free ASCII containment (any needle length): per-byte
+            // ASCII lowering IS the fold for ASCII text, so this equals
+            // "folded text contains folded query" without materializing either.
+            return AsciiCaseInsensitiveMatches::new(text, &self.lower_query)
+                .next()
+                .is_some();
+        }
+        // Same fold the scan buffer and the indexed trigrams use, so the
+        // occurrence notion is byte-identical to the matcher's.
+        self.lower_buf.clear();
+        self.lower_buf
+            .extend(text.chars().flat_map(lower_fold_char));
+        self.lower_buf.contains(self.lower_query.as_str())
+    }
 }
 
 impl SearchIndex {
@@ -573,6 +611,7 @@ impl SearchIndex {
         // path — `evict_oldest_lines`, `retain_history_from` — drops from
         // `lines` and the postings under the same watermark, so a row still
         // present in `lines` is still present in each of its posting lists.)
+        let mut replaced_old: Option<String> = None;
         let unchanged = match self.lines.remove(&line_num) {
             Some(old_text) if old_text == text => {
                 // Put the owned String straight back: no reallocation here, and
@@ -581,9 +620,14 @@ impl SearchIndex {
                 true
             }
             Some(old_text) => {
-                if self.maintain_trigrams {
-                    self.remove_trigrams(line_num, &old_text);
-                }
+                // A GENUINELY changed row (SA-3): defer the posting work to the
+                // set-diff path below, which touches only the trigrams whose
+                // membership actually changes instead of round-tripping every
+                // posting list of BOTH texts (remove-all + insert-all was
+                // ~2 × row-trigrams full-list decode/re-encode cycles for an
+                // edit that typically shares almost all its trigrams — the
+                // echoed prompt line, a partial last row).
+                replaced_old = Some(old_text);
                 false
             }
             None => false,
@@ -597,7 +641,11 @@ impl SearchIndex {
         // the Unicode arm's fold into the scratch buffer. Everything after this
         // block (the line/column-map cache, the counters, eviction) still runs
         // identically for it.
-        if self.maintain_trigrams {
+        if self.maintain_trigrams
+            && let Some(old_text) = replaced_old
+        {
+            self.reindex_changed_row_postings(line_u32, &old_text, text);
+        } else if self.maintain_trigrams {
             // Add all trigrams from this line (original case).
             for window in bytes.windows(3) {
                 let trigram: [u8; 3] = [window[0], window[1], window[2]];
@@ -623,7 +671,7 @@ impl SearchIndex {
             // for pure-ASCII text with no uppercase letter, `to_lowercase()` is
             // the identity, so the lowered trigrams equal the original-case ones
             // already inserted above. The predicate lives in `lower_need` and is
-            // shared with `remove_trigrams`/`rebuild_bloom` so insert/remove/
+            // shared with `reindex_changed_row_postings`/`rebuild_bloom` so insert/remove/
             // rebuild stay symmetric by construction.
             //
             // Neither non-identity arm allocates per line any more: pure-ASCII
@@ -704,33 +752,89 @@ impl SearchIndex {
         line_num
     }
 
-    /// Remove trigrams for a line (internal helper).
-    ///
-    /// Prunes empty bitmaps from the trigrams map to prevent unbounded growth (#2111).
-    fn remove_trigrams(&mut self, line_num: usize, text: &str) {
+    /// Collect the full trigram set one text contributes to the POSTING maps:
+    /// the original-case windows plus the lowered pass exactly when
+    /// [`lower_need`] says the insert path ran it (the shared classifier that
+    /// keeps insert/remove/rebuild symmetric by construction — #7398, #7470).
+    fn posting_trigram_set(&mut self, text: &str) -> FxHashSet<[u8; 3]> {
         let bytes = text.as_bytes();
-        let line_u32 = line_as_u32(line_num);
-
-        // Remove original-case trigrams.
+        let mut set: FxHashSet<[u8; 3]> =
+            FxHashSet::with_capacity_and_hasher(bytes.len().saturating_mul(2), FxBuildHasher);
         for window in bytes.windows(3) {
-            let trigram: [u8; 3] = [window[0], window[1], window[2]];
-            if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
-                bitmap.remove(line_u32);
-                if bitmap.is_empty() {
-                    self.trigrams.remove(&trigram);
+            set.insert([window[0], window[1], window[2]]);
+        }
+        match lower_need(text) {
+            LowerNeed::None => {}
+            LowerNeed::Ascii => {
+                for window in bytes.windows(3) {
+                    set.insert([
+                        window[0].to_ascii_lowercase(),
+                        window[1].to_ascii_lowercase(),
+                        window[2].to_ascii_lowercase(),
+                    ]);
+                }
+            }
+            LowerNeed::Unicode => {
+                lower_fold_into(text, &mut self.lower_scratch);
+                for window in self.lower_scratch.as_bytes().windows(3) {
+                    set.insert([window[0], window[1], window[2]]);
                 }
             }
         }
+        set
+    }
 
-        // Remove Unicode-lowercased trigrams (#7398, #7470).
-        //
-        // Mirrors `index_line` arm for arm through the shared `lower_need`
-        // classifier: when lowercasing is the identity (pure-ASCII, no
-        // uppercase) the lowered pass was never inserted, so it must not be
-        // removed either, or removal would double-delete shared trigrams and
-        // leak/corrupt posting lists. The ASCII arm derives the same lowered
-        // trigrams from the original bytes; the Unicode arm reuses the index's
-        // scratch buffer. Both produce byte-identical trigrams to the insert.
+    /// Posting + bloom maintenance for a row whose text GENUINELY changed
+    /// (SA-3): touch only the trigrams whose membership actually changes.
+    ///
+    /// The predecessor (`remove_trigrams(old)` + insert-every-new-trigram)
+    /// paid a full posting-list decode → splice → re-encode round trip TWICE
+    /// per trigram occurrence of BOTH texts — O(list length) each, ~160 round
+    /// trips for one edited 80-column row, even though a typical in-place edit
+    /// (the echoed prompt line, a partial last row) shares almost every
+    /// trigram between old and new text. For a SHARED trigram the
+    /// remove-then-reinsert was the identity on the list — an EXPENSIVE
+    /// identity. This does set-difference instead:
+    ///
+    /// - old ∩ new: posting list untouched. State-identical, not merely
+    ///   results-identical: every mutator writes the canonical minimal
+    ///   delta+varint encoding, so remove(row)-then-insert(row) would have
+    ///   rebuilt byte-for-byte what was already there (the same canonicality
+    ///   argument the unchanged-row skip in [`index_line`] rests on — even a
+    ///   shared trigram whose list momentarily emptied and was pruned would be
+    ///   recreated with the identical single-value encoding).
+    /// - old ∖ new: removed (and pruned when emptied — #2111), exactly as
+    ///   `remove_trigrams` did.
+    /// - new ∖ old: inserted, exactly as the insert pass did. The `new_seen`
+    ///   gate also spares repeated windows the old path's per-duplicate
+    ///   decode + binary-search no-op on non-tail rows.
+    ///
+    /// The BLOOM inserts are NOT diffed: `bloom.item_count()` drives the
+    /// `is_saturated()` rebuild cadence, which is observable
+    /// (`bloom_is_saturated`, the lifecycle differential oracles), so every
+    /// new-text window is inserted exactly as before. Cost scales with the
+    /// EDIT's trigram delta, not the row's trigram count; the O(list-length)
+    /// cost per genuinely-changed trigram remains (that is the posting
+    /// CONTAINER's shape — blocked postings are the follow-up category fix).
+    ///
+    /// [`index_line`]: Self::index_line
+    /// [`lower_need`]: crate::grapheme::lower_need
+    fn reindex_changed_row_postings(&mut self, line_u32: u32, old_text: &str, text: &str) {
+        let old_set = self.posting_trigram_set(old_text);
+        let bytes = text.as_bytes();
+        let mut new_seen: FxHashSet<[u8; 3]> =
+            FxHashSet::with_capacity_and_hasher(bytes.len().saturating_mul(2), FxBuildHasher);
+
+        // Original-case pass: bloom ALWAYS (cadence parity — see above),
+        // postings only for trigrams the old text did not already contribute.
+        for window in bytes.windows(3) {
+            let trigram: [u8; 3] = [window[0], window[1], window[2]];
+            self.bloom.insert_bytes(&trigram);
+            if new_seen.insert(trigram) && !old_set.contains(&trigram) {
+                self.trigrams.entry(trigram).or_default().insert(line_u32);
+            }
+        }
+        // Lowered pass, gated by the SHARED classifier (see `index_line`).
         match lower_need(text) {
             LowerNeed::None => {}
             LowerNeed::Ascii => {
@@ -740,24 +844,36 @@ impl SearchIndex {
                         window[1].to_ascii_lowercase(),
                         window[2].to_ascii_lowercase(),
                     ];
-                    if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
-                        bitmap.remove(line_u32);
-                        if bitmap.is_empty() {
-                            self.trigrams.remove(&trigram);
-                        }
+                    self.bloom.insert_bytes(&trigram);
+                    if new_seen.insert(trigram) && !old_set.contains(&trigram) {
+                        self.trigrams.entry(trigram).or_default().insert(line_u32);
                     }
                 }
             }
             LowerNeed::Unicode => {
                 lower_fold_into(text, &mut self.lower_scratch);
+                // Disjoint-field borrows (scratch read, bloom/trigrams
+                // written) — the exact pattern `index_line`'s Unicode arm
+                // already uses.
                 for window in self.lower_scratch.as_bytes().windows(3) {
                     let trigram: [u8; 3] = [window[0], window[1], window[2]];
-                    if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
-                        bitmap.remove(line_u32);
-                        if bitmap.is_empty() {
-                            self.trigrams.remove(&trigram);
-                        }
+                    self.bloom.insert_bytes(&trigram);
+                    if new_seen.insert(trigram) && !old_set.contains(&trigram) {
+                        self.trigrams.entry(trigram).or_default().insert(line_u32);
                     }
+                }
+            }
+        }
+        // Removals: trigrams only the OLD text contributed (prune emptied
+        // lists exactly as `remove_trigrams` did — #2111).
+        for trigram in old_set {
+            if new_seen.contains(&trigram) {
+                continue;
+            }
+            if let Some(bitmap) = self.trigrams.get_mut(&trigram) {
+                bitmap.remove(line_u32);
+                if bitmap.is_empty() {
+                    self.trigrams.remove(&trigram);
                 }
             }
         }
@@ -1214,6 +1330,70 @@ impl SearchIndex {
         self.eviction_occurred = true;
     }
 
+    /// Drop cached absolute rows below `first_retained_line` WITHOUT recording
+    /// an eviction — the complete-retention twin of [`retain_history_from`].
+    ///
+    /// [`retain_history_from`] models "rows the INDEX can no longer serve": an
+    /// honesty event (results become incomplete, the retained watermark
+    /// advances). This models "rows the TERMINAL no longer retains at all":
+    /// after grid retention advances (a full ring evicting one line per
+    /// append, a scrollback-limit or memory-budget shrink), the dropped rows
+    /// are not un-searchable content — they are nonexistent content, and a
+    /// from-scratch rebuild over the surviving rows would start a FRESH index
+    /// reporting COMPLETE results. The terminal's incremental refresh
+    /// (`Terminal::indexed_search`) uses this so its observable state
+    /// (matches, [`results_may_be_incomplete`], [`lowest_retained_line`]) is
+    /// byte-identical to that from-scratch rebuild — the refresh's
+    /// behavior-identity contract — instead of diverging into a sticky
+    /// `incomplete` the rebuild path never reported.
+    ///
+    /// Callers must only use this when the dropped rows are really gone from
+    /// the source buffer; for index-side capacity trimming keep
+    /// [`retain_history_from`], which reports honestly.
+    ///
+    /// [`retain_history_from`]: Self::retain_history_from
+    /// [`results_may_be_incomplete`]: Self::results_may_be_incomplete
+    /// [`lowest_retained_line`]: Self::lowest_retained_line
+    pub fn drop_history_below(&mut self, first_retained_line: usize) {
+        let old_first = self.first_cached_line.min(first_retained_line);
+        if first_retained_line <= old_first {
+            return;
+        }
+        // Same two-strategy stale-key collection as `retain_history_from`:
+        // small ordinary advances walk the removed numeric prefix; a sparse or
+        // large jump switches to one bounded cache scan.
+        let distance = first_retained_line.saturating_sub(old_first);
+        let stale: Vec<usize> = if distance <= self.lines.len().saturating_mul(2) {
+            (old_first..first_retained_line).collect()
+        } else {
+            self.lines
+                .keys()
+                .copied()
+                .filter(|line| *line < first_retained_line)
+                .collect()
+        };
+        for line in stale {
+            self.lines.remove(&line);
+            self.column_maps.remove(&line);
+        }
+        // One batched posting front-drain, exactly as `retain_history_from`
+        // (see there); only the honesty bookkeeping differs.
+        let watermark = line_as_u32(first_retained_line);
+        self.trigrams.retain(|_, bitmap| {
+            bitmap.drop_below(watermark);
+            !bitmap.is_empty()
+        });
+        self.first_cached_line = first_retained_line.min(self.line_count);
+        // Deliberately NOT touched: `lowest_retained_line` /
+        // `eviction_occurred`. A from-scratch rebuild over the surviving rows
+        // reports complete results with a zero watermark, and this drop must
+        // be observationally indistinguishable from that rebuild. The bloom
+        // filter keeps the dropped rows' stale bits (it is a NEGATIVE filter:
+        // stale bits cost false-positive candidate visits, never results);
+        // saturation-triggered rebuilds resize it from live lines exactly as
+        // on the incremental append path.
+    }
+
     /// Current maximum cached-lines cap.
     #[must_use]
     pub fn max_cached_lines(&self) -> usize {
@@ -1376,6 +1556,23 @@ const REGEX_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 /// bounds per-query memory even for patterns that pass the NFA size gate.
 #[cfg(feature = "regex")]
 const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
+
+/// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward
+/// batch results plus the occurrence-line frame that seeds the next
+/// incremental-search narrowing step (SA-1 isearch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarrowedSearch {
+    /// Batch results, ascending — identical to the forward batch path over
+    /// the same candidate universe (see the method docs).
+    pub results: SearchResults,
+    /// Ascending, deduplicated retained lines whose text CONTAINS the query
+    /// at the fold level — occurrences, a strict superset of reported-match
+    /// lines (zero-display-width occurrences count; reported matches do not
+    /// include them). `None` when the walk hit the batch cap: a truncated
+    /// frame would break the narrowing subset property, so the caller must
+    /// reseed from the engine.
+    pub occurrence_lines: Option<Vec<u32>>,
+}
 
 /// Error returned when search options are invalid (e.g., regex feature not enabled).
 #[non_exhaustive]
@@ -1696,6 +1893,234 @@ impl SearchIndex {
             }
         }
         matches
+    }
+
+    /// Cheap UPPER BOUND on how many candidate lines this index's OWN
+    /// machinery would visit for a literal `query` — the number a narrowing
+    /// frame has to beat to be worth using.
+    ///
+    /// `None` means the engine has no selectivity to offer: a query shorter
+    /// than one trigram range-scans every retained line, so any frame (a
+    /// subset of retained lines) is at least as cheap. Otherwise the bound is
+    /// the SMALLEST involved posting list — the candidate driver walks exactly
+    /// that list and binary-searches the rest — with `Some(0)` for a bloom
+    /// rejection or an absent trigram (the engine visits nothing at all).
+    ///
+    /// Why callers need it (SA-1): narrowing is only a win while the frame is
+    /// smaller than the index's own candidate set. The keystroke that turns a
+    /// COMMON prefix into a RARE query inverts that — a purpose-made probe
+    /// over 60k log-shaped lines measured the "size=" → "size=9" step at
+    /// 2.60 ms off a 60 000-line frame against 0.085 ms through the trigram
+    /// intersection, a 30x regression on exactly the keystroke whose latency
+    /// the user feels most. A frame is a subset property, not a cost
+    /// guarantee; policy layers compare against this bound and pass
+    /// `prev_lines: None` when the engine would visit fewer lines.
+    #[must_use]
+    pub fn literal_candidate_bound(&self, query: &str, case_sensitive: bool) -> Option<u64> {
+        let folded;
+        let effective = if case_sensitive {
+            query
+        } else {
+            folded = lower_fold(query);
+            folded.as_str()
+        };
+        if effective.len() < 3 {
+            // Range scan over every retained line: no selectivity to offer.
+            return None;
+        }
+        if self.lines.is_empty() || !self.might_contain(effective) {
+            return Some(0);
+        }
+        // A missing trigram means the intersection is empty before it starts.
+        let Some(postings) = self.posting_lists(effective) else {
+            return Some(0);
+        };
+        Some(
+            postings
+                .iter()
+                .map(|bitmap| bitmap.len())
+                .min()
+                .unwrap_or(0),
+        )
+    }
+
+    /// One incremental-search narrowing step (SA-1, isearch): the FORWARD
+    /// literal batch walk over an optional EXPLICIT candidate-line list,
+    /// returning the batch results PLUS the fold-level occurrence lines that
+    /// seed the next step.
+    ///
+    /// ## Contract
+    ///
+    /// - `prev_lines: None` runs the engine's own candidate machinery
+    ///   (short-query range / bloom + posting intersection) and is
+    ///   results-identical to
+    ///   [`search_results_opts_direction`](Self::search_results_opts_direction)
+    ///   with [`SearchDirection::Forward`] — same per-line verifiers
+    ///   (`next_literal_match` / `CaseInsensitiveMatcher::visit_matches`),
+    ///   same candidate enumeration, same cap edge (oldest retained). Pinned
+    ///   by the differential battery in `tests.rs`.
+    /// - `prev_lines: Some(frame)` replaces candidate enumeration with the
+    ///   given ascending line list and touches NO posting list and NO bloom
+    ///   probe — the per-keystroke win. The caller must pass a frame obtained
+    ///   from a previous step for a query of which this `query` is a
+    ///   byte-prefix extension, against the SAME index state. Soundness: a
+    ///   reported match of `query` on a line implies the line's folded text
+    ///   contains `lower_fold(query)` (case-insensitive) / its bytes contain
+    ///   `query` (case-sensitive), which implies containment of every prefix's
+    ///   fold — so every match line of the extended query is in the previous
+    ///   query's OCCURRENCE frame. Results are then the complete match set,
+    ///   identical to the batch walk (which merely enumerates a superset of
+    ///   candidate lines and verifies each identically).
+    /// - Direction: an UNCAPPED result is the complete ascending match set,
+    ///   which both directions of the batch path return verbatim; a CAPPED
+    ///   result equals the FORWARD batch's oldest-retaining edge only, so a
+    ///   backward caller must fall back to the batch path when
+    ///   `results.matches.len() >= MAX_SEARCH_MATCHES`.
+    /// - `occurrence_lines` is `None` when the walk was capped: a truncated
+    ///   frame would break the subset property, so the caller reseeds.
+    ///
+    /// Cost: O(candidate lines × line verify) with `Some(frame)` — no posting
+    /// decode, no intersection, no range scan; exactly the category SA-1
+    /// deletes for the grown-by-one-char keystroke.
+    pub fn search_literal_narrowed(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        prev_lines: Option<&[u32]>,
+    ) -> NarrowedSearch {
+        // A columns-only index cannot answer queries — mirror the batch
+        // entry points' loud tripwire.
+        debug_assert!(
+            self.maintain_trigrams,
+            "search_literal_narrowed on a columns-only index returns no matches"
+        );
+        if query.is_empty() {
+            // Batch parity: an empty query yields no matches; the honesty pair
+            // is the index's own (search_results_opts_direction shape).
+            return NarrowedSearch {
+                results: SearchResults::new(
+                    Vec::new(),
+                    self.results_may_be_incomplete(),
+                    self.lowest_retained_line(),
+                ),
+                occurrence_lines: None,
+            };
+        }
+
+        /// Either the engine's candidate machinery or an explicit frame —
+        /// both yield ascending, deduplicated retained line ids.
+        enum Candidates<'a> {
+            Engine(CandidateSource),
+            Frame(std::iter::Copied<std::slice::Iter<'a, u32>>),
+        }
+        impl Candidates<'_> {
+            fn next(&mut self) -> Option<u32> {
+                match self {
+                    Candidates::Engine(source) => source.next_candidate(),
+                    Candidates::Frame(iter) => iter.next(),
+                }
+            }
+        }
+
+        let mut matcher = (!case_sensitive).then(|| CaseInsensitiveMatcher::new(query));
+        let mut candidates = match prev_lines {
+            Some(lines) => Candidates::Frame(lines.iter().copied()),
+            None => Candidates::Engine(match &matcher {
+                // Case-insensitive seed: exactly `search_case_insensitive`'s
+                // forward candidate construction.
+                Some(matcher) => self.literal_candidates_forward(&matcher.lower_query, 0),
+                // Case-sensitive seed: exactly `search_with_positions` →
+                // `search_from_line(query, first_cached_line.min(line_count))`.
+                None => {
+                    let first = self.first_cached_line.min(self.line_count);
+                    if query.len() < 3 {
+                        CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count))
+                    } else if !self.might_contain(query) {
+                        CandidateSource::Empty
+                    } else if let Some(postings) = self.posting_lists(query) {
+                        CandidateSource::from_postings_forward(postings, line_as_u32(first))
+                    } else {
+                        CandidateSource::Empty
+                    }
+                }
+            }),
+        };
+
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        let mut occurrence_lines: Vec<u32> = Vec::new();
+        let mut capped = false;
+        'lines: while let Some(line_u32) = candidates.next() {
+            let line_num = line_u32 as usize;
+            let Some(text) = self.lines.get(&line_num) else {
+                continue;
+            };
+            let fallback;
+            let col_map = match self.column_maps.get(&line_num) {
+                Some(map) => map,
+                None => {
+                    fallback = ColumnMap::new(text);
+                    &fallback
+                }
+            };
+            let mut line_matched = false;
+            match matcher.as_mut() {
+                // Case-sensitive: the SINGLE shared literal verifier — the
+                // same per-line sequence `SearchMatchIterator` yields.
+                None => {
+                    let mut from_byte = 0usize;
+                    while let Some((found, resume)) =
+                        next_literal_match(line_num, text, query, col_map, from_byte)
+                    {
+                        from_byte = resume;
+                        line_matched = true;
+                        matches.push(found);
+                        if matches.len() >= MAX_SEARCH_MATCHES {
+                            // Batch parity: `.take(MAX_SEARCH_MATCHES)` stops
+                            // exactly here, mid-line included.
+                            occurrence_lines.push(line_u32);
+                            capped = true;
+                            break 'lines;
+                        }
+                    }
+                    // Occurrence, not match: a byte-level containment probe so
+                    // zero-display-width matches still keep the line in the
+                    // frame (see `CaseInsensitiveMatcher::has_occurrence`).
+                    if line_matched
+                        || memchr::memmem::find(text.as_bytes(), query.as_bytes()).is_some()
+                    {
+                        occurrence_lines.push(line_u32);
+                    }
+                }
+                // Case-insensitive: the batch arm's exact visitor + cap.
+                Some(matcher) => {
+                    let completed = matcher.visit_matches(line_num, text, col_map, |found| {
+                        line_matched = true;
+                        matches.push(found);
+                        matches.len() < MAX_SEARCH_MATCHES
+                    });
+                    if line_matched || matcher.has_occurrence(text) {
+                        occurrence_lines.push(line_u32);
+                    }
+                    if !completed {
+                        capped = true;
+                        break 'lines;
+                    }
+                }
+            }
+        }
+
+        // Cap detection mirrors `search_results_opts_direction`: a full result
+        // set reports incomplete (over-reporting on exactly-MAX real matches
+        // is the batch path's documented, honest behavior).
+        let capped = capped || matches.len() >= MAX_SEARCH_MATCHES;
+        NarrowedSearch {
+            results: SearchResults::new(
+                matches,
+                self.results_may_be_incomplete() || capped,
+                self.lowest_retained_line(),
+            ),
+            occurrence_lines: (!capped).then_some(occurrence_lines),
+        }
     }
 
     /// Find one regex match at the directional anchor without materializing a

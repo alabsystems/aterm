@@ -57,6 +57,18 @@ impl Grid {
             .saturating_sub(self.scrollback_lines() as u64)
     }
 
+    /// Monotonic epoch of history-row RENUMBERINGS that are invisible to the
+    /// `(content_gen, absolute_row_revision)` pair — see
+    /// `GridStorage::history_renumber_epoch`. An advance means the absolute
+    /// keys of retained history rows may have shifted wholesale (Kitty CSI +T
+    /// unscroll removed the newest scrollback lines): absolute-row-keyed
+    /// incremental caches must REBUILD rather than refresh.
+    #[must_use]
+    #[inline]
+    pub fn history_renumber_epoch(&self) -> u64 {
+        self.storage.history_renumber_epoch
+    }
+
     /// The absolute row number currently shown at the TOP of the viewport,
     /// accounting for the scrollback `display_offset`. At the live bottom this is
     /// `absolute_row_counter - visible_rows`; scrolled up by `display_offset` it

@@ -98,6 +98,35 @@ pub(crate) fn store_build_of(prefix: &Path, target: &Path) -> Option<(String, u6
 /// superseded. [`crate::gc::live_builds`] resolves the authoritative `store/<program>/current`
 /// link for that decision and requires this view to agree with it.
 #[must_use]
+/// The command names `program`'s INSTALLED build currently puts on PATH.
+///
+/// Derived from the shims themselves rather than from a stored manifest, for the same reason
+/// [`active_builds`] is: the shims are what a user actually invokes, so they are the
+/// authoritative answer to "what does this program expose here", and they are exactly what
+/// `atpkg unlink` restores. A manifest copy could disagree with the directory after a partial
+/// install; the directory cannot disagree with itself.
+///
+/// Order is `read_dir`'s, so callers that care must sort — this is a SET, not a sequence.
+/// Returns `None` when the program has no shims at all (nothing installed), which is
+/// distinguishable from `Some(vec![])` and lets a caller refuse rather than silently link
+/// nothing.
+pub fn installed_exposes(layout: &Layout, program: &str) -> Option<Vec<String>> {
+    let shims = std::fs::read_dir(layout.bin_dir()).ok()?;
+    let mut out = Vec::new();
+    for shim in shims.flatten() {
+        let Some(target) = crate::platform::resolve_shim(&shim.path()) else {
+            continue;
+        };
+        let Some((owner, _build)) = program_build_of_target(&target) else {
+            continue;
+        };
+        if owner == program {
+            out.push(shim.file_name().to_string_lossy().into_owned());
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 pub fn active_builds(layout: &Layout) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     let Ok(shims) = std::fs::read_dir(layout.bin_dir()) else {

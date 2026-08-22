@@ -168,14 +168,26 @@ fn atpkg_store_probe(exe: &str) -> Option<PathBuf> {
     resolve_store_shim(&bin_dir.join(exe))
 }
 
-/// `<home>/Library/Application Support/aterm/pkg/bin` — the Unix half of the
-/// prefix mirror (see [`atpkg_store_probe`]).
+/// The Unix half of the prefix mirror (see [`atpkg_store_probe`]):
+/// `<home>/Library/Application Support/aterm/pkg/bin` on macOS,
+/// `<home>/.local/share/aterm/pkg/bin` elsewhere.
 fn unix_store_bin_dir(home: &Path) -> PathBuf {
-    home.join("Library")
-        .join("Application Support")
-        .join("aterm")
-        .join("pkg")
-        .join("bin")
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("aterm")
+            .join("pkg")
+            .join("bin")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local")
+            .join("share")
+            .join("aterm")
+            .join("pkg")
+            .join("bin")
+    }
 }
 
 /// A shim is trusted only when it is a SYMLINK that resolves to a real file.
@@ -1520,9 +1532,15 @@ mod tests {
     /// no-dependency duplication both sites cross-reference).
     #[test]
     fn store_bin_dir_mirrors_the_atpkg_default_prefix() {
+        #[cfg(target_os = "macos")]
         assert_eq!(
             unix_store_bin_dir(Path::new("/Users//x")),
             Path::new("/Users//x/Library/Application Support/aterm/pkg/bin")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            unix_store_bin_dir(Path::new("/home/x")),
+            Path::new("/home/x/.local/share/aterm/pkg/bin")
         );
     }
 

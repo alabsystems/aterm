@@ -87,6 +87,12 @@ pub(crate) struct DurableUpdateStatus {
     /// states in which no check thread ever starts, so every ledger field is the
     /// pristine default of a machine that structurally cannot update.
     pub(crate) installable: bool,
+    /// The STRANDED verdict ([`aterm_update::UpdateStatus::channel_unreadable`]):
+    /// checks complete but the release channel cannot be read, deliberately with
+    /// ZERO ledger failures — so `failing_persistent` can never carry it, and any
+    /// surface keyed on that field alone reads "up to date" at a machine that
+    /// will never update (round-11 audit).
+    pub(crate) channel_unreadable: bool,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -281,6 +287,8 @@ pub(crate) struct UpdaterSnapshot {
     pub(crate) failing_applies: u32,
     /// See [`DurableUpdateStatus::installable`].
     pub(crate) installable: bool,
+    /// See [`DurableUpdateStatus::channel_unreadable`].
+    pub(crate) channel_unreadable: bool,
 }
 
 impl UpdaterSnapshot {
@@ -669,6 +677,7 @@ impl NativeUpdaterService {
                 failing_kind: String::new(),
                 failing_applies: 0,
                 installable: true,
+                channel_unreadable: false,
             },
             next_operation: 1,
             work_generation: 0,
@@ -821,6 +830,7 @@ impl NativeUpdaterService {
         if self.snapshot.failing_persistent == now_persistent
             && self.snapshot.failing_kind == kind
             && self.snapshot.failing_applies == status.failing_applies
+            && self.snapshot.channel_unreadable == status.channel_unreadable
         {
             return false;
         }
@@ -828,6 +838,7 @@ impl NativeUpdaterService {
         self.snapshot.failing_persistent = now_persistent;
         self.snapshot.failing_kind = kind;
         self.snapshot.failing_applies = status.failing_applies;
+        self.snapshot.channel_unreadable = status.channel_unreadable;
         self.publish();
         if now_persistent && !was_persistent {
             self.snapshot.attention_revision = Some(self.snapshot.revision);
@@ -861,6 +872,12 @@ impl NativeUpdaterService {
         };
         self.snapshot.failing_applies = status.failing_applies;
         self.snapshot.installable = status.installable;
+        // The stranded verdict rides every reduced check exactly like the
+        // persistent-failure one: it is what stops the update screen from
+        // headlining "You're up to date." at a machine whose channel is
+        // unreadable (round-11 audit — the state records zero ledger failures,
+        // so failing_persistent alone can never say it).
+        self.snapshot.channel_unreadable = status.enabled && status.channel_unreadable;
         if !status.enabled {
             let before = self.model_state();
             self.snapshot.active = None;
@@ -1538,6 +1555,7 @@ mod tests {
             failing_kind: String::new(),
             failing_applies: 0,
             installable: true,
+            channel_unreadable: false,
         }
     }
 
@@ -1829,6 +1847,7 @@ mod tests {
             failing_kind: String::new(),
             failing_applies: 0,
             installable: true,
+            channel_unreadable: false,
         };
         assert!(staged_from_status(11, 0, &download).is_none());
         download.staged_commit = Some("0".repeat(40));
@@ -1861,6 +1880,7 @@ mod tests {
             failing_kind: String::new(),
             failing_applies: 0,
             installable: true,
+            channel_unreadable: false,
         };
         let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
         assert_eq!(imported.commit, stage.commit);

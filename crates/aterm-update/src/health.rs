@@ -424,7 +424,7 @@ impl Health {
     /// blanking that field while a streak is still standing reports a healthy class on
     /// an unhealthy machine.
     #[must_use]
-    fn standing_acquisition_class(&self) -> Option<&'static str> {
+    pub(crate) fn standing_acquisition_class(&self) -> Option<&'static str> {
         [
             ("pipeline", self.pipeline_failures),
             ("manifest", self.manifest_failures),

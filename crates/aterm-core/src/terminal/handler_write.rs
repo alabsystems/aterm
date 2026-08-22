@@ -553,7 +553,8 @@ impl TerminalHandler<'_> {
     /// an autowrap scroll that shifts the written row.
     fn write_char_core(&mut self, c: char, width: usize) {
         // Read colors/flags directly from CurrentStyle — avoids StyleTable lookup.
-        // CurrentStyle is already kept in sync by update_style_id() on SGR changes.
+        // CurrentStyle is already kept in sync by `apply_style_change()` (and its
+        // narrower siblings) on SGR changes — there is no style table to consult.
         let mut flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
         } else {

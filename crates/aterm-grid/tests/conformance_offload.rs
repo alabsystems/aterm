@@ -69,6 +69,38 @@ fn feed_line(g: &mut Grid, s: &str) {
     g.carriage_return();
 }
 
+/// Saturate the detach-window ring so the NEXT scroll-off stages into the lazy
+/// buffer.
+///
+/// RFL-1 lifts the ring's scrollback rows into the detached job (that is the
+/// point: the synchronous width-change residue drops to the viewport), so the
+/// window now opens with an EMPTY ring — the first `RING` scroll-offs land in
+/// the ring instead of the staging buffer. The model's `Produce` means "a line
+/// scrolls off AND is staged", which is only what the real grid does once the
+/// ring is full; before RFL-1 the ring happened to be full at window open, so
+/// the fixture never had to say so. This feeds that precondition explicitly as
+/// UN-MODELLED environment output that predates the trace (it stays in the
+/// ring: `produced`/`retained` stay 0, `StagedWithinProduced` untouched), and
+/// asserts the precondition two-sidedly so it can never go vacuous.
+fn saturate_window_ring(g: &mut Grid) {
+    for i in 0..RING {
+        if g.ring_buffer_scrollback() >= RING {
+            break;
+        }
+        feed_line(g, &format!("RINGFILL{i}"));
+    }
+    assert_eq!(
+        g.ring_buffer_scrollback(),
+        RING,
+        "ring must be saturated before the modelled window output"
+    );
+    assert_eq!(
+        g.lazy_backlog_len(),
+        0,
+        "saturating the ring must not itself stage a row"
+    );
+}
+
 /// A real tiered grid with `H` short (rewrap-count-stable) tagged history lines.
 fn real_grid_with_history() -> Grid {
     let mut sb: ScrollbackStorage = Scrollback::new(64, 512, INITIAL_BUDGET).into();
@@ -704,6 +736,10 @@ fn replacement_backed_abort_preserves_window_output_in_spec() {
     let pending = g
         .resize_offloading_scrollback(ROWS, NEW_COLS)
         .expect("open detach window");
+    // RFL-1: the window opens with the ring history riding the job, so refill
+    // the ring first — the modelled Produce steps below assume a full ring.
+    saturate_window_ring(&mut g);
+
     let mut st = m.init_state();
     let mut transitions = Vec::new();
 

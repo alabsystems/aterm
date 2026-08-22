@@ -219,7 +219,7 @@ impl Ctx {
         env: EnvSnapshot,
         scratch: PathBuf,
     ) -> Self {
-        let tools = Toolchain::discover(env.trust_stage2_bin.as_deref(), &env.home);
+        let tools = Toolchain::discover(env.trust_stage2_bin.as_deref(), &env.home, &env.path);
         let path_env = tools.path_with_stage2_first(&env.path);
         Self {
             root,

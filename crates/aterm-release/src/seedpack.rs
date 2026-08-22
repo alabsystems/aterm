@@ -67,6 +67,15 @@ pub struct SeedStat {
     pub roster_seq: u64,
     /// The channel-pinned `(program, build)` set the seed can install.
     pub programs: Vec<(String, u64)>,
+    /// Non-fatal findings, for the CALLER to place.
+    ///
+    /// `validate` used to `println!` these itself, and a pure validator that prints
+    /// cannot be placed: its three callers sit on two different grids and at different
+    /// positions relative to their own label, so a function with no caller context got
+    /// all three wrong. Worse, both cut call sites run `validate`, so one `cargo ship
+    /// cut` printed the identical 600-column paragraph twice, ninety seconds apart —
+    /// which is how a real warning teaches an operator to skip warnings.
+    pub warnings: Vec<String>,
 }
 
 /// Resolve the seed directory for this cut: `ATERM_SEED_DIR` (explicit
@@ -188,7 +197,12 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     // nothing rather than sealing something it cannot vouch for.
     let deadline = now.saturating_add(margin);
     if deadline >= index_horizon {
-        return Err(freshness_err("index.toml", &index.valid_until, margin, now >= index_horizon));
+        return Err(freshness_err(
+            "index.toml",
+            &index.valid_until,
+            margin,
+            now >= index_horizon,
+        ));
     }
     // The roster leg, gated through the client's OWN re-admission at the future
     // clock rather than a second parse of the file — `still_fresh` is exactly
@@ -205,7 +219,9 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     }
     // What the DMG can honestly claim: the earlier of the two.
     let effective_valid_until = match rfc3339_to_unix(&roster_valid_until) {
-        Some(r) if i64::try_from(r).unwrap_or(i64::MAX) < index_horizon => roster_valid_until.clone(),
+        Some(r) if i64::try_from(r).unwrap_or(i64::MAX) < index_horizon => {
+            roster_valid_until.clone()
+        }
         _ => index.valid_until.clone(),
     };
 
@@ -305,14 +321,18 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     }
 
     // ---- 2b. arch coverage, the macOS twin of build.ps1's gate -----------
-    // The .app is UNIVERSAL (arm64 + x86_64), but the registry is packed
-    // host-triple-only — every published artifact today is
-    // aarch64-apple-darwin. Sealing that into a universal DMG ships hundreds of
-    // MB from which atpkg on an Intel Mac can install exactly nothing: every
-    // pin clean-skips on triple (`artifact_for`), so the batteries are
-    // silently absent on a machine that was promised them. The Windows lane
-    // already refuses this; the mac lane must SAY it at minimum, because
-    // "installs with all the binaries" is now the product claim.
+    // The .app is UNIVERSAL (arm64 + x86_64) and the registry is packed
+    // per-triple, so a seed serves exactly the slices its artifacts name. Since
+    // atpkg index build 12 the published registry carries x86_64-apple-darwin
+    // artifacts alongside aarch64 for six programs (ay, clean, nn, ny, ty,
+    // trust-mc); the rustc coherence group (trust, trust-ir, trust-cg,
+    // trust-vc) is still aarch64-only. Sealing an arm64-only stage into a
+    // universal DMG ships hundreds of MB from which atpkg on an Intel Mac can
+    // install exactly nothing: every pin clean-skips on triple
+    // (`artifact_for`), so the batteries are silently absent on a machine that
+    // was promised them. The Windows lane already refuses this; the mac lane
+    // must SAY it at minimum, because "installs with all the binaries" is now
+    // the product claim.
     //
     // The two slices are NOT symmetric, and treating them alike was a real bug.
     //
@@ -322,9 +342,12 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     //    refusal, and deliberately NOT mutable by `ATERM_SEED_ARCH_ACK` — the mute
     //    button used to cover this case too, which meant one env var could ship the
     //    one seal that is never right.
-    //  * NO x86_64 artifacts is a known, currently-unavoidable state: nothing
-    //    publishes an x86_64 lane yet. It warns, and the ack silences THAT and only
-    //    that, because it is the only one an operator can honestly acknowledge.
+    //  * NO x86_64 artifacts is a PARTIAL cut, not an impossible one. It used to be
+    //    unavoidable; it no longer is for most of the toolset, so an arm64-only
+    //    stage is now usually a stale `INDEX_BUILD` rather than a fact about the
+    //    world. It warns, and the ack silences THAT and only that, because a
+    //    deliberately arm64-only seal is the one an operator can honestly
+    //    acknowledge.
     //
     // The gate is also not sufficient on its own: `validate`'s present-artifact
     // check counts an artifact of ANY triple, so a seal could satisfy it while
@@ -343,26 +366,44 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
              architecture of essentially every Mac this will install on, so the seal would \
              cost every downloader ~600 MB and install nothing for almost all of them. \
              Restage from a registry packed for this triple \
-             (`INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`), or cut deliberately \
-             seedless with ATERM_SEEDLESS=1. This one is not acknowledgeable.",
+             (`tools/atpkg-seed-from-published.sh`), or cut deliberately seedless with \
+             ATERM_SEEDLESS=1. This one is not acknowledgeable.",
             listed()
         ));
     }
+    // Headline, then the ACT, then the facts one per line. Every fact that was in the
+    // 120-word run-on paragraph is still here: no x86 artifacts, which targets ARE
+    // covered, that an Intel Mac installs nothing, that there is no network fallback, the
+    // client's exact marker, the upstream root cause, where the evidence is, and the ack.
+    //
+    // What MOVED is the acknowledgement, from word 91 to line 2. Skimming stopped at "the
+    // seed carries NO x86_64", which reads as a refusal — so the operator went looking for
+    // what had failed, rather than for the one word that lets a warning proceed.
+    let mut warnings = Vec::new();
     if !covered.contains("x86_64-apple-darwin")
         && !std::env::var("ATERM_SEED_ARCH_ACK").is_ok_and(|v| v.trim() == "1")
     {
-        println!(
-            "    WARNING: the seed carries NO x86_64-apple-darwin artifacts (targets: {}) — \
-             an Intel Mac installs NOTHING from the seal. It does NOT fall back to a network \
-             install either: the published index carries no x86_64 packages at all, so on \
-             Intel there is no ALab toolchain by any route, and the client says so \
-             (`seed-unusable: no build for this Mac's architecture`). The blocker is \
-             upstream, not packaging: Trust has no x86_64-apple-darwin std, so the `trust` \
-             and `trust-mc` sysroot bundles cannot be produced for that triple at all \
-             (see buildplan.rs, the compat-slice comment). Acknowledge with \
-             ATERM_SEED_ARCH_ACK=1.",
+        warnings.push(format!(
+            "WARNING — no x86_64-apple-darwin artifacts in the seal (targets: {})\n\
+             since atpkg index build 12 this is usually a STALE STAGE, not an upstream \
+             limit — restage from a current index: INDEX_BUILD=<N> \
+             tools/atpkg-seed-from-published.sh (N >= 12); acknowledge a deliberately \
+             arm64-only seal with ATERM_SEED_ARCH_ACK=1 (a warning-mute, not a gate: \
+             the cut proceeds either way)\n\
+             · an Intel Mac installs NOTHING from this seal — the client says so and \
+             discards it (`seed-unusable: no build for this Mac's architecture`)\n\
+             · the published registry carries x86_64-apple-darwin artifacts for six \
+             programs (ay, clean, nn, ny, ty, trust-mc), so restaging puts that slice \
+             in the seal\n\
+             · what stays aarch64-only is the rustc coherence group (trust, trust-ir, \
+             trust-cg, trust-vc), and the reason is NARROWER than \"no std\": Trust's \
+             x86_64-apple-darwin sysroot DOES carry std — it is `rustc_private` (the \
+             rustc-dev component) that is absent cross-host, so the `trust` bundle \
+             alone cannot yet be produced for that triple\n\
+             · the group moves together: an x86_64 row on a sibling while `trust` \
+             lacks one aborts the whole group on every Intel client",
             listed()
-        );
+        ));
     }
 
     // ---- 3. nothing unaccounted rides the seal ---------------------------
@@ -387,6 +428,7 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
         valid_until: effective_valid_until,
         roster_seq: index.roster_seq(),
         programs: pins,
+        warnings,
     })
 }
 
@@ -422,8 +464,10 @@ fn freshness_err(what: &str, valid_until: &str, margin: i64, already_lapsed: boo
     if already_lapsed {
         return format!(
             "{what} freshness LAPSED ({valid_until}) — the shipped client refuses it, so this \
-             seed would be dead weight in every DMG. Restage from a freshly published index \
-             (`INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`)."
+             seed would be dead weight in every DMG.\n\
+             restage:  tools/atpkg-seed-from-published.sh\n\
+             \x20         (stages the NEWEST published index; set INDEX_BUILD=<build> only to \
+             stage an older one deliberately — it seals that build into every DMG)"
         );
     }
     format!(
@@ -443,8 +487,8 @@ fn freshness_err(what: &str, valid_until: &str, margin: i64, already_lapsed: boo
 /// a parse failure is reported, never silently defaulted.
 fn read_roster_valid_until(dir: &Path) -> Result<String, String> {
     let path = dir.join("aterm-machines.toml");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let parsed: toml::Value = toml::from_str(&text)
         .map_err(|e| format!("aterm-machines.toml parse (after verify): {e}"))?;
     parsed

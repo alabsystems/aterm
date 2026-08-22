@@ -1918,7 +1918,21 @@ pub fn spawn_shell_with_pid(
         )),
         ExecStatus::FailedBeforeExec(_) => Some((
             io::ErrorKind::Other,
-            "child failed to exec the shell before exec (_exit(127))".to_owned(),
+            // NAME THE TARGET. This is overwhelmingly a config typo (`shell` in
+            // aterm.toml, `--shell`, `$ATERM_SHELL` — the exec target is used
+            // VERBATIM, no PATH search), and the anonymous version of this
+            // message gave the user a fact with no handle on it. The child
+            // cannot say more (async-signal-safe: one status byte), but the
+            // parent holds the exact path the child's `execve` read —
+            // `exec_target` covers every mode, including `-e`, where the
+            // program is not the shell at all.
+            format!(
+                "child could not exec `{}` (_exit(127)) — usually a nonexistent or \
+                 non-executable path. If this is the shell, check `shell` in \
+                 aterm.toml / --shell / $ATERM_SHELL; `aterm --validate-config` \
+                 checks it without launching",
+                exec_target.to_string_lossy()
+            ),
         )),
         // The budget elapsed with neither a byte nor EOF. FAIL CLOSED.
         //

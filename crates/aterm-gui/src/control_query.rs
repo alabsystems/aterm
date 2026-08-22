@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use aterm_core::grid::extra::ImageData;
 use aterm_core::grid::{CellFlags, Grid};
 use aterm_core::search::{
-    DEFAULT_MAX_CACHED_LINES, SearchDirection as EngineSearchDirection, SearchMatch,
-    SearchOptionsError, SearchResults, TerminalSearch, max_cached_for_retained,
+    DEFAULT_MAX_CACHED_LINES, NarrowedSearch, SearchDirection as EngineSearchDirection,
+    SearchMatch, SearchOptionsError, SearchResults, TerminalSearch, max_cached_for_retained,
 };
 use aterm_core::selection::SelectionType;
 use aterm_core::terminal::{RenderCell, Terminal, UnderlineStyle};
@@ -190,6 +190,14 @@ fn cell_attrs(grid: &Grid, r: usize, c: usize) -> CellFlags {
     let Some(cell) = grid.row_at_screen(row).and_then(|gr| gr.get(col)) else {
         return CellFlags::default();
     };
+    // DEAD-BRANCH PROBE: no production writer sets `USES_STYLE_ID` and the SGR
+    // path no longer interns a `StyleId`, so the table rehydration below cannot
+    // be reached from a live grid. Kept for encoding completeness; asserted so
+    // the socket-introspection tests prove it rather than assume it.
+    debug_assert!(
+        !cell.uses_style_id(),
+        "cell_attrs: a live cell carries USES_STYLE_ID, but nothing interns styles"
+    );
     if cell.uses_style_id() {
         let extra = cell.flags().difference(CellFlags::USES_STYLE_ID);
         grid.resolve_style_to_colors(cell.style_id(), extra).2
@@ -1003,6 +1011,36 @@ fn query_search_index(
 ) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
     let results =
         index.search_results_opts_direction(query, case_sensitive, is_regex, direction)?;
+    let point_match = select_point_match(
+        index,
+        &results,
+        query,
+        case_sensitive,
+        is_regex,
+        direction,
+        anchor,
+        strict,
+    )?;
+    Ok((results, point_match))
+}
+
+/// Anchored point-match selection over ALREADY-COMPUTED batch results — split
+/// out of [`query_search_index`] verbatim so the narrowing path (SA-1) shares
+/// the exact anchored/point/cap-edge policy instead of re-implementing it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "verbatim split of query_search_index's policy tail; every flag is load-bearing"
+)]
+fn select_point_match(
+    index: &TerminalSearch,
+    results: &SearchResults,
+    query: &str,
+    case_sensitive: bool,
+    is_regex: bool,
+    direction: EngineSearchDirection,
+    anchor: Option<(usize, usize)>,
+    strict: bool,
+) -> Result<Option<SearchMatch>, SearchOptionsError> {
     let point_match = if let Some(anchor) = anchor {
         if results.matches.len() < MAX_SEARCH_MATCHES {
             let qualifies = |found: &SearchMatch| {
@@ -1056,6 +1094,290 @@ fn query_search_index(
     } else {
         None
     };
+    Ok(point_match)
+}
+
+// ---------------------------------------------------------------------------
+// SA-1: isearch-style prefix narrowing for the per-keystroke find-bar query.
+//
+// The find bar re-enters `search_full_history_direction` on EVERY text edit.
+// On unchanged content that is a snapshot-cache hit — but the QUERY layer was
+// stateless: each keystroke re-ran the complete batch query (full range scan
+// for 1–2-char literals, posting-list decode + intersection for longer ones,
+// up-to-100k match materialization) even though the consumer above is
+// precisely a stateful incremental search whose grown query can only ever
+// match INSIDE the previous query's occurrence set.
+//
+// A `NarrowSession` keeps, per terminal and per exact index generation
+// (alt/content_seq/revision/max_lines/case key — any content change kills it
+// by key mismatch, never by explicit invalidation), a PREFIX STACK of frames:
+// the ascending occurrence-line sets of each typed prefix, produced by
+// `TerminalSearch::search_literal_narrowed` (whose results are
+// differential-tested equal to the batch path in `aterm-search`). A keystroke
+// that extends a stacked prefix verifies ONLY that frame's lines — no range
+// scan, no posting decode; backspace re-verifies the shorter prefix off its
+// own frame; a non-suffix edit, a regex query, a capped previous set or any
+// content change falls back to the batch path (and reseeds where legal).
+//
+// Frames hold OCCURRENCE lines (fold-level containment), not reported-match
+// lines — the subset property `matches(q + c) ⊆ occurrences(q)` is pure
+// string logic (`lower_fold(q + c) == lower_fold(q) + lower_fold(c)`), immune
+// to the zero-display-width match drops that make reported-match frames
+// unsound (ﬁ/ß multi-char folds, prepend clusters — see the engine tests).
+// ---------------------------------------------------------------------------
+
+/// One typed prefix's occurrence frame.
+struct NarrowFrame {
+    query: String,
+    /// Ascending retained lines whose folded text contains the folded query.
+    occurrence_lines: Vec<u32>,
+}
+
+/// A terminal's live narrowing stack, valid for exactly one index generation.
+struct NarrowSession {
+    /// Identity key only (never dereferenced) — same discipline as
+    /// [`SearchSnapshot::term`].
+    term: Weak<Mutex<Terminal>>,
+    alt_screen: bool,
+    content_seq: u64,
+    absolute_row_revision: u64,
+    max_lines: usize,
+    case_sensitive: bool,
+    /// Prefix stack: `frames[i].query` is a byte-prefix of `frames[i+1].query`.
+    frames: Vec<NarrowFrame>,
+}
+
+/// A few concurrent find bars; matches the working-set thinking behind
+/// [`SEARCH_SNAPSHOT_CAPACITY`] at a quarter the size (one session per
+/// terminal, newest-kept).
+const NARROW_SESSION_CAPACITY: usize = 4;
+
+/// Retained-entry budget per session (~1.6 MB of `u32` at the bound). The
+/// SHALLOWEST frames (the biggest — short prefixes) are dropped first; a deep
+/// backspace past a dropped frame reseeds from the engine, which is always
+/// correct, merely batch-priced.
+const NARROW_SESSION_MAX_ENTRIES: usize = 4 * MAX_SEARCH_MATCHES;
+
+static NARROW_SESSIONS: Mutex<VecDeque<NarrowSession>> = Mutex::new(VecDeque::new());
+
+fn narrow_sessions_lock() -> MutexGuard<'static, VecDeque<NarrowSession>> {
+    // Stale-on-poison is safe: every session is validated by its full key.
+    NARROW_SESSIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Take (remove) this terminal's session iff its ENTIRE key matches the
+/// current query context. A key mismatch leaves nothing behind for this
+/// terminal to reuse, but does not disturb other terminals' sessions.
+fn take_narrow_session(
+    term: &Arc<Mutex<Terminal>>,
+    alt_screen: bool,
+    content_seq: u64,
+    absolute_row_revision: u64,
+    max_lines: usize,
+    case_sensitive: bool,
+) -> Option<NarrowSession> {
+    let mut sessions = narrow_sessions_lock();
+    sessions.retain(|session| session.term.strong_count() != 0);
+    let position = sessions.iter().position(|session| {
+        std::ptr::eq(session.term.as_ptr(), Arc::as_ptr(term))
+            && session.alt_screen == alt_screen
+            && session.content_seq == content_seq
+            && session.absolute_row_revision == absolute_row_revision
+            && session.max_lines == max_lines
+            && session.case_sensitive == case_sensitive
+    })?;
+    sessions.remove(position)
+}
+
+fn store_narrow_session(session: NarrowSession) {
+    let mut sessions = narrow_sessions_lock();
+    sessions.retain(|existing| {
+        existing.term.strong_count() != 0
+            && !std::ptr::eq(existing.term.as_ptr(), session.term.as_ptr())
+    });
+    if sessions.len() >= NARROW_SESSION_CAPACITY {
+        sessions.pop_front();
+    }
+    sessions.push_back(session);
+}
+
+#[cfg(test)]
+thread_local! {
+    static NARROWED_QUERY_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_narrowed_query() {
+    NARROWED_QUERY_STEPS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(not(test))]
+fn record_narrowed_query() {}
+
+/// Take (read and reset) how many queries on THIS thread were served off a
+/// narrowing frame — the deterministic reach signal for the wiring tests
+/// (thread-local so parallel tests on other terminals cannot perturb it).
+#[cfg(test)]
+fn take_narrowed_query_steps() -> usize {
+    NARROWED_QUERY_STEPS.with(|count| {
+        let value = count.get();
+        count.set(0);
+        value
+    })
+}
+
+/// The cache-hit query layer with narrowing: literal queries consult/extend
+/// this terminal's [`NarrowSession`]; regex and empty queries (and any capped
+/// backward edge) take the batch path unchanged. Results are ALWAYS equal to
+/// [`query_search_index`] on the same inputs — narrowing changes which lines
+/// get verified, never what a verified result is (engine-differential-tested;
+/// re-pinned here by the wiring tests).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the narrow-session key rides alongside query_search_index's own surface"
+)]
+fn query_search_index_narrowing(
+    term: &Arc<Mutex<Terminal>>,
+    index: &TerminalSearch,
+    key_alt: bool,
+    key_seq: u64,
+    absolute_row_revision: u64,
+    max_lines: usize,
+    query: &str,
+    case_sensitive: bool,
+    is_regex: bool,
+    direction: EngineSearchDirection,
+    anchor: Option<(usize, usize)>,
+    strict: bool,
+) -> Result<(SearchResults, Option<SearchMatch>), SearchOptionsError> {
+    if is_regex || query.is_empty() {
+        // Regex has no prefix-subset property; empty is the neutral bar state.
+        return query_search_index(
+            index,
+            query,
+            case_sensitive,
+            is_regex,
+            direction,
+            anchor,
+            strict,
+        );
+    }
+    let mut session = take_narrow_session(
+        term,
+        key_alt,
+        key_seq,
+        absolute_row_revision,
+        max_lines,
+        case_sensitive,
+    );
+    // Deepest stacked prefix of this query (equality included: a repeat or
+    // backspaced-to query re-verifies off its OWN frame — occurrences ⊇
+    // matches, so that is complete too).
+    let frame_index = session.as_ref().and_then(|session| {
+        session
+            .frames
+            .iter()
+            .rposition(|frame| query.starts_with(frame.query.as_str()))
+    });
+    let narrowed = {
+        let prev_lines = session.as_ref().and_then(|session| {
+            frame_index.map(|at| session.frames[at].occurrence_lines.as_slice())
+        });
+        // COST GUARD: a frame is a SUBSET property, not a cost guarantee. The
+        // keystroke that turns a COMMON prefix into a RARE query inverts the
+        // comparison — the engine's trigram intersection visits a handful of
+        // candidates while the inherited frame still holds every line the
+        // common prefix occurred on (measured on a 60k-line log-shaped probe:
+        // 2.60 ms off a 60 000-line frame against 0.085 ms through the index,
+        // on exactly the keystroke whose latency the user feels most). So
+        // narrow only while the frame is no bigger than the candidate set the
+        // engine would walk itself; the fallback is the plain seed path, which
+        // reseeds a fresh, SMALLER frame for the next keystroke, so the guard
+        // costs one step and never compounds.
+        //
+        // The comparison carries a 2x slack because the two sides do not cost
+        // the same PER CANDIDATE: a frame line is one verify, while an engine
+        // candidate additionally pays the driver list's varint decode and a
+        // binary-search probe per remaining trigram (~1.5x per candidate on
+        // the same probe). Only a DECISIVELY smaller candidate set is worth
+        // abandoning a frame for.
+        let prev_lines = prev_lines.filter(|lines| {
+            match index.literal_candidate_bound(query, case_sensitive) {
+                // Sub-trigram query: the engine range-scans every retained
+                // line, so any frame is at least as cheap.
+                None => true,
+                Some(bound) => lines.len() as u64 <= bound.saturating_mul(2),
+            }
+        });
+        if prev_lines.is_some() {
+            record_narrowed_query();
+        }
+        index.search_literal_narrowed(query, case_sensitive, prev_lines)
+    };
+    let NarrowedSearch {
+        results: narrowed_results,
+        occurrence_lines,
+    } = narrowed;
+    // A capped narrowed walk carries the FORWARD (oldest-retaining) cap edge;
+    // a capped BACKWARD batch retains the newest matches instead — fall back
+    // so the direction-aware edge semantics stay byte-identical.
+    let capped = narrowed_results.matches.len() >= MAX_SEARCH_MATCHES;
+    let results = if capped && direction == EngineSearchDirection::Backward {
+        index.search_results_opts_direction(query, case_sensitive, false, direction)?
+    } else {
+        narrowed_results
+    };
+    if let Some(occurrence_lines) = occurrence_lines {
+        let mut session = session.take().unwrap_or_else(|| NarrowSession {
+            term: Arc::downgrade(term),
+            alt_screen: key_alt,
+            content_seq: key_seq,
+            absolute_row_revision,
+            max_lines,
+            case_sensitive,
+            frames: Vec::new(),
+        });
+        // Keep only ancestors (prefixes) of this query, then push/replace so
+        // the stack invariant (each frame a byte-prefix of the next) holds.
+        session.frames.truncate(frame_index.map_or(0, |at| at + 1));
+        if session
+            .frames
+            .last()
+            .is_some_and(|frame| frame.query == query)
+        {
+            session.frames.pop();
+        }
+        session.frames.push(NarrowFrame {
+            query: query.to_string(),
+            occurrence_lines,
+        });
+        let mut total: usize = session
+            .frames
+            .iter()
+            .map(|frame| frame.occurrence_lines.len())
+            .sum();
+        while total > NARROW_SESSION_MAX_ENTRIES && session.frames.len() > 1 {
+            let dropped = session.frames.remove(0);
+            total = total.saturating_sub(dropped.occurrence_lines.len());
+        }
+        store_narrow_session(session);
+    } else if let Some(session) = session {
+        // Capped walk: no frame for THIS query, but the stacked ancestors are
+        // still valid for other extensions of their prefixes — keep them.
+        store_narrow_session(session);
+    }
+    let point_match = select_point_match(
+        index,
+        &results,
+        query,
+        case_sensitive,
+        false,
+        direction,
+        anchor,
+        strict,
+    )?;
     Ok((results, point_match))
 }
 
@@ -1123,8 +1445,17 @@ pub(crate) fn search_full_history_direction(
     let cached_index =
         cached_search_index(term, key_alt, key_seq, absolute_row_revision, max_lines);
     if let Some(index) = cached_index {
-        let (results, point_match) = query_search_index(
+        // SA-1: the per-keystroke query layer. Literal queries narrow from the
+        // previous keystroke's occurrence frame (batch-identical results, no
+        // index work for the dominant grown-by-one-char edit); regex/empty and
+        // every fallback condition route through the plain batch path inside.
+        let (results, point_match) = query_search_index_narrowing(
+            term,
             &index,
+            key_alt,
+            key_seq,
+            absolute_row_revision,
+            max_lines,
             query,
             case_sensitive,
             is_regex,
@@ -2263,6 +2594,19 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
+        // OMITTED (DMG-1 damage carrier): extraction-CONTINUITY tokens, not
+        // cell content. They answer "may this scratch's undamaged rows be
+        // retained by the next damage-scoped refill" — a question about the
+        // producer/scratch pair, meaningless to a client reading one frame.
+        // They are excluded from `RenderInput`'s own `PartialEq` for the same
+        // reason `snapshot_seq` is metadata rather than pixels; serializing
+        // them would leak engine-internal bookkeeping into the wire format and
+        // make byte-identical frames compare unequal.
+        terminal_id: _,
+        extract_gen: _,
+        engine_fill_seq: _,
+        engine_alt: _,
+        engine_row_order: _,
     } = ri;
 }
 
@@ -3064,5 +3408,281 @@ mod tests {
         assert!(value["rows"].is_null());
         assert!(value["cols"].is_null());
         assert!(value.get("redraw_attempts").is_some());
+    }
+
+    /// SA-1 cost guard: narrowing must not be used when the index would visit
+    /// FEWER lines than the inherited frame holds — the keystroke that turns a
+    /// common prefix into a rare query. Results stay equal to the batch layer
+    /// either way; what this pins is that the expensive choice is not taken
+    /// (the reach counter must NOT advance on that keystroke) while the
+    /// ordinary common-prefix keystrokes still narrow.
+    #[test]
+    fn narrowing_skips_frames_bigger_than_the_engines_own_candidate_set() {
+        let _guard = super::search_cap_test_guard();
+        let mut lines: Vec<String> = (0..40)
+            .map(|i| format!("svc-api request completed size=100 seq={i}"))
+            .collect();
+        lines.push("svc-api request completed size=977 seq=rare".to_string());
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let term = term_with(&refs);
+        let _ = super::take_narrowed_query_steps();
+
+        let batch_oracle = |q: &str| {
+            let (key_alt, key_seq, revision, rows) = {
+                let t = term_lock(&term);
+                (
+                    t.is_alternate_screen(),
+                    t.content_seq(),
+                    t.absolute_row_revision(),
+                    t.rows() as usize,
+                )
+            };
+            let max_lines =
+                super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
+            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
+                .expect("the previous search must have cached a consistent snapshot");
+            let (results, _) = super::query_search_index(
+                &index,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Forward,
+                None,
+                false,
+            )
+            .expect("literal batch query cannot fail");
+            results
+        };
+        let narrowed = |q: &str| {
+            super::search_full_history_direction(
+                &term,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Forward,
+                None,
+                false,
+            )
+            .expect("search ok")
+        };
+
+        // Common prefix: every retained line occurs, and the frames are no
+        // bigger than the postings the engine would walk — these narrow.
+        for q in ["siz", "size", "size="] {
+            let full = narrowed(q);
+            assert_eq!(full.results, batch_oracle(q), "keystroke {q:?}");
+        }
+        assert!(
+            super::take_narrowed_query_steps() >= 1,
+            "reach: the common-prefix keystrokes must narrow"
+        );
+
+        // The rare keystroke: the frame holds all 41 lines, the engine's own
+        // candidate set is the single rare line — take the engine path.
+        let rare = narrowed("size=9");
+        assert_eq!(rare.results, batch_oracle("size=9"));
+        assert_eq!(
+            rare.results.matches.len(),
+            1,
+            "precondition: the grown query really is rare"
+        );
+        assert_eq!(
+            super::take_narrowed_query_steps(),
+            0,
+            "cost guard: a frame bigger than the engine's candidate set must be skipped"
+        );
+
+        // ...and the reseeded (small) frame narrows again on the next
+        // keystroke, so the guard costs nothing beyond the one step.
+        let deeper = narrowed("size=97");
+        assert_eq!(deeper.results, batch_oracle("size=97"));
+        assert_eq!(
+            super::take_narrowed_query_steps(),
+            1,
+            "the reseeded frame is small, so narrowing resumes immediately"
+        );
+    }
+
+    /// SA-1 direction parity: the find bar's BACKWARD lane ("find previous")
+    /// goes through the same narrowing layer, and an uncapped narrowed walk —
+    /// which is the complete ascending match set — must equal the backward
+    /// batch path verbatim at every keystroke. (The capped backward edge keeps
+    /// the newest matches instead of the oldest, which is why
+    /// `query_search_index_narrowing` falls back to the batch path there; this
+    /// pins the uncapped half of that argument end to end.)
+    #[test]
+    fn narrowing_backward_direction_equals_the_batch_layer() {
+        let _guard = super::search_cap_test_guard();
+        let term = term_with(&[
+            "find one here",
+            "nothing on this row",
+            "find two here",
+            "find three here",
+        ]);
+        let _ = super::take_narrowed_query_steps();
+
+        let oracle = |q: &str| {
+            let (key_alt, key_seq, revision, rows) = {
+                let t = term_lock(&term);
+                (
+                    t.is_alternate_screen(),
+                    t.content_seq(),
+                    t.absolute_row_revision(),
+                    t.rows() as usize,
+                )
+            };
+            let max_lines =
+                super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
+            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
+                .expect("the previous search must have cached a consistent snapshot");
+            let (results, point) = super::query_search_index(
+                &index,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Backward,
+                None,
+                false,
+            )
+            .expect("literal batch query cannot fail");
+            (results, point)
+        };
+
+        for q in ["f", "fi", "fin", "find", "find t"] {
+            let full = super::search_full_history_direction(
+                &term,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Backward,
+                None,
+                false,
+            )
+            .expect("search ok");
+            let (results, _) = oracle(q);
+            assert_eq!(
+                full.results, results,
+                "backward keystroke {q:?} must equal the backward batch layer"
+            );
+        }
+        assert!(
+            super::take_narrowed_query_steps() >= 2,
+            "reach: the backward lane must also run off narrowing frames"
+        );
+    }
+
+    /// SA-1 wiring: typing a query one char at a time through the real
+    /// cache-hit path narrows from the previous keystroke's occurrence frame
+    /// — results equal the plain batch layer at EVERY step (the oracle is
+    /// `query_search_index` over the same cached index), narrowing really
+    /// engages (thread-local reach counter — immune to parallel tests on
+    /// other terminals), and backspace + a non-suffix edit stay equal too.
+    #[test]
+    fn incremental_typing_narrows_and_equals_the_batch_layer() {
+        let _guard = super::search_cap_test_guard();
+        let term = term_with(&[
+            "plain ascii find line",
+            // Zero-width character: "\u{200b}" alone spans no display column
+            // and is dropped from reported matches, while "\u{200b}b" crosses
+            // into the next cell and matches for real — the zero-display-width
+            // hazard the occurrence frame must survive. (A U+0600 prepend
+            // cluster shows the same shape in the engine, but the VT layer
+            // drops that character before it reaches the grid, so the
+            // end-to-end line uses the one the terminal really stores.)
+            "a\u{200b}b zero width",
+            "stra\u{df}e stop",
+            "find find find",
+            "no hits here",
+        ]);
+        let _ = super::take_narrowed_query_steps();
+
+        let batch_oracle = |q: &str| {
+            let (key_alt, key_seq, revision, rows) = {
+                let t = term_lock(&term);
+                (
+                    t.is_alternate_screen(),
+                    t.content_seq(),
+                    t.absolute_row_revision(),
+                    t.rows() as usize,
+                )
+            };
+            let max_lines =
+                super::search_max_lines().max(aterm_core::search::max_cached_for_retained(rows));
+            let index = super::cached_search_index(&term, key_alt, key_seq, revision, max_lines)
+                .expect("the previous search must have cached a consistent snapshot");
+            let (results, _) = super::query_search_index(
+                &index,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Forward,
+                None,
+                false,
+            )
+            .expect("literal batch query cannot fail");
+            results
+        };
+        let narrowed = |q: &str| {
+            super::search_full_history_direction(
+                &term,
+                q,
+                false,
+                false,
+                super::EngineSearchDirection::Forward,
+                None,
+                false,
+            )
+            .expect("search ok")
+        };
+
+        // Grow: f → fi → fin → find. The first call is a snapshot MISS
+        // (batch build); "fi" seeds the stack off the fresh hit; "fin"/"find"
+        // must run off frames.
+        for q in ["f", "fi", "fin", "find"] {
+            let full = narrowed(q);
+            assert!(full.consistent, "no concurrent mutation in this test");
+            assert_eq!(
+                full.results,
+                batch_oracle(q),
+                "narrowed keystroke {q:?} must equal the batch layer"
+            );
+        }
+        assert!(
+            super::take_narrowed_query_steps() >= 2,
+            "reach: the grown keystrokes must have run off narrowing frames"
+        );
+
+        // Backspace to "fin": re-verifies off the stacked frame, still equal.
+        let full = narrowed("fin");
+        assert_eq!(full.results, batch_oracle("fin"));
+        assert_eq!(
+            super::take_narrowed_query_steps(),
+            1,
+            "reach: the backspaced query must be served off its own frame"
+        );
+
+        // Non-suffix edit ("xfind" shares no stacked prefix): batch reseed,
+        // still equal — the fallback arm is equality-pinned too.
+        let full = narrowed("xfind");
+        assert_eq!(full.results, batch_oracle("xfind"));
+
+        // The zero-width-only line end-to-end: "\u{200b}" has zero reported
+        // matches on the zero-width line (it spans no display column) yet
+        // "\u{200b}b" (grown from it) must find the straddling match — the
+        // occurrence-frame property surviving the whole GUI path.
+        let full_zw = narrowed("\u{200b}");
+        assert_eq!(full_zw.results, batch_oracle("\u{200b}"));
+        assert!(
+            full_zw.results.matches.is_empty(),
+            "precondition: the zero-width character spans no display column, so \
+             it reports no match anywhere in this corpus"
+        );
+        let full_zwb = narrowed("\u{200b}b");
+        assert_eq!(full_zwb.results, batch_oracle("\u{200b}b"));
+        assert!(
+            full_zwb.results.matches.iter().any(|m| m.line == 1),
+            "the zero-width-straddling match on the zero-width line (abs row 1) \
+             must survive narrowing"
+        );
     }
 }

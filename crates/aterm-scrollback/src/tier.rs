@@ -364,7 +364,7 @@ impl WarmTier {
         // Map logical index to physical position (including consumed lines).
         let physical_idx = idx.saturating_add(self.front_offset);
 
-        let Some(block_idx) = self.find_block(physical_idx) else {
+        let Some((block_idx, line_in_block)) = self.locate(physical_idx) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -372,15 +372,6 @@ impl WarmTier {
                 ),
             )));
         };
-        let block_start = if block_idx == 0 {
-            0
-        } else {
-            self.cumulative_lines
-                .get(block_idx.saturating_sub(1))
-                .copied()
-                .unwrap_or(0)
-        };
-        let line_in_block = physical_idx.saturating_sub(block_start);
 
         // Check cache first — scan every slot; hit semantics are unchanged, a
         // straddling viewport just stops evicting the block it is about to

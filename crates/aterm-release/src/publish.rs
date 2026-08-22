@@ -94,10 +94,192 @@ pub enum CutKind {
 // transcript printing
 // ---------------------------------------------------------------------------
 
-/// One transcript step line: two-space indent, label padded to the 11-column
-/// gutter of the spec §5 transcript. Continuation lines pass `""`.
+/// The column every value starts in: two spaces of indent, the label, then one
+/// HARD space. Thirteen is what the transcript already rendered, so nothing moves.
+///
+/// The hard space is the whole point. The old primitive was `"  {label:<11}"`, and
+/// `{:<11}` pads only when the label is SHORTER than 11 — an 11-character label got
+/// no separator at all and ran straight into its own value. That is not theoretical:
+/// `print_check("seed source", …)` printed `seed source10 program(s) staged at …`
+/// in a real provisioning run. A pad that can vanish is not a gutter.
+pub const VALUE_COL: usize = 13;
+
+/// The longest label the grid can carry: 2 indent + 10 + 1 hard space = [`VALUE_COL`].
+///
+/// Enforced by a `debug_assert` in [`grid_block`] and by a census over every label
+/// literal in the crate (`tests/transcript_grid.rs`), because the failure mode is a
+/// line that still PRINTS — it just prints two facts glued together.
+pub const LABEL_MAX: usize = VALUE_COL - 3;
+
+/// How wide a transcript line may be.
+///
+/// `COLUMNS` when the shell exports it, else 100: wide enough for the transcript's
+/// natural line, narrow enough that an 80-column window only wraps the tail. It is
+/// deliberately NOT a tty probe — a piped run wraps exactly the way the terminal
+/// does, so a transcript pasted into an issue reads like the screen it came from.
+/// That matters here more than in most tools: the thing an operator sends for help
+/// is `provision 2>&1 | tee`, and a wall of unwrapped 600-column paragraphs is the
+/// form in which the warnings that cost a certificate slot went unread.
+fn width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(60, 120)
+}
+
+/// Break one message into value-column rows.
+///
+/// The rules, in order, and each one exists because a message needed it:
+///
+/// 1. **Segment on `'\n'` first.** An author-supplied newline is honoured absolutely.
+///    It is how a block gets a verdict line, then an act line, then bullets — the
+///    shape that survives skimming.
+/// 2. **A segment's own leading spaces become ITS hanging indent**, so a sub-bullet
+///    or an indented path stays visually attached to the line above it instead of
+///    unwrapping flush against unrelated prose.
+/// 3. **Break on `' '` only.** A token longer than the remaining budget goes out
+///    WHOLE and is allowed to overrun. Paths, base64 public keys, URLs and commands
+///    stay one unbroken double-clickable token; a hyphenated public key is a public
+///    key the operator cannot paste.
+/// 4. **An empty segment is a genuinely empty line** — no gutter, no trailing spaces.
+/// 5. **A trailing space survives**, because a prompt ends `"… [y/N] "` and the
+///    cursor has to sit one space clear of the question.
+fn wrapped(msg: &str, width: usize) -> Vec<String> {
+    let budget = width.saturating_sub(VALUE_COL);
+    let mut out: Vec<String> = Vec::new();
+    for seg in msg.split('\n') {
+        if seg.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        // A segment's leading spaces are its hanging indent — and so is a LIST MARKER.
+        // `· it does NOT fall back…` wrapping flush under the bullet turns a five-item
+        // warning into a paragraph with dots in it; hanging the continuation under the
+        // item's TEXT is what keeps the items countable at a glance, which is the whole
+        // reason it is a list.
+        let lead = seg.len() - seg.trim_start_matches(' ').len();
+        let body = &seg[lead..];
+        let marker = &body[..bullet_marker(body)];
+        let hang = " ".repeat(lead + marker.chars().count());
+        let mut line = String::from(&seg[..lead]);
+        line.push_str(marker);
+        let mut filled = false;
+        let mut rest = &body[marker.len()..];
+        while !rest.is_empty() {
+            // The run of spaces BEFORE this word is kept, not collapsed. A double space
+            // is the transcript's mini-column separator — `key  <path>  0600, stays on
+            // this machine  (pub …)` is three fields, and a wrapper that normalises
+            // whitespace turns them into one sentence.
+            let gap = rest.len() - rest.trim_start_matches(' ').len();
+            rest = &rest[gap..];
+            if rest.is_empty() {
+                break;
+            }
+            let end = rest.find(' ').unwrap_or(rest.len());
+            let (word, tail) = rest.split_at(end);
+            rest = tail;
+            if filled && line.chars().count() + gap + word.chars().count() > budget {
+                out.push(std::mem::replace(&mut line, hang.clone()));
+                filled = false;
+            }
+            if filled {
+                for _ in 0..gap {
+                    line.push(' ');
+                }
+            }
+            line.push_str(word);
+            filled = true;
+        }
+        out.push(line);
+    }
+    // Rule 5: the greedy split above drops the trailing space a prompt depends on.
+    if msg.ends_with(' ')
+        && !msg.trim().is_empty()
+        && let Some(last) = out.last_mut()
+        && !last.is_empty()
+    {
+        last.push(' ');
+    }
+    out
+}
+
+/// The BYTE length of a leading list marker — `· `, `- `, `* `, `1. ` — or 0.
+///
+/// Bytes, because it is used to split the segment; the marker's COLUMN width is taken
+/// separately with `chars().count()`, and for `· ` those two differ (3 bytes, 2 columns).
+fn bullet_marker(body: &str) -> usize {
+    for m in ["\u{b7} ", "\u{2022} ", "- ", "* "] {
+        if body.starts_with(m) {
+            return m.len();
+        }
+    }
+    let digits = body.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 && body[digits..].starts_with(". ") {
+        return digits + 2;
+    }
+    0
+}
+
+/// Exactly what [`step`] prints, as a `String` with NO trailing newline.
+///
+/// It is a separate function so a PROMPT can be written to `/dev/tty` in the
+/// transcript's own grid. There used to be three hand-rolled gutters — a
+/// `" ".repeat(13)`, a `{:<11}`, and a hand-counted `"\n  notary   "` that was
+/// three columns shy — printing questions about permanent, irreversible acts in a
+/// layout that did not match the lines around them. A question that arrives under a
+/// different gutter reads as a different subject.
+pub fn grid_block(label: &str, msg: &str) -> String {
+    grid_block_at(width(), label, msg)
+}
+
+/// [`grid_block`] at an EXPLICIT width, so a test can assert what an 80-column window
+/// shows without mutating `COLUMNS` out from under every other test in the process.
+pub fn grid_block_at(width: usize, label: &str, msg: &str) -> String {
+    debug_assert!(
+        label.chars().count() <= LABEL_MAX,
+        "label {label:?} is {} columns; the grid carries {LABEL_MAX} \
+         (a longer one eats its own separator — see VALUE_COL)",
+        label.chars().count()
+    );
+    // Nothing to say prints NOTHING — not a labelled empty row, and not thirteen
+    // spaces of invisible gutter. `step("signing", "")` used to render as the word
+    // `signing` followed by emptiness, twice, bracketing the loudest warning the
+    // tool can print; at a labelled empty row the operator's first thought is that
+    // output was lost, at exactly the moment they are being told they are about to
+    // wedge an installed base forever.
+    if msg.trim().is_empty() {
+        return String::new();
+    }
+    let gutter = " ".repeat(VALUE_COL);
+    let mut out = String::new();
+    let mut label_placed = false;
+    for (i, row) in wrapped(msg, width).iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if row.is_empty() {
+            continue;
+        }
+        if label_placed {
+            out.push_str(&gutter);
+        } else {
+            out.push_str(&format!("  {label:<LABEL_MAX$} "));
+            label_placed = true;
+        }
+        out.push_str(row);
+    }
+    out
+}
+
+/// One transcript line (or block): two-space indent, label, value at [`VALUE_COL`],
+/// every continuation aligned under the value. Continuation lines pass `""`.
+///
+/// Call sites never pad, never count columns and never hand-break a line: the width
+/// is decided here, once, so a message widens with the terminal instead of being
+/// frozen at whatever fitted the author's window.
 pub fn step(label: &str, msg: &str) {
-    println!("  {label:<11}{msg}");
+    println!("{}", grid_block(label, msg));
 }
 
 /// "4m12s" / "38s" — whole-cut timing for the DONE line.
@@ -2042,14 +2224,24 @@ pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -
     match (carried, newest_channel) {
         (_, None) => Ok(()),
         (Some(carried), Some(newest)) if carried >= newest => Ok(()),
+        // Headline, the two numbers that DIAGNOSE the machine set side by side where
+        // they can be compared, then the fix, then the mechanism that justifies it.
+        // The remedy used to be one clause at the end of an 82-word paragraph whose first
+        // sixty words were `RosterReject::Rollback` internals — and the two generations
+        // were embedded in prose, which is the one place two numbers cannot be compared.
         (Some(carried), Some(newest)) => Err(Error::new(format!(
-            "the channel head was published under machine roster generation {newest}, but \
-             this cut carries {carried}; every client that has already seen generation \
-             {newest} refuses a release under an older one (RosterReject::Rollback) before \
-             it checks any artifact crypto, and the updater has no fallback to an older \
-             release — so publishing this would stop those clients updating at all. Refresh \
-             this machine's copy of aterm-machines.toml (it is the master-signed document \
-             `atpkg-keys join`/`machine-revoke` wrote) and cut again"
+            "this machine's roster is older than the channel's, so publishing would stop \
+             every up-to-date client from updating at all.\n\
+             \n\
+             channel head  machine roster generation {newest}\n\
+             this cut      generation {carried}\n\
+             fix           refresh this machine's copy of aterm-machines.toml — the \
+             master-signed document `atpkg-keys join` / `machine-revoke` wrote — and cut \
+             again\n\
+             \n\
+             why: every client that has already seen generation {newest} refuses a release \
+             under an older one (RosterReject::Rollback) BEFORE it checks any artifact \
+             crypto, and the updater has no fallback to an older release."
         ))),
         (None, Some(newest)) => Err(Error::new(format!(
             "the channel head was published under machine roster generation {newest}, but \
@@ -3115,18 +3307,41 @@ pub fn channel_signature_policy(
     if let Some(why) = standing.strands() {
         match evidence.pre_roster {
             PreRosterClients::Protected => {
+                // 189 words in one paragraph with no line break was the longest string
+                // this tool could print, fired at the moment a cut stops — and it hid an
+                // invisible fork between two completely different next moves. An operator
+                // scanning for "what do I type" found the word FAILED and then a wall,
+                // and the likeliest recovery is to reach for the half-remembered flag,
+                // which PERMANENTLY WEDGES installed clients. The crate already knew
+                // better: the `Stranded` branch below breaks the same argument into
+                // lines, and `gates.rs` uses an indented fix:/or: block for exactly this
+                // shape of fork.
+                //
+                // Every fact is kept — the key, its index, what ACCEPT-ONLY means, what
+                // promotion to index 0 asserts, who accepts, who is wedged, both
+                // remedies, and the `machine_id` requirement. What changes is that the
+                // reassuring fact (no ledger claim) is hoisted out of the tail, where it
+                // answers the operator's first worry, and that the fork is a list.
                 return Err(Error::new(format!(
-                    "the configured signing key's public identity {material} {why}. The \
-                     master-signed roster authorizes this machine, and every ROSTER-AWARE \
-                     client will accept this release — but a client running a build older \
-                     than the roster verifies the appcast under its own compiled-in \
-                     keyset, has no fallback to an older release, and would therefore \
-                     never update again. If no such client is left, say so on the command \
-                     line: pass {PRE_ROSTER_STRANDING_FLAG}. If some are, cut with the \
-                     committed channel head {} — the roster names it as a machine for \
-                     exactly this reason, and the release-credentials profile on that \
-                     machine must set `machine_id` to the roster id it is listed under; \
-                     no ledger claim was made",
+                    "publishing under this key would permanently wedge every client older \
+                     than the machine roster. No ledger claim was made.\n\
+                     \n\
+                     the key       {material}\n\
+                     \x20             {why}\n\
+                     who accepts   every ROSTER-AWARE client — the master-signed roster \
+                     authorizes this machine\n\
+                     who does not  a client running a build older than the roster: it \
+                     verifies the appcast under its own compiled-in keyset, has NO \
+                     fallback to an older release, and would never update again\n\
+                     \n\
+                     CHOOSE ONE\n\
+                     \x20 1. cut with the committed channel head {} — the roster names it \
+                     as a machine for exactly this reason. The release-credentials profile \
+                     on THAT machine must set `machine_id` to the roster id it is listed \
+                     under, or the cut refuses there too.\n\
+                     \x20 2. pass {PRE_ROSTER_STRANDING_FLAG} — ONLY if no client older \
+                     than the roster is left in the field. This is not a delay for them, \
+                     it is permanent: a reinstall is the only remedy.",
                     // `strands()` is `Some` only for the two variants that carry a head,
                     // so the fallback is unreachable — spelled out rather than unwrapped
                     // because a refusal path is the worst place to learn that.
@@ -3136,30 +3351,28 @@ pub fn channel_signature_policy(
             PreRosterClients::Stranded => {
                 // Loud, unmissable, and printed on every entry that signs under such a
                 // key — not once at the moment the flag was invented.
-                step("signing", "");
+                // Air, not a labelled empty row. `step("signing", "")` rendered as the
+                // word `signing` followed by nothing, twice, bracketing the loudest
+                // warning this tool can print — and an operator's first thought at a
+                // labelled empty row is that output was lost, at exactly the moment they
+                // are being told they are about to wedge an installed base forever.
+                println!();
                 step(
                     "signing",
                     "⚠ STRANDING PRE-ROSTER CLIENTS, because you asked for it",
                 );
                 step("", &format!("the signing key {material} {why}"));
+                // Same words, one string: the wrapper owns the breaks, so this widens
+                // with the terminal instead of staying frozen at the author's window.
                 step(
                     "",
-                    "every client running a build older than the machine roster verifies",
+                    "every client running a build older than the machine roster verifies \
+                     the appcast under its own compiled-in keyset, and release selection \
+                     has NO fallback to an older release. Those clients will not install \
+                     this release, or any release after it, ever — they are not delayed, \
+                     they are wedged, and a reinstall is the only remedy.",
                 );
-                step(
-                    "",
-                    "the appcast under its own compiled-in keyset, and release selection",
-                );
-                step(
-                    "",
-                    "has NO fallback to an older release. Those clients will not install",
-                );
-                step(
-                    "",
-                    "this release, or any release after it, ever — they are not delayed,",
-                );
-                step("", "they are wedged, and a reinstall is the only remedy.");
-                step("signing", "");
+                println!();
             }
             PreRosterClients::Answered => {}
         }
@@ -3716,6 +3929,91 @@ pub(crate) const fn release_identity_jq(listing: bool) -> &'static str {
         RELEASE_IDENTITY_LIST_JQ
     } else {
         RELEASE_IDENTITY_OBJECT_JQ
+    }
+}
+
+/// The highest `atpkg-index-N` build published in `slug`, or `None` when the
+/// repo publishes no index releases at all.
+///
+/// Deliberately reads TAG NAMES only. The index build is encoded in the tag by
+/// `tools/atpkg-index.sh`, so this needs neither asset downloads nor signature
+/// verification — it is answering "has the index moved past what we sealed?",
+/// not "is this index trustworthy?". Trust is the client's chain's job, and it
+/// runs over the sealed bytes regardless of what this returns.
+fn newest_published_index_build(slug: &str) -> Result<Option<u64>> {
+    const PER_PAGE: usize = 100;
+    let endpoint = format!("repos/{slug}/releases?per_page={PER_PAGE}");
+    let out = gh_retry(&["api", &endpoint, "--jq", ".[].tag_name"])?;
+    Ok(out
+        .stdout_utf8()
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("atpkg-index-"))
+        .filter_map(|rest| rest.parse::<u64>().ok())
+        .max())
+}
+
+/// Refuse a cut whose staged seed is behind the index CLIENTS will read.
+///
+/// The seal is frozen at staging time and then pressed into every DMG, so an
+/// index published between staging and cut ships as day-one staleness that no
+/// amount of client-side care can undo. v0.44.0 is the worked example: sealed
+/// at index build 8, `atpkg-index-9` published 70 minutes before the cut, and
+/// four of ten programs (`ay`, `clean`, `ny`, `ty`) were behind the moment the
+/// DMG existed.
+///
+/// Every other seed gate here is internal-consistency or shelf-life — all of
+/// them pass on a stale-but-well-formed seal, which is exactly what shipped.
+/// This is the only gate that asks the outside world a question.
+///
+/// FATAL on a confirmed lag (with a named override, because rehearsing an older
+/// index is a real if rare thing to want) and LOUD but non-fatal when the index
+/// cannot be reached — an offline rehearsal should not be blocked by a gate
+/// that had no answer either way.
+fn gate_seed_matches_published_index(stat: &crate::seedpack::SeedStat) -> Result<()> {
+    if std::env::var_os("ATERM_ALLOW_STALE_SEED").is_some() {
+        step(
+            "seed-index",
+            &format!(
+                "ATERM_ALLOW_STALE_SEED set — NOT checking index build {} against the published index",
+                stat.index_build
+            ),
+        );
+        return Ok(());
+    }
+    let slug = atpkg::discovery::resolve_account(None).slug();
+    match newest_published_index_build(&slug) {
+        Ok(Some(newest)) if newest > stat.index_build => Err(Error::new(format!(
+            "staged seed is index build {} but {slug} already publishes atpkg-index-{newest} — \
+             every DMG from this cut would install superseded programs on day one. Re-stage with \
+             `tools/atpkg-seed-from-published.sh` (it now takes the newest index by default), or \
+             cut anyway with ATERM_ALLOW_STALE_SEED=1.",
+            stat.index_build
+        ))),
+        Ok(Some(newest)) => {
+            step(
+                "seed-index",
+                &format!("seed is index build {} — current with {slug} (newest: {newest})", stat.index_build),
+            );
+            Ok(())
+        }
+        Ok(None) => {
+            step(
+                "seed-index",
+                &format!("{slug} publishes no atpkg-index-N release — nothing to compare against"),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            step(
+                "seed-index",
+                &format!(
+                    "WARNING: could not read the published index list from {slug} ({e}) — \
+                     shipping seed index build {} UNCHECKED for staleness",
+                    stat.index_build
+                ),
+            );
+            Ok(())
+        }
     }
 }
 
@@ -4441,7 +4739,11 @@ pub fn validate_draft_asset_set(
     };
     // The manifest is the authority for the zip exactly as it is for the DMG: a
     // manifest that names a container the release does not carry would publish a
-    // head every client resolves and then fails to download.
+    // head every client resolves and then fails to download. Each container
+    // carries its `.sha256` sidecar — the record the release notes tell a human
+    // to verify the download against.
+    let dmg_sidecar = mirror::sha256_sidecar_name(&manifest.dmg);
+    let zip_sidecar = manifest.zip.as_deref().map(mirror::sha256_sidecar_name);
     let mut exact_counts = vec![
         (manifest_out::MANIFEST_ASSET, 1usize),
         (
@@ -4449,12 +4751,16 @@ pub fn validate_draft_asset_set(
             usize::from(signature_required),
         ),
         (manifest.dmg.as_str(), 1usize),
+        (dmg_sidecar.as_str(), 1usize),
         (provenance_name, 1usize),
         (roster::ROSTER_ASSET, usize::from(roster_attached)),
         (roster::ROSTER_SIG_ASSET, usize::from(roster_attached)),
     ];
     if let Some(zip) = manifest.zip.as_deref() {
         exact_counts.push((zip, 1usize));
+    }
+    if let Some(sidecar) = zip_sidecar.as_deref() {
+        exact_counts.push((sidecar, 1usize));
     }
     for (name, expected) in exact_counts {
         let observed = count(name);
@@ -4478,10 +4784,14 @@ pub fn validate_draft_asset_set(
     let mut allowed = vec![
         manifest_out::MANIFEST_ASSET,
         manifest.dmg.as_str(),
+        dmg_sidecar.as_str(),
         provenance_name,
     ];
     if let Some(zip) = manifest.zip.as_deref() {
         allowed.push(zip);
+    }
+    if let Some(sidecar) = zip_sidecar.as_deref() {
+        allowed.push(sidecar);
     }
     if signature_required {
         allowed.push(manifest_out::MANIFEST_SIG_ASSET);
@@ -5414,6 +5724,20 @@ impl CutCtx {
     fn app_path(&self) -> PathBuf {
         bundle::staged_app_path(&self.dist)
     }
+    /// The DMG's `.sha256` sidecar in dist/ — written by `step_build` from the
+    /// in-process digest, verified against the manifest by `step_selfcheck`.
+    fn dmg_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::dmg_asset_name(
+                &self.version,
+            )))
+    }
+    fn zip_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::zip_asset_name(
+                &self.version,
+            )))
+    }
     fn manifest_path(&self) -> PathBuf {
         self.dist.join(manifest_out::MANIFEST_ASSET)
     }
@@ -5660,7 +5984,9 @@ impl CutCtx {
     fn upload_asset_paths(&self) -> Vec<PathBuf> {
         let mut files = vec![
             self.dmg_path(),
+            self.dmg_sha256_path(),
             self.zip_path(),
+            self.zip_sha256_path(),
             self.manifest_path(),
             self.provenance_path(),
         ];
@@ -5678,7 +6004,9 @@ impl CutCtx {
         let mut files = vec![
             self.manifest_path(),
             self.dmg_path(),
+            self.dmg_sha256_path(),
             self.zip_path(),
+            self.zip_sha256_path(),
             self.provenance_path(),
         ];
         if self.signature_required {
@@ -6923,6 +7251,14 @@ fn recover_published_cut(
         &manifest.sha256,
         &dist.join(&manifest.dmg),
     )?;
+    // Regenerate the stable download twin from the digest-verified canonical
+    // DMG: recovery must leave dist/ able to satisfy required_asset_names(),
+    // and the twin is by definition a byte copy of the canonical asset.
+    fs::copy(
+        dist.join(&manifest.dmg),
+        dist.join(mirror::stable_dmg_asset_name()),
+    )
+    .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
     verify_release_asset_digest_for_release_id_to(
         slug,
         release_object.id,
@@ -6931,6 +7267,21 @@ fn recover_published_cut(
         &recovered_zip_sha256,
         &dist.join(&recovered_zip),
     )?;
+    // The `.sha256` sidecars are pure functions of the manifest digests just
+    // proved against the downloaded bytes, so a recovery REGENERATES them
+    // rather than downloading — the mirror step demands them from dist/ and a
+    // release published before sidecars existed can still be recovered.
+    for (name, sha) in [
+        (manifest.dmg.as_str(), manifest.sha256.as_str()),
+        (recovered_zip.as_str(), recovered_zip_sha256.as_str()),
+    ] {
+        let sidecar = mirror::sha256_sidecar_name(name);
+        fs::write(
+            dist.join(&sidecar),
+            mirror::sha256_sidecar_contents(sha, name),
+        )
+        .map_err(|error| Error::new(format!("reconstruct {sidecar}: {error}")))?;
+    }
     fs::write(dist.join(manifest_out::MANIFEST_ASSET), &manifest_bytes)
         .map_err(|error| Error::new(format!("reconstruct manifest: {error}")))?;
     if let Some(signature) = &signature_bytes {
@@ -7287,13 +7638,22 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                         stat.valid_until
                     ),
                 );
+                // Emitted HERE and only here. The second call site (`step_build`) runs
+                // the same `validate` ninety seconds later and stays silent, because
+                // printing the identical paragraph twice in one cut is how a real warning
+                // teaches an operator to skip warnings.
+                for w in &stat.warnings {
+                    step("", w);
+                }
             }
             None => {
                 return Err(Error::new(
-                    "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
-                     a batteries-included cut seals every published binary into the app. Stage \
-                     one with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
-                     deliberately seedless with ATERM_SEEDLESS=1. No ledger claim was made.",
+                    "no toolchain seed staged — a batteries-included cut seals every \
+                     published binary into the app, and there is nothing to seal. No ledger \
+                     claim was made.\n\
+                     stage it:  tools/atpkg-seed-from-published.sh\n\
+                     or cut deliberately seedless:  ATERM_SEEDLESS=1\n\
+                     looked at:  dist/toolchain-seed, and ATERM_SEED_DIR (unset)",
                 ));
             }
         }
@@ -8232,6 +8592,30 @@ pub fn notarize_and_package(
     pack: &dyn Packager,
     seeded: bool,
 ) -> Result<PackagedCut> {
+    // Said BEFORE the two notarization waits, and said HERE rather than in `sign.rs`,
+    // which deliberately references nothing else in the crate so `tests/signconf.rs` can
+    // mount it alone.
+    //
+    // The crate teaches, in the ONE other place it mentions interrupting — the
+    // certificate wait, "Ctrl-C is safe, nothing is lost and this step resumes" — that a
+    // long silent wait may be interrupted. This is the other kind, and every fact below
+    // already lived in `run_streamed`'s doc and in `NOTARY_SUBMIT_TIMEOUT` without ever
+    // being printed.
+    if tier.identity().is_some() {
+        step(
+            "notarize",
+            &format!(
+                "Apple decides how long this takes, not us: usually 2-10 min, and this cut \
+                 gives up after {} min.\n\
+                 ⚠ do NOT Ctrl-C — unlike the certificate wait, this cut is holding a \
+                 release lease, a publisher fence and a burned build number, and abandoning \
+                 it here is recoverable only through an explicit killed-machine takeover \
+                 (`cargo ship recover`).\n\
+                 notarytool streams its own progress below.",
+                sign::NOTARY_SUBMIT_TIMEOUT.as_secs() / 60
+            ),
+        );
+    }
     // THE BUNDLE IS NOTARIZED FIRST, before either container exists.
     let notarized_app = sign::notarize_app(app, tier, tools).map_err(Error::new)?;
     if notarized_app {
@@ -8358,15 +8742,27 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         None
     } else {
         match crate::seedpack::resolve(&ctx.dist) {
-            Some(dir) => Some(crate::seedpack::validate(&dir).map_err(Error::new)?),
+            Some(dir) => {
+                let stat = crate::seedpack::validate(&dir).map_err(Error::new)?;
+                // Internal consistency and shelf life are proven above; this is
+                // the only gate that asks whether the world moved past the seal.
+                gate_seed_matches_published_index(&stat)?;
+                Some(stat)
+            }
             None => {
+                // The caveat LEADS here, because it is the only thing that distinguishes
+                // this refusal from the pre-claim one forty-five words earlier — and
+                // recognising the opening of a message you have already read is exactly
+                // what suppresses the tail where the distinguishing fact used to sit.
                 return Err(Error::new(
-                    "no toolchain seed staged (dist/toolchain-seed absent, no ATERM_SEED_DIR) — \
-                     a batteries-included cut seals every published binary into the app. Stage \
-                     one with `INDEX_BUILD=<N> tools/atpkg-seed-from-published.sh`, or cut \
-                     deliberately seedless with ATERM_SEEDLESS=1. If this is a --resume of a \
-                     cut that was already running seedless, re-export ATERM_SEEDLESS=1 in this \
-                     shell: the flag is read from the environment, not from the journal.",
+                    "no toolchain seed staged — and if this is a --resume of a cut that was \
+                     already running seedless, that is why: ATERM_SEEDLESS=1 is read from \
+                     the environment, not from the journal, so it must be re-exported in \
+                     THIS shell.\n\
+                     resume seedless:  ATERM_SEEDLESS=1\n\
+                     or stage it:  tools/atpkg-seed-from-published.sh\n\
+                     a batteries-included cut seals every published binary into the app, \
+                     and there is nothing to seal.",
                 ));
             }
         }
@@ -8437,6 +8833,19 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         &RealPackager,
         spec.seed.is_some(),
     )?;
+    // The stable download twin (`aterm.dmg`) is copied only HERE, after
+    // `notarize_and_package` has produced the FINAL DMG bytes (codesign/staple
+    // rewrites included), so the twin is byte-identical to the bytes dmg_sha
+    // covers. required_asset_names() lists it, so the mirror uploads it and
+    // refuses a channel head without it.
+    let stable_dmg = ctx.dist.join(mirror::stable_dmg_asset_name());
+    fs::copy(&dout.path, &stable_dmg).map_err(|e| {
+        Error::new(format!(
+            "copy {} -> {}: {e}",
+            dout.path.display(),
+            stable_dmg.display()
+        ))
+    })?;
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
     if ctx.signature_required {
@@ -8483,13 +8892,40 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             &zout.sha256[..12.min(zout.sha256.len())]
         ),
     );
+    // `.sha256` sidecars for BOTH containers, from the SAME in-process digests
+    // that feed the manifest — `shasum -a 256 -c` records, exactly like the
+    // Linux tarball's. The DMG is the manual download and its digest otherwise
+    // lives only inside the appcast TOML no human opens; these two ~99-byte
+    // assets are what the release notes' verify instruction points at.
+    for (path, sha, name) in [
+        (
+            ctx.dmg_sha256_path(),
+            dmg_sha.as_str(),
+            mirror::dmg_asset_name(&ctx.version),
+        ),
+        (
+            ctx.zip_sha256_path(),
+            zout.sha256.as_str(),
+            mirror::zip_asset_name(&ctx.version),
+        ),
+    ] {
+        fs::write(&path, mirror::sha256_sidecar_contents(sha, &name))
+            .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
+    }
+    step("", "`.sha256` sidecars staged for both containers (shasum -a 256 -c)");
 
     // ---- manifest + notes (the rolled body, verbatim, once — spec §3) -----
     let cl_text = fs::read_to_string(ctx.repo.join(changelog::CHANGELOG_FILE))
         .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
     let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
-    fs::write(ctx.notes_path(), format!("{body}\n"))
-        .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
+    // The GITHUB body gets the standing newcomer preamble; the manifest's
+    // `changelog` below stays the rolled section verbatim — the in-app notes
+    // address a machine that already runs aterm.
+    fs::write(
+        ctx.notes_path(),
+        changelog::release_notes_document(&ctx.version, &body),
+    )
+    .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
 
     let plist_text = fs::read_to_string(app.join("Contents/Info.plist"))
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
@@ -8811,7 +9247,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     // downloads, so a stale/absent zip must abort the cut here, not strand every
     // machine on a digest mismatch after publication.
     let zip_name = mirror::zip_asset_name(&ctx.version);
-    match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
+    let zip_sha256 = match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
         (Some(name), Some(expected)) => {
             if name != zip_name {
                 return Err(Error::new(format!(
@@ -8824,6 +9260,7 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
                     "self-check failed: zip sha256 {sha} != manifest {expected}"
                 )));
             }
+            expected.to_string()
         }
         _ => {
             return Err(Error::new(
@@ -8831,6 +9268,42 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
                  updater cannot stage without `hdiutil`, which an orphaned post-handoff \
                  process cannot use",
             ));
+        }
+    };
+
+    // The `.sha256` sidecars on disk must state EXACTLY the digests the manifest
+    // does — dist/ is mutable and a resume skips `step_build`, so a stale sidecar
+    // from an earlier attempt would ship a verification record that fails against
+    // the very bytes beside it. Byte equality against the regenerated record, not
+    // a parse: the sidecar has one legal spelling (`<hash>  <name>\n`).
+    //
+    // A sidecar that is MISSING outright is the other resume shape: a cut staged
+    // by a pre-sidecar cutter, resumed by this one. Sidecars are pure functions
+    // of digests the manifest already binds, so they are regenerated here the
+    // same way `recover_published_cut` reconstructs them for old releases —
+    // refusing would strand every journal written before sidecars existed.
+    for (path, sha, name) in [
+        (
+            ctx.dmg_sha256_path(),
+            manifest.sha256.as_str(),
+            manifest.dmg.as_str(),
+        ),
+        (ctx.zip_sha256_path(), zip_sha256.as_str(), zip_name.as_str()),
+    ] {
+        let expected = mirror::sha256_sidecar_contents(sha, name);
+        if !path.exists() {
+            fs::write(&path, &expected)
+                .map_err(|e| Error::new(format!("self-check: write {}: {e}", path.display())))?;
+        }
+        let observed = fs::read_to_string(&path)
+            .map_err(|e| Error::new(format!("self-check: read {}: {e}", path.display())))?;
+        if observed != expected {
+            return Err(Error::new(format!(
+                "self-check failed: {} does not carry the manifest's digest record \
+                 (expected {expected:?}, found {observed:?}) — a stale sidecar would \
+                 fail `shasum -c` against the artifact beside it",
+                path.display()
+            )));
         }
     }
 
@@ -9364,10 +9837,40 @@ fn prove_draft_artifacts(ctx: &mut CutCtx) -> Result<()> {
         .then(|| dsym_path.file_name().and_then(|name| name.to_str()))
         .flatten();
     let inventory_before = release_asset_inventory_for_release_id(&ctx.slug, release_id)?;
-    let names: Vec<String> = inventory_before
+    let mut names: Vec<String> = inventory_before
         .iter()
         .map(|asset| asset.name.clone())
         .collect();
+    // A draft uploaded by a pre-sidecar cutter lacks exactly the `.sha256`
+    // sidecar assets. They are pure digest records `step_selfcheck` above just
+    // re-proved (regenerating them on disk if absent), and
+    // `recover_published_cut` already attaches them to PUBLISHED releases on
+    // the same reasoning — so converge the draft here rather than strand every
+    // pre-sidecar journal at its own proof step. Anything else missing still
+    // fails `validate_draft_asset_set` below, on a fresh listing.
+    let sidecar_uploads = [
+        (
+            mirror::sha256_sidecar_name(&mirror::dmg_asset_name(&ctx.version)),
+            ctx.dmg_sha256_path(),
+        ),
+        (
+            mirror::sha256_sidecar_name(&mirror::zip_asset_name(&ctx.version)),
+            ctx.zip_sha256_path(),
+        ),
+    ];
+    let mut converged = false;
+    for (name, path) in &sidecar_uploads {
+        if !names.iter().any(|n| n == name) && path.is_file() {
+            upload_release_asset_by_id(ctx, release_id, path)?;
+            converged = true;
+        }
+    }
+    if converged {
+        names = release_asset_inventory_for_release_id(&ctx.slug, release_id)?
+            .iter()
+            .map(|asset| asset.name.clone())
+            .collect();
+    }
     validate_draft_asset_set(
         &names,
         &manifest,

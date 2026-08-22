@@ -79,6 +79,31 @@ pub struct DiskColdTier {
     /// Lines logically consumed from the first page. Avoids decompression
     /// during line-limit truncation — pages are dropped when fully consumed.
     front_offset: usize,
+    /// Compressed bytes appended since the last append-side durability
+    /// barrier (`SYNC_APPEND_BYTES` in disk_write.rs). Drives the deferred
+    /// fsync policy only; never consulted by reads or indexing.
+    unsynced_append_bytes: usize,
+    /// True when the on-disk header's page/line counters lag the in-memory
+    /// index. The counters are ADVISORY (`scan_pages` rebuilds the index from
+    /// page headers and only uses them as a clamped preallocation hint), so
+    /// lag is always safe — this flag merely schedules the catch-up write at
+    /// the next barrier.
+    header_dirty: bool,
+    /// Shared dead-prefix length of `index` AND `cumulative_lines` (their
+    /// first `front_dropped` entries belong to dropped pages). Front drops
+    /// advance this cursor in O(dropped) instead of draining both vectors —
+    /// the old path memmoved `index` and memmoved+rebased `cumulative_lines`,
+    /// O(total pages) per drop, on the line-limit path of every push. The
+    /// prefix is reclaimed by one amortized memmove when it outgrows the
+    /// live half (see `drop_front_index_entries`).
+    front_dropped: usize,
+    /// Absolute cumulative value at the current front: total physical lines
+    /// in pages dropped since the last full rebuild. Live `cumulative_lines`
+    /// entries are ABSOLUTE (base + physical lines in live pages `0..=i`);
+    /// lookups add the base to the search target instead of ever rebasing
+    /// stored values. Saturating bumps are exact on every real path (crate
+    /// idiom).
+    cumulative_base: usize,
 }
 
 impl DiskColdTier {
@@ -100,6 +125,10 @@ impl DiskColdTier {
             write_offset: HEADER_SIZE as u64,
             bytes_used: Cell::new(0),
             front_offset: 0,
+            unsynced_append_bytes: 0,
+            header_dirty: false,
+            front_dropped: 0,
+            cumulative_base: 0,
         }
         .with_computed_bytes_used()
     }
@@ -170,6 +199,10 @@ impl DiskColdTier {
             write_offset: HEADER_SIZE as u64,
             bytes_used: Cell::new(0),
             front_offset: 0,
+            unsynced_append_bytes: 0,
+            header_dirty: false,
+            front_dropped: 0,
+            cumulative_base: 0,
         }
         .with_computed_bytes_used())
     }
@@ -204,6 +237,10 @@ impl DiskColdTier {
             write_offset,
             bytes_used: Cell::new(0),
             front_offset: 0,
+            unsynced_append_bytes: 0,
+            header_dirty: false,
+            front_dropped: 0,
+            cumulative_base: 0,
         }
         .with_computed_bytes_used())
     }
@@ -361,10 +398,10 @@ impl DiskColdTier {
         self.line_count
     }
 
-    /// Get the total compressed size on disk.
+    /// Get the total compressed size on disk (live pages only).
     #[must_use]
     pub fn compressed_size(&self) -> usize {
-        self.index
+        self.live_index()
             .iter()
             .map(|e| len_u32_to_usize(e.compressed_size))
             .sum()
@@ -376,13 +413,71 @@ impl DiskColdTier {
         self.bytes_used.get()
     }
 
+    /// Live (non-dropped) page-index entries. Total `get` keeps it
+    /// panic-free; `front_dropped <= len` is a maintained invariant.
+    #[inline]
+    pub(super) fn live_index(&self) -> &[PageIndexEntry] {
+        self.index.get(self.front_dropped..).unwrap_or(&[])
+    }
+
+    /// Live region of the cumulative index (parallel to [`Self::live_index`]).
+    #[inline]
+    pub(super) fn live_cumulative(&self) -> &[usize] {
+        self.cumulative_lines.get(self.front_dropped..).unwrap_or(&[])
+    }
+
+    /// Drop the first `k` LIVE pages from the index in O(k) amortized:
+    /// advance the shared cursor and the absolute base, leaving every
+    /// surviving entry of BOTH vectors untouched. The dead prefix is
+    /// reclaimed by a single memmove of both vectors only once it outgrows
+    /// the live half — amortized O(1) per dropped page, single-call bound
+    /// O(live) word-moves — replacing the old unconditional drain-and-rebase
+    /// (O(total pages) memmove + rewrite per drop). Clears everything (and
+    /// resets the base) when no live page survives, so `empty => base == 0`
+    /// holds for `push_compressed`.
+    // Skip: `Vec::drain` under its guard — the BLANKET-unmodeled drain class
+    // (guards don't chain). Same audit as `truncate_front_lines`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(super) fn drop_front_index_entries(&mut self, k: usize) {
+        if k == 0 {
+            return;
+        }
+        let live_len = self.live_index().len();
+        if k >= live_len {
+            self.index.clear();
+            self.cumulative_lines.clear();
+            self.front_dropped = 0;
+            self.cumulative_base = 0;
+            return;
+        }
+        // New base = absolute value of the LAST dropped entry. `get` keeps
+        // the lookup total; the None arm is unreachable (1 <= k < live_len
+        // just established, so `front_dropped + k - 1 < len`) and falls back
+        // to the current base — it cannot execute on any real path.
+        let last_dropped = self.front_dropped.saturating_add(k).saturating_sub(1);
+        self.cumulative_base = self
+            .cumulative_lines
+            .get(last_dropped)
+            .copied()
+            .unwrap_or(self.cumulative_base);
+        self.front_dropped = self.front_dropped.saturating_add(k);
+        // Amortized reclamation of the dead prefix (both vectors together —
+        // they are parallel by construction).
+        if self.front_dropped > self.index.len().saturating_sub(self.front_dropped) {
+            let dead = self.front_dropped;
+            self.index.drain(..dead);
+            self.cumulative_lines.drain(..dead);
+            self.front_dropped = 0;
+        }
+    }
+
     /// Bytes of dead (unreclaimable) space at the front of the file.
     ///
     /// After `truncate_front_lines` drops pages, the space between the file
     /// header and the first surviving page is dead — it cannot be reclaimed
     /// by `ftruncate` (which only trims from the end).
     fn dead_bytes(&self) -> u64 {
-        self.index
+        self.live_index()
             .first()
             .map_or(0, |e| e.offset.saturating_sub(HEADER_SIZE as u64))
     }
@@ -404,6 +499,10 @@ impl DiskColdTier {
 /// Flush and unmap before closing the backing file.
 impl Drop for DiskColdTier {
     fn drop(&mut self) {
+        // Deferred append durability: catch the header up and fsync before
+        // closing, so a clean exit loses nothing despite the batched
+        // barriers (power loss mid-session is the only widened window).
+        let _ = self.sync_appends();
         let _ = self.flush_and_drop_mmap();
         if let Some(ref mut file) = self.file {
             let _ = file.sync_all();

@@ -45,12 +45,65 @@ pub fn tree_root(root: &Path) -> io::Result<String> {
     // builds the array on the stack first and reintroduces exactly what this removes.
     let mut buf = vec![0u8; 64 * 1024];
     walk(root, root, &mut entries, &mut buf)?;
+    Ok(root_of_entry_lines(entries))
+}
+
+/// Fold a set of canonical entry lines ([`entry_line`]) into the tree root: **sort**,
+/// concatenate, SHA-256, lowercase hex.
+///
+/// Extracted from [`tree_root`] verbatim so the *other* producer of this digest — the
+/// extraction-time accumulator in [`crate::extract`], which folds the bytes it already
+/// has in a register instead of re-reading the payload from disk — cannot drift from
+/// it. `tree_root` is a CROSS-VERSION byte contract (signed manifests embed roots
+/// computed by earlier releases), so "two implementations that agree today" is not good
+/// enough: there is one formatter and one fold, and both callers go through them.
+///
+/// The sort is over whole LINES, exactly as before. That is the same order as a sort by
+/// relpath whenever the relpaths are distinct — a path byte is never `0x00`, and `\0` is
+/// the lowest byte, so at the first position where two lines differ either the paths
+/// already differ (same verdict) or one path ended and its `\0` compares below the
+/// other's next path byte (again the same verdict as the shorter-prefix-first path
+/// order). The accumulator relies on that equivalence; it still sorts, so the property
+/// is belt-and-suspenders rather than load-bearing.
+pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
     entries.sort();
     let mut h = Sha256::new();
     for e in &entries {
         h.update(e);
     }
-    Ok(hex(&h.finalize()))
+    hex(&h.finalize())
+}
+
+/// Build ONE canonical entry line: `<relpath-bytes> 0x00 <octal-perm-bits> 0x00
+/// <lowercase-hex content sha256> 0x0A` (see [`tree_root`] for the contract).
+///
+/// `mode` is the value [`crate::platform::permission_mode`] reports for the file,
+/// masked to `0o7777` by the caller — NOT the mode the extractor asked for. The two are
+/// the same on Unix (the extractor `set_mode`s and the filesystem stores it verbatim)
+/// and both are `0` on Windows (no POSIX bits), but reading the mode back is what keeps
+/// the extraction-time twin honest on any filesystem that would answer differently.
+pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> Vec<u8> {
+    // Saturating spelling of the capacity hint (a no-op on every real
+    // input: entry lines are a path + 64 hex chars + separators, nowhere
+    // near `usize::MAX`), branch-dominated for the allocation-budget
+    // recognizer. A capacity hint is behavior-neutral anyway — the `Vec`
+    // grows as needed.
+    let cap = rel_bytes
+        .len()
+        .saturating_add(content_sha_hex.len())
+        .saturating_add(16);
+    let mut line = if cap <= 4096 {
+        Vec::with_capacity(cap)
+    } else {
+        Vec::with_capacity(4096)
+    };
+    line.extend_from_slice(rel_bytes);
+    line.push(0);
+    line.extend_from_slice(oct_mode(mode).as_bytes());
+    line.push(0);
+    line.extend_from_slice(content_sha_hex.as_bytes());
+    line.push(b'\n');
+    line
 }
 
 /// Recursively collect one canonical entry line per regular file under `dir`, hashing
@@ -79,27 +132,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::
             // as missing-SAFETY-comment refutations under the strict Trust gate (see
             // `lib.rs`). Same call, same receiver; behavior identical.
             let rel_bytes = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
-            // Saturating spelling of the capacity hint (a no-op on every real
-            // input: entry lines are a path + 64 hex chars + separators, nowhere
-            // near `usize::MAX`), branch-dominated for the allocation-budget
-            // recognizer. A capacity hint is behavior-neutral anyway — the `Vec`
-            // grows as needed.
-            let cap = rel_bytes
-                .len()
-                .saturating_add(fsha.len())
-                .saturating_add(16);
-            let mut line = if cap <= 4096 {
-                Vec::with_capacity(cap)
-            } else {
-                Vec::with_capacity(4096)
-            };
-            line.extend_from_slice(rel_bytes);
-            line.push(0);
-            line.extend_from_slice(oct_mode(mode).as_bytes());
-            line.push(0);
-            line.extend_from_slice(fsha.as_bytes());
-            line.push(b'\n');
-            out.push(line);
+            out.push(entry_line(rel_bytes, mode, &fsha));
         } else {
             // symlink / device / fifo / socket — must not be in an extracted bundle.
             // Manual concat of the previous
@@ -200,7 +233,7 @@ fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
 /// hint is clamped behind a dominating comparison for the allocation-budget
 /// recognizer; every real input is a digest (32 bytes -> 64 chars), so the
 /// clamp never bites — and a capacity hint is behavior-neutral anyway.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     /// The lowercase hex digit for nibble `n` (`n < 16` at every call site).
     fn nibble(n: u8) -> char {
         if n < 10 {

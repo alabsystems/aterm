@@ -9,7 +9,7 @@
 //!
 //! Extracted from `mod.rs` to reduce file size (#4553).
 
-use crate::grid::{Grid, StyleId};
+use crate::grid::Grid;
 
 use super::TaskbarProgress;
 #[cfg(feature = "sixel")]
@@ -66,7 +66,9 @@ impl ResetGroups<'_> {
     }
 }
 
-/// Reset shared terminal state — 10 parameters (#4307, was 27→18→9; +1 for #7336).
+/// Reset shared terminal state — 9 parameters (#4307, was 27→18→9; +1 for #7336,
+/// then -1 when the write-only style interner was deleted and `current_style_id`
+/// with it).
 ///
 /// Core state fields are passed individually for split-borrow compatibility.
 /// Grouped protocol/image/title state is bundled in [`ResetGroups`].
@@ -80,7 +82,6 @@ pub(super) fn reset_common_fields(
     grid: &mut Grid,
     modes: &mut TerminalModes,
     style: &mut CurrentStyle,
-    current_style_id: &mut StyleId,
     charset: &mut CharacterSetState,
     alt_grid: &mut Option<Grid>,
     cursor_save: &mut CursorSaveState,
@@ -94,7 +95,6 @@ pub(super) fn reset_common_fields(
     // Modes and style
     *modes = TerminalModes::new();
     style.reset();
-    *current_style_id = StyleId::DEFAULT;
     charset.reset();
     // If on the alternate screen, `grid` currently points at the alt grid and
     // `alt_grid` holds the main grid (with its scrollback).  Swap the main
@@ -180,7 +180,6 @@ impl Terminal {
             &mut self.grid,
             &mut self.modes,
             &mut self.style,
-            &mut self.current_style_id,
             &mut self.charset,
             &mut self.alt_grid,
             &mut self.cursor_save,

@@ -21,8 +21,27 @@
 //! `SelectionType`) — no fs, no socket, no winit. Both sources BUILD an
 //! `InputEvent` and feed it to the ONE policy site `App::input(ev, src)`, which
 //! is the sole reader of `keyboard_mode()`/`mouse_tracking_enabled()` and the
-//! sole caller of the encoders / `scroll_display` / `clear_selection` /
-//! `snap_to_bottom` / `reset_blink` / `apply_term_resize`. (The predictive-echo
+//! sole caller of the encoders / `scroll_display` / `reset_blink` /
+//! `apply_term_resize`, and of the press-path viewport snap + selection clear
+//! (`app_input::apply_press_custody`, inlined into the seam's one term-lock
+//! scope).
+//!
+//! Two corrections to what this paragraph used to claim. There is no
+//! `fn clear_selection` anywhere in the workspace — the clear is
+//! `text_selection_mut().clear()` under the seam's own lock. And `snap_to_bottom`
+//! is NOT seam-exclusive: after SELECTION CUSTODY its callers outside the seam
+//! are exactly the PASTE-or-ECHO arms, which never reach the seam and so must
+//! snap for themselves —
+//!
+//!   * `app_input::input_paste` and `dispatch_action`'s `Action::Paste`
+//!   * the hardcoded ⌘-V arm of `on_key`
+//!   * the IME-composition arm of `on_key` (a composing key IS typing; the
+//!     preedit paints at the cursor, so a scrolled-back composer would type
+//!     off-screen)
+//!
+//! …plus `app_mouse::select_all`. Every OTHER caller was deleted: a press that
+//! writes no bytes to the PTY expresses no typing intent and may not take the
+//! user's reading position (SELECTION CUSTODY R1). (The predictive-echo
 //! gate additionally reads the NARROW
 //! `Terminal::kitty_suppresses_predictive_echo()` projection of the mode — a
 //! read-only DISPLAY gate deciding whether a local guess may paint; it never

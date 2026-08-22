@@ -8,8 +8,10 @@
 //! shape: resolving the GitHub release source (owner/repo) under
 //! env > config > default precedence with a URL-safety allowlist; an advisory
 //! [`FileLock`] and a [`same_volume`] check; token-optional `curl` plumbing to the
-//! GitHub Releases API ([`api_get`], [`download_bytes`], [`download_to`] — anonymous
-//! when no token is provisioned, so a PUBLIC channel needs no credential); the
+//! GitHub Releases API ([`api_get`], [`api_get_conditional`], [`download_bytes`],
+//! [`download_to`] — anonymous when no token is provisioned, so a PUBLIC channel needs
+//! no credential; conditional so a steady-state check costs a 304 instead of the whole
+//! release history); the
 //! per-machine [`token`] resolution chain; private-dir hardening
 //! ([`ensure_private_dir`]); a `shasum`-backed [`sha256_file`]; the release-tag
 //! grammar ([`tag`]) the publisher and the updater client BOTH classify with, so
@@ -46,8 +48,9 @@ mod sys;
 
 pub use hash::sha256_file;
 pub use http::{
-    HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get, api_get_classified, download_bytes,
-    download_error_is_rate_limit, download_to,
+    ApiResponse, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get, api_get_classified,
+    api_get_conditional, download_bytes, download_error_is_rate_limit, download_to,
+    download_to_resumable, validator_safe,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

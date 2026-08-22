@@ -8945,28 +8945,40 @@ impl App {
                             // of the session — an unbounded lazy-buffer leak + all tiered
                             // history invisible (audit #5). Cancellation reuses that SAME
                             // recovery path (abort → ring-only), not a second one.
-                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                drive_reflow_job(pending, &cancel, REFLOW_WORKER_STEP_LINES)
-                            })) {
-                                Ok(Some(reflowed)) => {
-                                    term_lock(&term).finish_resize_offload(reflowed);
-                                }
-                                Ok(None) => {
-                                    aterm_log::info!(
-                                        "reflow worker cancelled rewrapping session {id} \
-                                         scrollback (session teardown); aborting the offload \
-                                         (detached history released, grid recovered to \
-                                         ring-only)"
-                                    );
-                                    term_lock(&term).abort_resize_offload();
-                                }
-                                Err(_) => {
-                                    aterm_log::error!(
-                                        "reflow worker panicked rewrapping session {id} \
-                                         scrollback; aborting the offload (tiered history \
-                                         lost, grid recovered to ring-only)"
-                                    );
-                                    term_lock(&term).abort_resize_offload();
+                            // CONVERGENCE LOOP (RFL-3): a re-attach whose width no
+                            // longer matches the grid (a superseding drag step landed
+                            // mid-rewrap) hands back a re-detached job at the settled
+                            // width — keep driving it on this same thread until the
+                            // widths agree. Terminates: each pass rewraps to the width
+                            // observed at ITS detach, so once the drag stops at most
+                            // one extra pass runs. Supersede's zero-data-loss
+                            // semantics are unchanged — nothing is cancelled, content
+                            // re-attaches before every re-detach.
+                            let mut next = Some(pending);
+                            while let Some(active) = next.take() {
+                                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || drive_reflow_job(active, &cancel, REFLOW_WORKER_STEP_LINES),
+                                )) {
+                                    Ok(Some(reflowed)) => {
+                                        next = term_lock(&term).finish_resize_offload(reflowed);
+                                    }
+                                    Ok(None) => {
+                                        aterm_log::info!(
+                                            "reflow worker cancelled rewrapping session {id} \
+                                             scrollback (session teardown); aborting the \
+                                             offload (detached history released, grid \
+                                             recovered to ring-only)"
+                                        );
+                                        term_lock(&term).abort_resize_offload();
+                                    }
+                                    Err(_) => {
+                                        aterm_log::error!(
+                                            "reflow worker panicked rewrapping session {id} \
+                                             scrollback; aborting the offload (tiered history \
+                                             lost, grid recovered to ring-only)"
+                                        );
+                                        term_lock(&term).abort_resize_offload();
+                                    }
                                 }
                             }
                             // Repaint either way: rewrapped history on success, or the
@@ -9010,7 +9022,30 @@ impl App {
                             pending.reflow()
                         })) {
                             Ok(reflowed) => {
-                                term_lock(&term).finish_resize_offload(reflowed);
+                                // CONVERGENCE (RFL-3), inline flavor: the main thread
+                                // is blocked right here, so no further width change
+                                // can interleave — at most one follow-up pass runs,
+                                // equally bounded by the small-history gate above.
+                                let mut next = term_lock(&term).finish_resize_offload(reflowed);
+                                while let Some(follow) = next {
+                                    match std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| follow.reflow()),
+                                    ) {
+                                        Ok(again) => {
+                                            next =
+                                                term_lock(&term).finish_resize_offload(again);
+                                        }
+                                        Err(_) => {
+                                            aterm_log::error!(
+                                                "inline convergence rewrap of session {id} \
+                                                 panicked; aborting the offload (grid \
+                                                 recovered)"
+                                            );
+                                            term_lock(&term).abort_resize_offload();
+                                            break;
+                                        }
+                                    }
+                                }
                                 aterm_log::warn!(
                                     "reflow worker spawn failed; rewrapped session {id} \
                                      scrollback synchronously on the main thread \
@@ -12872,6 +12907,10 @@ impl App {
                 term.cell_frame_into(&mut ws.input_scratch, rows, cols);
                 term.take_damage();
             }
+            // The composition must occupy exactly the columns the committed text
+            // will (the write path honors EA-Ambiguous width), so the overlay
+            // below reads the SAME mode bit under the same lock.
+            let ambiguous_cjk = term.modes().ambiguous_width_double;
             drop(term);
             // Rescan frames extracted under LOCK A and therefore keep these
             // LOCK-A colors. Non-rescan frames overwrite both under LOCK B
@@ -13881,6 +13920,13 @@ impl App {
                     bar_y,
                     handholds,
                     handhold_count: count as u8,
+                    // The window's vertical extent in grid px (the shared
+                    // `effects_origin_win` derivation: origin_y is the grid
+                    // top in window px, win_h the full frame) — the brain
+                    // clamps every scene inside it, and hides him when the
+                    // window cannot hold his body (never clipped by an edge).
+                    win_top: -i32::from(origin_y),
+                    win_bot: i32::from(win_h) - i32::from(origin_y),
                 };
                 let mut robi_fp = 0u64;
                 // The hit-box is THIS frame's truth (the `pet_hit_rect`
@@ -14251,6 +14297,7 @@ impl App {
                 settings_fp,
                 find_fp,
                 pill_fp,
+                preedit_fp: crate::preedit_fingerprint(&ws.preedit, ws.preedit_caret),
                 // M1b sub-row scroll: the banked residual PRESENTED this frame (gated
                 // by the SmoothScroll motion policy — Reduced ⇒ 0 ⇒ whole-row snap).
                 // A frac-only change dirties no cell, so it must live in the key or
@@ -14423,6 +14470,29 @@ impl App {
                 ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
             }
             ws.fade_shown = fade_tinted;
+            // IME-1 INLINE: composite the live composition into the presented
+            // snapshot at the caret — same host-side mutation discipline as
+            // stream fade directly above (the engine grid, copied text, and
+            // recordings are untouched; CPU/GPU parity holds because both
+            // backends consume the same mutated bytes), and the same
+            // ghost-paint rule: the frame that draws a composition AND the
+            // frame that erases one both mutate cells relative to the cached
+            // snapshot, so both bump `snapshot_seq` past the render cache.
+            // Skipped while scrolled back — the cursor cell maps to unrelated
+            // history rows there ("never PAINT them over the scrollback
+            // view"), and the title indicator still carries the composition.
+            let preedit_drawn = !ws.preedit.is_empty() && display_offset == 0;
+            if preedit_drawn {
+                ws.input_scratch.overlay_ime_preedit(
+                    &ws.preedit,
+                    ws.preedit_caret,
+                    ambiguous_cjk,
+                );
+            }
+            if preedit_drawn || ws.preedit_shown {
+                ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+            }
+            ws.preedit_shown = preedit_drawn;
             // Hand the renderer this frame's aurora (grid-interior pixels; the
             // tab-strip splice below shifts it down with the cursor).
             // `cell_frame_into` does not touch this field, so set it after the refill.
@@ -16044,6 +16114,17 @@ impl App {
                     focused_cursor_fx_sample =
                         Some(focused_composed_cursor_fx_sample(session, &term, row_probe));
                 }
+            }
+            // IME-1 INLINE, split form: the FOCUSED pane's live composition is
+            // spliced into ITS sub-frame before the blit, so the composed
+            // window carries it exactly like the single-pane path does — and
+            // BEFORE the cursor read below, so the composed cursor follows the
+            // caret inside the composition. Same scrollback rule: a scrolled
+            // pane's cursor cell maps to history, so nothing is painted there.
+            if focused && !ws.preedit.is_empty() && ws.pane_scratch.display_offset == 0 {
+                let ambiguous_cjk = term.modes().ambiguous_width_double;
+                ws.pane_scratch
+                    .overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
             }
             let cursor = (focused
                 && ws.pane_scratch.cursor_visible
@@ -17716,6 +17797,12 @@ impl App {
             find_fp,
             // Split-pane compose paints no scroll pill (single-pane only).
             pill_fp: 0,
+            // The FOCUSED pane's live composition — same forcing term as the
+            // single-pane key; the overlay is spliced into the focused leaf.
+            preedit_fp: self
+                .windows
+                .get(&wid)
+                .map_or(0, |ws| crate::preedit_fingerprint(&ws.preedit, ws.preedit_caret)),
             // M1b sub-row scroll is single-pane only: a whole-composite band shift
             // would slide every pane together, so splits stay whole-row (frac 0).
             scroll_frac_px: 0,
@@ -18017,6 +18104,20 @@ impl App {
         // this host-owned composite change.
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         ws.stamp_present_decision(key);
+        // FL-1: this committed compose IS the redraw any outstanding recovery
+        // edge asked for — acknowledge the delivery. Without this, a
+        // compose-only consumer (the frame-latency bench, headless captures)
+        // recomposes EVERY settled frame forever: nothing on that path ever
+        // presents to glass, so nothing else clears
+        // `recovery_redraw_outstanding`, and `should_repaint_or_recover`
+        // bypasses the RepaintKey early-out permanently (the bench's
+        // presented-300/300 pins). The windowed path is unchanged in effect:
+        // its present, which follows this compose in the same frame, resets
+        // the retry ledger on success (`on_presented`) AND on drop
+        // (`on_drop*` clears this bit while arming the bounded retry), and a
+        // suppressed redraw still re-arms through the external-stimulus path
+        // because that suppression means this commit never ran.
+        ws.present_retry.on_recovery_redraw_serviced();
         Some(focus_title)
     }
 
@@ -19480,10 +19581,27 @@ impl App {
         // `window_frame_px` folds in the strip AND the pad; with both zero this keeps
         // the original request (byte-identical).
         let size = self.window_frame_px(rows, cols);
-        if let Some(w) = self.front().and_then(|ws| ws.os_window.as_ref()) {
+        // A driven resize OWNS the geometry from here: the launch-time initial
+        // frame settle must not re-assert the attach grid over it.
+        #[cfg(target_os = "linux")]
+        if let Some(ws) = self.front_mut() {
+            ws.initial_frame_settle = None;
+        }
+        if let Some(w) = self.front().and_then(|ws| ws.os_window.clone()) {
             // A best-effort request; the WM may clamp. The engine/PTY geometry is
             // already authoritative regardless of what the window settles on.
-            let _ = w.request_inner_size(size);
+            //
+            // `Some` = the backend applied the size SYNCHRONOUSLY and no `Resized`
+            // event will follow (winit's Wayland contract; macOS/X11/Windows return
+            // `None` and keep the event path). The window pixels + swapchain must
+            // follow HERE or they stay at the old size forever — observed on GNOME
+            // Wayland as a 30×100 engine cropped into the old 584×364 surface.
+            if let Some(applied) = w.request_inner_size(size) {
+                if let Some(ws) = self.front_mut() {
+                    ws.win_px = Some(applied);
+                }
+                self.sync_surface_to_window(wid);
+            }
             w.request_redraw();
         }
     }
@@ -19537,8 +19655,10 @@ fn preview_damage_from_compiled(
 /// exists for. Two honest caveats inherit from `reflow_step`'s cost contract:
 /// the single step that completes a soft-wrapped run longer than the budget
 /// rewraps that whole run at once (runs are capped at MAX_LOGICAL_WIDTH cells),
-/// and the input-exhausting step also clears the store (O(store blocks)) — both
-/// bounded, so the latency bound holds up to those constants.
+/// and a step's input front-truncation can land mid-block, re-decoding at most
+/// one warm/cold block next step (RFL-2 streams input out of and output back
+/// into the store, so there is no store-clearing step and no materialized
+/// history) — both bounded, so the latency bound holds up to those constants.
 pub(crate) const REFLOW_WORKER_STEP_LINES: usize = 50_000;
 
 /// Drive a detached scrollback-reflow job to completion in bounded
@@ -19548,7 +19668,8 @@ pub(crate) const REFLOW_WORKER_STEP_LINES: usize = 50_000;
 /// * `Some(reflowed)` — the completed rewrap, content-IDENTICAL to the one-shot
 ///   `PendingScrollbackReflow::reflow()` for any budget (aterm-grid's proven
 ///   `reflow_step_any_schedule_matches_one_shot` property) — pass to
-///   `Terminal::finish_resize_offload` exactly as before.
+///   `Terminal::finish_resize_offload`, and drive any follow-up job it returns
+///   (the RFL-3 width-convergence pass) through this same function.
 /// * `None` — `cancel` was observed: the job (and the detached history it owns)
 ///   is DROPPED, the documented bounded-loss semantics of a dying worker, but
 ///   IMMEDIATE and clean instead of after the full O(history) rewrap. The
@@ -19728,8 +19849,8 @@ mod reflow_worker_tests {
         let rb = jb.reflow(); // the old one-shot the worker used to run
 
         assert_eq!(ra.line_count(), rb.line_count());
-        a.finish_resize_offload(ra);
-        b.finish_resize_offload(rb);
+        assert!(a.finish_resize_offload(ra).is_none(), "widths agree");
+        assert!(b.finish_resize_offload(rb).is_none(), "widths agree");
         assert_eq!(
             history_fingerprint(&a),
             history_fingerprint(&b),
@@ -19737,15 +19858,17 @@ mod reflow_worker_tests {
         );
     }
 
-    /// SUPERSEDE, MEASURED (why a superseding resize does NOT cancel): while a
-    /// job is in flight a second width-resize detaches nothing (the one-detach
-    /// serialization), and the job's completed result STILL re-attaches with its
-    /// content intact — only the wrapping is stale, and the very next width
-    /// change re-detaches and re-reflows it (the documented self-heal). Cancel +
-    /// abort here would instead drop the ENTIRE tiered history and leave the
-    /// session permanently ring-only — a routine drag becoming data loss.
+    /// SUPERSEDE + CONVERGE (RFL-3): while a job is in flight a second
+    /// width-resize detaches nothing (the one-detach serialization), and the
+    /// job's completed result STILL re-attaches with its content intact — then
+    /// the width mismatch hands the worker ONE follow-up job at the settled
+    /// width, after which the history is genuinely wrapped for the current
+    /// grid and no further pass runs. Cancel + abort here would instead drop
+    /// the ENTIRE tiered history and leave the session permanently ring-only —
+    /// a routine drag becoming data loss; convergence keeps supersede's
+    /// zero-loss property AND removes its unbounded staleness.
     #[test]
-    fn superseding_resize_keeps_the_in_flight_history() {
+    fn superseding_resize_converges_to_the_settled_width() {
         let mut t = term_with_history(24, 80, 500);
         let before = t.grid().scrollback_lines();
         assert!(before > 100);
@@ -19760,20 +19883,44 @@ mod reflow_worker_tests {
         );
         assert!(t.grid().reflow_offload_in_flight());
 
-        // The worker finishes at the OLD width; the result still re-attaches.
+        // The worker finishes at the OLD width; re-attach detects the settled
+        // width and hands back exactly one convergence job.
         let cancel = AtomicBool::new(false);
         let reflowed = drive_reflow_job(job, &cancel, REFLOW_WORKER_STEP_LINES).expect("no cancel");
-        t.finish_resize_offload(reflowed);
+        let follow = t
+            .finish_resize_offload(reflowed)
+            .expect("width mismatch re-detaches for convergence (RFL-3)");
+        assert!(
+            t.grid().reflow_offload_in_flight(),
+            "the convergence window is open"
+        );
+        let reflowed = drive_reflow_job(follow, &cancel, REFLOW_WORKER_STEP_LINES)
+            .expect("no cancel");
+        assert!(
+            t.finish_resize_offload(reflowed).is_none(),
+            "widths agree after exactly one extra pass"
+        );
         assert!(!t.grid().reflow_offload_in_flight());
+
         let after = t.grid().scrollback_lines();
         assert!(
             after > 100,
             "history content survives a superseded reflow (before={before}, after={after})"
         );
-        // The stale wrap self-heals: the NEXT width change re-detaches the store.
+        // Settled wrapping is REAL: the 72-char fill lines re-wrapped to 60.
+        let mis_wrapped = (0..after).any(|i| {
+            t.grid().get_history_line(i).is_some_and(|line| {
+                line.as_str().is_some_and(|text| text.chars().count() > 60)
+            })
+        });
+        assert!(
+            !mis_wrapped,
+            "no history line may exceed the settled 60-col width"
+        );
+        // And the protocol is quiescent: the next width change still detaches.
         assert!(
             t.resize_offloading_scrollback(24, 50).is_some(),
-            "next width change re-reflows the width-stale store"
+            "next width change re-reflows normally"
         );
     }
 }
@@ -23334,5 +23481,153 @@ mod key_time_click_tests {
             app.glow_config().style,
             "the key-time click must name the frame drain's instrument"
         );
+    }
+}
+
+#[cfg(test)]
+mod settled_compose_early_out_tests {
+    //! FL-1 regression pins. A SETTLED composed window takes the RepaintKey
+    //! early-out: one delivered recovery edge buys exactly ONE recomposed
+    //! present, never a permanent train — while every real state change still
+    //! repaints (the no-stale-frames law). Pre-fix, the recovery flag latched
+    //! by a tab switch / split sync had no clearing edge on the composed path,
+    //! so `should_repaint_or_recover` bypassed the early-out on every frame
+    //! forever (the bench's FL-1 presented-300/300 pins).
+
+    use crate::{App, WindowId, term_lock};
+    use std::time::{Duration, Instant};
+
+    fn compose(app: &mut App, wid: WindowId, now: Instant) -> bool {
+        app.redraw_compose(wid, 24, 80, false, false, None, 0, now)
+            .is_some()
+    }
+
+    /// Drive composes until the window settles; assert it really settled and
+    /// STAYS settled (the "key unchanged -> skip taken" half of the pin).
+    ///
+    /// STRICT BY DESIGN — one skipped compose counts as settled — which means
+    /// the fixture's effect engines must be IDLE at every settle point. A live
+    /// aurora is a REAL presenter: while its wake decays, `glow_fp` moves on
+    /// most frames but HOLDS across the occasional adjacent pair (quantized
+    /// alpha in the decay tail), so the early-out honestly elides that one
+    /// repeated frame and then presents the next step — an alternating
+    /// skip/present run that is correct behaviour, not a train. Under this
+    /// helper's one-skip criterion that alternation reads as "settled, then
+    /// presented again" and panics below. Keep the strictness (it is exactly
+    /// what pins "one recovery edge buys ONE present") and instead build
+    /// fixtures whose steps animate nothing they don't wait out.
+    fn settle(app: &mut App, wid: WindowId, now: &mut Instant) {
+        let mut settled = false;
+        for _ in 0..40 {
+            *now += Duration::from_millis(16);
+            if !compose(app, wid, *now) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the fixture must reach a settled (skipping) state");
+        *now += Duration::from_millis(16);
+        assert!(!compose(app, wid, *now), "settled stays settled");
+    }
+
+    /// FL-1 core: a latched recovery edge (what a tab switch / split sync
+    /// leaves behind via `rearm_present_and_request(.., true, ..)`) forces ONE
+    /// recomposed present, is acknowledged by that commit, and the next
+    /// settled compose takes the early-out again.
+    #[test]
+    fn recovery_edge_buys_one_present_not_a_train() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        let mut now = Instant::now();
+        settle(&mut app, wid, &mut now);
+        // Latch the edge exactly as `sync_window`'s switch block does.
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .present_retry
+            .recovery_redraw_outstanding = true;
+        now += Duration::from_millis(16);
+        assert!(
+            compose(&mut app, wid, now),
+            "the delivered edge services one recomposed present"
+        );
+        assert!(
+            !app.windows[&wid].present_retry.recovery_redraw_outstanding,
+            "the composed commit acknowledged the delivered edge"
+        );
+        now += Duration::from_millis(16);
+        assert!(
+            !compose(&mut app, wid, now),
+            "and the train ends: the settled compose takes the early-out"
+        );
+    }
+
+    /// The bench-fixture shape: a 2-pane split (whose setup crosses the
+    /// `sync_window` latch) settles; then EACH real writer — PTY damage in a
+    /// BACKGROUND pane, a pure cursor move (no grid damage), the blink phase,
+    /// a config change, a resize — changes the key, repaints, and settles
+    /// again. The two-sided no-stale-frames pin for the FL-1 fix.
+    #[test]
+    fn split_settles_and_every_real_change_still_repaints() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // EVERY cursor effect off (the bench's `effects_all_off` shape, cache
+        // refresh included). The shipped default is rainbow-kitty ON, and this
+        // fixture MOVES the cursor: with the aurora live, the CUF step would
+        // ignite a wake whose decaying `glow_fp` legitimately keeps presenting
+        // (and, in its quantized tail, alternates skip/present) for ~2s of
+        // simulated time — see `settle`'s strictness note. This test pins the
+        // RepaintKey early-out and the FL-1 recovery ack, not aurora physics,
+        // so the engines stay dark and `glow_fp`/`trail_fp` stay exactly 0.
+        app.config.cursor_trail = Some(false);
+        app.config.cursor_trail_style = Some("off".into());
+        app.kitty_cursor_enabled_cache = None;
+        app.recompute_sparkle();
+        // Focused NEW pane `sid`; session 0 stays visible in the background.
+        let sid = app.split_active_stub_tab(wid);
+        app.windows.get_mut(&wid).expect("window").focused = true;
+        let mut now = Instant::now();
+        settle(&mut app, wid, &mut now);
+
+        // PTY damage, BACKGROUND pane: the key folds every visible pane's
+        // damage epoch, so a write nobody focuses still repaints.
+        let bg = app.pool.get(0).expect("background session").term.clone();
+        term_lock(&bg).process(b"background write");
+        now += Duration::from_millis(16);
+        assert!(compose(&mut app, wid, now), "background PTY damage repaints");
+        settle(&mut app, wid, &mut now);
+
+        // Pure cursor MOVE in the focused pane: CUF marks no grid damage; the
+        // key's cursor terms force the repaint.
+        let fg = app.pool.get(sid).expect("focused session").term.clone();
+        term_lock(&fg).process(b"\x1b[C");
+        now += Duration::from_millis(16);
+        assert!(
+            compose(&mut app, wid, now),
+            "a damage-free cursor move repaints"
+        );
+        settle(&mut app, wid, &mut now);
+
+        // Cursor blink phase flip (the blink timer's key term).
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.blink_phase = !ws.blink_phase;
+        }
+        now += Duration::from_millis(16);
+        assert!(compose(&mut app, wid, now), "a blink phase flip repaints");
+        settle(&mut app, wid, &mut now);
+
+        // Config change: the build badge rides `RepaintKey::badge_fp`.
+        app.config.show_build_badge = Some(true);
+        now += Duration::from_millis(16);
+        assert!(compose(&mut app, wid, now), "a config change repaints");
+        settle(&mut app, wid, &mut now);
+
+        // Resize: a grid resize marks full damage, so `damage_epoch` advances.
+        term_lock(&fg).resize(12, 30);
+        now += Duration::from_millis(16);
+        assert!(compose(&mut app, wid, now), "a resize repaints");
+        settle(&mut app, wid, &mut now);
     }
 }

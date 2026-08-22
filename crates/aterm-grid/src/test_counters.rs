@@ -40,6 +40,15 @@ thread_local! {
     static REFLOW_CELL_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// Counter for scrollback lines that took the RFL-4a rewrap PASSTHROUGH
+// (clone-through of width-invariant single-row logical lines) instead of the
+// full decompose+rebuild path. Reach is asserted in BOTH directions: a mixed
+// corpus must drive it above zero (the fast path really fires) and a
+// wrap-changing corpus must leave it at zero (the gate never over-fires).
+thread_local! {
+    static REFLOW_PASSTHROUGH_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Counter for off-screen scrollback lines rewrapped SYNCHRONOUSLY inside a
 // `Grid::resize` width change (the L0-hang budget: this must stay bounded by the
 // viewport, NOT by session history — see `tests/reflow/cost_bound.rs` and the
@@ -59,6 +68,31 @@ pub(crate) fn count_extras_shift_ops(n: usize) {
 #[cfg(test)]
 pub(crate) fn take_extras_shift_ops() -> usize {
     EXTRAS_SHIFT_OPS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+// Counter for hyperlink-limit COLD-PATH walks (entries iterated per walk).
+//
+// The guard in `CellExtras::enforce_hyperlink_limit` is supposed to keep this
+// at zero unless the hyperlink population is genuinely over budget; a
+// non-zero-per-call count is the signature of the guard testing the wrong
+// quantity (total extras entries instead of hyperlink-bearing ones).
+thread_local! {
+    static HYPERLINK_WALK_OPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the hyperlink cold-path walk counter by `n` (entries iterated).
+pub(crate) fn count_hyperlink_walk_ops(n: usize) {
+    HYPERLINK_WALK_OPS.with(|c| c.set(c.get() + n));
+}
+
+/// Take (read and reset) the hyperlink cold-path walk count.
+#[cfg(test)]
+pub(crate) fn take_hyperlink_walk_ops() -> usize {
+    HYPERLINK_WALK_OPS.with(|c| {
         let v = c.get();
         c.set(0);
         v
@@ -134,6 +168,22 @@ pub(crate) fn count_reflow_cell_ops(n: usize) {
 #[cfg(test)]
 pub(crate) fn take_reflow_cell_ops() -> usize {
     REFLOW_CELL_OPS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+/// Increment the rewrap-passthrough counter by `n` (lines clone-through-ed by
+/// the RFL-4a wrap-invariance fast path in `reflow_scrollback_lines`).
+pub(crate) fn count_reflow_passthrough_lines(n: usize) {
+    REFLOW_PASSTHROUGH_LINES.with(|c| c.set(c.get() + n));
+}
+
+/// Take (read and reset) the rewrap-passthrough line count.
+#[cfg(test)]
+pub(crate) fn take_reflow_passthrough_lines() -> usize {
+    REFLOW_PASSTHROUGH_LINES.with(|c| {
         let v = c.get();
         c.set(0);
         v
